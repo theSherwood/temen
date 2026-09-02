@@ -84,6 +84,182 @@ fn module(src: &str) -> Arc<temen_ir::Module> {
     Arc::new(m)
 }
 
+/// Increment 2 — the **caller-parking round-trip**, in the topology a driver actually uses. A finding
+/// from increment 1's follow-on: a domain cannot both inline-spawn a caller *and* serve that caller's
+/// calls from the same task — it would have to reach its `svc.wait` while still executing the spawn.
+/// The servicer must be a **separate task already parked at a service point** before the caller runs
+/// (the `svc_serve_loop::a_sibling_calls_a_sibling` shape). So a conductor (func 0) spawns two
+/// children over one module:
+/// - **S, the servicer** (func 1 entry): stashes its own §14 Instantiator (its starter cap `v0`) for
+///   the handler, then `svc.wait`s — parked, ready, before C exists.
+/// - **C, the caller** (func 2 entry): writes "svc" into its own low memory then `self.resolve`s it
+///   (a §14 child's small carve does not carry the module's data segment at its authored offset, so
+///   the name is written locally — the `svc_serve_loop` sibling caller does the same) — the conductor
+///   re-granted S's offer into C via `child_offer` + a grant record — and calls it, parking C.
+/// - the **handler** (func 3, "svc.go") loads S's Instantiator and op-17-spawns a grandchild (func 4,
+///   returns 99) into a sub-carve of S's own window, joins it, and returns 99 — S's serve handler
+///   answering C's cap call by nesting a §14 spawn. The reply wakes C.
+///
+/// Composite return: `join(C) * 1000 + join(S)` = 99*1000 + 1 (S served exactly one) = 99001. This is
+/// the full guest-serves-via-grandchild shape (toy grandchild): nimsem(C) calls exec(the re-granted
+/// offer), the driver(S) services it by spawning nifler(the grandchild). Increment 3 swaps the toy
+/// grandchild for a real nifler_ce over a shared memfs.
+const SIBLING_DRIVEN: &str = r#"
+memory 18
+type 0 func (i64) -> (i64)
+type 1 interface { go: 0 }
+export 0 interface "svc" 1 { go: 3 }
+data 16584 "svc"
+
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  s0 = i64.const 4294967296
+  a0 = i64.const 17664
+  i64.store a0 s0
+  s1 = i64.const 65536
+  a1 = i64.const 17672
+  i64.store a1 s1
+  s2 = i64.const -4294967280
+  a2 = i64.const 17680
+  i64.store a2 s2
+  s3 = i64.const 4294967295
+  a3 = i64.const 17688
+  i64.store a3 s3
+  s4 = i64.const 0
+  a4 = i64.const 17696
+  i64.store a4 s4
+  a5 = i64.const 17704
+  i64.store a5 s4
+  a6 = i64.const 17712
+  i64.store a6 s4
+  sp = i64.const 17664
+  vS = call.cap 6 17 (i64) -> (i32) v0 (sp)
+  vzero = i64.const 0
+  vcap = call.cap 6 14 (i32, i64) -> (i32) v0 (vS, vzero)
+  g0 = i64.const 16640
+  gn = i32.const 16584
+  i32.store g0 gn
+  g1 = i64.const 16644
+  gl = i32.const 3
+  i32.store g1 gl
+  g2 = i64.const 16648
+  i32.store g2 vcap
+  d0 = i64.const 8589934592
+  b0 = i64.const 17728
+  i64.store b0 d0
+  d1 = i64.const 131072
+  b1 = i64.const 17736
+  i64.store b1 d1
+  d2 = i64.const -4294967284
+  b2 = i64.const 17744
+  i64.store b2 d2
+  d3 = i64.const 4294967295
+  b3 = i64.const 17752
+  i64.store b3 d3
+  d4 = i64.const 0
+  b4 = i64.const 17760
+  i64.store b4 d4
+  d5 = i64.const 16640
+  b5 = i64.const 17768
+  i64.store b5 d5
+  d6 = i64.const 1
+  b6 = i64.const 17776
+  i64.store b6 d6
+  bp = i64.const 17728
+  vC = call.cap 6 17 (i64) -> (i32) v0 (bp)
+  vjC = call.cap 6 1 (i32) -> (i64) v0 (vC)
+  vjS = call.cap 6 1 (i32) -> (i64) v0 (vS)
+  vk = i64.const 1000
+  vm = i64.mul vjC vk
+  vr = i64.add vm vjS
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vi = i32.wrap_i64 v0
+  sa = i64.const 16512
+  i32.store sa vi
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  return vn
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  nm = i64.const 6518387
+  za = i64.const 0
+  i64.store za nm
+  vp = i64.const 0
+  vl = i64.const 3
+  vh = self.resolve vp vl
+  va = i64.const 7
+  vr = call.cap 268435456 0 (i64) -> (i64) vh (va)
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (vx: i64) {
+  sa = i64.const 16512
+  vi = i32.load sa
+  e0 = i64.const 17179869184
+  f0 = i64.const 18432
+  i64.store f0 e0
+  e1 = i64.const 32768
+  f1 = i64.const 18440
+  i64.store f1 e1
+  e2 = i64.const -4294967284
+  f2 = i64.const 18448
+  i64.store f2 e2
+  e3 = i64.const 4294967295
+  f3 = i64.const 18456
+  i64.store f3 e3
+  e4 = i64.const 0
+  f4 = i64.const 18464
+  i64.store f4 e4
+  f5 = i64.const 18472
+  i64.store f5 e4
+  f6 = i64.const 18480
+  i64.store f6 e4
+  fp = i64.const 18432
+  vG = call.cap 6 17 (i64) -> (i32) vi (fp)
+  vr = call.cap 6 1 (i32) -> (i64) vi (vG)
+  return vr
+  }
+}
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vr = i64.const 99
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_child_cap_call_is_serviced_by_a_handler_that_nests_a_grandchild_spawn() {
+    let m = module(SIBLING_DRIVEN);
+    // Serves and instantiates → folded to the tree-walk oracle, same as increment 1.
+    assert!(
+        !serve_qualifies(&m.funcs),
+        "serve+instantiate folds to the oracle"
+    );
+    let mut host = Host::new();
+    host.set_self_module(&m);
+    let hi = host.grant_instantiator(0, 1u64 << 18);
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(&m, 0, &[Value::I32(hi)], &mut fuel, &mut host).expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(99001)],
+        "C called S's re-granted offer → parked → S's handler op-17-spawned a grandchild and joined \
+         it (99) → reply woke C → conductor joined C(99) and S(served 1): 99*1000 + 1"
+    );
+}
+
 #[test]
 fn a_serve_handler_services_a_dispatch_by_nesting_a_spawn_and_join() {
     let servicer = module(SERVICER);
