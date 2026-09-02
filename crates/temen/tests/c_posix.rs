@@ -4729,3 +4729,43 @@ fn c_multiple_background_jobs_stop_and_continue_across_process_groups() {
         "parallel driver: the same two-group stop/continue/reap over real OS threads — matching the oracle"
     );
 }
+
+// #797 — ^D (VEOF) is a ONE-SHOT EOF, not a permanent terminal close. The guest reads the terminal
+// twice: a ^D on the first (empty) read returns 0 (EOF), and a SECOND read then BLOCKS for fresh
+// input — a later `x\n` completes it. Before the fix, the empty-line VEOF dropped the terminal's
+// writer count to 0 permanently, so the second read EOF'd immediately (returned 0) instead of
+// blocking — the bug that made a foreground `cat`'s ^D also EOF the shell's next prompt read.
+const TERM_ONESHOT_EOF_SRC: &str = r#"
+long __px_read(int cap, long fd, long buf, long len);
+long __vm_read(int fd, void *buf, long len);
+static char b[8];
+static long ph_(long r){ return r <= -1048576 ? -(r+1048576) : -1; }
+static long rterm(long n){ long r=__px_read(0,0,(long)b,n); long h=ph_(r); if(h>=0) return __vm_read((int)h,b,n); return r; }
+int main(void){
+  long n1 = rterm(8);                 /* ^D on an empty line -> EOF -> 0 */
+  if (n1 != 0) return 100;
+  long n2 = rterm(8);                 /* MUST block for input; permanent-EOF would return 0 here */
+  if (n2 <= 0) return 200;
+  if (b[0] != 'x') return 300;
+  return 42;
+}
+"#;
+
+#[test]
+fn c_terminal_ctrl_d_eof_is_one_shot_not_a_permanent_close() {
+    let feeds = || vec![(150u64, b"\x04".to_vec()), (600u64, b"x\n".to_vec())];
+    let e = run_interp_terminal_setup(TERM_ONESHOT_EOF_SRC, feeds(), |_, _| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the empty-line ^D EOF'd only the pending read; the second read re-armed the \
+         terminal writer and blocked for the later `x` instead of inheriting the EOF"
+    );
+    let b = run_bytecode_terminal_setup(TERM_ONESHOT_EOF_SRC, feeds(), |_, _| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): same one-shot ^D EOF — the shell's prompt read no longer \
+         inherits a foreground job's ^D"
+    );
+}

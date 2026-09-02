@@ -102,13 +102,34 @@ async function worker() {
       && ex.temen_par_inst_eligible(entry) === 1) {
     const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    // #1151 Slice 2c: the child vCPU is built anyway — never `temen_par_run`, it services every
+    // `env.call_interp` leaf over the carve with the child's OWN powerbox (`temen_par_inst_call_interp`
+    // → `bounce_call`), so a leaf may store / `map` / `unmap` / `protect` exactly as the interpreter
+    // path would run it. On a paged unit (the module reaches a page op) the emitted accesses consult a
+    // page-state table re-synced from this vCPU after each bounce. Its starter cap handles (the entry
+    // args) come from the argv stash — no longer inert zeros.
+    const cv = ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel));
+    if (cv === 0) {
+      Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2);
+      parentPort.postMessage({ kind: 'fail', why: 'confined child vcpu build failed (codegen path)' });
+      return;
+    }
+    const paged = ex.temen_par_inst_paged() === 1;
+    let uexports = null;
+    const syncPaged = () => {
+      uexports.mapped.value = ex.temen_par_ev_b(cv);
+      uexports.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(cv));
+    };
     const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
         trap: () => {},
-        call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: (f, a) => {
+          if (ex.temen_par_inst_call_interp(cv, f, a) !== 0) throw new Error('cross-tier trap');
+          if (paged) syncPaged();
+        },
         instantiate: (cwin, _inst, centry, off, cslog, quota) => {
           const gsize = 1 << Number(cslog), goff = Number(off);
           if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize)
@@ -186,6 +207,7 @@ async function worker() {
       Atomics.store(i32(), slot >> 2, 2);
       Atomics.notify(i32(), slot >> 2);
     }
+    ex.temen_par_free(cv);
     return;
   }
 

@@ -827,9 +827,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    §2 deletes them onto the unified offer, so any wasm-tier arm would be work queued for deletion.
    **[landed — the browser driver wiring, real-browser-verified]** A confined child whose granted-unit
    entry *uses* its `Instantiator` now runs on emitted wasm in the browser: `temen_par_enable_inst_codegen`
-   emits the granted module via `compile_module_nested` first (falling back to the tier-up shape — an
-   ADDRESS_SPACE-using entry fails closed to the interpreter until the browser's `call_interp` carries a
-   powerbox), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
+   emits the granted module via `compile_nested` — `compile_nested_paged` when it reaches a page op
+   (#1151 Slice 2c: its `env.call_interp` leaves run on the child's own vCPU over the carve,
+   `temen_par_inst_call_interp`, with the page-state table re-synced after each bounce; an entry that
+   page-ops directly still falls to the interpreter), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
    through the *same* confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms
    — the grandchild spawns on its own Worker via the page relay; `env.join` `Atomics.wait`s its slot;
    the carve checks (power-of-two, aligned, inside the child's own window) replicate the engine's, so a
@@ -841,7 +842,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    spawns a pure grandchild → 9 into a narrowed 1 KiB sub-carve, joins → 84; root sums 8 × 84 = 672) —
    interp ≡ codegen ≡ 672 across **17 Workers** with **16 on emitted wasm** (the cap-using parents
    themselves + their grandchildren), verified in Node (`threads-spawn.mjs`, ported in parity) and in
-   real Chromium (`browser-test.mjs`, CI-gated). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   real Chromium (`browser-test.mjs`, CI-gated). The page-op child is pinned the same way by the
+   `instpaged` work item (#1151, `threads_inst_paged_unit`: the entry's helper `unmap`s one carve page
+   and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
+   sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
+   the unmapped page faults on both tiers). The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
+   #1025 Path 1) runs its separate-module child on the single-shot emit, which declines a page-op
+   child; the loop then runs that child on the interpreter over the same carve and marshaled powerbox
+   instead of trapping the driver (`browser/tests/op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
    marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
    §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `temen-wasmjit` cross-engine bench

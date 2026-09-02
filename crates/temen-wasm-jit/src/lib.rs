@@ -853,12 +853,13 @@ fn module_can_spawn_same_module(m: &Module) -> bool {
 /// keeps the unit interpreter-tier). This closes the D40/§13 page-enforcement question on the nested
 /// axis (INVARIANTS #14) — the paged whole-program path already carries it (`module_uses_unmap_protect`).
 ///
-/// `map` (0, a guest *grow*) is deliberately **not** outlined here yet: unlike `unmap`/`protect` it
-/// adds committed pages the emitted bounds check reaches only through a live `"mapped"` re-sync after
-/// the bounce, which the nested driver does not yet perform — admitting it is deferred to the nested-
-/// driver slice so a grow-using nested unit keeps its safe pre-#1151 interpreter fallback until then.
+/// `map` (0, a guest *grow*) is outlined too (#1151 Slice 2c): its effect reaches the emitted tier
+/// through the same post-bounce refresh as `unmap`/`protect` — the driver rebuilds the page-state
+/// table from the live map and re-points `"pagestate"`/`"mapped"` (the table's coverage grows with a
+/// `map` past the mapped prefix, `build_pagestate_table`), so a grow-using nested entry emits paged
+/// instead of falling to the interpreter.
 fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
-    type_id == cap_id::ADDRESS_SPACE && (op == 1 || op == 2 || op == 3 || op == 4)
+    type_id == cap_id::ADDRESS_SPACE && op <= 4
 }
 
 /// Outline each [`is_nested_leaf_cap`] `call.cap` into an appended int-signature wrapper (exactly
@@ -1230,6 +1231,28 @@ pub fn module_uses_unmap_protect(m: &Module) -> bool {
                     Inst::CapCall {
                         type_id: cap_id::ADDRESS_SPACE,
                         op: 1..=2,
+                        ..
+                    }
+                )
+            })
+        })
+    })
+}
+
+/// Whether any function reaches an `ADDRESS_SPACE` page op at all — `map`/`unmap`/`protect` (iface 5
+/// ops 0–2). The browser's §14 codegen entry keys its **paged** routing on this (#1151 Slice 2c): a
+/// unit whose leaves can remap pages must emit with the per-access page check, since a `map` inside
+/// a bounced leaf is carried only by the post-bounce `"pagestate"`/`"mapped"` refresh (the mask-only
+/// tier's scalar `"mapped"` cannot represent an `Ro`/hole state and would deny everything).
+pub fn module_uses_addr_space_page_ops(m: &Module) -> bool {
+    m.funcs.iter().any(|f| {
+        f.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::ADDRESS_SPACE,
+                        op: 0..=2,
                         ..
                     }
                 )
@@ -1676,9 +1699,12 @@ fn compile_module_nested_inner(
         ));
     }
     // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
-    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers) reached
-    // via `env.call_interp` — whose host callback must therefore carry the run's powerbox (the
-    // reactor-path contract, not the throwaway-window one). Anything else fails closed.
+    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers, an
+    // op-13 grant-seeding `call.cap` helper) reached via `env.call_interp` — whose host callback must
+    // therefore carry the run's powerbox over the **live window** (the reactor-path contract, not the
+    // throwaway-window one). A leaf may touch memory and caps under that contract — so a host must
+    // never service these leaves on a throwaway window; the browser's §14 codegen path services them
+    // on the child's own vCPU over its carve (`bounce_call`, #1151 Slice 2c). Anything else fails closed.
     let nested_ok = |f: &Func| {
         f.blocks.iter().all(|b| {
             block_value_types(m, b, true)
@@ -1690,7 +1716,7 @@ fn compile_module_nested_inner(
     // in-subset function instead of falling to the cross-tier leaf path.
     let null_guard = emit_null_guard_extent(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
-    let mut interp_leaf = vec![false; n];
+    let mut leaves = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
         if nested_ok(f) {
@@ -1715,7 +1741,7 @@ fn compile_module_nested_inner(
                 .chain(&f.results)
                 .all(|t| !matches!(t, ValType::V128))
         {
-            interp_leaf[i] = true;
+            leaves[i] = true;
         } else {
             // Not nested-emittable and carries a `v128`/`ref`/`cap` in its signature. A nested
             // unit's `env.call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot
@@ -1736,7 +1762,7 @@ fn compile_module_nested_inner(
         shared_memory,
         &emitted,
         &wasm_of,
-        &interp_leaf,
+        &leaves,
         None,
         true,
         paged,
@@ -1867,9 +1893,12 @@ pub fn check_child_carve(
 /// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
 /// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
 ///
-/// A unit that manages its own pages (`map`/`unmap`/`protect`) emits **nothing** and runs wholly on
-/// the interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
-/// [`module_uses_page_ops`]). `page_size`/`sub` (queries/attenuation) are unaffected.
+/// A unit that `unmap`s/`protect`s its own pages emits **nothing** here and runs wholly on the
+/// interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
+/// [`module_uses_page_ops`]); [`compile_nested_paged`] is the entry that carries those.
+/// `page_size`/`sub` (queries/attenuation) are unaffected. A `WasmDriven` artifact's `env.call_interp`
+/// leaves may touch memory and caps (a `map`-calling allocator helper, an op-13 grant seeder) — the
+/// servicer contract is the powerbox over the live window, never a throwaway one (#1151).
 pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
     if module_uses_page_ops(m) {
         return compile_interp_only(m, shared_memory, true);

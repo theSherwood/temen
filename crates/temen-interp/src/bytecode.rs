@@ -2927,6 +2927,12 @@ pub struct Vcpu<'p> {
     /// is resumable by a later one — the same one-registry-per-invoke scope the interpreted
     /// `run_invoke` has by construction. Cleared when the invoke resolves (`deliver_jit_invoke_*`).
     invoke_fibers: Vec<FiberState>,
+    /// The entry's initial arguments as the constructor built them — a §14 confined child's starter
+    /// cap handles (`[Instantiator, AddressSpace?]`, widened to `i64`), so a host that runs the
+    /// child's entry on emitted wasm (the browser's codegen path) passes exactly the handles the
+    /// interpreter would, and a bounced leaf's `call.cap` resolves them on this vCPU. Empty on the
+    /// other constructors.
+    entry_args: Vec<Value>,
     /// A trap to surface on the next `run` (a joined child trap propagates to the joiner).
     trap: Option<Trap>,
     /// **wasm-JIT tier-up eligibility** (browser wasm-JIT threads slice). When set, `jit_eligible[f]`
@@ -3145,6 +3151,7 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             invoke_fibers: Vec::new(),
+            entry_args: Vec::new(),
             trap: None,
             jit_eligible: None,
             jit_page_checked: false,
@@ -3312,6 +3319,7 @@ impl<'p> Vcpu<'p> {
             pending: None,
             pending_jit: None,
             invoke_fibers: Vec::new(),
+            entry_args: args,
             trap: None,
             jit_eligible: None,
             jit_page_checked: false,
@@ -3359,6 +3367,12 @@ impl<'p> Vcpu<'p> {
     /// reachable through a cross-tier leaf). `None` for a memory-less module.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
+    }
+
+    /// The entry's initial arguments (see [`entry_args`](Self::entry_args) on the struct) — a §14
+    /// confined child's starter cap handles, for a host that drives the entry on emitted wasm.
+    pub fn entry_args(&self) -> &[Value] {
+        &self.entry_args
     }
 
     /// #1009 paged tier-up: the window's page-map version — a cheap `O(1)` counter bumped on every
@@ -6026,6 +6040,13 @@ impl DebugRun {
         }
     }
 
+    /// The faulting guest address of the last `MemoryFault` (window-relative; a NULL deref → `0`),
+    /// or `None` if the last termination was not an address-recording memory fault. Read by the DAP
+    /// layer to report a segfault's address (#1190).
+    pub fn fault_addr(&self) -> Option<u64> {
+        self.mem.as_ref().and_then(|m| m.peek_fault_rel())
+    }
+
     /// **Write a source variable by name** (slice 8, the DAP `setVariable` backend): a promoted
     /// SSA scalar takes `value` coerced to its slot type (integers only); a memory-located var
     /// takes `value`'s low `width` bytes little-endian at its resolved window address. Refused
@@ -8072,6 +8093,15 @@ impl ScheduledDebugRun {
             Some(m) => m.read_window(addr, len),
             None => Err(Trap::Malformed),
         }
+    }
+
+    /// The faulting guest address of the focused task's last `MemoryFault` (window-relative; a NULL
+    /// deref → `0`), or `None` if it was not an address-recording memory fault. Read by the DAP
+    /// layer to report a segfault's address (#1190).
+    pub fn fault_addr(&self) -> Option<u64> {
+        self.task_mem(self.focus)
+            .as_ref()
+            .and_then(|m| m.peek_fault_rel())
     }
 }
 

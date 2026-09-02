@@ -1561,12 +1561,26 @@ impl DapServer {
                 // `terminated`, so a client can show "exited with N". The on-ramp powerbox turns
                 // `main`'s return into an `exit` capability call (`Trap::Exit(code)`); a deny-all
                 // compute session instead finishes with returned values, whose first scalar is the
-                // result. A non-exit trap (fault/unreachable/…) exits non-zero the way a real
-                // process would on a signal.
-                events.push((
-                    "exited",
-                    Json::obj(vec![("exitCode", Json::i(exit_code_of(&result) as i64))]),
-                ));
+                // result.
+                //
+                // A non-`Exit` trap is an *involuntary* crash — the SIGSEGV/SIGILL channel, not a
+                // chosen exit code — so `exitCode` alone (which collapses every such trap to `1`)
+                // cannot tell it from a clean `exit(1)`. #1190: tag the trap kind, and for a
+                // `MemoryFault` the faulting guest address, so a client can report a segfault (and
+                // where) the way a native shell distinguishes "killed by signal" from a normal exit.
+                // Both are optional/additive — a clean exit carries neither field.
+                let mut body = vec![("exitCode", Json::i(exit_code_of(&result) as i64))];
+                if let Err(trap) = &result {
+                    body.push(("trap", Json::s(trap_name(trap))));
+                    if matches!(trap, Trap::MemoryFault) {
+                        if let Some(addr) =
+                            self.session.as_ref().and_then(|s| s.inspector.fault_addr())
+                        {
+                            body.push(("faultAddr", Json::i(addr as i64)));
+                        }
+                    }
+                }
+                events.push(("exited", Json::obj(body)));
                 events.push(("terminated", Json::obj(vec![])));
             }
             Stop::Blocked => events.push(stopped_event("pause", tid)),
@@ -1622,6 +1636,27 @@ fn exit_code_of(result: &Result<Vec<Value>, Trap>) -> i32 {
         },
         Err(Trap::Exit(code)) => *code,
         Err(_) => 1,
+    }
+}
+
+/// The `trap` field name for a run that ended in a trap (#1190) — the involuntary-crash kind, so a
+/// client distinguishes e.g. a memory fault from a chosen `exit(k)`. `Trap::Exit` is the clean-exit
+/// path (surfaced via `exitCode`, not a crash) and is named here only for completeness.
+fn trap_name(trap: &Trap) -> &'static str {
+    match trap {
+        Trap::OutOfFuel => "OutOfFuel",
+        Trap::DivByZero => "DivByZero",
+        Trap::IntOverflow => "IntOverflow",
+        Trap::MemoryFault => "MemoryFault",
+        Trap::StackOverflow => "StackOverflow",
+        Trap::IndirectCallType => "IndirectCallType",
+        Trap::Unreachable => "Unreachable",
+        Trap::BadConversion => "BadConversion",
+        Trap::CapFault => "CapFault",
+        Trap::Exit(_) => "Exit",
+        Trap::FiberFault => "FiberFault",
+        Trap::ThreadFault => "ThreadFault",
+        Trap::Malformed => "Malformed",
     }
 }
 

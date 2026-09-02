@@ -2271,7 +2271,8 @@ the read/write sets, or re-back a page's bytes mid-run — states a single monot
 so an emitted access would sail through a page the interpreter (which enforces `Mem`'s full
 page-protection + backing map, §4/§13) traps on or backs with different bytes. A module that reaches
 any such op therefore emits **nothing** and runs wholly on the interpreter — correct by construction
-(the interpreter is the oracle, INVARIANTS.md #9) with **zero** added confinement-TCB. The gate is
+(the interpreter is the oracle, INVARIANTS.md #9) with **zero** added confinement-TCB — and the
+**paged** entry below is the shipped escalation that carries `unmap`/`protect`. The mask-only gate is
 module-wide (the hazard is every *other* emitted access, not the op's own function) and covers only
 those shrinking/aliasing ops: `page_size`/`sub`/`len` are pure queries, and `AddressSpace.map` — a
 guest **grow** — only adds committed pages within the reservation the mask already permits, so
@@ -2288,10 +2289,13 @@ instead (tier-up falls through at the dispatch; an invoke uses the interpreted d
 emitted code never runs over a state it would mis-admit; the map-containing function itself is
 never emitted either (a remapping `call.cap` is not in-subset). `tierup_grow_window.rs` and
 `jit_grow_window.rs` are the differential proofs, both directions plus the decline arms, with the
-unsynced divergences pinned as negative tests. The **page-state** axis stays fail-closed as above.
+unsynced divergences pinned as negative tests. The **page-state** axis is carried by the paged entry.
 The `& MASK` clamp to `reserved` is unchanged, so a wrong live size is only a trap-parity
 divergence, never an escape. The escalation past emit-nothing — a per-access **software page-check** in emitted code — has
-**landed dark** as the strictly opt-in paged entry (#750, `compile_module_tierup_paged`): every
+**landed** as the paged entry (#750, `compile_module_tierup_paged`), which the browser's cooperative
+tier-up selects whenever the module carries a `readonly` data segment or reaches `unmap`/`protect`
+(`module_uses_unmap_protect`; #1009 — every real card write-protects its rodata, so this is the
+shipped default for them, not an opt-in): every
 confined access in a paged module also consults a host-maintained byte-per-page state table
 (`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
 `Mem::map_info` — page state is frozen while emitted code runs, since page ops are `call.cap`s
@@ -2299,13 +2303,33 @@ that never emit and never hide in a cross-tier leaf), first and last touched pag
 the existing fault seam exactly where `check_prot` would. The driver writes the table's coverage to
 `"mapped"`, so the bound check traps everything above it — the two checks compose. Paged-mode
 limits, fail-closed: `SharedRegion` aliasing still gates the whole module (a `Backed` page's bytes
-live outside the window), bulk-memory functions stay interpreted, and the page check is never
+live outside the window), bulk-memory spans walk every page they touch (#1081, the `paged_walk`
+fuzz target), and the page check is never
 elided (an in-window proof says nothing about dynamic page state). Every **unflagged** entry emits
 byte-identical code — the fail-closed default pays zero TCB — and the check runs strictly inside
 the always-emitted `& MASK` clamp, so a wrong table is a trap-parity divergence, never an escape.
 `page_check.rs` is the differential + boundary proof (unmapped load, Ro load/store split, page-edge
-straddle, unsynced-table divergence pin). The cost remains ~1.5–3×+ on the random-access tail for
-guests that opt in; no default flips until a hot page-managing consumer justifies it. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+straddle, unsynced-table divergence pin). The cost is ~1.5–3×+ on the random-access tail, paid only
+by the modules the flip selects.
+
+**Nested units (#1151).** `compile_nested_paged` is the paged §14 front door: `unmap`/`protect`
+`call.cap`s are outlined into `env.call_interp` wrappers (`outline_nested_cap_calls`, so the op runs
+interp-serviced and the driver re-syncs the table on return) and every emitted access carries the page
+check; `SharedRegion` aliasing and fiber-bearing units still fail closed to whole-interpreter. The
+nested emit's `env.call_interp` contract is a **powerbox-carrying servicer over the live window** —
+a leaf may store and `call.cap` (the op-13 grant seeder, a `map`-calling allocator helper). A host
+must never service these leaves on a throwaway window (the browser's `temen_wasmjit_call_interp`,
+which is faithful only for the tier-up analysis's pure leaves) — an impure helper run on the empty
+powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
+The browser's §14 codegen entry
+(`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
+`compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
+carve** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
+the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
+after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
+wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
+still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
+refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned by `browser/tests/inst_codegen_paged.rs`. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 

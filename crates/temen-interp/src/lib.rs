@@ -1831,6 +1831,14 @@ impl Inspector {
         })
         .unwrap_or(Ok(Vec::new()))
     }
+
+    /// The faulting guest address of the run's last `MemoryFault`, window-relative (a NULL deref →
+    /// `0`); `None` if the last termination was not an address-recording memory fault. Read by the
+    /// DAP layer to report a segfault's address (#1190).
+    pub fn fault_addr(&self) -> Option<u64> {
+        self.with_focused(|v| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
+            .flatten()
+    }
 }
 
 /// Like [`run`], but with a caller-provided [`Host`] (the powerbox): grant the entry
@@ -23289,6 +23297,15 @@ struct Mem {
     /// supplies the page) from an out-of-window fault (a real trap). Per-`Mem` (each vCPU owns its
     /// own), written/read only by the owning thread; `AtomicU64` keeps `Mem: Sync` for the futex path.
     last_fault: AtomicU64,
+    /// #1190 debugger side-channel: the confined address of the most recent **fatal** memory fault
+    /// (a NULL-guard access, an unmapped/read-only page), recorded by `check_prot` for the DAP layer
+    /// to report a segfault's address (a NULL deref → `0`). Distinct from [`last_fault`], which is the
+    /// §14 *recoverable* pager channel — a NULL-guard fault must **not** set `last_fault` (a demand
+    /// parent could not legally map the reserved region), so it needs its own field. Set-once: a fatal
+    /// fault ends the run (detect-and-kill) and each run gets a fresh `Mem`, so it is never cleared.
+    /// [`NO_FAULT`] when no fatal fault has occurred; an out-of-window fault leaves it unset (address
+    /// unknown). Read-only outside the owning thread; `AtomicU64` keeps `Mem: Sync`.
+    fault_report: AtomicU64,
     /// Monotonic count of operations that **actually changed** a byte (a `store`/`atomic.store`/
     /// `atomic.rmw`, or an `atomic.cmpxchg` that *swapped*). The deterministic explorer reads the
     /// per-turn delta to drive spin-loop detection (a turn that changed no memory and returned the vCPU
@@ -23336,6 +23353,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
         }
@@ -23376,10 +23394,19 @@ impl Mem {
     /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
     /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
     /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
-    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
-    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`. The crate stays
     /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    ///
+    /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
+    /// 1-TiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
+    /// would over the engine's own reservation right up to the first access, which the emitted tier's
+    /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
+    /// the interpreter's own accesses past the backing read as zero / drop writes, enforced at the
+    /// [`Region`] accessors themselves (#1191: the word/atomic fast paths were unbounded and reached
+    /// host memory behind the window). A Region-backed run that needs memory past its backing is
+    /// decline-and-rerun territory, never a silent host access.
     fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
@@ -23393,6 +23420,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
         }
@@ -23419,6 +23447,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
         }
@@ -23463,6 +23492,7 @@ impl Mem {
             prot_dirty: Arc::clone(&self.prot_dirty),
             map_version: Arc::clone(&self.map_version),
             last_fault: AtomicU64::new(NO_FAULT),
+            fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: self.null_guard,
         }
@@ -23598,6 +23628,7 @@ impl Mem {
             prot_dirty: Arc::new(AtomicBool::new(false)),
             map_version: Arc::new(AtomicU64::new(0)),
             last_fault: AtomicU64::new(NO_FAULT),
+            fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
         }
@@ -23642,7 +23673,11 @@ impl Mem {
                 // coroutine child can suspend to its parent (fault-driven yield) instead of trapping.
                 None if page * self.page < self.null_guard => {
                     // #964: a NULL dereference — fatal, never a recoverable §14 page fault (a
-                    // demand parent could not legally map the reserved region anyway).
+                    // demand parent could not legally map the reserved region anyway). #1190: record
+                    // the faulting address for the debugger (a segfault at `base`) in the dedicated
+                    // report field — *not* `last_fault`, whose recoverable-fault contract the guard
+                    // deliberately sidesteps here.
+                    self.fault_report.store(base, Ordering::Relaxed);
                     return Err(Trap::MemoryFault);
                 }
                 None => return Err(self.page_fault(base)), // unmapped
@@ -23760,6 +23795,25 @@ impl Mem {
         match self.last_fault.swap(NO_FAULT, Ordering::Relaxed) {
             NO_FAULT => None,
             addr => Some(addr),
+        }
+    }
+
+    /// The window-relative guest address of the run's last **fatal** memory fault (`base −
+    /// window.base()`; a top-level window's base is `0`, so a NULL deref reads back as `0`), for the
+    /// debugger to report a segfault's address (#1190). Reads the dedicated [`fault_report`] field
+    /// (set by the NULL-guard arm of [`check_prot`]) first, then falls back to [`last_fault`] — which
+    /// a top-level unmapped/read-only fault leaves set at the offending address (a satisfied §14
+    /// recoverable fault clears it via `take_fault`, so no stale value survives). Non-clearing, so it
+    /// does not disturb the §14 pager. `None` when no address was recorded — e.g. a pure out-of-window
+    /// fault (address unknown, honest).
+    pub(crate) fn peek_fault_rel(&self) -> Option<u64> {
+        let raw = match self.fault_report.load(Ordering::Relaxed) {
+            NO_FAULT => self.last_fault.load(Ordering::Relaxed),
+            reported => reported,
+        };
+        match raw {
+            NO_FAULT => None,
+            base => Some(base.wrapping_sub(self.window.base())),
         }
     }
 
