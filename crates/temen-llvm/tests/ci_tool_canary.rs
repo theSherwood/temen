@@ -44,8 +44,6 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
         ("llvm-as", &["--version"]),
         ("llvm-link", &["--version"]),
         ("opt", &["--version"]),
-        ("llvm-objcopy", &["--version"]),
-        ("ar", &["--version"]),
         ("rustc", &["--version"]),
     ];
     let missing: Vec<&str> = tools
@@ -58,6 +56,21 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
         "CI runner is missing {missing:?} — the temen-llvm tests that need these would silently \
          auto-skip, so this lane would be green while testing nothing. Fix the CI setup step \
          (ci.yml `temen-llvm` job: `scripts/ci/install-llvm.sh` + PATH) — do not delete this canary."
+    );
+    // The Rust probes build std from source (`-Z build-std`), which needs the `rust-src` component on
+    // the default toolchain — without it every `peval_*`/`w5_leng_*` test auto-skips.
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        std::path::Path::new(&sysroot)
+            .join("lib/rustlib/src/rust/library/std/Cargo.toml")
+            .exists(),
+        "the default toolchain has no `rust-src` component (sysroot {sysroot}) — the build-std probes \
+         would auto-skip. Add `rust-src` to the ci.yml `temen-llvm` job's stable toolchain components."
     );
     // The peval probes feed the default `rustc`'s IR to `llvm-link`/`opt`, which only ingest IR of
     // their own LLVM version or older — so the pinned LLVM major must equal the stable rustc's.

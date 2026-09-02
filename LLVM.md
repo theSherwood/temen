@@ -130,9 +130,13 @@ while CI's LLVM-21 lane ran without `-g`; (2) `llvm.fake.use` at `-Og`; (3) the 
 everywhere else, fanned out at call sites and bound as a two-result return) — the Temen-side ABI is
 unchanged; (5) LLVM ≥21's loop-idiom pass synthesizes `wcslen` from a `while (s[i]) i++` over
 `wchar_t` (the Postgres `libc_shim` now defines it); (6) rustc ≥1.83 moved `Vec` growth into a
-non-generic `RawVecInner::grow_one` inside precompiled `liballoc`, so the `peval_*` probes link the
-sysroot rlib's embedded bitcode (`ar x` + `llvm-objcopy --dump-section .llvmbc`) beside the
-`--emit=llvm-ir` output.
+non-generic `RawVecInner::grow_one` inside precompiled `liballoc` (and the closure creeps on:
+`String::from_utf8_lossy` → `libcore`'s `Utf8Chunks` → hashbrown → std), real code `--emit=llvm-ir`
+never sees and no stub can stand in for — so **every Rust probe now builds std from source**
+(`-Z build-std`, `panic_immediate_abort`; the one builder `tests/common::build_fixture_bc`, std built
+once into a shared target dir), which needs `rust-src` on the stable toolchain (the CI `temen-llvm`
+job installs it; `ci_tool_canary` checks). Linking the sysroot rlibs' embedded bitcode instead was
+tried and rejected: it is `panic=unwind` code, and the reachable set keeps growing crate by crate.
 
 *History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
 `llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual

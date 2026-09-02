@@ -42,7 +42,7 @@ fn native_checksum() -> i32 {
 
 #[test]
 fn real_temen_leng_translator_runs_on_temen() {
-    let Some(ll) = common::build_fixture_bc_std("leng_probe") else {
+    let Some(ll) = common::build_fixture_bc("leng_probe") else {
         return; // build-std toolchain absent — helper already logged the skip
     };
 
