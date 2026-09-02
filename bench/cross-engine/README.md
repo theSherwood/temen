@@ -1,6 +1,6 @@
 # Cross-engine micro-benchmarks
 
-Compares the Temen backends against native, WebAssembly, JavaScript, and Python on the same compute
+Compares the Temen backends against native, WebAssembly, JavaScript, Python, and Lua on the same compute
 kernels, to place the bytecode engine and JIT on an absolute scale. **One C source** (`kernels.c`)
 feeds every engine — including the Temen ones, which run IR produced by the **real LLVM frontend**
 (`clang -emit-llvm` → `temen-llvm`), not hand-written IR.
@@ -18,6 +18,7 @@ feeds every engine — including the Temen ones, which run IR produced by the **
 | `temen-wasmjit` | the same IR **JIT-compiled to wasm** (the `temen-wasmjit` emitter, `BROWSER.md` § "wasm-JIT tier") and run on Node/V8 — beside `temen-bytecode-wasm` it is JIT-in-wasm vs interpreter-in-wasm on identical IR. Now covers **every** kernel — integer, scalar-float, `call_indirect`, and SIMD (`vadd`). (The last two lit up once `v128` moved in-subset: this bench bundles every kernel into one module, and `call_indirect` requires the *whole* module in-subset, which the SIMD `vadd` kernel used to break.) `result@small` is cross-checked against native bytecode (a mismatch is a loud `MISCOMPILE`). Driven by `browser/bench_jit.mjs` (optional: needs `node` + the cdylib) |
 | `temen-tree-walk` | this repo's tree-walking oracle (`temen_interp::run`), on LLVM-frontend IR |
 | `python` | CPython 3 |
+| `lua` | PUC Lua 5.4 (`bench.lua`, needs `lua` 5.3+ on PATH — 64-bit integers + native bitops; skipped with a note otherwise) |
 | `wasm32/64(wasmtime)` | the same wasm on Wasmtime (Cranelift, like `temen-jit`) — in-process via `wasmtime-rs/`, or via the `wasmtime` CLI with `wasmtime_bench.py` |
 | `wasm32/64(pulley)` | the same wasm on Wasmtime's **Pulley** portable bytecode *interpreter* (`target("pulley64")`) — the interpreter-tier baseline for `temen-bytecode`, in-process via `wasmtime-rs/` |
 
@@ -126,10 +127,12 @@ microseconds so its `cold` stays ~pure compile.
 The cross-engine table places the *JIT* (`temen-jit`) next to native/V8/Wasmtime-Cranelift. To place the
 *interpreters* (`temen-bytecode`, `temen-tree-walk`) on an absolute scale, the table includes two
 interpreter baselines that execute the **same compiled bytecode** of the same C — **Pulley**
-(Wasmtime's production portable bytecode interpreter, added via `wasmtime-rs/`) and CPython (`python`,
-though that interprets a Python *transliteration*, not the same compiled IR). Pulley is the fair
-apples-to-apples reference: a mature switch/tail-call bytecode loop, same input, same in-process
-methodology.
+(Wasmtime's production portable bytecode interpreter, added via `wasmtime-rs/`) — plus two scripting-language
+interpreters, CPython (`python`) and PUC Lua 5.4 (`lua`), though those interpret a *transliteration* of the
+kernels, not the same compiled IR. Pulley is the fair apples-to-apples reference: a mature switch/tail-call
+bytecode loop, same input, same in-process methodology. Lua is the classic "good bytecode interpreter" bar
+(a register VM with unboxed integers, no per-op accounting), so it is the natural yardstick for where
+`temen-bytecode` *should* land.
 
 Indicative shape (per-iter ns; absolute numbers machine-dependent):
 
@@ -146,6 +149,14 @@ still **~3–9× behind Pulley** — real headroom in the bytecode dispatch loop
 dispatch overhead), not an algorithmic gap. Both Temen interpreters are the same order of magnitude as a
 production wasm interpreter, and both are ~20–50× off the JIT (cf. the steady-state table) — which is
 why the JIT exists and why the break-even analysis above matters for tier selection.
+
+Scripting-interpreter placement (`lua` ÷ `python` per-iter, one box, so the ratio travels): Lua runs
+**~3.5× faster than CPython** on `alu`, ~7× on `xorshift`, ~3× on `call`, ~5× on `chase`/`fnv` — with
+`chase_rand` the exception (~2×, both bottlenecked on cache misses through a 16-byte-per-element table).
+Since `temen-bytecode` is CPython-class on scalar kernels (see `INTERP_PERF.md`), that puts it roughly
+**2–4× behind PUC Lua** on scalar loops (calls are the wide end) and further behind on the memory path — the Phase-5 headroom
+in `INTERP_PERF.md`, restated against a familiar reference. (Lua's `chase_rand` table is 16 B/element
+vs the C kernel's 4 B, so its footprint is 4× larger; same caveat as `python`.)
 
 ## TEMEN-in-wasm — the interpreter inside the wasm sandbox
 
@@ -395,7 +406,8 @@ bench/cross-engine/run.sh        # prints engine,kernel,ns_per_iter CSV
 
 Needs `clang`, `node`, `python3`; the Temen rows additionally need the **LLVM-18 CLI tools**
 (`llvm-dis`, for `temen-llvm`'s textual reader — no libLLVM is linked), and `run.sh` skips them with a
-note if they're absent. (`crates/temen/examples/megabench.rs` is a separate hand-written-IR variant
+note if they're absent. The `lua` row needs `lua` 5.3+ (`lua5.4` on Debian; or `LUA=/path/to/lua`) and
+is likewise skipped with a note. (`crates/temen/examples/megabench.rs` is a separate hand-written-IR variant
 that needs no LLVM toolchain at all, with its own simpler kernels — not part of this table.)
 
 To also compare against **Wasmtime** (Cranelift JIT, like `temen-jit`) and **Pulley** (its bytecode
