@@ -208,6 +208,13 @@ pub trait Debuggee {
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue>;
     fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64>;
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap>;
+    /// The faulting guest address of the run's last `MemoryFault`, window-relative (a NULL deref →
+    /// `0`); `None` if unknown or the last termination was not an address-recording memory fault.
+    /// Read by `stop_events` to attach `faultAddr` to the `exited` event (#1190). Default `None` for
+    /// engines that don't track it.
+    fn fault_addr(&self) -> Option<u64> {
+        None
+    }
 
     // --- threads / time coordinate ---------------------------------------------------------------
     fn threads(&self) -> Vec<u64>;
@@ -352,6 +359,9 @@ impl Debuggee for Inspector {
     }
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
         Inspector::read_window(self, addr, len)
+    }
+    fn fault_addr(&self) -> Option<u64> {
+        Inspector::fault_addr(self)
     }
     fn threads(&self) -> Vec<u64> {
         Inspector::threads(self)
@@ -1133,6 +1143,12 @@ impl Debuggee for BytecodeBackend {
         match &self.engine {
             Engine::Single(run) => run.read_window(addr, len),
             Engine::Threaded(run) => run.read_window(addr, len),
+        }
+    }
+    fn fault_addr(&self) -> Option<u64> {
+        match &self.engine {
+            Engine::Single(run) => run.fault_addr(),
+            Engine::Threaded(run) => run.fault_addr(),
         }
     }
     fn threads(&self) -> Vec<u64> {
