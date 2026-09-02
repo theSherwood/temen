@@ -347,12 +347,12 @@ try {
   const kb = (readFileSync(built).length / 1024).toFixed(0);
   console.log(`  ✓ chibicc.temen (${kb} KB)`);
 } catch (e) {
-  console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm-18?)`);
+  console.log(`  – chibicc skipped (${e.message} — offline, or no clang/llvm?)`);
 }
 
 // temen-leng — the in-browser leng→TEMEN-IR self-host card (NIM.md §3e): the real `temen-leng` translator,
 // compiled to a verified Temen module through the LLVM on-ramp, run over a real hexer Leng file. Unlike
-// chibicc it needs the `-Z build-std`/`llvm-18` toolchain to rebuild, so — like `shell.temen` — its
+// chibicc it needs the `-Z build-std`/`llvm` toolchain to rebuild, so — like `shell.temen` — its
 // bytes are the committed in-tree asset (`crates/temen-run/demos/leng_selfhost/temen-leng.temen`, kept in
 // sync with `temen-leng` by that demo's own code-coupling gate). Copy it in (offline-safe); rebuild with
 // `bash crates/temen-run/demos/leng_selfhost/build_leng_temen.sh` when `temen-leng`/the encoder changes.

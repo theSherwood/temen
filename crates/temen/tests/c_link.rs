@@ -1139,17 +1139,8 @@ fn chibicc_ref() -> &'static Path {
         let src = repo_root().join("frontend/chibicc");
         let here = selfhost_dir();
         let out = std::env::temp_dir().join(format!("temen_chibicc_ref_{}", std::process::id()));
-        // Prefer clang-18 (the pinned version the on-ramp uses), else whatever `clang` is on PATH.
-        let clang = if Command::new("clang-18")
-            .arg("--version")
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            "clang-18"
-        } else {
-            "clang"
-        };
-        let mut cmd = Command::new(clang);
+        // Whatever `clang` is on PATH (CI puts the pinned LLVM's bin dir first).
+        let mut cmd = Command::new("clang");
         cmd.args(["-O2", "-mlong-double-64", "-Wno-switch"])
             .arg(format!("-I{}", src.display()));
         for t in [

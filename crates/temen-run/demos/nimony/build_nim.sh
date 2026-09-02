@@ -5,7 +5,7 @@
 # exercises the actual Nim runtime (ARC ref objects, seqs) that nimony shares, standing in for
 # nimony's Leng->C output until a nimony bootstrap is available (NIM.md §2 status).
 #
-#   needs: nim (2.x), clang-18/llvm-link-18/llvm-nm-18, cargo. Fail-soft SKIP if nim is absent
+#   needs: nim (2.x), clang/llvm-link/llvm-nm, cargo. Fail-soft SKIP if nim is absent
 #          (the toolchain-absent pattern — CI without a Nim install skips, doesn't fail).
 #
 # Key Nim flags (measured, NIM.md §2):
@@ -18,9 +18,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 CACHE="${TEMEN_NIM_CACHE:-/tmp/temen_nim_cache}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
-NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
+NM="${LLVM_NM:-llvm-nm}"
 SRC="$HERE/list_seq.nim"
 mkdir -p "$CACHE"
 

@@ -10,15 +10,15 @@
 # the compiler itself before the libc lands (step 3 replaces the stubs with the self-host
 # libc + personality imports and drops --stub-externs).
 #
-#   needs: clang-18 (or clang ≥18), llvm-link, llvm-dis, cargo
+#   needs: clang, llvm-link, llvm-dis, cargo
 #   env:   TEMEN_CHIBICC_CACHE (default /tmp/temen_chibicc_cache)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 SRC="$REPO/frontend/chibicc"
 CACHE="${TEMEN_CHIBICC_CACHE:-/tmp/temen_chibicc_cache}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
 mkdir -p "$CACHE"
 
 # The cc1-path TU set ONLY (Appendix A.3): no main.c (driver — its glob/fork/execvp externs
@@ -60,7 +60,7 @@ echo "=== [2a/4] stub audit — every undefined symbol must be expected libc ===
 # excluded codegen.c but called 15× for struct layout — a runtime time bomb the verify gate
 # can't see). Allowlist = Appendix A's libc fill-set (step 3 provides these); anything else
 # undefined is a build bug: fail loudly.
-NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
+NM="${LLVM_NM:-llvm-nm}"
 "$NM" --undefined-only "$CACHE/chibicc.linked.bc" | awk '{print $2}' | sort -u \
   > "$CACHE/undefined.txt"
 # With the guest libc linked in, the ONLY undefined symbols left should be names the on-ramp itself

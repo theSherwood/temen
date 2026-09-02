@@ -4,7 +4,7 @@
 # authentic pipeline (nifler -> nimony -> hexer -> Leng -> lengc c), distinct from build_nim.sh
 # (which uses the *stock* Nim compiler as a stand-in).
 #
-#   needs: a bootstrapped nimony toolchain (bin/nimony), clang-18/llvm-*-18, cargo. Fail-soft SKIP
+#   needs: a bootstrapped nimony toolchain (bin/nimony), clang/llvm-*, cargo. Fail-soft SKIP
 #          if nimony is absent — it is NOT in CI (bootstrap needs Nim 2.3.x devel; see NIM.md §2).
 #
 # Point NIMONY_BIN at the nimony binary (or put it on PATH):
@@ -21,9 +21,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 CACHE="${TEMEN_NIMONY_CACHE:-/tmp/temen_nimony_demo}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
-NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
+NM="${LLVM_NM:-llvm-nm}"
 SRC="$HERE/sum_sq_nimony.nim"
 SHIM="$HERE/nimony_runtime_shim.c"
 mkdir -p "$CACHE"

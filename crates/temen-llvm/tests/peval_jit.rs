@@ -11,7 +11,7 @@
 //! it to the guest as `argv[1]`, runs it under `run_powerbox` (which grants the `Jit` cap), and asserts
 //! the guest reports `0` mismatches against its own oracle.
 //!
-//! Auto-skips when the toolchain (`rustc +1.81.0`, `llvm-link-18`, `opt-18`) is unavailable.
+//! Auto-skips when the toolchain (`rustc`, `llvm-link`, `opt`) is unavailable.
 
 mod common;
 

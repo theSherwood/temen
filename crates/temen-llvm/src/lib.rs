@@ -5185,7 +5185,8 @@ fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>, Vec<String>) {
                                 }
                             }
                         }
-                        Some("llvm.eh.typeid.for") => {
+                        // LLVM ≥19 spells the intrinsic overloaded (`llvm.eh.typeid.for.p0`).
+                        Some("llvm.eh.typeid.for" | "llvm.eh.typeid.for.p0") => {
                             uses = true;
                             if let Some((op, _)) = c.arguments.first() {
                                 intern(op, &mut ids);
@@ -15623,6 +15624,10 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
             || s.starts_with("llvm.experimental.noalias.scope.decl")
+            // `llvm.fake.use` (LLVM ≥20, `-Og`/`-fextend-variable-liveness`): keeps a source variable's
+            // value alive to the end of its scope so a debugger can still read it. A pure liveness
+            // marker, like `llvm.lifetime.*` — no runtime effect, so it lowers to nothing.
+            || s.starts_with("llvm.fake.use")
             // `core::hint::spin_loop()` → the x86 `pause` hint, emitted by the threaded-`std` futex
             // spin loops (Mutex/RwLock/Once). It is a CPU backoff hint with no architectural effect,
             // so dropping it is semantics-preserving (the cooperative scheduler makes progress the
@@ -15951,7 +15956,8 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             });
             Ok(true)
         }
-        "llvm.eh.typeid.for" => {
+        // LLVM ≥19 spells the intrinsic overloaded on the pointer type (`llvm.eh.typeid.for.p0`).
+        "llvm.eh.typeid.for" | "llvm.eh.typeid.for.p0" => {
             // Subtype-aware selector match (the Itanium personality's `__do_catch`). clang compares the
             // landing-pad selector — the *thrown* type's id — against this value with `icmp eq` to pick
             // a catch clause. Return the live selector when the thrown type *is-a* the clause type (so

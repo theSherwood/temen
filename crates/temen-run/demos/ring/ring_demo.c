@@ -124,7 +124,10 @@ int main(void) {
   memcpy(rb, base + at, (unsigned long)slen);
   rb[slen] = 0;
   char head[8];
-  memcpy(head, base, 7);
+  /* Read the aliased head through `volatile`: the C abstract machine can't see that `base[0..7)` is
+   * the same physical memory as `base[CAP..CAP+7)`, so an optimizer (clang ≥21) would otherwise forward
+   * the `memset` zeros here and never load what the straddling write left at offset 0. */
+  for (int j = 0; j < 7; j++) head[j] = ((volatile char *)base)[j];
   head[7] = 0;
   printf("wrap-read: %s\n", rb);   /* "WRAPWRAPWRAP" — the full straddling span, contiguous */
   printf("wrap-alias: %s\n", head); /* "RAPWRAP" — the overflow, aliased to offset 0 */

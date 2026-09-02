@@ -65,7 +65,7 @@ const MAY_BE_ABSENT = new Set([
   'tcl_snapshot.temen', // build fetches Tcl (SourceForge) + openlibm (GitHub) + needs clang/llvm-link — the warm Tcl card degrades to a hint if absent
   'chibicc_selfhost.img', // build-selfhost-assets.mjs needs a native chibicc + the glibc header tree
   // The bash card degrades to a build hint when its module is absent: bash.temen needs the
-  // ftp.gnu.org fetch + clang/llvm-18 (GPLv3 — can never ship committed). The bin_*.temen coreutils
+  // ftp.gnu.org fetch + clang/llvm (GPLv3 — can never ship committed). The bin_*.temen coreutils
   // ride the same build script (a copy of committed fixtures, so they only miss when the script
   // didn't run at all — the same absence).
   'bash.temen',

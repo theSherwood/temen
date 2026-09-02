@@ -1,9 +1,9 @@
 # The `temen-leng.temen` guest (NIM.md §3e / W5 capstone): the `temen-leng` translator wrapped as a
 # powerbox program — read a Leng-NIF module from stdin, translate it, write the Temen text to stdout.
-# Built through the LLVM on-ramp (`-Z build-std` → `llvm-link-18` → `temen-llvm-translate --binary` →
+# Built through the LLVM on-ramp (`-Z build-std` → `llvm-link` → `temen-llvm-translate --binary` →
 # `prep_temen`, all in `build_leng_temen.sh`) into the committed `temen-leng.temen` asset. Not part of the
 # escape-TCB: everything it emits is re-verified by temen-verify (DESIGN.md §2a). Its own `[workspace]`
-# keeps it out of the root workspace (it builds under a pinned `rustc +1.81` with `build-std`).
+# keeps it out of the root workspace (it builds under `rustc` with `build-std` (`RUSTC_BOOTSTRAP=1`)).
 [package]
 name = "leng-guest"
 version = "0.0.0"

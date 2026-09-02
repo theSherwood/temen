@@ -12,7 +12,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 SRC="$REPO/frontend/chibicc"
 CACHE="${TEMEN_CHIBICC_CACHE:-/tmp/temen_chibicc_cache}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
+CLANG="${CLANG:-clang}"
 TEMEN="$CACHE/chibicc.temen"
 [ -f "$TEMEN" ] || { echo "missing $TEMEN — run build_chibicc_temen.sh first"; exit 1; }
 

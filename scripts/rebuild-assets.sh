@@ -21,8 +21,8 @@
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
 #   Steps:  leng chibicc onramp shell nifler nim_hello nim_phases lua_snapshot
 #
-# Toolchains, per step: leng needs rustc +1.81 (+rust-src) & llvm-18; chibicc/onramp need clang-18 &
-# llvm-link-18 (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
+# Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
+# llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
 # in-tree chibicc; nifler & nim_hello need the nimony toolchain (Nim + nimony/bin) — see NIM.md §2.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -88,7 +88,7 @@ if want leng; then
       && note "leng ✓ (temen-leng.temen; browser copy is refreshed by onramp)" \
       || note "leng ✗ (rebuilt but failed re-validate)"
   else
-    note "leng SKIP/✗ (see output above — rustc +1.81 + rust-src + llvm-18?)"
+    note "leng SKIP/✗ (see output above — rustc + rust-src + llvm?)"
   fi
 fi
 
@@ -101,7 +101,7 @@ if want chibicc; then
     validate browser/web/assets/chibicc.temen \
       && note "chibicc ✓" || note "chibicc ✗ (rebuilt but failed re-validate)"
   else
-    note "chibicc SKIP/✗ (clang-18 / llvm-link-18?)"
+    note "chibicc SKIP/✗ (clang / llvm-link?)"
   fi
 fi
 
@@ -132,7 +132,7 @@ if want nifler; then
       note "nifler SKIP (toolchain absent — script SKIPs without rebuilding)"
     fi
   else
-    note "nifler ✗ (nim + nimony/bin/nifler + clang-18/llvm-nm-18?)"
+    note "nifler ✗ (nim + nimony/bin/nifler + clang/llvm-nm?)"
   fi
 fi
 
@@ -167,7 +167,7 @@ if want nim_phases; then
     [ "$ok" = 1 ] && note "nim_phases ✓ (nimsem.temen.gz + hexer.temen.gz)" \
                   || note "nim_phases ✗ (a phase guest missing/failed re-validate)"
   else
-    note "nim_phases SKIP/✗ (nimony toolchain — nim + nimony/bin/{nimony,hexer} + clang-18/llvm-nm-18?)"
+    note "nim_phases SKIP/✗ (nimony toolchain — nim + nimony/bin/{nimony,hexer} + clang/llvm-nm?)"
   fi
 fi
 

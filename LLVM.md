@@ -110,12 +110,20 @@ argument. (Critical edges get split first — standard.)
   with a differential harness running the existing C demos through *stock LLVM* and
   matching native `clang`.
 
-### Toolchain present in the dev container (confirmed)
-- `clang` 18.1.3, `llvm-config` 18.1.3 (`/usr/lib/llvm-18/lib`).
-- `libLLVM.so.18.1` present (plus 17/20/21 — we **pin 18**, the `clang` default here).
+### Toolchain pin
+The pinned LLVM lives in **one place, `scripts/ci/install-llvm.sh`** (`LLVM_MAJOR`, currently
+**22**), which every CI job runs to get `clang`/`llvm-dis`/`llvm-link`/`opt` from apt.llvm.org and
+puts first on `PATH`; the rest of the tree uses **unversioned** tool names. The pin is chosen to
+**equal the stable rustc's LLVM major** (`rustc -vV`; `RUST_STABLE` in ci.yml — 1.97 = LLVM 22), so
+the `peval_*` probes can feed default-`rustc` IR straight to `llvm-link`/`opt` (which only ingest IR
+of their own version or older) with no second rustc toolchain; `ci_tool_canary` asserts the two
+majors agree. Bump both together when rustc moves. The reader itself is version-tolerant (§8 Q1a):
+it takes textual IR from any recent LLVM, including the LLVM ≥19 `#dbg_*` debug records and the
+LLVM ≥20 `llvm.fake.use` liveness marker.
 
-So the pinned baseline is **LLVM 18**. (Re-pin deliberately, never drift; a bitcode
-produced by a different major version is rejected, not best-effort parsed.)
+*History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
+`llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual
+reader removed that coupling; the remaining pin is the rustc↔`llvm-link` pairing above.
 
 ---
 

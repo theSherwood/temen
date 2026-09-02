@@ -1,6 +1,6 @@
 //! Shared harness for the `peval_*` on-ramp tests (`peval_in_sandbox.rs`, `peval_jit.rs`,
-//! `peval_futamura.rs`). Each runs the manual probe — `rustc +1.81 --emit=llvm-ir` → `llvm-link-18 -S`
-//! → `opt-18 -S internalize,globaldce` → translate → verify → run — on an in-repo fixture crate under
+//! `peval_futamura.rs`). Each runs the manual probe — `rustc --emit=llvm-ir` → `llvm-link -S`
+//! → `opt -S internalize,globaldce` → translate → verify → run — on an in-repo fixture crate under
 //! `tests/fixtures/<name>`. The build half is identical across them, so it lives here.
 //!
 //! As a `tests/common/mod.rs` submodule it is **not** compiled as its own test binary; each test does
@@ -22,21 +22,23 @@ fn tool_ok(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// True when the on-ramp toolchain (`rustc +1.81.0`, `llvm-link-18`, `opt-18`) is available.
+/// True when the on-ramp toolchain (`rustc`, `llvm-link`, `opt`) is available. The default `rustc`'s
+/// LLVM must not be newer than `llvm-link`/`opt` (they ingest IR of their own version or older) — CI
+/// pins the two majors equal (`scripts/ci/install-llvm.sh`, checked by `ci_tool_canary`).
 pub fn toolchain_present() -> bool {
-    tool_ok("rustc", &["+1.81.0", "--version"])
-        && tool_ok("llvm-link-18", &["--version"])
-        && tool_ok("opt-18", &["--version"])
+    tool_ok("rustc", &["--version"])
+        && tool_ok("llvm-link", &["--version"])
+        && tool_ok("opt", &["--version"])
 }
 
 /// [`toolchain_present`] plus the `rust-src` component `-Z build-std` needs to compile std from
-/// source (the standard library `Cargo.toml` under the 1.81 sysroot). Gates [`build_fixture_bc_std`].
+/// source (the standard library `Cargo.toml` under the toolchain's sysroot). Gates [`build_fixture_bc_std`].
 pub fn build_std_toolchain_present() -> bool {
     if !toolchain_present() {
         return false;
     }
     let Some(sysroot) = Command::new("rustc")
-        .args(["+1.81.0", "--print", "sysroot"])
+        .args(["--print", "sysroot"])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -54,14 +56,14 @@ pub fn build_std_toolchain_present() -> bool {
 /// or no IR is emitted.
 ///
 /// Mirrors the manual probe exactly: emit per-crate textual IR for the whole dependency closure
-/// (`RUSTFLAGS=--emit=llvm-ir cargo +1.81.0 build --release`), `llvm-link-18 -S` them, then
-/// `opt-18 internalize,globaldce` down to the closure reachable from the powerbox `main`/`malloc`/
+/// (`RUSTFLAGS=--emit=llvm-ir cargo build --release`), `llvm-link -S` them, then
+/// `opt internalize,globaldce` down to the closure reachable from the powerbox `main`/`malloc`/
 /// `free`. Building the fixture as a `lib` means no final executable link, so cargo exits cleanly even
 /// though `malloc`/`free`/`write`/`__vm_jit_*` are undefined (the on-ramp synthesizes/lowers them); we
 /// still tolerate a non-zero status and check for the `.bc`.
 pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
     if !toolchain_present() {
-        eprintln!("note: skipping {fixture} (need `rustc +1.81.0`, `llvm-link-18`, `opt-18`)");
+        eprintln!("note: skipping {fixture} (need `rustc`, `llvm-link`, `opt`)");
         return None;
     }
 
@@ -77,7 +79,7 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
         .current_dir(&fixture_dir)
         .env("RUSTFLAGS", "--emit=llvm-ir")
         .env("CARGO_TARGET_DIR", &target)
-        .args(["+1.81.0", "build", "--release", "--ignore-rust-version"])
+        .args(["build", "--release", "--ignore-rust-version"])
         .status()
         .unwrap_or_else(|e| panic!("run cargo build for the {fixture} fixture: {e}"));
     if !status.success() {
@@ -100,20 +102,20 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
     // reader (`translate_ll_path`) rather than the `llvm-dis` bitcode shim.
     let linked = work.join("linked.ll");
     assert!(
-        Command::new("llvm-link-18")
+        Command::new("llvm-link")
             .arg("-S")
             .args(&lls)
             .arg("-o")
             .arg(&linked)
             .status()
-            .expect("run llvm-link-18")
+            .expect("run llvm-link")
             .success(),
-        "llvm-link-18 failed"
+        "llvm-link failed"
     );
 
     let legalized = work.join("legalized.ll");
     assert!(
-        Command::new("opt-18")
+        Command::new("opt")
             .args([
                 "-S",
                 "-passes=internalize,globaldce",
@@ -123,9 +125,9 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
             .arg("-o")
             .arg(&legalized)
             .status()
-            .expect("run opt-18")
+            .expect("run opt")
             .success(),
-        "opt-18 failed"
+        "opt failed"
     );
     Some(legalized)
 }
@@ -133,8 +135,8 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
 /// [`build_fixture_bc`], but with **`std` compiled from source** via `-Z build-std` (W5 §3e). The
 /// plain [`build_fixture_bc`] leaves libcore/liballoc symbols (`fmt`/`FromStr`/panic) *external* — fine
 /// for a translate-only test, but a real *run* would trap in a stub. This variant makes them real:
-/// `RUSTC_BOOTSTRAP=1` unlocks `-Z build-std` on **stable 1.81** (whose LLVM 18 matches the
-/// `llvm-*-18` tools), and `build-std-features=panic_immediate_abort` collapses every panic to a bare
+/// `RUSTC_BOOTSTRAP=1` unlocks `-Z build-std` on **stable** (whose LLVM major CI pins equal to the
+/// `llvm-*` tools'), and `build-std-features=panic_immediate_abort` collapses every panic to a bare
 /// `abort` so no float-formatting (`flt2dec`/dragon4) is pulled in for panic messages. The result links
 /// to a module whose only externals are the allocator + `bcmp` — all synthesized/recognized by the
 /// on-ramp — so `translate_to_text` runs to a correct result in the sandbox.
@@ -142,9 +144,7 @@ pub fn build_fixture_bc(fixture: &str) -> Option<PathBuf> {
 /// Returns `None` (skip) if the `-Z build-std` toolchain (incl. the `rust-src` component) is absent.
 pub fn build_fixture_bc_std(fixture: &str) -> Option<PathBuf> {
     if !build_std_toolchain_present() {
-        eprintln!(
-            "note: skipping {fixture} (need `rustc +1.81.0` + `rust-src`, `llvm-link-18`, `opt-18`)"
-        );
+        eprintln!("note: skipping {fixture} (need `rustc` + `rust-src`, `llvm-link`, `opt`)");
         return None;
     }
 
@@ -164,7 +164,6 @@ pub fn build_fixture_bc_std(fixture: &str) -> Option<PathBuf> {
         .env("CARGO_TARGET_DIR", &target)
         .env("RUSTC_BOOTSTRAP", "1")
         .args([
-            "+1.81.0",
             "build",
             "--release",
             "-Zbuild-std=std,panic_abort",
@@ -203,20 +202,20 @@ pub fn build_fixture_bc_std(fixture: &str) -> Option<PathBuf> {
 
     let linked = work.join("linked.ll");
     assert!(
-        Command::new("llvm-link-18")
+        Command::new("llvm-link")
             .arg("-S")
             .args(&lls)
             .arg("-o")
             .arg(&linked)
             .status()
-            .expect("run llvm-link-18")
+            .expect("run llvm-link")
             .success(),
-        "llvm-link-18 failed"
+        "llvm-link failed"
     );
 
     let legalized = work.join("legalized.ll");
     assert!(
-        Command::new("opt-18")
+        Command::new("opt")
             .args([
                 "-S",
                 "-passes=internalize,globaldce",
@@ -226,9 +225,9 @@ pub fn build_fixture_bc_std(fixture: &str) -> Option<PathBuf> {
             .arg("-o")
             .arg(&legalized)
             .status()
-            .expect("run opt-18")
+            .expect("run opt")
             .success(),
-        "opt-18 failed"
+        "opt failed"
     );
     Some(legalized)
 }

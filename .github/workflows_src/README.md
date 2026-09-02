@@ -16,6 +16,17 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **LLVM pin 18 → 22 via `scripts/ci/install-llvm.sh` (`ci.yml` + `pages.yml`)** — every
+  `install LLVM/clang 18` step (seven in `ci.yml`, one in `pages.yml`: the I67 apt-mirror cleanup +
+  `apt-get install llvm-18 clang-18 …` + `GITHUB_PATH`) is replaced by one line,
+  `run: bash scripts/ci/install-llvm.sh [extra apt packages]`; the script is the single place the
+  version lives (apt.llvm.org, since Ubuntu's archive stops at 18/19). The `temen-llvm` job's
+  `install Rust 1.81 (LLVM 18)` step is deleted — the peval probes now use the default stable rustc,
+  whose LLVM major (1.97 = 22) the pin matches (`ci_tool_canary` asserts it). The `rustbench` job's
+  `rustup toolchain install 1.81.0` + `rustup +1.81.0 target add wasm32-unknown-unknown` become
+  `rustup target add wasm32-unknown-unknown` on the stable toolchain. (Until copied over, the
+  `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
   one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
   drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module

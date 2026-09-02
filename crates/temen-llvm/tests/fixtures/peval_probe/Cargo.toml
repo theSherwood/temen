@@ -3,7 +3,7 @@
 # A `no_std`/`panic=abort` powerbox program that depends on `temen-peval` (`default-features = false`,
 # the in-temen build — no `libm`) and `temen-ir`, builds a small module, calls `temen_peval::specialize`,
 # and prints a summary of the residual. The `peval_in_sandbox.rs` test in the parent crate compiles
-# this to LLVM-18 bitcode (`rustc +1.81`), links + `globaldce`s the `specialize` closure, translates
+# this to LLVM bitcode (`rustc`), links + `globaldce`s the `specialize` closure, translates
 # it to temen-IR, and runs it on the reference interpreter — the manual probe, folded into a test.
 #
 # Its own `[workspace]` keeps it out of the repo's root workspace (which excludes `crates/temen-llvm`);

@@ -19,7 +19,7 @@
 //!            comparison (32-bit addressing + free 4 GiB guards), shown for context only.
 //!
 //! Toolchain: the **system default** `rustc` drives the native/temen/wasm32 lanes (set
-//! `TEMEN_RUSTBENCH_RUSTC` to pick another, e.g. `+1.81.0`); the wasm64 lane needs `+nightly` with the
+//! `TEMEN_RUSTBENCH_RUSTC` to pick another, e.g. `+nightly`); the wasm64 lane needs `+nightly` with the
 //! `rust-src` component. Add the `wasm32`/`wasm64` targets for the wasm lanes. Missing pieces just
 //! blank the column. Run from `bench/`:  cargo run --release --bin rustbench
 
@@ -30,10 +30,9 @@ use std::time::Instant;
 use wasmtime::{Config, Engine, Instance, Module, Store, Val};
 
 const REPS: u32 = 15;
-/// The rustc for the guest lanes. `TEMEN_RUSTBENCH_RUSTC` overrides the toolchain (e.g. `+1.81.0` to
-/// reproduce the old LLVM-18 build, or `+nightly`); the default is the **system default** toolchain.
-/// The temen-jit lane feeds *textual* LLVM IR to the version-tolerant on-ramp (I24), so it no longer
-/// needs an LLVM-18 rustc — any modern rustc works, the same one the native/wasm lanes use.
+/// The rustc for the guest lanes. `TEMEN_RUSTBENCH_RUSTC` overrides the toolchain (e.g. `+nightly`); the default is the **system default** toolchain.
+/// The temen-jit lane feeds *textual* LLVM IR to the version-tolerant on-ramp (I24), so any modern
+/// rustc works, the same one the native/wasm lanes use.
 fn rustc() -> Command {
     let mut c = Command::new("rustc");
     if let Ok(tc) = std::env::var("TEMEN_RUSTBENCH_RUSTC") {
@@ -148,7 +147,7 @@ fn native_lane(src: &Path, small: i64, large: i64) -> Option<(f64, i64)> {
 /// Emits **textual** LLVM IR and feeds it to the version-tolerant `.ll` reader
 /// ([`temen_llvm::translate_ll_path`]) — no `llvm-dis`, so **any** rustc works (I24): the on-ramp is no
 /// longer coupled to the producer's LLVM version, so this lane rides the same modern rustc as the
-/// native/wasm lanes instead of a pinned LLVM-18 toolchain.
+/// native/wasm lanes instead of a separately pinned toolchain.
 fn temenjit_runner(src: &Path, small: i64) -> Option<(impl FnMut(i64) -> i64, i64)> {
     let ll = tmp("temen.ll");
     let ok = rustc()

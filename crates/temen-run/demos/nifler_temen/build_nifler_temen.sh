@@ -4,13 +4,13 @@
 # file **byte-for-byte identically to native nifler**, across all three engines.
 #
 # This is the C-on-ramp path (NIM.md Phase 1) applied to a real compiler phase, not a user program:
-#   nifler.nim --(stock nim c, ARC)--> C --(clang-18)--> bitcode --(link nifler_shim.c)-->
+#   nifler.nim --(stock nim c, ARC)--> C --(clang)--> bitcode --(link nifler_shim.c)-->
 #   whole-program bitcode --(temen-llvm-translate --stub-externs)--> Temen --(prep_temen: verify)--> .temen
 # then run `nifler p in.nim out.nif` as a guest over an in-window `fs` memfs seeded with the source,
 # and diff the emitted `.nif` against native nifler on the same source.
 #
 #   needs: the nimony submodule (nimony/src/nifler), stock `nim` (2.3.x, for the C backend), the built
-#          `nifler` binary (the oracle — bin/nifler), clang-18/llvm-link-18/llvm-nm-18, cargo. Fail-soft
+#          `nifler` binary (the oracle — bin/nifler), clang/llvm-link/llvm-nm, cargo. Fail-soft
 #          SKIP if any is absent (nimony bootstrap needs Nim 2.3.x devel; NOT in the per-PR CI, NIM.md §2).
 #
 # The bottom edge (nifler_shim.c) reuses the shims that already run Postgres on Temen (../postgres/
@@ -20,9 +20,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 CACHE="${TEMEN_NIFLER_CACHE:-/tmp/temen_nifler_build}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
-NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
+NM="${LLVM_NM:-llvm-nm}"
 NIFLER_SRC="$REPO/nimony/src/nifler/nifler.nim"
 mkdir -p "$CACHE"
 

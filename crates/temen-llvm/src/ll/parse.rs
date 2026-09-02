@@ -1056,8 +1056,9 @@ impl Parser {
             self.cur_block_idx = blocks.len() as u32;
             self.cur_phi_ord = 0;
             let mut instrs = Vec::new();
-            // Instructions until a terminator.
+            // Instructions until a terminator; `#dbg_*` debug records sit between them (LLVM ≥19).
             loop {
+                while self.dbg_record()? {}
                 if self.at_terminator() {
                     break;
                 }
@@ -2526,6 +2527,50 @@ impl Parser {
             is_tail_call,
             debugloc: None,
         })
+    }
+
+    /// An LLVM ≥19 **debug record** — `#dbg_declare(ptr %a, !var, !DIExpression(), !loc)`,
+    /// `#dbg_value(<ty> <val>, !var, !expr, !loc)`, `#dbg_assign(<val>, !var, !expr, !id, <addr>,
+    /// !addrexpr, !loc)`, `#dbg_label(!label)` — the non-instruction statement form that replaced the
+    /// `llvm.dbg.*` intrinsic calls (LLVM 19 switched the printers over; 21 no longer emits the calls
+    /// at all). Captured into the same list as the calls (operand `[0]` = the located value, `[1]` =
+    /// the `!DILocalVariable`), so the §6 variable reader is version-blind. Returns `true` when a
+    /// record was consumed; an unknown `#dbg_*` kind is a parse error (fail-closed).
+    fn dbg_record(&mut self) -> PResult<bool> {
+        let declare = match self.peek() {
+            Some(Token::Word(w)) if w == "#dbg_declare" => Some(true),
+            Some(Token::Word(w)) if w == "#dbg_value" || w == "#dbg_assign" => Some(false),
+            Some(Token::Word(w)) if w == "#dbg_label" => None,
+            Some(Token::Word(w)) if w.starts_with("#dbg_") => {
+                return self.err(format!("unsupported debug record `{w}`"));
+            }
+            _ => return Ok(false),
+        };
+        self.pos += 1; // the `#dbg_*` word
+        self.expect(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !self.eat(&Token::RParen) {
+            loop {
+                args.push(self.metadata_operand_value()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+        }
+        if let (Some(declare), Some(MetaArg::Ref(var))) = (declare, args.get(1)) {
+            let value = match &args[0] {
+                MetaArg::Value(n) => Some(n.clone()),
+                _ => None,
+            };
+            self.dbg_intrinsics.push(DbgIntrinsic {
+                func: self.current_func.clone(),
+                declare,
+                value,
+                var: *var,
+            });
+        }
+        Ok(true)
     }
 
     /// If the just-parsed call is `@llvm.dbg.declare`/`@llvm.dbg.value`, record its captured operands

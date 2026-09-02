@@ -17,7 +17,7 @@
 //   env:  TEMEN_PG_CACHE (default /tmp/temen_pg_cache)   — the input cache (bitcode + cluster + native pg)
 //         TEMEN_PG_DATA   (default $TEMEN_PG_CACHE/pgdata) — the demo cluster the image is built from
 //         TEMEN_PG_VER    (default 17.5)                — Postgres version (passed to build_bitcode.sh)
-// Needs (only on a cold input cache): clang-18/llvm-18, flex, bison, perl, make, curl, and a NON-root
+// Needs (only on a cold input cache): clang/llvm, flex, bison, perl, make, curl, and a NON-root
 // user (initdb refuses root). The regenerate half needs only cargo + the workspace.
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';

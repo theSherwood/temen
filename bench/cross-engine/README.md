@@ -404,9 +404,9 @@ doubles as a whole-stack differential test on programs we didn't write.
 bench/cross-engine/run.sh        # prints engine,kernel,ns_per_iter CSV
 ```
 
-Needs `clang`, `node`, `python3`; the Temen rows additionally need the **LLVM-18 CLI tools**
-(`llvm-dis`, for `temen-llvm`'s textual reader — no libLLVM is linked), and `run.sh` skips them with a
-note if they're absent. The `lua` row needs `lua` 5.3+ (`lua5.4` on Debian; or `LUA=/path/to/lua`) and
+Needs `clang`, `node`, `python3`; the Temen rows additionally need `llvm-dis` (any recent LLVM — it
+disassembles the bitcode for `temen-llvm`'s version-tolerant textual reader; no libLLVM is linked), and
+`run.sh` skips them with a note if they're absent. The `lua` row needs `lua` 5.3+ (`lua5.4` on Debian; or `LUA=/path/to/lua`) and
 is likewise skipped with a note. (`crates/temen/examples/megabench.rs` is a separate hand-written-IR variant
 that needs no LLVM toolchain at all, with its own simpler kernels — not part of this table.)
 
