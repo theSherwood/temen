@@ -1,21 +1,21 @@
 //! #816 Slice C oracle (invariant 14, **durability axis**, cross-host leg): a durability-instrumented
 //! guest that **`vm_map`-grows** its window past its declared size, **freezes mid-run** at a clock
-//! unwind point, is serialized through the §12 SVMD codec, **restored on a fresh `Host`**, and
+//! unwind point, is serialized through the §12 snapshot codec, **restored on a fresh `Host`**, and
 //! **resumes to completion** — with the grown-page content surviving the whole freeze→serialize→
 //! restore→thaw cross-host round-trip.
 //!
 //! This is the native oracle for the browser "persist a warmed/grown guest across a reload"
 //! consumer (`browser/src/lib.rs` `temen_durable_freeze` / `temen_durable_thaw_resume`): the browser
-//! FFI drives exactly this sequence, storing the SVMD bytes in IndexedDB between the freeze and the
+//! FFI drives exactly this sequence, storing the snapshot bytes in IndexedDB between the freeze and the
 //! thaw. The codec-only round-trip is already pinned by `durable_prot_capture.rs`
 //! (`a_vm_map_grown_window_survives_the_codec`); what this adds is the *running* two-phase shape —
-//! freeze-at-unwind → SVMD → restore → **resume** — of a grown guest, the behavior the reload
+//! freeze-at-unwind → snapshot → restore → **resume** — of a grown guest, the behavior the reload
 //! consumer depends on and which nothing exercised before.
 //!
 //! Freeze point: the guest self-flips the state word to `UNWINDING` just before the **clock** call
 //! (the `multipoint.rs` idiom), so the grow + marker store complete first and the unwind lands at the
 //! clock. The grow (`vm_map`) is an earlier resume point, so on thaw the growth is **not** re-issued —
-//! the grown pages can only be present because they rode the SVMD artifact. Handle continuity across
+//! the grown pages can only be present because they rode the snapshot artifact. Handle continuity across
 //! the codec mirrors `durable_nesting.rs`: the restored caps are recovered from the thawed handle
 //! table, never re-granted.
 
@@ -56,7 +56,7 @@ fn to_codec_prots(caps: &[CapturedProt]) -> Vec<PageProt> {
 // window into the reserved tail, writes a marker into a grown page, reads the clock (the durable
 // unwind point), then reloads the marker *after* the call and returns clock + marker. Baseline
 // (clock 42): 42 + 77 = 119. The reloaded marker lives in a grown page, so it can only survive a
-// freeze/thaw if the grown extent rides the SVMD artifact. `flip` inserts the self-requested freeze
+// freeze/thaw if the grown extent rides the snapshot artifact. `flip` inserts the self-requested freeze
 // (store UNWINDING into the state word) just before the clock — the mid-run trigger.
 fn guest_src(flip: bool) -> String {
     let flip_ir = if flip {
@@ -201,7 +201,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
         "grown page captured Rw"
     );
 
-    // Serialize the frozen (grown) domain through the §12 SVMD codec at its real reservation, then
+    // Serialize the frozen (grown) domain through the §12 snapshot codec at its real reservation, then
     // restore it on a FRESH host — the cross-host boundary the browser crosses via IndexedDB.
     let art = freeze_with_prots(
         &freezable,
@@ -210,7 +210,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
         RESERVED_LOG2,
         &fhost,
     )
-    .expect("freeze grown durable domain to SVMD");
+    .expect("freeze grown durable domain to snapshot");
     let mut thost = Host::new();
     thost.set_durable(true);
     let (rwin, rprots, rreserved) =
@@ -242,7 +242,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     // captured page map via `seed_pages`. The clock result (42) is REPLAYED (THAW_CLOCK would surface
     // if it were re-issued), the grown-page marker is reloaded, and the guest runs to completion with
     // the same result as the uninterrupted baseline. `vm_map` (an earlier resume point) is NOT
-    // re-issued, so the grown pages are present only because they rode the SVMD artifact.
+    // re-issued, so the grown pages are present only because they rode the snapshot artifact.
     let prog = bytecode::SharedProgram::compile(&freezable).expect("compile for resume");
     let mut rwin = rwin;
     begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING

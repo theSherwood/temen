@@ -1,5 +1,5 @@
 //! **Build a demo data image.** Walk a host directory (e.g. a natively-`initdb`'d, cleanly-shut-down
-//! Postgres cluster) into a single self-contained `SVMFSIM1` blob — the shippable filesystem image a
+//! Postgres cluster) into a single self-contained fs-image blob (TEMEN wire header, `kind` = fs-image) — the shippable filesystem image a
 //! demo mounts on the `fs` cap with no host filesystem (`temen_run::fs::mem_fs_from_archive`). This is
 //! the data half of the browser demo's artifacts (the code half is the resolved `.temen`; see
 //! `BOOTSPEED.md`).

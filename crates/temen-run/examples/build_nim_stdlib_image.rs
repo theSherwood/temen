@@ -1,5 +1,5 @@
 //! **Build the nimony stdlib image for the in-browser compiler card (#958).** Walk the nimony `lib/`
-//! tree into a single `SVMFSIM1` blob with the exact key layout `nimc::compile_nim` mounts: every file
+//! tree into a single fs-image blob (TEMEN wire header, `kind` = fs-image) with the exact key layout `nimc::compile_nim` mounts: every file
 //! keyed `lib/<rel>`, and every `std/…` file *also* keyed flattened `lib/<rel-minus-std/>` — the same
 //! two-view seed the headless `nim_selfdrive` driver and the `nimc` `io_hello` test build (nimony
 //! resolves `std/syncio` and bare `syncio` alike, and its search path is `lib/`). `build_image` can't

@@ -99,7 +99,7 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   read-only *directory* open so Postgres can `fsync` dirs at checkpoint, and a `0700` data-dir mode.)
   The seed step (~40 MB image) takes ~35 ms; the guest run ~1.2 s natively.
 - **✅ Data image — a self-contained, shippable filesystem blob.** `encode_image`/`decode_image` +
-  `mem_fs_from_archive` (`crates/temen-run/src/fs.rs`) serialize a cluster into one `SVMFSIM1` byte blob
+  `mem_fs_from_archive` (`crates/temen-run/src/fs.rs`) serialize a cluster into one fs-image byte blob (TEMEN wire header, `kind` = fs-image)
   that mounts on the `fs` cap with **no host filesystem** — the browser's data half. `build_image`
   (example) produces it from an on-disk cluster (Postgres' 39 MB `initdb` tree → a 41 MB image in ~3 s);
   Postgres `--single` boots from the mounted archive and runs the round-trip (`Exited(0)`). So the

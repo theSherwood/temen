@@ -49,7 +49,7 @@ identical until the next agent edit.
 - **`browser-durable-persist-reload-test.mjs` in the `browser-real` job (`ci.yml`, #816 Slice C)** — one
   line added after `node browser-jit-runtime-grow-test.mjs`: `node browser-durable-persist-reload-test.mjs`.
   It is the invariant-14 **durability axis, cross-host leg** pin: a `vm_map`-GROWN durability-instrumented
-  guest frozen to a §12 SVMD artifact (`temen_durable_freeze`), persisted to **IndexedDB**, and — after a
+  guest frozen to a §12 snapshot artifact (`temen_durable_freeze`), persisted to **IndexedDB**, and — after a
   genuine **page reload** into a fresh WebAssembly instance — thawed and resumed to completion
   (`temen_durable_thaw_resume`), with the grown-page content surviving the reload. The shipped-path proof
   of the browser "persist a warmed/grown guest across a reload" consumer (the native oracle

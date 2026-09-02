@@ -1,5 +1,5 @@
 // Real-browser (V8) end-to-end for #816 Slice C (invariant 14, **durability axis**, cross-host leg):
-// a durability-instrumented, `vm_map`-GROWN guest **frozen to a §12 SVMD artifact**, persisted to
+// a durability-instrumented, `vm_map`-GROWN guest **frozen to a §12 snapshot artifact**, persisted to
 // **IndexedDB**, and — after a genuine **page reload** into a fresh WebAssembly instance — **thawed
 // and resumed to completion**, with the grown-page content surviving the whole round-trip.
 //
@@ -13,7 +13,7 @@
 // `multipoint.rs` freeze device), then reload the marker after the call and return clock + marker.
 // Baseline (clock 42): 42 + 77 = 119. A correct thaw REPLAYS the captured clock (42), so seeding the
 // thaw clock to 9999 and still getting 119 proves both the replay AND that the grown-page marker
-// rode the SVMD artifact across the reload (a lost grown page would give 42; a re-issued clock 9999+).
+// rode the snapshot artifact across the reload (a lost grown page would give 42; a re-issued clock 9999+).
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -61,9 +61,9 @@ const RESERVED_LOG2 = 20; // 1 MiB mask domain (declared 128 KiB, grows into the
 const FREEZE_CLOCK = 42;
 const THAW_CLOCK = 9999; // different on purpose — a re-issue instead of a replay would surface it
 const WANT = 119; // 42 (replayed clock) + 77 (grown-page marker reloaded across the reload)
-const DB = 'temen-slice-c', STORE = 'kv', KEY = 'svmd';
+const DB = 'temen-slice-c', STORE = 'kv', KEY = 'snapshot';
 
-// ---- Phase A: freeze the grown durable guest and persist the SVMD artifact to IndexedDB. ----
+// ---- Phase A: freeze the grown durable guest and persist the snapshot artifact to IndexedDB. ----
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 const a = await page.evaluate(async ({ src, reserved, clock, db, store, key }) => {
   const { loadEngine } = await import('./par.js');
@@ -101,7 +101,7 @@ const a = await page.evaluate(async ({ src, reserved, clock, db, store, key }) =
 }, { src: GUEST_SRC, reserved: RESERVED_LOG2, clock: FREEZE_CLOCK, db: DB, store: STORE, key: KEY });
 
 // ---- The reload: a fresh page context + a fresh WebAssembly instance (new linear memory). The
-// SVMD bytes survive only because they live in IndexedDB, not in the discarded wasm memory. ----
+// snapshot bytes survive only because they live in IndexedDB, not in the discarded wasm memory. ----
 await page.reload();
 
 // ---- Phase B: thaw the artifact from IndexedDB into the fresh instance and resume to completion. ----
@@ -150,7 +150,7 @@ if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 
 const ok = errors.length === 0
   && a.status === 0          // STATUS_OK: the guest actually froze mid-run (non-vacuous)
-  && a.artLen > 32           // a real SVMD artifact was produced and persisted
+  && a.artLen > 32           // a real snapshot artifact was produced and persisted
   && !b.error
   && b.status === 0          // STATUS_OK: the thaw resumed to completion
   && b.result === WANT;      // grown-page marker + clock replay survived the reload
