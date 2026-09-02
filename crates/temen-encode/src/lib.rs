@@ -241,7 +241,95 @@ mod op {
     pub const UNREACHABLE: u8 = 0x8F;
 }
 
-const MAGIC: [u8; 4] = *b"SVM\x00";
+/// The unified **TEMEN wire header** (`WIRE.md`) shared by every temen on-disk format — module,
+/// object, snapshot, fs-image, … — so one sniff identifies any temen blob and dispatches on `kind`.
+///
+/// Layout (16 bytes, little-endian):
+/// ```text
+/// [0..8)   MAGIC   = b"TEMEN\0\0\0"
+/// [8..10)  kind    : u16  — what the payload IS (the WIRE.md kind registry)
+/// [10..12) version : u16  — the payload's format version, per kind
+/// [12..16) flags   : u32  — per-kind modifiers; reserved bits fail closed
+/// ```
+/// The reader checks only the magic; every consumer enforces its own `kind`/`version`/`flags`
+/// (fail-closed) at the header, before reading a single payload byte. Unknown kinds are never
+/// dispatched — an execution path accepts exactly its expected kind.
+pub mod wire {
+    use alloc::vec::Vec;
+
+    /// Container magic: `"TEMEN"` NUL-padded to 8 bytes.
+    pub const MAGIC: [u8; 8] = *b"TEMEN\0\0\0";
+    /// Total header length.
+    pub const HEADER_LEN: usize = 16;
+
+    // Core, stable kinds (`0x0000..=0x00FF`). The full registry + reserved ranges: WIRE.md.
+    /// A runnable module (`encode_module`/`decode_module`).
+    pub const KIND_MODULE: u16 = 0x0000;
+    /// A link unit / object — the pre-link dialect (`encode_unit`/`decode_unit`).
+    pub const KIND_OBJECT: u16 = 0x0001;
+    /// A §12 durable-snapshot artifact (`temen-snapshot`).
+    pub const KIND_SNAPSHOT: u16 = 0x0002;
+    /// A filesystem image (`temen-fs::encode_image`).
+    pub const KIND_FS_IMAGE: u16 = 0x0003;
+    /// Reserved (WIRE.md): a container of self-delimited sub-blobs. Not yet implemented.
+    pub const KIND_BUNDLE: u16 = 0x0004;
+
+    /// A parsed header.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Header {
+        pub kind: u16,
+        pub version: u16,
+        pub flags: u32,
+    }
+
+    /// Why a header failed to parse. Kind/version/flags policy is the caller's (per-format).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum HeaderError {
+        /// Fewer than [`HEADER_LEN`] bytes.
+        Truncated,
+        /// The first 8 bytes are not [`MAGIC`].
+        BadMagic,
+    }
+
+    /// Append a header for `kind`/`version`/`flags`.
+    pub fn write_header(out: &mut Vec<u8>, kind: u16, version: u16, flags: u32) {
+        out.extend_from_slice(&MAGIC);
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&flags.to_le_bytes());
+    }
+
+    /// Parse the header, returning it and the payload after it. Checks only the magic.
+    pub fn read_header(bytes: &[u8]) -> Result<(Header, &[u8]), HeaderError> {
+        if bytes.len() < HEADER_LEN {
+            return Err(HeaderError::Truncated);
+        }
+        if bytes[..8] != MAGIC {
+            return Err(HeaderError::BadMagic);
+        }
+        let kind = u16::from_le_bytes([bytes[8], bytes[9]]);
+        let version = u16::from_le_bytes([bytes[10], bytes[11]]);
+        let flags = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        Ok((
+            Header {
+                kind,
+                version,
+                flags,
+            },
+            &bytes[HEADER_LEN..],
+        ))
+    }
+
+    /// Cheap sniff: `Some(kind)` when the bytes carry a well-formed TEMEN header, else `None`.
+    pub fn sniff_kind(bytes: &[u8]) -> Option<u16> {
+        read_header(bytes).ok().map(|(h, _)| h.kind)
+    }
+
+    /// True for an encoded module **or** object blob (the two module-dialect kinds).
+    pub fn is_module_blob(bytes: &[u8]) -> bool {
+        matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
+    }
+}
 // v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
 // concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
 // list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 briefly
@@ -282,20 +370,20 @@ const MAGIC: [u8; 4] = *b"SVM\x00";
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u8 = 10;
+const VERSION: u16 = 10;
 
-/// Header flags byte, bit 0 (v9): this file is an **object** (a pre-link unit, `decode_unit`
-/// dialect). All other bits are reserved and must be zero (fail-closed).
-const FLAG_OBJECT: u8 = 0x01;
+// The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
 /// Why decoding rejected a byte stream.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum DecodeError {
     UnexpectedEof,
     BadMagic,
-    BadVersion(u8),
-    /// The header flags byte (v9) had a reserved (non-object) bit set.
-    BadFlags(u8),
+    /// The TEMEN header's `kind` is not a module dialect (neither `module` nor `object`).
+    BadKind(u16),
+    BadVersion(u16),
+    /// The TEMEN header's `flags` had a reserved bit set (no module flags are defined yet).
+    BadFlags(u32),
     /// The input is an **object** (a pre-link unit, header flag bit 0) but was handed to
     /// [`decode_module`], the runnable-module path. Link it first; objects decode only via
     /// [`decode_unit`].
@@ -388,11 +476,17 @@ pub fn encode_unit(m: &Module) -> Vec<u8> {
 
 fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&MAGIC);
-    out.push(VERSION);
-    // v9 flags byte: bit 0 marks the object dialect; a runnable module writes 0, keeping its wire
-    // bit-for-bit v8 from here on.
-    out.push(if object { FLAG_OBJECT } else { 0 });
+    // The unified TEMEN wire header (WIRE.md): the object dialect is its own `kind`, not a flag.
+    wire::write_header(
+        &mut out,
+        if object {
+            wire::KIND_OBJECT
+        } else {
+            wire::KIND_MODULE
+        },
+        VERSION,
+        0,
+    );
     // Memory descriptor: presence flag, then `size_log2` if present.
     match &m.memory {
         None => out.push(0),
@@ -1748,30 +1842,32 @@ pub fn decode_unit(bytes: &[u8]) -> Result<Module, DecodeError> {
 }
 
 fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> {
-    let mut c = Cursor::new(bytes);
-    if c.take(4)? != MAGIC {
-        return Err(DecodeError::BadMagic);
+    // The unified TEMEN wire header (WIRE.md). The shared reader checks only the magic; this path
+    // enforces its own kind/version/flags — every mismatch fails closed *here, at the header*, before
+    // a single section is read, so link scaffolding (the object dialect) and every foreign kind stay
+    // unreachable from the runtime load path.
+    let (hdr, payload) = wire::read_header(bytes).map_err(|e| match e {
+        wire::HeaderError::Truncated => DecodeError::UnexpectedEof,
+        wire::HeaderError::BadMagic => DecodeError::BadMagic,
+    })?;
+    let object = match hdr.kind {
+        wire::KIND_MODULE => false,
+        wire::KIND_OBJECT => true,
+        other => return Err(DecodeError::BadKind(other)),
+    };
+    // Exact-version only: the decoder accepts the current `VERSION` and nothing else (the v9
+    // compatibility window was retired by the #900 wire rev; every other version fails closed).
+    if hdr.version != VERSION {
+        return Err(DecodeError::BadVersion(hdr.version));
     }
-    let v = c.byte()?;
-    // Exact-version only: the decoder accepts the current `VERSION` and nothing else. The v9
-    // compatibility window (v9 impl-exports read as `single`, no policy byte) was retired once
-    // every committed `.temen` asset regenerated onto v10 in the wire rev (#900) — its whole
-    // purpose was to keep those pre-policy-byte blobs loading until then. Every other version,
-    // v9 included, now fails closed.
-    if v != VERSION {
-        return Err(DecodeError::BadVersion(v));
+    // Reserved flag bits fail closed.
+    if hdr.flags != 0 {
+        return Err(DecodeError::BadFlags(hdr.flags));
     }
-    // v9 flags byte. Reserved bits fail closed; the object bit is rejected on the runnable path
-    // *here, at the header* — link scaffolding stays unreachable from the runtime load path
-    // without scanning a single section.
-    let flags = c.byte()?;
-    if flags & !FLAG_OBJECT != 0 {
-        return Err(DecodeError::BadFlags(flags));
-    }
-    let object = flags & FLAG_OBJECT != 0;
     if object && !allow_object {
         return Err(DecodeError::ObjectInput);
     }
+    let mut c = Cursor::new(payload);
     let memory = match c.byte()? {
         0 => None,
         1 => Some(Memory {
@@ -2771,8 +2867,8 @@ mod object_tests {
     fn reserved_flag_bits_fail_closed() {
         // Set a reserved bit in an otherwise-valid header: both entry points reject.
         let mut bytes = encode_module(&Module::default());
-        assert_eq!(bytes[5] & !FLAG_OBJECT, 0, "flags byte position");
-        bytes[5] |= 0x02;
+        assert_eq!(&bytes[12..16], &[0, 0, 0, 0], "flags word position");
+        bytes[12] |= 0x02;
         assert_eq!(decode_module(&bytes), Err(DecodeError::BadFlags(0x02)));
         assert_eq!(decode_unit(&bytes), Err(DecodeError::BadFlags(0x02)));
     }
@@ -2787,7 +2883,7 @@ mod object_tests {
         let mut bytes = encode_unit(&m);
         // Flip the dialect to runnable, leaving the body bytes: the stream now desyncs at the
         // object-only sections/opcodes, so any Err is correct — but it must not decode.
-        bytes[5] &= !FLAG_OBJECT;
+        bytes[8..10].copy_from_slice(&wire::KIND_MODULE.to_le_bytes());
         assert!(
             decode_module(&bytes).is_err(),
             "link-form opcodes decoded outside the object dialect"
@@ -3132,7 +3228,7 @@ mod debug_tests {
         assert_eq!(diffs.len(), 1, "the policy byte is the only difference");
         let mut v9 = b_single.clone();
         v9.remove(diffs[0]);
-        v9[4] = 9;
+        v9[10..12].copy_from_slice(&9u16.to_le_bytes());
         // The window is closed: v9 now fails closed, exactly like every other non-current version.
         assert!(matches!(
             decode_module(&v9),
@@ -3140,7 +3236,7 @@ mod debug_tests {
         ));
         // …and the same bytes stamped v8 were already rejected — nothing below VERSION decodes.
         let mut v8 = v9.clone();
-        v8[4] = 8;
+        v8[10..12].copy_from_slice(&8u16.to_le_bytes());
         assert!(matches!(
             decode_module(&v8),
             Err(DecodeError::BadVersion(8))

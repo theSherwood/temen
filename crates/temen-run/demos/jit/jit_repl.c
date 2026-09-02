@@ -89,13 +89,14 @@ static void sleb(char *buf, long v) {
 
 static long emit_unit(char *buf) {
   n_out = 0;
-  // Header: magic + version.
-  eb(buf, 'S');
-  eb(buf, 'V');
-  eb(buf, 'M');
-  eb(buf, 0);
-  eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
-  eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
+  // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
+  // magic "TEMEN\0\0\0", u16 kind (0 = module), u16 version, u32 flags (0; reserved bits
+  // fail closed). Mirrors `temen_encode::wire::write_header`.
+  eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
+  eb(buf, 0); eb(buf, 0); eb(buf, 0);
+  eb(buf, 0); eb(buf, 0);                 // kind = module
+  eb(buf, (10) & 0xff); eb(buf, (10) >> 8); // version (u16)
+  eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(buf, 1);
