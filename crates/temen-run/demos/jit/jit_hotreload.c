@@ -74,12 +74,14 @@ static void sleb(char *buf, long v) {
 }
 static void emit_header(char *buf) {
   n_out = 0;
-  eb(buf, 'S');
-  eb(buf, 'V');
-  eb(buf, 'M');
-  eb(buf, 0);
-  eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
-  eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
+  // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
+  // magic "TEMEN\0\0\0", u16 kind (0 = module), u16 version, u32 flags (0; reserved bits
+  // fail closed). Mirrors `temen_encode::wire::write_header`.
+  eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
+  eb(buf, 0); eb(buf, 0); eb(buf, 0);
+  eb(buf, 0); eb(buf, 0);                 // kind = module
+  eb(buf, (10) & 0xff); eb(buf, (10) >> 8); // version (u16)
+  eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
   eb(buf, 0);

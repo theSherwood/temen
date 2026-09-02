@@ -75,8 +75,8 @@ static long interp(Ins *prog, long a, long b) {
 }
 
 // --- the runtime emitter: bytecode -> serialized Temen IR -------------------------------------
-// The binary layout mirrors `crates/temen-encode` (LEB128 + one-byte opcodes): magic "Temen\0" +
-// version + flags (v9), a memory descriptor, a data-segment count, a §7 import count (0 here —
+// The binary layout mirrors `crates/temen-encode` (LEB128 + one-byte opcodes): the 16-byte TEMEN wire header (WIRE.md: magic +
+// u16 kind/u16 version/u32 flags), a memory descriptor, a data-segment count, a §7 import count (0 here —
 // this unit is self-contained), a function count, then per function its
 // params/results/blocks, each block its params, instruction count, instructions, terminator.
 // Values are block-local indices (params first, then each instruction's result).
@@ -123,13 +123,14 @@ static long emit_unit(Ins *prog, char *buf, int abi_sp) {
   long a_idx = abi_sp;      // the accumulator seed (v0 raw, v1 with the SP param)
   long b_idx = abi_sp + 1;
   n_out = 0;
-  // Header: magic + version.
-  eb(buf, 'S');
-  eb(buf, 'V');
-  eb(buf, 'M');
-  eb(buf, 0);
-  eb(buf, 10); // format v10 (v9 + the impl-export policy byte, CALLS.md 7.4)
-  eb(buf, 0); // flags: runnable dialect (bit 0 = object/link unit; reserved bits fail closed)
+  // Header: the unified TEMEN wire header (WIRE.md) — 16 bytes, little-endian:
+  // magic "TEMEN\0\0\0", u16 kind (0 = module), u16 version, u32 flags (0; reserved bits
+  // fail closed). Mirrors `temen_encode::wire::write_header`.
+  eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
+  eb(buf, 0); eb(buf, 0); eb(buf, 0);
+  eb(buf, 0); eb(buf, 0);                 // kind = module
+  eb(buf, (10) & 0xff); eb(buf, (10) >> 8); // version (u16)
+  eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   // Memory descriptor: present, size_log2 17. The validator's memory-match precondition
   // requires the blob to declare the SAME window as this module — chibicc keeps a small
   // program like this one at the 64 KiB default (a mismatch is a clean -22, not an escape).
