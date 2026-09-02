@@ -17240,6 +17240,25 @@ pub trait SignalSource: Send + Sync {
         false
     }
 
+    /// #1171 — is this domain currently **stopped** (`SIGSTOP`/`SIGTSTP`, before its `SIGCONT`)? The
+    /// cooperative driver's settle scan consults it so a stopped reader parked on a pipe/terminal read
+    /// is NOT re-admitted by an input wake — a stopped process makes no progress and must not steal the
+    /// bytes a foreground shell should read. Cleared at continue; the read re-admits then. Default
+    /// `false` — sources without job control never withhold a wake.
+    fn stopped(&self) -> bool {
+        false
+    }
+
+    /// #1171 — **read-and-clear** the one-shot "a child of this domain transitioned (stop/continue)"
+    /// edge. The cooperative driver's all-parked sweep consults this to re-admit a task parked in a
+    /// blocking personality `waitpid(WUNTRACED/WCONTINUED)` when a child stopped/continued — even with
+    /// no async SIGCHLD delivery armed (a poll-only SIGCHLD cannot wake a parked reap park, and a job
+    /// stopped on a parked read never enters a core stop-park). One-shot: consumed here, so a
+    /// re-admitted `waitpid` (report-once) cannot spin. Default `false` — sources without job control.
+    fn reap_pending(&self) -> bool {
+        false
+    }
+
     /// #796 default actions — store the run's **terminate closure**: firing it sets the domain's
     /// term flag; every vCPU of the domain self-terminates at its next per-op poll (checked after
     /// `kill`, before stop — death beats stop), and parked/stopped vCPUs are woken so they observe
