@@ -107,6 +107,15 @@ try {
   await term.press('Control+d'); // EOF to the resumed cat → it exits, bash reaps it
   await new Promise((r) => setTimeout(r, 800));
 
+  // #797 — the ^D that EOF'd `cat` is a ONE-SHOT EOF: the prompt is fully usable afterward. Before
+  // the fix the empty-line ^D dropped the terminal's writer permanently, so bash's very next prompt
+  // read also EOF'd and the shell exited; here it must run this command normally.
+  await term.fill('echo aliveafter=$?');
+  await term.press('Enter');
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.includes('aliveafter='),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+
   // ^D on the empty line ends the session: bash prints its `exit` farewell and the card settles.
   await term.press('Control+d');
   await page.waitForFunction(
