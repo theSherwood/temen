@@ -893,16 +893,20 @@ pub fn read_host_dir(root: &Path) -> std::io::Result<FsSeed> {
     Ok((files, dirs))
 }
 
-const IMAGE_MAGIC: &[u8; 8] = b"SVMFSIM1";
+use temen_encode::wire;
+
+/// The fs-image payload format version — the TEMEN header's `version` for `kind = fs-image`.
+const IMAGE_VERSION: u16 = 1;
 
 /// Serialize a `(files, dirs)` seed into a **self-contained data image** — a flat, portable byte blob a
 /// demo ships and mounts with [`mem_fs_from_archive`] (no host filesystem needed, e.g. in the browser).
-/// Format (all little-endian): magic `SVMFSIM1`; `u32` dir count, then each dir `u32 len + path`; `u32`
+/// Format (all little-endian): the TEMEN wire header (`kind` = fs-image, `version` = 1; `WIRE.md`);
+/// `u32` dir count, then each dir `u32 len + path`; `u32`
 /// file count, then each file `u32 path-len + path + u64 data-len + data`. Paths are stored verbatim
 /// (normalization happens at mount time, as for any seed).
 pub fn encode_image(files: &[(String, Vec<u8>)], dirs: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(IMAGE_MAGIC);
+    wire::write_header(&mut out, wire::KIND_FS_IMAGE, IMAGE_VERSION, 0);
     out.extend_from_slice(&(dirs.len() as u32).to_le_bytes());
     for d in dirs {
         out.extend_from_slice(&(d.len() as u32).to_le_bytes());
@@ -921,6 +925,22 @@ pub fn encode_image(files: &[(String, Vec<u8>)], dirs: &[String]) -> Vec<u8> {
 /// Parse a [`encode_image`] blob back into a [`FsSeed`]. `Err` on a bad magic or a truncated/oversized
 /// field (fail-closed — a corrupt image never yields a partial mount).
 pub fn decode_image(bytes: &[u8]) -> Result<FsSeed, String> {
+    // The unified TEMEN wire header (WIRE.md): magic, then this format's own kind/version/flags,
+    // each fail-closed before a single field is read.
+    let (hdr, payload) = wire::read_header(bytes).map_err(|e| match e {
+        wire::HeaderError::Truncated => "image: truncated".to_string(),
+        wire::HeaderError::BadMagic => "image: bad magic".to_string(),
+    })?;
+    if hdr.kind != wire::KIND_FS_IMAGE {
+        return Err("image: not an fs-image".into());
+    }
+    if hdr.version != IMAGE_VERSION {
+        return Err(format!("image: unsupported version {}", hdr.version));
+    }
+    if hdr.flags != 0 {
+        return Err("image: reserved flags set".into());
+    }
+    let bytes = payload;
     let mut p = 0usize;
     let take = |p: &mut usize, n: usize| -> Result<&[u8], String> {
         let end = p.checked_add(n).ok_or("image: length overflow")?;
@@ -935,9 +955,6 @@ pub fn decode_image(bytes: &[u8]) -> Result<FsSeed, String> {
         let v = u64::from_le_bytes(take(p, 8)?.try_into().unwrap());
         usize::try_from(v).map_err(|_| "image: entry too large".to_string())
     };
-    if take(&mut p, 8)? != IMAGE_MAGIC {
-        return Err("image: bad magic".into());
-    }
     let n_dirs = u32at(&mut p)?;
     let mut dirs = Vec::with_capacity(n_dirs);
     for _ in 0..n_dirs {

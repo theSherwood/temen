@@ -35,14 +35,16 @@ function ensureChibicc() {
   execFileSync('make', ['chibicc'], { cwd: join(REPO, 'frontend/chibicc'), stdio: 'inherit' });
 }
 
-// temen_fs::encode_image wire form (crates/temen-fs/src/lib.rs): "SVMFSIM1" + dirs(u32 n, each u32 len+bytes)
-// + files(u32 n, each u32 len+path, u64 len+data). Little-endian.
+// temen_fs::encode_image wire form (crates/temen-fs/src/lib.rs): the unified TEMEN wire header
+// (WIRE.md — "TEMEN\0\0\0" + u16 kind=3 fs-image + u16 version=1 + u32 flags=0) + dirs(u32 n, each
+// u32 len+bytes) + files(u32 n, each u32 len+path, u64 len+data). Little-endian.
 function encodeImage(files, dirs) {
   const enc = new TextEncoder(); const parts = []; let n = 0;
+  const u16 = (v) => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, v, true); parts.push(b); n += 2; };
   const u32 = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, true); parts.push(b); n += 4; };
   const u64 = (v) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), true); parts.push(b); n += 8; };
   const raw = (b) => { parts.push(b); n += b.length; };
-  raw(enc.encode('SVMFSIM1'));
+  raw(enc.encode('TEMEN')); raw(new Uint8Array(3)); u16(3); u16(1); u32(0); // TEMEN header: kind=fs-image, v1
   u32(dirs.length); for (const d of dirs) { const b = enc.encode(d); u32(b.length); raw(b); }
   u32(files.length); for (const [p, data] of files) { const b = enc.encode(p); u32(b.length); raw(b); u64(data.length); raw(data); }
   const out = new Uint8Array(n); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out;
