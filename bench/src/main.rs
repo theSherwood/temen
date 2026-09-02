@@ -307,15 +307,17 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v11 = i64.and v9 v10
   v12 = i64.const 8
   v13 = i64.mul v11 v12
-  i64.store v13 v9
-  v14 = i64.load v13
-  v15 = i64.add v8 v14
-  v16 = i64.const 1
-  v17 = i64.add v9 v16
-  br 1(v7, v15, v17)
+  v14 = i64.const 16384
+  v15 = i64.add v13 v14
+  i64.store v15 v9
+  v16 = i64.load v15
+  v17 = i64.add v8 v16
+  v18 = i64.const 1
+  v19 = i64.add v9 v18
+  br 1(v7, v17, v19)
 }
-block 3 (v18: i64) {
-  return v18
+block 3 (v20: i64) {
+  return v20
 }
 }
 ",
@@ -385,19 +387,22 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v13 = i64.and v11 v12
   v14 = i64.const 8
   v15 = i64.mul v13 v14
-  i64.store v15 v9
-  v16 = i64.const 2246822519
-  v17 = i64.mul v9 v16
-  v18 = i64.and v17 v12
-  v19 = i64.mul v18 v14
-  v20 = i64.load v19
-  v21 = i64.add v8 v20
-  v22 = i64.const 1
-  v23 = i64.add v9 v22
-  br 1(v7, v21, v23)
+  v16 = i64.const 16384
+  v17 = i64.add v15 v16
+  i64.store v17 v9
+  v18 = i64.const 2246822519
+  v19 = i64.mul v9 v18
+  v20 = i64.and v19 v12
+  v21 = i64.mul v20 v14
+  v22 = i64.add v21 v16
+  v23 = i64.load v22
+  v24 = i64.add v8 v23
+  v25 = i64.const 1
+  v26 = i64.add v9 v25
+  br 1(v7, v24, v26)
 }
-block 3 (v24: i64) {
-  return v24
+block 3 (v27: i64) {
+  return v27
 }
 }
 ",
@@ -622,7 +627,7 @@ block 0 (v0: i64) {
 const CACHE: Kernel = Kernel {
     name: "cache",
     ir: "\
-memory 20
+memory 21
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 0
@@ -640,19 +645,22 @@ block 2 (v7: i64, v8: i64, v9: i64) {
   v13 = i64.and v11 v12
   v14 = i64.const 8
   v15 = i64.mul v13 v14
-  i64.store v15 v9
-  v16 = i64.const 2246822519
-  v17 = i64.mul v9 v16
-  v18 = i64.and v17 v12
-  v19 = i64.mul v18 v14
-  v20 = i64.load v19
-  v21 = i64.add v8 v20
-  v22 = i64.const 1
-  v23 = i64.add v9 v22
-  br 1(v7, v21, v23)
+  v16 = i64.const 16384
+  v17 = i64.add v15 v16
+  i64.store v17 v9
+  v18 = i64.const 2246822519
+  v19 = i64.mul v9 v18
+  v20 = i64.and v19 v12
+  v21 = i64.mul v20 v14
+  v22 = i64.add v21 v16
+  v23 = i64.load v22
+  v24 = i64.add v8 v23
+  v25 = i64.const 1
+  v26 = i64.add v9 v25
+  br 1(v7, v24, v26)
 }
-block 3 (v24: i64) {
-  return v24
+block 3 (v27: i64) {
+  return v27
 }
 }
 ",
@@ -1207,7 +1215,7 @@ block 1 (v3: i64, v4: i64, v5: i64) {
 }
 block 2 (v7: i64, v8: i64, v9: i64) {
   v10 = i32.const 0
-  v11 = i64.const 0
+  v11 = i64.const 16384
   v12 = i64.const 64
   v13 = call.cap 0 1 (i64, i64) -> (i64) v10(v11, v12)
   v14 = i64.add v8 v13
@@ -1250,8 +1258,10 @@ block 3 (v17: i64) {
 /// `wat32`. `run` is found by signature — the unique `(i64, i64) -> (i64)` function (`main`
 /// returns i32, `_start` takes three i32s) — so this is robust against the frontend's function
 /// ordering. `lead` is the args before `n`: `run` threads the data-stack pointer as v0, so it is
-/// the initial SP (0 is safe here — the frame is tiny and self-contained). Returns `Err` (caller
-/// skips the kernel) if the frontend can't be built/run.
+/// the initial SP. A memory-using kernel must pass an SP that clears the unconditional NULL guard
+/// `[0, 16384)` (#1094) and any rodata segment (see `locals_from_c`); a pure-compute kernel that
+/// never dereferences the SP (`alu_c`) is unaffected by its value. Returns `Err` (caller skips the
+/// kernel) if the frontend can't be built/run.
 fn c_kernel(
     name: &str,
     src: &str,
@@ -1355,10 +1365,18 @@ fn locals_from_c() -> Result<Resolved, String> {
         (br $loop)))
     (local.get $acc)))
 "#;
+    // The data-SP threaded as v0. It must clear the **unconditional NULL guard** `[0, 16384)`
+    // (`temen_ir::POWERBOX_NULL_GUARD`, #1094) *and* the module's rodata segment (chibicc parks the
+    // function-name strings at 32768) — chibicc lays this kernel's `volatile long a[256]` at `sp+16`,
+    // so the frame spans `[sp+16, sp+2064)`. `vec![0]` (the old value) put that frame inside the guard,
+    // trapping `MemoryFault` on *every* tier once #1094 made the guard unconditional (#1134). `49152` is
+    // chibicc's own `_start` frame base — a valid data-SP clear of both regions with ample headroom
+    // below the 128 KiB window. The measured value (Σi) and timing are sp-independent (an unbounded,
+    // still-masked block param), so the baseline stays comparable.
     c_kernel(
         "locals_c",
         SRC,
-        vec![0],
+        vec![49152],
         WAT32.to_string(),
         Some(WAT64.to_string()),
         Some(native_locals),
@@ -2090,5 +2108,35 @@ fn main() {
         print_csv(&results);
     } else {
         print_table(&results);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1134 regression guard: every resolvable kernel must **run on every tier without trapping**.
+    /// `measure` asserts the Temen JIT, the reference interpreter, the wasm oracle(s), and the native
+    /// twin all agree on the result *before* timing — and panics on any trap (`temen_call` /
+    /// `temen_host_call`) — so a single-rep pass over every kernel proves none faults or diverges. This
+    /// catches the class #1134 hid: a kernel whose memory base lands in the unconditional NULL guard
+    /// `[0, 16384)` (#1094), which traps `MemoryFault` on every guard-enforcing tier. Fast (reps=1) and
+    /// runnable via `cargo test` in `bench/`, unlike the schedule-only `--check` run.
+    #[test]
+    fn every_kernel_runs_on_every_tier() {
+        let mut config = Config::new();
+        config.wasm_memory64(true);
+        config.wasm_threads(true);
+        config.shared_memory(true);
+        let engine = Engine::new(&config).expect("engine");
+        let kernels = resolve_kernels(false);
+        assert!(
+            !kernels.is_empty(),
+            "at least the hand-written kernels resolve"
+        );
+        for k in &kernels {
+            // Panics (fails the test) on any trap or cross-tier result disagreement.
+            let _ = measure(&engine, k, 1, false);
+        }
     }
 }
