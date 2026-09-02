@@ -125,13 +125,14 @@ fn map_past_the_backing_never_writes_host_memory() {
 #[test]
 fn protect_straddling_the_backing_end_never_reads_host_memory() {
     let page = temen_interp::host_page_size();
-    // The nested_paged seed-900 shape: a protect that starts inside the window and runs past it.
-    let (r, canary) = run(2, 0, WIN - 8 * page, 30 * page);
+    // The nested_paged seed-900 shape: a protect that starts inside the window (above the null
+    // guard on any host page size — 16 KiB on macOS) and runs past it.
+    let (r, canary) = run(2, 0, WIN - 2 * page, 4 * page);
     assert_eq!(errno_of(&r), 0, "protect inside the reservation succeeds");
     assert_eq!(canary, 0x5A);
     // Followed by a store just past the backing: the page is read-only, so the interpreter faults
     // before the access — and the canary behind the buffer is untouched either way.
-    let (r, canary) = run(2, 1, WIN - 8 * page, 30 * page);
+    let (r, canary) = run(2, 1, WIN - 2 * page, 4 * page);
     assert!(
         matches!(r, Err(Trap::MemoryFault)),
         "a store to a protected page faults, got {r:?}"
