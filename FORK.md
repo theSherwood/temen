@@ -797,7 +797,7 @@ So the capstone is **not** DURABILITY §10 "clone at a quiescent point" (cheap s
 forking caller is *not* quiescent. It is: **make a JIT `call.cap` a suspendable, pre-result durable
 safepoint**, so a forking caller unwinds to a reified continuation (shadow-stack bytes in the window)
 instead of thread-blocking. The snapshot format is already engine-agnostic and cloneable
-(`temen-snapshot`, magic `SVMD`), and the interp's live `fork_parked_caller` is the semantic oracle —
+(`temen-snapshot`, TEMEN wire header, `kind` = snapshot), and the interp's live `fork_parked_caller` is the semantic oracle —
 so the real work is turning the JIT call into a reifiable park. The four items, in dependency order:
 
 1. **The inject-vs-reload distinction is *runtime*, not a new compile-time `SuspendKind`** (refined

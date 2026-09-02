@@ -411,7 +411,19 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
 /// `exec` capability) runs `nifler` as a nested guest over the **same** memfs. Only `nifler` is in the
 /// registry (argv[0] `nifler` or `/bin/nifler`); anything else is refused. Non-`run` ops
 /// (status/read/close) go through `temen_exec::JobTable`, exactly like `temen-run`'s `domain_exec`.
-fn make_exec(nifler: Arc<Module>, fs_factory: FsFactory) -> HostProc {
+///
+/// #1025 Gap-2: when a **child-entry** nifler (`nifler_ce`) is threaded in, the sub-spawn runs as a
+/// confined §14 op-13 **grandchild** ([`run_phase_op13`]) — the guest itself now services the exec cap
+/// via the confinement path, not the driver's inline interpreter run. nifler `parse` writes its
+/// `.p.nif` into the shared memfs (byte-identical to the inline run, proven by
+/// `op13_nifler_crawl_matches_inline`), which is what nimsem reads back — so the grandchild's stdout is
+/// unobserved (empty), matching the phase-1 crawl's discard. Without `nifler_ce`, the inline
+/// [`run_phase`] path is kept (identical output either way).
+fn make_exec(
+    nifler: Arc<Module>,
+    nifler_ce: Option<Arc<Module>>,
+    fs_factory: FsFactory,
+) -> HostProc {
     let mut jobs = temen_exec::JobTable::default();
     Box::new(move |op, args, mem, _minter| {
         if op != temen_exec::EXEC_RUN {
@@ -428,7 +440,10 @@ fn make_exec(nifler: Arc<Module>, fs_factory: FsFactory) -> HostProc {
             return Ok(vec![temen_ir::errno::EPERM]);
         }
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let (stdout, exit) = run_phase(&nifler, &argv_refs, (fs_factory)(), None);
+        let (stdout, exit) = match &nifler_ce {
+            Some(ce) => (vec![], run_phase_op13(ce, &argv_refs, &fs_factory)),
+            None => run_phase(&nifler, &argv_refs, (fs_factory)(), None),
+        };
         Ok(vec![jobs.push(temen_exec::Job {
             stdout,
             stderr: vec![],
@@ -470,10 +485,12 @@ pub fn compile_nim(
 }
 
 /// [`compile_nim`] with an optional **child-entry** nifler (`nifler_ce`, built `--child-entry`). When
-/// present, the phase-1 import crawl runs nifler as a confined §14 op-13 child on the tier-up-capable
-/// engine ([`run_phase_op13`], #1025) instead of inline in the driver's powerbox; otherwise it stays on
-/// the inline [`run_phase`] path (byte-identical output either way). nimsem/hexer stay inline for now
-/// (their 256 MiB carves are the #816 half of the browser story).
+/// present, nifler runs as a confined §14 op-13 child on the tier-up-capable engine ([`run_phase_op13`],
+/// #1025) in **both** places it's spawned: the phase-1 import crawl, and nimsem's phase-2 `exec("nifler
+/// …")` sub-spawn (the Gap-2 keystone — the guest itself services the exec cap through the confinement
+/// path via [`make_exec`]). Without `nifler_ce` both stay on the inline [`run_phase`] path
+/// (byte-identical output either way). nimsem/hexer themselves stay inline for now (their 256 MiB carves
+/// are the #816 half of the browser story).
 pub fn compile_nim_ce(
     nifler: &[u8],
     nifler_ce: Option<&[u8]>,
@@ -483,11 +500,11 @@ pub fn compile_nim_ce(
     main_nim: &str,
 ) -> Result<String, String> {
     let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
-    let nifler_ce_m = match nifler_ce {
+    let nifler_ce_m: Option<Arc<Module>> = match nifler_ce {
         Some(bytes) => {
             let m = temen_encode::decode_module(bytes).map_err(|_| "decode nifler_ce")?;
             temen_verify::verify_module(&m).map_err(|_| "verify nifler_ce")?;
-            Some(m)
+            Some(Arc::new(m))
         }
         None => None,
     };
@@ -564,7 +581,7 @@ pub fn compile_nim_ce(
             Role::Import => {}
         }
         argv.push(&pnif);
-        let exec = make_exec(nifler_m.clone(), factory.clone());
+        let exec = make_exec(nifler_m.clone(), nifler_ce_m.clone(), factory.clone());
         let (_o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
             return Err(format!("nimsem failed on {stem} (code {code})"));
@@ -785,6 +802,100 @@ mod tests {
         assert_eq!(
             deps_inline, deps_op13,
             ".p.deps.nif byte-identical between inline and op-13 nifler"
+        );
+    }
+
+    /// A flat scratch window standing in for a guest's address space, so the `exec` cap's `EXEC_RUN`
+    /// argv can be read back by [`temen_exec::run_args`] exactly as it would be from a real phase guest.
+    struct VecMem(Vec<u8>);
+    impl temen_interp::GuestMem for VecMem {
+        fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+            let (a, b) = (ptr as usize, (ptr + len) as usize);
+            self.0.get(a..b).map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+            let (a, b) = (ptr as usize, ptr as usize + data.len());
+            self.0.get_mut(a..b)?.copy_from_slice(data);
+            Some(())
+        }
+    }
+
+    /// The nimsem phase-2 **exec** path (Gap-2, #1025): nimsem's `exec("nifler … parse …")` sub-spawn,
+    /// routed through [`make_exec`], must write a **byte-identical** `.p.nif` into the shared memfs
+    /// whether the exec cap runs nifler inline (`None`) or as a confined §14 op-13 **grandchild**
+    /// (`Some(nifler_ce)`). Drives the exec closure directly with a synthetic `EXEC_RUN` — fast, no full
+    /// compile — so it gates in per-PR CI alongside `op13_nifler_crawl_matches_inline`.
+    #[test]
+    fn exec_op13_nifler_matches_inline() {
+        let Some(ce) = inflate_nifler_ce() else {
+            eprintln!("SKIP: nifler_ce.temen.gz unavailable / gzip missing");
+            return;
+        };
+        let Some(top) = inflate("web/assets/nifler.temen.gz") else {
+            eprintln!("SKIP: web/assets/nifler.temen.gz unavailable");
+            return;
+        };
+        let ce_m = Arc::new({
+            let m = temen_encode::decode_module(&ce).expect("decode nifler_ce");
+            temen_verify::verify_module(&m).expect("verify nifler_ce");
+            m
+        });
+        let top_m = Arc::new(temen_encode::decode_module(&top).expect("decode nifler"));
+
+        // argv is a single NUL-separated blob (temen_exec::read_argv), placed above a small scratch gap.
+        let mut blob = Vec::new();
+        for a in [
+            "nifler",
+            "--portablePaths",
+            "--deps",
+            "parse",
+            "/in.nim",
+            "/nimcache/in.p.nif",
+        ] {
+            blob.extend_from_slice(a.as_bytes());
+            blob.push(0);
+        }
+        const AP: usize = 64;
+
+        let run = |ce: Option<Arc<Module>>| {
+            let (factory, handle) = temen_fs::mem_fs_shared_factory(
+                vec![("in.nim".into(), b"let x = 1\n".to_vec())],
+                vec!["nimcache".into()],
+            );
+            let factory: FsFactory = Arc::new(factory);
+            let mut exec = make_exec(top_m.clone(), ce, factory);
+            let mut mem = VecMem(vec![0u8; AP + blob.len()]);
+            mem.0[AP..].copy_from_slice(&blob);
+            let args = [AP as i64, blob.len() as i64, 0, 0];
+            let handles = exec(
+                temen_exec::EXEC_RUN,
+                &args,
+                Some(&mut mem as &mut dyn temen_interp::GuestMem),
+                None,
+            )
+            .expect("exec cap did not trap");
+            (
+                handles,
+                read(&handle, "nimcache/in.p.nif"),
+                read(&handle, "nimcache/in.p.deps.nif"),
+            )
+        };
+        let (h_inline, nif_inline, deps_inline) = run(None);
+        let (h_op13, nif_op13, deps_op13) = run(Some(ce_m));
+
+        assert_eq!(h_inline, vec![0], "inline exec returns job handle 0");
+        assert_eq!(h_op13, vec![0], "op-13 exec returns job handle 0");
+        assert!(
+            nif_op13.is_some(),
+            "op-13 exec nifler wrote its .p.nif into the shared memfs"
+        );
+        assert_eq!(
+            nif_inline, nif_op13,
+            ".p.nif byte-identical between inline exec and op-13-grandchild exec"
+        );
+        assert_eq!(
+            deps_inline, deps_op13,
+            ".p.deps.nif byte-identical between inline exec and op-13-grandchild exec"
         );
     }
 

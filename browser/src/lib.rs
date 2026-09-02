@@ -7651,7 +7651,7 @@ pub extern "C" fn temen_link_run(
     // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
     // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
     let load_unit = |bytes: &[u8]| -> Option<temen_ir::Module> {
-        if bytes.starts_with(b"SVM\0") {
+        if temen_encode::wire::is_module_blob(bytes) {
             temen_encode::decode_unit(bytes).ok()
         } else {
             temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
@@ -10138,7 +10138,7 @@ pub extern "C" fn temen_run_durable(
     value
 }
 
-/// The §12 SVMD durable-snapshot artifact slot (#816 Slice C) — cdylib-managed bytes read via
+/// The §12 durable-snapshot artifact slot (#816 Slice C) — cdylib-managed bytes read via
 /// [`temen_durable_art_ptr`]/[`temen_durable_art_len`], valid until the next [`temen_durable_freeze`].
 static mut DURABLE_ART: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
@@ -10281,7 +10281,7 @@ pub extern "C" fn temen_durable_art_len() -> usize {
 }
 
 /// #816 Slice C — the reload consumer's thaw half. Decode the durability-instrumented module, restore
-/// the §12 SVMD artifact at `[art_ptr, art_len)` (e.g. loaded back from IndexedDB) on a **fresh**
+/// the §12 snapshot artifact at `[art_ptr, art_len)` (e.g. loaded back from IndexedDB) on a **fresh**
 /// host via [`temen_snapshot::restore_with_prots`] — rebuilding the grown window image, its per-page
 /// protection map, and the durable handle table — then resume func 0 to completion over a backing
 /// pre-filled with the restored image (grown pages included), through the grown-restore seam
@@ -10309,7 +10309,7 @@ pub extern "C" fn temen_durable_thaw_resume(
             return 0;
         }
     };
-    // The SVMD artifact binds the instrumented module's digest, so the thaw must instrument the same
+    // The snapshot artifact binds the instrumented module's digest, so the thaw must instrument the same
     // raw module the same way (`transform_module_assume_confined` is deterministic — matching digest).
     let m = match temen_durable::transform_module_assume_confined(&raw) {
         Ok(m) => m,

@@ -17,7 +17,8 @@
 //!
 //! # Container (§12.1)
 //!
-//! `b"SVMD"`, a `u16` format version, then ascending-tag TLV sections (`tag`/`len`/body, so a
+//! The unified TEMEN wire header (`WIRE.md`; `kind` = snapshot, `version` = the format version
+//! below), then ascending-tag TLV sections (`tag`/`len`/body, so a
 //! reader can skip unknown tags). Encoding is **canonical** — minimal LEB128, fixed section
 //! order, sparse entries ascending — so the §12.6 invariant "re-serialize a freshly-restored
 //! domain at the same safepoint is byte-identical" is a plain `==`.
@@ -38,15 +39,15 @@
 
 #![forbid(unsafe_code)]
 
-use temen_encode::{digest256, encode_module};
+use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     DurableBinding, DurableHandle, DurableJitDomain, DurableJitUnit, FrozenChildState, FrozenFiber,
     FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use temen_ir::Module;
 
-/// Container magic (§12.2): "TEMEN-Durable".
-const MAGIC: &[u8; 4] = b"SVMD";
+// Container (§12.2): the unified TEMEN wire header (WIRE.md) with `kind = snapshot`; the u16
+// `version` field carries `FORMAT_VERSION`. See `freeze_with_prots` / `restore_with_prots`.
 /// Format version; bump on an incompatible change (§12.2). v2 (recycling step 2): each fiber residue
 /// record carries its **generation** (the high bits of a recycled-slot guest handle), so a thaw
 /// re-seeds a recycled fiber at the generation its handle expects. v3 (i64 fiber handles): the handle
@@ -218,7 +219,7 @@ pub enum FreezeError {
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RestoreError {
-    /// Not an `SVMD` container.
+    /// Not a TEMEN snapshot container (bad magic, or a header `kind` that isn't `snapshot`).
     BadMagic,
     /// A format version this build doesn't understand.
     UnsupportedVersion(u16),
@@ -370,8 +371,7 @@ pub fn freeze_with_prots(
     let digest = digest256(&encode_module(module));
 
     let mut out = Vec::new();
-    out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    wire::write_header(&mut out, wire::KIND_SNAPSHOT, FORMAT_VERSION, 0);
 
     // Section 0 — Header (§12.2). `reserved_log2` is the caller's mask domain (v18: no longer derived
     // from `window.len()`, so a grown committed extent < reservation is representable); `mapped` is the
@@ -584,14 +584,22 @@ pub fn restore_with_prots(
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
-    let mut r = Reader::new(artifact);
-    if r.take(4)? != MAGIC {
-        return Err(RestoreError::BadMagic);
+    // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
+    // each fail-closed at the header before any section is read.
+    let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
+        wire::HeaderError::Truncated => RestoreError::Truncated,
+        wire::HeaderError::BadMagic => RestoreError::BadMagic,
+    })?;
+    if hdr.kind != wire::KIND_SNAPSHOT {
+        return Err(RestoreError::BadMagic); // a TEMEN blob, but not a snapshot
     }
-    let version = u16::from_le_bytes([r.u8()?, r.u8()?]);
-    if version != FORMAT_VERSION {
-        return Err(RestoreError::UnsupportedVersion(version));
+    if hdr.version != FORMAT_VERSION {
+        return Err(RestoreError::UnsupportedVersion(hdr.version));
     }
+    if hdr.flags != 0 {
+        return Err(RestoreError::Malformed); // reserved flag bits
+    }
+    let mut r = Reader::new(payload);
 
     let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
     let mut serve_body = None;

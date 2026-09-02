@@ -2882,7 +2882,7 @@ embedder running pre-instrumented modules links neither into the escape-TCB):
   guest-resident bytes, so they ride along for free); what is captured host-side is the **handle
   table** (authority, not the resources it names). The artifact binds the **instrumented-module
   digest** — restore refuses on a mismatch (the durability boundary: the shadow schema is a function
-  of the instrumented module's structure). Container is `b"SVMD"` + versioned ascending-tag TLV,
+  of the instrumented module's structure). Container is the unified TEMEN wire header (`WIRE.md`, `kind` = snapshot) + versioned ascending-tag TLV,
   **canonical** encoding (so "re-serialize a freshly-restored domain at the same safepoint is
   byte-identical" is a plain `==`), with sparse window pages + zero-page elision + per-page
   protection, and parked **fibers** flattened into the image. **Status:** single- and multi-vCPU

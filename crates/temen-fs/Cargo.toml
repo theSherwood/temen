@@ -14,3 +14,4 @@ publish = false
 [dependencies]
 temen-ir.workspace = true
 temen-interp.workspace = true
+temen-encode = { path = "../temen-encode" }
