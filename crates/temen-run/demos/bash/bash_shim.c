@@ -307,6 +307,13 @@ __attribute__((constructor)) static void px_sig_init_(void) {
 /* terminal — the op termios is the 32-byte personality layout {lflag: i64, cc[8], vmin: i64,
  * vtime: i64}; marshal to/from glibc termios {iflag,oflag,cflag,lflag: u32@0..16, line: u8@16,
  * cc[32]@17, ispeed@36, ospeed@40}. */
+/* The op cc[8] packs {VINTR,VQUIT,VERASE,VKILL,VEOF,VSUSP,_,_} — VSUSP at op index 5. glibc c_cc is
+ * indexed by the Linux control-char numbers, where index 5 is VTIME and 6 is VMIN, and VSUSP lives at
+ * index 10. So the first FIVE slots (VINTR..VEOF, indices 0..5) share the same position, but op
+ * VSUSP(5) must map to glibc c_cc[10], NOT c_cc[5] (VTIME). A blanket 0..8 copy silently drops VSUSP:
+ * it writes it onto the VTIME slot and leaves c_cc[10] zero, so after bash's first job-control
+ * get/set round-trip the terminal's VSUSP became 0 and ^Z stopped generating SIGTSTP for later jobs
+ * (#798). VMIN/VTIME travel as the op's separate vmin/vtime words (buf[2]/buf[3]). */
 int tcgetattr(int fd, void *t) {
   long buf[4];
   long r = px_call_(PX_TCGETATTR, fd, (long)buf, 0, 0);
@@ -315,9 +322,10 @@ int tcgetattr(int fd, void *t) {
   unsigned long i;
   for (i = 0; i < 60; i = i + 1) b[i] = 0;
   *(unsigned int *)(b + 12) = (unsigned int)buf[0]; /* c_lflag */
-  for (i = 0; i < 8; i = i + 1) b[17 + i] = ((char *)&buf[1])[i]; /* cc[0..8) */
-  b[17 + 6] = (char)buf[2]; /* VMIN */
-  b[17 + 5] = (char)buf[3]; /* VTIME */
+  for (i = 0; i < 5; i = i + 1) b[17 + i] = ((char *)&buf[1])[i]; /* VINTR..VEOF: glibc c_cc[0..5) */
+  b[17 + 10] = ((char *)&buf[1])[5]; /* op VSUSP(5) -> glibc c_cc[VSUSP] = 10 */
+  b[17 + 6] = (char)buf[2]; /* VMIN -> glibc c_cc[6] */
+  b[17 + 5] = (char)buf[3]; /* VTIME -> glibc c_cc[5] */
   return 0;
 }
 int tcsetattr(int fd, int actions, const void *t) {
@@ -327,9 +335,10 @@ int tcsetattr(int fd, int actions, const void *t) {
   unsigned long i;
   buf[0] = *(const unsigned int *)(b + 12);
   buf[1] = 0;
-  for (i = 0; i < 8; i = i + 1) ((char *)&buf[1])[i] = b[17 + i];
-  buf[2] = (unsigned char)b[17 + 6];
-  buf[3] = (unsigned char)b[17 + 5];
+  for (i = 0; i < 5; i = i + 1) ((char *)&buf[1])[i] = b[17 + i]; /* VINTR..VEOF */
+  ((char *)&buf[1])[5] = b[17 + 10]; /* glibc c_cc[VSUSP]=10 -> op VSUSP(5) */
+  buf[2] = (unsigned char)b[17 + 6]; /* VMIN */
+  buf[3] = (unsigned char)b[17 + 5]; /* VTIME */
   return (int)px_ret_(px_call_(PX_TCSETATTR, fd, (long)buf, 0, 0));
 }
 int tcgetwinsize(int fd, void *ws) {

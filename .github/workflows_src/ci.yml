@@ -1017,6 +1017,10 @@ jobs:
           # #797 line discipline / draining output), type a builtin and a fork+exec'd coreutil at
           # the prompt, ^D exits. SKIPs with the batch test when bash.temen is absent.
           node browser-bash-interactive-test.mjs
+          # The interactive bash card's JOB TABLE with several jobs (#798 multiple concurrent jobs):
+          # ^Z two `cat`s so both sit stopped, `jobs` lists them with the [1]-/[2]+ previous/current
+          # markers, `fg %1`/`fg %2` resume each by spec. SKIPs with the batch when bash.temen is absent.
+          node browser-bash-jobs-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
