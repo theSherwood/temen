@@ -27,6 +27,19 @@ use temen_interp::{bytecode, host_page_size, Host, Value};
 
 const FUEL: u64 = 10_000_000;
 
+// #1182 — serialize the tests that drive the `temen_par_*` codegen path. The emitted-JIT stash
+// (`WASMJIT`, `PAR_JIT_ELIGIBLE`, `PAR_JIT_PAGED`) and its once-per-run memoization
+// (`PAR_RUN_GEN` → `TIERUP_DONE_GEN`) are process-GLOBAL and single-run by design: in production one
+// page runs one program, and the page-side publisher bumps the generation serially before any Worker
+// is alive (see `CodegenGuard` in `browser/src/lib.rs`). `cargo test` breaks that assumption by
+// running these two tests concurrently: their `powerbox_inst` gen-bumps and `enable_jit*` emits
+// interleave, so the paged test can observe `TIERUP_DONE_GEN == generation` already set by the
+// sibling's NON-paged emit and early-return with `PAR_JIT_PAGED` still false — then its child either
+// tiers up with no pagestate table (`plen == 0`) or, on a module mismatch, never tiers up at all.
+// Holding this lock across each test body restores the serial single-run contract the globals assume.
+// Poison-tolerant (`into_inner`) so one test's panic still lets the other run and report on its own.
+static JIT_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Window-relative offset the leaf writes its marker to. It must be **above the #1094 unconditional
 /// NULL guard** (`[0, POWERBOX_NULL_GUARD)` = `[0, 16 KiB)` faults on any guest access) yet still
 /// inside the child's carve — so the same offset is valid in both the root window and the carve.
@@ -115,6 +128,7 @@ fn service_tierup(v: *mut temen_browser::ParVcpu, win: *mut u8, len: u64) {
 
 #[test]
 fn par_confined_child_tiers_up_over_its_own_carve() {
+    let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // #1182 — serial single-run
     let m = temen_text::parse_module(SRC).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
@@ -289,6 +303,7 @@ block 0 (vx: i64) {{
 /// assertion inspects.
 #[test]
 fn par_confined_child_paged_reflects_its_own_unmap() {
+    let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner()); // #1182 — serial single-run
     let page = host_page_size();
     // Page-aligned offsets above the 16 KiB NULL guard, inside the 64 KiB carve.
     let unmap_off = 16384u64; // the first usable page (guard is a multiple of every host page size)
