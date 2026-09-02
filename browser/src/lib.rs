@@ -5677,11 +5677,7 @@ impl JitOnrampRun {
         // The window backing must be exactly `1 << win_log2` bytes — the emitter masks every access to
         // that domain, so a shorter backing would let a masked access read past it. Every caller sizes
         // `back`/`win_size` this way; assert the contract rather than silently trusting it.
-        debug_assert_eq!(
-            win_size,
-            1u64 << win_log2,
-            "window backing must equal 1 << win_log2"
-        );
+        debug_assert_eq!(win_size, 1u64 << win_log2, "window backing must equal 1 << win_log2");
         // The emit (outline → interp program → `compile_jit`) is what a re-Run reuses via `cached`
         // (#1011 slice 1): a nifler emit is ~2 s and its `Module` clone another ~2 s, so a cache hand
         // here turns a re-Run into build-window + drive. On a miss we emit fresh and return the products
@@ -8626,8 +8622,7 @@ pub extern "C" fn temen_op13jit_open() -> i32 {
     ) else {
         return -STATUS_DECODE_ERR;
     };
-    if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
-    {
+    if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err() {
         return -STATUS_VERIFY_ERR;
     }
     let Some(prog) = bytecode::VcpuProgram::compile(&driver) else {
@@ -8932,7 +8927,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
                 let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
                 let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
-                               // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
+                // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
                 let cached = if d.child_key != 0 {
                     unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
                         .filter(|c| c.key == d.child_key)
@@ -9007,11 +9002,7 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
 /// The driver's final return value (valid after a [`OP13JIT_DONE`] step).
 #[no_mangle]
 pub extern "C" fn temen_op13jit_result() -> i64 {
-    unsafe {
-        (*core::ptr::addr_of!(OP13_JIT))
-            .as_ref()
-            .map_or(0, |d| d.result)
-    }
+    unsafe { (*core::ptr::addr_of!(OP13_JIT)).as_ref().map_or(0, |d| d.result) }
 }
 
 /// The marshaled `"fs"` counter — the observable proof the granted cap ran inside the emitted child.
@@ -10244,8 +10235,7 @@ pub extern "C" fn temen_durable_thaw_resume(
     };
     let mut host = Host::new();
     host.set_durable(true);
-    let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host)
-    {
+    let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host) {
         Ok(t) => t,
         Err(_) => {
             set(STATUS_UNSUPPORTED);
@@ -10271,10 +10261,9 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     };
     temen_durable::begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
-                                             // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
-                                             // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
-    let Some(back) =
-        temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
+    // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
+    // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
+    let Some(back) = temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
     else {
         set(STATUS_UNSUPPORTED);
         return 0;
@@ -12102,19 +12091,13 @@ block 0 () {
         let (host, counter) = granted_fs_host();
         let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new(), None)
             .expect("open an owned JIT run over the granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the granted host");
+        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the granted host");
         assert_eq!(
             r.first(),
             Some(&Value::I64(41)),
             "child f0 = 40 + granted fs() = 41 over the caller-provided powerbox"
         );
-        assert_eq!(
-            *counter.lock().unwrap(),
-            1,
-            "the granted fs ran exactly once"
-        );
+        assert_eq!(*counter.lock().unwrap(), 1, "the granted fs ran exactly once");
     }
 
     #[test]
@@ -12138,12 +12121,9 @@ block 0 () {
             .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
             .expect("marshal the grant list into a child powerbox");
 
-        let mut run =
-            JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
-                .expect("open a JIT run over the *marshaled* granted host");
-        let r = run
-            .run_cross_tier(0, &[])
-            .expect("child f0 runs over the marshaled host");
+        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
+            .expect("open a JIT run over the *marshaled* granted host");
+        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the marshaled host");
         assert_eq!(
             r.first(),
             Some(&Value::I64(41)),
