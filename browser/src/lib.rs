@@ -7382,6 +7382,7 @@ pub extern "C" fn temen_bash_session(
     bins_ptr: *const u8,
     bins_len: usize,
 ) -> i32 {
+    par_install_panic_capture(); // I22: a mid-session engine panic self-identifies (FILE:LINE) not a bare `unreachable`
     let slice = |p: *const u8, n: usize| -> &'static [u8] {
         if p.is_null() || n == 0 {
             &[]
