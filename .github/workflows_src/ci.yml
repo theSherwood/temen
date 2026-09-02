@@ -965,6 +965,24 @@ jobs:
           # (the first in-browser exercise of the guest-runtime-JIT growth path). No assets — parses
           # in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
           node browser-jit-runtime-grow-test.mjs
+          # #1025 Path 1: the JS-orchestrated §14 op-13 loop — a resumable driver marshals an `fs` grant to
+          # a confined child, and JS runs that child's `_start` on emitted wasm over its carve. The child's
+          # `call.cap` leaf resolves the marshaled `fs` on the reactor cross-tier bounce and returns 41; the
+          # driver joins it. The browser realization of nimc.rs::drive_op13 with the child tiered up. No
+          # assets (parses in-page); reuses the threads module built above.
+          node browser-op13jit-e2e-test.mjs
+          # #1025 Path 1 (real nifler): the same op-13 loop scaled to a REAL phase child — a driver marshals
+          # {fs,stdout,exit} to nifler_ce (child-entry) and JS runs its `_start` on emitted wasm over the
+          # carve; it reads the source from the marshaled memfs and writes `.p.nif`, byte-identical to the
+          # interpreter oracle (top-level nifler on the tree-walker). nimc.rs phase-1 nifler crawl, nested +
+          # JIT'd. Uses the committed nifler_ce.temen.gz + web/assets/nifler.temen.gz; reuses the threads module.
+          node browser-op13jit-nifler-test.mjs
+          # #1025 Path 1 (whole card): drive the WHOLE nim card through the op-13 loop — the compile's phase-1
+          # nifler crawl runs each module as a nested op-13 emitted child (nifler_ce, {fs,stdout,exit}
+          # marshaled, emit cached across modules), then nimsem/hexer/link/run finish. The card's output is
+          # byte-identical whether phase-1 ran on the interpreter or as nested op-13 emitted children. Uses
+          # the committed nim assets + nifler_ce.temen.gz; reuses the threads module.
+          node browser-nim-op13-crawl-e2e-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to

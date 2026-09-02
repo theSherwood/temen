@@ -16,6 +16,36 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
+  one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
+  drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module
+  as a nested op-13 emitted child (nifler_ce, `{fs,stdout,exit}` marshaled, the nifler_ce emit cached across
+  modules), then nimsem/hexer/link/run finish — and the card's output is asserted byte-identical whether
+  phase-1 ran on the interpreter or as nested op-13 emitted children (`hello, Nim…`, 4 modules crawled). Uses
+  the committed nim assets + `nifler_ce.temen.gz` (stages a temp gunzipped copy it deletes); reuses the
+  threads wasm the job already builds. Verified locally in Chromium. (Until copied over, the
+  `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`browser-op13jit-nifler-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, real nifler)** —
+  one line added after `node browser-op13jit-e2e-test.mjs`: `node browser-op13jit-nifler-test.mjs`. It scales
+  the op-13 loop to a **real phase child**: a driver marshals `{fs, stdout, exit}` to nifler_ce (child-entry)
+  and JS runs its `_start` on emitted wasm over the carve; it reads the source from the marshaled memfs and
+  writes `.p.nif`, asserted byte-identical to the interpreter oracle (top-level nifler on the tree-walker) —
+  `nimc.rs` phase-1 nifler crawl, nested under op-13 and tiered up to JIT. Uses the committed
+  `nifler_ce.temen.gz` + `web/assets/nifler.temen.gz` (stages a temp gunzipped copy it deletes); reuses the
+  threads wasm the job already builds. Verified locally in Chromium (174B `.p.nif` ≡ oracle). (Until copied
+  over, the `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`browser-op13jit-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1)** — one line added
+  after `node browser-jit-runtime-grow-test.mjs`: `node browser-op13jit-e2e-test.mjs` (with a comment). It
+  pins the JS-orchestrated §14 op-13 loop in real V8: a resumable driver marshals an `fs` grant to a
+  confined child, JS runs that child's `_start` on **emitted wasm** over its carve, the child's `call.cap`
+  leaf resolves the *marshaled* `fs` on the reactor cross-tier bounce and returns 41, and the driver joins
+  it — the browser realization of `nimc.rs::drive_op13` with the child tiered up. No new toolchain (reuses
+  the threads wasm the job already builds); parses its guest in-page, so no assets. Verified locally in
+  Chromium (result 41, counter 1). (Until copied over, the `workflows-in-sync` guard stays red — the
+  expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-durable-persist-reload-test.mjs` in the `browser-real` job (`ci.yml`, #816 Slice C)** — one
   line added after `node browser-jit-runtime-grow-test.mjs`: `node browser-durable-persist-reload-test.mjs`.
   It is the invariant-14 **durability axis, cross-host leg** pin: a `vm_map`-GROWN durability-instrumented
