@@ -183,5 +183,15 @@ test = false
 doc = false
 bench = false
 
+# #1151 nested paged per-access check (`compile_module_nested_paged` + the outlined page-op bounce) vs
+# the interpreter's `check_prot` — the emitted §14 nested tier's page-state confinement, with the bounce
+# serviced on a real vCPU (`bounce_call`). The stable `nested_paged_diff` test drives the same `fuzz_one`.
+[[bin]]
+name = "nested_paged"
+path = "fuzz_targets/nested_paged.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

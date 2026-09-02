@@ -16,6 +16,13 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`nested_paged` in the `fuzz` job matrix (`ci.yml`, #1151)** — one row added after `paged_walk`
+  (plus a comment line): the new `fuzz/fuzz_targets/nested_paged.rs` target (the emitted §14 nested
+  paged scalar page check vs the interpreter oracle, page-op bounce serviced on a real vCPU). Until
+  copied over, the `fuzz targets wired` lockstep guard (`scripts/ci/check-fuzz-matrix.sh`) is red on
+  the PR — the target file and its `fuzz/Cargo.toml` `[[bin]]` exist but the live matrix lacks the row;
+  `cp .github/workflows_src/*.yml .github/workflows/` drains it.
+
 - **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
   one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
   drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module
