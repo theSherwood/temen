@@ -4634,3 +4634,98 @@ fn c_terminal_fg_resumes_a_stopped_execd_job_then_restops_it() {
          wake and re-parked the shell's reap — matching the oracle (this is the bash `fg` resume shape)"
     );
 }
+
+fn mjobs_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pa, pb;\n\
+static int fa[2]; static int fb[2];\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }}\n\
+int main(void){{\n\
+  int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  pa = __px_fork(0,0);\n\
+  if (pa < 0) return 1;\n\
+  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 2;\n\
+  if (pb == 0){{ __px_setpgid(0,0,0); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  __px_setpgid(0, pa, pa);\n\
+  __px_setpgid(0, pb, pb);\n\
+  /* stop BOTH background groups; the per-op stop poll parks each job stopped even though the stop\n\
+     races their first read. The shell then collects two WUNTRACED reports across the two pgids. */\n\
+  __px_kill(0, -pa, 20);\n\
+  __px_kill(0, -pb, 20);\n\
+  int sa=0, sb=0, k;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){{}}\n\
+    if (h < 0) return 100+k;\n\
+    if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
+    if (h==pa) sa++; else if (h==pb) sb++; else return 200+k;\n\
+  }}\n\
+  if (sa!=1 || sb!=1) return 300;\n\
+  __px_kill(0,-pa,18); __px_kill(0,-pb,18);\n\
+  wr1(fa[1]); wr1(fb[1]);\n\
+  int ea=0, eb=0;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+    if (h < 0) return 4000 + (int)(-h);\n\
+    if ((status & 0x7f) != 0) return 500 + (status & 0xffff);\n\
+    int code = (status>>8)&0xff;\n\
+    if (h==pa){{ if(code!=7) return 601; ea++; }}\n\
+    else if (h==pb){{ if(code!=9) return 602; eb++; }}\n\
+    else return 603;\n\
+  }}\n\
+  if (ea!=1 || eb!=1) return 700;\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #798 multiple concurrent jobs — the personality carries SEVERAL jobs at once, each in its own
+// process group, and the shell manages them by group: two background jobs (each `setpgid`'d into its
+// own pgid, then parked on a pipe read) are BOTH stopped via `kill(-pgid, SIGTSTP)`, the shell
+// collects two `waitpid(-1, WUNTRACED)` stop reports across the two groups (the one-shot reap-wake
+// edge must survive draining two pending transitions, not just one), then BOTH are continued via
+// `kill(-pgid, SIGCONT)`, fed a byte so their reads complete, and reaped — each exit reported exactly
+// once through the wildcard `waitpid(-1)`. This is the job-table-depth shape behind `cmd1 & cmd2 &`
+// + `^Z`/`bg`/`fg %n`: the single-job #1171 path generalized to N groups. The waits retry `EINTR`
+// (as real bash's reap loop does): a continue transition can spuriously wake a wildcard wait, and the
+// tree-walker surfaces that as `EINTR` where the coop engine re-blocks — both converge once retried.
+#[test]
+fn c_multiple_background_jobs_stop_and_continue_across_process_groups() {
+    let e = run_interp_only(&mjobs_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: two jobs in two pgids each stopped + reported via waitpid(-1, WUNTRACED), then \
+         continued and reaped — one exit each through the wildcard wait"
+    );
+    let b = run_bytecode_only(&mjobs_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the all-parked sweep drained two pending stop transitions on \
+         the one-shot reap edge and re-parked between them — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(&mjobs_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: the same two-group stop/continue/reap over real OS threads — matching the oracle"
+    );
+}

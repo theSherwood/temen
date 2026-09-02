@@ -46,6 +46,17 @@ identical until the next agent edit.
   Chromium (result 41, counter 1). (Until copied over, the `workflows-in-sync` guard stays red — the
   expected mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`browser-bash-jobs-test.mjs` in the `browser-real` job (`ci.yml`, #798 multiple concurrent jobs)** —
+  one line added after `node browser-bash-interactive-test.mjs`: `node browser-bash-jobs-test.mjs`. It
+  drives the interactive bash card's **job table with several jobs**: `^Z` two `cat`s so both sit stopped,
+  `jobs` lists them with the `[1]-`/`[2]+` previous/current markers, `fg %1`/`fg %2` resume each by job
+  spec (re-`^Z` between them), then the stopped-jobs `^D` exit. SKIPs cleanly with the rest of the bash
+  batch when the deploy-built `bash.temen`/`bin_cat.temen` are absent, so it reds only on a real
+  job-control regression. Pairs with the shim fix in this change (`bash_shim.c` VSUSP marshalling) and the
+  native cross-engine differential (`c_posix.rs::c_multiple_background_jobs_stop_and_continue_across_process_groups`).
+  Verified locally in Chromium. (Until copied over, the `workflows-in-sync` guard stays red — the expected
+  mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-durable-persist-reload-test.mjs` in the `browser-real` job (`ci.yml`, #816 Slice C)** — one
   line added after `node browser-jit-runtime-grow-test.mjs`: `node browser-durable-persist-reload-test.mjs`.
   It is the invariant-14 **durability axis, cross-host leg** pin: a `vm_map`-GROWN durability-instrumented
