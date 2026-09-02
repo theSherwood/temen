@@ -55,7 +55,7 @@ try {
   page.on('pageerror', (e) => { pageErrors.push(e.message); console.log(`  [pageerror] ${e.message}`); });
   await page.goto(`http://127.0.0.1:${port}/`, { waitUntil: 'load' });
 
-  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'jitruntime', 'jitb2', 'instthreads'];
+  const WORK_IDS = ['powerbox', 'threads', 'jit', 'inst', 'capio', 'wasmjit', 'tierup', 'jitcodegen', 'instcodegen', 'instnested', 'instpaged', 'jitruntime', 'jitb2', 'instthreads'];
   const read = (id) => page.$eval(`#${id}`, (e) => ({ status: e.dataset.status, text: e.textContent }));
 
   // I22 mitigation: the index page exercises the rare shared-memory codegen-stash race (a worker vCPU
@@ -66,7 +66,7 @@ try {
   // visible (per AGENTS.md "log flakiness early"); a real regression fails all 3 attempts and stays red.
   const INDEX_ATTEMPTS = 3;
   let pageOk = false;
-  let isolated, powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, jitruntime, jitb2, instthreads;
+  let isolated, powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads;
   for (let attempt = 1; attempt <= INDEX_ATTEMPTS; attempt++) {
     if (attempt > 1) {
       console.log(`  [I22 retry] index-page attempt ${attempt}/${INDEX_ATTEMPTS} — reloading (a prior attempt hit the rare codegen-race trap; it clears on reload)`);
@@ -102,6 +102,7 @@ try {
     jitcodegen = await read('jitcodegen');
     instcodegen = await read('instcodegen');
     instnested = await read('instnested');
+    instpaged = await read('instpaged');
     jitruntime = await read('jitruntime');
     jitb2 = await read('jitb2');
     instthreads = await read('instthreads');
@@ -110,14 +111,14 @@ try {
       threads.status === 'pass' && jit.status === 'pass' && inst.status === 'pass' &&
       capio.status === 'pass' && wasmjit.status === 'pass' && tierup.status === 'pass' &&
       jitcodegen.status === 'pass' && instcodegen.status === 'pass' &&
-      instnested.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
+      instnested.status === 'pass' && instpaged.status === 'pass' && jitruntime.status === 'pass' && jitb2.status === 'pass' &&
       instthreads.status === 'pass';
     if (pageOk) {
       if (attempt > 1) console.log(`  [I22 retry] index page passed on attempt ${attempt} (self-healed the flake)`);
       break;
     }
     if (attempt < INDEX_ATTEMPTS) {
-      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, jitruntime, jitb2, instthreads][i].status !== 'pass');
+      const bad = WORK_IDS.filter((id, i) => [powerbox, threads, jit, inst, capio, wasmjit, tierup, jitcodegen, instcodegen, instnested, instpaged, jitruntime, jitb2, instthreads][i].status !== 'pass');
       console.log(`  [I22 retry] attempt ${attempt}: index page not green (failing: ${bad.join(', ') || 'isolated'}) — retrying`);
     }
   }
@@ -133,6 +134,7 @@ try {
   console.log(`  ${jitcodegen.text}`);
   console.log(`  ${instcodegen.text}`);
   console.log(`  ${instnested.text}`);
+  console.log(`  ${instpaged.text}`);
   console.log(`  ${jitruntime.text}`);
   console.log(`  ${jitb2.text}`);
   console.log(`  ${instthreads.text}\n`);

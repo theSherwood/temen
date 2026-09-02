@@ -1255,6 +1255,50 @@ block 0 (v0: i64) {
 }
 "#;
 
+// #1151 — the **page-op** granted module (the real-Chromium twin of `browser/tests/inst_codegen_paged.rs`):
+// with the same [`THREADS_INST_MOD`] root, the unit's entry (emitted, **paged**) calls a helper that
+// `unmap`s page P (32 KiB) and `protect`s page Q (48 KiB, holding "K" = 75) read-only — an out-of-subset
+// leaf the Worker bounces whole onto the child's own vCPU over its carve, re-syncing the page-state
+// table after — then reads K on the `Ro` page and stores + loads a marker at `target`, returning
+// `75 × 100 + 9 = 7509`; the root sums 8 × 7509 = 60072. Offsets are 16 KiB multiples so they are
+// page-aligned on a 4 KiB (wasm) or 16 KiB host page. `target` on an `Rw` page (16 KiB + 8) passes; on
+// the unmapped page P (`threads_inst_paged_trap_unit`) the child faults on BOTH tiers.
+fn inst_paged_unit(target: u64) -> String {
+    format!(
+        r#"memory 16
+data 49152 "K"
+func (i64, i64) -> (i64) {{
+block 0 (vinst: i64, vas: i64) {{
+  vr = call 1 (vas)
+  vq = i64.const 49152
+  vk = i64.load8_u vq
+  vt = i64.const {target}
+  vm = i64.const 9
+  i64.store vt vm
+  vld = i64.load vt
+  vhundred = i64.const 100
+  vkh = i64.mul vk vhundred
+  vsum = i64.add vkh vld
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vas: i64) {{
+  vas32 = i32.wrap_i64 vas
+  vlen = i64.const 16384
+  vp = i64.const 32768
+  vr1 = call.cap 5 1 (i64, i64) -> (i64) vas32 (vp, vlen)
+  vq = i64.const 49152
+  vro = i32.const 1
+  vr2 = call.cap 5 2 (i64, i64, i32) -> (i64) vas32 (vq, vlen, vro)
+  vsum = i64.add vr1 vr2
+  return vsum
+  }}
+}}
+"#
+    )
+}
+
 // §22 runtime-compile unit for the multi-Worker twins: `() -> (i32)` returning 7 — each worker vCPU
 // compiles it AT RUNTIME (`call.cap 11 0`) from the blob the harness stages in the window.
 const JIT_RT_UNIT: &str = r#"memory 16
@@ -2220,6 +2264,9 @@ fn main() {
     emit("threads_inst_mod_high", THREADS_INST_MOD_HIGH);
     emit("threads_inst_unit_high", THREADS_INST_UNIT_HIGH);
     emit("threads_inst_nested_unit", THREADS_INST_NESTED_UNIT);
+    // #1151 — the page-op unit (→ 8 × 7509 = 60072) and its trap twin (store on the unmapped page).
+    emit("threads_inst_paged_unit", &inst_paged_unit(16384 + 8));
+    emit("threads_inst_paged_trap_unit", &inst_paged_unit(32768 + 8));
     emit("threads_inst_threads_unit", THREADS_INST_THREADS_UNIT);
     // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them
     // (blob offsets/lengths baked into the guest's `compile (ptr, len)` sites; the harness stages

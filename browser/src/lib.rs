@@ -5738,6 +5738,62 @@ impl JitOnrampRun {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The single-shot emit (outline → interp program → `compile_jit`) a run is built around — the
+    /// products a re-Run reuses via `cached` (#1011 slice 1). `Err(STATUS_UNSUPPORTED)` is the decline:
+    /// `_start` out of subset, a suspending reachable set, or a module that manages its own pages
+    /// (`unmap`/`protect` — the mask-only emit can't honor page state, DESIGN.md §14). Factored out so a
+    /// caller that has somewhere else to run the guest (the op-13 loop's interpreter child) can learn
+    /// the decline **before** it commits its powerbox to a run.
+    pub(crate) fn emit_for_run(
+        m: &temen_ir::Module,
+        shared_memory: bool,
+    ) -> Result<CachedEmit, i32> {
+        // A §14 **child-entry** module (`f0: [I64]->[I64]` / `[I64,I64]->[I64]`, `child_entry_ok`)
+        // is not a named-powerbox `_start`, so it fails `onramp_check` — but its manifest is bound
+        // separately by the op-13 servicer (`bind_child_manifest`), so the check is moot. Skip it
+        // for a child-entry; keep it for every `_start` guest (#1025 Path 1).
+        let child_entry = m.funcs.first().is_some_and(|f| {
+            f.results[..] == [temen_ir::ValType::I64]
+                && (f.params[..] == [temen_ir::ValType::I64]
+                    || f.params[..] == [temen_ir::ValType::I64, temen_ir::ValType::I64])
+        });
+        if !child_entry {
+            onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        }
+        let mut module = m.clone();
+        temen_wasm_jit::outline_cap_calls(&mut module);
+        // #1153: NO pre-size. The emitted `_start` grows the live window via `vm_map` — the
+        // emitter's bounds check reads the live `"mapped"` global, not a baked `1 << size_log2`
+        // (`temen-wasm-jit` `MAPPED_GLOBAL_IDX`), so growth is already emittable. `run_cross_tier`
+        // persists the grown page state across bounces and surfaces the new extent for the JS
+        // `"mapped"` re-sync — parity with the coop tier (invariant 14). The declared window stays
+        // the guest's own, so `mapped` starts small and grows; a `vm_map` past the window gets the
+        // same result the interpreter oracle gives, and the emitted access to it then declines.
+        // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
+        let program = std::sync::Arc::new(
+            bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
+        );
+        // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to
+        // `env.call_interp`. The front door reports `InterpDriven` (→ fall back to the pure
+        // interpreter) if `_start` is out of subset or its reachable set can suspend — this
+        // driver can only run a wasm-driven artifact.
+        let artifact = temen_wasm_jit::compile_jit(
+            &module,
+            temen_wasm_jit::Shape::Batch { entry: 0 },
+            shared_memory,
+        )
+        .map_err(|_| STATUS_UNSUPPORTED)?;
+        let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
+            return Err(STATUS_UNSUPPORTED);
+        };
+        Ok((
+            std::sync::Arc::new(module),
+            program,
+            std::sync::Arc::from(artifact.wasm),
+            artifact.emitted,
+        ))
+    }
+
     fn open_over_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
@@ -5764,52 +5820,7 @@ impl JitOnrampRun {
         // (all `Arc`-shared) so the caller can stash them for next time.
         let (module, program, emitted_wasm, emitted): CachedEmit = match cached {
             Some(c) => c,
-            None => {
-                // A §14 **child-entry** module (`f0: [I64]->[I64]` / `[I64,I64]->[I64]`, `child_entry_ok`)
-                // is not a named-powerbox `_start`, so it fails `onramp_check` — but its manifest is bound
-                // separately by the op-13 servicer (`bind_child_manifest`), so the check is moot. Skip it
-                // for a child-entry; keep it for every `_start` guest (#1025 Path 1).
-                let child_entry = m.funcs.first().is_some_and(|f| {
-                    f.results[..] == [temen_ir::ValType::I64]
-                        && (f.params[..] == [temen_ir::ValType::I64]
-                            || f.params[..] == [temen_ir::ValType::I64, temen_ir::ValType::I64])
-                });
-                if !child_entry {
-                    onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
-                }
-                let mut module = m.clone();
-                temen_wasm_jit::outline_cap_calls(&mut module);
-                // #1153: NO pre-size. The emitted `_start` grows the live window via `vm_map` — the
-                // emitter's bounds check reads the live `"mapped"` global, not a baked `1 << size_log2`
-                // (`temen-wasm-jit` `MAPPED_GLOBAL_IDX`), so growth is already emittable. `run_cross_tier`
-                // persists the grown page state across bounces and surfaces the new extent for the JS
-                // `"mapped"` re-sync — parity with the coop tier (invariant 14). The declared window stays
-                // the guest's own, so `mapped` starts small and grows; a `vm_map` past the window gets the
-                // same result the interpreter oracle gives, and the emitted access to it then declines.
-                // Compile once — reused for every cross-tier bounce (and shared across Runs via the cache).
-                let program = std::sync::Arc::new(
-                    bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
-                );
-                // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to
-                // `env.call_interp`. The front door reports `InterpDriven` (→ fall back to the pure
-                // interpreter) if `_start` is out of subset or its reachable set can suspend — this
-                // driver can only run a wasm-driven artifact.
-                let artifact = temen_wasm_jit::compile_jit(
-                    &module,
-                    temen_wasm_jit::Shape::Batch { entry: 0 },
-                    shared_memory,
-                )
-                .map_err(|_| STATUS_UNSUPPORTED)?;
-                let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
-                    return Err(STATUS_UNSUPPORTED);
-                };
-                (
-                    std::sync::Arc::new(module),
-                    program,
-                    std::sync::Arc::from(artifact.wasm),
-                    artifact.emitted,
-                )
-            }
+            None => Self::emit_for_run(m, shared_memory)?,
         };
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
@@ -8695,11 +8706,32 @@ static mut OP13_JIT_COUNTER: Option<std::sync::Arc<std::sync::Mutex<i64>>> = Non
 /// build error. Drive it with [`temen_op13jit_step`].
 #[no_mangle]
 pub extern "C" fn temen_op13jit_open() -> i32 {
+    let Ok(child) = temen_text::parse_module(OP13_MINI_CHILD) else {
+        return -STATUS_DECODE_ERR;
+    };
+    op13jit_open_mini(child)
+}
+
+/// [`temen_op13jit_open`] over a **caller-provided** encoded child module (the same mini driver +
+/// marshaled `"fs"` counter; the child is spawned into the driver's 32-KiB buddy-half carve, so it
+/// declares `memory 15` or less). The seam the page-op / decline gates use: a child the single-shot
+/// emit declines (#1151) runs on the interpreter inside [`temen_op13jit_step`] instead of trapping it.
+///
+/// # Safety
+/// `(ptr, len)` must be a live `temen_alloc`ation the host just filled (or any readable byte range
+/// for a native caller).
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_open_child(ptr: *const u8, len: usize) -> i32 {
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    let Ok(child) = temen_encode::decode_module(bytes) else {
+        return -STATUS_DECODE_ERR;
+    };
+    op13jit_open_mini(child)
+}
+
+fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
     temen_op13jit_close();
-    let (Ok(driver), Ok(child)) = (
-        temen_text::parse_module(OP13_MINI_DRIVER),
-        temen_text::parse_module(OP13_MINI_CHILD),
-    ) else {
+    let Ok(driver) = temen_text::parse_module(OP13_MINI_DRIVER) else {
         return -STATUS_DECODE_ERR;
     };
     if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
@@ -8981,34 +9013,22 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             }
             bytecode::VcpuEvent::Trapped(_) => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Instantiate {
+                module,
                 entry,
                 carve,
                 size_log2,
-                ..
+                fuel,
             } => {
                 let Some(mut host) = d.root.take_granted_host() else {
                     return OP13JIT_TRAP; // the driver always marshals; a grant-less child is off-contract
                 };
-                // Replicate the confined child-entry setup `new_confined_child_over_host` does, so the
-                // child runs EMITTED over the same powerbox it would on the interpreter: grant the starter
-                // Instantiator + AddressSpace over the carve, bind the child's import manifest (write/read/
-                // exit/fs) against the re-granted caps, and pass the child-entry its `Instantiator` handle
-                // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
-                // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
                 let child_size = 1u64 << size_log2;
-                let cinst = host.grant_instantiator(0, child_size);
-                let _cas = host.grant_address_space(0, child_size);
-                if host
-                    .bind_child_manifest(&d.child.imports, &d.child.types)
-                    .is_err()
-                {
-                    return OP13JIT_TRAP;
-                }
                 // SAFETY: the engine validated the carve within the driver's window; the child window
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
                 let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
-                let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
-                               // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
+                // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once);
+                // on a miss, emit now — BEFORE the powerbox is committed to a run — so a decline still has
+                // the powerbox to run the child on the interpreter with.
                 let cached = if d.child_key != 0 {
                     unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
                         .filter(|c| c.key == d.child_key)
@@ -9017,6 +9037,51 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     None
                 };
                 let had_cache = cached.is_some();
+                let emit = match cached {
+                    Some(c) => c,
+                    None => match JitOnrampRun::emit_for_run(&d.child, true) {
+                        Ok(e) => e,
+                        Err(_) => {
+                            // #1151: the emit declined (a child that `unmap`s/`protect`s its pages, an
+                            // out-of-subset entry, a suspending reachable set). Run the child on the
+                            // interpreter over the same carve and powerbox instead of trapping the driver:
+                            // `new_confined_child_over_host` grants the starter caps and binds the manifest
+                            // exactly as the native `drive_op13` does, and the result is banked for the
+                            // driver's `join` like an emitted child's. Fail-closed, byte-identical.
+                            // SAFETY: `prog` outlives the driver (freed in `close`, after the root and this
+                            // child are dropped); the carve region aliases the driver's live window.
+                            let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
+                            let back = std::sync::Arc::new(unsafe {
+                                temen_interp::Region::shared(carve_ptr, child_size)
+                            });
+                            let r = match bytecode::Vcpu::new_confined_child_over_host(
+                                prog, module, entry, back, size_log2, fuel, host,
+                            ) {
+                                Ok(c) => nimc::drive_op13(prog, carve_ptr, c),
+                                Err(t) => Err(t),
+                            };
+                            let handle = d.children.len() as i32;
+                            d.children.push(r);
+                            d.root.deliver_handle(handle);
+                            continue; // the driver's `join` on this handle is serviced inline below
+                        }
+                    },
+                };
+                // Replicate the confined child-entry setup `new_confined_child_over_host` does, so the
+                // child runs EMITTED over the same powerbox it would on the interpreter: grant the starter
+                // Instantiator + AddressSpace over the carve, bind the child's import manifest (write/read/
+                // exit/fs) against the re-granted caps, and pass the child-entry its `Instantiator` handle
+                // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
+                // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
+                let cinst = host.grant_instantiator(0, child_size);
+                let _cas = host.grant_address_space(0, child_size);
+                if host
+                    .bind_child_manifest(&d.child.imports, &d.child.types)
+                    .is_err()
+                {
+                    return OP13JIT_TRAP;
+                }
+                let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -9028,7 +9093,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         Vec::new(),
                         None,
                         cinst as u64,
-                        cached,
+                        Some(emit),
                     )
                 };
                 match run {
