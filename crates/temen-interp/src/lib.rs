@@ -23376,12 +23376,23 @@ impl Mem {
     /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
     /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
     /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
-    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
-    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`. The crate stays
     /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    ///
+    /// **The reservation is clamped to the backing** (`reserved ≤ back.len()`, rounded down to a power
+    /// of two, never below the mapped prefix). The confinement bound of every access is the
+    /// reservation (`Window::checked_reserved` + the page map), and the flat backings' word fast
+    /// path (`Region::read_word`/`write_word`) is bounded by that alone — so a reservation wider
+    /// than the backing let a guest `map`/`protect` pages past the backing's end (both are admitted
+    /// anywhere in `[0, reserved)`) and then read/write **host memory** behind the window through
+    /// them (found by the `nested_paged` differential: a `protect` past a 128-KiB `Region::shared`
+    /// followed by a load returned heap bytes). With the clamp, `prot_pages` rejects such a range
+    /// with `-EINVAL` (a value, invariant 5) and a scalar access past the backing faults — the
+    /// `run_over_grown` seam's #816 clamp, now enforced for every caller instead of by convention.
     fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
-        let reserved_log2 = reserved_log2.max(mapped_log2);
+        let backing_log2 = back.len().checked_ilog2().map_or(0, |b| b as u8);
+        let reserved_log2 = reserved_log2.min(backing_log2).max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
         Mem {
