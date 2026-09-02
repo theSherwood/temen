@@ -16,6 +16,16 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
+- **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
+  one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
+  drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module
+  as a nested op-13 emitted child (nifler_ce, `{fs,stdout,exit}` marshaled, the nifler_ce emit cached across
+  modules), then nimsem/hexer/link/run finish — and the card's output is asserted byte-identical whether
+  phase-1 ran on the interpreter or as nested op-13 emitted children (`hello, Nim…`, 4 modules crawled). Uses
+  the committed nim assets + `nifler_ce.temen.gz` (stages a temp gunzipped copy it deletes); reuses the
+  threads wasm the job already builds. Verified locally in Chromium. (Until copied over, the
+  `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-op13jit-nifler-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, real nifler)** —
   one line added after `node browser-op13jit-e2e-test.mjs`: `node browser-op13jit-nifler-test.mjs`. It scales
   the op-13 loop to a **real phase child**: a driver marshals `{fs, stdout, exit}` to nifler_ce (child-entry)

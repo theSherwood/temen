@@ -5492,7 +5492,6 @@ impl JitOnrampRun {
     /// As [`open_shared_run`](Self::open_shared_run): `[win_ptr, win_size)` must be a live region of this
     /// module's linear memory (the carve), used solely as this run's window, valid until the run is dropped.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub unsafe fn open_shared_run_over_host(
         m: &temen_ir::Module,
         win_ptr: *mut u8,
@@ -5503,6 +5502,7 @@ impl JitOnrampRun {
         init_mem: Vec<u8>,
         readback: Option<(temen_fs::MemFsHandle, String)>,
         entry_sp: u64,
+        cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
         let win_base = win_ptr as usize;
         let back = std::sync::Arc::new(temen_interp::Region::shared(win_ptr, win_size));
@@ -5521,7 +5521,7 @@ impl JitOnrampRun {
                 readback,
                 entry_sp,
             },
-            None,
+            cached,
         )
     }
 
@@ -8527,8 +8527,19 @@ struct Op13JitDriver {
     /// read back by [`temen_op13jit_phase_output`]. `None` for the built-in mini driver (no fs output).
     fsh: Option<temen_fs::MemFsHandle>,
     readback: Option<String>,
+    /// Identity of the child module (`nifler_module_key`), so the step reuses the cached emit across a
+    /// crawl's many `phase_open`s (the ~15 s nifler_ce emit runs once). `0` for the built-in mini child.
+    child_key: u64,
 }
 static mut OP13_JIT: Option<Op13JitDriver> = None;
+
+/// Cross-`phase_open` cache of the confined child's emit (the ~15 s nifler_ce `compile_jit`), keyed by
+/// [`nifler_module_key`] — so the nim card's per-module op-13 crawl re-emits nifler_ce only once.
+struct Op13ChildEmit {
+    key: u64,
+    emit: CachedEmit,
+}
+static mut OP13_CHILD_EMIT: Option<Op13ChildEmit> = None;
 
 /// A minimal op-13 driver that grants one cap (`"fs"`) to a confined child in a **buddy-half** carve
 /// (`voff == 1<<vsl == 32768`, the upper half of the `memory 16` window) and returns the child's join
@@ -8677,6 +8688,7 @@ pub extern "C" fn temen_op13jit_open() -> i32 {
             result: 0,
             fsh: None,
             readback: None,
+            child_key: 0,
         });
     }
     STATUS_OK
@@ -8708,6 +8720,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
     let file = String::from_utf8_lossy(sl(file_ptr, file_len)).into_owned();
     let out = String::from_utf8_lossy(sl(out_ptr, out_len)).into_owned();
     let src = sl(src_ptr, src_len).to_vec();
+    let child_key = nifler_module_key(sl(child_ptr, child_len));
     let Ok(child) = temen_encode::decode_module(sl(child_ptr, child_len)) else {
         return -STATUS_DECODE_ERR;
     };
@@ -8807,6 +8820,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             result: 0,
             fsh: Some(handle),
             readback: Some(readback),
+            child_key,
         });
     }
     STATUS_OK
@@ -8825,6 +8839,29 @@ pub extern "C" fn temen_op13jit_phase_output() -> usize {
                 files.into_iter().find(|(kk, _)| kk == k).map(|(_, v)| v)
             }
             _ => None,
+        })
+        .unwrap_or_default();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// Read **any** file the phase child wrote to the shared memfs, by memfs key (no leading `/`), onto
+/// [`OUT`]; returns its length (`0` if absent). Lets the JS crawl read both `nimcache/<stem>.p.nif` and
+/// its `.p.deps.nif` sibling (the import list) a nifler `--deps` run produces.
+///
+/// # Safety
+/// `(key_ptr, key_len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_phase_read(key_ptr: *const u8, key_len: usize) -> usize {
+    let key = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(key_ptr, key_len) })
+        .trim_start_matches('/')
+        .to_string();
+    let bytes = unsafe { (*core::ptr::addr_of!(OP13_JIT)).as_ref() }
+        .and_then(|d| d.fsh.as_ref())
+        .and_then(|h| {
+            let (files, _) = h.seed();
+            files.into_iter().find(|(k, _)| *k == key).map(|(_, v)| v)
         })
         .unwrap_or_default();
     let len = bytes.len();
@@ -8881,6 +8918,15 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
                 let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
                 let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
+                // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
+                let cached = if d.child_key != 0 {
+                    unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
+                        .filter(|c| c.key == d.child_key)
+                        .map(|c| c.emit.clone())
+                } else {
+                    None
+                };
+                let had_cache = cached.is_some();
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -8892,10 +8938,20 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         Vec::new(),
                         None,
                         cinst as u64,
+                        cached,
                     )
                 };
                 match run {
                     Ok(r) => {
+                        // On a cache miss, stash this run's emit for the next `phase_open` (same child).
+                        if !had_cache && d.child_key != 0 {
+                            unsafe {
+                                *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = Some(Op13ChildEmit {
+                                    key: d.child_key,
+                                    emit: r.cached_emit(),
+                                });
+                            }
+                        }
                         unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
                         return OP13JIT_CHILD;
                     }
@@ -11994,6 +12050,7 @@ block 0 () {
                 Vec::new(),
                 None,
                 0,
+                None,
             )
         }
         .expect("open a JIT run over the caller-provided granted host");

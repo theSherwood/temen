@@ -752,6 +752,116 @@ export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath
   return { crawled };
 }
 
+// The **op-13 nested** variant of `jitNimCrawl` (#1025 Path 1 — drive the whole nim card through the op-13
+// loop): each module's `nifler --deps parse` step runs as a §14 op-13 **nested** child (nifler_ce) whose
+// `_start` executes on emitted wasm over a confined carve, its `{fs,stdout,exit}` **marshaled** across the
+// op-13 bounce by a resumable driver — not a top-level JitOnrampRun. The child reads the module source from
+// the marshaled memfs and writes `.p.nif` + `.p.deps.nif` back; we read both out (`temen_op13jit_phase_read`)
+// and seed them into the same pre-crawl accumulator `temen_compile_nim_fs` mounts. The nifler_ce emit is
+// cached across modules (Rust-side `OP13_CHILD_EMIT` + the JS `driveJitRun` instance cache), so it pays the
+// ~one nifler compile once. Best-effort: any module the op-13 step traps on is left for interpreter phase-1.
+export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, mainPath, mainSrc, cacheKey) {
+  const u8 = () => new Uint8Array(memory.buffer);
+  const enc = new TextEncoder(), dec = new TextDecoder();
+  const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  const call1 = (fn, s) => {
+    const b = enc.encode(s);
+    const p = Number(ex.temen_alloc(b.length));
+    u8().set(b, p);
+    ex[fn](p, b.length);
+    const out = readOut();
+    ex.temen_dealloc(p, b.length);
+    return out;
+  };
+  const putFile = (path, bytes) => {
+    const pb = enc.encode(path);
+    const pp = Number(ex.temen_alloc(pb.length));
+    const bp = Number(ex.temen_alloc(bytes.length));
+    { const v = u8(); v.set(pb, pp); v.set(bytes, bp); }
+    ex.temen_nim_precrawl_put(pp, pb.length, bp, bytes.length);
+    ex.temen_dealloc(pp, pb.length);
+    ex.temen_dealloc(bp, bytes.length);
+  };
+  const phaseRead = (key) => {
+    const b = enc.encode(key);
+    const p = Number(ex.temen_alloc(b.length));
+    u8().set(b, p);
+    const len = ex.temen_op13jit_phase_read(p, b.length);
+    ex.temen_dealloc(p, b.length);
+    return readOut().slice(0, len);
+  };
+  const pushBytes = (bytes) => { const p = Number(ex.temen_alloc(bytes.length)); u8().set(bytes, p); return p; };
+
+  // Run one `nifler --deps parse <file> <out>` step as an op-13 nested emitted child. Returns
+  // `{pnif, deps}` (the two products) or `null` if the driver/child trapped.
+  const op13Step = async (file, out, src) => {
+    const cp = pushBytes(niflerCeBytes);
+    const fb = enc.encode(file), ob = enc.encode(out);
+    const fp = pushBytes(fb), op = pushBytes(ob), sp = pushBytes(src);
+    const opened = ex.temen_op13jit_phase_open(cp, niflerCeBytes.length, fp, fb.length, op, ob.length, sp, src.length);
+    ex.temen_dealloc(cp, niflerCeBytes.length);
+    ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
+    if (opened !== 0) { ex.temen_op13jit_close(); return null; }
+    let steps = 0;
+    for (;;) {
+      if (steps++ > 8) { ex.temen_op13jit_close(); return null; }
+      const s = ex.temen_op13jit_step();
+      if (s === 0) break;             // DONE
+      if (s === 1) {                  // CHILD — run nifler_ce emitted
+        try { await driveJitRun(ex, memory, cacheKey); }
+        catch { ex.temen_op13jit_close(); return null; }
+        ex.temen_op13jit_deliver();
+        continue;
+      }
+      ex.temen_op13jit_close();
+      return null;
+    }
+    const key = out.replace(/^\//, '');
+    const pnif = phaseRead(key);
+    const deps = phaseRead(key.replace(/\.nif$/, '.deps.nif'));
+    ex.temen_op13jit_close();
+    return { pnif, deps };
+  };
+
+  // Open the stdlib image (module-source resolver) + clear the pre-crawl accumulator.
+  {
+    const ip = pushBytes(stdlibImage);
+    ex.temen_nim_stdlib_open(ip, stdlibImage.length);
+    ex.temen_dealloc(ip, stdlibImage.length);
+  }
+  ex.temen_nim_precrawl_reset();
+
+  const seen = new Set();
+  const work = ['/lib/std/system.nim', mainPath];
+  let crawled = 0;
+  while (work.length) {
+    const file = work.pop();
+    const stem = dec.decode(call1('temen_nim_module_suffix', file));
+    if (seen.has(stem)) continue;
+    seen.add(stem);
+    const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
+    if (!src.length) continue;
+
+    const r = await op13Step(file, `/nimcache/${stem}.p.nif`, src);
+    if (!r || !r.pnif.length) continue;
+    putFile(`nimcache/${stem}.p.nif`, r.pnif);
+    putFile(`nimcache/${stem}.p.deps.nif`, r.deps);
+    crawled++;
+
+    const dir = file.slice(0, file.lastIndexOf('/'));
+    const dirB = enc.encode(dir);
+    const dp = Number(ex.temen_alloc(r.deps.length));
+    const drp = Number(ex.temen_alloc(dirB.length));
+    { const v = u8(); v.set(r.deps, dp); v.set(dirB, drp); }
+    ex.temen_nim_parse_imports(dp, r.deps.length, drp, dirB.length);
+    const imports = dec.decode(readOut());
+    ex.temen_dealloc(dp, r.deps.length);
+    ex.temen_dealloc(drp, dirB.length);
+    for (const imp of imports.split('\n')) if (imp) work.push(imp);
+  }
+  return { crawled };
+}
+
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
 // its own cc1 TUs (`tuBytes`, a memfs-relative path like `frontend/chibicc/hashmap.c`) to a linkable
 // object, reading the TU + its glibc header closure from `imgBytes` (the committed closure image). Same
