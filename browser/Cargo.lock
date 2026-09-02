@@ -191,6 +191,7 @@ dependencies = [
  "temen-leng",
  "temen-opt",
  "temen-posix",
+ "temen-snapshot",
  "temen-text",
  "temen-verify",
  "temen-wasm-jit",
@@ -285,6 +286,15 @@ dependencies = [
 name = "temen-posix"
 version = "0.0.0"
 dependencies = [
+ "temen-interp",
+ "temen-ir",
+]
+
+[[package]]
+name = "temen-snapshot"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
  "temen-interp",
  "temen-ir",
 ]

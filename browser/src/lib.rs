@@ -9803,6 +9803,269 @@ pub extern "C" fn temen_run_durable(
     value
 }
 
+/// The §12 SVMD durable-snapshot artifact slot (#816 Slice C) — cdylib-managed bytes read via
+/// [`temen_durable_art_ptr`]/[`temen_durable_art_len`], valid until the next [`temen_durable_freeze`].
+static mut DURABLE_ART: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
+/// #816 Slice C — the browser **"persist a grown durable guest across a reload"** consumer, freeze
+/// half. Decode the **raw** guest module at `[mod_ptr, mod_len)`, instrument it for freeze/thaw
+/// ([`temen_durable::transform_module_assume_confined`] — deterministic, so the thaw side reproduces
+/// the same digest), and run func 0 over a fresh durable window at the grown reservation
+/// `reserved_log2`, granting a durable `AddressSpace` + `Clock` (clock seeded to `clock`). The guest
+/// arms its own freeze (stores `UNWINDING` into the state word at a suspend point, the `multipoint.rs`
+/// device), so the run **unwinds**; the captured grown window image + per-page protections + handle
+/// table are serialized through the §12 codec ([`temen_snapshot::freeze_with_prots`]) into the
+/// artifact slot (`temen_durable_art_ptr`/`_len`) for the caller to persist (e.g. to IndexedDB).
+/// Returns and sets [`LAST_STATUS`]: `STATUS_OK` on a clean freeze, `STATUS_VERIFY_ERR` if the
+/// instrumented IR fails to verify, `STATUS_TRAP` if the guest trapped, `STATUS_BAD_RESULT` if it ran
+/// to completion instead of freezing, `STATUS_UNSUPPORTED` if the transform or the codec refused
+/// (e.g. a non-durable handle or a §13 backed alias). FFI of the native oracle
+/// `crates/temen/tests/durable_grown_snapshot_resume.rs`.
+#[no_mangle]
+pub extern "C" fn temen_durable_freeze(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    clock: i64,
+    reserved_log2: i32,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees the range is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let raw = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return STATUS_DECODE_ERR;
+        }
+    };
+    let m = match temen_durable::transform_module_assume_confined(&raw) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return STATUS_UNSUPPORTED;
+        }
+    };
+    if temen_verify::verify_module(&m).is_err() {
+        set(STATUS_VERIFY_ERR);
+        return STATUS_VERIFY_ERR;
+    }
+    let size_log2 = match m.memory.as_ref() {
+        Some(mc) => mc.size_log2,
+        None => {
+            set(STATUS_UNSUPPORTED);
+            return STATUS_UNSUPPORTED;
+        }
+    };
+    // Run over the shared **bytecode** grown-restore seam (`SharedProgram::run_over_grown`, the
+    // wasm-safe engine `durable_run` uses — the interp scheduler's `Instant::now` timer path aborts on
+    // wasm32). The backing is pre-filled with a fresh durable window; the guest grows into the tail.
+    let Some(prog) = bytecode::SharedProgram::compile(&m) else {
+        set(STATUS_UNSUPPORTED);
+        return STATUS_UNSUPPORTED;
+    };
+    let init = temen_durable::init_durable_window(1usize << size_log2);
+    let Some(back) =
+        temen_interp::Region::owned_zeroed(1u64 << reserved_log2, temen_snapshot::PAGE as u64)
+    else {
+        set(STATUS_UNSUPPORTED);
+        return STATUS_UNSUPPORTED;
+    };
+    let back = std::sync::Arc::new(back);
+    back.write_from(0, &init);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let space = host.grant_memory();
+    let clk = host.grant_clock();
+    host.clock_ns = clock;
+    let mut fuel = 50_000_000u64;
+    let (r, pages, mapped) = prog.run_over_grown(
+        0,
+        &[Value::I32(space), Value::I32(clk)],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        true, // seed data segments + null guard into the fresh window
+        reserved_log2 as u8,
+        None,
+    );
+    if r.is_err() {
+        set(STATUS_TRAP);
+        return STATUS_TRAP;
+    }
+    let Some(pages) = pages else {
+        // §13 backed alias — a byte snapshot can't restore it; the codec would refuse anyway.
+        set(STATUS_UNSUPPORTED);
+        return STATUS_UNSUPPORTED;
+    };
+    // Read the committed (grown) window image out of the backing, and check it actually unwound.
+    let mut win = vec![0u8; mapped as usize];
+    back.read_into(0, &mut win);
+    if temen_durable::read_state(&win) != temen_durable::STATE_UNWINDING {
+        // Ran to completion (or otherwise didn't unwind) — nothing to persist.
+        set(STATUS_BAD_RESULT);
+        return STATUS_BAD_RESULT;
+    }
+    // Dense per-page protection map for the codec: default committed pages are `Rw`; the sparse
+    // `map_info` entries (grown `Rw` tail, `Ro`/`Unmapped` pages) override.
+    let npages = mapped as usize / temen_snapshot::PAGE;
+    let mut dense = vec![temen_snapshot::PageProt::Rw; npages];
+    for &(off, kind) in &pages {
+        let i = off as usize / temen_snapshot::PAGE;
+        if i < npages {
+            dense[i] = match kind {
+                0 => temen_snapshot::PageProt::Ro,
+                2 => temen_snapshot::PageProt::Unmapped,
+                _ => temen_snapshot::PageProt::Rw, // 1 = Rw (3 = Backed excluded above)
+            };
+        }
+    }
+    match temen_snapshot::freeze_with_prots(&m, &win, &dense, reserved_log2 as u8, &host) {
+        Ok(art) => {
+            // SAFETY: single-threaded wasm; read back only via the artifact accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(DURABLE_ART), art) };
+            set(STATUS_OK);
+            STATUS_OK
+        }
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            STATUS_UNSUPPORTED
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn temen_durable_art_ptr() -> *const u8 {
+    // SAFETY: single-threaded wasm; the slot is only mutated by `temen_durable_freeze`.
+    unsafe { DURABLE_ART.0 }
+}
+
+#[no_mangle]
+pub extern "C" fn temen_durable_art_len() -> usize {
+    // SAFETY: single-threaded wasm; the slot is only mutated by `temen_durable_freeze`.
+    unsafe { DURABLE_ART.1 }
+}
+
+/// #816 Slice C — the reload consumer's thaw half. Decode the durability-instrumented module, restore
+/// the §12 SVMD artifact at `[art_ptr, art_len)` (e.g. loaded back from IndexedDB) on a **fresh**
+/// host via [`temen_snapshot::restore_with_prots`] — rebuilding the grown window image, its per-page
+/// protection map, and the durable handle table — then resume func 0 to completion over a backing
+/// pre-filled with the restored image (grown pages included), through the grown-restore seam
+/// [`bytecode::SharedProgram::run_over_grown`]. The restored cap handles are recovered from the thawed
+/// table (never re-granted); `clock` seeds the resumed host (a correct thaw REPLAYS the captured call
+/// result, so `clock` only affects *new* clock reads past the resume point). Returns the guest's `i64`
+/// result and sets [`LAST_STATUS`] (`STATUS_OK`, `STATUS_TRAP`, `STATUS_BAD_RESULT`, or
+/// `STATUS_UNSUPPORTED` / `STATUS_DECODE_ERR`).
+#[no_mangle]
+pub extern "C" fn temen_durable_thaw_resume(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    art_ptr: *const u8,
+    art_len: usize,
+    clock: i64,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees both ranges are live `temen_alloc`ations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let art = unsafe { core::slice::from_raw_parts(art_ptr, art_len) };
+    let raw = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    // The SVMD artifact binds the instrumented module's digest, so the thaw must instrument the same
+    // raw module the same way (`transform_module_assume_confined` is deterministic — matching digest).
+    let m = match temen_durable::transform_module_assume_confined(&raw) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
+    };
+    let mut host = Host::new();
+    host.set_durable(true);
+    let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host) {
+        Ok(t) => t,
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
+    };
+    // Recover the restored cap handles (never re-grant): AddressSpace then Clock, `(gen << 8) | slot`.
+    let caps = match host.capture_durable_handles() {
+        Ok(c) => c,
+        Err(_) => {
+            set(STATUS_UNSUPPORTED);
+            return 0;
+        }
+    };
+    if caps.len() < 2 {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    }
+    let handle = |i: usize| ((caps[i].generation << 8) | caps[i].slot) as i32;
+    let (t_space, t_clk) = (handle(0), handle(1));
+    let Some(prog) = bytecode::SharedProgram::compile(&m) else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
+    temen_durable::begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
+    // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
+    // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
+    let Some(back) = temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
+    else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
+    let back = std::sync::Arc::new(back);
+    back.write_from(0, &rwin);
+    let entries: Vec<(u64, u8)> = rprots
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            let kind = match p {
+                temen_snapshot::PageProt::Ro => 0u8,
+                temen_snapshot::PageProt::Rw => 1,
+                temen_snapshot::PageProt::Unmapped => 2,
+            };
+            (i as u64 * temen_snapshot::PAGE as u64, kind)
+        })
+        .collect();
+    host.clock_ns = clock;
+    let mut fuel = 50_000_000u64;
+    let (r, _, _) = prog.run_over_grown(
+        0,
+        &[Value::I32(t_space), Value::I32(t_clk)],
+        &mut fuel,
+        back,
+        &mut host,
+        false, // bytes already restored into the backing — do not re-init data segments
+        rreserved,
+        Some(&entries),
+    );
+    match r {
+        Ok(vals) => match vals.first() {
+            Some(Value::I64(x)) => {
+                set(STATUS_OK);
+                *x
+            }
+            Some(Value::I32(x)) => {
+                set(STATUS_OK);
+                *x as i64
+            }
+            _ => {
+                set(STATUS_BAD_RESULT);
+                0
+            }
+        },
+        Err(_) => {
+            set(STATUS_TRAP);
+            0
+        }
+    }
+}
+
 /// Run `m`'s function 0 with a host-granted **`SharedRegion`** (iface 4, 64 KiB) as its sole cap —
 /// the §13 host-backed memory object a guest `map`s into its window (op 0), aliasing the same backing
 /// at multiple offsets (the magic-ring-buffer primitive); op 2 `len`, op 3 `page_size`. Returns

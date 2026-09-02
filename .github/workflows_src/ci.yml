@@ -971,6 +971,12 @@ jobs:
           # driver joins it. The browser realization of nimc.rs::drive_op13 with the child tiered up. No
           # assets (parses in-page); reuses the threads module built above.
           node browser-op13jit-e2e-test.mjs
+          # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
+          # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
+          # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
+          # completion (temen_durable_thaw_resume), with the grown-page content surviving the reload.
+          # No assets — parses in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
+          node browser-durable-persist-reload-test.mjs
           node browser-play-editor-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
