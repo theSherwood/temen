@@ -856,7 +856,9 @@ fn module_can_spawn_same_module(m: &Module) -> bool {
 /// `map` (0, a guest *grow*) is deliberately **not** outlined here yet: unlike `unmap`/`protect` it
 /// adds committed pages the emitted bounds check reaches only through a live `"mapped"` re-sync after
 /// the bounce, which the nested driver does not yet perform — admitting it is deferred to the nested-
-/// driver slice so a grow-using nested unit keeps its safe pre-#1151 interpreter fallback until then.
+/// driver slice. Until then a `map`-calling function is an ordinary impure cross-tier leaf — correct
+/// under a powerbox-carrying live-window servicer, and [`Artifact::leaves_pure`] is what keeps a
+/// throwaway-window host (the browser's §14 codegen entry) from running it wrong.
 fn is_nested_leaf_cap(type_id: u32, op: u32) -> bool {
     type_id == cap_id::ADDRESS_SPACE && (op == 1 || op == 2 || op == 3 || op == 4)
 }
@@ -1676,9 +1678,12 @@ fn compile_module_nested_inner(
         ));
     }
     // Classify each function: in the nested subset ⇒ emitted; otherwise it must qualify as an
-    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers) reached
-    // via `env.call_interp` — whose host callback must therefore carry the run's powerbox (the
-    // reactor-path contract, not the throwaway-window one). Anything else fails closed.
+    // int-signature cross-tier leaf (the [`outline_nested_cap_calls`] ADDRESS_SPACE wrappers, an
+    // op-13 grant-seeding `call.cap` helper) reached via `env.call_interp` — whose host callback must
+    // therefore carry the run's powerbox over the **live window** (the reactor-path contract, not the
+    // throwaway-window one). A leaf may touch memory and caps under that contract; a host whose
+    // servicer is a throwaway window (the browser's `temen_wasmjit_call_interp`) must check
+    // [`Artifact::leaves_pure`] before driving the artifact (#1151). Anything else fails closed.
     let nested_ok = |f: &Func| {
         f.blocks.iter().all(|b| {
             block_value_types(m, b, true)
@@ -1690,7 +1695,7 @@ fn compile_module_nested_inner(
     // in-subset function instead of falling to the cross-tier leaf path.
     let null_guard = emit_null_guard_extent(m);
     let mut wasm_of: Vec<Option<u32>> = vec![None; n];
-    let mut interp_leaf = vec![false; n];
+    let mut leaves = vec![false; n];
     let mut emitted: Vec<usize> = Vec::new();
     for (i, f) in m.funcs.iter().enumerate() {
         if nested_ok(f) {
@@ -1715,7 +1720,7 @@ fn compile_module_nested_inner(
                 .chain(&f.results)
                 .all(|t| !matches!(t, ValType::V128))
         {
-            interp_leaf[i] = true;
+            leaves[i] = true;
         } else {
             // Not nested-emittable and carries a `v128`/`ref`/`cap` in its signature. A nested
             // unit's `env.call_interp` lands in the vCPU's `bounce_call`, whose `&[i64]` slot
@@ -1736,7 +1741,7 @@ fn compile_module_nested_inner(
         shared_memory,
         &emitted,
         &wasm_of,
-        &interp_leaf,
+        &leaves,
         None,
         true,
         paged,
@@ -1867,9 +1872,13 @@ pub fn check_child_carve(
 /// ([`outline_nested_cap_calls`]) before calling if the host's `call_interp` carries a powerbox;
 /// otherwise a `sub`/`page_size` entry simply falls to the interpreter-driven mode.
 ///
-/// A unit that manages its own pages (`map`/`unmap`/`protect`) emits **nothing** and runs wholly on
-/// the interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
-/// [`module_uses_page_ops`]). `page_size`/`sub` (queries/attenuation) are unaffected.
+/// A unit that `unmap`s/`protect`s its own pages emits **nothing** here and runs wholly on the
+/// interpreter — the mask-only tier can't honor page state (Track 3 (c)+(a), see
+/// [`module_uses_page_ops`]); [`compile_nested_paged`] is the entry that carries those.
+/// `page_size`/`sub` (queries/attenuation) are unaffected. A `WasmDriven` artifact's `env.call_interp`
+/// leaves may touch memory and caps (a `map`-calling allocator helper, an op-13 grant seeder) — the
+/// servicer contract is the powerbox over the live window; a throwaway-window host must gate on
+/// [`Artifact::leaves_pure`] (#1151).
 pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
     if module_uses_page_ops(m) {
         return compile_interp_only(m, shared_memory, true);
@@ -3006,6 +3015,32 @@ pub struct Artifact {
     pub wasm: Vec<u8>,
     pub emitted: Vec<bool>,
     pub drive: DriveMode,
+}
+
+impl Artifact {
+    /// Whether every function this artifact bounces to `env.call_interp` is a **pure** leaf (the
+    /// tier-up [`interp_leaf`] predicate: no memory, call, cap, or import ops) — i.e. whether a
+    /// servicer that runs leaves on a **throwaway window with an empty powerbox** (the browser's
+    /// `temen_wasmjit_call_interp`) computes exactly what the interpreter would. The nested emit's
+    /// own contract is the *live-window, powerbox-carrying* servicer, under which a leaf may store
+    /// and `call.cap` (an op-13 grant seeder, a `map`-calling allocator helper); a host that instead
+    /// wires the throwaway servicer must gate on this (#1151): before the browser's §14 codegen entry
+    /// did, such a helper `CapFault`ed / wrote a fresh window where the interpreter succeeded — a
+    /// trap-parity divergence (never an escape, but INVARIANTS #9 forbids it).
+    ///
+    /// `InterpDriven` is always `true`: the tier-up fixpoint admits only pure leaves as bounce
+    /// targets, so an emitted function never reaches an impure one. `m` must be the module the
+    /// artifact was compiled from (outlined, if the caller outlined).
+    pub fn leaves_pure(&self, m: &Module) -> bool {
+        match self.drive {
+            DriveMode::InterpDriven => true,
+            DriveMode::WasmDriven { .. } => m
+                .funcs
+                .iter()
+                .zip(&self.emitted)
+                .all(|(f, &e)| e || interp_leaf(f)),
+        }
+    }
 }
 
 /// Whether any function reachable from `entry` uses a §12 concurrency op (`cont.*`/`suspend`/
