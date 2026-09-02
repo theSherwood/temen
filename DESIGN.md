@@ -2318,15 +2318,18 @@ interp-serviced and the driver re-syncs the table on return) and every emitted a
 check; `SharedRegion` aliasing and fiber-bearing units still fail closed to whole-interpreter. The
 nested emit's `env.call_interp` contract is a **powerbox-carrying servicer over the live window** —
 a leaf may store and `call.cap` (the op-13 grant seeder, a `map`-calling allocator helper). A host
-whose servicer is a throwaway window (the browser's `temen_wasmjit_call_interp`) must gate on
-`Artifact::leaves_pure` (every bounced leaf is a pure tier-up `interp_leaf`) and otherwise run the
-unit on the interpreter — the browser's §14 codegen entry does, so an impure helper is never run on
-the empty powerbox where it would `CapFault` while the interpreter succeeds (`nested_leaf_gate.rs`).
-Still open: the browser's §14 codegen entry
-(`temen_par_enable_inst_codegen`) routes through the mask-only `compile_nested` — routing it paged
-needs a child `call_interp` servicer over the child's carve with its own powerbox plus a
-`"pagestate"`/`"mapped"` re-sync after each bounce; `map` (grow) admission on the nested paged
-path rides that same re-sync. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
+must never service these leaves on a throwaway window (the browser's `temen_wasmjit_call_interp`,
+which is faithful only for the tier-up analysis's pure leaves) — an impure helper run on the empty
+powerbox `CapFault`s / writes a fresh window where the interpreter succeeds.
+The browser's §14 codegen entry
+(`temen_par_enable_inst_codegen`) routes a unit that reaches any ADDRESS_SPACE page op through
+`compile_nested_paged` and services its `env.call_interp` leaves on the **child's own vCPU over its
+carve** (`temen_par_inst_call_interp` → `bounce_call`, the child's attenuated powerbox — the shape
+the `nested_paged` fuzz harness uses), re-syncing the page-state table + `"mapped"` from that vCPU
+after each bounce; the helper that `map`s/`unmap`s/`protect`s is bounced whole (no outlining — a
+wrapper would index a function the child's domain doesn't hold), and an entry that page-ops directly
+still falls to the interpreter. `map` (grow) is admitted on the nested paged path by the same
+refresh (`is_nested_leaf_cap` admits ops 0–4). Pinned by `browser/tests/inst_codegen_paged.rs`. (Read-only D40 const segments are host-applied at instantiation, not a guest op; on the wasm
 tier they remain a defense-in-depth-only gap — a write to "const" data succeeds instead of faulting,
 losing §5 self-corruption detection, but the guest still cannot escape.)
 

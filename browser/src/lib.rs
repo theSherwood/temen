@@ -1391,6 +1391,9 @@ static mut INST_UNIT_WASM: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 /// `f{i}` is emitted + safe to call directly. A confined child whose entry is eligible runs on wasm;
 /// else it interprets.
 static mut INST_ELIGIBLE: Option<Vec<bool>> = None;
+/// Whether [`INST_UNIT_WASM`] was emitted **paged** (the unit reaches an ADDRESS_SPACE page op) — the
+/// Worker then seeds + re-syncs its `"pagestate"`/`"mapped"` globals from the child vCPU (#1151).
+static mut INST_PAGED: bool = false;
 
 /// Enable §14 real codegen for the run: emit the granted unit ([`ParInstCfg::module`]) to wasm and
 /// stash it + the per-function eligibility. Called by each Worker before it builds a confined child
@@ -1423,30 +1426,35 @@ pub extern "C" fn temen_par_enable_inst_codegen() -> i32 {
         // entry drops it from `emitted` (the tier-up fixpoint), and a `thread.spawn`ed fiber runs in its
         // own spawned interpreter vCPU — never across the emitted frame. The Worker offers the whole
         // nested import set unconditionally, so the uniform layout `compile_nested` emits just works.
-        // ADDRESS_SPACE wrappers are NOT outlined here (the browser's `call_interp` carries no powerbox
-        // yet), so a `sub`/`page_size` entry stays interpreter-driven; an `unmap`/`protect` unit
-        // emits nothing and interprets wholly (mask-only confinement can't honor page state). The
-        // Worker services this artifact's `env.call_interp` with `temen_wasmjit_call_interp` — a
-        // throwaway window + empty powerbox — which is faithful only for **pure** leaves. The nested
-        // emit's own contract is a live-window, powerbox-carrying servicer, under which a leaf may
-        // store and `call.cap` (a `map`-calling allocator helper): on this servicer such a leaf would
-        // `CapFault` / write a fresh window where the interpreter succeeds. So decline codegen (the
-        // child runs on the interpreter, byte-identical) unless every leaf is pure (#1151).
-        let Ok(artifact) = temen_wasm_jit::compile_nested(m, true) else {
-            return 0;
+        // #1151 Slice 2c: the emitted unit's `env.call_interp` leaves run on the CHILD's OWN vCPU over
+        // its carve (`temen_par_inst_call_interp` → `bounce_call`: the live powerbox, the interpreter's
+        // `Mem`), so a leaf may store and `call.cap` — an allocator helper that `map`s, a page-managing
+        // helper that `unmap`s/`protect`s. A unit reaching any ADDRESS_SPACE page op emits **paged**
+        // (`compile_nested_paged`): every emitted access consults the page-state table the Worker
+        // re-syncs from the child vCPU after each bounce. No outlining here: an entry that page-ops
+        // directly is out of subset and falls to the interpreter (an outlined wrapper would index a
+        // function the child's domain doesn't hold); helpers are bounced whole. A `sub`/`page_size`
+        // entry likewise stays interpreter-driven.
+        let paged = temen_wasm_jit::module_uses_addr_space_page_ops(m);
+        let artifact = if paged {
+            let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+            temen_wasm_jit::compile_nested_paged(m, true, page_log2)
+        } else {
+            temen_wasm_jit::compile_nested(m, true)
         };
-        if !artifact.leaves_pure(m) {
-            return 0;
-        }
-        let temen_wasm_jit::Artifact {
+        let Ok(temen_wasm_jit::Artifact {
             wasm,
             emitted: eligible,
             ..
-        } = artifact;
+        }) = artifact
+        else {
+            return 0;
+        };
         // SAFETY: written once per run while CODEGEN_LOCK is held; Workers then read it stable.
         unsafe {
             stash(&mut *core::ptr::addr_of_mut!(INST_UNIT_WASM), wasm);
             *core::ptr::addr_of_mut!(INST_ELIGIBLE) = Some(eligible);
+            *core::ptr::addr_of_mut!(INST_PAGED) = paged;
         }
         1
     })();
@@ -1484,6 +1492,60 @@ pub extern "C" fn temen_par_inst_nparams(entry: u32) -> usize {
         .and_then(|c| c.module.as_ref())
         .and_then(|m| m.funcs.get(entry as usize))
         .map_or(0, |f| f.params.len())
+}
+
+/// Whether the run's emitted §14 unit is **paged** (see [`INST_PAGED`]): the Worker must then call
+/// [`temen_par_inst_pagestate_sync`] before the entry and re-point the unit instance's
+/// `"pagestate"`/`"mapped"` globals from the child vCPU after it and after every bounce.
+#[no_mangle]
+pub extern "C" fn temen_par_inst_paged() -> i32 {
+    // SAFETY: single-reader per instance; set by `temen_par_enable_inst_codegen`.
+    unsafe { *core::ptr::addr_of!(INST_PAGED) as i32 }
+}
+
+/// #1151 Slice 2c — rebuild a child vCPU's page-state table from its live map and stage it exactly
+/// as a paged [`PAR_TIERUP`] does: the table bytes via [`temen_par_tierup_pagestate_ptr`]/`_len` (the
+/// value for the unit instance's `"pagestate"` global) and its coverage via [`temen_par_ev_b`] (the
+/// value for `"mapped"`).
+fn inst_sync_pagestate(v: &mut ParVcpu) {
+    let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+    let (table, cover) = bytecode::build_pagestate_table(&info);
+    v.pagestate = table;
+    v.b = cover as i64;
+}
+
+/// Seed the child's page-state table before its emitted entry runs (see [`inst_sync_pagestate`]).
+#[no_mangle]
+pub extern "C" fn temen_par_inst_pagestate_sync(v: *mut ParVcpu) {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker.
+    inst_sync_pagestate(unsafe { &mut *v });
+}
+
+/// #1151 Slice 2c — service one `env.call_interp(func, args_ptr)` bounce of the emitted §14 unit on
+/// the **child's own vCPU** ([`temen_par_child_confined`]): the leaf runs interpreted over the child's
+/// carve with the child's attenuated powerbox ([`bytecode::Vcpu::bounce_call`]) — so a leaf may
+/// store, `map`/`unmap`/`protect`, or otherwise `call.cap`, exactly as the interpreter path would run
+/// it. `args_ptr` is the env scratch (i64 slots, args → results in place). On a paged unit the
+/// page-state table is then re-synced ([`inst_sync_pagestate`]) so the emitted accesses that follow
+/// admit exactly what the interpreter would. Returns `0` on success, `1` on a trap (the Worker
+/// throws, unwinding the emitted entry; the child's slot reads trapped).
+#[no_mangle]
+pub extern "C" fn temen_par_inst_call_interp(v: *mut ParVcpu, func: u32, args_ptr: *mut u8) -> i32 {
+    // SAFETY: `v` is a live `ParVcpu` owned by this Worker; the host passes the env scratch, at least
+    // `XCALL_MAX_SLOTS` 8-aligned i64 slots wide (`temen_wasmjit_env_bytes`).
+    let v = unsafe { &mut *v };
+    let io = unsafe {
+        core::slice::from_raw_parts_mut(args_ptr as *mut i64, temen_wasm_jit::XCALL_MAX_SLOTS)
+    };
+    match v.inner.bounce_call(func, io) {
+        Ok(_) => {
+            if temen_par_inst_paged() == 1 {
+                inst_sync_pagestate(v);
+            }
+            0
+        }
+        Err(_) => 1,
+    }
 }
 
 // ---- 4d: host I/O across Workers — the run's shared powerbox ------------------------------------
@@ -1943,7 +2005,21 @@ pub extern "C" fn temen_par_child_confined(
         // its Worker's `win` is the carve base and each event's `mapped`/page-state come from the
         // child's own `Mem` (the carve-sized confinement bound). A separate-module child carries
         // the bitmap inertly (the engine's module-0 dispatch gate). See [`with_tierup`].
-        Ok(inner) => par_box(with_tierup(inner)),
+        Ok(inner) => {
+            // #1151 Slice 2c: stage the child's starter cap handles (its entry args) in the tier-up
+            // argv stash, so the Worker's codegen path passes the emitted entry the same handles the
+            // interpreter would (`temen_par_tierup_argv_ptr`/`_len`; no TIERUP event precedes the
+            // entry on that path, so the stash is free until then).
+            let entry_args: Vec<i64> = inner
+                .entry_args()
+                .iter()
+                .map(|a| first_i64(std::slice::from_ref(a)))
+                .collect();
+            let v = par_box(with_tierup(inner));
+            // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
+            unsafe { (*v).tierup_argv = entry_args };
+            v
+        }
         Err(_) => {
             par_vcpu_retire();
             core::ptr::null_mut()
@@ -5677,7 +5753,11 @@ impl JitOnrampRun {
         // The window backing must be exactly `1 << win_log2` bytes — the emitter masks every access to
         // that domain, so a shorter backing would let a masked access read past it. Every caller sizes
         // `back`/`win_size` this way; assert the contract rather than silently trusting it.
-        debug_assert_eq!(win_size, 1u64 << win_log2, "window backing must equal 1 << win_log2");
+        debug_assert_eq!(
+            win_size,
+            1u64 << win_log2,
+            "window backing must equal 1 << win_log2"
+        );
         // The emit (outline → interp program → `compile_jit`) is what a re-Run reuses via `cached`
         // (#1011 slice 1): a nifler emit is ~2 s and its `Module` clone another ~2 s, so a cache hand
         // here turns a re-Run into build-window + drive. On a miss we emit fresh and return the products
@@ -8622,7 +8702,8 @@ pub extern "C" fn temen_op13jit_open() -> i32 {
     ) else {
         return -STATUS_DECODE_ERR;
     };
-    if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err() {
+    if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
+    {
         return -STATUS_VERIFY_ERR;
     }
     let Some(prog) = bytecode::VcpuProgram::compile(&driver) else {
@@ -8927,7 +9008,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
                 let carve_ptr = unsafe { d.mem_base.add(carve as usize) };
                 let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
-                // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
+                               // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once).
                 let cached = if d.child_key != 0 {
                     unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
                         .filter(|c| c.key == d.child_key)
@@ -9002,7 +9083,11 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
 /// The driver's final return value (valid after a [`OP13JIT_DONE`] step).
 #[no_mangle]
 pub extern "C" fn temen_op13jit_result() -> i64 {
-    unsafe { (*core::ptr::addr_of!(OP13_JIT)).as_ref().map_or(0, |d| d.result) }
+    unsafe {
+        (*core::ptr::addr_of!(OP13_JIT))
+            .as_ref()
+            .map_or(0, |d| d.result)
+    }
 }
 
 /// The marshaled `"fs"` counter — the observable proof the granted cap ran inside the emitted child.
@@ -10235,7 +10320,8 @@ pub extern "C" fn temen_durable_thaw_resume(
     };
     let mut host = Host::new();
     host.set_durable(true);
-    let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host) {
+    let (mut rwin, rprots, rreserved) = match temen_snapshot::restore_with_prots(art, &m, &mut host)
+    {
         Ok(t) => t,
         Err(_) => {
             set(STATUS_UNSUPPORTED);
@@ -10261,9 +10347,10 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     };
     temen_durable::begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
-    // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
-    // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
-    let Some(back) = temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
+                                             // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
+                                             // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
+    let Some(back) =
+        temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
     else {
         set(STATUS_UNSUPPORTED);
         return 0;
@@ -12091,13 +12178,19 @@ block 0 () {
         let (host, counter) = granted_fs_host();
         let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, host, Vec::new(), None)
             .expect("open an owned JIT run over the granted host");
-        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the granted host");
+        let r = run
+            .run_cross_tier(0, &[])
+            .expect("child f0 runs over the granted host");
         assert_eq!(
             r.first(),
             Some(&Value::I64(41)),
             "child f0 = 40 + granted fs() = 41 over the caller-provided powerbox"
         );
-        assert_eq!(*counter.lock().unwrap(), 1, "the granted fs ran exactly once");
+        assert_eq!(
+            *counter.lock().unwrap(),
+            1,
+            "the granted fs ran exactly once"
+        );
     }
 
     #[test]
@@ -12121,9 +12214,12 @@ block 0 () {
             .spawn_named_child_from_window(&window, 32, 1, 1 << 12)
             .expect("marshal the grant list into a child powerbox");
 
-        let mut run = JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
-            .expect("open a JIT run over the *marshaled* granted host");
-        let r = run.run_cross_tier(0, &[]).expect("child f0 runs over the marshaled host");
+        let mut run =
+            JitOnrampRun::open_owned_run_over_host(&m, 12, false, child_host, Vec::new(), None)
+                .expect("open a JIT run over the *marshaled* granted host");
+        let r = run
+            .run_cross_tier(0, &[])
+            .expect("child f0 runs over the marshaled host");
         assert_eq!(
             r.first(),
             Some(&Value::I64(41)),

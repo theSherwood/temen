@@ -170,13 +170,34 @@ self.onmessage = async (e) => {
       && ex.temen_par_inst_eligible(entry) === 1) {
     const wptr = Number(ex.temen_par_inst_unit_wasm_ptr()), wlen = ex.temen_par_inst_unit_wasm_len();
     const bytes = new Uint8Array(memory.buffer).slice(wptr, wptr + wlen);
+    // #1151 Slice 2c: the child vCPU is built anyway — never `temen_par_run`, it services every
+    // `env.call_interp` leaf over the carve with the child's OWN powerbox (`temen_par_inst_call_interp`
+    // → `bounce_call`), so a leaf may store / `map` / `unmap` / `protect` exactly as the interpreter
+    // path would run it. On a paged unit (the module reaches a page op) the emitted accesses consult a
+    // page-state table re-synced from this vCPU after each bounce. Its starter cap handles (the entry
+    // args) come from the argv stash — no longer inert zeros.
+    const cv = ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel));
+    if (cv === 0) {
+      Atomics.store(i32(), slot >> 2, 2); Atomics.notify(i32(), slot >> 2);
+      self.postMessage({ kind: 'fail', why: 'confined child vcpu build failed (codegen path)' });
+      return;
+    }
+    const paged = ex.temen_par_inst_paged() === 1;
+    let uexports = null;
+    const syncPaged = () => {
+      uexports.mapped.value = ex.temen_par_ev_b(cv);
+      uexports.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(cv));
+    };
     const childSlots = []; // env.instantiate handle (index) → grandchild completion slot ptr
     const threadSlots = []; // env.thread_spawn handle (index) → thread completion slot ptr
     const uinst = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
       env: {
         memory,
         trap: () => {},
-        call_interp: (f, a) => { if (ex.temen_wasmjit_call_interp(f, a) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: (f, a) => {
+          if (ex.temen_par_inst_call_interp(cv, f, a) !== 0) throw new Error('cross-tier trap');
+          if (paged) syncPaged();
+        },
         // §14 VM-in-VM spawn bounce. The emitted parent does no confinement itself, so the engine's
         // `event_instantiate` carve checks are replicated here: the grandchild's power-of-two carve
         // must be aligned and lie inside THIS child's own window (confinement composes); a violation
@@ -261,8 +282,18 @@ self.onmessage = async (e) => {
     // child use its whole carve — heap growth into `[1 << declared, winSize)` (a malloc child, e.g. a nim
     // phase). Matches the interpreter confined child (`mapped == carve`) and the headless wasmi servicer
     // (crates/temen-wasm-jit/tests/nested_emitted_child.rs). `mapped` is exported by every emitted module.
-    uinst.exports.mapped.value = BigInt(winSize);
-    const args = new Array(Number(ex.temen_par_inst_nparams(entry))).fill(0n); // cap handles, ignored
+    uexports = uinst.exports;
+    if (paged) {
+      // The page-state table + its coverage (the value for `mapped`), seeded from the child's live map.
+      ex.temen_par_inst_pagestate_sync(cv);
+      syncPaged();
+    } else {
+      uinst.exports.mapped.value = BigInt(winSize);
+    }
+    // The entry args: the child's starter cap handles, staged by `temen_par_child_confined`.
+    const nargs = Number(ex.temen_par_tierup_argv_len(cv)), aptr = Number(ex.temen_par_tierup_argv_ptr(cv));
+    const args = [];
+    for (let i = 0; i < nargs; i++) args.push(i64()[(aptr >> 3) + i]);
     if (tierupCell) Atomics.add(i32(), tierupCell >> 2, 1); // count emitted children (non-vacuity)
     try {
       const ret = uinst.exports['f' + entry](win, envCell, ...args);
@@ -273,6 +304,7 @@ self.onmessage = async (e) => {
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped (the joiner traps on deliver_join)
       Atomics.notify(i32(), slot >> 2);
     }
+    ex.temen_par_free(cv);
     return;
   }
 

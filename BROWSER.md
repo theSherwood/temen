@@ -827,9 +827,10 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    §2 deletes them onto the unified offer, so any wasm-tier arm would be work queued for deletion.
    **[landed — the browser driver wiring, real-browser-verified]** A confined child whose granted-unit
    entry *uses* its `Instantiator` now runs on emitted wasm in the browser: `temen_par_enable_inst_codegen`
-   emits the granted module via `compile_module_nested` first (falling back to the tier-up shape — an
-   ADDRESS_SPACE-using entry fails closed to the interpreter until the browser's `call_interp` carries a
-   powerbox), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
+   emits the granted module via `compile_nested` — `compile_nested_paged` when it reaches a page op
+   (#1151 Slice 2c: its `env.call_interp` leaves run on the child's own vCPU over the carve,
+   `temen_par_inst_call_interp`, with the page-state table re-synced after each bounce; an entry that
+   page-ops directly still falls to the interpreter), and `worker.js`'s confined instCodegen block services **`env.instantiate`/`env.join`**
    through the *same* confined-child completion-slot protocol as the interpreter's INSTANTIATE/JOIN arms
    — the grandchild spawns on its own Worker via the page relay; `env.join` `Atomics.wait`s its slot;
    the carve checks (power-of-two, aligned, inside the child's own window) replicate the engine's, so a
