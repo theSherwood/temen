@@ -4769,3 +4769,53 @@ fn c_terminal_ctrl_d_eof_is_one_shot_not_a_permanent_close() {
          inherits a foreground job's ^D"
     );
 }
+
+fn ttin_bg_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+static int status;\n\
+static long pb;\n\
+static char b[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+int main(void){{\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 1;\n\
+  if (pb == 0){{ __px_setpgid(0,0,0); long r; do {{ r=__px_read(0,0,(long)b,8); }} while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }}\n\
+  __px_setpgid(0, pb, pb);\n\
+  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  if (h != pb) return 100;\n\
+  if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #798/#1198 — a **background** process reading the controlling terminal is stopped by SIGTTIN. A
+// forked job in its own process group (never `tcsetpgrp`'d to the foreground — the shell's group
+// stays foreground) reads fd 0; `tty_background_check` raises SIGTTIN (default: stop), the read
+// returns `ERESTART`, and the reader — retrying `ERESTART`, as a libc read wrapper does — parks
+// stopped rather than draining input. The shell's `waitpid(WUNTRACED)` reports the stop with the
+// stop signal SIGTTIN (21), so `(status & 0xff) == 0x7f` and `(status >> 8) == 21` → 4021 on both
+// engines. This is the mechanism a correct `bg` of a terminal-reading job relies on (#1198): the
+// resumed reader must SIGTTIN-stop, not steal the shell's input.
+#[test]
+fn c_a_background_terminal_read_is_stopped_by_sigttin() {
+    let e = run_interp_terminal_setup(&ttin_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(4021)],
+        "tree-walker: the background read raised SIGTTIN, the reader re-issued on ERESTART and parked \
+         stopped, and waitpid(WUNTRACED) reported the SIGTTIN(21) stop"
+    );
+    let b = run_bytecode_terminal_setup(&ttin_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(4021)],
+        "coop bytecode (the browser tier): same SIGTTIN background-read stop — matching the oracle"
+    );
+}
