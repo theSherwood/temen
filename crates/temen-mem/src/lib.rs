@@ -268,14 +268,28 @@ impl Region {
         }
     }
 
+    /// Whether `[off, off+width)` lies inside the region — the one bound every word/atomic accessor
+    /// enforces (#1191). The interpreter confines an access to the window's *reservation* and its
+    /// page map, not to this backing, and a caller-provided backing (`Region::shared` over a browser
+    /// window slice) can be narrower than the reservation: an admitted page past the backing's end
+    /// must read as zero / drop the write here, never touch the host memory behind the buffer.
+    #[inline]
+    fn in_range(&self, off: u64, width: u32) -> bool {
+        off.checked_add(width as u64)
+            .is_some_and(|end| end <= self.len())
+    }
+
     /// **Non-atomic** width-specialized (1/2/4/8) little-endian read — one (possibly unaligned)
     /// machine load instead of `width` per-byte atomic loads. Sound **only for a single-threaded
     /// caller**: the cooperative bytecode interpreter has exactly one vCPU touching the backing at a
     /// time (no race), so it can take this path; the genuinely concurrent tree-walker / §12 atomics
-    /// keep the per-byte [`Region::byte`] / [`Region::atomic_load`] paths. The caller must have
-    /// confined `[off, off+width) ⊆ [0, size)` (e.g. via `temen_mask::Window::checked`).
+    /// keep the per-byte [`Region::byte`] / [`Region::atomic_load`] paths. Out-of-range reads
+    /// return 0 (like [`Region::byte`]); the caller confines to the window, this bounds to the backing.
     #[inline]
     pub fn read_word(&self, off: u64, width: u32) -> u64 {
+        if !self.in_range(off, width) {
+            return 0;
+        }
         match self.backing() {
             Ok(s) => s.read_word(off, width),
             Err(p) => p.read_word(off, width),
@@ -286,6 +300,9 @@ impl Region {
     /// [`Region::read_word`] (same single-threaded contract). Keeps only the low `width` bytes.
     #[inline]
     pub fn write_word(&self, off: u64, width: u32, val: u64) {
+        if !self.in_range(off, width) {
+            return;
+        }
         match self.backing() {
             Ok(s) => s.write_word(off, width, val),
             Err(p) => p.write_word(off, width, val),
@@ -295,6 +312,9 @@ impl Region {
     /// `width`-byte (4 or 8) sequentially-consistent atomic load (§12). The caller guarantees
     /// natural alignment and in-window bounds.
     pub fn atomic_load(&self, off: u64, width: u32) -> u64 {
+        if !self.in_range(off, width) {
+            return 0;
+        }
         match self.backing() {
             Ok(s) => s.atomic_load(off, width),
             Err(p) => p.atomic_load(off, width),
@@ -303,6 +323,9 @@ impl Region {
 
     /// `width`-byte seq-cst atomic store.
     pub fn atomic_store(&self, off: u64, width: u32, val: u64) {
+        if !self.in_range(off, width) {
+            return;
+        }
         match self.backing() {
             Ok(s) => s.atomic_store(off, width, val),
             Err(p) => p.atomic_store(off, width, val),
@@ -311,6 +334,9 @@ impl Region {
 
     /// `width`-byte seq-cst read-modify-write; returns the **old** value.
     pub fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
+        if !self.in_range(off, width) {
+            return 0;
+        }
         match self.backing() {
             Ok(s) => s.atomic_rmw(off, width, op, val),
             Err(p) => p.atomic_rmw(off, width, op, val),
@@ -320,6 +346,9 @@ impl Region {
     /// `width`-byte seq-cst compare-exchange: store `replacement` iff the current value equals
     /// `expected`; always return the **old** value.
     pub fn atomic_cmpxchg(&self, off: u64, width: u32, expected: u64, replacement: u64) -> u64 {
+        if !self.in_range(off, width) {
+            return 0;
+        }
         match self.backing() {
             Ok(s) => s.atomic_cmpxchg(off, width, expected, replacement),
             Err(p) => p.atomic_cmpxchg(off, width, expected, replacement),
@@ -386,7 +415,9 @@ mod shared {
     // SAFETY: as `Mapped` — a raw `*mut u8` whose every access is a real seq-cst atomic (`atomic_*`)
     // or a relaxed single byte (`byte`/`set_byte`), both defined under races; bulk `zero`/`read_into`
     // are control-plane. The embedder guarantees the backing is genuinely shared across the threads
-    // that hold this region and outlives it; `Region` bounds every `off < size` before dispatching.
+    // that hold this region and outlives it; `Region` bounds every access to `[0, size)` before
+    // dispatching (`byte`/`set_byte` per byte, `in_range` for the word/atomic paths, `clamp_len` for
+    // the bulk paths).
     unsafe impl Send for Shared {}
     unsafe impl Sync for Shared {}
 
@@ -1299,5 +1330,55 @@ mod tests {
         drop(a);
         // SAFETY: same layout; `a` dropped above.
         unsafe { std::alloc::dealloc(base, layout) };
+    }
+}
+
+#[cfg(test)]
+mod backing_bound_tests {
+    //! #1191 — the word/atomic accessors are bounded to the backing: an interpreter that admitted a
+    //! page past a caller-provided backing (the reservation is wider than a `Region::shared` window
+    //! slice) must read zero / drop the write, never touch the host memory behind the buffer.
+    use super::*;
+
+    #[test]
+    fn word_and_atomic_accessors_stop_at_the_backing_end() {
+        // A 32-byte buffer; the region covers only the first 16 — the last 16 are the canary.
+        let mut buf = [0u8; 32];
+        for (i, b) in buf.iter_mut().enumerate().skip(16) {
+            *b = 0xA5 ^ i as u8;
+        }
+        let canary = buf[16..].to_vec();
+        // SAFETY: `buf` outlives the region and is touched only through it below.
+        let r = unsafe { Region::shared(buf.as_mut_ptr(), 16) };
+        r.write_word(8, 8, 0x1122_3344_5566_7788);
+        assert_eq!(
+            r.read_word(8, 8),
+            0x1122_3344_5566_7788,
+            "in-range round-trips"
+        );
+        // Exactly past the end, and straddling it: reads zero, writes dropped, rmw/cmpxchg inert.
+        for (off, width) in [(16u64, 8u32), (12, 8), (15, 2), (u64::MAX - 3, 8)] {
+            r.write_word(off, width, u64::MAX);
+            assert_eq!(
+                r.read_word(off, width),
+                0,
+                "read past the backing at {off}+{width}"
+            );
+            r.atomic_store(off, width.max(4), u64::MAX);
+            assert_eq!(r.atomic_load(off, width.max(4)), 0);
+            assert_eq!(r.atomic_rmw(off, width.max(4), RmwOp::Add, 1), 0);
+            assert_eq!(r.atomic_cmpxchg(off, width.max(4), 0, 1), 0);
+        }
+        assert_eq!(
+            r.read_word(8, 8),
+            0x1122_3344_5566_7788,
+            "a straddling write is dropped whole, not truncated into the in-range prefix"
+        );
+        drop(r);
+        assert_eq!(
+            &buf[16..],
+            &canary[..],
+            "the bytes behind the backing are untouched"
+        );
     }
 }

@@ -23376,10 +23376,19 @@ impl Mem {
     /// Like [`Mem::with_reservation`], but the backing is a **caller-provided** [`Region`] (e.g. a
     /// [`Region::shared`] over the host's shared linear memory) rather than an engine-`mmap`ped one —
     /// the substrate the parallel-wasm backend runs over (every per-vCPU Worker executes over the same
-    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`; reserved-tail
-    /// accesses beyond it read as zero (a confined guest stays in its prefix). The crate stays
+    /// shared window). `back` must address ≥ the mapped prefix `1 << mapped_log2`. The crate stays
     /// `#![forbid(unsafe_code)]` — the `unsafe` of borrowing host memory is in the embedder's
     /// `Region::shared` call, not here. Today still driven cooperatively; only the backing changes.
+    ///
+    /// `back` may be **narrower than the reservation** (every Region-backed vCPU path asks for the
+    /// 1-TiB `DEFAULT_RESERVED_LOG2` over a window-sized backing). A `map`/`protect` past the backing
+    /// is then admitted by the reservation — deliberately: a guest that `vm_map`s high behaves as it
+    /// would over the engine's own reservation right up to the first access, which the emitted tier's
+    /// bounds check turns into a **decline** (#1153, the browser re-runs on the interpreter) — while
+    /// the interpreter's own accesses past the backing read as zero / drop writes, enforced at the
+    /// [`Region`] accessors themselves (#1191: the word/atomic fast paths were unbounded and reached
+    /// host memory behind the window). A Region-backed run that needs memory past its backing is
+    /// decline-and-rerun territory, never a silent host access.
     fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));

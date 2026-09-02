@@ -10,6 +10,8 @@
 //! whole-program path already carries it (`module_uses_unmap_protect`, proven by
 //! `crates/temen/tests/support/paged.rs`).
 //!
+//! `map` (op 0) is admitted too (Slice 2c): the same bounce + refresh carries a re-commit.
+//!
 //! **Scope of this file (Slice 1 — the emit change):** admission (a page-op nested unit emits under
 //! the paged entry where the non-paged entry fails closed), the eligibility split (the page-op
 //! wrapper stays an interp leaf, the compute entry emits), the `"pagestate"` export, and — through a
@@ -143,10 +145,9 @@ fn run_paged_nested(src: &str) -> (Outcome, u32) {
     outline_nested_cap_calls(&mut m);
     let (wasm, eligible) = compile_module_nested_paged_with_eligibility(&m, false, PAGE_LOG2)
         .expect("paged nested emit");
-    assert_eq!(
-        eligible,
-        vec![true, false],
-        "paged nested: the entry emits, the unmap wrapper is a cross-tier leaf"
+    assert!(
+        eligible[0] && eligible[1..].iter().all(|&e| !e),
+        "paged nested: the entry emits, every page-op wrapper is a cross-tier leaf ({eligible:?})"
     );
 
     let engine = Engine::default();
@@ -201,7 +202,13 @@ fn run_paged_nested(src: &str) -> (Outcome, u32) {
                 };
                 let off = slot(1);
                 let len = slot(2);
-                let kind = if op == 1 { 2 } else { 0 }; // 2 = Unmapped, 0 = Ro
+                // `map_info` kinds: 1 = Rw (a `map` re-commit), 2 = Unmapped, 0 = Ro. A later entry
+                // for the same page wins in `build_pagestate_table` (a re-map after an unmap).
+                let kind = match op {
+                    0 => 1,
+                    1 => 2,
+                    _ => 0,
+                };
                 {
                     let st = caller.data_mut();
                     st.bounces += 1;
@@ -211,7 +218,7 @@ fn run_paged_nested(src: &str) -> (Outcome, u32) {
                         p += PAGE;
                     }
                 }
-                // `unmap` returns 0 on success — write it into slot 0 (the result slot).
+                // The page op returns 0 on success — write it into slot 0 (the result slot).
                 let out = mem.data_mut(&mut caller);
                 let o = args_ptr as usize;
                 out[o..o + 8].copy_from_slice(&0u64.to_le_bytes());
@@ -361,6 +368,36 @@ fn nested_paged_protect_then_read_passes() {
         out,
         Outcome::Val(424242),
         "an emitted read of an Ro page must return the stored sentinel"
+    );
+}
+
+/// `map` (op 0, #1151 Slice 2c): unmap page 5, then `map` it back read-write (two outlined bounces),
+/// then store + load on it — the emitted paged access passes over the re-committed page, because the
+/// post-bounce refresh carries the `Rw` entry into the table. (Without the second bounce the store
+/// would trap, as `nested_paged_unmap_then_load_traps` pins.)
+#[test]
+fn nested_paged_unmap_then_map_then_store_passes() {
+    let src = r#"memory 17
+func (i32) -> (i64) {
+block 0 (vas: i32) {
+  voff = i64.const 20480
+  vlen = i64.const 4096
+  vr = call.cap 5 1 (i64, i64) -> (i64) vas (voff, vlen)
+  vprot = i32.const 3
+  vr2 = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  vv = i64.const 777
+  i64.store voff vv
+  vld = i64.load voff
+  return vld
+  }
+}
+"#;
+    let (out, bounces) = run_paged_nested(src);
+    assert_eq!(bounces, 2, "unmap + map wrappers both bounce");
+    assert_eq!(
+        out,
+        Outcome::Val(777),
+        "an emitted store/load on a re-mapped page must pass under paged nested mode"
     );
 }
 
