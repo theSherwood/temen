@@ -291,7 +291,7 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
 /// the op-13 re-granted powerbox (`take_granted_host`) and run the child over it
 /// (`new_confined_child_over_host`, which binds the child manifest against that powerbox); `Join` delivers
 /// the child's result. Single-threaded here (the driver worker), so the window base travels as a raw ptr.
-fn drive_op13<'p>(
+pub(crate) fn drive_op13<'p>(
     prog: &'p bytecode::VcpuProgram,
     base: *mut u8,
     mut vcpu: bytecode::Vcpu<'p>,
