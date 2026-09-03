@@ -41,6 +41,18 @@ fn main() {
     }
     .expect("translate");
     eprintln!("translated in {:.1?}", t0.elapsed());
+    // `PG_SINGLE_FUNCS=<path>`: dump `index<TAB>name` for every function, to resolve the `f<idx>` a
+    // `TEMEN_TRAP_TRACE=1` run names at a trap.
+    if let Ok(path) = std::env::var("PG_SINGLE_FUNCS") {
+        // `funcs <total>` first, then every defined function's `index<TAB>name` (`exports`); the
+        // trap stubs are appended after all defined functions + helpers, in `TEMEN_STUB_DEBUG=1` print
+        // order, so stub k is index `total - nstubs + k`.
+        let mut text = format!("funcs\t{}\n", t.module.funcs.len());
+        for (name, idx) in &t.exports {
+            text += &format!("{idx}\t{name}\n");
+        }
+        std::fs::write(&path, text).expect("write func names");
+    }
     let inst = temen_run::instantiate(t.module).expect("instantiate");
     let config = temen_run::RunConfig {
         stdin: sql,

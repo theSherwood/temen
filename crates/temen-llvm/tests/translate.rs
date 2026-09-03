@@ -11159,6 +11159,21 @@ fn vec4i16_byte_clamp_select_sext_mask() {
     }
 }
 
+/// A float math **intrinsic** (`llvm.log.f64`, `llvm.exp.f32`, … — clang ≥22 emits these under
+/// `-fno-math-errno` where older clangs emitted the libcall) resolves to the guest-**defined** libm
+/// function of that name when the program links one (Postgres bundles openlibm; its `cost_tuplesort`
+/// `log()` trapped as an unresolved-extern stub). Here the TU defines its own `log`/`expf`, so the
+/// result proves the intrinsic reached *them* — natively, the same definitions override libm.
+#[test]
+fn math_intrinsic_resolves_to_guest_libm() {
+    let src = "__attribute__((noinline)) double log(double x){ return x + 40.5; }\n\
+               __attribute__((noinline)) float expf(float x){ return x * 2.0f; }\n\
+               int run(int n){ double a = __builtin_log((double)n); float b = __builtin_expf((float)n);\n\
+               \x20 return ((int)a + (int)b) & 0xff; }\n\
+               int main(){ return run(7); }\n";
+    check_vs_native_flags("math_intrinsic_libm", src, &["-fno-math-errno"], 7);
+}
+
 /// `frem`: clang ≥22 folds a constant-divisor `fmod(x, C)` into the instruction (Postgres's `dsind`);
 /// older clangs keep the `fmod` call. Both lower to the synthesized IEEE-exact `__temen_fmod`, so the
 /// result is bit-identical to native either way — including the f32 form, which promotes through f64.

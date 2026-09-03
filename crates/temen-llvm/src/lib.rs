@@ -15822,6 +15822,22 @@ fn lower_frameaddress(
     })))
 }
 
+/// The libm function an LLVM float math intrinsic stands for: `llvm.log.f64` → `log`,
+/// `llvm.exp2.f32` → `exp2f`. Only the plain `<name>.f32|f64` shape (the transcendental family);
+/// anything else — other suffixes, vector types, non-`llvm.` names — is `None`.
+fn libm_intrinsic_target(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("llvm.")?;
+    let (base, ty) = rest.rsplit_once('.')?;
+    if base.contains('.') || !base.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    match ty {
+        "f64" => Some(base.to_string()),
+        "f32" => Some(format!("{base}f")),
+        _ => None,
+    }
+}
+
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
 /// (`core::panicking::*` — `panic`, `panic_fmt`, `panic_const_*`, `panic_bounds_check` — plus the
 /// `unwrap`/`expect`/slice-index failure helpers) are `-> !` and abort the process, and they are
@@ -18788,7 +18804,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 // Reaching here means every recognizer/synthesizer/capability declined `name` — it is a
                 // genuinely undefined external. Strict default: fail closed. With `stub_unresolved_externs`:
                 // mint (or reuse) a trap stub and call it, deferring the fail-closed to run time (§2a).
-                let func = match ctx.name2idx.get(&name) {
+                // A float math **intrinsic** no recognizer lowered (`llvm.log.f64`, `llvm.exp.f32`, …
+                // — clang ≥22 emits these where older clangs emitted the libcall) resolves to the
+                // guest-defined libm function of the same name when the program links one (Postgres
+                // bundles openlibm: `log`, `exp`, `pow`, `sin`, …; `f32` → the `…f` variant). Same
+                // signature, same `(sp, args…)` convention as any direct call.
+                let libm = libm_intrinsic_target(&name)
+                    .filter(|t| ctx.name2idx.contains_key(t))
+                    .unwrap_or_else(|| name.clone());
+                let func = match ctx.name2idx.get(&libm) {
                     Some(&idx) => idx,
                     None => match ctx.stubs {
                         Some(cell) => {

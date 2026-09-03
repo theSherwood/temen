@@ -151,7 +151,15 @@ signed compare without sign-extending them out of their i32 container (`i16 -1` 
 the same §3b narrow-int hazard the scalar `icmp` path already guarded. Tail lanes are now canonically
 extended per the consumer's signedness. Found by the Embench differential (`picojpeg: MISCOMPILE`
 on all three engines), bisected with the example's new `EMBENCH_ONLY`/`EMBENCH_CFLAGS` to
-"vectorization + AVX2", then to the one function whose vector code differed between clang 21 and 22.
+"vectorization + AVX2", then to the one function whose vector code differed between clang 21 and 22. (11) After all of
+that the browser card *booted* Postgres and then trapped on `ORDER BY`: clang 22 emits `llvm.log.f64`
+for `cost_tuplesort`'s `log()` where clang 21 emitted the libcall that resolved to the linked
+openlibm, and an unrecognized intrinsic fell to an unresolved-extern trap stub. An otherwise-unhandled
+`llvm.<fn>.f64|f32` now resolves to the guest-defined `<fn>`/`<fn>f` when the program links one
+(`libm_intrinsic_target`). Reproduced and fixed on the reference host with the new
+`examples/pg_single.rs` driver (`TEMEN_TRAP_TRACE=1` names the trapping function index,
+`PG_SINGLE_FUNCS` + `TEMEN_STUB_DEBUG=1` map it to a name), which boots the module against an
+`initdb`'d cluster with the card's SQL.
 
 *History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
 `llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual
