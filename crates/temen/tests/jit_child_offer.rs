@@ -431,7 +431,7 @@ block 0 (v0: i64) {
 }
 func (i64, i64) -> (i64) {
 block 0 (va: i64, vb: i64) {
-  vaddr = i64.const 8
+  vaddr = i64.const 16392
   vexp = i32.const 0
   vto = i64.const 2000000
   vst = i32.atomic.wait vaddr vexp vto
@@ -440,6 +440,8 @@ block 0 (va: i64, vb: i64) {
   }
 }
 "#;
+// (The parking handler's futex word sits at 16392 — above the NULL guard the child's 64 KiB carve
+// reserves like any window, #1206.)
 
 /// **The 5c.2 pin**: handoff-on ≡ handoff-off ≡ interp, on the result AND the callee's
 /// served-count observation (the §10.2 settlement rule). With the knob on, whether a given run
