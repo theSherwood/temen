@@ -226,6 +226,18 @@ fn run(backend: Backend, src: &str) -> Result<i32, String> {
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
+/// [`run`] on its own thread with a deadline: the #1217 pins guard against a *hang* (a pager
+/// parked forever), so a regression must fail the test, not stall the binary until CI's timeout.
+fn run_bounded(backend: Backend, src: &str) -> Result<i32, String> {
+    let src = src.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run(backend, &src));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{backend:?}: the run hung (pager parked with a dead client?)"))
+}
+
 /// The record spelling of a plain op-0 spawn produces the identical result.
 #[test]
 fn record_spawn_matches_legacy_plain_spawn() {
@@ -248,18 +260,47 @@ fn record_spawn_carries_the_pager_binding() {
 }
 
 /// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
-/// recoverable kind the pager services (the reserved region cannot be mapped). The parent `join`s
-/// straight away (no `svc.wait`: a parent parked on a service whose only client died never wakes —
-/// the pre-existing deadlock shape, tracked separately), and the join surfaces the trap; the run
-/// does not exit.
+/// recoverable kind the pager services (the reserved region cannot be mapped). The parent is parked
+/// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
+/// no-progress answer) so its `join` surfaces the trap — the run traps instead of hanging.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
-    let src = record_pager_program_at(0).replace("vs = svc.wait vz", "vs = i64.extend_i32_u vz");
+    let src = record_pager_program_at(0);
     for b in BACKENDS {
         assert!(
-            run(b, &src).is_err(),
+            run_bounded(b, &src).is_err(),
             "{b:?}: a NULL fault in a paged child is fatal"
         );
+    }
+}
+
+/// #1217: a demand child that **never faults** — it returns `5` without touching its window — must
+/// not strand the pager parked in `svc.wait`. The wait returns `0` once the child is gone; the
+/// `join` delivers `5`; the run exits `0 * 1000 + 5`.
+#[test]
+fn pager_child_that_never_faults_releases_the_parked_pager() {
+    let src = record_pager_program_at(0).replace("vb = i32.load8_u vaddr", "vb = i32.const 5");
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
+    }
+}
+
+/// #1217, the other order: the child is already gone (joined) when the parent reaches `svc.wait`,
+/// so nothing could ever wake it — the wait returns `0` immediately rather than parking.
+#[test]
+fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
+    let src = record_pager_program_at(0)
+        .replace("vb = i32.load8_u vaddr", "vb = i32.const 5")
+        .replace(
+            "  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n",
+            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vs = svc.wait vz\n",
+        );
+    assert!(
+        src.contains("(vch)\n  vs = svc.wait"),
+        "the swap must apply"
+    );
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
     }
 }
 
