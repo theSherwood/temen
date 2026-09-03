@@ -4915,6 +4915,12 @@ struct Sched {
     live: usize,
     /// Worker threads in existence (incl. the calling thread, counted as 1).
     workers: usize,
+    /// #1228 — worker threads currently **blocked** in the scheduler condvar (idle, no runnable
+    /// vCPU). Maintained around every [`worker_loop`] wait. When a worker about to block observes
+    /// `parked == workers - 1`, every *other* worker is already blocked (none is mid-`dispatch`),
+    /// so the whole run is quiescent — the precondition for the all-parked deadlock check
+    /// ([`run_deadlocked`]). `workers` only ever grows during a run, so the comparison is stable.
+    parked: usize,
     next_task: TaskId,
     next_wid: u64,
     shutdown: bool,
@@ -6266,6 +6272,58 @@ fn park_gate(s: &mut Sched, v: Box<VCpu>) -> Option<Box<VCpu>> {
     None
 }
 
+/// #1228 — the tree-walk executor's **all-parked deadlock** predicate, the counterpart of the
+/// cooperative bytecode driver's `ThreadFault` at quiescence (`bytecode.rs`, "deadlock (no
+/// runnable, no waiters)") and of the deterministic explorer's quiescent-run end. Read by
+/// [`worker_loop`] under the scheduler lock, at the point a worker would otherwise block forever
+/// (nothing runnable, no futex/svc timer). It is a genuine deadlock when:
+///
+/// - there is live work parked (`live > 0`) that nothing runnable can advance, and
+/// - **every** worker is idle — the caller is about to become the last (`parked == workers - 1`),
+///   so no sibling is mid-`dispatch` about to push runnable work or wake a waiter, and
+/// - **every** parked vCPU is in an internally-wakeable-only park. DESIGN.md §12: for a
+///   reactor/Session an all-parked run can be a live domain's *resting state* — something outside a
+///   running guest vCPU may still wake it — so the executor must not declare deadlock while any
+///   such wake is possible. Those channels are exactly the parks an embedder or the pool can
+///   complete from outside the run: an interruptible syscall an embedder `raise_signal` can `EINTR`
+///   or a `feed_terminal` can satisfy — a pipe read/write (`pipe_waiters` / `pipe_write_waiters`),
+///   a blocking stream read (`cap_waiters` — the interactive stdin `^C`), a blocking `waitpid`
+///   (`posix_reap_waiters` / `reap_any_waiters`, and a `wait(pid)` filed in `join_waiters` under
+///   [`Pending::ReapPid`]); a job-control stop awaiting `SIGCONT` (`stopped`); and a punted
+///   dispatch a pool worker will post (`completion_waiters`). This is the executor's own copy of
+///   the set [`Scheduler::interrupt_interruptible_parks`] drains, plus the always-external pool
+///   and stop channels. Everything left — a `thread.join`, `svc.wait` (incl. an
+///   `OfferPark`/`cont.resume.block` resumer), a cap reply, an offer admission — is woken only by
+///   another vCPU of the run, so with nothing runnable it can never make progress.
+///
+/// This is the executor's counterpart of the cooperative driver's `external` check (a pipe park
+/// behind an armed doorbell): the same "is any outside wake possible?" test, over the executor's
+/// own waiter maps. Reactor resting states are preserved wholesale — an interactive terminal rests
+/// with its input reader parked (`pipe_waiters` / `cap_waiters`), a stopped job with `stopped`, and
+/// a durable freeze-on-quiesce run fires its freeze (re-admitting the parked consumers) before the
+/// worker ever reaches here. The `svc.wait`-parked daemon whose clients are gone (#1217) — a
+/// `loop { svc.wait }` server a *batch* root then `join`s — is the motivating shape: the
+/// client-death token gives one spurious `0` and the loop re-parks untimed, so without this the
+/// executor waits on the condvar forever where the cooperative driver traps (INVARIANTS.md #9: a
+/// run completes, traps, or declines — never hangs).
+fn run_deadlocked(s: &Sched) -> bool {
+    s.live > 0
+        && s.parked == s.workers.saturating_sub(1)
+        && s.pipe_waiters.is_empty()
+        && s.pipe_write_waiters.is_empty()
+        && s.cap_waiters.is_empty()
+        && s.completion_waiters.is_empty()
+        && s.stopped.is_empty()
+        && s.posix_reap_waiters.is_empty()
+        && s.reap_any_waiters.is_empty()
+        // A `wait(pid)` (POSIX) rides `join_waiters` under `Pending::ReapPid` and is interruptible;
+        // a `thread.join` (a different `pending`) is the internally-wakeable park #1228 traps.
+        && !s
+            .join_waiters
+            .values()
+            .any(|v| matches!(v.pending, Some(Pending::ReapPid { .. })))
+}
+
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
 fn worker_loop(sched: &Arc<Scheduler>) {
@@ -6318,14 +6376,32 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                     Some(dl) => {
                         let now = Instant::now();
                         if dl > now {
+                            s.parked += 1;
                             let (g, _) = sched
                                 .work
                                 .wait_timeout(s, dl - now)
                                 .unwrap_or_else(|e| e.into_inner());
                             s = g;
+                            s.parked -= 1;
                         }
                     }
-                    None => s = sched.work.wait(s).unwrap_or_else(|e| e.into_inner()),
+                    None => {
+                        // #1228 — nothing runnable and no timer: about to block on the condvar. If
+                        // the run is genuinely deadlocked (every worker idle, no external wake
+                        // channel open), end it with `Trap::ThreadFault` exactly as the cooperative
+                        // bytecode driver does, instead of waiting forever. `teardown_run` reaps
+                        // every parked vCPU — the root among them — with `ThreadFault`, so `drive`'s
+                        // root-outcome read returns the trap; `notify_all` wakes the other idle
+                        // workers to observe `shutdown` and exit.
+                        if run_deadlocked(&s) {
+                            teardown_run(&mut s);
+                            sched.work.notify_all();
+                            continue;
+                        }
+                        s.parked += 1;
+                        s = sched.work.wait(s).unwrap_or_else(|e| e.into_inner());
+                        s.parked -= 1;
+                    }
                 }
             }
         };
