@@ -98,6 +98,25 @@ else
   echo "FAILED (child-entry): residual diff:"; diff <(norm "$CACHE/native.s.nif") <(norm "$ceout/nimcache/$sys.s.nif") | head -20; exit 1
 fi
 
+# ---- emit the committed driver-guest fixtures (crates/temen-llvm/tests/rust_driver_nimsem.rs) --------
+# The step-9 guest op-13-spawns THIS nimsem_ce over the system import closure, reproducing the .s.nif
+# above (nimsem is deterministic for a fixed memfs; either nifler yields identical output). Opt-in so a
+# normal demo run doesn't rewrite committed assets. The test hardcodes the system stem `sysvq0asl`, so
+# guard on it — if a frontend bump changes the stem, bump the test's argv/filenames in lockstep.
+if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
+  FX="$HERE/fixtures"; mkdir -p "$FX"
+  if [ "$sys" != "sysvq0asl" ]; then
+    echo "WARN: system stem is '$sys', not 'sysvq0asl' — update rust_driver_nimsem.rs (argv + fixture names) to match"
+  fi
+  gzip -9 -c "$CACHE/nimsem_ce_raw.temen" > "$FX/nimsem_ce.temen.gz"
+  cp "$W/nimcache/$sys.p.nif" "$FX/$sys.p.nif"
+  gzip -9 -c "$ceout/nimcache/$sys.s.nif" > "$FX/$sys.s.nif.gz"
+  # The system module's import closure the nifler grandchildren parse: system.nim's include set lives
+  # under lib/std/system/, plus errorcodes. Self-contained (system/* only imports errorcodes).
+  tar czf "$FX/syslib.tar.gz" -C "$BIN/../lib" std/system.nim std/system std/errorcodes
+  echo "  emitted driver-guest fixtures -> $FX ($(du -sh "$FX" | cut -f1), sys=$sys)"
+fi
+
 # ---- [6/6] the front-end CHAIN, both phases op-13 children over ONE shared memfs (nimsem -> hexer) ---
 # The compiler driver on Temen: a native conductor op-13-spawns nimsem then hexer, handing the `.s.nif`
 # between them through one shared memfs (nifler runs as nimsem's exec grandchildren). Oracle: native
