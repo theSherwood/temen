@@ -10145,6 +10145,40 @@ struct CoopSched {
     invoke_fibers: Vec<FiberState>,
 }
 
+/// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
+/// bell, so an embedder signal (a terminal `^C`/`^Z`, a `kill(1)`) delivered *while the pump is
+/// all-parked* rings the bell and re-runs the settle instead of being slept through. Every door is the
+/// same ring — "something changed" — and the pump's settle does the real work (pipe poll, `reap_pending`
+/// re-admit, the `#1215` loop-top kill sweep). Two gaps this closes: (1) `set_kill` was never wired, so a
+/// default-action TERMINATE (`^C` of a job with no handler) set `term_sig` but woke nothing; (2) a fork
+/// twin's doors were never wired at all, so an embedder signal to a foreground/background *twin* (the
+/// shape of a real `cat`) could not ring the root bell. The tree-walker points these doors at
+/// `interrupt_interruptible_parks`/`wake_stopped`; the cooperative pump needs only the ring.
+fn wire_pump_bell(
+    source: &std::sync::Arc<dyn super::SignalSource + Send + Sync>,
+    bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+) {
+    fn ring(
+        bell: &std::sync::Arc<(std::sync::Mutex<u64>, std::sync::Condvar)>,
+    ) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        let bell = std::sync::Arc::clone(bell);
+        std::sync::Arc::new(move || {
+            let (gen, cv) = &*bell;
+            *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            cv.notify_all();
+        })
+    }
+    source.set_wake(ring(bell));
+    source.set_kill(ring(bell));
+    source.set_chld_wake(ring(bell));
+    let bell_pw = std::sync::Arc::clone(bell);
+    source.set_pipe_wake(std::sync::Arc::new(move |_pipe| {
+        let (gen, cv) = &*bell_pw;
+        *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        cv.notify_all();
+    }));
+}
+
 impl CoopSched {
     /// Build the initial scheduler state: the root task at `entry`, plus any fibers a durable freeze
     /// left to re-seed (taken from `host.frozen_fibers`). This is `drive`'s former preamble verbatim
@@ -10245,35 +10279,15 @@ impl CoopSched {
         // readiness on each ring — an embedder's `feed_terminal` (another OS thread, or another
         // wasm-thread instantiation) is the wake source. The pipe id is unused: the pump's settle
         // already polls every parked pipe, so the ring only needs to say "something changed".
+        // #1122/#1146/#1262 — wire the root's personality signal doors to ring the external-wake bell
+        // (pipe-wake for a `feed_terminal` byte arrival; `set_wake` for an EINTR-bearing deliverable
+        // signal; `set_chld_wake` for a child stop/continue re-scan; `set_kill` for a default-action
+        // TERMINATE), so an embedder signal delivered while the pump is all-parked re-runs the settle
+        // instead of being slept through. The pump's settle does the work (pipe poll, `reap_pending`,
+        // the #1215 kill sweep). See [`wire_pump_bell`].
         if let Some(bell) = host.external_wake() {
             if let Some((_, source)) = host.signal_poll() {
-                let bell_pw = std::sync::Arc::clone(&bell);
-                source.set_pipe_wake(std::sync::Arc::new(move |_pipe| {
-                    let (gen, cv) = &*bell_pw;
-                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-                    cv.notify_all();
-                }));
-                // #1146 slice 2 — a deliverable signal that deposits no bytes (a `^C` fg-group kill
-                // raises SIGINT, so `feed_terminal` wakes via signal delivery — the `set_wake` door —
-                // not the pipe-wake door) must also ring this bell, else the all-parked pump sleeps
-                // through it and never runs its EINTR sweep. The tree-walker points `set_wake` at
-                // `interrupt_interruptible_parks`; the cooperative pump needs only the ring — waking
-                // re-enters the `None` arm, whose sweep does the interrupting.
-                let bell_cw = std::sync::Arc::clone(&bell);
-                source.set_wake(std::sync::Arc::new(move || {
-                    let (gen, cv) = &*bell_cw;
-                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-                    cv.notify_all();
-                }));
-                // #1213 — the child-transition nudge rings the same bell: the cooperative pump's
-                // settle scan reads `reap_pending` and re-admits the blocked `waitpid`, so an
-                // embedder-raised child stop/continue while the pump is all-parked is not slept
-                // through. (The tree-walker points this at the clean `rescan_reap_parks`.)
-                source.set_chld_wake(std::sync::Arc::new(move || {
-                    let (gen, cv) = &*bell;
-                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-                    cv.notify_all();
-                }));
+                wire_pump_bell(&source, &bell);
             }
         }
 
@@ -11357,6 +11371,18 @@ impl CoopSched {
                             // (`-ENOSYS`/`-ECHILD`) — so a bash pipeline SUBSHELL (itself a twin) cannot
                             // fork+wait its command, wedging `echo | cat` in a waitpid busy-loop.
                             twin_host.wire_park_door();
+                            // #1262 — wire the twin's personality signal doors to the SAME external-wake
+                            // bell as the root. A foreground/background job is a twin, and an embedder
+                            // signal to it (a terminal `^C`/`^Z`, a `kill(1)`) while the pump is
+                            // all-parked must ring the bell so the settle re-runs — the #1215 kill sweep
+                            // then finalizes a terminated twin parked on its terminal read, and the reap
+                            // wakes the shell. Without it the twin's doors were unwired and the embedder
+                            // signal was slept through: interactive `^C` of a parked `cat` deadlocked.
+                            if let Some(bell) = host.external_wake() {
+                                if let Some((_, tsource)) = twin_host.signal_poll() {
+                                    wire_pump_bell(&tsource, &bell);
+                                }
+                            }
                             // The twin's continuation is the parent's, at the post-fork resume point,
                             // with the return-twice `0` (the parent keeps the twin's pid, set below). A
                             // bare root carries no resume chain / invoke (`Vm` derives `Clone`).

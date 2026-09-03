@@ -4478,6 +4478,95 @@ fn c_terminal_ctrl_z_stops_an_execd_foreground_command_and_the_shell_reports_it(
     );
 }
 
+fn zintr_src() -> String {
+    format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_signal(int cap, long signum, long handler);\n\
+long __px_sigaltstack(int cap, long sp, long size);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_tcsetpgrp(int cap, long fd, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static char sigstk[16384];\n\
+static volatile long chld;\n\
+static void on_chld(int s){{ chld = chld + 1; }}\n\
+static int status;\n\
+static long cpid;\n\
+static int sync_fds[2];\n\
+static char *av[] = {{ \"catr\", 0 }};\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+int main(void){{\n\
+  __px_signal(0, 17, (long)on_chld);\n\
+  __px_sigaltstack(0, (long)sigstk, 16384);\n\
+  int h2[2]; __vm_pipe(h2); __px_pipe_adopt(0, h2[0], h2[1], (long)sync_fds);\n\
+  cpid = __px_fork(0, 0);\n\
+  if (cpid < 0) return 1;\n\
+  if (cpid == 0) {{\n\
+    /* the foreground job: its own group, no SIGINT handler (default: TERMINATE), then execve catr\n\
+       which blocks reading the terminal until the ^C arrives. */\n\
+    __px_setpgid(0, 0, 0);\n\
+    char g; long r = __px_read(0, sync_fds[0], (long)&g, 1);\n\
+    long hh = ph_(r); if (hh >= 0) __vm_read((int)hh, &g, 1);\n\
+    execve(\"/bin/catr\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  __px_setpgid(0, cpid, cpid);\n\
+  __px_tcsetpgrp(0, 0, cpid);        /* the job is the terminal foreground group */\n\
+  char g = 'g'; long wr = __px_write(0, sync_fds[1], (long)&g, 1);\n\
+  long wh = ph_(wr); if (wh >= 0) __vm_write((int)wh, &g, 1);\n\
+  long h;\n\
+  /* the shell blocks reaping the foreground job. A terminal ^C (VINTR) raises SIGINT at the\n\
+     foreground group; the job has no handler, so it dies WIFSIGNALED(SIGINT=2). */\n\
+  while ((h = __px_waitpid(0, cpid, (long)&status, 0)) == -4) {{ }}\n\
+  if (h != cpid) return 4;\n\
+  __px_tcsetpgrp(0, 0, 1);           /* the shell reclaims the terminal */\n\
+  if ((status & 0x7f) == 0) return 5000 + ((status>>8)&0xff);  /* exited, not signaled */\n\
+  return 3000 + (status & 0x7f);     /* WIFSIGNALED: 3002 for SIGINT */\n\
+}}\n"
+    )
+}
+
+// #1146/#796 — the interactive `^C`: a terminal VINTR raises SIGINT at the foreground process group,
+// and a foreground job with NO handler is TERMINATED (default action), waking the shell's blocked
+// `waitpid`. This is the ^C analog of `c_terminal_ctrl_z_stops_an_execd_foreground_command_...` — the
+// browser shape where bash interrupts a real fork+execve `cat`, not a fork twin of itself. The shell
+// foregrounds a job that `execve`s `/bin/catr` (blocks reading the terminal) with no SIGINT
+// disposition; a fed `\x03` fires the line discipline's ISIG group-kill at the foreground group; the
+// job dies WIFSIGNALED(SIGINT), the shell's `waitpid` reaps `(status & 0x7f) == 2` → 3002, and the
+// shell reclaims the terminal. Exercises the default-action TERMINATE (invariant 14: #1215 coop
+// loop-top kill sweep finalizing a job parked on its terminal read) reached through a *terminal* ^C at
+// the group, and the reap-wake back to the shell — on the tree-walker oracle and the cooperative
+// bytecode engine (the browser tier).
+#[test]
+fn c_terminal_ctrl_c_terminates_an_execd_foreground_job_and_the_shell_reaps_it() {
+    let feeds = || vec![(300u64, b"\x03".to_vec())];
+    let e = run_interp_terminal_setup(&zintr_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(3002)],
+        "tree-walker: the terminal ^C raised SIGINT at the foreground group, the exec'd `catr` (no \
+         handler) was terminated on its parked terminal read, and the shell's waitpid reaped \
+         WIFSIGNALED(SIGINT)"
+    );
+    let b = run_bytecode_terminal_setup(&zintr_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        b.result,
+        vec![Value::I32(3002)],
+        "coop bytecode (the browser tier): the loop-top kill sweep finalized the foreground job parked \
+         on its terminal read (WIFSIGNALED via term_sig) and woke the shell's reap — matching the oracle"
+    );
+}
+
 /// #1171 — **a stopped child wakes a shell blocked in `waitpid(WUNTRACED)` even with NO async SIGCHLD
 /// delivery** — the bash shape. Real bash installs a `SIGCHLD` handler but no sigaltstack, so its
 /// `SIGCHLD` is poll-only: a parked `waitpid` cannot be woken by the async-delivery door, and a
