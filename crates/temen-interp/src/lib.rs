@@ -3761,8 +3761,11 @@ fn run_one_schedule(
     let mem = memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
         mm.init_data(data);
-        // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
-        // `fresh_single_root`).
+        // #1183: seed the NULL guard so the DPOR/Brute explorer traps a NULL deref exactly like the
+        // real tiers — otherwise the exhaustive scheduler would explore an *unguarded* address space
+        // and could accept a schedule the guarded tiers reject. The guard is unconditional (#1094),
+        // so it needs no module marker in reach here (unlike the pre-#1094 comment claimed).
+        mm.seed_null_guard(temen_ir::module_null_guard());
         mm
     });
     let det = Arc::new(DetSched::new(0, MAX_VCPUS)); // seed unused under the exhaustive policy
