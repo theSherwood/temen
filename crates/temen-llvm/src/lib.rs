@@ -586,7 +586,8 @@ fn translate_impl(
     let need_ldexp =
         calls_external(m, &defined_names, "ldexp") || calls_external(m, &defined_names, "scalbn");
     let need_pow = calls_external(m, &defined_names, "pow");
-    let need_fmod = calls_external(m, &defined_names, "fmod");
+    // `frem` (clang ≥22 folds `fmod(x, C)` into the instruction) lowers to the same helper.
+    let need_fmod = calls_external(m, &defined_names, "fmod") || uses_frem(m);
     let need_frexp = calls_external(m, &defined_names, "frexp");
     let need_strtod = calls_external(m, &defined_names, "strtod");
     let need_localeconv = calls_external(m, &defined_names, "localeconv");
@@ -3234,6 +3235,7 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
         I::FMul(x) => locals(&[&x.operand0, &x.operand1]),
         I::FDiv(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FRem(x) => locals(&[&x.operand0, &x.operand1]),
         I::FCmp(x) => locals(&[&x.operand0, &x.operand1]),
         I::FNeg(x) => locals(&[&x.operand]),
         I::FPToSI(x) => locals(&[&x.operand]),
@@ -5123,6 +5125,14 @@ struct Helpers {
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
+/// Does the module contain a scalar `frem` (→ the synthesized `__temen_fmod` helper)?
+fn uses_frem(m: &LModule) -> bool {
+    m.functions
+        .iter()
+        .flat_map(|f| &f.basic_blocks)
+        .any(|bb| bb.instrs.iter().any(|i| matches!(i, Instruction::FRem(_))))
+}
+
 /// Does the module use a **narrow** (i8/i16) atomic that needs the CAS-loop helpers — an `atomicrmw`,
 /// a `cmpxchg`, or an atomic `store` on an i8/i16? (A narrow atomic *load* is emulated inline, so it
 /// doesn't pull in a helper.) Wide (i32/i64) atomics lower directly and need no helper.
@@ -14172,26 +14182,44 @@ fn lower_int_intrinsic(
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(32);
         let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-        let opnd_ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
-        let a = ctx.operand(args[0])?;
-        let b = ctx.operand(args[1])?;
-        let (gtop, ltop) = if signed {
-            (CmpOp::GtS, CmpOp::LtS)
+        let opnd_ty = args[0].get_type(types);
+        let (gt, lt) = if let Some(pair) = i128_pair(opnd_ty.as_ref()) {
+            // An i128 three-way compare (Postgres's `int128` interval math, clang ≥22) — the two
+            // orderings on the `(lo, hi)` pairs, exactly as an `icmp i128` lowers.
+            let pa = ctx.agg_operand(args[0], &pair)?;
+            let pb = ctx.agg_operand(args[1], &pair)?;
+            let (gtp, ltp) = if signed {
+                (IntPredicate::SGT, IntPredicate::SLT)
+            } else {
+                (IntPredicate::UGT, IntPredicate::ULT)
+            };
+            (
+                i128_icmp(ctx, gtp, pa[0], pa[1], pb[0], pb[1]),
+                i128_icmp(ctx, ltp, pa[0], pa[1], pb[0], pb[1]),
+            )
         } else {
-            (CmpOp::GtU, CmpOp::LtU)
+            let opnd_ty = int_ty(val_type(opnd_ty.as_ref())?)?;
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let (gtop, ltop) = if signed {
+                (CmpOp::GtS, CmpOp::LtS)
+            } else {
+                (CmpOp::GtU, CmpOp::LtU)
+            };
+            let gt = ctx.push(Inst::IntCmp {
+                ty: opnd_ty,
+                op: gtop,
+                a,
+                b,
+            });
+            let lt = ctx.push(Inst::IntCmp {
+                ty: opnd_ty,
+                op: ltop,
+                a,
+                b,
+            });
+            (gt, lt)
         };
-        let gt = ctx.push(Inst::IntCmp {
-            ty: opnd_ty,
-            op: gtop,
-            a,
-            b,
-        });
-        let lt = ctx.push(Inst::IntCmp {
-            ty: opnd_ty,
-            op: ltop,
-            a,
-            b,
-        });
         let sub = ctx.push(Inst::IntBin {
             ty: IntTy::I32,
             op: BinOp::Sub,
@@ -19291,6 +19319,38 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         I::FSub(x) => fp_binop(ctx, &x.dest, FBinOp::Sub, &x.operand0, &x.operand1, types)?,
         I::FMul(x) => fp_binop(ctx, &x.dest, FBinOp::Mul, &x.operand0, &x.operand1, types)?,
         I::FDiv(x) => fp_binop(ctx, &x.dest, FBinOp::Div, &x.operand0, &x.operand1, types)?,
+        // `frem` (clang ≥22 folds a constant-divisor `fmod(x, C)` into it — Postgres's `dsind`): the
+        // synthesized `__temen_fmod` (f64, IEEE-exact). An f32 `frem` promotes through f64 — fmod is
+        // exact and its magnitude is below the divisor's, so the f32 result round-trips losslessly.
+        I::FRem(x) => {
+            let Some(f) = ctx.helpers.fmod else {
+                return unsup("frem without the fmod helper");
+            };
+            let ty = float_ty(val_type(x.operand0.get_type(types).as_ref())?)?;
+            let mut a = ctx.operand(&x.operand0)?;
+            let mut b = ctx.operand(&x.operand1)?;
+            if ty == FloatTy::F32 {
+                a = ctx.push(Inst::Cast {
+                    op: CastOp::Promote,
+                    a,
+                });
+                b = ctx.push(Inst::Cast {
+                    op: CastOp::Promote,
+                    a: b,
+                });
+            }
+            let mut r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b],
+            });
+            if ty == FloatTy::F32 {
+                r = ctx.push(Inst::Cast {
+                    op: CastOp::Demote,
+                    a: r,
+                });
+            }
+            (&x.dest, r)
+        }
         I::FNeg(x) => {
             let ty = fty(&x.operand)?;
             let a = ctx.operand(&x.operand)?;

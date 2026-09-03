@@ -208,7 +208,17 @@ fn main() {
     let mut v8_64_ratios = Vec::new();
     let mut wt_32_ratios = Vec::new();
     let mut wt_64_ratios = Vec::new();
+    // `EMBENCH_ONLY=picojpeg,crc32` runs a subset (bisecting one kernel's miscompile / flags).
+    let only: Option<Vec<String>> = std::env::var("EMBENCH_ONLY")
+        .ok()
+        .map(|v| v.split(',').map(|k| k.trim().to_string()).collect());
     for bench in BENCHES {
+        if only
+            .as_ref()
+            .is_some_and(|o| !o.iter().any(|k| k == bench.name))
+        {
+            continue;
+        }
         let &Bench {
             name,
             src: rel,
@@ -308,6 +318,13 @@ fn main() {
             "-fno-builtin-memcmp",
             "-fno-builtin-bcmp",
         ])
+        // `EMBENCH_CFLAGS="-fno-vectorize …"`: extra flags for the Temen-side compile only (bisecting
+        // a kernel's miscompile down to the optimization that shapes it).
+        .args(
+            std::env::var("EMBENCH_CFLAGS")
+                .map(|v| v.split_whitespace().map(String::from).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        )
         .arg(&wrapper)
         .arg("-o")
         .arg(&bc)

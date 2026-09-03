@@ -135,7 +135,13 @@ fn check_flags(name: &str, src: &str, flags: &[&str], args: &[Value], expect: &[
 /// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
 /// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
 fn check_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_ll(name, src) else {
+    check_vs_native_flags(name, src, &[], seed);
+}
+
+/// [`check_vs_native`] with extra clang flags for the Temen-side compile (the native oracle build
+/// gets them too).
+fn check_vs_native_flags(name: &str, src: &str, flags: &[&str], seed: i32) {
+    let Some(bc) = compile_to_ll_flags(name, src, flags) else {
         return;
     };
     let exe =
@@ -143,6 +149,7 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
     // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
     match Command::new("cc")
+        .args(flags)
         .arg(&c)
         .arg("-lm")
         .arg("-o")
@@ -11099,6 +11106,39 @@ fn fast_math_flags_on_every_float_op() {
         &[Value::F64(2.0), Value::F64(1.0), Value::I32(3)],
         &[Value::F64(-21.625)],
     );
+}
+
+/// `frem`: clang ≥22 folds a constant-divisor `fmod(x, C)` into the instruction (Postgres's `dsind`);
+/// older clangs keep the `fmod` call. Both lower to the synthesized IEEE-exact `__temen_fmod`, so the
+/// result is bit-identical to native either way — including the f32 form, which promotes through f64.
+#[test]
+fn frem_folded_fmod_matches_native() {
+    let src = "#include <math.h>\n\
+               double d(double x){ return fmod(x, 360.0); }\n\
+               float f(float x){ return fmodf(x, 7.5f); }\n\
+               int run(int n){ double a = d(n * 1234.5 + 0.25); float b = f(n * 3.25f + 0.5f);\n\
+               \x20 return ((int)a + (int)(b * 4.0f)) & 0xff; }\n\
+               int main(){ return run(97); }\n";
+    // `-fno-math-errno` is what lets clang fold the libcall into `frem`.
+    check_vs_native_flags("frem_fmod", src, &["-fno-math-errno"], 97);
+}
+
+/// The i128 **three-way compare** intrinsic (`llvm.scmp.i32.i128`, LLVM ≥19 — clang canonicalizes
+/// `(a > b) - (a < b)` into it; Postgres's `int128` interval math): lowered as two orderings on the
+/// `(lo, hi)` pairs. Compared against native across the sign/word boundaries.
+#[test]
+fn i128_three_way_compare_vs_native() {
+    let src = "static __int128 mk(long hi, unsigned long lo){ return ((__int128)hi << 64) | lo; }\n\
+               __attribute__((noinline)) static int cmp3(__int128 a, __int128 b){ return (a > b) - (a < b); }\n\
+               __attribute__((noinline)) static int ucmp3(unsigned __int128 a, unsigned __int128 b){ return (a > b) - (a < b); }\n\
+               int run(int n){ long h[4] = { 0, -1, 1, (long)0x8000000000000000L }; unsigned long l[3] = { 0, 1, ~0UL };\n\
+               \x20 int r = 0;\n\
+               \x20 for (int i = 0; i < 4; i++) for (int j = 0; j < 3; j++) for (int k = 0; k < 4; k++) for (int m = 0; m < 3; m++) {\n\
+               \x20   __int128 a = mk(h[i], l[j]), b = mk(h[k], l[m]);\n\
+               \x20   r = r * 3 + (cmp3(a, b) + 1); r = r * 3 + (ucmp3((unsigned __int128)a, (unsigned __int128)b) + 1); r ^= n; }\n\
+               \x20 return r & 0xff; }\n\
+               int main(){ return run(5); }\n";
+    check_vs_native("i128_cmp3", src, 5);
 }
 
 /// i128 through an **internal call**: a `noinline` callee taking two `__int128`s (one a constant at
