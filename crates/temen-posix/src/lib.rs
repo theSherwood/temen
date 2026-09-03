@@ -939,6 +939,11 @@ struct Proc {
     /// (#863 slice 3 — the core hands every door a domain-scoped weak wake, so reachability is
     /// independent of nesting depth and fork history; weak ⇒ a post-run fire is a no-op).
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #1213 — the run's **child-transition nudge** ([`SignalSource::set_chld_wake`], installed
+    /// beside the wake): a clean re-scan of the parent's blocked `waitpid` parks, fired by
+    /// [`Ctx::notify_parent_chld`] when a child transitions. Distinct from `wake` — that injects
+    /// `-EINTR` (right for a caught signal, wrong for a plain reap on a child's stop/continue).
+    chld_wake: Option<Arc<dyn Fn() + Send + Sync>>,
     /// #797 — the run's **pipe-reader wake** door ([`SignalSource::set_pipe_wake`]): how a
     /// host-side `feed_terminal` wakes a reader parked on the terminal's input pipe.
     pipe_wake: Option<Arc<dyn Fn(u32) + Send + Sync>>,
@@ -1443,17 +1448,18 @@ impl Posix {
     /// firing the returned wake after the locks drop. The embedder-path twin of
     /// [`Ctx::notify_parent_chld`]; an absent, dead, or handler-less parent is a no-op.
     fn chld_to(&self, ppid: i32) {
-        // #1171 — grab BOTH the (maybe-`None`) async SIGCHLD delivery wake AND the parent's domain
-        // run-wake. A child's stop/continue transition must wake a parent blocked in
+        // #1171 — grab BOTH the (maybe-`None`) async SIGCHLD delivery wake AND the parent's clean
+        // child-transition re-scan. A child's stop/continue transition must wake a parent blocked in
         // `waitpid(WUNTRACED/WCONTINUED)` even when the parent has no async SIGCHLD delivery armed
-        // (bash: no sigaltstack), so its blocked `waitpid` re-runs and reports the fresh stop.
+        // (bash: no sigaltstack), so its blocked `waitpid` re-runs and reports the fresh stop. #1213 —
+        // the re-scan (`chld_wake`), not the EINTR `wake`, so a plain reap is not spuriously interrupted.
         let (wake, run_wake) = {
             let w = self.world.lock().unwrap_or_else(|e| e.into_inner());
             match w.procs.get(&ppid) {
                 Some(ProcEntry::Live(t)) => {
                     let mut tp = t.lock().unwrap_or_else(|e| e.into_inner());
                     tp.reap_wake = true; // #1171 — one-shot reap re-check edge for the coop sweep
-                    (tp.deliver_signal(SIGCHLD), tp.wake.clone())
+                    (tp.deliver_signal(SIGCHLD), tp.chld_wake.clone())
                 }
                 _ => (None, None),
             }
@@ -1655,6 +1661,11 @@ impl SignalSource for SignalDoor {
 
     fn set_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).wake = Some(wake);
+    }
+
+    /// #1213 — store the core's clean child-transition re-scan closure for this process's domain.
+    fn set_chld_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).chld_wake = Some(wake);
     }
 
     /// #798 slice 2 — store the core's stop/continue closure for this process's domain.
@@ -2146,6 +2157,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         sig_stack_base: 0,
         sig_armed: Arc::new(AtomicBool::new(false)),
         wake: None,
+        chld_wake: None,
         pipe_wake: None,
         stop: None,
         stopped_sig: None,
@@ -2538,6 +2550,7 @@ impl Proc {
             sig_stack_base: self.sig_stack_base,
             sig_armed: Arc::new(AtomicBool::new(false)),
             wake: None,
+            chld_wake: None,
             pipe_wake: None,
             stop: None, // the twin's own domain gets its closure at mint (like the wake)
             stopped_sig: None,
@@ -3682,9 +3695,11 @@ impl Ctx<'_> {
             // `waitpid(WUNTRACED/WCONTINUED)`, independent of whether the parent has async SIGCHLD
             // delivery armed (bash installs no sigaltstack, so its SIGCHLD is poll-only — the async
             // `deliver_signal` wake above returns `None`, and a foreground job stopped on a parked
-            // read never enters the core stop-park that would drain the reap waiters). Fire the
-            // parent's own domain run-wake so its blocked `waitpid` re-runs and reports the fresh stop.
-            if let Some(w) = self.p.wake.clone() {
+            // read never enters the core stop-park that would drain the reap waiters). #1213 — fire
+            // the parent's clean re-scan (NOT the EINTR `wake`) so its blocked `waitpid` re-runs and
+            // reports the fresh stop/continue without spuriously interrupting a plain `waitpid(pid,0)`
+            // reap (an uncaught SIGCHLD must not raise -EINTR — POSIX).
+            if let Some(w) = self.p.chld_wake.clone() {
                 self.wake_after.push(w);
             }
             return;
@@ -3695,7 +3710,7 @@ impl Ctx<'_> {
             if let Some(f) = tp.deliver_signal(SIGCHLD) {
                 self.wake_after.push(f);
             }
-            if let Some(w) = tp.wake.clone() {
+            if let Some(w) = tp.chld_wake.clone() {
                 self.wake_after.push(w);
             }
         }

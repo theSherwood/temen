@@ -14,7 +14,7 @@ pub mod bytecode;
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -2246,7 +2246,7 @@ fn drive_over_cell(
     {
         let hg = host_shared.lock_unpoisoned();
         let root_dom = hg.domain_id() as usize;
-        let stop_flag = hg.stop_flag.clone();
+        let stop_depth = hg.stop_depth.clone();
         let term_flag = hg.term_flag.clone();
         let park_request = hg.park_request.clone();
         let source = hg.signal_poll().map(|(_, s)| s);
@@ -2268,11 +2268,21 @@ fn drive_over_cell(
             // #798 slice 2 — the stop/continue closure, same weak discipline as the wake.
             let sched_weak = Arc::downgrade(&sched);
             source.set_stop(Arc::new(move |stopped| {
-                stop_flag.store(stopped, Ordering::SeqCst);
-                if !stopped {
+                if stopped {
+                    stop_depth.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    stop_depth.fetch_sub(1, Ordering::SeqCst);
                     if let Some(s) = sched_weak.upgrade() {
                         s.wake_stopped(root_dom);
                     }
+                }
+            }));
+            // #1213 — the child-transition nudge: a clean re-scan wake (no EINTR), for a parent
+            // blocked in `waitpid` whose child transitioned while parked off the stop park.
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_chld_wake(Arc::new(move || {
+                if let Some(s) = sched_weak.upgrade() {
+                    s.rescan_reap_parks(root_dom);
                 }
             }));
             // #796 default actions — the terminate closure: flag up, then wake everything the
@@ -5307,6 +5317,51 @@ impl Scheduler {
         n
     }
 
+    /// #1213 — the **clean child-transition nudge**: re-admit this parent domain's blocked `waitpid`
+    /// parks for a RE-SCAN (the rewound op re-executes and re-reads the personality table). This is
+    /// the wake a child's stop/continue owes a parent blocked in `waitpid(WUNTRACED/WCONTINUED)` when
+    /// the child stopped while parked elsewhere (e.g. a pipe read) and so never entered
+    /// [`Blocked::Stopped`] — the one child transition no scheduler-side drain otherwise covers.
+    ///
+    /// Unlike [`Scheduler::interrupt_interruptible_parks`] it sets **no** `sig_interrupt`: a child
+    /// transition is not a caught signal, so a plain `waitpid(pid, 0)` reap re-scans and re-parks
+    /// rather than spuriously returning `-EINTR` (POSIX — an uncaught `SIGCHLD` never interrupts a
+    /// syscall; interrupting a reap that does not retry `EINTR` is the #1213 sibling flake). A
+    /// `WUNTRACED/WCONTINUED` wait instead finds the fresh stop/continue on the re-scan and reports
+    /// it. The wildcard bench goes through the latched [`wake_posix_reap_any_locked`] so a transition
+    /// racing the bench's park is marked pending, not lost.
+    fn rescan_reap_parks(&self, domain: usize) {
+        let mut s = self.lock();
+        let mut woke = wake_posix_reap_any_locked(&mut s, domain);
+        let wildcard = REAP_ANY_BASE | domain as TaskId;
+        let mut hits: Vec<Box<VCpu>> = Vec::new();
+        for (&k, ws) in s.posix_reap_waiters.iter_mut() {
+            if k == wildcard {
+                continue; // handled by the latched wildcard wake above
+            }
+            let keep: VecDeque<Box<VCpu>> = std::mem::take(ws)
+                .into_iter()
+                .filter_map(|v| {
+                    if domain_key_of(&v) == domain {
+                        hits.push(v);
+                        None
+                    } else {
+                        Some(v)
+                    }
+                })
+                .collect();
+            *ws = keep;
+        }
+        s.posix_reap_waiters.retain(|_, ws| !ws.is_empty());
+        for v in hits {
+            s.runnable.push_back(v);
+            woke = true;
+        }
+        if woke {
+            self.work.notify_all();
+        }
+    }
+
     /// §3.6 — deliver a served dispatch's result **atomically** against a racing caller park:
     /// wake the ticket's parked caller, or — under the SAME scheduler lock — stash the value in
     /// the callee's completion cell. The two-step form (a reply-wake miss, then a
@@ -5525,7 +5580,7 @@ impl Scheduler {
     fn wire_signal_doors(self: &Arc<Self>, host: &Arc<Mutex<Host>>) {
         let hg = host.lock_unpoisoned();
         let dom = hg.domain_id() as usize;
-        let stop_flag = hg.stop_flag.clone();
+        let stop_depth = hg.stop_depth.clone();
         let term_flag = hg.term_flag.clone();
         let park_request = hg.park_request.clone();
         let source = hg.signal_poll().map(|(_, s)| s);
@@ -5546,11 +5601,20 @@ impl Scheduler {
             // #798 slice 2 — the stop/continue closure, minted with the wake.
             let sched_weak = Arc::downgrade(self);
             source.set_stop(Arc::new(move |stopped| {
-                stop_flag.store(stopped, Ordering::SeqCst);
-                if !stopped {
+                if stopped {
+                    stop_depth.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    stop_depth.fetch_sub(1, Ordering::SeqCst);
                     if let Some(sc) = sched_weak.upgrade() {
                         sc.wake_stopped(dom);
                     }
+                }
+            }));
+            // #1213 — the child-transition nudge, minted with the wake/stop (clean re-scan).
+            let sched_weak = Arc::downgrade(self);
+            source.set_chld_wake(Arc::new(move || {
+                if let Some(sc) = sched_weak.upgrade() {
+                    sc.rescan_reap_parks(dom);
                 }
             }));
             // #796 default actions — the terminate closure, minted with the wake/stop.
@@ -6879,25 +6943,37 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             }
             Step::Park(Blocked::Stopped) => {
                 // #798 slice 2 — the job-control stop park. Park-vs-continue race (mirrors the
-                // pipe parks): a SIGCONT that cleared the flag between the poll and this insert
-                // found nothing in the stopped map to drain — so re-check the flag under the lock
-                // and re-admit instead of parking forever. Keyed by domain; drained wholesale by
-                // [`Scheduler::wake_stopped`].
+                // pipe parks): a SIGCONT that lowered the depth found nothing in the stopped map to
+                // drain — so re-check the depth and re-admit instead of parking forever. Keyed by
+                // domain; drained wholesale by [`Scheduler::wake_stopped`].
+                //
+                // #1213 — the depth re-check MUST hold the scheduler lock across the `s.stopped`
+                // insert. SIGCONT lowers `stop_depth` and THEN calls `wake_stopped`, which drains
+                // `s.stopped` under this same lock. Reading the depth *before* taking the lock (the
+                // old shape) let a child read `> 0`, have SIGCONT lower it + drain the (still-empty)
+                // map, and only then take the lock and insert — parked stopped forever with nothing
+                // left to wake it (the flaky CI hang: both jobs and the shell's wildcard wait all
+                // parked at once). Held under the lock, a `> 0` read implies SIGCONT's decrement has
+                // not happened, so its later `wake_stopped` is ordered after this insert and drains
+                // it; a `<= 0` read re-admits. (`stop_depth` being a commutative counter is what
+                // makes the read trustworthy under the reordered stop/continue fires — see its decl.)
+                // The read takes the host lock while holding the scheduler lock — the established
+                // scheduler → personality order (see the twin-completion drain above).
                 let dom = domain_key_of(&v);
-                let (still_stopped, term) = {
-                    let hg = v.host.lock_unpoisoned();
-                    (
-                        hg.stop_flag.load(Ordering::SeqCst),
-                        // #796 — the same race against a terminate: a kill whose `wake_stopped`
-                        // ran between the poll and this insert found nothing to drain; re-admit
-                        // so the vCPU dies at its next poll instead of parking stopped forever.
-                        hg.term_flag.load(Ordering::SeqCst),
-                    )
-                };
                 let mut s = sched.lock();
                 let Some(v) = park_gate(&mut s, v) else {
                     sched.work.notify_all();
                     return;
+                };
+                let (still_stopped, term) = {
+                    let hg = v.host.lock_unpoisoned();
+                    (
+                        hg.stop_depth.load(Ordering::SeqCst) > 0,
+                        // #796 — the same race against a terminate: a kill whose `wake_stopped`
+                        // ran before this insert found nothing to drain; re-admit so the vCPU dies
+                        // at its next poll instead of parking stopped forever.
+                        hg.term_flag.load(Ordering::SeqCst),
+                    )
                 };
                 if still_stopped && !term {
                     // #798/#802 interactive — a child ENTERING the stop park is a reportable
@@ -9900,10 +9976,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // #863 slice 3 — this vCPU's own domain, for the scoped park interrupt a deliverable signal
     // fires (INVARIANTS.md #12: a signal to this process never sweeps another domain's parks).
     let sig_domain = host.lock_unpoisoned().domain_id() as usize;
-    // #798 slice 2 — the domain's job-control stop flag (shared by every vCPU of the domain): one
-    // relaxed load per op, park [`Blocked::Stopped`] while set. Cloned once — the personality's
+    // #798 slice 2 — the domain's job-control stop depth (shared by every vCPU of the domain): one
+    // relaxed load per op, park [`Blocked::Stopped`] while `> 0`. Cloned once — the personality's
     // stop closure holds the same `Arc`.
-    let stop_flag = host.lock_unpoisoned().stop_flag.clone();
+    let stop_depth = host.lock_unpoisoned().stop_depth.clone();
     // #796 default actions — the domain's terminate flag, same one-relaxed-load-per-op shape.
     let term_flag = host.lock_unpoisoned().term_flag.clone();
 
@@ -10529,11 +10605,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             if term_flag.load(Ordering::Relaxed) {
                 return Err(Trap::ThreadFault);
             }
-            // #798 slice 2 — the job-control stop: park between ops while the domain's flag is set
-            // (nothing rewound; a resume executes the current inst). Checked after `kill`/terminate
-            // (death beats stop) and before signal delivery (a stopped process handles its signals
-            // at continue, not while stopped — POSIX).
-            if stop_flag.load(Ordering::Relaxed) {
+            // #798 slice 2 — the job-control stop: park between ops while the domain's depth is
+            // positive (nothing rewound; a resume executes the current inst). Checked after
+            // `kill`/terminate (death beats stop) and before signal delivery (a stopped process
+            // handles its signals at continue, not while stopped — POSIX).
+            if stop_depth.load(Ordering::Relaxed) > 0 {
                 return Ok(Inner::Park(Blocked::Stopped));
             }
             // #796 L2 async signal delivery (PROCESS.md §9). At this per-op safepoint, if a personality
@@ -11308,14 +11384,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             }
                                         }));
                                         // #798 slice 2 — and its stop/continue closure.
-                                        let stop_flag = ch.stop_flag.clone();
+                                        let stop_depth = ch.stop_depth.clone();
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_stop(Arc::new(move |stopped| {
-                                            stop_flag.store(stopped, Ordering::SeqCst);
-                                            if !stopped {
+                                            if stopped {
+                                                stop_depth.fetch_add(1, Ordering::SeqCst);
+                                            } else {
+                                                stop_depth.fetch_sub(1, Ordering::SeqCst);
                                                 if let Some(sc) = sched_weak.upgrade() {
                                                     sc.wake_stopped(dom);
                                                 }
+                                            }
+                                        }));
+                                        // #1213 — and its child-transition nudge (clean re-scan).
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_chld_wake(Arc::new(move || {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.rescan_reap_parks(dom);
                                             }
                                         }));
                                         // #796 default actions — and its terminate closure.
@@ -11755,14 +11840,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             }
                                         }));
                                         // #798 slice 2 — and its stop/continue closure.
-                                        let stop_flag = ch.stop_flag.clone();
+                                        let stop_depth = ch.stop_depth.clone();
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_stop(Arc::new(move |stopped| {
-                                            stop_flag.store(stopped, Ordering::SeqCst);
-                                            if !stopped {
+                                            if stopped {
+                                                stop_depth.fetch_add(1, Ordering::SeqCst);
+                                            } else {
+                                                stop_depth.fetch_sub(1, Ordering::SeqCst);
                                                 if let Some(sc) = sched_weak.upgrade() {
                                                     sc.wake_stopped(dom);
                                                 }
+                                            }
+                                        }));
+                                        // #1213 — and its child-transition nudge (clean re-scan).
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_chld_wake(Arc::new(move || {
+                                            if let Some(sc) = sched_weak.upgrade() {
+                                                sc.rescan_reap_parks(dom);
                                             }
                                         }));
                                         // #796 default actions — and its terminate closure.
@@ -17294,6 +17388,16 @@ pub trait SignalSource: Send + Sync {
     /// job-control story need not store it.
     fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
 
+    /// #1213 — install the run's **child-transition nudge**: `chld_wake()` re-admits this domain's
+    /// blocked `waitpid` parks for a clean re-scan ([`Scheduler::rescan_reap_parks`]). The
+    /// personality invokes it when a child of this process stops, continues, or exits and the parent
+    /// may be blocked in `waitpid`, INSTEAD of the EINTR-injecting [`Self::set_wake`] closure —
+    /// re-scanning reports a fresh `WUNTRACED/WCONTINUED` stop/continue without the spurious `-EINTR`
+    /// that an uncaught `SIGCHLD` must not raise on a plain reap. Installed at the same sites as the
+    /// wake, same weak-scheduler discipline. Default no-op — a source with no job-control story need
+    /// not store it.
+    fn set_chld_wake(&self, _wake: Arc<dyn Fn() + Send + Sync>) {}
+
     /// #797 — install the run's **pipe-reader wake** closure: `wake(pipe_id)` re-admits every
     /// reader parked on that pipe ([`Blocked::PipeRead`] — the rewound read re-executes and
     /// drains, invariant 7). The terminal personality invokes it after `feed_terminal` deposits
@@ -17657,11 +17761,18 @@ pub struct Host {
     /// #972 — hooks the exec image-replace fires with the pipe-end handle remap (see
     /// [`ForkedProc::exec_remap`]); carried across exec like `exit_hooks` (same process).
     exec_remap_hooks: Vec<ExecRemapHook>,
-    /// #798 slice 2 — the domain's **job-control stop flag**: set/cleared by the personality's
-    /// stop closure ([`SignalSource::set_stop`]); every vCPU of the domain polls it per op (beside
-    /// `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`] while set. On the `Host` so
-    /// thread siblings share it — a stop stops the whole domain.
-    stop_flag: Arc<AtomicBool>,
+    /// #798 slice 2 — the domain's **job-control stop depth**: raised (+1) by the personality's stop
+    /// closure and lowered (−1) by its continue ([`SignalSource::set_stop`]); every vCPU of the
+    /// domain polls it per op (beside `poll_kill`, free-when-clear) and parks [`Blocked::Stopped`]
+    /// while it is `> 0`. On the `Host` so thread siblings share it — a stop stops the whole domain.
+    ///
+    /// #1213 — a **signed counter, not a bool**: the stop and continue fires run on independent
+    /// detached wake threads (see temen-posix `handler`), so a stop-then-continue can apply as
+    /// continue-then-stop. `store(true)`/`store(false)` would then latch a stale `stopped`, wedging
+    /// the domain forever. `fetch_add`/`fetch_sub` commute, so the final depth is the same under any
+    /// ordering: a balanced stop+continue always nets back to `0` (and the transient can only dip
+    /// negative — never a false `> 0`). Reads test `> 0`.
+    stop_depth: Arc<AtomicI64>,
     /// #796 default actions — the domain's **terminate flag**: set by the personality's kill
     /// closure ([`SignalSource::set_kill`]) when a `SIG_DFL` terminate-action signal is delivered;
     /// every vCPU of the domain polls it per op beside `poll_kill`/`stop_flag` (free-when-clear,
@@ -18083,7 +18194,7 @@ impl Host {
             sig_source: None,
             exit_hooks: Vec::new(),
             exec_remap_hooks: Vec::new(),
-            stop_flag: Arc::new(AtomicBool::new(false)),
+            stop_depth: Arc::new(AtomicI64::new(0)),
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
@@ -21822,7 +21933,7 @@ impl Host {
         }
         // The stop/kill/park-request cells the doors store into: share them across the image-replace,
         // or a post-exec ^Z/kill sets a flag nothing reads.
-        child.stop_flag = Arc::clone(&self.stop_flag);
+        child.stop_depth = Arc::clone(&self.stop_depth);
         child.term_flag = Arc::clone(&self.term_flag);
         child.park_request = Arc::clone(&self.park_request);
         // The host-served personality moves VERBATIM (same handler over the same Proc — fds, pid, env
