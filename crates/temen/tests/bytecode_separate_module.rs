@@ -12,16 +12,17 @@
 use temen_interp::{bytecode, run_with_host, Host, Value};
 use temen_text::parse_module;
 
-/// The child ("plugin") module: a 64 KiB window with a data segment `"VM"` at offset 100. Its entry
-/// (`(i64 instantiator) -> (i64)`) loads its own data byte at 100, stores a marker at offset 0, and
+/// The child ("plugin") module: a 64 KiB window with a data segment `"VM"` at offset 16 KiB + 100
+/// (above the NULL guard its carve reserves like any window, #1206). Its entry
+/// (`(i64 instantiator) -> (i64)`) loads its own data byte there, stores a marker at offset 16 KiB, and
 /// returns `byte + 1000` — exercising a foreign module's code, data, and window writes, confined.
 const CHILD_SRC: &str = r#"memory 16
-data 100 "VM"
+data 16484 "VM"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 7
   i32.store8 v3 v4
   v5 = i64.extend_i32_u v2
@@ -94,8 +95,8 @@ fn module_child_runs_with_its_data_segments() {
     check(PARENT, CHILD_SRC, Ok(vec![Value::I64(1086)]));
 }
 
-/// The parent then reads the marker the module child wrote at the child's offset 0 (→ backing 64 KiB)
-/// and the child's data byte — proving the foreign module ran confined over the shared backing.
+/// The parent then reads the marker the module child wrote at the child's offset 16 KiB (→ backing
+/// 80 KiB) — proving the foreign module ran confined over the shared backing.
 const PARENT_READBACK: &str = r#"memory 17
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
@@ -105,7 +106,7 @@ block 0 (v0: i32, v1: i32) {
   v5 = i64.const 16
   v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
   v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
-  v8 = i64.const 65536
+  v8 = i64.const 81920
   v9 = i32.load8_u v8
   v10 = i64.extend_i32_u v9
   v11 = i64.const 1000000
@@ -118,7 +119,7 @@ block 0 (v0: i32, v1: i32) {
 
 #[test]
 fn module_child_writes_visible_to_parent() {
-    // child returns 1086; marker at child offset 0 is 7 → 1086 * 1_000_000 + 7.
+    // child returns 1086; marker at child offset 16 KiB is 7 → 1086 * 1_000_000 + 7.
     check(
         PARENT_READBACK,
         CHILD_SRC,
@@ -187,12 +188,12 @@ fn forged_module_handle_faults_identically() {
 /// Used to prove the bytecode engine drives `Module` op 0 (`resolve_export`, F2) identically to the
 /// tree-walker — name → funcidx through the generic `cap_dispatch_slots` seam.
 const NAMED_CHILD_SRC: &str = r#"memory 16
-data 100 "VM"
+data 16484 "VM"
 export 0 func "alpha" 0
 export 1 func "beta" 1
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
@@ -202,7 +203,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000
