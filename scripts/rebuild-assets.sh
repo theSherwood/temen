@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc onramp shell nifler nim_hello nim_phases lua_snapshot
+#   Steps:  leng chibicc onramp shell forth nifler nim_hello nim_phases lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -119,6 +119,16 @@ if want shell; then
   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture \
     && note "shell ✓ (shell/stage_runner/primes/upper fixtures)" \
     || note "shell ✗ (in-tree chibicc?)"
+fi
+
+# --- 4b) forth.temen (the sectorforth-class Forth kernel, hand-written text IR — issue #1214) ----------
+# No toolchain at all: `prep_temen` parses the `.temt`, verifies, bytecode-compiles, and writes the binary.
+if want forth; then
+  echo "=== [forth] prep_temen crates/temen-run/demos/forth/forth.temt → browser/web/assets/forth.temen ==="
+  "$PREP" crates/temen-run/demos/forth/forth.temt browser/web/assets/forth.temen >/dev/null \
+    && validate browser/web/assets/forth.temen \
+    && note "forth ✓ (forth.temen)" \
+    || note "forth ✗ (prep_temen failed on forth.temt?)"
 fi
 
 # --- 5) nifler.temen.gz (nimony pipeline; TEMEN_NIFLER_EMIT_ASSET gzips it + the expected fixtures) --

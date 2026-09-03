@@ -23,7 +23,15 @@ fn main() {
     println!("module: {} ({} bytes)", input, bytes.len());
 
     let t = Instant::now();
-    let module = temen_encode::decode_module(&bytes).expect("decode");
+    // A `.temt` input is hand-written text IR (e.g. the Forth kernel, `demos/forth/forth.temt`):
+    // parse it instead of decoding — the rest of the pipeline (verify, bytecode-compile, write the
+    // binary) is identical, so `scripts/rebuild-assets.sh` builds text-IR assets through this one tool.
+    let module = if input.ends_with(".temt") {
+        let src = String::from_utf8(bytes).expect("text IR is UTF-8");
+        temen_text::parse_module(&src).expect("parse text IR")
+    } else {
+        temen_encode::decode_module(&bytes).expect("decode")
+    };
     println!(
         "  decode           {:>8.1?}  ({} funcs)",
         t.elapsed(),

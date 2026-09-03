@@ -1,0 +1,3313 @@
+; forth.temt — a sectorforth-class Forth whose kernel is hand-written Temen text IR and whose
+; every colon definition is compiled to a verified Temen IR unit through the §22 `Jit`
+; capability (issue #1214). No C, no chibicc runtime: this module *is* the whole kernel.
+;
+;   temen-run crates/temen-run/demos/forth/forth.temt --stdin program.fs
+;
+; Design (issue #1214): the data stack is SSA, not memory. A word is an IR function whose
+; signature *is* its declared stack effect — `: sq ( n -- n ) dup * ;` becomes `(i64) -> (i64)`
+; — and the compiler keeps a compile-time virtual stack of SSA value indices, so `dup swap over
+; drop rot nip tuck` emit nothing. `if/else/then` and `begin/until|again|while/repeat` are IR
+; blocks whose params carry the live virtual stack. A word calls another by `call.dyn` on its
+; `Jit.install` slot; `recurse` is `call 0`. Each top-level line is an anonymous unit that is
+; compiled, `invoke`d, and `release`d (the `jit_repl.c` shape); a persistent REPL stack in
+; memory is touched only by those anonymous units (underflow loads from it, leftovers store to
+; it). Fibers are Forth words over `cont.new` / `cont.resume` / `suspend`; threads and the futex
+; are kernel functions (`spawn`/`join`/`wait`/`notify`) reached by `call.dyn`, atomics are templates.
+;
+; The kernel's own primitives are a flat table declared in the prelude (below) with the one
+; hardwired defining word `prim <name> <kind> <nin> <nout> <payload>`:
+;   kind 0 = installed word / kernel function (payload = call.dyn slot)
+;   kind 1 = i64 binop template (payload = opcode byte)   kind 3 = i64 compare (→ 0/1)
+;   kind 4 = load (payload = load opcode)                  kind 5 = store (payload = store opcode)
+;   kind 6 = constant (payload = value; `variable`/`create`) kind 8 = i64.eqz (`0=`)
+;   kind 7 = i64 atomic rmw `( n addr -- old )` (payload = rmw op)  kind 9 = cmpxchg `( exp new addr -- old )`
+;   kind 10 = atomic load `( addr -- x )`                 kind 11 = atomic store `( x addr -- )`
+;   kind 2 = compiler word (payload = an id dispatched by `br_table` in func 44)
+;
+; Memory map (window 2^20):
+;   0x08000 messages + prelude (data)      0x10000 kernel globals (see the constant table)
+;   0x10400 virtual stack   0x10C00 control stack   0x11400 block table   0x12400 type table
+;   0x13000 output buffer   0x14000 open-block scratch   0x18000 closed-block arena
+;   0x28000 assembled unit blob   0x38000 dictionary (32-byte entries)   0x4C000 REPL stack
+;   0x50000 input buffer (256 KiB)   0x90000 heap (`here`)
+;
+; Kernel globals (8-byte cells at 0x10000 = 65536):
+;   65536 HERE      65544 IN_POS    65552 IN_LEN    65560 DICT_N    65576 VS_DEPTH
+;   65584 NEXTV     65592 NBLK      65600 CUR_BLK   65608 SCR_LEN   65616 CUR_INSTS
+;   65624 CS_DEPTH  65632 MODE      65640 RDEPTH    65648 DEF_NIN   65656 DEF_NOUT
+;   65664 OUT_LEN   65672 DEAD      65680 TOK_PTR   65688 TOK_LEN   65696 DEF_NAME_PTR
+;   65704 DEF_NAME_LEN  65712 ERR   65720 CUR_PARAMS  65728 NTYPES  65736 BLOB_LEN
+;   65744 ARENA_LEN 65752 IN_BASE   65760 NUM       65768 STR_PTR   65776 STR_LEN
+;   65792.. 24-byte digit scratch
+;
+; Function index table (keep in sync — `call N` is by index):
+;    0 _start            1 emit(c)           2 type(a,n)         3 allot(n)        4 comma(x)
+;    5 flush()           6 sb(b)             7 suleb(v)          8 ssleb(v)        9 nv()
+;   10 vs_push(v)       11 ensure(n)        12 vs_pop()         13 alloc_blk()    14 open_block(i,np)
+;   15 close_block()    16 term_br(t)       17 term_br_if(c,t,e) 18 write_edge(t) 19 term_return(n)
+;   20 term_unreachable 21 type_idx(ni,no)  22 emit_const(x)    23 emit_bin(op,a,b) 24 emit_load(op,a)
+;   25 emit_store(op,a,v) 26 emit_calldyn(slot,ni,no) 27 emit_un(op,a) 28 emit_recurse(ni,no)
+;   29 assemble(ni,no)  30 bb(b)            31 buleb(v)         32 btypes(n)      33 next_tok()
+;   34 lookup(p,n)      35 add_entry(p,n,k,ni,no,pay)           36 parse_num(p,n) 37 streq(p1,p2,n)
+;   38 error(msg,len)   39 print_i64(v)     40 anon_begin()     41 anon_flush()   42 process(p,n)
+;   43 do_word(e)       44 do_imm(id)       45 do_colon()       46 do_semi()      47 do_prim()
+;   48 read_stdin()     49 cs_push(k,a,b,c,d) 50 cs_pop()       51 parse_effect() 52 vs_params(n)
+;   53 do_string()      54 strlen(p)        55 ab(b)            56 auleb(v)       57 skip_line()
+;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
+;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
+;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)
+
+memory 20
+
+import 0 "write" (i64, i64) -> (i64)
+import 1 "read" (i64, i64) -> (i64)
+import 2 "vm_jit_compile" (i64, i64) -> (i64)
+import 3 "vm_jit_install" (i64) -> (i64)
+import 4 "vm_jit_invoke2" (i64, i64, i64) -> (i64)
+import 5 "vm_jit_release" (i64) -> (i64)
+import 6 "vm_jit_uninstall" (i64) -> (i64)
+
+export 0 func "_start" 0
+
+; ---- messages (0x8000 = 32768) ----
+data 32768 "stack underflow"
+data 32784 "unknown word"
+data 32800 "unterminated definition"
+data 32832 "control structure mismatch"
+data 32864 "stack effect mismatch"
+data 32896 "compile error "
+data 32912 "nested definition"
+data 32944 "expected ( effect )"
+data 32976 " near "
+data 32992 "no such word"
+data 33008 "prim"
+data 33024 "--"
+data 33040 "install error "
+data 33056 "not compiling"
+data 33072 "expected a name"
+
+; ---- the prelude (0x9000 = 36864, NUL-terminated): the primitive table + the library, in Forth ----
+data 36864 "prim : 2 0 0 1
+prim ; 2 0 0 2
+prim if 2 0 0 3
+prim else 2 0 0 4
+prim then 2 0 0 5
+prim begin 2 0 0 6
+prim until 2 0 0 7
+prim again 2 0 0 8
+prim while 2 0 0 9
+prim repeat 2 0 0 10
+prim dup 2 0 0 11
+prim drop 2 0 0 12
+prim swap 2 0 0 13
+prim over 2 0 0 14
+prim rot 2 0 0 15
+prim nip 2 0 0 16
+prim tuck 2 0 0 17
+prim recurse 2 0 0 18
+prim ' 2 0 0 19
+prim .\" 2 0 0 20
+prim s\" 2 0 0 21
+prim variable 2 0 0 22
+prim create 2 0 0 23
+prim here 2 0 0 24
+prim task 2 0 0 25
+prim resume 2 0 0 26
+prim yield 2 0 0 27
+prim ( 2 0 0 28
+prim \\ 2 0 0 29
+prim + 1 2 1 64
+prim - 1 2 1 65
+prim * 1 2 1 66
+prim / 1 2 1 67
+prim mod 1 2 1 69
+prim and 1 2 1 71
+prim or 1 2 1 72
+prim xor 1 2 1 73
+prim lshift 1 2 1 74
+prim rshift 1 2 1 76
+prim = 3 2 1 81
+prim <> 3 2 1 82
+prim < 3 2 1 83
+prim u< 3 2 1 84
+prim <= 3 2 1 85
+prim > 3 2 1 87
+prim >= 3 2 1 89
+prim 0= 8 1 1 80
+prim @ 4 1 1 241
+prim c@ 4 1 1 249
+prim ! 5 2 0 133
+prim c! 5 2 0 138
+prim emit 0 1 0 1
+prim type 0 2 0 2
+prim allot 0 1 0 3
+prim , 0 1 0 4
+prim spawn 0 2 1 67
+prim join 0 1 1 68
+prim wait 0 2 1 69
+prim notify 0 2 1 70
+prim atomic@ 10 1 1 0
+prim atomic! 11 2 0 0
+prim atomic+! 7 2 1 0
+prim atomic-xchg 7 2 1 5
+prim cas 9 3 1 0
+: negate ( n -- n ) 0 swap - ;
+: invert ( n -- n ) -1 xor ;
+: 1+ ( n -- n ) 1 + ;
+: 1- ( n -- n ) 1 - ;
+: 2dup ( a b -- a b a b ) over over ;
+: 2drop ( a b -- ) drop drop ;
+: -rot ( a b c -- c a b ) rot rot ;
+: cr ( -- ) 10 emit ;
+: space ( -- ) 32 emit ;
+: spaces ( n -- ) begin dup 0 > while space 1- repeat drop ;
+: bl ( -- c ) 32 ;
+: digit ( n -- ) 48 + emit ;
+: u. ( u -- ) dup 10 < if digit else dup 10 / recurse 10 mod digit then ;
+: . ( n -- ) dup 0 < if 45 emit negate then u. space ;
+: abs ( n -- n ) dup 0 < if negate then ;
+: min ( a b -- n ) 2dup > if swap then drop ;
+: max ( a b -- n ) 2dup < if swap then drop ;
+: cells ( n -- n ) 8 * ;
+: +! ( n addr -- ) dup @ rot + swap ! ;
+\0"
+
+; ================================================================================================
+; 0 _start: HERE = heap base; run the prelude, then all of stdin; flush.
+func () -> (i32) {
+block 0 () {
+  hp = i64.const 65536
+  heap = i64.const 589824
+  i64.store hp heap
+  pp = i64.const 36864
+  pl = call 54 (pp)
+  call 42 (pp, pl)
+  n = call 48 ()
+  ib = i64.const 327680
+  call 42 (ib, n)
+  call 5 ()
+  z = i32.const 0
+  return z
+  }
+}
+
+; 1 emit(c): append to the output buffer; flush on newline or when full.
+func (i64) -> () {
+block 0 (c: i64) {
+  lp = i64.const 65664
+  len = i64.load lp
+  ob = i64.const 77824
+  a = i64.add ob len
+  i64.store8 a c
+  one = i64.const 1
+  len1 = i64.add len one
+  i64.store lp len1
+  nl = i64.const 10
+  isnl = i64.eq c nl
+  cap = i64.const 4096
+  full = i64.ge_s len1 cap
+  x = i32.or isnl full
+  br_if x 1() 2()
+  }
+block 1 () {
+  call 5 ()
+  return
+  }
+block 2 () {
+  return
+  }
+}
+
+; 2 type(a, n): emit n bytes from a.
+func (i64, i64) -> () {
+block 0 (a: i64, n: i64) {
+  z = i64.const 0
+  br 1(a, n, z)
+  }
+block 1 (a: i64, n: i64, i: i64) {
+  c = i64.ge_s i n
+  br_if c 3() 2(a, n, i)
+  }
+block 2 (a: i64, n: i64, i: i64) {
+  p = i64.add a i
+  ch = i64.load8_u p
+  call 1 (ch)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(a, n, i1)
+  }
+block 3 () {
+  return
+  }
+}
+
+; 3 allot(n): HERE += n
+func (i64) -> () {
+block 0 (n: i64) {
+  hp = i64.const 65536
+  h = i64.load hp
+  h1 = i64.add h n
+  i64.store hp h1
+  return
+  }
+}
+
+; 4 comma(x): store a cell at HERE, HERE += 8
+func (i64) -> () {
+block 0 (x: i64) {
+  hp = i64.const 65536
+  h = i64.load hp
+  i64.store h x
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  return
+  }
+}
+
+; 5 flush(): write the output buffer to stdout.
+func () -> () {
+block 0 () {
+  lp = i64.const 65664
+  len = i64.load lp
+  z = i64.const 0
+  e = i64.eq len z
+  br_if e 2() 1(len)
+  }
+block 1 (len: i64) {
+  ob = i64.const 77824
+  r = call.import 0 (ob, len)
+  lp = i64.const 65664
+  z = i64.const 0
+  i64.store lp z
+  return
+  }
+block 2 () {
+  return
+  }
+}
+
+; 6 sb(b): append a byte to the open-block scratch (0x14000, len at SCR_LEN).
+func (i64) -> () {
+block 0 (b: i64) {
+  lp = i64.const 65608
+  len = i64.load lp
+  base = i64.const 81920
+  a = i64.add base len
+  i64.store8 a b
+  one = i64.const 1
+  len1 = i64.add len one
+  i64.store lp len1
+  return
+  }
+}
+
+; 7 suleb(v): unsigned LEB128 into scratch.
+func (i64) -> () {
+block 0 (v: i64) {
+  br 1(v)
+  }
+block 1 (v: i64) {
+  m = i64.const 127
+  b7 = i64.and v m
+  seven = i64.const 7
+  rest = i64.shr_u v seven
+  z = i64.const 0
+  done = i64.eq rest z
+  br_if done 3(b7) 2(b7, rest)
+  }
+block 2 (b7: i64, rest: i64) {
+  hi = i64.const 128
+  b = i64.or b7 hi
+  call 6 (b)
+  br 1(rest)
+  }
+block 3 (b7: i64) {
+  call 6 (b7)
+  return
+  }
+}
+
+; 8 ssleb(v): signed LEB128 into scratch.
+func (i64) -> () {
+block 0 (v: i64) {
+  br 1(v)
+  }
+block 1 (v: i64) {
+  m = i64.const 127
+  b7 = i64.and v m
+  seven = i64.const 7
+  rest = i64.shr_s v seven
+  z = i64.const 0
+  m1 = i64.const -1
+  sb = i64.const 64
+  sign = i64.and b7 sb
+  signz = i64.eqz sign
+  r0 = i64.eq rest z
+  rm = i64.eq rest m1
+  signnz = i64.ne sign z
+  d1 = i32.and r0 signz
+  d2 = i32.and rm signnz
+  done = i32.or d1 d2
+  br_if done 3(b7) 2(b7, rest)
+  }
+block 2 (b7: i64, rest: i64) {
+  hi = i64.const 128
+  b = i64.or b7 hi
+  call 6 (b)
+  br 1(rest)
+  }
+block 3 (b7: i64) {
+  call 6 (b7)
+  return
+  }
+}
+
+; 9 nv(): allocate the next SSA value index in the open block.
+func () -> (i64) {
+block 0 () {
+  p = i64.const 65584
+  v = i64.load p
+  one = i64.const 1
+  v1 = i64.add v one
+  i64.store p v1
+  return v
+  }
+}
+
+; 10 vs_push(v)
+func (i64) -> () {
+block 0 (v: i64) {
+  dp = i64.const 65576
+  d = i64.load dp
+  eight = i64.const 8
+  off = i64.mul d eight
+  base = i64.const 66560
+  a = i64.add base off
+  i64.store a v
+  one = i64.const 1
+  d1 = i64.add d one
+  i64.store dp d1
+  return
+  }
+}
+
+; 11 ensure(n): while the virtual stack holds fewer than n values, pull one from the persistent
+; REPL stack (top-level anonymous unit only): emit a load and insert it at the bottom. In a
+; named word (MODE 1) or with an empty REPL stack this is a stack-underflow error.
+func (i64) -> () {
+block 0 (n: i64) {
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 8() 1(n)
+  }
+block 1 (n: i64) {
+  dp = i64.const 65576
+  d = i64.load dp
+  ok = i64.ge_s d n
+  br_if ok 8() 2(n, d)
+  }
+block 2 (n: i64, d: i64) {
+  mp = i64.const 65632
+  mode = i64.load mp
+  rp = i64.const 65640
+  rd = i64.load rp
+  z = i64.const 0
+  m1 = i64.ne mode z
+  r0 = i64.eq rd z
+  bad = i32.or m1 r0
+  br_if bad 7() 3(n, d, rd)
+  }
+block 3 (n: i64, d: i64, rd: i64) {
+  one = i64.const 1
+  rd1 = i64.sub rd one
+  rp = i64.const 65640
+  i64.store rp rd1
+  eight = i64.const 8
+  off = i64.mul rd1 eight
+  rs = i64.const 311296
+  addr = i64.add rs off
+  a = call 22 (addr)
+  op = i64.const 241
+  v = call 24 (op, a)
+  br 4(n, d, v, d)
+  }
+block 4 (n: i64, d: i64, v: i64, i: i64) {
+  z = i64.const 0
+  at0 = i64.le_s i z
+  br_if at0 6(n, d, v) 5(n, d, v, i)
+  }
+block 5 (n: i64, d: i64, v: i64, i: i64) {
+  eight = i64.const 8
+  base = i64.const 66560
+  one = i64.const 1
+  im1 = i64.sub i one
+  offs = i64.mul im1 eight
+  src = i64.add base offs
+  x = i64.load src
+  offd = i64.mul i eight
+  dst = i64.add base offd
+  i64.store dst x
+  br 4(n, d, v, im1)
+  }
+block 6 (n: i64, d: i64, v: i64) {
+  base = i64.const 66560
+  i64.store base v
+  one = i64.const 1
+  d1 = i64.add d one
+  dp = i64.const 65576
+  i64.store dp d1
+  br 1(n)
+  }
+block 7 () {
+  m = i64.const 32768
+  l = i64.const 15
+  call 38 (m, l)
+  return
+  }
+block 8 () {
+  return
+  }
+}
+
+; 12 vs_pop() -> v (0 after an error)
+func () -> (i64) {
+block 0 () {
+  one = i64.const 1
+  call 11 (one)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 2() 1()
+  }
+block 1 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  one = i64.const 1
+  d1 = i64.sub d one
+  i64.store dp d1
+  eight = i64.const 8
+  off = i64.mul d1 eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  return v
+  }
+block 2 () {
+  z = i64.const 0
+  return z
+  }
+}
+
+; 13 alloc_blk() -> NBLK++
+func () -> (i64) {
+block 0 () {
+  p = i64.const 65592
+  v = i64.load p
+  one = i64.const 1
+  v1 = i64.add v one
+  i64.store p v1
+  return v
+  }
+}
+
+; 14 open_block(idx, nparams)
+func (i64, i64) -> () {
+block 0 (idx: i64, np: i64) {
+  cb = i64.const 65600
+  i64.store cb idx
+  cp = i64.const 65720
+  i64.store cp np
+  z = i64.const 0
+  sl = i64.const 65608
+  i64.store sl z
+  ci = i64.const 65616
+  i64.store ci z
+  nx = i64.const 65584
+  i64.store nx np
+  dd = i64.const 65672
+  i64.store dd z
+  return
+  }
+}
+
+; 15 close_block(): write the open block (params, inst count, scratch bytes) to the arena and
+; record its (offset, len) in the block table at BLKTAB[CUR_BLK].
+func () -> () {
+block 0 () {
+  alp = i64.const 65744
+  off = i64.load alp
+  cpp = i64.const 65720
+  np = i64.load cpp
+  call 56 (np)
+  z = i64.const 0
+  br 1(off, np, z)
+  }
+block 1 (off: i64, np: i64, i: i64) {
+  c = i64.ge_s i np
+  br_if c 3(off) 2(off, np, i)
+  }
+block 2 (off: i64, np: i64, i: i64) {
+  one = i64.const 1
+  call 55 (one)
+  i1 = i64.add i one
+  br 1(off, np, i1)
+  }
+block 3 (off: i64) {
+  cip = i64.const 65616
+  ni = i64.load cip
+  call 56 (ni)
+  alp = i64.const 65744
+  alen = i64.load alp
+  arena = i64.const 98304
+  dst = i64.add arena alen
+  scr = i64.const 81920
+  slp = i64.const 65608
+  slen = i64.load slp
+  mem.copy dst scr slen
+  alen1 = i64.add alen slen
+  i64.store alp alen1
+  cbp = i64.const 65600
+  cb = i64.load cbp
+  sixteen = i64.const 16
+  toff = i64.mul cb sixteen
+  tab = i64.const 70656
+  e = i64.add tab toff
+  i64.store e off
+  len = i64.sub alen1 off
+  i64.store e len offset=8
+  return
+  }
+}
+
+; 16 term_br(t)
+func (i64) -> () {
+block 0 (t: i64) {
+  op = i64.const 128
+  call 6 (op)
+  call 18 (t)
+  call 15 ()
+  return
+  }
+}
+
+; 17 term_br_if(c, t, e)
+func (i64, i64, i64) -> () {
+block 0 (c: i64, t: i64, e: i64) {
+  op = i64.const 129
+  call 6 (op)
+  call 7 (c)
+  call 18 (t)
+  call 18 (e)
+  call 15 ()
+  return
+  }
+}
+
+; 18 write_edge(t): uleb target, then the whole virtual stack as branch args.
+func (i64) -> () {
+block 0 (t: i64) {
+  call 7 (t)
+  dp = i64.const 65576
+  d = i64.load dp
+  call 7 (d)
+  z = i64.const 0
+  br 1(d, z)
+  }
+block 1 (d: i64, i: i64) {
+  c = i64.ge_s i d
+  br_if c 3() 2(d, i)
+  }
+block 2 (d: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(d, i1)
+  }
+block 3 () {
+  return
+  }
+}
+
+; 19 term_return(n): return the top n virtual-stack values.
+func (i64) -> () {
+block 0 (n: i64) {
+  op = i64.const 131
+  call 6 (op)
+  call 7 (n)
+  dp = i64.const 65576
+  d = i64.load dp
+  i0 = i64.sub d n
+  br 1(d, i0)
+  }
+block 1 (d: i64, i: i64) {
+  c = i64.ge_s i d
+  br_if c 3() 2(d, i)
+  }
+block 2 (d: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(d, i1)
+  }
+block 3 () {
+  call 15 ()
+  return
+  }
+}
+
+; 20 term_unreachable()
+func () -> () {
+block 0 () {
+  op = i64.const 143
+  call 6 (op)
+  call 15 ()
+  return
+  }
+}
+
+; 21 type_idx(nin, nout) -> index into the unit's type section (interned on demand).
+func (i64, i64) -> (i64) {
+block 0 (ni: i64, no: i64) {
+  z = i64.const 0
+  br 1(ni, no, z)
+  }
+block 1 (ni: i64, no: i64, i: i64) {
+  np = i64.const 65728
+  n = i64.load np
+  c = i64.ge_s i n
+  br_if c 4(ni, no, i) 2(ni, no, i)
+  }
+block 2 (ni: i64, no: i64, i: i64) {
+  sixteen = i64.const 16
+  off = i64.mul i sixteen
+  tab = i64.const 74752
+  e = i64.add tab off
+  a = i64.load e
+  b = i64.load e offset=8
+  ea = i64.eq a ni
+  eb = i64.eq b no
+  both = i32.and ea eb
+  br_if both 5(i) 3(ni, no, i)
+  }
+block 3 (ni: i64, no: i64, i: i64) {
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(ni, no, i1)
+  }
+block 4 (ni: i64, no: i64, i: i64) {
+  sixteen = i64.const 16
+  off = i64.mul i sixteen
+  tab = i64.const 74752
+  e = i64.add tab off
+  i64.store e ni
+  i64.store e no offset=8
+  one = i64.const 1
+  i1 = i64.add i one
+  np = i64.const 65728
+  i64.store np i1
+  return i
+  }
+block 5 (i: i64) {
+  return i
+  }
+}
+
+; 22 emit_const(x) -> v   (i64.const)
+func (i64) -> (i64) {
+block 0 (x: i64) {
+  op = i64.const 17
+  call 6 (op)
+  call 8 (x)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  v = call 9 ()
+  return v
+  }
+}
+
+; 23 emit_bin(op, a, b) -> v
+func (i64, i64, i64) -> (i64) {
+block 0 (op: i64, a: i64, b: i64) {
+  call 6 (op)
+  call 7 (a)
+  call 7 (b)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  v = call 9 ()
+  return v
+  }
+}
+
+; 24 emit_load(op, a) -> v  (offset 0)
+func (i64, i64) -> (i64) {
+block 0 (op: i64, a: i64) {
+  call 6 (op)
+  call 7 (a)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  v = call 9 ()
+  return v
+  }
+}
+
+; 25 emit_store(op, addr, val)  (offset 0, no result)
+func (i64, i64, i64) -> () {
+block 0 (op: i64, a: i64, v: i64) {
+  call 6 (op)
+  call 7 (a)
+  call 7 (v)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  return
+  }
+}
+
+; 26 emit_calldyn(slot, nin, nout): pop nin args, `call.dyn` the slot, push nout results.
+func (i64, i64, i64) -> () {
+block 0 (slot: i64, ni: i64, no: i64) {
+  call 11 (ni)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 7() 1(slot, ni, no)
+  }
+block 1 (slot: i64, ni: i64, no: i64) {
+  op = i64.const 16
+  call 6 (op)
+  call 8 (slot)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  f = call 9 ()
+  op2 = i64.const 116
+  call 6 (op2)
+  ti = call 21 (ni, no)
+  call 7 (ti)
+  call 7 (f)
+  call 7 (ni)
+  dp = i64.const 65576
+  d = i64.load dp
+  i0 = i64.sub d ni
+  i64.store dp i0
+  br 2(no, d, i0)
+  }
+block 2 (no: i64, d: i64, i: i64) {
+  c = i64.ge_s i d
+  br_if c 4(no, d) 3(no, d, i)
+  }
+block 3 (no: i64, d: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 2(no, d, i1)
+  }
+block 4 (no: i64, d: i64) {
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  br 5(no, d)
+  }
+block 5 (no: i64, d: i64) {
+  z = i64.const 0
+  c = i64.le_s no z
+  br_if c 7() 6(no, d)
+  }
+block 6 (no: i64, d: i64) {
+  v = call 9 ()
+  call 10 (v)
+  one = i64.const 1
+  no1 = i64.sub no one
+  br 5(no1, d)
+  }
+block 7 () {
+  return
+  }
+}
+
+; 27 emit_un(op, a) -> v   (one-operand op: extend 0x61, wrap 0x62, eqz 0x50)
+func (i64, i64) -> (i64) {
+block 0 (op: i64, a: i64) {
+  call 6 (op)
+  call 7 (a)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  v = call 9 ()
+  return v
+  }
+}
+
+; 28 emit_recurse(nin, nout): `call 0` — the unit's own function.
+func (i64, i64) -> () {
+block 0 (ni: i64, no: i64) {
+  call 11 (ni)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 7() 1(ni, no)
+  }
+block 1 (ni: i64, no: i64) {
+  op = i64.const 115
+  call 6 (op)
+  z = i64.const 0
+  call 7 (z)
+  call 7 (ni)
+  dp = i64.const 65576
+  d = i64.load dp
+  i0 = i64.sub d ni
+  i64.store dp i0
+  br 2(no, d, i0)
+  }
+block 2 (no: i64, d: i64, i: i64) {
+  c = i64.ge_s i d
+  br_if c 4(no) 3(no, d, i)
+  }
+block 3 (no: i64, d: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 2(no, d, i1)
+  }
+block 4 (no: i64) {
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  br 5(no)
+  }
+block 5 (no: i64) {
+  z = i64.const 0
+  c = i64.le_s no z
+  br_if c 7() 6(no)
+  }
+block 6 (no: i64) {
+  v = call 9 ()
+  call 10 (v)
+  one = i64.const 1
+  no1 = i64.sub no one
+  br 5(no1)
+  }
+block 7 () {
+  return
+  }
+}
+
+; 29 assemble(nin, nout) -> len: build the unit blob at 0x28000 from the closed blocks.
+func (i64, i64) -> (i64) {
+block 0 (ni: i64, no: i64) {
+  blp = i64.const 65736
+  z = i64.const 0
+  i64.store blp z
+  ; "TEMEN\0\0\0" kind=0 version=10 flags=0
+  c84 = i64.const 84
+  call 30 (c84)
+  c69 = i64.const 69
+  call 30 (c69)
+  c77 = i64.const 77
+  call 30 (c77)
+  call 30 (c69)
+  c78 = i64.const 78
+  call 30 (c78)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  ten = i64.const 10
+  call 30 (ten)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  ; memory present, size_log2 20 (must match this kernel's window)
+  one = i64.const 1
+  call 30 (one)
+  twenty = i64.const 20
+  call 30 (twenty)
+  ; no data, no imports, no exports
+  call 30 (z)
+  call 30 (z)
+  call 30 (z)
+  ; type section
+  ntp = i64.const 65728
+  nt = i64.load ntp
+  call 31 (nt)
+  br 1(ni, no, z)
+  }
+block 1 (ni: i64, no: i64, i: i64) {
+  ntp = i64.const 65728
+  nt = i64.load ntp
+  c = i64.ge_s i nt
+  br_if c 3(ni, no) 2(ni, no, i)
+  }
+block 2 (ni: i64, no: i64, i: i64) {
+  sixteen = i64.const 16
+  off = i64.mul i sixteen
+  tab = i64.const 74752
+  e = i64.add tab off
+  a = i64.load e
+  b = i64.load e offset=8
+  z = i64.const 0
+  call 30 (z)
+  call 32 (a)
+  call 32 (b)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(ni, no, i1)
+  }
+block 3 (ni: i64, no: i64) {
+  z = i64.const 0
+  call 30 (z)
+  one = i64.const 1
+  call 30 (one)
+  call 32 (ni)
+  call 32 (no)
+  nbp = i64.const 65592
+  nb = i64.load nbp
+  call 31 (nb)
+  br 4(z)
+  }
+block 4 (i: i64) {
+  nbp = i64.const 65592
+  nb = i64.load nbp
+  c = i64.ge_s i nb
+  br_if c 6() 5(i)
+  }
+block 5 (i: i64) {
+  sixteen = i64.const 16
+  toff = i64.mul i sixteen
+  tab = i64.const 70656
+  e = i64.add tab toff
+  off = i64.load e
+  len = i64.load e offset=8
+  arena = i64.const 98304
+  src = i64.add arena off
+  blp = i64.const 65736
+  bl = i64.load blp
+  blob = i64.const 163840
+  dst = i64.add blob bl
+  mem.copy dst src len
+  bl1 = i64.add bl len
+  i64.store blp bl1
+  one = i64.const 1
+  i1 = i64.add i one
+  br 4(i1)
+  }
+block 6 () {
+  blp = i64.const 65736
+  bl = i64.load blp
+  return bl
+  }
+}
+
+; 30 bb(b): append a byte to the blob.
+func (i64) -> () {
+block 0 (b: i64) {
+  lp = i64.const 65736
+  len = i64.load lp
+  base = i64.const 163840
+  a = i64.add base len
+  i64.store8 a b
+  one = i64.const 1
+  len1 = i64.add len one
+  i64.store lp len1
+  return
+  }
+}
+
+; 31 buleb(v): unsigned LEB128 into the blob.
+func (i64) -> () {
+block 0 (v: i64) {
+  br 1(v)
+  }
+block 1 (v: i64) {
+  m = i64.const 127
+  b7 = i64.and v m
+  seven = i64.const 7
+  rest = i64.shr_u v seven
+  z = i64.const 0
+  done = i64.eq rest z
+  br_if done 3(b7) 2(b7, rest)
+  }
+block 2 (b7: i64, rest: i64) {
+  hi = i64.const 128
+  b = i64.or b7 hi
+  call 30 (b)
+  br 1(rest)
+  }
+block 3 (b7: i64) {
+  call 30 (b7)
+  return
+  }
+}
+
+; 32 btypes(n): a type list of n × i64 into the blob (uleb count, then n × tag 1).
+func (i64) -> () {
+block 0 (n: i64) {
+  call 31 (n)
+  z = i64.const 0
+  br 1(n, z)
+  }
+block 1 (n: i64, i: i64) {
+  c = i64.ge_s i n
+  br_if c 3() 2(n, i)
+  }
+block 2 (n: i64, i: i64) {
+  one = i64.const 1
+  call 30 (one)
+  i1 = i64.add i one
+  br 1(n, i1)
+  }
+block 3 () {
+  return
+  }
+}
+
+; 33 next_tok() -> len: whitespace-delimited token from the input at IN_POS; a newline is its
+; own 1-byte token (the REPL's line boundary); 0 at end of input. Sets TOK_PTR / TOK_LEN.
+func () -> (i64) {
+block 0 () {
+  pp = i64.const 65544
+  pos = i64.load pp
+  br 1(pos)
+  }
+block 1 (pos: i64) {
+  lp = i64.const 65552
+  len = i64.load lp
+  atend = i64.ge_s pos len
+  br_if atend 5() 2(pos)
+  }
+block 2 (pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  a = i64.add base pos
+  ch = i64.load8_u a
+  nl = i64.const 10
+  isnl = i64.eq ch nl
+  br_if isnl 6(pos, a) 3(pos, ch)
+  }
+block 3 (pos: i64, ch: i64) {
+  sp = i64.const 32
+  ws = i64.le_s ch sp
+  br_if ws 4(pos) 7(pos)
+  }
+block 4 (pos: i64) {
+  one = i64.const 1
+  pos1 = i64.add pos one
+  br 1(pos1)
+  }
+block 5 () {
+  tl = i64.const 65688
+  z = i64.const 0
+  i64.store tl z
+  return z
+  }
+block 6 (pos: i64, a: i64) {
+  tp = i64.const 65680
+  i64.store tp a
+  tl = i64.const 65688
+  one = i64.const 1
+  i64.store tl one
+  pp = i64.const 65544
+  pos1 = i64.add pos one
+  i64.store pp pos1
+  return one
+  }
+block 7 (pos: i64) {
+  br 8(pos, pos)
+  }
+block 8 (start: i64, pos: i64) {
+  lp = i64.const 65552
+  len = i64.load lp
+  atend = i64.ge_s pos len
+  br_if atend 10(start, pos) 9(start, pos)
+  }
+block 9 (start: i64, pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  a = i64.add base pos
+  ch = i64.load8_u a
+  sp = i64.const 32
+  ws = i64.le_s ch sp
+  br_if ws 10(start, pos) 11(start, pos)
+  }
+block 10 (start: i64, pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  a = i64.add base start
+  tp = i64.const 65680
+  i64.store tp a
+  n = i64.sub pos start
+  tl = i64.const 65688
+  i64.store tl n
+  pp = i64.const 65544
+  i64.store pp pos
+  return n
+  }
+block 11 (start: i64, pos: i64) {
+  one = i64.const 1
+  pos1 = i64.add pos one
+  br 8(start, pos1)
+  }
+}
+
+; 34 lookup(p, n) -> dictionary entry address, or 0. Newest first, so redefinition shadows.
+func (i64, i64) -> (i64) {
+block 0 (p: i64, n: i64) {
+  dp = i64.const 65560
+  dn = i64.load dp
+  one = i64.const 1
+  i = i64.sub dn one
+  br 1(p, n, i)
+  }
+block 1 (p: i64, n: i64, i: i64) {
+  z = i64.const 0
+  neg = i64.lt_s i z
+  br_if neg 5() 2(p, n, i)
+  }
+block 2 (p: i64, n: i64, i: i64) {
+  sz = i64.const 32
+  off = i64.mul i sz
+  dict = i64.const 229376
+  e = i64.add dict off
+  elen = i64.load32_s e offset=8
+  same = i64.eq elen n
+  br_if same 3(p, n, i, e) 4(p, n, i)
+  }
+block 3 (p: i64, n: i64, i: i64, e: i64) {
+  eptr = i64.load e
+  eq = call 37 (eptr, p, n)
+  z = i64.const 0
+  hit = i64.ne eq z
+  br_if hit 6(e) 4(p, n, i)
+  }
+block 4 (p: i64, n: i64, i: i64) {
+  one = i64.const 1
+  i1 = i64.sub i one
+  br 1(p, n, i1)
+  }
+block 5 () {
+  z = i64.const 0
+  return z
+  }
+block 6 (e: i64) {
+  return e
+  }
+}
+
+; 35 add_entry(p, n, kind, nin, nout, payload): append a 32-byte dictionary entry.
+func (i64, i64, i64, i64, i64, i64) -> () {
+block 0 (p: i64, n: i64, k: i64, ni: i64, no: i64, pay: i64) {
+  dp = i64.const 65560
+  dn = i64.load dp
+  sz = i64.const 32
+  off = i64.mul dn sz
+  dict = i64.const 229376
+  e = i64.add dict off
+  i64.store e p
+  i64.store32 e n offset=8
+  i64.store32 e k offset=12
+  i64.store32 e ni offset=16
+  i64.store32 e no offset=20
+  i64.store e pay offset=24
+  one = i64.const 1
+  dn1 = i64.add dn one
+  i64.store dp dn1
+  return
+  }
+}
+
+; 36 parse_num(p, n) -> ok; the value lands in NUM (65760). Decimal, optional leading '-'.
+func (i64, i64) -> (i64) {
+block 0 (p: i64, n: i64) {
+  z = i64.const 0
+  empty = i64.le_s n z
+  br_if empty 9() 1(p, n)
+  }
+block 1 (p: i64, n: i64) {
+  ch = i64.load8_u p
+  minus = i64.const 45
+  neg = i64.eq ch minus
+  br_if neg 2(p, n) 3(p, n)
+  }
+block 2 (p: i64, n: i64) {
+  one = i64.const 1
+  only = i64.eq n one
+  br_if only 9() 4(p, n, one, one)
+  }
+block 3 (p: i64, n: i64) {
+  z = i64.const 0
+  br 4(p, n, z, z)
+  }
+block 4 (p: i64, n: i64, neg: i64, i: i64) {
+  z = i64.const 0
+  br 5(p, n, neg, i, z)
+  }
+block 5 (p: i64, n: i64, neg: i64, i: i64, v: i64) {
+  done = i64.ge_s i n
+  br_if done 8(neg, v) 6(p, n, neg, i, v)
+  }
+block 6 (p: i64, n: i64, neg: i64, i: i64, v: i64) {
+  a = i64.add p i
+  ch = i64.load8_u a
+  c48 = i64.const 48
+  d = i64.sub ch c48
+  z = i64.const 0
+  nine = i64.const 9
+  lo = i64.lt_s d z
+  hi = i64.gt_s d nine
+  bad = i32.or lo hi
+  br_if bad 9() 7(p, n, neg, i, v, d)
+  }
+block 7 (p: i64, n: i64, neg: i64, i: i64, v: i64, d: i64) {
+  ten = i64.const 10
+  v10 = i64.mul v ten
+  v1 = i64.add v10 d
+  one = i64.const 1
+  i1 = i64.add i one
+  br 5(p, n, neg, i1, v1)
+  }
+block 8 (neg: i64, v: i64) {
+  z = i64.const 0
+  nv = i64.sub z v
+  isneg = i64.ne neg z
+  isneg32 = i32.eqz isneg
+  r = select isneg32 v nv
+  np = i64.const 65760
+  i64.store np r
+  one = i64.const 1
+  return one
+  }
+block 9 () {
+  z = i64.const 0
+  return z
+  }
+}
+
+; 37 streq(p1, p2, n) -> 1 if the n bytes match.
+func (i64, i64, i64) -> (i64) {
+block 0 (p1: i64, p2: i64, n: i64) {
+  z = i64.const 0
+  br 1(p1, p2, n, z)
+  }
+block 1 (p1: i64, p2: i64, n: i64, i: i64) {
+  done = i64.ge_s i n
+  br_if done 3() 2(p1, p2, n, i)
+  }
+block 2 (p1: i64, p2: i64, n: i64, i: i64) {
+  a = i64.add p1 i
+  b = i64.add p2 i
+  ca = i64.load8_u a
+  cb = i64.load8_u b
+  ne = i64.ne ca cb
+  one = i64.const 1
+  i1 = i64.add i one
+  br_if ne 4() 1(p1, p2, n, i1)
+  }
+block 3 () {
+  one = i64.const 1
+  return one
+  }
+block 4 () {
+  z = i64.const 0
+  return z
+  }
+}
+
+; 38 error(msg, len): print "<msg> near <token>" and set ERR (the outer loop resynchronizes).
+func (i64, i64) -> () {
+block 0 (msg: i64, len: i64) {
+  call 5 ()
+  call 2 (msg, len)
+  near = i64.const 32976
+  six = i64.const 6
+  call 2 (near, six)
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  call 2 (t, n)
+  nl = i64.const 10
+  call 1 (nl)
+  call 5 ()
+  ep = i64.const 65712
+  one = i64.const 1
+  i64.store ep one
+  return
+  }
+}
+
+; 39 print_i64(v): decimal, through emit.
+func (i64) -> () {
+block 0 (v: i64) {
+  z = i64.const 0
+  neg = i64.lt_s v z
+  br_if neg 1(v) 2(v)
+  }
+block 1 (v: i64) {
+  minus = i64.const 45
+  call 1 (minus)
+  z = i64.const 0
+  nv = i64.sub z v
+  br 2(nv)
+  }
+block 2 (v: i64) {
+  z = i64.const 0
+  br 3(v, z)
+  }
+block 3 (v: i64, i: i64) {
+  ten = i64.const 10
+  d = i64.rem_u v ten
+  c48 = i64.const 48
+  ch = i64.add d c48
+  buf = i64.const 65792
+  a = i64.add buf i
+  i64.store8 a ch
+  q = i64.div_u v ten
+  one = i64.const 1
+  i1 = i64.add i one
+  z = i64.const 0
+  done = i64.eq q z
+  br_if done 4(i1) 3(q, i1)
+  }
+block 4 (i: i64) {
+  z = i64.const 0
+  done = i64.le_s i z
+  br_if done 6() 5(i)
+  }
+block 5 (i: i64) {
+  one = i64.const 1
+  i1 = i64.sub i one
+  buf = i64.const 65792
+  a = i64.add buf i1
+  ch = i64.load8_u a
+  call 1 (ch)
+  br 4(i1)
+  }
+block 6 () {
+  return
+  }
+}
+
+; 40 anon_begin(): start a fresh top-level anonymous unit `(i64, i64) -> (i64)` (the two
+; params are the raw `invoke2` args, ignored; the virtual stack starts empty).
+func () -> () {
+block 0 () {
+  z = i64.const 0
+  mp = i64.const 65632
+  i64.store mp z
+  nbp = i64.const 65592
+  i64.store nbp z
+  ntp = i64.const 65728
+  i64.store ntp z
+  alp = i64.const 65744
+  i64.store alp z
+  csp = i64.const 65624
+  i64.store csp z
+  b = call 13 ()
+  two = i64.const 2
+  call 14 (b, two)
+  dp = i64.const 65576
+  i64.store dp z
+  return
+  }
+}
+
+; 41 anon_flush(): finish the top-level unit — spill the virtual stack to the persistent REPL
+; stack, compile, invoke, release — then begin a fresh one. A unit with nothing in it is skipped.
+func () -> () {
+block 0 () {
+  csp = i64.const 65624
+  cs = i64.load csp
+  z = i64.const 0
+  open = i64.ne cs z
+  br_if open 10() 1()
+  }
+block 1 () {
+  cip = i64.const 65616
+  ni = i64.load cip
+  dp = i64.const 65576
+  d = i64.load dp
+  nbp = i64.const 65592
+  nb = i64.load nbp
+  z = i64.const 0
+  one = i64.const 1
+  a = i64.ne ni z
+  b = i64.ne d z
+  c = i64.gt_s nb one
+  ab = i32.or a b
+  dirty = i32.or ab c
+  br_if dirty 2(d, z) 9()
+  }
+block 2 (d: i64, i: i64) {
+  done = i64.ge_s i d
+  br_if done 4(d) 3(d, i)
+  }
+block 3 (d: i64, i: i64) {
+  rp = i64.const 65640
+  rd = i64.load rp
+  slot = i64.add rd i
+  eight = i64.const 8
+  off = i64.mul slot eight
+  rs = i64.const 311296
+  addr = i64.add rs off
+  a = call 22 (addr)
+  base = i64.const 66560
+  voff = i64.mul i eight
+  va = i64.add base voff
+  v = i64.load va
+  op = i64.const 133
+  call 25 (op, a, v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 2(d, i1)
+  }
+block 4 (d: i64) {
+  rp = i64.const 65640
+  rd = i64.load rp
+  rd1 = i64.add rd d
+  i64.store rp rd1
+  dp = i64.const 65576
+  z = i64.const 0
+  i64.store dp z
+  v = call 22 (z)
+  call 10 (v)
+  one = i64.const 1
+  call 19 (one)
+  two = i64.const 2
+  len = call 29 (two, one)
+  blob = i64.const 163840
+  code = call.import 2 (blob, len)
+  bad = i64.lt_s code z
+  br_if bad 5(code) 6(code)
+  }
+block 5 (code: i64) {
+  m = i64.const 32896
+  n = i64.const 14
+  call 2 (m, n)
+  call 39 (code)
+  nl = i64.const 10
+  call 1 (nl)
+  br 9()
+  }
+block 6 (code: i64) {
+  slot = call.import 3 (code)
+  z = i64.const 0
+  bad = i64.lt_s slot z
+  br_if bad 7(slot, code) 8(slot, code)
+  }
+block 7 (slot: i64, code: i64) {
+  m = i64.const 33040
+  n = i64.const 14
+  call 2 (m, n)
+  call 39 (slot)
+  nl = i64.const 10
+  call 1 (nl)
+  rel = call.import 5 (code)
+  br 9()
+  }
+block 8 (slot: i64, code: i64) {
+  f = i32.wrap_i64 slot
+  z = i64.const 0
+  r = call.dyn (i64, i64) -> (i64) f (z, z)
+  un = call.import 6 (slot)
+  rel = call.import 5 (code)
+  br 9()
+  }
+block 9 () {
+  call 40 ()
+  return
+  }
+block 10 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+}
+
+; 42 process(p, n): the outer interpreter over one input buffer.
+func (i64, i64) -> () {
+block 0 (p: i64, n: i64) {
+  bp = i64.const 65752
+  i64.store bp p
+  pp = i64.const 65544
+  z = i64.const 0
+  i64.store pp z
+  lp = i64.const 65552
+  i64.store lp n
+  br 1()
+  }
+block 1 () {
+  len = call 33 ()
+  z = i64.const 0
+  end = i64.eq len z
+  br_if end 20() 2()
+  }
+block 2 () {
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 3() 7()
+  }
+block 3 () {
+  isnl = call 60 ()
+  z = i64.const 0
+  nl = i64.ne isnl z
+  br_if nl 4() 5()
+  }
+block 4 () {
+  br 6()
+  }
+block 5 () {
+  call 57 ()
+  br 6()
+  }
+block 6 () {
+  z = i64.const 0
+  ep = i64.const 65712
+  i64.store ep z
+  call 40 ()
+  br 1()
+  }
+block 7 () {
+  isnl = call 60 ()
+  z = i64.const 0
+  nl = i64.ne isnl z
+  br_if nl 8() 10()
+  }
+block 8 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 9() 1()
+  }
+block 9 () {
+  call 41 ()
+  br 1()
+  }
+block 10 () {
+  tl = i64.const 65688
+  n = i64.load tl
+  four = i64.const 4
+  is4 = i64.eq n four
+  br_if is4 11() 13()
+  }
+block 11 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  prim = i64.const 33008
+  four = i64.const 4
+  eq = call 37 (t, prim, four)
+  z = i64.const 0
+  hit = i64.ne eq z
+  br_if hit 12() 13()
+  }
+block 12 () {
+  call 47 ()
+  br 1()
+  }
+block 13 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  e = call 34 (t, n)
+  z = i64.const 0
+  miss = i64.eq e z
+  br_if miss 17() 14(e)
+  }
+block 14 (e: i64) {
+  kind = i64.load32_s e offset=12
+  two = i64.const 2
+  imm = i64.eq kind two
+  br_if imm 15(e) 16(e)
+  }
+block 15 (e: i64) {
+  id = i64.load e offset=24
+  call 44 (id)
+  br 1()
+  }
+block 16 (e: i64) {
+  call 43 (e)
+  br 1()
+  }
+block 17 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  ok = call 36 (t, n)
+  z = i64.const 0
+  isnum = i64.ne ok z
+  br_if isnum 18() 19()
+  }
+block 18 () {
+  np = i64.const 65760
+  v = i64.load np
+  x = call 22 (v)
+  call 10 (x)
+  br 1()
+  }
+block 19 () {
+  m = i64.const 32784
+  n = i64.const 12
+  call 38 (m, n)
+  br 1()
+  }
+block 20 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 22() 21()
+  }
+block 21 () {
+  m = i64.const 32800
+  n = i64.const 23
+  call 38 (m, n)
+  z = i64.const 0
+  ep = i64.const 65712
+  i64.store ep z
+  call 40 ()
+  return
+  }
+block 22 () {
+  call 41 ()
+  return
+  }
+}
+
+; 43 do_word(e): compile a dictionary entry by kind (see the table at the top).
+func (i64) -> () {
+block 0 (e: i64) {
+  kind = i64.load32_s e offset=12
+  ni = i64.load32_s e offset=16
+  no = i64.load32_s e offset=20
+  pay = i64.load e offset=24
+  k32 = i32.wrap_i64 kind
+  br_table k32 [5(ni, no, pay), 6(pay), 12(), 7(pay), 8(pay), 9(pay), 10(pay), 1(pay), 11(), 2(), 3(), 4()] 12()
+  }
+block 1 (pay: i64) {
+  two = i64.const 2
+  call 11 (two)
+  addr = call 12 ()
+  n = call 12 ()
+  op = i64.const 200
+  call 6 (op)
+  one = i64.const 1
+  call 6 (one)
+  call 6 (pay)
+  call 7 (addr)
+  call 7 (n)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  c = i64.load cip
+  c1 = i64.add c one
+  i64.store cip c1
+  v = call 9 ()
+  call 10 (v)
+  return
+  }
+block 2 () {
+  three = i64.const 3
+  call 11 (three)
+  addr = call 12 ()
+  nw = call 12 ()
+  ex = call 12 ()
+  op = i64.const 201
+  call 6 (op)
+  one = i64.const 1
+  call 6 (one)
+  call 7 (addr)
+  call 7 (ex)
+  call 7 (nw)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  c = i64.load cip
+  c1 = i64.add c one
+  i64.store cip c1
+  v = call 9 ()
+  call 10 (v)
+  return
+  }
+block 3 () {
+  addr = call 12 ()
+  op = i64.const 198
+  call 6 (op)
+  one = i64.const 1
+  call 6 (one)
+  call 7 (addr)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  c = i64.load cip
+  c1 = i64.add c one
+  i64.store cip c1
+  v = call 9 ()
+  call 10 (v)
+  return
+  }
+block 4 () {
+  two = i64.const 2
+  call 11 (two)
+  addr = call 12 ()
+  x = call 12 ()
+  op = i64.const 199
+  call 6 (op)
+  one = i64.const 1
+  call 6 (one)
+  call 7 (addr)
+  call 7 (x)
+  z = i64.const 0
+  call 7 (z)
+  cip = i64.const 65616
+  c = i64.load cip
+  c1 = i64.add c one
+  i64.store cip c1
+  return
+  }
+block 5 (ni: i64, no: i64, pay: i64) {
+  call 26 (pay, ni, no)
+  return
+  }
+block 6 (pay: i64) {
+  two = i64.const 2
+  call 11 (two)
+  b = call 12 ()
+  a = call 12 ()
+  v = call 23 (pay, a, b)
+  call 10 (v)
+  return
+  }
+block 7 (pay: i64) {
+  two = i64.const 2
+  call 11 (two)
+  b = call 12 ()
+  a = call 12 ()
+  c = call 23 (pay, a, b)
+  ext = i64.const 97
+  v = call 27 (ext, c)
+  call 10 (v)
+  return
+  }
+block 8 (pay: i64) {
+  a = call 12 ()
+  v = call 24 (pay, a)
+  call 10 (v)
+  return
+  }
+block 9 (pay: i64) {
+  two = i64.const 2
+  call 11 (two)
+  addr = call 12 ()
+  x = call 12 ()
+  call 25 (pay, addr, x)
+  return
+  }
+block 10 (pay: i64) {
+  v = call 22 (pay)
+  call 10 (v)
+  return
+  }
+block 11 () {
+  a = call 12 ()
+  eqz = i64.const 80
+  c = call 27 (eqz, a)
+  ext = i64.const 97
+  v = call 27 (ext, c)
+  call 10 (v)
+  return
+  }
+block 12 () {
+  return
+  }
+}
+
+; 44 do_imm(id): the compiler words, dispatched by id.
+func (i64) -> () {
+block 0 (id: i64) {
+  id32 = i32.wrap_i64 id
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19()] 16()
+  }
+block 1 () {
+  call 45 ()
+  return
+  }
+block 2 () {
+  call 46 ()
+  return
+  }
+block 3 (id: i64) {
+  call 61 (id)
+  return
+  }
+block 4 (id: i64) {
+  call 62 (id)
+  return
+  }
+block 5 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 6() 7()
+  }
+block 6 () {
+  m = i64.const 33056
+  n = i64.const 13
+  call 38 (m, n)
+  return
+  }
+block 7 () {
+  nip = i64.const 65648
+  ni = i64.load nip
+  nop = i64.const 65656
+  no = i64.load nop
+  call 28 (ni, no)
+  return
+  }
+block 8 () {
+  len = call 33 ()
+  tp = i64.const 65680
+  t = i64.load tp
+  e = call 34 (t, len)
+  z = i64.const 0
+  miss = i64.eq e z
+  br_if miss 9() 10(e)
+  }
+block 9 () {
+  m = i64.const 32992
+  n = i64.const 12
+  call 38 (m, n)
+  return
+  }
+block 10 (e: i64) {
+  kind = i64.load32_s e offset=12
+  z = i64.const 0
+  word = i64.eq kind z
+  br_if word 11(e) 9()
+  }
+block 11 (e: i64) {
+  pay = i64.load e offset=24
+  v = call 22 (pay)
+  call 10 (v)
+  return
+  }
+block 12 (id: i64) {
+  call 53 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 16() 13(id)
+  }
+block 13 (id: i64) {
+  sp = i64.const 65768
+  sa = i64.load sp
+  sl = i64.const 65776
+  sn = i64.load sl
+  a = call 22 (sa)
+  call 10 (a)
+  l = call 22 (sn)
+  call 10 (l)
+  twenty = i64.const 20
+  dot = i64.eq id twenty
+  br_if dot 14() 16()
+  }
+block 14 () {
+  two = i64.const 2
+  z = i64.const 0
+  call 26 (two, two, z)
+  return
+  }
+block 15 (id: i64) {
+  call 64 (id)
+  return
+  }
+block 16 () {
+  return
+  }
+block 17 (id: i64) {
+  call 63 (id)
+  return
+  }
+block 18 () {
+  call 58 ()
+  return
+  }
+block 19 () {
+  call 57 ()
+  return
+  }
+}
+
+; 45 do_colon(): `: name ( in -- out )` — flush the top-level unit, then open the word's unit.
+func () -> () {
+block 0 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 2() 1()
+  }
+block 1 () {
+  m = i64.const 32912
+  n = i64.const 17
+  call 38 (m, n)
+  return
+  }
+block 2 () {
+  call 41 ()
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 3() 4()
+  }
+block 3 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 4 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  np = i64.const 65696
+  i64.store np t
+  nl = i64.const 65704
+  i64.store nl n
+  call 51 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 6() 5()
+  }
+block 5 () {
+  one = i64.const 1
+  z = i64.const 0
+  mp = i64.const 65632
+  i64.store mp one
+  nbp = i64.const 65592
+  i64.store nbp z
+  ntp = i64.const 65728
+  i64.store ntp z
+  alp = i64.const 65744
+  i64.store alp z
+  csp = i64.const 65624
+  i64.store csp z
+  b = call 13 ()
+  nip = i64.const 65648
+  ni = i64.load nip
+  call 14 (b, ni)
+  call 52 (ni)
+  return
+  }
+block 6 () {
+  return
+  }
+}
+
+; 46 do_semi(): close the word — return, assemble, compile, install, define.
+func () -> () {
+block 0 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 1() 2()
+  }
+block 1 () {
+  m = i64.const 33056
+  n = i64.const 13
+  call 38 (m, n)
+  return
+  }
+block 2 () {
+  csp = i64.const 65624
+  cs = i64.load csp
+  z = i64.const 0
+  open = i64.ne cs z
+  br_if open 3() 4()
+  }
+block 3 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+block 4 () {
+  dp = i64.const 65672
+  dead = i64.load dp
+  z = i64.const 0
+  isdead = i64.ne dead z
+  br_if isdead 5() 6()
+  }
+block 5 () {
+  call 20 ()
+  br 9()
+  }
+block 6 () {
+  nop = i64.const 65656
+  no = i64.load nop
+  vp = i64.const 65576
+  d = i64.load vp
+  same = i64.eq d no
+  br_if same 7(no) 8()
+  }
+block 7 (no: i64) {
+  call 19 (no)
+  br 9()
+  }
+block 8 () {
+  m = i64.const 32864
+  n = i64.const 21
+  call 38 (m, n)
+  return
+  }
+block 9 () {
+  nip = i64.const 65648
+  ni = i64.load nip
+  nop = i64.const 65656
+  no = i64.load nop
+  len = call 29 (ni, no)
+  blob = i64.const 163840
+  code = call.import 2 (blob, len)
+  z = i64.const 0
+  bad = i64.lt_s code z
+  br_if bad 10(code) 11(code, ni, no)
+  }
+block 10 (code: i64) {
+  m = i64.const 32896
+  n = i64.const 14
+  call 2 (m, n)
+  call 39 (code)
+  nl = i64.const 10
+  call 1 (nl)
+  br 14()
+  }
+block 11 (code: i64, ni: i64, no: i64) {
+  slot = call.import 3 (code)
+  rel = call.import 5 (code)
+  z = i64.const 0
+  bad = i64.lt_s slot z
+  br_if bad 12(slot) 13(slot, ni, no)
+  }
+block 12 (slot: i64) {
+  m = i64.const 33040
+  n = i64.const 14
+  call 2 (m, n)
+  call 39 (slot)
+  nl = i64.const 10
+  call 1 (nl)
+  br 14()
+  }
+block 13 (slot: i64, ni: i64, no: i64) {
+  np = i64.const 65696
+  p = i64.load np
+  nl = i64.const 65704
+  n = i64.load nl
+  z = i64.const 0
+  call 35 (p, n, z, ni, no, slot)
+  br 14()
+  }
+block 14 () {
+  call 40 ()
+  return
+  }
+}
+
+; 47 do_prim(): `prim <name> <kind> <nin> <nout> <payload>` — the hardwired defining word.
+func () -> () {
+block 0 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  br_if none 7() 1()
+  }
+block 1 () {
+  tp = i64.const 65680
+  p = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  ok = call 65 ()
+  z = i64.const 0
+  bad = i64.eq ok z
+  br_if bad 6() 2(p, n)
+  }
+block 2 (p: i64, n: i64) {
+  np = i64.const 65760
+  k = i64.load np
+  ok = call 65 ()
+  z = i64.const 0
+  bad = i64.eq ok z
+  br_if bad 6() 3(p, n, k)
+  }
+block 3 (p: i64, n: i64, k: i64) {
+  np = i64.const 65760
+  ni = i64.load np
+  ok = call 65 ()
+  z = i64.const 0
+  bad = i64.eq ok z
+  br_if bad 6() 4(p, n, k, ni)
+  }
+block 4 (p: i64, n: i64, k: i64, ni: i64) {
+  np = i64.const 65760
+  no = i64.load np
+  ok = call 65 ()
+  z = i64.const 0
+  bad = i64.eq ok z
+  br_if bad 6() 5(p, n, k, ni, no)
+  }
+block 5 (p: i64, n: i64, k: i64, ni: i64, no: i64) {
+  np = i64.const 65760
+  pay = i64.load np
+  call 35 (p, n, k, ni, no, pay)
+  return
+  }
+block 6 () {
+  m = i64.const 32784
+  n = i64.const 12
+  call 38 (m, n)
+  return
+  }
+block 7 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+}
+
+; 48 read_stdin() -> n: read all of stdin into the input buffer (up to 256 KiB).
+func () -> (i64) {
+block 0 () {
+  z = i64.const 0
+  br 1(z)
+  }
+block 1 (n: i64) {
+  cap = i64.const 262144
+  room = i64.sub cap n
+  z = i64.const 0
+  full = i64.le_s room z
+  br_if full 3(n) 2(n, room)
+  }
+block 2 (n: i64, room: i64) {
+  base = i64.const 327680
+  a = i64.add base n
+  r = call.import 1 (a, room)
+  z = i64.const 0
+  eof = i64.le_s r z
+  n1 = i64.add n r
+  br_if eof 3(n) 1(n1)
+  }
+block 3 (n: i64) {
+  return n
+  }
+}
+
+; 49 cs_push(kind, a, b, c, depth): 40-byte control-stack entries at 0x10C00.
+func (i64, i64, i64, i64, i64) -> () {
+block 0 (k: i64, a: i64, b: i64, c: i64, d: i64) {
+  csp = i64.const 65624
+  n = i64.load csp
+  forty = i64.const 40
+  off = i64.mul n forty
+  base = i64.const 68608
+  e = i64.add base off
+  i64.store e k
+  i64.store e a offset=8
+  i64.store e b offset=16
+  i64.store e c offset=24
+  i64.store e d offset=32
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store csp n1
+  return
+  }
+}
+
+; 50 cs_pop() -> entry address (fields stay readable until the next push), or 0 if empty.
+func () -> (i64) {
+block 0 () {
+  csp = i64.const 65624
+  n = i64.load csp
+  z = i64.const 0
+  empty = i64.le_s n z
+  br_if empty 2() 1(n)
+  }
+block 1 (n: i64) {
+  one = i64.const 1
+  n1 = i64.sub n one
+  csp = i64.const 65624
+  i64.store csp n1
+  forty = i64.const 40
+  off = i64.mul n1 forty
+  base = i64.const 68608
+  e = i64.add base off
+  return e
+  }
+block 2 () {
+  z = i64.const 0
+  return z
+  }
+}
+
+; 51 parse_effect(): `( a b -- c )` after the word's name → DEF_NIN / DEF_NOUT.
+func () -> () {
+block 0 () {
+  len = call 33 ()
+  one = i64.const 1
+  is1 = i64.eq len one
+  br_if is1 1() 10()
+  }
+block 1 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  ch = i64.load8_u t
+  lp = i64.const 40
+  open = i64.eq ch lp
+  z = i64.const 0
+  br_if open 2(z) 10()
+  }
+block 2 (ni: i64) {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  br_if none 10() 3(ni, len)
+  }
+block 3 (ni: i64, len: i64) {
+  two = i64.const 2
+  is2 = i64.eq len two
+  br_if is2 4(ni) 5(ni)
+  }
+block 4 (ni: i64) {
+  tp = i64.const 65680
+  t = i64.load tp
+  dd = i64.const 33024
+  two = i64.const 2
+  eq = call 37 (t, dd, two)
+  z = i64.const 0
+  hit = i64.ne eq z
+  br_if hit 6(ni, z) 5(ni)
+  }
+block 5 (ni: i64) {
+  one = i64.const 1
+  ni1 = i64.add ni one
+  br 2(ni1)
+  }
+block 6 (ni: i64, no: i64) {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  br_if none 10() 7(ni, no, len)
+  }
+block 7 (ni: i64, no: i64, len: i64) {
+  one = i64.const 1
+  is1 = i64.eq len one
+  tp = i64.const 65680
+  t = i64.load tp
+  ch = i64.load8_u t
+  rp = i64.const 41
+  close = i64.eq ch rp
+  done = i32.and is1 close
+  br_if done 9(ni, no) 8(ni, no)
+  }
+block 8 (ni: i64, no: i64) {
+  one = i64.const 1
+  no1 = i64.add no one
+  br 6(ni, no1)
+  }
+block 9 (ni: i64, no: i64) {
+  nip = i64.const 65648
+  i64.store nip ni
+  nop = i64.const 65656
+  i64.store nop no
+  return
+  }
+block 10 () {
+  m = i64.const 32944
+  n = i64.const 19
+  call 38 (m, n)
+  return
+  }
+}
+
+; 52 vs_params(n): the virtual stack becomes the open block's n params (values 0..n).
+func (i64) -> () {
+block 0 (n: i64) {
+  dp = i64.const 65576
+  i64.store dp n
+  z = i64.const 0
+  br 1(n, z)
+  }
+block 1 (n: i64, i: i64) {
+  done = i64.ge_s i n
+  br_if done 3() 2(n, i)
+  }
+block 2 (n: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  i64.store a i
+  one = i64.const 1
+  i1 = i64.add i one
+  br 1(n, i1)
+  }
+block 3 () {
+  return
+  }
+}
+
+; 53 do_string(): raw-scan `<sp>text"` from the input, copy the bytes to HERE (8-aligned),
+; leave (addr, len) in STR_PTR / STR_LEN.
+func () -> () {
+block 0 () {
+  pp = i64.const 65544
+  pos = i64.load pp
+  bp = i64.const 65752
+  base = i64.load bp
+  lp = i64.const 65552
+  len = i64.load lp
+  inb = i64.lt_s pos len
+  br_if inb 1(base, pos, len) 2(base, pos, len)
+  }
+block 1 (base: i64, pos: i64, len: i64) {
+  a = i64.add base pos
+  ch = i64.load8_u a
+  sp = i64.const 32
+  issp = i64.eq ch sp
+  one = i64.const 1
+  pos1 = i64.add pos one
+  br_if issp 2(base, pos1, len) 2(base, pos, len)
+  }
+block 2 (base: i64, start: i64, len: i64) {
+  br 3(base, start, len, start)
+  }
+block 3 (base: i64, start: i64, len: i64, pos: i64) {
+  atend = i64.ge_s pos len
+  br_if atend 5(base, start, pos) 4(base, start, len, pos)
+  }
+block 4 (base: i64, start: i64, len: i64, pos: i64) {
+  a = i64.add base pos
+  ch = i64.load8_u a
+  q = i64.const 34
+  isq = i64.eq ch q
+  one = i64.const 1
+  pos1 = i64.add pos one
+  br_if isq 5(base, start, pos) 3(base, start, len, pos1)
+  }
+block 5 (base: i64, start: i64, pos: i64) {
+  n = i64.sub pos start
+  hp = i64.const 65536
+  h = i64.load hp
+  src = i64.add base start
+  mem.copy h src n
+  seven = i64.const 7
+  n7 = i64.add n seven
+  m8 = i64.const -8
+  na = i64.and n7 m8
+  h1 = i64.add h na
+  i64.store hp h1
+  sp = i64.const 65768
+  i64.store sp h
+  sl = i64.const 65776
+  i64.store sl n
+  one = i64.const 1
+  pos1 = i64.add pos one
+  pp = i64.const 65544
+  i64.store pp pos1
+  return
+  }
+}
+
+; 54 strlen(p)
+func (i64) -> (i64) {
+block 0 (p: i64) {
+  z = i64.const 0
+  br 1(p, z)
+  }
+block 1 (p: i64, i: i64) {
+  a = i64.add p i
+  ch = i64.load8_u a
+  z = i64.const 0
+  end = i64.eq ch z
+  one = i64.const 1
+  i1 = i64.add i one
+  br_if end 2(i) 1(p, i1)
+  }
+block 2 (i: i64) {
+  return i
+  }
+}
+
+; 55 ab(b): append a byte to the closed-block arena.
+func (i64) -> () {
+block 0 (b: i64) {
+  lp = i64.const 65744
+  len = i64.load lp
+  base = i64.const 98304
+  a = i64.add base len
+  i64.store8 a b
+  one = i64.const 1
+  len1 = i64.add len one
+  i64.store lp len1
+  return
+  }
+}
+
+; 56 auleb(v): unsigned LEB128 into the arena.
+func (i64) -> () {
+block 0 (v: i64) {
+  br 1(v)
+  }
+block 1 (v: i64) {
+  m = i64.const 127
+  b7 = i64.and v m
+  seven = i64.const 7
+  rest = i64.shr_u v seven
+  z = i64.const 0
+  done = i64.eq rest z
+  br_if done 3(b7) 2(b7, rest)
+  }
+block 2 (b7: i64, rest: i64) {
+  hi = i64.const 128
+  b = i64.or b7 hi
+  call 55 (b)
+  br 1(rest)
+  }
+block 3 (b7: i64) {
+  call 55 (b7)
+  return
+  }
+}
+
+; 57 skip_line(): advance the input to (not past) the next newline.
+func () -> () {
+block 0 () {
+  pp = i64.const 65544
+  pos = i64.load pp
+  br 1(pos)
+  }
+block 1 (pos: i64) {
+  lp = i64.const 65552
+  len = i64.load lp
+  atend = i64.ge_s pos len
+  br_if atend 3(pos) 2(pos)
+  }
+block 2 (pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  a = i64.add base pos
+  ch = i64.load8_u a
+  nl = i64.const 10
+  isnl = i64.eq ch nl
+  one = i64.const 1
+  pos1 = i64.add pos one
+  br_if isnl 3(pos) 1(pos1)
+  }
+block 3 (pos: i64) {
+  pp = i64.const 65544
+  i64.store pp pos
+  return
+  }
+}
+
+; 58 skip_paren(): skip tokens through the one that ends with `)`.
+func () -> () {
+block 0 () {
+  br 1()
+  }
+block 1 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  br_if none 3() 2(len)
+  }
+block 2 (len: i64) {
+  tp = i64.const 65680
+  t = i64.load tp
+  one = i64.const 1
+  l1 = i64.sub len one
+  a = i64.add t l1
+  ch = i64.load8_u a
+  rp = i64.const 41
+  close = i64.eq ch rp
+  br_if close 3() 1()
+  }
+block 3 () {
+  return
+  }
+}
+
+; 59 emit_flag(x) -> c: an i32 `x != 0` for a branch condition.
+func (i64) -> (i64) {
+block 0 (x: i64) {
+  z = i64.const 0
+  zv = call 22 (z)
+  ne = i64.const 82
+  c = call 23 (ne, x, zv)
+  return c
+  }
+}
+
+; 60 is_newline() -> 1 if the current token is the newline token.
+func () -> (i64) {
+block 0 () {
+  tl = i64.const 65688
+  n = i64.load tl
+  one = i64.const 1
+  is1 = i64.eq n one
+  br_if is1 1() 2()
+  }
+block 1 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  ch = i64.load8_u t
+  nl = i64.const 10
+  isnl = i64.eq ch nl
+  r = i64.extend_i32_u isnl
+  return r
+  }
+block 2 () {
+  z = i64.const 0
+  return z
+  }
+}
+
+; 61 do_control(id): if(3) else(4) then(5) begin(6) until(7) again(8) while(9) repeat(10).
+; Control-stack entries: (kind, a, b, c, depth) — IF(1): a=else/join block;
+; ELSE(2): a=join, b=then-arm depth; BEGIN(3): a=header; WHILE(4): a=header, b=exit, c=exit depth.
+func (i64) -> () {
+block 0 (id: i64) {
+  three = i64.const 3
+  k = i64.sub id three
+  k32 = i32.wrap_i64 k
+  br_table k32 [1(), 3(), 6(), 13(), 14(), 19(), 23(), 27()] 31()
+  }
+; ---- if ----
+block 1 () {
+  x = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 31() 2(x)
+  }
+block 2 (x: i64) {
+  c = call 59 (x)
+  t = call 13 ()
+  e = call 13 ()
+  dp = i64.const 65576
+  d = i64.load dp
+  call 17 (c, t, e)
+  call 14 (t, d)
+  call 52 (d)
+  one = i64.const 1
+  z = i64.const 0
+  call 49 (one, e, z, z, d)
+  return
+  }
+; ---- else ----
+block 3 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 4(e)
+  }
+block 4 (e: i64) {
+  kind = i64.load e
+  one = i64.const 1
+  isif = i64.eq kind one
+  br_if isif 5(e) 32()
+  }
+block 5 (e: i64) {
+  eblk = i64.load e offset=8
+  d = i64.load e offset=32
+  j = call 13 ()
+  dp = i64.const 65576
+  d1 = i64.load dp
+  call 16 (j)
+  call 14 (eblk, d)
+  call 52 (d)
+  two = i64.const 2
+  z = i64.const 0
+  call 49 (two, j, d1, z, d)
+  return
+  }
+; ---- then ----
+block 6 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 7(e)
+  }
+block 7 (e: i64) {
+  kind = i64.load e
+  one = i64.const 1
+  two = i64.const 2
+  isif = i64.eq kind one
+  iselse = i64.eq kind two
+  br_if isif 8(e) 9(e, iselse)
+  }
+block 8 (e: i64) {
+  blk = i64.load e offset=8
+  d = i64.load e offset=32
+  br 11(blk, d)
+  }
+block 9 (e: i64, iselse: i32) {
+  br_if iselse 10(e) 32()
+  }
+block 10 (e: i64) {
+  blk = i64.load e offset=8
+  d = i64.load e offset=16
+  br 11(blk, d)
+  }
+block 11 (blk: i64, d: i64) {
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur d
+  br_if same 12(blk, d) 33()
+  }
+block 12 (blk: i64, d: i64) {
+  call 16 (blk)
+  call 14 (blk, d)
+  call 52 (d)
+  return
+  }
+; ---- begin ----
+block 13 () {
+  h = call 13 ()
+  dp = i64.const 65576
+  d = i64.load dp
+  call 16 (h)
+  call 14 (h, d)
+  call 52 (d)
+  three = i64.const 3
+  z = i64.const 0
+  call 49 (three, h, z, z, d)
+  return
+  }
+; ---- until ----
+block 14 () {
+  x = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 31() 15(x)
+  }
+block 15 (x: i64) {
+  c = call 59 (x)
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 16(e, c)
+  }
+block 16 (e: i64, c: i64) {
+  kind = i64.load e
+  three = i64.const 3
+  ok = i64.eq kind three
+  br_if ok 17(e, c) 32()
+  }
+block 17 (e: i64, c: i64) {
+  h = i64.load e offset=8
+  d = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur d
+  br_if same 18(h, d, c) 33()
+  }
+block 18 (h: i64, d: i64, c: i64) {
+  x = call 13 ()
+  call 17 (c, x, h)
+  call 14 (x, d)
+  call 52 (d)
+  return
+  }
+; ---- again ----
+block 19 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 20(e)
+  }
+block 20 (e: i64) {
+  kind = i64.load e
+  three = i64.const 3
+  ok = i64.eq kind three
+  br_if ok 21(e) 32()
+  }
+block 21 (e: i64) {
+  h = i64.load e offset=8
+  d = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur d
+  br_if same 22(h, d) 33()
+  }
+block 22 (h: i64, d: i64) {
+  call 16 (h)
+  x = call 13 ()
+  call 14 (x, d)
+  call 52 (d)
+  ddp = i64.const 65672
+  one = i64.const 1
+  i64.store ddp one
+  return
+  }
+; ---- while ----
+block 23 () {
+  x = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 31() 24(x)
+  }
+block 24 (x: i64) {
+  c = call 59 (x)
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 25(e, c)
+  }
+block 25 (e: i64, c: i64) {
+  kind = i64.load e
+  three = i64.const 3
+  ok = i64.eq kind three
+  br_if ok 26(e, c) 32()
+  }
+block 26 (e: i64, c: i64) {
+  h = i64.load e offset=8
+  dh = i64.load e offset=32
+  b = call 13 ()
+  x = call 13 ()
+  dp = i64.const 65576
+  dx = i64.load dp
+  call 17 (c, b, x)
+  call 14 (b, dx)
+  call 52 (dx)
+  four = i64.const 4
+  call 49 (four, h, x, dx, dh)
+  return
+  }
+; ---- repeat ----
+block 27 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 32() 28(e)
+  }
+block 28 (e: i64) {
+  kind = i64.load e
+  four = i64.const 4
+  ok = i64.eq kind four
+  br_if ok 29(e) 32()
+  }
+block 29 (e: i64) {
+  h = i64.load e offset=8
+  x = i64.load e offset=16
+  dx = i64.load e offset=24
+  dh = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur dh
+  br_if same 30(h, x, dx) 33()
+  }
+block 30 (h: i64, x: i64, dx: i64) {
+  call 16 (h)
+  call 14 (x, dx)
+  call 52 (dx)
+  return
+  }
+block 31 () {
+  return
+  }
+block 32 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+block 33 () {
+  m = i64.const 32864
+  n = i64.const 21
+  call 38 (m, n)
+  return
+  }
+}
+
+; 62 do_shuffle(id): dup(11) drop(12) swap(13) over(14) rot(15) nip(16) tuck(17) — pure
+; virtual-stack permutations; nothing is emitted.
+func (i64) -> () {
+block 0 (id: i64) {
+  eleven = i64.const 11
+  k = i64.sub id eleven
+  k32 = i32.wrap_i64 k
+  br_table k32 [1(), 3(), 4(), 6(), 8(), 10(), 12()] 14()
+  }
+block 1 () {
+  one = i64.const 1
+  call 11 (one)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 2()
+  }
+block 2 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  one = i64.const 1
+  d1 = i64.sub d one
+  eight = i64.const 8
+  off = i64.mul d1 eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+block 3 () {
+  v = call 12 ()
+  return
+  }
+block 4 () {
+  two = i64.const 2
+  call 11 (two)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 5()
+  }
+block 5 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  eight = i64.const 8
+  base = i64.const 66560
+  one = i64.const 1
+  two = i64.const 2
+  d1 = i64.sub d one
+  d2 = i64.sub d two
+  o1 = i64.mul d1 eight
+  o2 = i64.mul d2 eight
+  a1 = i64.add base o1
+  a2 = i64.add base o2
+  v1 = i64.load a1
+  v2 = i64.load a2
+  i64.store a1 v2
+  i64.store a2 v1
+  return
+  }
+block 6 () {
+  two = i64.const 2
+  call 11 (two)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 7()
+  }
+block 7 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  two = i64.const 2
+  d2 = i64.sub d two
+  eight = i64.const 8
+  off = i64.mul d2 eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+block 8 () {
+  three = i64.const 3
+  call 11 (three)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 9()
+  }
+block 9 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  eight = i64.const 8
+  base = i64.const 66560
+  one = i64.const 1
+  two = i64.const 2
+  three = i64.const 3
+  d1 = i64.sub d one
+  d2 = i64.sub d two
+  d3 = i64.sub d three
+  a1 = i64.add base d1
+  o1 = i64.mul d1 eight
+  o2 = i64.mul d2 eight
+  o3 = i64.mul d3 eight
+  p1 = i64.add base o1
+  p2 = i64.add base o2
+  p3 = i64.add base o3
+  va = i64.load p3
+  vb = i64.load p2
+  vc = i64.load p1
+  i64.store p3 vb
+  i64.store p2 vc
+  i64.store p1 va
+  return
+  }
+block 10 () {
+  two = i64.const 2
+  call 11 (two)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 11()
+  }
+block 11 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  eight = i64.const 8
+  base = i64.const 66560
+  one = i64.const 1
+  two = i64.const 2
+  d1 = i64.sub d one
+  d2 = i64.sub d two
+  o1 = i64.mul d1 eight
+  o2 = i64.mul d2 eight
+  p1 = i64.add base o1
+  p2 = i64.add base o2
+  v = i64.load p1
+  i64.store p2 v
+  i64.store dp d1
+  return
+  }
+block 12 () {
+  two = i64.const 2
+  call 11 (two)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 14() 13()
+  }
+block 13 () {
+  dp = i64.const 65576
+  d = i64.load dp
+  eight = i64.const 8
+  base = i64.const 66560
+  one = i64.const 1
+  two = i64.const 2
+  d1 = i64.sub d one
+  d2 = i64.sub d two
+  o1 = i64.mul d1 eight
+  o2 = i64.mul d2 eight
+  p1 = i64.add base o1
+  p2 = i64.add base o2
+  va = i64.load p2
+  vb = i64.load p1
+  i64.store p2 vb
+  i64.store p1 va
+  call 10 (vb)
+  return
+  }
+block 14 () {
+  return
+  }
+}
+
+; 63 do_fiber(id): task(25) `( xt -- f )` = cont.new; resume(26) `( f x -- status y )` =
+; cont.resume; yield(27) `( x -- y )` = suspend. A task body is any word `( x -- y )`: the fiber
+; entry is always the module-0 trampoline (func 66) with the word's xt riding in the `sp` slot, so
+; every engine resolves the entry through the primary table (the bytecode engine cannot yet start
+; a fiber directly on an installed-unit function).
+func (i64) -> () {
+block 0 (id: i64) {
+  c25 = i64.const 25
+  k = i64.sub id c25
+  k32 = i32.wrap_i64 k
+  br_table k32 [1(), 3(), 5()] 7()
+  }
+block 1 () {
+  x = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 7() 2(x)
+  }
+block 2 (x: i64) {
+  c16 = i64.const 16
+  call 6 (c16)
+  tramp = i64.const 66
+  call 8 (tramp)
+  cip0 = i64.const 65616
+  n0 = i64.load cip0
+  one0 = i64.const 1
+  n01 = i64.add n0 one0
+  i64.store cip0 n01
+  f = call 9 ()
+  op = i64.const 202
+  call 6 (op)
+  call 7 (f)
+  call 7 (x)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  h = call 9 ()
+  call 10 (h)
+  return
+  }
+block 3 () {
+  two = i64.const 2
+  call 11 (two)
+  x = call 12 ()
+  f = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 7() 4(x, f)
+  }
+block 4 (x: i64, f: i64) {
+  op = i64.const 203
+  call 6 (op)
+  call 7 (f)
+  call 7 (x)
+  z = i64.const 0
+  call 6 (z)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  s = call 9 ()
+  y = call 9 ()
+  ext = i64.const 97
+  se = call 27 (ext, s)
+  call 10 (se)
+  call 10 (y)
+  return
+  }
+block 5 () {
+  x = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 7() 6(x)
+  }
+block 6 (x: i64) {
+  op = i64.const 204
+  call 6 (op)
+  call 7 (x)
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  y = call 9 ()
+  call 10 (y)
+  return
+  }
+block 7 () {
+  return
+  }
+}
+
+; 64 do_defining(id): variable(22) create(23) here(24).
+func (i64) -> () {
+block 0 (id: i64) {
+  c22 = i64.const 22
+  k = i64.sub id c22
+  k32 = i32.wrap_i64 k
+  br_table k32 [1(), 3(), 6()] 7()
+  }
+block 1 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 8() 2()
+  }
+block 2 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  z = i64.const 0
+  i64.store h z
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  br 5(h)
+  }
+block 3 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 8() 4()
+  }
+block 4 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  br 5(h)
+  }
+block 5 (addr: i64) {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  six = i64.const 6
+  z = i64.const 0
+  one = i64.const 1
+  call 35 (t, n, six, z, one, addr)
+  return
+  }
+block 6 () {
+  hp = i64.const 65536
+  a = call 22 (hp)
+  ld = i64.const 241
+  v = call 24 (ld, a)
+  call 10 (v)
+  return
+  }
+block 7 () {
+  return
+  }
+block 8 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+}
+
+; 65 next_num() -> ok: read a token and parse it as a number into NUM.
+func () -> (i64) {
+block 0 () {
+  len = call 33 ()
+  tp = i64.const 65680
+  t = i64.load tp
+  ok = call 36 (t, len)
+  return ok
+  }
+}
+
+; 66 tramp(xt, x) -> y: the fiber/thread entry `(i64 sp, i64 arg) -> i64` — the word's xt rides in
+; the `sp` slot (no word uses a data stack), so `task`/`spawn` bodies are plain `( x -- y )` words.
+func (i64, i64) -> (i64) {
+block 0 (xt: i64, x: i64) {
+  f = i32.wrap_i64 xt
+  y = call.dyn (i64) -> (i64) f (x)
+  return y
+  }
+}
+
+; 67 spawn(xt, x) -> t: run word `xt` on a new vCPU (§12 `thread.spawn`) with `x`.
+func (i64, i64) -> (i64) {
+block 0 (xt: i64, x: i64) {
+  h = thread.spawn 66 xt x
+  t = i64.extend_i32_u h
+  return t
+  }
+}
+
+; 68 join(t) -> y
+func (i64) -> (i64) {
+block 0 (t: i64) {
+  h = i32.wrap_i64 t
+  y = thread.join h
+  return y
+  }
+}
+
+; 69 wait(addr, expected) -> status: futex wait with no timeout.
+func (i64, i64) -> (i64) {
+block 0 (addr: i64, exp: i64) {
+  forever = i64.const -1
+  s = i64.atomic.wait addr exp forever
+  r = i64.extend_i32_u s
+  return r
+  }
+}
+
+; 70 notify(addr, n) -> woken
+func (i64, i64) -> (i64) {
+block 0 (addr: i64, n: i64) {
+  c = i32.wrap_i64 n
+  w = atomic.notify addr c
+  r = i64.extend_i32_u w
+  return r
+  }
+}
