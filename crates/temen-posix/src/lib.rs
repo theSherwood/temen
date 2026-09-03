@@ -3651,18 +3651,21 @@ impl Ctx<'_> {
     /// job-control-aware guest what happened).
     fn tty_background_check(&mut self, sig: i32) {
         if self.p.pgid != self.w.fg_pgid {
-            // #1198 — a background WRITE only stops when the terminal has `TOSTOP` set (POSIX). bash
-            // leaves TOSTOP off by default, so `cmd &` output must proceed. Before the cooperative
-            // engine enforced stops this was invisible (a SIGTTOU-"stopped" writer kept running under
-            // the missing per-op stop poll); now that a stopped domain is really benched at its syscall
-            // boundary, an unconditional SIGTTOU stop would freeze every writing `cmd &` (`seq 3 &`
-            // stalls after its first line). A background READ (SIGTTIN) is unconditional — it always stops.
+            // #1198 — a background WRITE to a real (termios) terminal only stops when its `TOSTOP`
+            // lflag is set (POSIX). bash leaves TOSTOP off by default, so `cmd &` output must proceed.
+            // Before the cooperative engine enforced stops this was invisible (a SIGTTOU-"stopped"
+            // writer kept running under the missing per-op stop poll); now that a stopped domain is
+            // really benched at its syscall boundary, an unconditional SIGTTOU stop would freeze every
+            // writing `cmd &` (`seq 3 &` stalls after its first line). Gated on a termios terminal being
+            // present: the proto-terminal (fg_pgid only, no termios — the native fork/fixture tests) has
+            // no TOSTOP and keeps its L0 doorbell. A background READ (SIGTTIN) is never gated — it
+            // always stops.
             if sig == SIGTTOU
                 && self
                     .w
                     .terminal
                     .as_ref()
-                    .is_none_or(|t| t.lflag & TOSTOP == 0)
+                    .is_some_and(|t| t.lflag & TOSTOP == 0)
             {
                 return;
             }
@@ -5194,7 +5197,8 @@ mod tests {
     /// #798 slice 1 — the proto-terminal: `tcgetpgrp`/`tcsetpgrp` on stdio fds (`-ENOTTY` on a
     /// file), foreground validation (`-EINVAL` non-positive, `-EPERM` for an unoccupied group),
     /// and the background doorbells — a background write rings `SIGTTOU`, a background read rings
-    /// `SIGTTIN` (both proceed — the L0 approximation), and a foreground process rings nothing.
+    /// `SIGTTIN` (both proceed — the L0 approximation; this is the proto-terminal with no termios, so
+    /// the #1198 TOSTOP gate does not apply), and a foreground process rings nothing.
     #[test]
     fn the_proto_terminal_foreground_group_gates_with_ttou_ttin_doorbells() {
         let mut host = Host::new();
@@ -5237,6 +5241,8 @@ mod tests {
             1,
             "foreground group unchanged by setpgid"
         );
+        // Proto-terminal (no termios): a background write rings caught SIGTTOU (the L0 doorbell — the
+        // #1198 TOSTOP gate applies only to a real termios terminal), a background read rings SIGTTIN.
         assert_eq!(
             st.write(&[1, 0, 2], Some(&mut mem)).unwrap()[0],
             2,

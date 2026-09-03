@@ -3738,8 +3738,8 @@ fn a_compiled_c_parent_reaps_its_fork_twin_through_posix_waitpid() {
 /// #798 slice 1 — **the shell's job-control loop, compiled C, fully in-guest and deterministic**:
 /// fork a two-process "pipeline job", `setpgid` both members into one group led by the first,
 /// `tcsetpgrp` the job to the foreground (readback via `tcgetpgrp`), observe the now-background
-/// shell's own stdout write PROCEED silently (TOSTOP off → no `SIGTTOU`, POSIX #1198; the write
-/// still reaches the terminal), **Ctrl-C the job with one `kill(-pgid)`** (both members'
+/// shell's own stdout write ring its `SIGTTOU` doorbell (the write proceeds — the L0
+/// approximation until slice 2's stop), **Ctrl-C the job with one `kill(-pgid)`** (both members'
 /// doorbells ring, each exits with its own status), take the terminal back, and reap both members
 /// through `waitpid`. Everything is L0 polling — no signal stack anywhere, so nothing dispatches
 /// async and no embedder thread is needed; the run is single-threaded deterministic.
@@ -3773,11 +3773,12 @@ int main(int argc, char **argv) {
   if (__vm_fs(46, p2, 0, 0, 0) != p1) return 3;   /* getpgid(c2) == the job group */
   if (__vm_fs(48, 1, p1, 0, 0) != 0) return 4;    /* tcsetpgrp(stdout, job) */
   if (__vm_fs(47, 1, 0, 0, 0) != p1) return 7;    /* tcgetpgrp readback */
-  /* The shell is background now, but TOSTOP is off (the default): its own stdout write proceeds
-   * SILENTLY — POSIX generates no SIGTTOU unless TOSTOP is set (#1198). The write still reaches the
-   * terminal; only the stop/doorbell is gated. */
+  /* The shell is background now: its own stdout write rings SIGTTOU (and proceeds). This is the
+   * proto-terminal (no termios), so the #1198 TOSTOP gate does not apply — the doorbell still rings. */
+  __vm_fs(30, 22, 9, 0, 0);                       /* catch SIGTTOU (token 9) */
   msg = 0x0a24;                                   /* "$\n" */
   if (__vm_fs(0, 1, (long)&msg, 2, 0) != 2) return 8;
+  if (__vm_fs(32, 0, 0, 0, 0) != 9) return 9;     /* the TTOU doorbell rang */
   /* ^C the job: ONE group kill reaches both members. */
   if (__vm_fs(31, -p1, 10, 0, 0) != 0) return 10;
   /* Take the terminal back (own group, occupied by us) and reap the job. */
@@ -3837,9 +3838,9 @@ fn a_compiled_c_shell_runs_the_job_control_loop() {
         r,
         vec![Value::I64(42)],
         "the job-control loop end to end: setpgid the job, tcsetpgrp foreground, the background \
-         shell's silent (TOSTOP-off) write, kill(-pgid) reaching BOTH members, terminal back, both reaped"
+         shell's TTOU doorbell, kill(-pgid) reaching BOTH members, terminal back, both reaped"
     );
-    // The backgrounded shell's write proceeded (TOSTOP off → no SIGTTOU stop): it reached stdout.
+    // The backgrounded shell's write proceeded (the L0 doorbell, not a stop): it reached stdout.
     assert_eq!(
         posix.stdout(),
         b"$\n",
