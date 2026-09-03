@@ -17,7 +17,7 @@
 //! nif parse, the `Translator`, `String`/`Vec`/`HashMap`-driven TEMEN-text emission — is the real crate.
 //! Interpreter-run: the JIT declines this ~255-func build-std module (a backend gap, not a translation
 //! one — the module verifies), so this pins the tree-walker against the native oracle. Linux + the
-//! `rustc +1.81.0`/`rust-src`/`llvm-*-18` build-std toolchain gated; skips otherwise.
+//! `rustc`/`rust-src`/`llvm-*` build-std toolchain gated; skips otherwise.
 
 #![cfg(target_os = "linux")]
 
@@ -42,7 +42,7 @@ fn native_checksum() -> i32 {
 
 #[test]
 fn real_temen_leng_translator_runs_on_temen() {
-    let Some(ll) = common::build_fixture_bc_std("leng_probe") else {
+    let Some(ll) = common::build_fixture_bc("leng_probe") else {
         return; // build-std toolchain absent — helper already logged the skip
     };
 

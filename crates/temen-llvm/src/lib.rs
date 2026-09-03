@@ -342,7 +342,7 @@ fn decl_extern_sig(
 ) -> Option<temen_ir::FuncType> {
     let mut sp_params = vec![ValType::I64]; // the prepended data-SP
     for p in params {
-        sp_params.push(val_type(p.ty.as_ref()).ok()?);
+        sp_params.extend(param_vtypes(p.ty.as_ref()).ok()?);
     }
     let results = result_types(return_type, types).ok()?;
     Some(temen_ir::FuncType {
@@ -367,7 +367,7 @@ fn extern_stub_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<temen_ir::
     };
     let mut params = vec![ValType::I64]; // the prepended data-SP
     for p in param_types {
-        params.push(val_type(p.as_ref())?);
+        params.extend(param_vtypes(p.as_ref())?);
     }
     let results = result_types(result_type.as_ref(), types)?;
     Ok(temen_ir::FuncType { params, results })
@@ -586,7 +586,8 @@ fn translate_impl(
     let need_ldexp =
         calls_external(m, &defined_names, "ldexp") || calls_external(m, &defined_names, "scalbn");
     let need_pow = calls_external(m, &defined_names, "pow");
-    let need_fmod = calls_external(m, &defined_names, "fmod");
+    // `frem` (clang ≥22 folds `fmod(x, C)` into the instruction) lowers to the same helper.
+    let need_fmod = calls_external(m, &defined_names, "fmod") || uses_frem(m);
     let need_frexp = calls_external(m, &defined_names, "frexp");
     let need_strtod = calls_external(m, &defined_names, "strtod");
     let need_localeconv = calls_external(m, &defined_names, "localeconv");
@@ -679,8 +680,9 @@ fn translate_impl(
         let params: Option<Vec<ValType>> = f
             .parameters
             .iter()
-            .map(|p| val_type(p.ty.as_ref()).ok())
-            .collect();
+            .map(|p| param_vtypes(p.ty.as_ref()).ok())
+            .collect::<Option<Vec<_>>>()
+            .map(|v| v.concat());
         if let Some(params) = params {
             def_sigs.insert(f.name.clone(), (params, f.is_var_arg));
         }
@@ -2192,6 +2194,31 @@ fn val_type(ty: &Type) -> Result<ValType, Error> {
     }
 }
 
+/// `Some([i64, i64])` for a 65..=128-bit integer type — held everywhere as a `(lo, hi)` pair in the
+/// `agg` side-table (the unified i128 representation) — else `None`.
+fn i128_pair(ty: &Type) -> Option<Vec<ValType>> {
+    matches!(ty, Type::IntegerType { bits } if (65..=128).contains(bits))
+        .then(|| vec![ValType::I64, ValType::I64])
+}
+
+/// The Temen **signature slots** of one LLVM parameter/argument type. An `i128` takes two `i64`
+/// slots `(lo, hi)` — the pair it is held as ([`i128_pair`]), and exactly the `(i64, i64)` coercion
+/// clang ≤21 applied itself on x86-64; LLVM 22's clang passes `__int128` params/returns as a bare
+/// `i128`, so the on-ramp now does the split (the ABI a caller sees is unchanged). Anything else is
+/// its one scalar type.
+fn param_vtypes(ty: &Type) -> Result<Vec<ValType>, Error> {
+    match i128_pair(ty) {
+        Some(pair) => Ok(pair),
+        None => Ok(vec![val_type(ty)?]),
+    }
+}
+
+/// The field types of a value held **field-wise** in the `agg` side-table: a flat struct's fields
+/// ([`struct_field_vtypes`]) or an i128's `(lo, hi)` pair. `None` for a scalar.
+fn agg_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, Error>> {
+    struct_field_vtypes(ty, types).or_else(|| i128_pair(ty).map(Ok))
+}
+
 /// The lane type of a **2-lane 32-bit vector** (`<2 x float>` or `<2 x i32>`) — the only vectors the
 /// on-ramp scalarizes (packed into an `i64`, lane 0 low). `None` for any other vector.
 fn vec2_lane_ty(ty: &Type) -> Option<ValType> {
@@ -2341,7 +2368,8 @@ fn struct_field_vtypes(ty: &Type, types: &Types) -> Option<Result<Vec<ValType>, 
 fn result_types(ty: &Type, types: &Types) -> Result<Vec<ValType>, Error> {
     match ty {
         Type::VoidType => Ok(Vec::new()),
-        _ => match struct_field_vtypes(ty, types) {
+        // (An `i128` return is the `(lo, hi)` pair — two results, like a `{i64, i64}` struct.)
+        _ => match agg_vtypes(ty, types) {
             Some(fields) => fields,
             None => Ok(vec![val_type(ty)?]),
         },
@@ -2711,7 +2739,7 @@ fn translate_func(
     // is threaded as block-local index 0 of every block; a call passes `sp + frame_size`.
     let mut params: Vec<ValType> = vec![ValType::I64];
     for p in &f.parameters {
-        params.push(val_type(&p.ty)?);
+        params.extend(param_vtypes(&p.ty)?);
     }
     // A small by-value struct return flattens to a multi-result signature (§3a).
     let results = result_types(f.return_type.as_ref(), types)?;
@@ -2971,7 +2999,15 @@ fn scan_func(f: &Function, types: &Types) -> Result<Scan, Error> {
     for p in &f.parameters {
         let id = s.ty.len();
         s.name2id.insert(p.name.clone(), id);
-        s.ty.push(val_type(&p.ty)?);
+        // An i128 parameter arrives as two i64 slots (`param_vtypes`) and is held as its `(lo, hi)`
+        // pair — the `agg_layout` fan-out the entry block's params get exactly like any other edge.
+        match i128_pair(&p.ty) {
+            Some(pair) => {
+                s.agg_layout.insert(id, pair);
+                s.ty.push(ValType::I64);
+            }
+            None => s.ty.push(val_type(&p.ty)?),
+        }
         s.def_block.push(0);
     }
     for (bi, bb) in f.basic_blocks.iter().enumerate() {
@@ -3199,6 +3235,7 @@ fn local_uses(instr: &Instruction) -> Result<Vec<Name>, Error> {
         I::FSub(x) => locals(&[&x.operand0, &x.operand1]),
         I::FMul(x) => locals(&[&x.operand0, &x.operand1]),
         I::FDiv(x) => locals(&[&x.operand0, &x.operand1]),
+        I::FRem(x) => locals(&[&x.operand0, &x.operand1]),
         I::FCmp(x) => locals(&[&x.operand0, &x.operand1]),
         I::FNeg(x) => locals(&[&x.operand]),
         I::FPToSI(x) => locals(&[&x.operand]),
@@ -3269,7 +3306,7 @@ fn indirect_sig(c: &crate::ll::ast::Call, types: &Types) -> Result<temen_ir::Fun
         } => {
             let mut params = vec![ValType::I64]; // the prepended data-SP
             for p in param_types {
-                params.push(val_type(p.as_ref())?);
+                params.extend(param_vtypes(p.as_ref())?);
             }
             let results = result_types(result_type.as_ref(), types)?;
             Ok(temen_ir::FuncType { params, results })
@@ -5088,6 +5125,14 @@ struct Helpers {
 }
 
 /// Does the module call an external (not guest-defined) function with name `n`?
+/// Does the module contain a scalar `frem` (→ the synthesized `__temen_fmod` helper)?
+fn uses_frem(m: &LModule) -> bool {
+    m.functions
+        .iter()
+        .flat_map(|f| &f.basic_blocks)
+        .any(|bb| bb.instrs.iter().any(|i| matches!(i, Instruction::FRem(_))))
+}
+
 /// Does the module use a **narrow** (i8/i16) atomic that needs the CAS-loop helpers — an `atomicrmw`,
 /// a `cmpxchg`, or an atomic `store` on an i8/i16? (A narrow atomic *load* is emulated inline, so it
 /// doesn't pull in a helper.) Wide (i32/i64) atomics lower directly and need no helper.
@@ -5185,7 +5230,8 @@ fn scan_eh(m: &LModule) -> (bool, HashMap<String, u32>, Vec<String>) {
                                 }
                             }
                         }
-                        Some("llvm.eh.typeid.for") => {
+                        // LLVM ≥19 spells the intrinsic overloaded (`llvm.eh.typeid.for.p0`).
+                        Some("llvm.eh.typeid.for" | "llvm.eh.typeid.for.p0") => {
                             uses = true;
                             if let Some((op, _)) = c.arguments.first() {
                                 intern(op, &mut ids);
@@ -14136,26 +14182,44 @@ fn lower_int_intrinsic(
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(32);
         let args: Vec<&Operand> = c.arguments.iter().map(|(a, _)| a).collect();
-        let opnd_ty = int_ty(val_type(args[0].get_type(types).as_ref())?)?;
-        let a = ctx.operand(args[0])?;
-        let b = ctx.operand(args[1])?;
-        let (gtop, ltop) = if signed {
-            (CmpOp::GtS, CmpOp::LtS)
+        let opnd_ty = args[0].get_type(types);
+        let (gt, lt) = if let Some(pair) = i128_pair(opnd_ty.as_ref()) {
+            // An i128 three-way compare (Postgres's `int128` interval math, clang ≥22) — the two
+            // orderings on the `(lo, hi)` pairs, exactly as an `icmp i128` lowers.
+            let pa = ctx.agg_operand(args[0], &pair)?;
+            let pb = ctx.agg_operand(args[1], &pair)?;
+            let (gtp, ltp) = if signed {
+                (IntPredicate::SGT, IntPredicate::SLT)
+            } else {
+                (IntPredicate::UGT, IntPredicate::ULT)
+            };
+            (
+                i128_icmp(ctx, gtp, pa[0], pa[1], pb[0], pb[1]),
+                i128_icmp(ctx, ltp, pa[0], pa[1], pb[0], pb[1]),
+            )
         } else {
-            (CmpOp::GtU, CmpOp::LtU)
+            let opnd_ty = int_ty(val_type(opnd_ty.as_ref())?)?;
+            let a = ctx.operand(args[0])?;
+            let b = ctx.operand(args[1])?;
+            let (gtop, ltop) = if signed {
+                (CmpOp::GtS, CmpOp::LtS)
+            } else {
+                (CmpOp::GtU, CmpOp::LtU)
+            };
+            let gt = ctx.push(Inst::IntCmp {
+                ty: opnd_ty,
+                op: gtop,
+                a,
+                b,
+            });
+            let lt = ctx.push(Inst::IntCmp {
+                ty: opnd_ty,
+                op: ltop,
+                a,
+                b,
+            });
+            (gt, lt)
         };
-        let gt = ctx.push(Inst::IntCmp {
-            ty: opnd_ty,
-            op: gtop,
-            a,
-            b,
-        });
-        let lt = ctx.push(Inst::IntCmp {
-            ty: opnd_ty,
-            op: ltop,
-            a,
-            b,
-        });
         let sub = ctx.push(Inst::IntBin {
             ty: IntTy::I32,
             op: BinOp::Sub,
@@ -15623,6 +15687,10 @@ fn is_droppable_call(c: &crate::ll::ast::Call) -> bool {
             || s.starts_with("llvm.va_end")
             // Alias-analysis metadata hints (no runtime effect) — e.g. clang's `restrict` scopes.
             || s.starts_with("llvm.experimental.noalias.scope.decl")
+            // `llvm.fake.use` (LLVM ≥20, `-Og`/`-fextend-variable-liveness`): keeps a source variable's
+            // value alive to the end of its scope so a debugger can still read it. A pure liveness
+            // marker, like `llvm.lifetime.*` — no runtime effect, so it lowers to nothing.
+            || s.starts_with("llvm.fake.use")
             // `core::hint::spin_loop()` → the x86 `pause` hint, emitted by the threaded-`std` futex
             // spin loops (Mutex/RwLock/Once). It is a CPU backoff hint with no architectural effect,
             // so dropping it is semantics-preserving (the cooperative scheduler makes progress the
@@ -15752,6 +15820,22 @@ fn lower_frameaddress(
         a: base,
         b: sp,
     })))
+}
+
+/// The libm function an LLVM float math intrinsic stands for: `llvm.log.f64` → `log`,
+/// `llvm.exp2.f32` → `exp2f`. Only the plain `<name>.f32|f64` shape (the transcendental family);
+/// anything else — other suffixes, vector types, non-`llvm.` names — is `None`.
+fn libm_intrinsic_target(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("llvm.")?;
+    let (base, ty) = rest.rsplit_once('.')?;
+    if base.contains('.') || !base.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    match ty {
+        "f64" => Some(base.to_string()),
+        "f32" => Some(format!("{base}f")),
+        _ => None,
+    }
 }
 
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
@@ -15951,7 +16035,8 @@ fn lower_eh_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Re
             });
             Ok(true)
         }
-        "llvm.eh.typeid.for" => {
+        // LLVM ≥19 spells the intrinsic overloaded on the pointer type (`llvm.eh.typeid.for.p0`).
+        "llvm.eh.typeid.for" | "llvm.eh.typeid.for.p0" => {
             // Subtype-aware selector match (the Itanium personality's `__do_catch`). clang compares the
             // landing-pad selector — the *thrown* type's id — against this value with `icmp eq` to pick
             // a catch clause. Return the live selector when the thrown type *is-a* the clause type (so
@@ -16388,7 +16473,7 @@ impl<'a> BlockCtx<'a> {
             Operand::LocalOperand { .. } => self.agg_of(op).map(Ok),
             Operand::ConstantOperand(c) => {
                 let ty = c.get_type(self.types);
-                match struct_field_vtypes(ty.as_ref(), self.types) {
+                match agg_vtypes(ty.as_ref(), self.types) {
                     Some(Ok(ftys)) => Some(self.agg_operand(op, &ftys)),
                     Some(Err(e)) => Some(Err(e)),
                     None => None,
@@ -16907,6 +16992,27 @@ impl<'a> BlockCtx<'a> {
     /// param width when the call-site type drifted (empty-parens prototypes let each site invent
     /// its own). Integer widths zero-extend/wrap — deterministic where the native ABI leaves the
     /// upper bits as junk; a float/vector drift has no ABI story and fails closed.
+    /// Append one call argument's signature slot(s) to `args`: an i128 argument is its `(lo, hi)`
+    /// pair (two slots, matching [`param_vtypes`]), anything else one scalar coerced to the callee's
+    /// slot type `coerce_to[slot]`. Returns the next slot index.
+    fn push_call_arg(
+        &mut self,
+        args: &mut Vec<ValIdx>,
+        a: &Operand,
+        coerce_to: Option<&[ValType]>,
+        slot: usize,
+        types: &Types,
+    ) -> Result<usize, Error> {
+        if let Some(pair) = i128_pair(a.get_type(types).as_ref()) {
+            args.extend(self.agg_operand(a, &pair)?);
+            return Ok(slot + 2);
+        }
+        let v = self.operand(a)?;
+        let want = coerce_to.and_then(|p| p.get(slot)).copied();
+        args.push(self.coerce_arg(v, a, want, types)?);
+        Ok(slot + 1)
+    }
+
     fn coerce_arg(
         &mut self,
         v: ValIdx,
@@ -18609,6 +18715,18 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `synth_dispatcher`): the deposit is skipped here because the dispatcher owns ALL
         // marshaling (its default arm reproduces the strict varargs `call.dyn` exactly).
         let dispatcher = dispatch_key_for(c, types).and_then(|k| ctx.dispatch_map.get(&k).copied());
+        // The argument list in signature **slots** (an i128 argument is two, `param_vtypes`).
+        let arg_slots: usize = c
+            .arguments
+            .iter()
+            .map(|(a, _)| {
+                if i128_pair(a.get_type(types).as_ref()).is_some() {
+                    2
+                } else {
+                    1
+                }
+            })
+            .sum();
         let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = if dispatcher.is_some() {
             (None, None)
         } else {
@@ -18620,7 +18738,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                     (Some(params.len()), Some(params))
                 }
                 Some((params, false)) => {
-                    if params.len() != c.arguments.len() {
+                    if params.len() != arg_slots {
                         return unsup("call arity differs from a non-variadic definition");
                     }
                     (None, Some(params))
@@ -18636,6 +18754,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
         };
         if let Some(fixed) = fixed {
+            if arg_slots != c.arguments.len() {
+                return unsup("i128 argument to a variadic call");
+            }
             let scratch_off = *ctx.frame.get(&VARARG_SCRATCH).ok_or_else(|| {
                 Error::Unsupported("varargs call without reserved scratch".into())
             })?;
@@ -18671,10 +18792,9 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 args.push(ctx.coerce_arg(v, a, want, types)?);
             }
         } else {
-            for (i, (a, _attrs)) in c.arguments.iter().enumerate() {
-                let v = ctx.operand(a)?;
-                let want = coerce_to.as_ref().and_then(|p| p.get(i)).copied();
-                args.push(ctx.coerce_arg(v, a, want, types)?);
+            let mut slot = 0;
+            for (a, _attrs) in c.arguments.iter() {
+                slot = ctx.push_call_arg(&mut args, a, coerce_to.as_deref(), slot, types)?;
             }
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
@@ -18684,7 +18804,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
                 // Reaching here means every recognizer/synthesizer/capability declined `name` — it is a
                 // genuinely undefined external. Strict default: fail closed. With `stub_unresolved_externs`:
                 // mint (or reuse) a trap stub and call it, deferring the fail-closed to run time (§2a).
-                let func = match ctx.name2idx.get(&name) {
+                // A float math **intrinsic** no recognizer lowered (`llvm.log.f64`, `llvm.exp.f32`, …
+                // — clang ≥22 emits these where older clangs emitted the libcall) resolves to the
+                // guest-defined libm function of the same name when the program links one (Postgres
+                // bundles openlibm: `log`, `exp`, `pow`, `sin`, …; `f32` → the `…f` variant). Same
+                // signature, same `(sp, args…)` convention as any direct call.
+                let libm = libm_intrinsic_target(&name)
+                    .filter(|t| ctx.name2idx.contains_key(t))
+                    .unwrap_or_else(|| name.clone());
+                let func = match ctx.name2idx.get(&libm) {
                     Some(&idx) => idx,
                     None => match ctx.stubs {
                         Some(cell) => {
@@ -18750,7 +18878,7 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             Type::FuncType { result_type, .. } => result_type.clone(),
             other => return unsup(format!("call through non-function type {other}")),
         };
-        let agg_fields = match struct_field_vtypes(result_ty.as_ref(), types) {
+        let agg_fields = match agg_vtypes(result_ty.as_ref(), types) {
             Some(r) => Some(r?),
             None => None,
         };
@@ -19215,6 +19343,38 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         I::FSub(x) => fp_binop(ctx, &x.dest, FBinOp::Sub, &x.operand0, &x.operand1, types)?,
         I::FMul(x) => fp_binop(ctx, &x.dest, FBinOp::Mul, &x.operand0, &x.operand1, types)?,
         I::FDiv(x) => fp_binop(ctx, &x.dest, FBinOp::Div, &x.operand0, &x.operand1, types)?,
+        // `frem` (clang ≥22 folds a constant-divisor `fmod(x, C)` into it — Postgres's `dsind`): the
+        // synthesized `__temen_fmod` (f64, IEEE-exact). An f32 `frem` promotes through f64 — fmod is
+        // exact and its magnitude is below the divisor's, so the f32 result round-trips losslessly.
+        I::FRem(x) => {
+            let Some(f) = ctx.helpers.fmod else {
+                return unsup("frem without the fmod helper");
+            };
+            let ty = float_ty(val_type(x.operand0.get_type(types).as_ref())?)?;
+            let mut a = ctx.operand(&x.operand0)?;
+            let mut b = ctx.operand(&x.operand1)?;
+            if ty == FloatTy::F32 {
+                a = ctx.push(Inst::Cast {
+                    op: CastOp::Promote,
+                    a,
+                });
+                b = ctx.push(Inst::Cast {
+                    op: CastOp::Promote,
+                    a: b,
+                });
+            }
+            let mut r = ctx.push(Inst::Call {
+                func: f,
+                args: vec![a, b],
+            });
+            if ty == FloatTy::F32 {
+                r = ctx.push(Inst::Cast {
+                    op: CastOp::Demote,
+                    a: r,
+                });
+            }
+            (&x.dest, r)
+        }
         I::FNeg(x) => {
             let ty = fty(&x.operand)?;
             let a = ctx.operand(&x.operand)?;
@@ -21185,8 +21345,19 @@ fn vec_explode(
                 }));
             }
         }
+        // A tail lane is a narrow scalar in an i32 container whose high bits are unspecified (the
+        // same §3b hazard as a scalar `icmp` on a zext-loaded `i16`): canonically extend it for the
+        // consumer — sign-extended for a signed use, zero-extended otherwise. Without this, a signed
+        // lane compare against `splat (i16 -1)` (held as 65535) is wrong for every positive lane
+        // (clang ≥22's SLP-vectorized byte clamp in picojpeg's `pjpeg_decode_mcu`).
+        let w = layout.shape.lane_bytes() * 8;
         for t in 0..layout.tail_lanes {
-            out.push(parts[layout.full_chunks + t]);
+            let v = parts[layout.full_chunks + t];
+            out.push(if w < 32 {
+                emit_ext(ctx, v, w, 32, signed)
+            } else {
+                v
+            });
         }
         return Ok(out);
     }

@@ -4,12 +4,12 @@
 # (the build-pg-assets.mjs pattern): clang -O2 -emit-llvm → temen-llvm-translate → prep_temen gate,
 # then run on both engines via the generic example runner and byte-compare stdout+exit to native.
 #
-#   needs: clang-18 (or clang ≥18), cargo
+#   needs: clang, cargo
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 CACHE="${TEMEN_NIMONY_CACHE:-/tmp/temen_nimony_cache}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
+CLANG="${CLANG:-clang}"
 mkdir -p "$CACHE"
 SRC="$HERE/arc_probe.c"
 

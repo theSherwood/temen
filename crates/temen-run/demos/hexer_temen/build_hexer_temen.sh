@@ -10,15 +10,15 @@
 # `system` module's) to both native hexer and hexer-on-Temen and diff every file each produces.
 #
 #   needs: the nimony submodule, stock `nim` (2.3.x, C backend), the built `nimony` + `hexer` binaries
-#          (oracle + fixture generator), clang-18/llvm-18, cargo. Fail-soft SKIP if any is absent
+#          (oracle + fixture generator), clang/llvm, cargo. Fail-soft SKIP if any is absent
 #          (nimony bootstrap needs Nim 2.3.x devel — NOT in the per-PR CI, NIM.md §2).
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
 CACHE="${TEMEN_HEXER_CACHE:-/tmp/temen_hexer_build}"
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
-NM="${LLVM_NM:-llvm-nm-18}"; command -v "$NM" >/dev/null || NM=llvm-nm
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
+NM="${LLVM_NM:-llvm-nm}"
 HEXER_SRC="$REPO/nimony/src/hexer/hexer.nim"
 SHIM="$REPO/crates/temen-run/demos/nifler_temen/nifler_shim.c"   # the shared nimony-phase bottom edge
 mkdir -p "$CACHE"

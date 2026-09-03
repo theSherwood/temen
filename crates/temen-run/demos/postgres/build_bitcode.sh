@@ -3,7 +3,7 @@
 # Fetch → configure → native oracle → per-TU bitcode → llvm-link the exact `postgres` link set →
 # translate through the on-ramp. Fetched-not-vendored (PostgreSQL license). See README.md.
 #
-#   needs: clang-18, llvm-dis, llvm-link, flex, bison, perl, make, curl
+#   needs: clang, llvm-dis, llvm-link, flex, bison, perl, make, curl
 #   env:   TEMEN_PG_CACHE (default /tmp/temen_pg_cache), TEMEN_PG_VER (default 17.5)
 set -uo pipefail
 CACHE="${TEMEN_PG_CACHE:-/tmp/temen_pg_cache}"

@@ -96,7 +96,12 @@ fn from_slot(t: ValType, s: i64) -> Value {
 /// **both** backends with `args`; assert they agree and equal `expect`. Returns silently if clang
 /// is unavailable.
 fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
-    let Some(bc) = compile_to_ll(name, src) else {
+    check_flags(name, src, &[], args, expect);
+}
+
+/// [`check`] with extra clang flags.
+fn check_flags(name: &str, src: &str, flags: &[&str], args: &[Value], expect: &[Value]) {
+    let Some(bc) = compile_to_ll_flags(name, src, flags) else {
         return;
     };
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
@@ -130,7 +135,13 @@ fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
 /// code on **both** backends. The native compiler is the strongest oracle (the chibicc Tier-2
 /// pattern); `run` returns a byte so the full result survives the 8-bit Unix exit code.
 fn check_vs_native(name: &str, src: &str, seed: i32) {
-    let Some(bc) = compile_to_ll(name, src) else {
+    check_vs_native_flags(name, src, &[], seed);
+}
+
+/// [`check_vs_native`] with extra clang flags for the Temen-side compile (the native oracle build
+/// gets them too).
+fn check_vs_native_flags(name: &str, src: &str, flags: &[&str], seed: i32) {
+    let Some(bc) = compile_to_ll_flags(name, src, flags) else {
         return;
     };
     let exe =
@@ -138,6 +149,7 @@ fn check_vs_native(name: &str, src: &str, seed: i32) {
     let c = std::env::temp_dir().join(format!("temen_llvm_{}_{}.c", std::process::id(), name));
     // `-lm` so demos that call libm (`sqrt`/`floor`/…) link natively; harmless for the rest.
     match Command::new("cc")
+        .args(flags)
         .arg(&c)
         .arg("-lm")
         .arg("-o")
@@ -11075,6 +11087,150 @@ fn i128_param_and_return() {
     }
 }
 
+/// `-ffast-math` code: every float op carries fast-math flags — LLVM ≥20 prints them on the casts
+/// too (`fptrunc fast`, `fpext fast`, `sitofp fast`) and on `phi`/`select`, beside the binops,
+/// `fneg`, `fcmp`, and calls (openlibm inside the Postgres build is compiled this way). The flags are
+/// semantic license, not semantics: the reader skips them and the program computes the same value.
+#[test]
+fn fast_math_flags_on_every_float_op() {
+    let src = "double f(double a, double b, int n){\n\
+               \x20 float t = (float)a; double s = t + (double)n;\n\
+               \x20 for (int i = 0; i < n; i++) s = s * 1.5 + b;\n\
+               \x20 return s > b ? -s : s;\n\
+               }\n";
+    // t = 2, s = 2 + 3 = 5; ×3: 8.5, 13.75, 21.625 (all dyadic — exact under any reassociation).
+    check_flags(
+        "fast_math",
+        src,
+        &["-ffast-math"],
+        &[Value::F64(2.0), Value::F64(1.0), Value::I32(3)],
+        &[Value::F64(-21.625)],
+    );
+}
+
+/// The byte-clamp idiom clang ≥22's SLP vectorizer emits in picojpeg's `pjpeg_decode_mcu` on a
+/// **64-bit** `<4 x i16>` (sub-128, so held lane-wise as tail scalars): `v >u 255 ? (v >s -1 ? -1 : 0)
+/// : v`, then `& 255` — `icmp` masks, `sext <4 x i1>`, a vector `select`, `and` with a splat, and the
+/// result threaded through a `phi`. Lanes (300, -5, 100, 0) → (255, 0, 100, 0), packed little-endian.
+/// (Embench's picojpeg miscompiled on all three engines under clang 22 with this shape.)
+#[test]
+fn vec4i16_byte_clamp_select_sext_mask() {
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %v = insertelement <4 x i16> <i16 300, i16 -5, i16 100, i16 poison>, i16 0, i64 3\n  \
+        %c1 = icmp ugt <4 x i16> %v, splat (i16 255)\n  \
+        %c2 = icmp sgt <4 x i16> %v, splat (i16 -1)\n  \
+        %sx = sext <4 x i1> %c2 to <4 x i16>\n  \
+        %sel = select <4 x i1> %c1, <4 x i16> %sx, <4 x i16> %v\n  \
+        %m = and <4 x i16> %sel, splat (i16 255)\n  \
+        br label %join\n\
+        join:\n  \
+        %ph = phi <4 x i16> [ %m, %entry ]\n  \
+        %e0 = extractelement <4 x i16> %ph, i64 0\n  \
+        %e1 = extractelement <4 x i16> %ph, i64 1\n  \
+        %e2 = extractelement <4 x i16> %ph, i64 2\n  \
+        %e3 = extractelement <4 x i16> %ph, i64 3\n  \
+        %z0 = zext i16 %e0 to i32\n  \
+        %z1 = zext i16 %e1 to i32\n  \
+        %z2 = zext i16 %e2 to i32\n  \
+        %z3 = zext i16 %e3 to i32\n  \
+        %s1 = shl i32 %z1, 8\n  \
+        %s2 = shl i32 %z2, 16\n  \
+        %s3 = shl i32 %z3, 24\n  \
+        %o1 = or i32 %z0, %s1\n  \
+        %o2 = or i32 %o1, %s2\n  \
+        %o3 = or i32 %o2, %s3\n  \
+        ret i32 %o3\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vec4i16 clamp .ll");
+    temen_verify::verify_module(&t.module).expect("verify vec4i16 clamp");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec4i16 clamp");
+    let want = 255 | (100 << 16); // lanes (255, 0, 100, 0), little-endian
+    assert_eq!(
+        r,
+        vec![Value::I32(want)],
+        "lanes (300,-5,100,0) clamp to (255,0,100,0)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, want, "JIT vec4i16 clamp"),
+        other => panic!("JIT vec4i16 clamp: unexpected {other:?}"),
+    }
+}
+
+/// A float math **intrinsic** (`llvm.log.f64`, `llvm.exp.f32`, … — clang ≥22 emits these under
+/// `-fno-math-errno` where older clangs emitted the libcall) resolves to the guest-**defined** libm
+/// function of that name when the program links one (Postgres bundles openlibm; its `cost_tuplesort`
+/// `log()` trapped as an unresolved-extern stub). Here the TU defines its own `log`/`expf`, so the
+/// result proves the intrinsic reached *them* — natively, the same definitions override libm.
+#[test]
+fn math_intrinsic_resolves_to_guest_libm() {
+    let src = "__attribute__((noinline)) double log(double x){ return x + 40.5; }\n\
+               __attribute__((noinline)) float expf(float x){ return x * 2.0f; }\n\
+               int run(int n){ double a = __builtin_log((double)n); float b = __builtin_expf((float)n);\n\
+               \x20 return ((int)a + (int)b) & 0xff; }\n\
+               int main(){ return run(7); }\n";
+    check_vs_native_flags("math_intrinsic_libm", src, &["-fno-math-errno"], 7);
+}
+
+/// `frem`: clang ≥22 folds a constant-divisor `fmod(x, C)` into the instruction (Postgres's `dsind`);
+/// older clangs keep the `fmod` call. Both lower to the synthesized IEEE-exact `__temen_fmod`, so the
+/// result is bit-identical to native either way — including the f32 form, which promotes through f64.
+#[test]
+fn frem_folded_fmod_matches_native() {
+    let src = "#include <math.h>\n\
+               double d(double x){ return fmod(x, 360.0); }\n\
+               float f(float x){ return fmodf(x, 7.5f); }\n\
+               int run(int n){ double a = d(n * 1234.5 + 0.25); float b = f(n * 3.25f + 0.5f);\n\
+               \x20 return ((int)a + (int)(b * 4.0f)) & 0xff; }\n\
+               int main(){ return run(97); }\n";
+    // `-fno-math-errno` is what lets clang fold the libcall into `frem`.
+    check_vs_native_flags("frem_fmod", src, &["-fno-math-errno"], 97);
+}
+
+/// The i128 **three-way compare** intrinsic (`llvm.scmp.i32.i128`, LLVM ≥19 — clang canonicalizes
+/// `(a > b) - (a < b)` into it; Postgres's `int128` interval math): lowered as two orderings on the
+/// `(lo, hi)` pairs. Compared against native across the sign/word boundaries.
+#[test]
+fn i128_three_way_compare_vs_native() {
+    let src = "static __int128 mk(long hi, unsigned long lo){ return ((__int128)hi << 64) | lo; }\n\
+               __attribute__((noinline)) static int cmp3(__int128 a, __int128 b){ return (a > b) - (a < b); }\n\
+               __attribute__((noinline)) static int ucmp3(unsigned __int128 a, unsigned __int128 b){ return (a > b) - (a < b); }\n\
+               int run(int n){ long h[4] = { 0, -1, 1, (long)0x8000000000000000L }; unsigned long l[3] = { 0, 1, ~0UL };\n\
+               \x20 int r = 0;\n\
+               \x20 for (int i = 0; i < 4; i++) for (int j = 0; j < 3; j++) for (int k = 0; k < 4; k++) for (int m = 0; m < 3; m++) {\n\
+               \x20   __int128 a = mk(h[i], l[j]), b = mk(h[k], l[m]);\n\
+               \x20   r = r * 3 + (cmp3(a, b) + 1); r = r * 3 + (ucmp3((unsigned __int128)a, (unsigned __int128)b) + 1); r ^= n; }\n\
+               \x20 return r & 0xff; }\n\
+               int main(){ return run(5); }\n";
+    check_vs_native("i128_cmp3", src, 5);
+}
+
+/// i128 through an **internal call**: a `noinline` callee taking two `__int128`s (one a constant at
+/// the call site) and returning one. clang ≤21 coerces these to `(i64, i64)` pairs itself; LLVM 22's
+/// clang passes/returns a bare `i128`, so the on-ramp splits the signature, fans the argument pair out
+/// at the call, and binds the two-result return — either shape must compute the same value.
+#[test]
+fn i128_noinline_callee_param_and_return() {
+    let src =
+        "__attribute__((noinline)) static __int128 addc(__int128 a, __int128 b){ return a + b; }\n\
+               __int128 big2(__int128 a){ return addc(a, addc(a, 7)); }\n";
+    for (lo, hi) in [(0u64, 0u64), (u64::MAX, 0x1234), (u64::MAX, u64::MAX)] {
+        let a = ((hi as u128) << 64) | lo as u128;
+        let r = a.wrapping_add(a).wrapping_add(7);
+        check(
+            "i128_big2",
+            src,
+            &[Value::I64(lo as i64), Value::I64(hi as i64)],
+            &[
+                Value::I64(r as u64 as i64),
+                Value::I64((r >> 64) as u64 as i64),
+            ],
+        );
+    }
+}
+
 /// i128 comparisons across **all predicates** (signed + unsigned ordering, eq/ne), each compared to a
 /// native `i128`/`u128` oracle. Packs the ten results into an int.
 #[test]
@@ -11395,12 +11551,18 @@ fn i128_select_and_store_roundtrip() {
 
 /// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
 fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    compile_to_ll_flags(name, src, &[])
+}
+
+/// [`compile_to_ll`] with extra clang flags (e.g. `-ffast-math`).
+fn compile_to_ll_flags(name: &str, src: &str, flags: &[&str]) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("temen_llvm_{}_{}_ll.c", std::process::id(), name));
     let ll = dir.join(format!("temen_llvm_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-S"])
+        .args(flags)
         .arg(&c)
         .arg("-o")
         .arg(&ll)

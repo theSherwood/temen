@@ -350,6 +350,15 @@ long atol(const char *s) { return strtol(s, (char **)0, 10); }
 
 #include <wchar.h>
 
+/* LLVM ≥21's loop-idiom pass turns a `while (s[i]) i++` over `wchar_t` into a `wcslen` libcall, so the
+ * counting loops below (and any in Postgres) need a definition to resolve against. clang leaves the
+ * body of a function *named* `wcslen` alone (no self-call). */
+size_t wcslen(const wchar_t *s) {
+  size_t n = 0;
+  while (s[n]) n++;
+  return n;
+}
+
 size_t mbstowcs(wchar_t *dst, const char *src, size_t n) {
   size_t i = 0;
   if (!dst) { /* just count (up to the terminating NUL) */

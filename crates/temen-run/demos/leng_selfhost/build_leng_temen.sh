@@ -4,12 +4,12 @@
 # (decode/verify/bytecode-compile gate). Produces the committed `temen-leng.temen`: the real translator,
 # run in-sandbox over a real hexer Leng file, emits Temen text byte-identical to native.
 #
-# Unlike chibicc (C, clang per-TU), temen-leng is Rust: `-Z build-std` (unlocked on stable 1.81 via
-# RUSTC_BOOTSTRAP=1 — LLVM 18, matching the llvm-*-18 tools) compiles std from source so the whole
+# Unlike chibicc (C, clang per-TU), temen-leng is Rust: `-Z build-std` (unlocked on stable via
+# RUSTC_BOOTSTRAP=1 — its LLVM matching the llvm-* tools, see scripts/ci/install-llvm.sh) compiles std from source so the whole
 # guest links with only `read`/`write`/`bcmp` external (all on-ramp-recognized). `panic_immediate_abort`
 # keeps the float formatter out of panic paths; the guest's own bump allocator means no `malloc` extern.
 #
-#   needs: rustc +1.81.0 (+ rust-src), llvm-link-18, opt-18, cargo
+#   needs: rustc (+ rust-src), llvm-link, opt, cargo
 #   env:   TEMEN_LENG_CACHE (default /tmp/temen_leng_cache)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,14 +19,14 @@ CACHE="${TEMEN_LENG_CACHE:-/tmp/temen_leng_cache}"
 TRIPLE="x86_64-unknown-linux-gnu"
 mkdir -p "$CACHE"
 
-LINK="${LLVM_LINK:-llvm-link-18}"; command -v "$LINK" >/dev/null || LINK=llvm-link
-OPT="${LLVM_OPT:-opt-18}"; command -v "$OPT" >/dev/null || OPT=opt
+LINK="${LLVM_LINK:-llvm-link}"
+OPT="${LLVM_OPT:-opt}"
 
 # [1/4] build-std: emit per-crate textual LLVM IR for the whole closure (guest + temen-leng + std from
 # source). `--emit=llvm-ir`, release, panic=abort with panic_immediate_abort.
-echo "[1/4] build-std (rustc +1.81.0) ..."
+echo "[1/4] build-std (default rustc) ..."
 ( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
-    cargo +1.81.0 build --release \
+    cargo build --release \
       -Zbuild-std=std,panic_abort -Zbuild-std-features=panic_immediate_abort \
       --target "$TRIPLE" --ignore-rust-version )
 

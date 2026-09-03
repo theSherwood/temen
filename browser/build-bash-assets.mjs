@@ -27,7 +27,7 @@
 // Usage:  node build-bash-assets.mjs
 //   env:  TEMEN_BASH_CACHE (default /tmp/temen_bash_cache) — the input cache (bash source + bitcode)
 //         TEMEN_BASH_VER   (default 5.2.21)                — bash version (passed to build_bitcode.sh)
-// Needs (only on a cold input cache): clang-18/llvm-link-18, make, curl, tar. The regenerate half
+// Needs (only on a cold input cache): clang/llvm-link, make, curl, tar. The regenerate half
 // needs only cargo + the workspace.
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';

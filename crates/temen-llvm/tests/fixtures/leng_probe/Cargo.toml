@@ -1,7 +1,7 @@
 # W5 slice-2 probe (NIM.md §3e): the **real** `temen-leng` translator as an temen guest. A powerbox
 # program that calls `temen_leng::translate_to_text` on a fixed Leng module and returns a checksum of
 # the emitted Temen text. The `w5_leng_guest.rs` test in the parent crate compiles this to LLVM IR
-# (`rustc +1.81`), links + prunes to the closure reachable from `main`/`malloc`/`free`, translates it
+# (`rustc`), links + prunes to the closure reachable from `main`/`malloc`/`free`, translates it
 # to temen-IR, and runs it — asserting the in-sandbox checksum equals the same translation run host-side.
 #
 # Unlike the `peval_*` probes this is a **std** crate (temen-leng is std): the experiment is whether a

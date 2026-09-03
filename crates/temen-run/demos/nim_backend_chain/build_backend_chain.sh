@@ -16,7 +16,7 @@
 # byte). So here the `.s.nif` is produced by the oracle toolchain; once nimsem-on-Temen is unblocked it
 # slots in ahead of hexer as a third guest, closing the full Nim→run chain.
 #
-#   needs: the nimony submodule, stock nim (2.3.x), the built nimony + hexer binaries, clang-18/llvm-18,
+#   needs: the nimony submodule, stock nim (2.3.x), the built nimony + hexer binaries, clang/llvm,
 #          cargo. Fail-soft SKIP if any is absent (NIM.md §2). hexer.temen is a build artifact (~3 MB,
 #          not committed); temen-leng.temen is the committed asset. This script is the gate.
 set -euo pipefail

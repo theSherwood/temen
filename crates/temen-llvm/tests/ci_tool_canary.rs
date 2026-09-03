@@ -1,8 +1,8 @@
 //! CI canary against silent tool-skip rot (ISSUES.md, "Platform-coverage skips & caps" inventory).
 //!
 //! ~30 tests in this crate **auto-skip** when a pipeline tool is absent (`clang`/`cc` for the C/C++
-//! corpus, `llvm-dis` for the textual reader, `llvm-as[-18]` for hand-written `.ll`, and
-//! `rustc +1.81.0` / `llvm-link-18` / `opt-18` for the `peval_*` probes). That keeps contributor
+//! corpus, `llvm-dis` for the textual reader, `llvm-as` for hand-written `.ll`, and
+//! `rustc` / `llvm-link` / `opt` for the `peval_*` probes). That keeps contributor
 //! machines unburdened — but it means that if a CI setup step ever rots (an apt package rename, a
 //! rustup failure, a PATH change), the whole `temen-llvm` lane goes green while testing nothing.
 //! That failure shape is not hypothetical: the TSan and ASan lanes ran *nothing* for two weeks in
@@ -42,10 +42,9 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
         ("cc", &["--version"]),
         ("llvm-dis", &["--version"]),
         ("llvm-as", &["--version"]),
-        ("llvm-as-18", &["--version"]),
-        ("llvm-link-18", &["--version"]),
-        ("opt-18", &["--version"]),
-        ("rustc", &["+1.81.0", "--version"]),
+        ("llvm-link", &["--version"]),
+        ("opt", &["--version"]),
+        ("rustc", &["--version"]),
     ];
     let missing: Vec<&str> = tools
         .iter()
@@ -56,7 +55,43 @@ fn ci_has_every_tool_the_auto_skips_probe_for() {
         missing.is_empty(),
         "CI runner is missing {missing:?} — the temen-llvm tests that need these would silently \
          auto-skip, so this lane would be green while testing nothing. Fix the CI setup step \
-         (ci.yml `temen-llvm` job: apt llvm-18/clang-18 + PATH, rustup 1.81.0) — do not delete this \
-         canary."
+         (ci.yml `temen-llvm` job: `scripts/ci/install-llvm.sh` + PATH) — do not delete this canary."
     );
+    // The Rust probes build std from source (`-Z build-std`), which needs the `rust-src` component on
+    // the default toolchain — without it every `peval_*`/`w5_leng_*` test auto-skips.
+    let sysroot = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    assert!(
+        std::path::Path::new(&sysroot)
+            .join("lib/rustlib/src/rust/library/std/Cargo.toml")
+            .exists(),
+        "the default toolchain has no `rust-src` component (sysroot {sysroot}) — the build-std probes \
+         would auto-skip. Add `rust-src` to the ci.yml `temen-llvm` job's stable toolchain components."
+    );
+    // The peval probes feed the default `rustc`'s IR to `llvm-link`/`opt`, which only ingest IR of
+    // their own LLVM version or older — so the pinned LLVM major must equal the stable rustc's.
+    let rustc_llvm = llvm_major(&["rustc", "-vV"]);
+    let link_llvm = llvm_major(&["llvm-link", "--version"]);
+    assert_eq!(
+        rustc_llvm, link_llvm,
+        "rustc's LLVM major ({rustc_llvm:?}) != the installed llvm-link's ({link_llvm:?}) — the \
+         peval probes would auto-skip. Bump `LLVM_MAJOR` in scripts/ci/install-llvm.sh to match \
+         `RUST_STABLE`'s LLVM (`rustc -vV`), or vice versa."
+    );
+}
+
+/// The LLVM major in a tool's version banner (`LLVM version: 22.1.6` / `LLVM version 22.1.6`).
+fn llvm_major(cmd: &[&str]) -> Option<u32> {
+    let out = Command::new(cmd[0]).args(&cmd[1..]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rest = text.split("LLVM version").nth(1)?;
+    rest.trim_start_matches([':', ' '])
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }

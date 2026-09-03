@@ -16,7 +16,7 @@
 # Temen *and its output runs too*.
 #
 #   needs: the nimony submodule, stock nim (2.3.x), the built nimony/nifler/nimsem/hexer binaries,
-#          clang-18/llvm-18, cargo. Fail-soft SKIP if absent (NIM.md §2). The .temen are build artifacts
+#          clang/llvm, cargo. Fail-soft SKIP if absent (NIM.md §2). The .temen are build artifacts
 #          (nifler ~17 MB, nimsem ~5.5 MB, hexer ~3 MB) — not committed; this script IS the gate.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,8 +32,8 @@ if ! command -v nim >/dev/null; then echo "SKIP: nim not on PATH"; exit 0; fi
 BIN="${NIMONY_TOOLCHAIN_BIN:-$REPO/.nimtool/nimony/bin}"
 NIMONY="${NIMONY_BIN:-$(command -v nimony || echo "$BIN/nimony")}"
 [ -x "$NIMONY" ] || { echo "SKIP: nimony binary absent (NIM.md §2)"; exit 0; }
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
-LINK=llvm-link-18; command -v "$LINK" >/dev/null || LINK=llvm-link
+CLANG="${CLANG:-clang}"
+LINK="${LLVM_LINK:-llvm-link}"
 TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
 NIMLIB="$(nim dump 2>/dev/null | grep -m1 '/lib$' || true)"; [ -f "$NIMLIB/nimbase.h" ] || NIMLIB="$NIMLIB_FALLBACK"
