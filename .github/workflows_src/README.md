@@ -14,6 +14,17 @@ direction only — `workflows_src` is the source of truth for *pending* changes;
 `.github/workflows/` is what actually runs. After a copy-over the two are
 identical until the next agent edit.
 
+**How pending changes are tracked — not here.** The `workflows_src == workflows` CI check *is* the
+to-do list: it goes red on a PR the moment the mirror differs from the live workflows, names the file,
+and drains on copy-over. Describe a workflow edit in the **PR description** (what changed and why),
+exactly like any other change in the PR. Do **not** add an entry to this file: per-change entries made
+every workflow-touching branch edit the same lines of this README, which produced merge conflicts
+between concurrent PRs over a file that carries nothing the diff and the PR don't already carry. (The
+`fuzz targets wired` check plays the same role for fuzz-target matrix rows.)
+
+The section below is a **frozen** historical ledger from before that rule. It is not to be extended,
+and it is deleted once the open PR branches have converged with `main`.
+
 ## Pending changes not yet copied over
 
 - **`nested_paged` in the `fuzz` job matrix (`ci.yml`, #1151)** — one row added after `paged_walk`

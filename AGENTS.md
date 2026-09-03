@@ -73,7 +73,7 @@ not from micro-optimizing hot code. Default to:
 
 **Always open a PR whenever you have changes** — every branch with commits gets a PR, no exceptions. Open it as soon as you have changes rather than waiting for the work to feel finished. If you have multiple slices queued to implement, you can put them on the same PR until the PR exceeds 1000 loc. When you complete slices after opening a PR, check for merge conflicts and address them.
 
-**Editing CI:** the session token can't push under `.github/workflows/` (needs the `workflow` scope). If you need to change a workflow but can't commit it there, edit the mirror in `.github/workflows_src/` instead and note it in that dir's README — the owner copies it over. See `.github/workflows_src/README.md`.
+**Editing CI:** the session token can't push under `.github/workflows/` (needs the `workflow` scope). If you need to change a workflow but can't commit it there, edit the mirror in `.github/workflows_src/` instead and describe the change in the PR description (do **not** log it in that dir's README — the per-change ledger there caused merge conflicts between concurrent PRs and is frozen; the `workflows_src == workflows` check is the to-do list) — the owner copies it over. See `.github/workflows_src/README.md`.
 
 **Fast local pre-push check (optional):** `git config core.hooksPath .githooks` (or run `scripts/ci/install-git-hooks.sh`) enables a pre-push hook that mirrors CI's `check` job (`build · test · fmt · clippy`), so the common failures surface before a CI round-trip. It's fast feedback, **not** the gate — the CI matrix (cross-OS, miri/asan/tsan/loom, fuzz, differential) still runs on the PR and remains authoritative. Bypass once with `TEMEN_HOOK_SKIP=1 git push`. See `.githooks/README.md`.
 
