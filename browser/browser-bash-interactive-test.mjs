@@ -64,6 +64,14 @@ try {
   // handler on the cooperative bytecode engine — the slice-1 safepoint redirect + slice-2a CorePipe
   // EINTR), so bash aborts the line and sets `$? = 130` (128 + SIGINT). Before async delivery landed
   // on the bytecode tier the ^C was swallowed and `$?` stayed 0.
+  // #1223 — the builtin-output wait above fires the instant `hi from the terminal` drains, which can
+  // beat bash reprinting its prompt and re-parking on the read; the async SIGINT only aborts a
+  // *parked* read, so a ^C that lands first leaves `$?` at 0 and the rc=130 wait below times out.
+  // Wait for the fresh prompt (`$ ` at the end of the pane), then let its read park (as cat/fg do).
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.trimEnd().endsWith('$'),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+  await new Promise((r) => setTimeout(r, 800)); // let the reprinted prompt's read park before ^C
   await term.press('Control+c');
   await term.fill('echo rc=$?');
   await term.press('Enter');
