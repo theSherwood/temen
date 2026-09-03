@@ -3881,7 +3881,11 @@ int main(int argc, char **argv) {
     return 5;
   }
   if (__vm_fs(31, pid, 20, 0, 0) != 0) return 1;        /* kill(child, SIGTSTP): stop */
-  r = __vm_fs(28, -1, (long)&status, 2, 0);             /* waitpid(-1, WUNTRACED) */
+  /* #1207 — retry on -EINTR (-4): a child stop/continue fires the parent's domain run-wake, which
+   * can interrupt a blocking wait here even though no signal is deliverable to this poll-only parent
+   * — a robust `waitpid` re-issues, exactly as a real program must. (`-10` is the not-yet-a-
+   * transition poll answer this loop already tolerates.) */
+  while ((r = __vm_fs(28, -1, (long)&status, 2, 0)) == -4);  /* waitpid(-1, WUNTRACED) */
   if (r != pid) return 2;
   if ((status & 0xff) != 0x7f) return 3;                /* stopped marker */
   if (((status >> 8) & 0xff) != 20) return 4;           /* by SIGTSTP */
@@ -3896,9 +3900,12 @@ int main(int argc, char **argv) {
                                               WUNTRACED would park this probe forever): still
                                               alive, truly stopped */
   if (__vm_fs(31, pid, 18, 0, 0) != 0) return 9;        /* kill(child, SIGCONT): resume */
-  while ((r = __vm_fs(28, pid, (long)&status, 8, 0)) == -10);  /* waitpid(pid, WCONTINUED) */
+  /* Retry on both the not-yet poll (-10) and a spurious -EINTR (-4, #1207): the SIGCONT itself fires
+   * the parent's run-wake, whose interrupt can leak onto this blocking reap even though no signal is
+   * deliverable to this parent; re-issue rather than mistake it for a result. */
+  while ((r = __vm_fs(28, pid, (long)&status, 8, 0)) == -10 || r == -4);  /* waitpid(pid, WCONTINUED) */
   if (r == pid && status == 0xffff) {
-    while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10);  /* now the real reap */
+    while ((r = __vm_fs(28, pid, (long)&status, 0, 0)) == -10 || r == -4);  /* now the real reap */
   }
   if (r != pid) return 10;
   if (((status >> 8) & 0xff) != 5) return 11;           /* the held 10 delivered post-continue */
