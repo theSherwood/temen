@@ -16250,6 +16250,13 @@ enum Binding {
         base: u64,
         size: u64,
     },
+    /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
+    /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
+    /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
+    /// decode+verify is host-injected ([`Host::module_validator`]) so this TCB crate holds no
+    /// `temen-verify` dependency (the same injection shape as [`JitValidator`]). Non-durable, mirroring
+    /// the `Module` handles it mints (a live loader makes the domain non-snapshottable).
+    ModuleLoader,
     /// A §14 `Module` handle, carrying the index of its grant in [`Host::modules`]. Confers only the
     /// authority to instantiate (the Instantiator's module ops, serviced by the eval loop / nesting
     /// runtime); the generic dispatch treats any `call.cap` on it as an inert `CapFault`.
@@ -16465,6 +16472,9 @@ pub struct NonDurableHandle {
 pub enum NonDurableKind {
     SharedRegion,
     Module,
+    /// A §14 module loader (iface 7) — mints `Module` grants, which are themselves non-durable; a
+    /// live loader makes the domain non-snapshottable, re-granted by the embedder after restore.
+    ModuleLoader,
     Blocking,
     JitDomain,
     JitCode,
@@ -17905,6 +17915,11 @@ pub struct Host {
     /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
     /// `None` (the default) fail-closes every `compile` (`-EINVAL`).
     jit_validator: Option<JitValidator>,
+    /// The host-injected decode+verify gate for `ModuleLoader.from_bytes` ([`ModuleValidator`]) —
+    /// injected for the same reason as [`Host::jit_validator`] (the verifier lives in the injecting
+    /// tier, keeping this crate's dependency set tiny). `None` (the default) fail-closes every
+    /// `from_bytes` (`-EINVAL`).
+    module_validator: Option<ModuleValidator>,
     /// The durable-JIT install fence (DURABILITY.md §12.5, R8): an injected predicate — set only by
     /// a durable grant — that returns `true` to **reject** a just-validated unit whose entry
     /// suspends but whose signature the program does not taint (an un-instrumented `call.dyn`
@@ -18055,6 +18070,15 @@ impl BoundImport {
 /// ordinary closed-blob `compile` op — an empty table resolves nothing, so a unit with imports
 /// fails closed — and carries the guest's table only for the `compile_linked` op.
 pub type JitValidator = fn(&[u8], Option<u8>, &[u8]) -> Result<Arc<[Func]>, i64>;
+
+/// The host-injected decode+verify gate for `ModuleLoader.from_bytes` (iface 7): given a
+/// wire-encoded module blob from the guest window, return the decoded+**verified** [`Module`]
+/// (the trusted floor — the same `temen_verify::verify_module` a host-granted module passed) or a
+/// fail-closed `-errno` (`-EINVAL` for a malformed / unverifiable blob). Injected as a bare `fn`
+/// like [`JitValidator`] so this TCB crate keeps no `temen-verify` dependency — the verifier lives
+/// in the injecting tier (`temen-run`'s [`module_blob_validator`]). Without one installed, every
+/// `from_bytes` is `-EINVAL` (fail closed).
+pub type ModuleValidator = fn(&[u8]) -> Result<Module, i64>;
 
 /// The durable-JIT install fence predicate ([`Host::set_jit_durable_gate`]): given a just-validated
 /// unit's functions and the program's tainted signatures, return `true` to **reject** the unit
@@ -18291,6 +18315,7 @@ impl Host {
             quota: Quota::default(),
             jit_domains: Vec::new(),
             jit_validator: None,
+            module_validator: None,
             jit_durable_gate: None,
             jit_durable_tainted_sigs: Vec::new(),
             jit_wasm_emitter: None,
@@ -19478,6 +19503,9 @@ impl Host {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
                 Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                Binding::ModuleLoader => {
+                    return Err(self.non_durable(slot, NonDurableKind::ModuleLoader))
+                }
                 Binding::Blocking(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::Blocking))
                 }
@@ -19559,6 +19587,7 @@ impl Host {
                 | Binding::JitCode { .. } => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
+                Binding::ModuleLoader => NonDurableKind::ModuleLoader,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
@@ -21123,6 +21152,37 @@ impl Host {
     /// differential pair (see [`JitValidator`]); without one, every `compile` is `-EINVAL`.
     pub fn set_jit_validator(&mut self, v: JitValidator) {
         self.jit_validator = Some(v);
+    }
+
+    /// Install the [`ModuleValidator`] — the decode+verify gate `ModuleLoader.from_bytes` runs.
+    /// Without one, every `from_bytes` is `-EINVAL` (fail closed). Installed by the tier that grants a
+    /// module loader ([`temen_run::grant_module_loader`]).
+    pub fn set_module_validator(&mut self, v: ModuleValidator) {
+        self.module_validator = Some(v);
+    }
+
+    /// Grant a §14 `ModuleLoader` capability (iface 7): the authority to promote guest bytes to a
+    /// spawnable `Module` (`from_bytes`). Embedder-granted (non-ambient, like `exec`/`fs`). The decode+
+    /// verify gate must also be installed ([`Host::set_module_validator`]); [`temen_run::grant_module_loader`]
+    /// does both.
+    pub fn grant_module_loader(&mut self) -> i32 {
+        self.grant(cap_id::MODULE_LOADER, Binding::ModuleLoader)
+    }
+
+    /// `ModuleLoader.from_bytes` (iface 7 op 0): decode+**verify** a wire-encoded module from `bytes`
+    /// (borrowed from the guest window) via the host-injected [`ModuleValidator`], and on success mint a
+    /// `MODULE` grant for it — returning the new handle. Fail-closed to `-EINVAL` when no validator is
+    /// installed or the blob does not decode+verify (the verifier is the trusted floor; nothing is
+    /// minted on failure). The decode is the copy: the returned module is host-owned and immutable, so a
+    /// later guest write to the source buffer cannot alter the code that gets spawned.
+    fn module_from_bytes(&mut self, bytes: &[u8]) -> i64 {
+        let Some(validate) = self.module_validator else {
+            return EINVAL;
+        };
+        match validate(bytes) {
+            Ok(m) => self.grant_module(&m) as i64,
+            Err(e) => e,
+        }
     }
 
     /// Install the durable-JIT install fence: the predicate ([`Host::jit_durable_gate`]) plus the
@@ -23103,6 +23163,24 @@ impl Host {
             Binding::Instantiator { base, size } => match op {
                 0 => Ok(vec![base as i64, size as i64]),
                 _ => Err(Trap::CapFault),
+            },
+            // §14 `ModuleLoader` (iface 7): op 0 `from_bytes(ptr, len) -> module_handle | -errno`.
+            // Read the wire-encoded module from the holder's window and mint a `Module` grant for it
+            // (decode+verify via the injected validator — the trusted floor). Like `Jit.compile`, the
+            // blob is borrowed from guest memory; with no window there is nothing to read (`-EFAULT`).
+            Binding::ModuleLoader => match op {
+                0 => {
+                    let Some(mem) = mem else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    let ptr = *args.first().unwrap_or(&0) as u64;
+                    let len = *args.get(1).unwrap_or(&0) as u64;
+                    let Some(bytes) = mem.read_bytes(ptr, len) else {
+                        return Ok(vec![EFAULT]);
+                    };
+                    Ok(vec![self.module_from_bytes(&bytes)])
+                }
+                _ => Ok(vec![EINVAL]),
             },
             // A §14 `Module` handle confers instantiation authority (through the Instantiator's module
             // ops 5/6/7) plus one callable op:

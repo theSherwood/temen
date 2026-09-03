@@ -3774,6 +3774,11 @@ const SHARED_REGION_TYPE_ID: u32 = 4;
 /// (op 1). Pinned numerically like [`HOST_PROC_TYPE_ID`]; `temen-run`'s `instantiator_type_id_matches`
 /// test locks the two together.
 const INSTANTIATOR_TYPE_ID: u32 = 6;
+/// The `ModuleLoader` interface id (`temen_interp::cap_id::MODULE_LOADER`) — the §14 authority to
+/// promote guest bytes to a spawnable `Module`, reached from a guest via `__vm_module_from_bytes`
+/// (op 0, `from_bytes`). Pinned numerically like [`INSTANTIATOR_TYPE_ID`]; `temen-run`'s
+/// `module_loader_type_id_matches` test locks the two together.
+const MODULE_LOADER_TYPE_ID: u32 = 7;
 
 /// End of the low reserved region (`[0, 32)`) that held the retired capability-handle stash
 /// (IMPORTS.md phase 3 — imports are manifest slots the host binds; nothing is stashed). Kept as
@@ -12829,6 +12834,33 @@ fn lower_vm_builtin(
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 13,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 run-in-guest: `long __vm_module_from_bytes(int loader, long ptr, long len)` →
+        // `call.cap MODULE_LOADER 0 loader (ptr, len)` — the `from_bytes` primitive that has the host
+        // decode+verify a wire-encoded module from `[ptr, ptr+len)` in the guest window and mints a
+        // `Module` handle for it (returned; `-EINVAL` on a malformed/unverifiable blob). `loader` is the
+        // reflection-discovered `ModuleLoader` handle (`__vm_cap_at`, interface id 7); the returned
+        // handle is then passed as `module` to `__vm_instantiate` (op 13) to run the built program as a
+        // confined child. The input side of nesting: a guest that *produces* a module can now run it.
+        "__vm_module_from_bytes" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the ModuleLoader handle
+            let args = (1..3)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?)) // ptr, len
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; 2],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: MODULE_LOADER_TYPE_ID,
+                op: 0,
                 sig,
                 handle,
                 args,

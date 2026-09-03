@@ -695,6 +695,14 @@ mod tests {
         assert_eq!(temen_interp::cap_id::INSTANTIATOR, 6);
     }
 
+    /// `temen-llvm` pins `ModuleLoader`'s interface id numerically (`MODULE_LOADER_TYPE_ID`, for the
+    /// `__vm_module_from_bytes` run-in-guest builtin a guest driver lowers to); this locks that pin to
+    /// the real constant.
+    #[test]
+    fn module_loader_type_id_matches() {
+        assert_eq!(temen_interp::cap_id::MODULE_LOADER, 7);
+    }
+
     /// The §4b zero-copy op end to end at the capability boundary: `host_fs_mmap`'s `FS_MAP_REGION`
     /// opens a real file and mints a **file-backed `SharedRegion`** whose size matches, while a plain
     /// `host_fs` refuses the op (no minting authority). Combined with `file_region_tests` (which prove

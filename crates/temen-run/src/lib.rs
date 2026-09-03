@@ -1053,6 +1053,22 @@ pub fn jit_blob_validator_durable(
     jit_resolve_and_validate_impl(bytes, mem_log2, |name| table.get(name).copied(), true)
 }
 
+/// The canonical [`temen_interp::ModuleValidator`] — the decode+verify gate for
+/// `ModuleLoader.from_bytes` (§14 run-in-guest). Unlike [`jit_blob_validator`] (which compiles a
+/// *relocatable unit* into the caller's own domain and so forbids data segments and pins the module's
+/// memory to the parent window), this promotes a **whole, self-contained module** — its own memory
+/// declaration, data segments, and `_start` are exactly what the `Instantiator`'s module ops want (the
+/// child runs it confined to a carve, data materialized into that carve). So the gate is just
+/// `decode_module` (untrusted-input-facing, fail-closed) → `verify_module` (the escape-freedom floor —
+/// the same trusted verifier a host-granted module passed); the carve/memory sizing is enforced later,
+/// at the op-13 spawn (`cm.memory_log2 <= size_log2`). All failures are `-EINVAL` (guest-visible,
+/// non-fatal; nothing minted). Install it with [`grant_module_loader`].
+pub fn module_blob_validator(bytes: &[u8]) -> Result<Module, i64> {
+    let m = decode_module(bytes).map_err(|_| EINVAL)?;
+    verify_module(&m).map_err(|_| EINVAL)?;
+    Ok(m)
+}
+
 /// Decode the guest-provided **symbol table** for `compile_linked` (DESIGN.md §22): a `name →
 /// [`Resolved`]` map the loader binds a unit's §7 imports against. Untrusted-input-facing and
 /// fail-closed (`None` on any malformation) — but note the *values* are guest-chosen by design:
@@ -1245,6 +1261,17 @@ fn jit_resolve_and_validate_impl(
 pub fn grant_jit(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     host.set_jit_validator(jit_blob_validator);
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
+}
+
+/// Grant a §14 `ModuleLoader` capability (iface 7) and install its decode+verify gate
+/// ([`module_blob_validator`]) — the "run-in-guest" primitive: the holder can promote its own bytes
+/// (a linked program it produced) to a spawnable `Module` via `from_bytes`, then run it as a confined
+/// child through the `Instantiator`'s module ops. Both backends: the interpreter services the iface in
+/// its dispatch; the JIT tier's [`cap_thunk`] services it natively. Register a name for it
+/// ([`Host::register_cap_name`]) if the guest resolves by name.
+pub fn grant_module_loader(host: &mut Host) -> i32 {
+    host.set_module_validator(module_blob_validator);
+    host.grant_module_loader()
 }
 
 /// Like [`grant_jit`], but the granted domain may host §12 **fibers** (`cont.*`) in submitted units
