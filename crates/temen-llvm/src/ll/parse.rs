@@ -1239,8 +1239,11 @@ impl Parser {
 
     /// Skip binop flags (`nsw`, `nuw`, `exact`, `disjoint`) between the opcode and the type.
     fn skip_binop_flags(&mut self) {
+        // Integer wrap flags, plus the fast-math flags a float binop carries under `-ffast-math`
+        // (`fadd fast`, `fmul nnan ninf …` — e.g. openlibm inside the Postgres build).
         while matches!(self.peek(), Some(Token::Word(w))
-            if matches!(w.as_str(), "nsw" | "nuw" | "exact" | "disjoint"))
+            if matches!(w.as_str(), "nsw" | "nuw" | "exact" | "disjoint"
+                | "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc" | "fast"))
         {
             self.pos += 1;
         }
@@ -1807,6 +1810,8 @@ impl Parser {
     /// A conversion (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`): `<op> [flags] <srcty> <val> to <dstty>`.
     fn conv_inst(&mut self, dest: Name) -> PResult<UnaryOp> {
         self.pos += 1; // opcode
+                       // LLVM ≥20 carries fast-math flags on the float casts (`fptrunc fast double %x to float`).
+        self.skip_fast_math_flags();
         self.skip_conv_flags();
         let srcty = self.type_()?;
         let operand = self.value_as_operand(&srcty)?;
@@ -1902,6 +1907,7 @@ impl Parser {
     /// what makes the pairs resolve identically to the bitcode reader.
     fn phi_inst(&mut self, dest: Name) -> PResult<Phi> {
         self.pos += 1; // `phi`
+        self.skip_fast_math_flags(); // a float φ may carry fast-math flags (`phi fast double …`)
         let to_type = self.type_()?;
         let mut incoming_values = Vec::new();
         let mut inc_idx = 0u32;

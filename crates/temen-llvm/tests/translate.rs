@@ -96,7 +96,12 @@ fn from_slot(t: ValType, s: i64) -> Value {
 /// **both** backends with `args`; assert they agree and equal `expect`. Returns silently if clang
 /// is unavailable.
 fn check(name: &str, src: &str, args: &[Value], expect: &[Value]) {
-    let Some(bc) = compile_to_ll(name, src) else {
+    check_flags(name, src, &[], args, expect);
+}
+
+/// [`check`] with extra clang flags.
+fn check_flags(name: &str, src: &str, flags: &[&str], args: &[Value], expect: &[Value]) {
+    let Some(bc) = compile_to_ll_flags(name, src, flags) else {
         return;
     };
     let t = temen_llvm::translate_ll_path(&bc).expect("translate bitcode");
@@ -11075,6 +11080,27 @@ fn i128_param_and_return() {
     }
 }
 
+/// `-ffast-math` code: every float op carries fast-math flags — LLVM ≥20 prints them on the casts
+/// too (`fptrunc fast`, `fpext fast`, `sitofp fast`) and on `phi`/`select`, beside the binops,
+/// `fneg`, `fcmp`, and calls (openlibm inside the Postgres build is compiled this way). The flags are
+/// semantic license, not semantics: the reader skips them and the program computes the same value.
+#[test]
+fn fast_math_flags_on_every_float_op() {
+    let src = "double f(double a, double b, int n){\n\
+               \x20 float t = (float)a; double s = t + (double)n;\n\
+               \x20 for (int i = 0; i < n; i++) s = s * 1.5 + b;\n\
+               \x20 return s > b ? -s : s;\n\
+               }\n";
+    // t = 2, s = 2 + 3 = 5; ×3: 8.5, 13.75, 21.625 (all dyadic — exact under any reassociation).
+    check_flags(
+        "fast_math",
+        src,
+        &["-ffast-math"],
+        &[Value::F64(2.0), Value::F64(1.0), Value::I32(3)],
+        &[Value::F64(-21.625)],
+    );
+}
+
 /// i128 through an **internal call**: a `noinline` callee taking two `__int128`s (one a constant at
 /// the call site) and returning one. clang ≤21 coerces these to `(i64, i64)` pairs itself; LLVM 22's
 /// clang passes/returns a bare `i128`, so the on-ramp splits the signature, fans the argument pair out
@@ -11419,12 +11445,18 @@ fn i128_select_and_store_roundtrip() {
 
 /// Compile C to a textual `.ll` (the in-house reader's input), mirroring [`compile_to_bc`].
 fn compile_to_ll(name: &str, src: &str) -> Option<PathBuf> {
+    compile_to_ll_flags(name, src, &[])
+}
+
+/// [`compile_to_ll`] with extra clang flags (e.g. `-ffast-math`).
+fn compile_to_ll_flags(name: &str, src: &str, flags: &[&str]) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let c = dir.join(format!("temen_llvm_{}_{}_ll.c", std::process::id(), name));
     let ll = dir.join(format!("temen_llvm_{}_{}.ll", std::process::id(), name));
     std::fs::write(&c, src).expect("write C source");
     let status = Command::new("clang")
         .args(["-O2", "-emit-llvm", "-S"])
+        .args(flags)
         .arg(&c)
         .arg("-o")
         .arg(&ll)
