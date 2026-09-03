@@ -4946,6 +4946,73 @@ fn c_a_background_terminal_write_does_not_stop_without_tostop() {
     );
 }
 
+fn bgcont_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+static int status;\n\
+static long pb;\n\
+static char b[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+int main(void){{\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 1;\n\
+  if (pb == 0){{ __px_setpgid(0,0,0); long r; do {{ r=__px_read(0,0,(long)b,8); }} while(r==-85); long h=ph_(r); if(h>=0) __vm_read((int)h,b,8); return 7; }}\n\
+  __px_setpgid(0, pb, pb);\n\
+  long h;\n\
+  /* first stop: the background read raises SIGTTIN */\n\
+  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  if (h != pb) return 100;\n\
+  if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
+  if (((status>>8)&0xff) != 21) return 3000 + ((status>>8)&0xff);\n\
+  /* bg: SIGCONT the job's group; the terminal STAYS with the shell (no tcsetpgrp). */\n\
+  __px_kill(0, -pb, 18);\n\
+  /* second wait (WUNTRACED only): the resumed reader must re-issue its terminal read,\n\
+     SIGTTIN-stop AGAIN, and NOT steal the line fed into the race window. A re-stop is\n\
+     4021; a steal (the reader consumed the fed line and exited 7) is 5007. */\n\
+  while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  if (h != pb) return 101;\n\
+  if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1198 tail — `bg` of a SIGTTIN-stopped terminal reader must RE-stop it, not steal the shell's
+// input. This is the second half of #1198: `c_a_background_terminal_read_is_stopped_by_sigttin`
+// covers the initial stop; this covers the resume. After the background reader SIGTTIN-stops, the
+// shell `bg`s it — a guest `kill(-pgid, SIGCONT)` that leaves the terminal foreground with the shell
+// (no `tcsetpgrp` to the job). The resumed reader re-issues its terminal read, hits
+// `tty_background_check` again (its group is still not the foreground), and SIGTTIN-re-stops on the
+// EMPTY terminal — before any input — so a line fed into the resume window is NOT consumed by the
+// background job. The shell's second `waitpid(WUNTRACED)` reports the fresh SIGTTIN(21) re-stop
+// (4021); had the reader stolen the fed line it would have exited 7 (5007). The feed lands mid-resume
+// on purpose: the correct re-stop is input-independent, so 4021 holds regardless of feed timing,
+// while a scheduler that deferred the reader's re-read until input would consume the line and fail.
+#[test]
+fn c_bg_of_a_stopped_terminal_reader_restops_without_stealing_input() {
+    let feeds = || vec![(400u64, b"echo hi\n".to_vec())];
+    let e = run_interp_terminal_setup(&bgcont_src(), feeds(), |_, _| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(4021)],
+        "tree-walker: the `bg`-continued background reader re-issued its terminal read, SIGTTIN-re-stopped \
+         on the empty terminal, and did not steal the fed line — waitpid(WUNTRACED) reported 4021"
+    );
+    let b = run_bytecode_terminal_setup(&bgcont_src(), feeds(), |_, _| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(4021)],
+        "coop bytecode (the browser tier): on SIGCONT the benched reader un-benches, re-reads, and \
+         SIGTTIN-re-stops before the fed line is consumed — no input steal, matching the oracle"
+    );
+}
+
 fn killspin_src() -> String {
     format!(
         "{WIN_PAD_17}\

@@ -1012,6 +1012,12 @@ jobs:
           # WIFSIGNALED) — the job leaves the table (`[1]+ Killed/Signal`) and `^D` exits cleanly with no
           # "There are stopped jobs" hold. SKIPs with the batch when bash.temen/bin_cat.temen is absent.
           node browser-bash-kill-stopped-test.mjs
+          # `bg` of a stopped terminal reader (#1198 tail): after `cat &` SIGTTIN-stops, `bg %1` resumes
+          # it — and the resumed `cat`, still a background reader, SIGTTIN-RE-stops on its re-issued read
+          # rather than STEALING the shell's input (the original ping-pong). The next command RUNS (its
+          # output prints) and `cat` bounces back to `[1]+ Stopped`. SKIPs with the batch when
+          # bash.temen/bin_cat.temen/bin_echo.temen is absent.
+          node browser-bash-bg-resume-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
