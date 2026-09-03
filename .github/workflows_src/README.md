@@ -33,6 +33,18 @@ identical until the next agent edit.
   `workflows-in-sync` guard stays red — the expected mirror-edit friction;
   `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
 
+- **`browser-bash-bg-tty-test.mjs` in the `browser-real` job (`ci.yml`, #1198 bg terminal-read stop)** — one
+  line added after `node browser-bash-bg-test.mjs`: `node browser-bash-bg-tty-test.mjs`. It drives the
+  interactive bash card's **background terminal-read stop**: `cat &` reads the controlling terminal from a
+  background process group, so SIGTTIN stops it (`[1]+ Stopped cat`) — the exec'd reader is benched at its
+  syscall boundary instead of spinning on the libc `-ERESTART` retry (the coop-engine bug this PR fixes) —
+  the prompt stays usable and stopped cat does NOT steal the next typed line; `fg %1` + `^D` resumes and
+  ends it cleanly. SKIPs cleanly with the rest of the bash batch when the deploy-built
+  `bash.temen`/`bin_cat.temen` are absent, so it reds only on a real bg-tty regression. Pairs with the
+  native cross-engine differential (`c_posix.rs::c_a_execd_background_terminal_read_is_stopped_by_sigttin`).
+  Verified locally in Chromium. (Until copied over, the `workflows-in-sync` guard stays red — the expected
+  mirror-edit friction; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
 - **`browser-nim-op13-crawl-e2e-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, whole card)** —
   one line added after `node browser-op13jit-nifler-test.mjs`: `node browser-nim-op13-crawl-e2e-test.mjs`. It
   drives the **whole nim card through the op-13 loop**: the compile's phase-1 nifler crawl runs each module
