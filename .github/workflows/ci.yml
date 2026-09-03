@@ -1023,6 +1023,10 @@ jobs:
           # ^Z two `cat`s so both sit stopped, `jobs` lists them with the [1]-/[2]+ previous/current
           # markers, `fg %1`/`fg %2` resume each by spec. SKIPs with the batch when bash.temen is absent.
           node browser-bash-jobs-test.mjs
+          # Background job launch (#798 bg/&): `seq 3 &` runs in its own pgroup without a terminal
+          # handoff or a blocking wait — bash prints `[1] pid`, the prompt stays usable, and the async
+          # `[1]+ Done` posts on the next prompt. SKIPs with the batch when bash.temen is absent.
+          node browser-bash-bg-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
