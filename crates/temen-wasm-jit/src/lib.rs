@@ -2492,6 +2492,51 @@ pub fn compile_module_reactor_budgeted(
     module_budget: usize,
     split_target: Option<(usize, usize)>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_inner(
+        m,
+        entry,
+        shared_memory,
+        cap,
+        module_budget,
+        split_target,
+        None,
+    )
+}
+
+/// #1201 — [`compile_module_reactor`] in **paged** mode (#750): the wasm-driven, entry-rooted emit whose
+/// every access also consults the host-maintained page-state table, so a guest that `unmap`s/`protect`s
+/// its own pages runs on the single-shot tier instead of declining to the interpreter. The driver
+/// contract is [`compile_module_tierup_paged`]'s (refresh the table from the live map after each
+/// bounce, `"mapped"` = its coverage); the page-op cap calls themselves ride the outlined cross-tier
+/// wrappers (`outline_cap_calls`), interp-serviced. `SharedRegion` aliasing (iface 4) stays gated —
+/// the caller ([`compile_jit_paged`]) checks it, as the paged tier-up entry does.
+pub fn compile_module_reactor_paged(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_inner(
+        m,
+        entry,
+        shared_memory,
+        MAX_EMITTED_FUNC_BYTES,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        None,
+        Some(page_log2),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_module_reactor_inner(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    cap: usize,
+    module_budget: usize,
+    split_target: Option<(usize, usize)>,
+    paged: Option<u8>,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
@@ -2561,7 +2606,7 @@ pub fn compile_module_reactor_budgeted(
             &cross,
             None,
             false,
-            None,
+            paged,
             emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
             &split_plan,
@@ -3161,6 +3206,55 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
             // suspending cross-tier callee it can't safely unwind) — closing that latent sharp edge.
             if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
                 if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
+                    return Ok(Artifact {
+                        wasm,
+                        emitted,
+                        drive: DriveMode::WasmDriven { entry },
+                    });
+                }
+            }
+            interp_driven(m)
+        }
+    }
+}
+
+/// #1201 — [`compile_jit`] for a host whose driver carries the **paged** contract (#750: it refreshes the
+/// page-state table from the live map after each cross-tier bounce and points `"pagestate"`/`"mapped"`
+/// at it). A module that `unmap`s/`protect`s its own pages ([`module_uses_unmap_protect`]) then emits
+/// **paged** instead of `compile_jit`'s emit-nothing decline — wasm-driven when rooted and
+/// suspension-free (`compile_module_reactor_paged`), else interpreter-driven paged tier-up
+/// (`compile_module_tierup_paged`). Everything else is exactly `compile_jit` (a `map`-only guest keeps
+/// the mask-only emit + the live `"mapped"` bound, #1153), so a non-page-op guest emits byte-identical
+/// code. `SharedRegion` aliasing (iface 4) still fails closed to the whole interpreter — a `Backed`
+/// page's bytes live outside the window, which no trap check can honor.
+pub fn compile_jit_paged(
+    m: &Module,
+    shape: Shape,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<Artifact, Error> {
+    if !module_uses_unmap_protect(m) {
+        return compile_jit(m, shape, shared_memory);
+    }
+    if m.funcs.iter().any(func_uses_region_ops) {
+        return compile_interp_only(m, shared_memory, false);
+    }
+    let interp_driven = |m: &Module| -> Result<Artifact, Error> {
+        let (wasm, emitted) = compile_module_tierup_paged(m, shared_memory, page_log2)?;
+        Ok(Artifact {
+            wasm,
+            emitted,
+            drive: DriveMode::InterpDriven,
+        })
+    };
+    match shape {
+        Shape::Threaded => interp_driven(m),
+        Shape::Batch { entry } | Shape::Reactor { entry } => {
+            // The same wasm-drivability gate as `compile_jit`: rooted, no suspension, no setjmp.
+            if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
+                if let Ok((wasm, emitted)) =
+                    compile_module_reactor_paged(m, entry, shared_memory, page_log2)
+                {
                     return Ok(Artifact {
                         wasm,
                         emitted,

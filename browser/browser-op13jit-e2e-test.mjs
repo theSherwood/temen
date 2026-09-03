@@ -55,13 +55,49 @@ const res = await page.evaluate(async () => {
   const result = Number(ex.temen_op13jit_result());
   const counter = Number(ex.temen_op13jit_counter());
   ex.temen_op13jit_close();
-  return { result, counter, drove };
+
+  // #1201 — the same loop over a PAGE-OP child (`op13_paged_child`: its leaf `protect`s the "K" page
+  // read-only, `f0` reads K back → 116): the single-shot emit is paged, the child is staged for
+  // `driveJitRun` (not run on the interpreter inline), and the driver re-syncs `"pagestate"`/`"mapped"`
+  // after the bounce — so the page-op child runs on the EMITTED tier like any other.
+  const bytes = new Uint8Array(await (await fetch('/corpus/op13_paged_child.temenc')).arrayBuffer());
+  const ptr = ex.temen_alloc(bytes.length);
+  new Uint8Array(memory.buffer).set(bytes, ptr);
+  const st = ex.temen_op13jit_open_child(ptr, bytes.length);
+  ex.temen_dealloc(ptr, bytes.length);
+  if (st !== 0) return { result, counter, drove, err: `open_child failed: status ${st}` };
+  let pSteps = 0, pDrove = 0, paged = false;
+  for (;;) {
+    if (pSteps++ > 8) { ex.temen_op13jit_close(); return { result, counter, drove, err: 'paged loop did not terminate' }; }
+    const s = ex.temen_op13jit_step();
+    if (s === 0) break;
+    if (s === 1) {
+      paged = ex.temen_onramp_jit_run_pagestate_len() > 0;
+      try {
+        await driveJitRun(ex, memory, 'op13jit-paged-child');
+      } catch (e) {
+        ex.temen_op13jit_close();
+        return { result, counter, drove, err: `paged driveJitRun threw: ${String(e && e.message || e)}` };
+      }
+      ex.temen_op13jit_deliver();
+      pDrove++;
+      continue;
+    }
+    ex.temen_op13jit_close();
+    return { result, counter, drove, err: `paged trap at step (code ${s})` };
+  }
+  const pagedResult = Number(ex.temen_op13jit_result());
+  const pagedCounter = Number(ex.temen_op13jit_counter());
+  ex.temen_op13jit_close();
+  return { result, counter, drove, pagedResult, pagedCounter, pagedDrove: pDrove, paged };
 });
 
 await browser.close(); server.close();
 console.log('RESULT', JSON.stringify(res, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
-const ok = !res.err && res.result === 41 && res.counter === 1 && res.drove === 1;
+const ok = !res.err && res.result === 41 && res.counter === 1 && res.drove === 1 &&
+  res.pagedResult === 116 && res.pagedCounter === 1 && res.pagedDrove === 1 && res.paged === true;
 console.log(`  op13jit-e2e: result=${res.result} counter=${res.counter} childrenDriven=${res.drove}${res.err ? ` · ERR ${res.err}` : ''}`);
-console.log(ok ? 'PASS — nested child ran on the EMITTED tier over its marshaled fs (driver joined 41)' : 'FAIL');
+console.log(`  op13jit-e2e (paged child): result=${res.pagedResult} counter=${res.pagedCounter} childrenDriven=${res.pagedDrove} paged=${res.paged}`);
+console.log(ok ? 'PASS — nested children ran on the EMITTED tier over their marshaled fs (41; page-op child paged → 116)' : 'FAIL');
 process.exit(ok ? 0 : 1);

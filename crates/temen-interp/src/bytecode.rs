@@ -2350,6 +2350,37 @@ impl SharedProgram {
         reserved_log2: u8,
         prots: Option<&[(u64, u8)]>,
     ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>, u64) {
+        let (out, info, mapped) = self.run_over_grown_info(
+            func,
+            args,
+            fuel,
+            back,
+            host,
+            seed_data,
+            reserved_log2,
+            prots,
+        );
+        (out, info.map(|i| i.3), mapped)
+    }
+
+    /// [`run_over_grown`](Self::run_over_grown), but returning the post-run window's whole
+    /// [`MemMapInfo`] (page size, committed prefix, reservation, explicit entries) rather than the
+    /// entries alone — what a **paged** cross-tier driver feeds [`build_pagestate_table`] after each
+    /// bounce (#1201: the single-shot wasm-JIT tier carrying `unmap`/`protect`). `None` under the same
+    /// §13 `Backed`-alias condition; `Some((1, 0, 0, vec![]))` for a memory-less module. The trailing
+    /// `u64` is the scalar extent, as for `run_over_grown`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_over_grown_info(
+        &self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        back: std::sync::Arc<super::Region>,
+        host: &mut Host,
+        seed_data: bool,
+        reserved_log2: u8,
+        prots: Option<&[(u64, u8)]>,
+    ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
             return (Err(Trap::Malformed), None, 0);
         }
@@ -2369,9 +2400,10 @@ impl SharedProgram {
         });
         let out = run(dom, func, args, fuel, &mut mem, host);
         let (pages, mapped) = match mem.as_ref() {
-            None => (Some(Vec::new()), 0),
+            None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
-                let (_, _, reserved, entries) = m.map_info();
+                let info = m.map_info();
+                let reserved = info.2;
                 // The committed **scalar extent** — not `map_info`'s `window.mapped()`, which counts
                 // only the demand-committed prefix and misses a `vm_map`-grown tail (the pages live in
                 // the page map). `scalar_extent` folds the contiguous grown tail into the high-water so
@@ -2382,10 +2414,10 @@ impl SharedProgram {
                 // of a self-`protect`ed rodata page still admit, and the interpreter page map (returned
                 // in `entries`, re-seeded next bounce) keeps per-page state authoritative on that tier.
                 let mapped = m.scalar_extent().unwrap_or(reserved);
-                if entries.iter().any(|&(_, kind)| kind == 3) {
+                if info.3.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
-                    (Some(entries), mapped)
+                    (Some(info), mapped)
                 }
             }
         };

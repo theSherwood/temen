@@ -847,9 +847,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    and `protect`s the "K" page read-only, the entry reads K and stores on an `Rw` page → 7509; root
    sums 8 × 7509 = 60072, interp ≡ codegen with every child emitted **paged**; the trap twin storing on
    the unmapped page faults on both tiers). The JS-orchestrated **op-13** loop (`temen_op13jit_*`,
-   #1025 Path 1) runs its separate-module child on the single-shot emit, which declines a page-op
-   child; the loop then runs that child on the interpreter over the same carve and marshaled powerbox
-   instead of trapping the driver (`browser/tests/op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
+   #1025 Path 1) runs its separate-module child on the single-shot emit, which since #1201 emits a
+   page-op child **paged** (`compile_jit_paged` → `compile_module_reactor_paged`; `JitOnrampRun`
+   rebuilds the page-state table after each bounce and `driveJitRun` re-points `"pagestate"`/`"mapped"`,
+   the child's real starter `AddressSpace` handle reaching the emitted entry) — the same paged emit
+   serves a root on-ramp guest that `unmap`s/`protect`s (`browser/tests/jit_paged_onramp.rs`, the wasmi
+   twin of `driveJitRun`; `browser-op13jit-e2e-test.mjs` in real Chromium). A child the emit still
+   declines (`SharedRegion` aliasing, fibers) runs on the interpreter over the same carve and marshaled
+   powerbox instead of trapping the driver (`op13jit_paged.rs`). *(All scalar unit signatures — i32/i64/f32/f64 — now
    marshal by type; **v128** unit sigs stay on the interpreter — the cap ABI is scalar-only by design,
    §17.)*
 6. **Long tail + measurement.** **Measurement landed early:** the `temen-wasmjit` cross-engine bench

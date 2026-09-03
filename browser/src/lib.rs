@@ -5395,6 +5395,14 @@ pub struct JitOnrampRun {
     grow: bool,
     prots: Option<Vec<(u64, u8)>>,
     mapped: u64,
+    /// #1201 — the run emits **paged** (`module_uses_unmap_protect`, see `emit_for_run`): `pagestate`
+    /// is the #750 page-state table rebuilt from each bounce's live map
+    /// ([`bytecode::build_pagestate_table`]) and `mapped` is then the table's **coverage** (the paged
+    /// driver contract). The JS driver reads both through [`temen_onramp_jit_run_pagestate_ptr`]/`_len`
+    /// and [`temen_onramp_jit_run_mapped`] to re-point the emitted `"pagestate"`/`"mapped"` globals
+    /// before `f0` and after each bounce — the single-shot twin of the coop tier's `sync_pagestate`.
+    paged: bool,
+    pagestate: Vec<u8>,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -5426,8 +5434,11 @@ enum RunInput {
         /// The child entry's data-stack pointer, passed as its first `i64` param for a §14 child-entry
         /// module (`child_entry_ok`: `[I64]->[I64]`). `0` for a paramless `_start` child (the param is
         /// then not emitted, so the value is unused). The emitted `f{entry}` is called with the module's
-        /// declared params filled from this (`sp`, then `0` for any second).
+        /// declared params filled from this (`sp`, then `entry_as` for a second).
         entry_sp: u64,
+        /// #1201 — the child entry's second `i64` param, its starter `AddressSpace` handle for the
+        /// `[I64,I64]->[I64]` shape (a page-op child's outlined leaf `call.cap`s on it). `0` otherwise.
+        entry_as: u64,
     },
 }
 
@@ -5523,6 +5534,7 @@ impl JitOnrampRun {
                 init_mem,
                 readback,
                 entry_sp: 0,
+                entry_as: 0,
             },
         )
     }
@@ -5587,6 +5599,7 @@ impl JitOnrampRun {
         init_mem: Vec<u8>,
         readback: Option<(temen_fs::MemFsHandle, String)>,
         entry_sp: u64,
+        entry_as: u64,
         cached: Option<CachedEmit>,
     ) -> Result<JitOnrampRun, i32> {
         let win_base = win_ptr as usize;
@@ -5605,6 +5618,7 @@ impl JitOnrampRun {
                 init_mem,
                 readback,
                 entry_sp,
+                entry_as,
             },
             cached,
         )
@@ -5776,11 +5790,17 @@ impl JitOnrampRun {
         // Emit rooted at func 0 (`_start`), wasm-driven; cross-tier helpers route to
         // `env.call_interp`. The front door reports `InterpDriven` (→ fall back to the pure
         // interpreter) if `_start` is out of subset or its reachable set can suspend — this
-        // driver can only run a wasm-driven artifact.
-        let artifact = temen_wasm_jit::compile_jit(
+        // driver can only run a wasm-driven artifact. #1201: a guest that `unmap`s/`protect`s its
+        // pages emits PAGED — this driver rebuilds the page-state table after each bounce
+        // (`run_cross_tier`) and the JS/wasmi driver re-points `"pagestate"`/`"mapped"` at it — so
+        // such a guest runs on this tier instead of declining (invariant 14, runtime-backend parity
+        // with the coop tier); a non-page-op guest emits byte-identical to before.
+        let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
+        let artifact = temen_wasm_jit::compile_jit_paged(
             &module,
             temen_wasm_jit::Shape::Batch { entry: 0 },
             shared_memory,
+            page_log2,
         )
         .map_err(|_| STATUS_UNSUPPORTED)?;
         let temen_wasm_jit::DriveMode::WasmDriven { .. } = artifact.drive else {
@@ -5825,8 +5845,14 @@ impl JitOnrampRun {
         // Build the powerbox + the window-prefix seed (`init_mem`, the argv blob for the `Fs` path)
         // from the input shape. `frame` is only ever populated by a `display.present` — kept for
         // struct parity; a compiler/compute guest never presents.
-        let (mut host, init_mem, frame, fs_readback, entry_sp): (Host, Vec<u8>, _, _, u64) =
-            match input {
+        let (mut host, init_mem, frame, fs_readback, entry_sp, entry_as): (
+            Host,
+            Vec<u8>,
+            _,
+            _,
+            u64,
+            u64,
+        ) = match input {
                 RunInput::Stdin(stdin) => {
                     let mut host = Host::new();
                     host.stdin = stdin;
@@ -5834,7 +5860,7 @@ impl JitOnrampRun {
                     // by name; `display` too (unused by a pure compute guest, present for parity with
                     // `onramp_exec`). No `fs` (input comes from stdin).
                     let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
-                    (host, Vec::new(), frame, None, 0)
+                    (host, Vec::new(), frame, None, 0, 0)
                 }
                 RunInput::Fs {
                     image,
@@ -5851,26 +5877,34 @@ impl JitOnrampRun {
                     host.stdin = stdin;
                     let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
                     let fs_readback = readback.map(|key| (fsh, key));
-                    (host, init_mem, frame, fs_readback, 0)
+                    (host, init_mem, frame, fs_readback, 0, 0)
                 }
                 RunInput::PreGranted {
                     host,
                     init_mem,
                     readback,
                     entry_sp,
+                    entry_as,
                 } => {
                     // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
                     // here; the parent granted exactly what the child holds (the confinement default).
                     let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                    (*host, init_mem, frame, readback, entry_sp)
+                    (*host, init_mem, frame, readback, entry_sp, entry_as)
                 }
             };
         // The emitted `f{entry}` is called `f{entry}(win, env, ...declared params)`. A paramless `_start`
         // adds no trailing slots; a §14 child-entry (`[I64]->[I64]` / `[I64,I64]->[I64]`) takes its
-        // data-stack pointer as the first param (`entry_sp`), any second param `0` (#1025 Path 1).
+        // starter `Instantiator` as the first param (`entry_sp`) and its `AddressSpace` as the second
+        // (`entry_as`) — the handles the interpreter passes (#1025 Path 1; #1201 for the second).
         let n_params = module.funcs.first().map_or(0, |f| f.params.len());
         let entry_slots: Vec<Value> = (0..n_params)
-            .map(|i| Value::I64(if i == 0 { entry_sp as i64 } else { 0 }))
+            .map(|i| {
+                Value::I64(match i {
+                    0 => entry_sp as i64,
+                    1 => entry_as as i64,
+                    _ => 0,
+                })
+            })
             .collect();
         // Live-stream stdout from the emitted `_start`'s cross-tier `write` bounces (#1141) — a no-op
         // unless the page has a streaming sink active.
@@ -5899,6 +5933,16 @@ impl JitOnrampRun {
         // global self-initializes to the same `1 << size_log2`); it grows as `vm_map` bounces commit
         // pages. Computed before `module` moves into the struct.
         let declared_extent = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        // #1201: a paged emit starts from the interpreter's initial map — the declared window `Rw`
+        // (the NULL guard is enforced by the emitted guard compare itself; the first bounce's map then
+        // carries the guard entries into the table too) — and `"mapped"` is the table's coverage.
+        let paged = temen_wasm_jit::module_uses_unmap_protect(&module);
+        let (pagestate, mapped) = if paged {
+            let page = temen_interp::host_page_size();
+            bytecode::build_pagestate_table(&(page, declared_extent, 0, Vec::new()))
+        } else {
+            (Vec::new(), declared_extent)
+        };
         Ok(JitOnrampRun {
             module,
             program,
@@ -5918,7 +5962,9 @@ impl JitOnrampRun {
             fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
             prots: Some(Vec::new()),
-            mapped: declared_extent,
+            mapped,
+            paged,
+            pagestate,
         })
     }
 
@@ -6011,6 +6057,8 @@ impl JitOnrampRun {
             grow: false,
             prots: Some(Vec::new()),
             mapped: 1u64 << win_log2,
+            paged: false,
+            pagestate: Vec::new(),
         })
     }
 
@@ -6080,7 +6128,7 @@ impl JitOnrampRun {
             // A `None` page map = a §13 `Backed` alias appeared, unrestorable by a byte map ⇒ fail the run
             // closed (the caller declines to the interpreter, which handles §13). On-ramp guests are not
             // granted a `SharedRegion`, so this is defensive.
-            let (r, pages, mapped) = self.program.run_over_grown(
+            let (r, info, mapped) = self.program.run_over_grown_info(
                 func,
                 args,
                 &mut fuel,
@@ -6090,10 +6138,20 @@ impl JitOnrampRun {
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 self.prots.as_deref(),
             );
-            match pages {
-                Some(p) => {
-                    self.prots = Some(p);
-                    self.mapped = mapped;
+            match info {
+                Some(info) => {
+                    if self.paged {
+                        // #1201: the paged contract — the table from the live map, `"mapped"` = its
+                        // coverage (never the reserved domain), so the emitted bound check traps
+                        // everything above the table where the interpreter faults and the page states
+                        // refine within it.
+                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        self.pagestate = table;
+                        self.mapped = cover;
+                    } else {
+                        self.mapped = mapped;
+                    }
+                    self.prots = Some(info.3);
                 }
                 None => {
                     self.prots = None;
@@ -6125,6 +6183,19 @@ impl JitOnrampRun {
     /// coop tier's `temen_coop_mapped`.
     pub fn mapped(&self) -> u64 {
         self.mapped
+    }
+
+    /// #1201 — whether the run emitted **paged** (the module `unmap`s/`protect`s); the driver then
+    /// carries [`pagestate`](Self::pagestate) per the #750 contract.
+    pub fn paged(&self) -> bool {
+        self.paged
+    }
+
+    /// #1201 — the page-state table as of the last bounce (one byte per page: `0` Unmapped, `1` Rw,
+    /// `2` Ro), whose coverage [`mapped`](Self::mapped) reports. Empty for a non-paged run. Valid until
+    /// the next `run_cross_tier`.
+    pub fn pagestate(&self) -> &[u8] {
+        &self.pagestate
     }
 
     /// The captured streams / exit — read after the emitted `f0` returns or unwinds (same contract as
@@ -8448,6 +8519,18 @@ pub extern "C" fn temen_onramp_jit_run_wasm_len() -> usize {
 pub extern "C" fn temen_onramp_jit_run_mapped() -> u64 {
     unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.mapped())
 }
+/// #1201 — the page-state table of a **paged** single-shot run (the value for the emitted `"pagestate"`
+/// global; `temen_onramp_jit_run_mapped` is then its coverage), rebuilt after each bounce. Null / `0`
+/// for a non-paged run or with no live run. Valid until the next `temen_onramp_jit_run_call_interp`.
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_run_pagestate_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }
+        .map_or(core::ptr::null(), |r| r.pagestate().as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_run_pagestate_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.map_or(0, |r| r.pagestate().len())
+}
 /// The window base as a byte offset in this module's linear memory — the emitted `f0`'s `win`.
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_run_win_ptr() -> usize {
@@ -9074,7 +9157,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
                 // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
                 let cinst = host.grant_instantiator(0, child_size);
-                let _cas = host.grant_address_space(0, child_size);
+                let cas = host.grant_address_space(0, child_size);
                 if host
                     .bind_child_manifest(&d.child.imports, &d.child.types)
                     .is_err()
@@ -9082,6 +9165,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     return OP13JIT_TRAP;
                 }
                 let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
+                // The child-entry's starter handles, exactly as the interpreter passes them
+                // (`[Instantiator, AddressSpace]` for the two-param shape) — #1201: a page-op child's
+                // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`.
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
@@ -9093,6 +9179,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                         Vec::new(),
                         None,
                         cinst as u64,
+                        cas as u64,
                         Some(emit),
                     )
                 };
@@ -12210,6 +12297,7 @@ block 0 () {
                 host,
                 Vec::new(),
                 None,
+                0,
                 0,
                 None,
             )

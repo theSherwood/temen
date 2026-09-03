@@ -1299,6 +1299,44 @@ block 0 (vas: i64) {{
     )
 }
 
+// #1201 — the **page-op op-13 child** for the real-Chromium `browser-op13jit-e2e-test.mjs` (the twin of
+// `browser/tests/op13jit_paged.rs`): a §14 child-entry (`f0(inst, as)`, `memory 15` — the mini driver's
+// buddy-half carve) whose leaf resolves the marshaled `fs` (→ 1) and `protect`s the page holding "K" = 75
+// read-only; `f0` reads K back through the `Ro` page → 40 + 1 + 75 = 116. On the op-13 JIT loop it emits
+// PAGED and runs on `driveJitRun` with the page-state table re-synced after the bounce. "K" sits at 16 KiB,
+// just above the NULL guard the single-shot bounce seeds; the browser's software page is 4 KiB.
+const OP13_PAGED_CHILD: &str = r#"memory 15
+data 16384 "K"
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vas: i64) {
+  vc = call 1 (vas)
+  vq = i64.const 16384
+  vk = i64.load8_u vq
+  v40 = i64.const 40
+  vs = i64.add v40 vc
+  vr = i64.add vs vk
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (vas: i64) {
+  vname = i64.const 29542
+  vnp = i64.const 16392
+  i64.store vnp vname
+  vl2 = i64.const 2
+  vh = self.resolve vnp vl2
+  vc = call.cap 13 0 (i64) -> (i64) vh (vnp)
+  vas32 = i32.wrap_i64 vas
+  vq = i64.const 16384
+  vlen = i64.const 4096
+  vro = i32.const 1
+  vpr = call.cap 5 2 (i64, i64, i32) -> (i64) vas32 (vq, vlen, vro)
+  vsum = i64.add vc vpr
+  return vsum
+  }
+}
+"#;
+
 // §22 runtime-compile unit for the multi-Worker twins: `() -> (i32)` returning 7 — each worker vCPU
 // compiles it AT RUNTIME (`call.cap 11 0`) from the blob the harness stages in the window.
 const JIT_RT_UNIT: &str = r#"memory 16
@@ -2267,6 +2305,8 @@ fn main() {
     // #1151 — the page-op unit (→ 8 × 7509 = 60072) and its trap twin (store on the unmapped page).
     emit("threads_inst_paged_unit", &inst_paged_unit(16384 + 8));
     emit("threads_inst_paged_trap_unit", &inst_paged_unit(32768 + 8));
+    // #1201 — the page-op op-13 child (→ 116 on the op-13 JIT loop, emitted paged).
+    emit("op13_paged_child", OP13_PAGED_CHILD);
     emit("threads_inst_threads_unit", THREADS_INST_THREADS_UNIT);
     // §22 multi-Worker twins: the runtime-compile units + the guests whose workers compile them
     // (blob offsets/lengths baked into the guest's `compile (ptr, len)` sites; the harness stages
