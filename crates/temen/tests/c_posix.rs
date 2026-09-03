@@ -4896,3 +4896,52 @@ fn c_a_execd_background_terminal_read_is_stopped_by_sigttin() {
          boundary and is benched by the pick — no ERESTART spin — matching the oracle"
     );
 }
+
+fn ttou_bg_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pb;\n\
+static char msg[3];\n\
+int main(void){{\n\
+  msg[0]='h'; msg[1]='i'; msg[2]='\\n';\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 1;\n\
+  if (pb == 0){{ __px_setpgid(0,0,0); __px_write(0,1,(long)msg,3); return 7; }}\n\
+  __px_setpgid(0, pb, pb);\n\
+  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  if (h != pb) return 100;\n\
+  if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1198 — the TTOU counterpart to the SIGTTIN stop: a **background write** to the terminal must NOT
+// stop when `TOSTOP` is off — and bash leaves it off, so `cmd &` that prints (e.g. `seq 3 &`) runs to
+// completion. The personality raised SIGTTOU unconditionally on a background write; before the coop
+// engine enforced stops that was invisible, but once #1198 benches a stopped domain an unconditional
+// SIGTTOU would freeze every writing `cmd &` after its first line. The write now proceeds silently
+// (TOSTOP clear), so the forked background writer exits 7 (`5007`), not stopped (`4022`), on BOTH
+// engines. (A background *read* still always SIGTTIN-stops — see the sibling tests above.)
+#[test]
+fn c_a_background_terminal_write_does_not_stop_without_tostop() {
+    let e = run_interp_terminal_setup(&ttou_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(5007)],
+        "tree-walker: the background write proceeded (TOSTOP off — the default), so the writer ran to \
+         its own exit 7 instead of SIGTTOU-stopping"
+    );
+    let b = run_bytecode_terminal_setup(&ttou_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(5007)],
+        "coop bytecode (the browser tier): same — a writing `cmd &` is not frozen by an unconditional \
+         SIGTTOU; the write goes through and the job completes, matching the oracle"
+    );
+}

@@ -321,6 +321,11 @@ const SIGTSTP: i32 = 20; // the terminal ^Z — stop unless caught/ignored
 const SIGTTIN: i32 = 21; // background read from the terminal
 const SIGTTOU: i32 = 22; // background write to the terminal
 
+/// #1198 — `c_lflag` bit `TOSTOP` (Linux `0o400`): when set, a background write to the terminal
+/// raises `SIGTTOU` (stop); when clear — the default, and what bash leaves it — a background write
+/// proceeds silently. Only the write side gates on it; a background *read* always `SIGTTIN`-stops.
+const TOSTOP: i64 = 0o400;
+
 /// #796 default actions — `SIGKILL` (uncatchable, unmaskable terminate).
 const SIGKILL: i32 = 9;
 /// #796 — `sigaction` `sa_flags` bit: restart an interrupted blocking call instead of `-EINTR`
@@ -3646,6 +3651,21 @@ impl Ctx<'_> {
     /// job-control-aware guest what happened).
     fn tty_background_check(&mut self, sig: i32) {
         if self.p.pgid != self.w.fg_pgid {
+            // #1198 — a background WRITE only stops when the terminal has `TOSTOP` set (POSIX). bash
+            // leaves TOSTOP off by default, so `cmd &` output must proceed. Before the cooperative
+            // engine enforced stops this was invisible (a SIGTTOU-"stopped" writer kept running under
+            // the missing per-op stop poll); now that a stopped domain is really benched at its syscall
+            // boundary, an unconditional SIGTTOU stop would freeze every writing `cmd &` (`seq 3 &`
+            // stalls after its first line). A background READ (SIGTTIN) is unconditional — it always stops.
+            if sig == SIGTTOU
+                && self
+                    .w
+                    .terminal
+                    .as_ref()
+                    .is_none_or(|t| t.lflag & TOSTOP == 0)
+            {
+                return;
+            }
             // #798 slice 2 — through the delivery gate: default disposition now really STOPS the
             // background job (the doorbell became the POSIX action); ignored proceeds silently
             // (POSIX: an ignored TTOU write goes through); caught pends. The stop fires after
