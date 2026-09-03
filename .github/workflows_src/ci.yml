@@ -788,6 +788,11 @@ jobs:
   browser-real:
     name: real-browser (Chromium via Playwright)
     runs-on: ubuntu-latest
+    # #1175: the multi-Worker Chromium threads/atomics battery (step "Build threads module + run in
+    # Chromium (powerbox + multi-Worker → 4000)") is a lost-wakeup/deadlock flake source; with no
+    # job-level cap a hang runs to GitHub's 6-hour default instead of failing fast. Normal wall-clock
+    # is ~11 min, so 30 reds a hang in minutes with generous margin (same class of fix as #906).
+    timeout-minutes: 30
     # The Pages deploy rides this required job (ISSUES.md I75): it already builds the whole deployable
     # site (wasm engine + Postgres + chibicc + self-host), so assembling + uploading the Pages artifact
     # here — on a main push — means the deploy needs no separate heavy job that starves for a runner.
