@@ -195,3 +195,25 @@ bench = false
 
 [profile.release]
 debug = 1
+
+# #810 live-`mapped` bound: the mask-only tier's runtime-aware confinement — the emitted bounds check
+# against a guest-shaped (`vm_map`-grown, contiguous or above/filling a hole) window with the `"mapped"` global synced
+# from the tier-up event — vs the interpreter's page map, plus a canary past the reservation (escape).
+# The stable `live_mapped_diff` test drives the same `fuzz_one` from seeds.
+[[bin]]
+name = "live_mapped"
+path = "fuzz_targets/live_mapped.rs"
+test = false
+doc = false
+bench = false
+
+# #810 randomized page-state table: the paged tier's per-access check over THREE fuzzer-chosen page ops
+# (interleaved Unmapped/Rw/Ro runs, holes, re-commits) with scalar widths 1..16 and bulk walks straddling
+# every state transition — vs the interpreter's `check_prot`. The stable `pagestate_diff` test drives
+# the same `fuzz_one_pagestate` from seeds.
+[[bin]]
+name = "pagestate"
+path = "fuzz_targets/pagestate.rs"
+test = false
+doc = false
+bench = false
