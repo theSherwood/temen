@@ -5073,17 +5073,15 @@ fn debug_advance_fiber(
                             FiberState::Pending { funcref, sp } => (funcref, sp),
                             _ => unreachable!(),
                         };
-                    let m0 = source.primary();
-                    let f = (funcref as u32 as usize) & m0.table_mask;
-                    let ok = m0
-                        .sigs
-                        .get(f)
-                        .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
-                    if !ok {
+                    let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
+                    else {
                         return FiberStep::Trapped(Trap::FiberFault);
-                    }
-                    match Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)]) {
-                        Ok(v) => v,
+                    };
+                    match Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)]) {
+                        Ok(mut v) => {
+                            v.module = tmod;
+                            v
+                        }
                         Err(t) => return FiberStep::Trapped(t),
                     }
                 }
@@ -9111,18 +9109,15 @@ fn drive_nested(
                             FiberState::Pending { funcref, sp } => (funcref, sp),
                             _ => unreachable!(),
                         };
-                        // Resolve through module 0's natural table + the fiber signature, exactly
-                        // as `step_vcpu` (the raw-slot naming of DESIGN.md §22's renegotiation).
-                        let m0 = source.primary();
-                        let f = (funcref as u32 as usize) & m0.table_mask;
-                        let ok = m0
-                            .sigs
-                            .get(f)
-                            .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
-                        if !ok {
+                        // Resolve through the shared dispatch table (module-aware, exactly as
+                        // `Op::CallIndirect`), so a fiber over an installed §22 unit runs (#1226).
+                        let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
+                        else {
                             return Err(Trap::FiberFault);
-                        }
-                        Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)])?
+                        };
+                        let mut fvm = Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)])?;
+                        fvm.module = tmod;
+                        fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
                         match std::mem::replace(slot, FiberState::Running { blocking_ip: None }) {
@@ -9518,24 +9513,21 @@ fn step_vcpu(
                                 FiberState::Pending { funcref, sp } => (funcref, sp),
                                 _ => unreachable!(),
                             };
-                        // Resolve the fiber entry through module 0's natural table + `fiber_sig` —
-                        // a forged/mistyped funcref is a `FiberFault`. A *submitted unit* may now
-                        // create fibers (DESIGN.md §22 "Concurrency", renegotiated 2026-07-30); it
-                        // names the entry by a raw slot (`cont.new <slot>`), and an entry that is an
-                        // original (module-0) function resolves here exactly as the JIT's shared
-                        // `fn_table` and the tree-walker's `dispatch_indirect` do. (A fiber over an
-                        // *installed* unit function — a module ≥ 1 entry — is the deferred case; it
-                        // would need the module-aware `DomainTable` here, as those two backends use.)
-                        let m0 = dom.source.primary();
-                        let f = (funcref as u32 as usize) & m0.table_mask;
-                        let ok = m0
-                            .sigs
-                            .get(f)
-                            .is_some_and(|(p, r)| p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS);
-                        if !ok {
+                        // Resolve the fiber entry through the shared dispatch table (module-aware,
+                        // exactly as `Op::CallIndirect` / the tree-walker's `dispatch_indirect` / the
+                        // JIT's shared `fn_table`): a fiber may start on an **installed §22 unit**
+                        // function (a module ≥ 1 entry), not only a module-0-natural one — a
+                        // forged/mistyped funcref is still a `FiberFault` (#1226, DESIGN.md §22
+                        // "Concurrency", renegotiated 2026-07-30). Resolve against `ctx.table`, the
+                        // same table the fiber's own `call.dyn`s dispatch through (paired with
+                        // `dom.source` in the `resume` above).
+                        let Some((tmod, tfunc, tm)) =
+                            resolve_fiber_entry(&dom.source, ctx.table, funcref)
+                        else {
                             return Err(Trap::FiberFault);
-                        }
-                        let mut fvm = Vm::new(&m0, f, &[Value::I64(sp), Value::I64(arg)])?;
+                        };
+                        let mut fvm = Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)])?;
+                        fvm.module = tmod;
                         // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
                         fvm.durable_region_base = super::shadow_region_base(k + 1);
                         fvm
@@ -9894,6 +9886,34 @@ fn step_vcpu(
 /// `fiber_sig` params/results, inlined so the driver can compare without allocating a `FuncType`.
 const FIBER_PARAMS: [ValType; 2] = [ValType::I64, ValType::I64];
 const FIBER_RESULTS: [ValType; 1] = [ValType::I64];
+
+/// Resolve a fiber `funcref` through the domain's shared `call.dyn` dispatch table — **module-aware,
+/// exactly as [`Op::CallIndirect`]** — so a fiber may start on an **installed §22 unit** function (a
+/// module ≥ 1 entry), not only a module-0-natural one (#1226). The install slot the guest passed to
+/// `cont.new` is a dispatch-table index just like a `call.dyn` target, so resolving it here matches how
+/// the fiber's own calls dispatch and how the tree-walker (`dispatch_indirect`) and Cranelift JIT
+/// (shared `fn_table`) resolve the same entry. Returns the target `(module, func, its Compiled)`, or
+/// `None` (⇒ `FiberFault`) for an empty padding slot or a signature that is not the fiber-entry type
+/// `(i64, i64) -> i64`. Pass the same `(source, table)` pair the fiber's `resume` uses, so entry
+/// resolution and in-fiber dispatch agree.
+fn resolve_fiber_entry(
+    source: &ModuleSource,
+    table: &SharedSlots,
+    funcref: i32,
+) -> Option<(usize, usize, std::sync::Arc<Compiled>)> {
+    let ts = table.slot((funcref as u32 as usize) & (table.len() - 1));
+    if ts.module == super::TABLE_EMPTY {
+        return None;
+    }
+    let (tmod, tfunc) = (ts.module as usize, ts.func as usize);
+    let tm = source.get(tmod)?;
+    let (p, r) = tm.sigs.get(tfunc)?;
+    if p[..] == FIBER_PARAMS && r[..] == FIBER_RESULTS {
+        Some((tmod, tfunc, tm))
+    } else {
+        None
+    }
+}
 
 /// A §14 `instantiate` child's confined runtime, owned by [`drive`] alongside the task set. Its `mem`
 /// is a `nested_view` sub-window sharing the parent's backing (the §14 shared data plane), its `host`

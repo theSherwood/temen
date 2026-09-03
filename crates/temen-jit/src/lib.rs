@@ -2693,6 +2693,18 @@ impl CompiledModule {
         // keeping id-equality ≡ structural equality across units (DESIGN.md §22).
         let mut distinct = distinct_types(&m.funcs);
         intern_unit_sigs(&mut distinct, &m.funcs, &m.types)?;
+        // §12: a module that uses `cont.*` may `cont.new` a fiber over ANY dispatch-table slot —
+        // including a `Jit.install` slot into an installed unit whose `(i64,i64)->(i64)` entry is
+        // interned only when that unit is later `define_extra`'d. Intern the fiber-entry signature NOW
+        // (the compile-path twin of `enable_fiber_hosting`) so its id is stable and a later install of
+        // that signature gets the SAME id — keeping id-equality ≡ structural equality across units, so
+        // the root's fiber first-resume type-check matches an installed-unit entry (#1226) instead of
+        // seeing `NO_MATCH_TYPE_ID` (the root program itself has no such function). Append-only +
+        // idempotent, so a fiber-free module never reaches this and function ids are unchanged.
+        #[cfg(fiber_rt)]
+        if module_uses_fibers(m) {
+            intern_type(&mut distinct, &fiber_func_type())?;
+        }
         let distinct = distinct;
 
         // The host thunk + ctx addresses, baked into `call.cap` sites as constants.
@@ -2714,8 +2726,14 @@ impl CompiledModule {
         // fiber runtimes — one standalone, or one per vCPU when threads use `cont.*`.
         #[cfg(fiber_rt)]
         let fiber_type_id = type_id_of(&distinct, &fiber_func_type());
+        // The fiber-entry funcref is a `call.dyn` dispatch-table index (a `ref.func` of a module-0
+        // function OR a `Jit.install` slot into an installed §22 unit), so it must be masked into the
+        // **reserved** table exactly as `call.dyn` (the `(table_len as u64) - 1` mask baked per call
+        // site, below, and stored in `fn_table_mask`) — not `next_pow2(nfuncs) - 1`, which is 0 for a
+        // 1-function root and folds every install slot onto func 0, trapping `FiberFault` for an
+        // installed-unit fiber body (#1226; the tree-walk oracle + bytecode engine resolve module-aware).
         #[cfg(fiber_rt)]
-        let fiber_mask = (m.funcs.len().next_power_of_two() as u64) - 1;
+        let fiber_mask = (table_len as u64) - 1;
         // Fibers + threads compose via a per-vCPU fiber runtime (execution context), published through a
         // thread-local, all over **one domain-shared fiber table** (D57 3b-ii: a unified handle
         // namespace + a per-domain §15 quota, matching the interpreter's run-shared registry). This is

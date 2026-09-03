@@ -2198,7 +2198,7 @@ pub enum Inst {
     /// i64` at first resume (a bad ref traps there, like [`Inst::CallIndirect`]); `sp`
     /// (`i64`) is the fiber's own data-stack base — a fiber owns a **stack pair** (§3d): its
     /// in-window data stack (based here) plus the out-of-band control stack the runtime
-    /// allocates. Yields an `i32` **fiber handle**: a forgeable index into the runtime-owned
+    /// allocates. Yields an `i64` **fiber handle**: a forgeable index into the runtime-owned
     /// fiber table, masked + generation-checked at use like a capability handle (§3c), so a
     /// forged handle is inert (it traps or selects one of this domain's own fibers, never
     /// host state). The fiber does not run yet; the first resume calls `func(sp, arg)`.
