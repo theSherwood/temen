@@ -180,7 +180,11 @@ fn emitted_nested(child: &temen_ir::Module) -> (Outcome, u32) {
                 let len = slot(2);
                 let mg = caller.data().mapped_global.unwrap();
                 let cur = mg.get(&caller).i64().unwrap() as u64;
-                let grown = cur.max(off + len).min(GROWN); // never past the parent-granted carve
+                // Mirror the interpreter's `map`: the committed high-water rounds **up to the host
+                // page** (16 KiB macOS / 4 KiB Linux), so the live `mapped` a faithful driver reads back
+                // is page-rounded — not the raw `off+len`. `GROWN` (the carve) caps it (page-aligned).
+                let page = temen_interp::host_page_size();
+                let grown = cur.max((off + len).next_multiple_of(page)).min(GROWN);
                 mg.set(&mut caller, Val::I64(grown as i64)).unwrap();
                 caller.data_mut().bounces += 1;
                 // `map` returns 0 on success — write it into the result slot (slot 0).
