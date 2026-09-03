@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc onramp shell forth nifler nim_hello nim_phases lua_snapshot
+#   Steps:  leng chibicc onramp shell forth nifler nim_hello nim_phases nim_driver_guest lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -178,6 +178,21 @@ if want nim_phases; then
                   || note "nim_phases ✗ (a phase guest missing/failed re-validate)"
   else
     note "nim_phases SKIP/✗ (nimony toolchain — nim + nimony/bin/{nimony,hexer} + clang/llvm-nm?)"
+  fi
+fi
+
+# --- 6c) nimsem driver-guest fixtures (crates/temen-llvm/tests/rust_driver_nimsem.rs): the step-9 guest
+# op-13-spawns child-entry nimsem over the system import closure. build_frontend.sh (TEMEN_NIMSEM_EMIT_
+# ASSET=1) rebuilds nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif together. Toolchain-gated. -
+if want nim_driver_guest; then
+  echo "=== [nim_driver_guest] build_frontend.sh (emit) → nimsem_ce + syslib + sys.{p,s}.nif fixtures ==="
+  FX=crates/temen-run/demos/nim_frontend/fixtures
+  if TEMEN_NIMSEM_EMIT_ASSET=1 bash crates/temen-run/demos/nim_frontend/build_frontend.sh >/dev/null 2>&1 \
+     && [ -f "$FX/nimsem_ce.temen.gz" ] && gunzip -c "$FX/nimsem_ce.temen.gz" > /tmp/rebuild_nimsem_ce.temen 2>/dev/null \
+     && validate /tmp/rebuild_nimsem_ce.temen; then
+    note "nim_driver_guest ✓ (nimsem_ce.temen.gz + syslib.tar.gz + sysvq0asl.{p,s}.nif)"
+  else
+    note "nim_driver_guest SKIP/✗ (nimony toolchain — see build_frontend.sh; then refresh the expected via the test)"
   fi
 fi
 

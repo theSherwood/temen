@@ -51,6 +51,26 @@ NIMONY_BIN=<repo>/.nimtool/nimony/bin/nimony  NIMSEM_BIN=<repo>/.nimtool/nimony/
 
 Fail-soft **SKIP** without the toolchain (NIM.md §2). The `.temen` are build artifacts (not committed).
 
+## Committed driver-guest fixtures (`fixtures/`)
+
+`crates/temen-llvm/tests/rust_driver_nimsem.rs` (#1025 step 9) runs this front-end **per-PR without the
+toolchain**: a Rust-on-Temen guest op-13-spawns the real `nimsem` over the system import closure and the
+host asserts the emitted `.s.nif` is byte-identical to a committed expected (`nimsem` is deterministic
+for a fixed memfs). These are **wire-format-coupled** — regenerate them together on any IR/encoder/
+frontend change:
+
+- `fixtures/nimsem_ce.temen.gz` — `nimsem` built `--child-entry` (the op-13 child).
+- `fixtures/syslib.tar.gz` — the 26-file system import closure (`lib/std/system.nim` + its include set
+  under `lib/std/system/` + `lib/std/errorcodes/`) the `nifler` grandchildren parse.
+- `fixtures/sysvq0asl.p.nif` — the seeded parsed `system` module (`sys` = its nimony stem).
+- `fixtures/sysvq0asl.s.nif.gz` — the expected sema output.
+
+The `exec`'s nifler is the already-committed top-level `browser/web/assets/nifler.temen.gz` (either
+nifler yields identical output). **Regenerate** with `TEMEN_NIMSEM_EMIT_ASSET=1 bash build_frontend.sh`
+(or `ONLY=nim_driver_guest bash scripts/rebuild-assets.sh`), which rewrites all four from a fresh build.
+The system stem `sysvq0asl` is hardcoded in the test (argv + fixture names); if a frontend bump changes
+it, the emit prints a WARN — update the test in lockstep.
+
 ## Status
 
 ✅ **The full nimony front-end runs on the Temen.** With `nifler` (slice 1), `hexer` (slice 2), the
