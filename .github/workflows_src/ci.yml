@@ -1002,6 +1002,11 @@ jobs:
           # handoff or a blocking wait — bash prints `[1] pid`, the prompt stays usable, and the async
           # `[1]+ Done` posts on the next prompt. SKIPs with the batch when bash.temen is absent.
           node browser-bash-bg-test.mjs
+          # Background terminal-read stop (#1198): `cat &` reads the terminal from a background pgroup,
+          # so SIGTTIN stops it (`[1]+ Stopped cat`) — the exec'd reader is benched at its syscall
+          # boundary instead of spinning on -ERESTART, and the prompt stays usable with no input steal;
+          # `fg %1` + ^D resumes and ends it. SKIPs with the batch when bash.temen/bin_cat.temen is absent.
+          node browser-bash-bg-tty-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs

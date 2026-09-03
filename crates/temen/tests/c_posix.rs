@@ -4819,3 +4819,129 @@ fn c_a_background_terminal_read_is_stopped_by_sigttin() {
         "coop bytecode (the browser tier): same SIGTTIN background-read stop — matching the oracle"
     );
 }
+
+fn bgexec_src() -> String {
+    format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long cpid;\n\
+static int sync_fds[2];\n\
+static char *av[] = {{ \"catr\", 0 }};\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+int main(void){{\n\
+  int h2[2]; __vm_pipe(h2); __px_pipe_adopt(0, h2[0], h2[1], (long)sync_fds);\n\
+  cpid = __px_fork(0, 0);\n\
+  if (cpid < 0) return 1;\n\
+  if (cpid == 0) {{\n\
+    __px_setpgid(0, 0, 0);\n\
+    char g; long r = __px_read(0, sync_fds[0], (long)&g, 1);\n\
+    long hh = ph_(r); if (hh >= 0) __vm_read((int)hh, &g, 1);\n\
+    execve(\"/bin/catr\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  __px_setpgid(0, cpid, cpid);\n\
+  /* do NOT tcsetpgrp: catr is a BACKGROUND job (the shell's group stays foreground) */\n\
+  char g = 'g'; long wr = __px_write(0, sync_fds[1], (long)&g, 1);\n\
+  long wh = ph_(wr); if (wh >= 0) __vm_write((int)wh, &g, 1);\n\
+  long h; while ((h = __px_waitpid(0, cpid, (long)&status, 2)) == -4) {{ }}\n\
+  if (h != cpid) return 100;\n\
+  if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1198 — the same SIGTTIN background-terminal stop as
+// `c_a_background_terminal_read_is_stopped_by_sigttin`, but the reader is an **exec'd** coreutil
+// (`execve("/bin/catr")`), not a fork twin still running the parent's image. This is the shape a
+// real `bg cat` takes in the browser: the shell forks, the child `setpgid`s into its own group and
+// `execve`s the command, and the command — never `tcsetpgrp`'d to the foreground — reads the
+// terminal. `catr` retries `-ERESTART` in a `while` loop, exactly as a libc `read` wrapper does.
+//
+// On the tree-walker this already worked (a per-op `stop_flag` safepoint benches the stopped domain
+// after one retry turn). On the cooperative bytecode engine — the browser tier — the exec'd reader
+// SPUN: the engine has no per-op stop poll, so the `-ERESTART` retry loop re-issued `read` forever
+// inside one `step_vcpu` call, never yielding, so the pick could never bench it and the parent's
+// `waitpid` never woke (#1198). The fix yields to the pump at the syscall boundary when the domain
+// stopped itself, and the round-robin pick skips a stopped domain — so both engines now bench the
+// reader and report the SIGTTIN(21) stop word 4021.
+#[test]
+fn c_a_execd_background_terminal_read_is_stopped_by_sigttin() {
+    let feeds = || vec![(400u64, b"x\n".to_vec())];
+    let e = run_interp_terminal_setup(&bgexec_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(4021)],
+        "tree-walker: the exec'd background `catr` read raised SIGTTIN, retried `-ERESTART`, parked \
+         stopped, and the parent's waitpid(WUNTRACED) reported the SIGTTIN(21) stop"
+    );
+    let b = run_bytecode_terminal_setup(&bgexec_src(), feeds(), |host, posix| {
+        stage_executable(host, posix, "/bin/catr", CATR_CMD);
+    });
+    assert_eq!(
+        b.result,
+        vec![Value::I32(4021)],
+        "coop bytecode (the browser tier): the exec'd background reader yields at the syscall stop \
+         boundary and is benched by the pick — no ERESTART spin — matching the oracle"
+    );
+}
+
+fn ttou_bg_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pb;\n\
+static char msg[3];\n\
+int main(void){{\n\
+  msg[0]='h'; msg[1]='i'; msg[2]='\\n';\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 1;\n\
+  if (pb == 0){{ __px_setpgid(0,0,0); __px_write(0,1,(long)msg,3); return 7; }}\n\
+  __px_setpgid(0, pb, pb);\n\
+  long h; while ((h=__px_waitpid(0, pb, (long)&status, 2)) == -4){{}}\n\
+  if (h != pb) return 100;\n\
+  if ((status & 0xff) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1198 — the TTOU counterpart to the SIGTTIN stop: a **background write** to the terminal must NOT
+// stop when `TOSTOP` is off — and bash leaves it off, so `cmd &` that prints (e.g. `seq 3 &`) runs to
+// completion. The personality raised SIGTTOU unconditionally on a background write; before the coop
+// engine enforced stops that was invisible, but once #1198 benches a stopped domain an unconditional
+// SIGTTOU would freeze every writing `cmd &` after its first line. The write now proceeds silently
+// (TOSTOP clear), so the forked background writer exits 7 (`5007`), not stopped (`4022`), on BOTH
+// engines. (A background *read* still always SIGTTIN-stops — see the sibling tests above.)
+#[test]
+fn c_a_background_terminal_write_does_not_stop_without_tostop() {
+    let e = run_interp_terminal_setup(&ttou_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(5007)],
+        "tree-walker: the background write proceeded (TOSTOP off — the default), so the writer ran to \
+         its own exit 7 instead of SIGTTOU-stopping"
+    );
+    let b = run_bytecode_terminal_setup(&ttou_bg_src(), vec![], |_, _| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(5007)],
+        "coop bytecode (the browser tier): same — a writing `cmd &` is not frozen by an unconditional \
+         SIGTTOU; the write goes through and the job completes, matching the oracle"
+    );
+}

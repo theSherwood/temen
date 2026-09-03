@@ -3773,7 +3773,8 @@ int main(int argc, char **argv) {
   if (__vm_fs(46, p2, 0, 0, 0) != p1) return 3;   /* getpgid(c2) == the job group */
   if (__vm_fs(48, 1, p1, 0, 0) != 0) return 4;    /* tcsetpgrp(stdout, job) */
   if (__vm_fs(47, 1, 0, 0, 0) != p1) return 7;    /* tcgetpgrp readback */
-  /* The shell is background now: its own stdout write rings SIGTTOU (and proceeds). */
+  /* The shell is background now: its own stdout write rings SIGTTOU (and proceeds). This is the
+   * proto-terminal (no termios), so the #1198 TOSTOP gate does not apply — the doorbell still rings. */
   __vm_fs(30, 22, 9, 0, 0);                       /* catch SIGTTOU (token 9) */
   msg = 0x0a24;                                   /* "$\n" */
   if (__vm_fs(0, 1, (long)&msg, 2, 0) != 2) return 8;
