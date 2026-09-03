@@ -11146,7 +11146,7 @@ fn vec4i16_byte_clamp_select_sext_mask() {
     let full = vec![Value::I64(t.entry_sp as i64)];
     let mut fuel = 1_000_000u64;
     let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec4i16 clamp");
-    let want = 255 | (0 << 8) | (100 << 16) | (0 << 24);
+    let want = 255 | (100 << 16); // lanes (255, 0, 100, 0), little-endian
     assert_eq!(
         r,
         vec![Value::I32(want)],
