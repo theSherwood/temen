@@ -524,7 +524,11 @@ Two different things surface as "SIGSEGV" and the design splits them:
   supplies the page, and **resume retries the access**. Retry-on-resume is the trick:
   precise fault handling with no per-access deoptimization metadata — the tax that
   makes in-band SIGSEGV handlers expensive in a JIT, and which Cranelift won't sell
-  cheaply.
+  cheaply. The pager's side is a plain serve loop, and it never outlives its client
+  unobserved: a demand child that finishes — returns, exits, or traps, before or after
+  its first fault — releases a pager parked in `svc.wait` with the no-progress `0`
+  (the timed form's answer), so the pager reaches its `join` and the child's outcome
+  is raised there instead of the run hanging (#1217).
 
 The substrate generalization: **pager authority over a region is a grantable
 capability** — to the parent (built today), to a sibling service, or to a designated

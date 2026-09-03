@@ -226,6 +226,18 @@ fn run(backend: Backend, src: &str) -> Result<i32, String> {
 
 const BACKENDS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
+/// [`run`] on its own thread with a deadline: the #1217 pins guard against a *hang* (a pager
+/// parked forever), so a regression must fail the test, not stall the binary until CI's timeout.
+fn run_bounded(backend: Backend, src: &str) -> Result<i32, String> {
+    let src = src.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run(backend, &src));
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(60))
+        .unwrap_or_else(|_| panic!("{backend:?}: the run hung (pager parked with a dead client?)"))
+}
+
 /// The record spelling of a plain op-0 spawn produces the identical result.
 #[test]
 fn record_spawn_matches_legacy_plain_spawn() {
@@ -248,18 +260,157 @@ fn record_spawn_carries_the_pager_binding() {
 }
 
 /// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
-/// recoverable kind the pager services (the reserved region cannot be mapped). The parent `join`s
-/// straight away (no `svc.wait`: a parent parked on a service whose only client died never wakes —
-/// the pre-existing deadlock shape, tracked separately), and the join surfaces the trap; the run
-/// does not exit.
+/// recoverable kind the pager services (the reserved region cannot be mapped). The parent is parked
+/// in `svc.wait` for a request that never comes; #1217 releases it (its `svc.wait` returns `0`, the
+/// no-progress answer) so its `join` surfaces the trap — the run traps instead of hanging.
 #[test]
 fn pager_child_guard_fault_is_fatal() {
-    let src = record_pager_program_at(0).replace("vs = svc.wait vz", "vs = i64.extend_i32_u vz");
+    let src = record_pager_program_at(0);
     for b in BACKENDS {
         assert!(
-            run(b, &src).is_err(),
+            run_bounded(b, &src).is_err(),
             "{b:?}: a NULL fault in a paged child is fatal"
         );
+    }
+}
+
+/// #1217: a demand child that **never faults** — it returns `5` without touching its window — must
+/// not strand the pager parked in `svc.wait`. The wait returns `0` once the child is gone; the
+/// `join` delivers `5`; the run exits `0 * 1000 + 5`.
+#[test]
+fn pager_child_that_never_faults_releases_the_parked_pager() {
+    let src = record_pager_program_at(0).replace("vb = i32.load8_u vaddr", "vb = i32.const 5");
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
+    }
+}
+
+/// #1217, the other order: the child is already gone (joined) when the parent reaches `svc.wait`,
+/// so nothing could ever wake it — the wait returns `0` immediately rather than parking.
+#[test]
+fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
+    let src = record_pager_program_at(0)
+        .replace("vb = i32.load8_u vaddr", "vb = i32.const 5")
+        .replace(
+            "  vs = svc.wait vz\n  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n",
+            "  vj = call.cap 6 1 (i32) -> (i64) vh (vch)\n  vs = svc.wait vz\n",
+        );
+    assert!(
+        src.contains("(vch)\n  vs = svc.wait"),
+        "the swap must apply"
+    );
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 5, "{b:?}");
+    }
+}
+
+/// #1217, the granted-offer shape: the root spawns a **server** child (func 1: one `svc.wait`,
+/// returning its count), mints a `child_offer` over its export, and spawns a **guest** child
+/// (func 3, `guest`) with that offer re-granted by name as `"fork"`; then `join`s the server and
+/// exits its count. The guest's 4-KiB carve is below the guard size, so it stages the name at 0.
+fn granted_client_program(guest: &str) -> String {
+    format!(
+        "\
+memory 18
+data 16384 \"vm\"
+data 16684 \"fork\"
+type 0 func (i64) -> (i64)
+type 1 interface {{ op: 0 }}
+export 0 interface \"fork\" 1 {{ op: 2 }}
+import 0 \"exit\" (i32) -> ()
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  v0 = self.resolve vp vl
+  vf0 = i64.const 4294967296
+  vf8 = i64.const 65536
+  vf16 = i64.const -4294967284
+  vf24 = i64.const 4294967295
+  vf32 = i64.const 0
+  vf40 = i64.const 0
+  vf48 = i64.const 0
+{server_rec}
+  vsp = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
+  vz0 = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 16640
+  vnp0 = i32.const 16684
+  i32.store va0 vnp0
+  va1 = i64.const 16644
+  vfour = i32.const 4
+  i32.store va1 vfour
+  va2 = i64.const 16648
+  i32.store va2 voff
+  vg0 = i64.const 12884901888
+  vg8 = i64.const 131072
+  vg40 = i64.const 16640
+  vg48 = i64.const 1
+{guest_rec}
+  vgp = i64.const 17600
+  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
+  vjs = call.cap 6 1 (i32) -> (i64) v0 (vs)
+  vc = i32.wrap_i64 vjs
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vz = i32.const 0
+  vs = svc.wait vz
+  return vs
+  }}
+}}
+func 2 (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  vseven = i64.const 7
+  return vseven
+  }}
+}}
+func 3 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{guest}
+  }}
+}}
+",
+        server_rec = store_record(17536),
+        guest_rec = store_record(17600)
+            .replace("vra", "vgra")
+            .replace("vf0", "vg0")
+            .replace("vf8", "vg8")
+            .replace("vf40", "vg40")
+            .replace("vf48", "vg48"),
+        guest = guest,
+    )
+}
+
+/// The healthy exchange, pinning the program shape: the guest resolves `"fork"` and calls it once
+/// (the handler returns 7), the server's `svc.wait` counts 1, the root exits 1.
+#[test]
+fn granted_client_that_calls_once_is_served() {
+    let src = granted_client_program(
+        "  vfn = i64.const 1802661734
+  vz8 = i64.const 0
+  i64.store vz8 vfn
+  vl4 = i64.const 4
+  vfork = self.resolve vz8 vl4
+  vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
+  return vr",
+    );
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 1, "{b:?}");
+    }
+}
+
+/// #1217: the guest traps before calling. The server's only client is gone, so its `svc.wait`
+/// returns `0` (never parks forever), it returns, and the root's `join` delivers `0`.
+#[test]
+fn granted_client_that_dies_before_calling_releases_the_server() {
+    let src = granted_client_program("  unreachable");
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 0, "{b:?}");
     }
 }
 
