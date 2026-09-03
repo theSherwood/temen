@@ -9346,6 +9346,22 @@ fn step_vcpu(
                 if preemptible {
                     return Ok(VcpuStop::Preempted);
                 }
+                // #1198 — the COOPERATIVE pump only: `resume` bailed at a syscall boundary because this
+                // domain just STOPPED itself (a background-terminal SIGTTIN/SIGTTOU, or ^Z). Return to the
+                // pump so its round-robin pick benches the stopped domain, instead of re-looping straight
+                // into another stopped spin. The single-vCPU parallel/debug driver (`cooperative: false`)
+                // must NOT bench here: it has no pick to bench into, and its stop is a real concurrent
+                // busy-wait — the stopped vCPU spins on its own OS thread until ANOTHER thread SIGCONTs it,
+                // exactly as before. `Preempted` on that path is `ThreadFault` (fail-closed), so gate it.
+                // Otherwise a normal `Suspended` (the sliced-harness budget boundary) re-loops as ever.
+                if cooperative
+                    && ctx
+                        .host
+                        .with(|h| h.signal_poll())
+                        .is_some_and(|(_, s)| s.stopped())
+                {
+                    return Ok(VcpuStop::Preempted);
+                }
             }
             Outcome::Done(vals) => match vt.chain.pop() {
                 // The vCPU's root activation finished.
@@ -10410,11 +10426,26 @@ impl CoopSched {
                     }
                 }
             }
+            // #1198 — a Runnable task whose DOMAIN is stopped (SIGTSTP/SIGTTIN/SIGTTOU, before its
+            // SIGCONT) must not be stepped: a stopped process makes no progress. The tree-walker won't
+            // run a stopped process; the coop pick must skip it too, or a background job whose read
+            // returns `-ERESTART` on the SIGTTIN keeps re-issuing (its libc retries) and spins forever
+            // instead of benching. It re-runs when SIGCONT clears the stop. Domain-scoped (invariant 12).
+            let domain_stopped = |i: usize| -> bool {
+                match tasks[i].env {
+                    Some(k) => extra_envs[k]
+                        .host
+                        .lock_unpoisoned()
+                        .signal_poll()
+                        .is_some_and(|(_, s)| s.stopped()),
+                    None => host.signal_poll().is_some_and(|(_, s)| s.stopped()),
+                }
+            };
             // #1157 — round-robin from `last_pick + 1` (wrapping) rather than lowest-index-first.
             let n = tasks.len();
             let Some(ti) = (1..=n)
                 .map(|k| (last_pick + k) % n)
-                .find(|&i| matches!(tasks[i].state, TaskState::Runnable))
+                .find(|&i| matches!(tasks[i].state, TaskState::Runnable) && !domain_stopped(i))
             else {
                 // F2 (FIBER_PARK.md) — no runnable task with punt completions outstanding: that is
                 // pending work on the offload pool, never a deadlock and never a reason to jump the
@@ -14836,6 +14867,24 @@ impl Vm {
                                 Reg::from_value(slot_to_val(*ty, *s));
                         }
                         pc += 1;
+                        // #1198 — this syscall STOPPED its own domain (a background terminal read/write
+                        // hit `tty_background_check` → SIGTTIN/SIGTTOU default-action stop; or a `^Z`
+                        // SIGTSTP). The tree-walker benches a stopped domain at its per-op `stop_flag`
+                        // safepoint, so a libc restart loop (`while (r == -ERESTART) read();`) parks after
+                        // one turn. The bytecode engine has no per-op poll, so that loop would spin here
+                        // forever. Yield to the pump at THIS syscall boundary — the result is already
+                        // written and `pc` is past the op, so the resume re-executes the *next* op on
+                        // wake — and let the round-robin pick bench the stopped domain (it re-admits at
+                        // SIGCONT). Gated on a signal personality (`signal_poll` is `None` for a
+                        // pure-compute guest), and only reached when a syscall completed inline (no park),
+                        // so the common syscall path pays a single already-cached predicate.
+                        if signal_poll.as_ref().is_some_and(|(_, s)| s.stopped()) {
+                            self.module = module;
+                            self.cur = cur;
+                            self.base = base;
+                            self.pc = pc;
+                            return Ok(Outcome::Suspended);
+                        }
                     }
                 }
                 Op::SvcPoll { dst, wait } => {
