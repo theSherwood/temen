@@ -128,28 +128,29 @@ block 0 (v0: i32) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
+  v2 = i64.const 20480
   v3 = i32.const 171
   i32.store8 v2 v3
-  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
+  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0 — the child's marker and record sit at
+  ; 20 KiB, above the guard its 32 KiB carve reserves (#1206) and clear of the grandchild carve
   q2v0 = i64.const 8589934592
   q2v1 = i64.const 16384
   q2v2 = i64.const -4294967286
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0
-  q2a0 = i64.const 1280
+  q2a0 = i64.const 20544
   i64.store q2a0 q2v0
-  q2a1 = i64.const 1288
+  q2a1 = i64.const 20552
   i64.store q2a1 q2v1
-  q2a2 = i64.const 1296
+  q2a2 = i64.const 20560
   i64.store q2a2 q2v2
-  q2a3 = i64.const 1304
+  q2a3 = i64.const 20568
   i64.store q2a3 q2v3
-  q2a4 = i64.const 1312
+  q2a4 = i64.const 20576
   i64.store q2a4 q2v4
-  q2a5 = i64.const 1320
+  q2a5 = i64.const 20584
   i64.store q2a5 q2v4
-  q2a6 = i64.const 1328
+  q2a6 = i64.const 20592
   i64.store q2a6 q2v4
   v8 = call.cap 6 17 (i64) -> (i32) v1 (q2a0)
   v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
@@ -173,8 +174,9 @@ fn nesting_composes_to_depth_two() {
 }
 
 /// A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
-/// `AddressSpace` (iface 5, op 1 = `unmap`) to decommit the first 16 KiB of its **own** 64 KiB
-/// window — a confined sub-window page op — and returns the unmap result (0). The parent returns it.
+/// `AddressSpace` (iface 5, op 1 = `unmap`) to decommit the second 16 KiB of its **own** 64 KiB
+/// window (the first 16 KiB is its NULL guard, #1206 — a page op there is refused as at the root) — a
+/// confined sub-window page op — and returns the unmap result (0). The parent returns it.
 const ADDRESS_SPACE: &str = r#"memory 18
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -206,7 +208,7 @@ block 0 (v0: i32) {
 func (i64, i64) -> (i64) {
 block 0 (v0: i64, v1: i64) {
   v2 = i32.wrap_i64 v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i64.const 16384
   v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)
   return v5

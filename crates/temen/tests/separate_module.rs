@@ -18,12 +18,12 @@ use temen_verify::verify_module;
 /// offset 0, and returns `byte + 1000` — exercising code, data, and window writes of a foreign module.
 fn child_src() -> &'static str {
     "memory 16
-data 100 \"VM\"
+data 16484 \"VM\"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 7
   i32.store8 v3 v4
   v5 = i64.extend_i32_u v2
@@ -86,9 +86,12 @@ block 0 (v0: i32, v1: i32) {
     );
     // Its data segment materialized into the carve (the parent sees it — the §14 superset)…
     const CHILD: u64 = 64 << 10;
-    assert_eq!(&mem[(CHILD + 100) as usize..(CHILD + 102) as usize], b"VM");
-    // …its marker landed at its offset 0, and nothing outside the carve changed.
-    assert_eq!(mem[CHILD as usize], 7, "child marker missing");
+    assert_eq!(
+        &mem[(CHILD + 16484) as usize..(CHILD + 16486) as usize],
+        b"VM"
+    );
+    // …its marker landed at its offset 16 KiB (above its guard), and nothing outside the carve changed.
+    assert_eq!(mem[(CHILD + 16384) as usize], 7, "child marker missing");
     let init: Vec<u8> = (0..(128u64 << 10))
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
@@ -153,12 +156,12 @@ block 0 (v0: i32, v1: i32) {
 /// `byte + 2000`. Both are `(i64) -> (i64)` (the starter-cap convention).
 fn named_child_src() -> &'static str {
     "memory 16
-data 100 \"VM\"
+data 16484 \"VM\"
 export 0 func \"alpha\" 0
 export 1 func \"beta\" 1
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
@@ -168,7 +171,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000

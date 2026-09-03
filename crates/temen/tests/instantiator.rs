@@ -217,12 +217,13 @@ fn nesting_composes_to_depth_two() {
 #[test]
 fn child_manages_its_own_pages_via_address_space() {
     // A two-arg child receives its starter caps `(Instantiator, AddressSpace)`. It uses the
-    // `AddressSpace` (iface 5) to `unmap` the first 16 KiB of its **own** 64 KiB window — a §14
+    // `AddressSpace` (iface 5) to `unmap` the second 16 KiB of its **own** 64 KiB window (the first
+    // 16 KiB is its NULL guard, #1206 — a page op there is refused as at the root) — a §14
     // sub-window page op, which works now that the prot map is keyed window-relative. The unmap
-    // decommits (zeroes) exactly the child's first 16 KiB of the shared parent backing and returns 0;
-    // the rest of the child's window, and the entire parent outside it, stay as the parent seeded.
+    // decommits (zeroes) exactly those 16 KiB of the shared parent backing and returns 0; the rest of
+    // the child's window, and the entire parent outside it, stay as the parent seeded.
     const CHILD: u64 = 64 << 10; // child window [64 KiB, 128 KiB)
-    const SPAN: u64 = 16 << 10; // unmap the child's first 16 KiB (a whole multiple of any host page)
+    const SPAN: u64 = 16 << 10; // unmap the child's [16 KiB, 32 KiB) (a whole multiple of any host page)
     let src = "memory 18\n\
          func (i32) -> (i64) {\n\
          block 0 (v0: i32) {\n\
@@ -254,7 +255,7 @@ fn child_manages_its_own_pages_via_address_space() {
          func (i64, i64) -> (i64) {\n\
          block 0 (v0: i64, v1: i64) {\n\
          \x20 v2 = i32.wrap_i64 v1\n\
-         \x20 v3 = i64.const 0\n\
+         \x20 v3 = i64.const 16384\n\
          \x20 v4 = i64.const 16384\n\
          \x20 v5 = call.cap 5 1 (i64, i64) -> (i64) v2 (v3, v4)\n\
          \x20 return v5\n\
@@ -271,7 +272,7 @@ fn child_manages_its_own_pages_via_address_space() {
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();
     for i in 0..(256u64 << 10) {
-        if (CHILD..CHILD + SPAN).contains(&i) {
+        if (CHILD + SPAN..CHILD + 2 * SPAN).contains(&i) {
             assert_eq!(
                 mem[i as usize], 0,
                 "child's unmapped page byte {i} not decommitted"

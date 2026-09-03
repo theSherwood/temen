@@ -129,8 +129,15 @@ block 0 (v0: i64) {
 ";
 
 /// The §2.2 pager shape spelled as a record: pager export 0, one 64 KiB stride, handler
-/// supplies 123 — the record twin of `paging_offer.rs`'s single-fault vertical (exit 1123).
+/// supplies 123 — the record twin of `paging_offer.rs`'s single-fault vertical (exit 1123). The child
+/// faults at 16 KiB: its carve reserves the NULL guard below that like any window (#1206), and a guard
+/// fault is fatal, never the recoverable kind a pager services.
 fn record_pager_program() -> String {
+    record_pager_program_at(16384)
+}
+
+/// [`record_pager_program`] with the child's faulting address chosen by the caller.
+fn record_pager_program_at(fault: u64) -> String {
     let f0 = (1u64 << 32) as i64; // version 0, entry 1
     let f16 = 16i64; // size_log2 16, pager export 0
     let f24 = 0xFFFF_FFFFi64; // module -1, budget 0
@@ -172,7 +179,7 @@ block 0 () {{
 
 func 1 (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  vaddr = i64.const 0
+  vaddr = i64.const {fault}
   vb = i32.load8_u vaddr
   vbw = i64.extend_i32_u vb
   return vbw
@@ -191,6 +198,7 @@ block 0 (vaddr: i64) {{
         f0 = f0,
         f16 = f16,
         f24 = f24,
+        fault = fault,
         stores = store_record(17408),
     )
 }
@@ -236,6 +244,22 @@ fn record_spawn_carries_the_pager_binding() {
     let src = record_pager_program();
     for b in BACKENDS {
         assert_eq!(run(b, &src).expect("run"), 1123, "{b:?}: record ≡ op 16");
+    }
+}
+
+/// #1206: a pager-bound child's fault **below its NULL guard** is fatal on every backend — never the
+/// recoverable kind the pager services (the reserved region cannot be mapped). The parent `join`s
+/// straight away (no `svc.wait`: a parent parked on a service whose only client died never wakes —
+/// the pre-existing deadlock shape, tracked separately), and the join surfaces the trap; the run
+/// does not exit.
+#[test]
+fn pager_child_guard_fault_is_fatal() {
+    let src = record_pager_program_at(0).replace("vs = svc.wait vz", "vs = i64.extend_i32_u vz");
+    for b in BACKENDS {
+        assert!(
+            run(b, &src).is_err(),
+            "{b:?}: a NULL fault in a paged child is fatal"
+        );
     }
 }
 
@@ -432,39 +456,39 @@ block 0 (v0: i64) {{
   cu = i32.const 117
   ce = i32.const 101
   cr = i32.const 114
-  a0 = i64.const 0
+  a0 = i64.const 16384
   i32.store8 a0 cs
-  a1 = i64.const 1
+  a1 = i64.const 16385
   i32.store8 a1 ct
-  a2 = i64.const 2
+  a2 = i64.const 16386
   i32.store8 a2 cd
-  a3 = i64.const 3
+  a3 = i64.const 16387
   i32.store8 a3 co
-  a4 = i64.const 4
+  a4 = i64.const 16388
   i32.store8 a4 cu
-  a5 = i64.const 5
+  a5 = i64.const 16389
   i32.store8 a5 ct
   len6 = i64.const 6
   hout = self.resolve a0 len6
-  a16 = i64.const 16
+  a16 = i64.const 16400
   cO = i32.const 79
   i32.store8 a16 cO
   one = i64.const 1
   wo = call.cap 0 1 (i64, i64) -> (i64) hout (a16, one)
-  a32 = i64.const 32
+  a32 = i64.const 16416
   i32.store8 a32 cs
-  a33 = i64.const 33
+  a33 = i64.const 16417
   i32.store8 a33 ct
-  a34 = i64.const 34
+  a34 = i64.const 16418
   i32.store8 a34 cd
-  a35 = i64.const 35
+  a35 = i64.const 16419
   i32.store8 a35 ce
-  a36 = i64.const 36
+  a36 = i64.const 16420
   i32.store8 a36 cr
-  a37 = i64.const 37
+  a37 = i64.const 16421
   i32.store8 a37 cr
   herr = self.resolve a32 len6
-  a40 = i64.const 40
+  a40 = i64.const 16424
   cE = i32.const 69
   i32.store8 a40 cE
   we = call.cap 0 1 (i64, i64) -> (i64) herr (a40, one)

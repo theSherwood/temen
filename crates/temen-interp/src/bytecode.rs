@@ -3136,7 +3136,13 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         size_log2: Option<u8>,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = size_log2.map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
+        let mem = size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            // #1206: a spawned thread's `Mem` carries its own page map over the shared window, so it
+            // seeds the guard itself — a thread storing at NULL traps exactly as its spawner does.
+            mm.seed_null_guard(temen_ir::module_null_guard());
+            mm
+        });
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 
@@ -3325,11 +3331,14 @@ impl<'p> Vcpu<'p> {
         } else {
             vec![Value::I64(cinst as i64)]
         };
-        let mem = Some(Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
-            size_log2,
-            back,
-        ));
+        let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, size_log2, back);
+        // #964/#1094/#1206: the NULL guard is the one canonical layout — a confined child's carve
+        // reserves `[0, POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested
+        // arm and every cross-tier bounce over the same carve already seed it; the emitted tier's guard
+        // compare is unconditional). `seed_null_guard` skips a carve smaller than the guard, so a tiny
+        // sub-window (a 1-KiB grandchild) stays fully usable.
+        mm.seed_null_guard(temen_ir::module_null_guard());
+        let mem = Some(mm);
         let mut vt = VTask::new(&cunit, entry as usize, &args)?;
         vt.active.module = module as usize;
         vt.active.home = module as usize;
@@ -11407,10 +11416,11 @@ impl CoopSched {
                     let off_u = off as u64;
                     // #1094: the guard-overlap check must use the *spawning task's own* window guard,
                     // not the root's. A nested child running in a sub-guard (< 16384) carve is
-                    // unguarded (`null_guard == 0`), so a low grandchild carve is legal there — the
-                    // OS-thread parallel driver already reads the child's own `mem` (this file, the
-                    // parallel `Instantiate` arm), so the cooperative driver must match it or the two
-                    // engines diverge on depth-2 nesting.
+                    // unguarded (`seed_null_guard` skips it, `null_guard == 0`), so a low grandchild
+                    // carve is legal there; a child in a carve at or above the guard is guarded like a
+                    // root (#1206) and refuses one — the OS-thread parallel driver already reads the
+                    // child's own `mem` (this file, the parallel `Instantiate` arm), so the cooperative
+                    // driver must match it or the two engines diverge on depth-2 nesting.
                     let holder_guard = match tasks[ti].env {
                         None => mem.as_ref().map_or(0, |m| m.null_guard),
                         Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.null_guard),

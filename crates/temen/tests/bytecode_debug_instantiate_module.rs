@@ -14,16 +14,17 @@ use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{bytecode, run_with_host, Host, IrPc, Value};
 use temen_text::parse_module;
 
-// The granted "plugin" module: a 64 KiB window with a data segment "VM" at offset 100. Its entry
-// `(i64 instantiator) -> (i64)` loads its own data byte at 100 ('V' = 86), stores marker 7 at offset 0,
-// and returns byte + 1000 = 1086 — a foreign module's code + data + window write, confined.
+// The granted "plugin" module: a 64 KiB window with a data segment "VM" at offset 16 KiB + 100 (above
+// the NULL guard its carve reserves like any window, #1206). Its entry `(i64 instantiator) -> (i64)`
+// loads its own data byte there ('V' = 86), stores marker 7 at offset 16 KiB, and returns
+// byte + 1000 = 1086 — a foreign module's code + data + window write, confined.
 const CHILD_SRC: &str = r#"memory 16
-data 100 "VM"
+data 16484 "VM"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 7
   i32.store8 v3 v4
   v5 = i64.extend_i32_u v2
@@ -169,7 +170,7 @@ fn breakpoint_in_a_module_child_fires() {
 }
 
 /// Stopped inside the module child after its `i32.store8`, `read_window` reads the child's **confined**
-/// window: the marker byte 7 at the child's offset 0 (backing 64 KiB), not the shared window's offset 0.
+/// window: the marker byte 7 at the child's offset 16 KiB (backing 80 KiB), not the shared window's.
 #[test]
 fn inspect_a_module_childs_confined_window() {
     let mut r = module_session();
@@ -182,7 +183,7 @@ fn inspect_a_module_childs_confined_window() {
     let child = r.stopped_task().expect("stopped");
     assert!(r.select_task(child));
     assert_eq!(
-        r.read_window(0, 1).unwrap(),
+        r.read_window(16384, 1).unwrap(),
         vec![7u8],
         "reads the granted module child's confined window, not the shared one"
     );
@@ -219,7 +220,8 @@ fn module_child_tick_replays_deterministically() {
 
 /// A per-turn observation of the scheduled instantiate_module run: the global turn, every live task's
 /// call stack (frames as `m{module}f{func}b{block}i{inst}`, so a frame in the pushed child module reads
-/// `m1...`), and the child carve's bytes (its window starts at 64 KiB; the child stores marker 7 there).
+/// `m1...`), and the child carve's bytes (its window starts at 64 KiB; the child stores marker 7 at its
+/// offset 16 KiB — above its guard).
 fn sched_full_obs(run: &mut ScheduledDebugRun) -> (u64, String, Vec<u8>) {
     let turn = run.op_turn();
     let mut stacks = Vec::new();
@@ -236,7 +238,7 @@ fn sched_full_obs(run: &mut ScheduledDebugRun) -> (u64, String, Vec<u8>) {
         }
         stacks.push(format!("{tid}=[{}]", frames.join(",")));
     }
-    let win = run.read_window(65536, 8).unwrap_or_default();
+    let win = run.read_window(65536 + 16384, 8).unwrap_or_default();
     (turn, stacks.join(";"), win)
 }
 

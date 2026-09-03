@@ -1131,9 +1131,10 @@ block 0 (v0: i64) {
 }
 "#;
 
-// Same fan-out, but each child (handed its own Instantiator) instantiates a grandchild (func 2) over
-// its **whole** 64 KiB window (slog 16 at off 0 — a carve may equal the authorized range), joins it,
-// and returns its value — VM-in-VM-in-VM across three Worker generations. 8 × 9 = 72.
+// Same fan-out, but each child (handed its own Instantiator) instantiates a grandchild (func 2) in
+// the upper half of its 64 KiB window (slog 15 at off 32768 — above the child's own NULL guard, which
+// a 64 KiB carve reserves like a root does, #1206; a carve at 0 is refused there exactly as at the
+// root), joins it, and returns its value — VM-in-VM-in-VM across three Worker generations. 8 × 9 = 72.
 const THREADS_INST_NESTED: &str = r#"memory 20
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -1192,8 +1193,8 @@ func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
   ventry = i64.const 2
-  voff = i64.const 0
-  vslog = i64.const 16
+  voff = i64.const 32768
+  vslog = i64.const 15
   vquota = i64.const 0
   vgh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
   vgr = call.cap 6 1 (i32) -> (i64) vinst (vgh)
@@ -1238,7 +1239,7 @@ block 0 (v0: i64) {
   vk32 = i32.load8_u vz
   vk = i64.extend_i32_u vk32
   ventry = i64.const 1
-  voff = i64.const 0
+  voff = i64.const 32768
   vslog = i64.const 10
   vquota = i64.const 0
   vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)
