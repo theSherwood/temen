@@ -56,7 +56,7 @@
 ;   53 do_string()      54 strlen(p)        55 ab(b)            56 auleb(v)       57 skip_line()
 ;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
-;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)
+;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
 
 memory 20
 
@@ -117,6 +117,10 @@ prim resume 2 0 0 26
 prim yield 2 0 0 27
 prim ( 2 0 0 28
 prim \\ 2 0 0 29
+prim execute0 2 0 0 30
+prim execute1 2 0 0 31
+prim execute2 2 0 0 32
+prim exit 2 0 0 33
 prim + 1 2 1 64
 prim - 1 2 1 65
 prim * 1 2 1 66
@@ -1883,7 +1887,7 @@ block 12 () {
 func (i64) -> () {
 block 0 (id: i64) {
   id32 = i32.wrap_i64 id
-  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19()] 16()
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24()] 16()
   }
 block 1 () {
   call 45 ()
@@ -1993,6 +1997,57 @@ block 18 () {
   }
 block 19 () {
   call 57 ()
+  return
+  }
+; execute0(30)/execute1(31)/execute2(32): typed runtime `execute` — dispatch a runtime xt.
+block 20 (id: i64) {
+  c30 = i64.const 30
+  k = i64.sub id c30
+  k32 = i32.wrap_i64 k
+  br_table k32 [21(), 22(), 23()] 16()
+  }
+block 21 () {
+  z = i64.const 0
+  call 71 (z, z)
+  return
+  }
+block 22 () {
+  one = i64.const 1
+  call 71 (one, one)
+  return
+  }
+block 23 () {
+  two = i64.const 2
+  one = i64.const 1
+  call 71 (two, one)
+  return
+  }
+; exit(33): early return of the word's declared results, then a fresh DEAD block (like `again`).
+block 24 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 25() 26()
+  }
+block 25 () {
+  m = i64.const 33056
+  n = i64.const 13
+  call 38 (m, n)
+  return
+  }
+block 26 () {
+  nop = i64.const 65656
+  no = i64.load nop
+  call 19 (no)
+  x = call 13 ()
+  vp = i64.const 65576
+  d = i64.load vp
+  call 14 (x, d)
+  call 52 (d)
+  ddp = i64.const 65672
+  one = i64.const 1
+  i64.store ddp one
   return
   }
 }
@@ -3309,5 +3364,83 @@ block 0 (addr: i64, n: i64) {
   w = atomic.notify addr c
   r = i64.extend_i32_u w
   return r
+  }
+}
+
+; 71 emit_execute(ni, no): runtime `execute` — pop an xt (a funcref vs value) plus `ni` args, emit a
+; `call.dyn (ni×i64) -> (no×i64)` dispatching on the xt at run time, and push `no` results. The typed
+; counterpart of `emit_calldyn` (26) whose index is a runtime value, not a compile-time constant — so
+; `' word execute1`, deferred/dispatch-table words work (#1237). The xt is the top of stack.
+func (i64, i64) -> () {
+block 0 (ni: i64, no: i64) {
+  one = i64.const 1
+  need = i64.add ni one
+  call 11 (need)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 8() 1(ni, no)
+  }
+block 1 (ni: i64, no: i64) {
+  xt = call 12 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 8() 2(ni, no, xt)
+  }
+block 2 (ni: i64, no: i64, xt: i64) {
+  wrap = i64.const 98
+  xt32 = call 27 (wrap, xt)
+  op = i64.const 116
+  call 6 (op)
+  ti = call 21 (ni, no)
+  call 7 (ti)
+  call 7 (xt32)
+  call 7 (ni)
+  dp = i64.const 65576
+  d = i64.load dp
+  i0 = i64.sub d ni
+  i64.store dp i0
+  br 3(no, d, i0)
+  }
+block 3 (no: i64, d: i64, i: i64) {
+  c = i64.ge_s i d
+  br_if c 5(no, d) 4(no, d, i)
+  }
+block 4 (no: i64, d: i64, i: i64) {
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  i1 = i64.add i one
+  br 3(no, d, i1)
+  }
+block 5 (no: i64, d: i64) {
+  cip = i64.const 65616
+  n = i64.load cip
+  one = i64.const 1
+  n1 = i64.add n one
+  i64.store cip n1
+  br 6(no)
+  }
+block 6 (no: i64) {
+  z = i64.const 0
+  c = i64.le_s no z
+  br_if c 8() 7(no)
+  }
+block 7 (no: i64) {
+  v = call 9 ()
+  call 10 (v)
+  one = i64.const 1
+  no1 = i64.sub no one
+  br 6(no1)
+  }
+block 8 () {
+  return
   }
 }
