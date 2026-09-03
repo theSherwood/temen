@@ -11108,6 +11108,57 @@ fn fast_math_flags_on_every_float_op() {
     );
 }
 
+/// The byte-clamp idiom clang ≥22's SLP vectorizer emits in picojpeg's `pjpeg_decode_mcu` on a
+/// **64-bit** `<4 x i16>` (sub-128, so held lane-wise as tail scalars): `v >u 255 ? (v >s -1 ? -1 : 0)
+/// : v`, then `& 255` — `icmp` masks, `sext <4 x i1>`, a vector `select`, `and` with a splat, and the
+/// result threaded through a `phi`. Lanes (300, -5, 100, 0) → (255, 0, 100, 0), packed little-endian.
+/// (Embench's picojpeg miscompiled on all three engines under clang 22 with this shape.)
+#[test]
+fn vec4i16_byte_clamp_select_sext_mask() {
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %v = insertelement <4 x i16> <i16 300, i16 -5, i16 100, i16 poison>, i16 0, i64 3\n  \
+        %c1 = icmp ugt <4 x i16> %v, splat (i16 255)\n  \
+        %c2 = icmp sgt <4 x i16> %v, splat (i16 -1)\n  \
+        %sx = sext <4 x i1> %c2 to <4 x i16>\n  \
+        %sel = select <4 x i1> %c1, <4 x i16> %sx, <4 x i16> %v\n  \
+        %m = and <4 x i16> %sel, splat (i16 255)\n  \
+        br label %join\n\
+        join:\n  \
+        %ph = phi <4 x i16> [ %m, %entry ]\n  \
+        %e0 = extractelement <4 x i16> %ph, i64 0\n  \
+        %e1 = extractelement <4 x i16> %ph, i64 1\n  \
+        %e2 = extractelement <4 x i16> %ph, i64 2\n  \
+        %e3 = extractelement <4 x i16> %ph, i64 3\n  \
+        %z0 = zext i16 %e0 to i32\n  \
+        %z1 = zext i16 %e1 to i32\n  \
+        %z2 = zext i16 %e2 to i32\n  \
+        %z3 = zext i16 %e3 to i32\n  \
+        %s1 = shl i32 %z1, 8\n  \
+        %s2 = shl i32 %z2, 16\n  \
+        %s3 = shl i32 %z3, 24\n  \
+        %o1 = or i32 %z0, %s1\n  \
+        %o2 = or i32 %o1, %s2\n  \
+        %o3 = or i32 %o2, %s3\n  \
+        ret i32 %o3\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vec4i16 clamp .ll");
+    temen_verify::verify_module(&t.module).expect("verify vec4i16 clamp");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec4i16 clamp");
+    let want = 255 | (0 << 8) | (100 << 16) | (0 << 24);
+    assert_eq!(
+        r,
+        vec![Value::I32(want)],
+        "lanes (300,-5,100,0) clamp to (255,0,100,0)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, want, "JIT vec4i16 clamp"),
+        other => panic!("JIT vec4i16 clamp: unexpected {other:?}"),
+    }
+}
+
 /// `frem`: clang ≥22 folds a constant-divisor `fmod(x, C)` into the instruction (Postgres's `dsind`);
 /// older clangs keep the `fmod` call. Both lower to the synthesized IEEE-exact `__temen_fmod`, so the
 /// result is bit-identical to native either way — including the f32 form, which promotes through f64.

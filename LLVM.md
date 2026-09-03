@@ -138,6 +138,21 @@ once into a shared target dir), which needs `rust-src` on the stable toolchain (
 job installs it; `ci_tool_canary` checks). Linking the sysroot rlibs' embedded bitcode instead was
 tried and rejected: it is `panic=unwind` code, and the reachable set keeps growing crate by crate.
 
+*And what CI on clang 22 then surfaced* (the Postgres whole-program build and Embench, both compiled
+from source in CI — each fixed with a regression test): (7) `-ffast-math` code (openlibm in the
+Postgres build) carries fast-math flags on the float **casts** (LLVM ≥20: `fptrunc fast`), `phi`
+and the binops, which the reader skipped only on `fcmp`/`select`/`fneg`/`call`; (8) the i128
+three-way compare intrinsic `llvm.scmp.i32.i128` (Postgres's `int128` interval math) — two orderings
+on the `(lo, hi)` pairs; (9) `frem` (clang ≥22 folds a constant-divisor `fmod(x, C)` into it under
+`-fno-math-errno`) — lowered to the synthesized `__temen_fmod`; (10) a **silent miscompile**, the
+only one of the bump: clang 22's SLP vectorizer emits picojpeg's byte clamp as `icmp sgt <4 x i16>
+%v, splat (i16 -1)` on a 64-bit vector, and `vec_explode` handed the sub-128 *tail lanes* to the
+signed compare without sign-extending them out of their i32 container (`i16 -1` read as 65535) —
+the same §3b narrow-int hazard the scalar `icmp` path already guarded. Tail lanes are now canonically
+extended per the consumer's signedness. Found by the Embench differential (`picojpeg: MISCOMPILE`
+on all three engines), bisected with the example's new `EMBENCH_ONLY`/`EMBENCH_CFLAGS` to
+"vectorization + AVX2", then to the one function whose vector code differed between clang 21 and 22.
+
 *History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
 `llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual
 reader removed that coupling; the remaining pin is the rustc↔`llvm-link` pairing above.

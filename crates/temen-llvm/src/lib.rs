@@ -21321,8 +21321,19 @@ fn vec_explode(
                 }));
             }
         }
+        // A tail lane is a narrow scalar in an i32 container whose high bits are unspecified (the
+        // same §3b hazard as a scalar `icmp` on a zext-loaded `i16`): canonically extend it for the
+        // consumer — sign-extended for a signed use, zero-extended otherwise. Without this, a signed
+        // lane compare against `splat (i16 -1)` (held as 65535) is wrong for every positive lane
+        // (clang ≥22's SLP-vectorized byte clamp in picojpeg's `pjpeg_decode_mcu`).
+        let w = layout.shape.lane_bytes() as u32 * 8;
         for t in 0..layout.tail_lanes {
-            out.push(parts[layout.full_chunks + t]);
+            let v = parts[layout.full_chunks + t];
+            out.push(if w < 32 {
+                emit_ext(ctx, v, w, 32, signed)
+            } else {
+                v
+            });
         }
         return Ok(out);
     }
