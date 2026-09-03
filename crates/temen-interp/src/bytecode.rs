@@ -2350,6 +2350,37 @@ impl SharedProgram {
         reserved_log2: u8,
         prots: Option<&[(u64, u8)]>,
     ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>, u64) {
+        let (out, info, mapped) = self.run_over_grown_info(
+            func,
+            args,
+            fuel,
+            back,
+            host,
+            seed_data,
+            reserved_log2,
+            prots,
+        );
+        (out, info.map(|i| i.3), mapped)
+    }
+
+    /// [`run_over_grown`](Self::run_over_grown), but returning the post-run window's whole
+    /// [`MemMapInfo`] (page size, committed prefix, reservation, explicit entries) rather than the
+    /// entries alone — what a **paged** cross-tier driver feeds [`build_pagestate_table`] after each
+    /// bounce (#1201: the single-shot wasm-JIT tier carrying `unmap`/`protect`). `None` under the same
+    /// §13 `Backed`-alias condition; `Some((1, 0, 0, vec![]))` for a memory-less module. The trailing
+    /// `u64` is the scalar extent, as for `run_over_grown`.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub fn run_over_grown_info(
+        &self,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: &mut u64,
+        back: std::sync::Arc<super::Region>,
+        host: &mut Host,
+        seed_data: bool,
+        reserved_log2: u8,
+        prots: Option<&[(u64, u8)]>,
+    ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
             return (Err(Trap::Malformed), None, 0);
         }
@@ -2369,9 +2400,10 @@ impl SharedProgram {
         });
         let out = run(dom, func, args, fuel, &mut mem, host);
         let (pages, mapped) = match mem.as_ref() {
-            None => (Some(Vec::new()), 0),
+            None => (Some((1, 0, 0, Vec::new())), 0),
             Some(m) => {
-                let (_, _, reserved, entries) = m.map_info();
+                let info = m.map_info();
+                let reserved = info.2;
                 // The committed **scalar extent** — not `map_info`'s `window.mapped()`, which counts
                 // only the demand-committed prefix and misses a `vm_map`-grown tail (the pages live in
                 // the page map). `scalar_extent` folds the contiguous grown tail into the high-water so
@@ -2382,10 +2414,10 @@ impl SharedProgram {
                 // of a self-`protect`ed rodata page still admit, and the interpreter page map (returned
                 // in `entries`, re-seeded next bounce) keeps per-page state authoritative on that tier.
                 let mapped = m.scalar_extent().unwrap_or(reserved);
-                if entries.iter().any(|&(_, kind)| kind == 3) {
+                if info.3.iter().any(|&(_, kind)| kind == 3) {
                     (None, mapped) // §13 Backed alias — unrestorable by a byte snapshot; fail closed
                 } else {
-                    (Some(entries), mapped)
+                    (Some(info), mapped)
                 }
             }
         };
@@ -3104,7 +3136,13 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
         size_log2: Option<u8>,
     ) -> Result<Vcpu<'p>, Trap> {
-        let mem = size_log2.map(|sl| Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back));
+        let mem = size_log2.map(|sl| {
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            // #1206: a spawned thread's `Mem` carries its own page map over the shared window, so it
+            // seeds the guard itself — a thread storing at NULL traps exactly as its spawner does.
+            mm.seed_null_guard(temen_ir::module_null_guard());
+            mm
+        });
         Vcpu::with_mem_in(prog, module, func, args, mem, Host::new())
     }
 
@@ -3293,11 +3331,14 @@ impl<'p> Vcpu<'p> {
         } else {
             vec![Value::I64(cinst as i64)]
         };
-        let mem = Some(Mem::with_reservation_over(
-            DEFAULT_RESERVED_LOG2,
-            size_log2,
-            back,
-        ));
+        let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, size_log2, back);
+        // #964/#1094/#1206: the NULL guard is the one canonical layout — a confined child's carve
+        // reserves `[0, POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested
+        // arm and every cross-tier bounce over the same carve already seed it; the emitted tier's guard
+        // compare is unconditional). `seed_null_guard` skips a carve smaller than the guard, so a tiny
+        // sub-window (a 1-KiB grandchild) stays fully usable.
+        mm.seed_null_guard(temen_ir::module_null_guard());
+        let mem = Some(mm);
         let mut vt = VTask::new(&cunit, entry as usize, &args)?;
         vt.active.module = module as usize;
         vt.active.home = module as usize;
@@ -11406,10 +11447,11 @@ impl CoopSched {
                     let off_u = off as u64;
                     // #1094: the guard-overlap check must use the *spawning task's own* window guard,
                     // not the root's. A nested child running in a sub-guard (< 16384) carve is
-                    // unguarded (`null_guard == 0`), so a low grandchild carve is legal there — the
-                    // OS-thread parallel driver already reads the child's own `mem` (this file, the
-                    // parallel `Instantiate` arm), so the cooperative driver must match it or the two
-                    // engines diverge on depth-2 nesting.
+                    // unguarded (`seed_null_guard` skips it, `null_guard == 0`), so a low grandchild
+                    // carve is legal there; a child in a carve at or above the guard is guarded like a
+                    // root (#1206) and refuses one — the OS-thread parallel driver already reads the
+                    // child's own `mem` (this file, the parallel `Instantiate` arm), so the cooperative
+                    // driver must match it or the two engines diverge on depth-2 nesting.
                     let holder_guard = match tasks[ti].env {
                         None => mem.as_ref().map_or(0, |m| m.null_guard),
                         Some(k) => extra_envs[k].mem.as_ref().map_or(0, |m| m.null_guard),

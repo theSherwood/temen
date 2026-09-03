@@ -4,11 +4,11 @@
 //! byte-identical bodies into one definition plus an `@x = alias <ty>, ptr @y`. An alias has no body,
 //! so a `call` to it once looked like an undefined external (`Unsupported("call to external/undefined
 //! function …")`); the on-ramp now registers each function alias under its aliasee's index. The
-//! `peval_jit` end-to-end test exercises this, but only with the heavy `rustc +1.81`/`temen-peval`
+//! `peval_jit` end-to-end test exercises this, but only with the heavy `rustc`/`temen-peval`
 //! toolchain. This test pins the behaviour directly with a hand-written `.ll`: `@entry` calls
 //! `@aliasfn`, an alias of `@real`, and the result must flow through to `@real` on **both** backends.
 //!
-//! Gated only on `llvm-as-18` (far lighter than the on-ramp's `rustc +1.81` lane).
+//! Gated only on `llvm-as` (far lighter than the on-ramp's `rustc` build-std lane).
 
 use std::path::PathBuf;
 use temen_ir::ValType;

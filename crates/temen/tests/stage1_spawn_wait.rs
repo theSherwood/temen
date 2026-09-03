@@ -20,28 +20,30 @@ use temen_verify::verify_module;
 
 const WIN: usize = 128 << 10; // parent window: 128 KiB
 const CARVE: u64 = 64 << 10; // child carve at 64 KiB (its window is [64 KiB, 128 KiB))
-const OUT_OFF: u64 = 8; // child writes its result here (carve-relative)
+const ARGV_OFF: u64 = 16384; // the parent seeds argv here (above the child's NULL guard, #1206)
+const OUT_OFF: u64 = ARGV_OFF + 8; // child writes its result here; parent reads CARVE + OUT_OFF
 
-/// The child "command" module: a 64 KiB window, no data segments (so the parent's seed at low
-/// offsets survives spawn). Its entry reads a 4-byte `argv` token the parent seeded at offset 0,
+/// The child "command" module: a 64 KiB window, no data segments (so the parent's seed survives
+/// spawn). Its entry reads a 4-byte `argv` token the parent seeded at `ARGV_OFF` (16 KiB — above the
+/// NULL guard the carve reserves, #1206),
 /// sums the bytes, writes the sum back at `OUT_OFF` (the parent reads it via the shared carve), and
 /// returns the sum as its exit status. A pure function of the seed — proving argv was delivered.
 fn child_src() -> &'static str {
     "memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  p0 = i64.const 0
+  p0 = i64.const 16384
   b0 = i32.load8_u p0
-  p1 = i64.const 1
+  p1 = i64.const 16385
   b1 = i32.load8_u p1
-  p2 = i64.const 2
+  p2 = i64.const 16386
   b2 = i32.load8_u p2
-  p3 = i64.const 3
+  p3 = i64.const 16387
   b3 = i32.load8_u p3
   s01 = i32.add b0 b1
   s23 = i32.add b2 b3
   s = i32.add s01 s23
-  po = i64.const 8
+  po = i64.const 16392
   i32.store po s
   sx = i64.extend_i32_u s
   return sx
@@ -50,15 +52,15 @@ block 0 (v0: i64) {
 "
 }
 
-/// Build a parent "shell" module that seeds the 4-byte `token` into the child's carve at offset 0
-/// (window offset `CARVE`), spawns the child module (entry 0, carve at `CARVE`, size_log2 16), joins,
+/// Build a parent "shell" module that seeds the 4-byte `token` into the child's carve at `ARGV_OFF`
+/// (window offset `CARVE + ARGV_OFF`), spawns the child module (entry 0, carve at `CARVE`, size_log2 16), joins,
 /// and returns the child's exit status. `(Instantiator, Module)` arrive as the entry's two args.
 fn parent_src(token: &[u8; 4]) -> String {
     let seed: String = token
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let addr = CARVE + i as u64;
+            let addr = CARVE + ARGV_OFF + i as u64;
             format!("  q{i} = i64.const {addr}\n  c{i} = i32.const {b}\n  i32.store8 q{i} c{i}\n",)
         })
         .collect();

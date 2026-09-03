@@ -2,7 +2,7 @@
 //!
 //! Slice 1 ran `temen-leng`-*shaped* Rust on temen. This drives the **actual** crate: the `leng_probe`
 //! fixture is a `std` powerbox program that calls `temen_leng::translate_to_text` on a fixed Leng
-//! module, built through the LLVM on-ramp (`rustc +1.81` → `llvm-link-18` → `opt-18` → `temen-llvm`).
+//! module, built through the LLVM on-ramp (`rustc` → `llvm-link` → `opt` → `temen-llvm`).
 //!
 //! What this pins, and what it does not:
 //! - **Does:** the whole `std` `temen-leng` translator (+ `temen-ir`/`temen-text`/`temen-encode`) compiles to
@@ -13,10 +13,10 @@
 //! - **Does not:** *run* the translator to a correct result. `translate_to_text` reaches
 //!   `core::fmt::Display`/`FromStr` (it formats and parses numbers), which are **stubbed** here — a
 //!   call would trap. A correct run needs those libcore/liballoc functions *real*, via `-Z build-std`,
-//!   which needs a nightly whose LLVM matches the `llvm-*-18` tools (this env has only LLVM-18 tools
+//!   which needs a nightly whose LLVM matches the `llvm-*` tools (this env has only the pinned LLVM tools
 //!   vs. LLVM-23 nightly — a toolchain-alignment task, tracked in §3e, not a code one).
 //!
-//! Gated to Linux + the `rustc +1.81.0`/`llvm-link-18`/`opt-18` on-ramp toolchain; skips otherwise.
+//! Gated to Linux + the `rustc`/`llvm-link`/`opt` on-ramp toolchain; skips otherwise.
 
 #![cfg(target_os = "linux")]
 

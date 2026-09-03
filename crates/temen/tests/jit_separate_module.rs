@@ -15,16 +15,16 @@ use temen_verify::verify_module;
 
 type BothOut = (Result<Vec<Value>, Trap>, Vec<u8>, JitOutcome, Vec<u8>);
 
-/// The child ("plugin") module — see `separate_module.rs`: 64 KiB window, `data 100 "VM"`, an entry
+/// The child ("plugin") module — see `separate_module.rs`: 64 KiB window, `data 16484 "VM"` (above the NULL guard the carve reserves, #1206), an entry
 /// that reads its data byte, stores a marker at 0, and returns `byte + 1000`.
 fn child_src() -> &'static str {
     "memory 16
-data 100 \"VM\"
+data 16484 \"VM\"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
-  v3 = i64.const 0
+  v3 = i64.const 16384
   v4 = i32.const 7
   i32.store8 v3 v4
   v5 = i64.extend_i32_u v2
@@ -85,12 +85,12 @@ fn both(parent_src: &str) -> BothOut {
 /// backends (see `separate_module.rs`).
 fn named_child_src() -> &'static str {
     "memory 16
-data 100 \"VM\"
+data 16484 \"VM\"
 export 0 func \"alpha\" 0
 export 1 func \"beta\" 1
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 1000
@@ -100,7 +100,7 @@ block 0 (v0: i64) {
 }
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v3 = i64.extend_i32_u v2
   v4 = i64.const 2000
@@ -219,8 +219,15 @@ block 0 (v0: i32, v1: i32) {
     // marker in the carve, everything outside it exactly as seeded.
     assert_eq!(imem, jmem, "interp/JIT parent windows diverge");
     const CHILD: u64 = 64 << 10;
-    assert_eq!(&jmem[(CHILD + 100) as usize..(CHILD + 102) as usize], b"VM");
-    assert_eq!(jmem[CHILD as usize], 7, "child marker missing on the JIT");
+    assert_eq!(
+        &jmem[(CHILD + 16484) as usize..(CHILD + 16486) as usize],
+        b"VM"
+    );
+    assert_eq!(
+        jmem[(CHILD + 16384) as usize],
+        7,
+        "child marker missing on the JIT"
+    );
     let init: Vec<u8> = (0..(128u64 << 10))
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
         .collect();

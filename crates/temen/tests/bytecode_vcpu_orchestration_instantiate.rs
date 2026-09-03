@@ -153,25 +153,27 @@ block 6 (vs3: i64) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vinst = i32.wrap_i64 v0
-  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
+  ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0. The record lives at 20480 — above
+  ; the child's own NULL guard (#1206: a 32 KiB carve is guarded like a root) and clear of the
+  ; grandchild carve at [16384, 17408).
   q0v0 = i64.const 8589934592
   q0v1 = i64.const 0
   q0voff = i64.const 16384
   q0v2 = i64.const -4294967286
   q0v3 = i64.const 4294967295
-  q0a0 = i64.const 1152
+  q0a0 = i64.const 20480
   i64.store q0a0 q0v0
-  q0a1 = i64.const 1160
+  q0a1 = i64.const 20488
   i64.store q0a1 q0voff
-  q0a2 = i64.const 1168
+  q0a2 = i64.const 20496
   i64.store q0a2 q0v2
-  q0a3 = i64.const 1176
+  q0a3 = i64.const 20504
   i64.store q0a3 q0v3
-  q0a4 = i64.const 1184
+  q0a4 = i64.const 20512
   i64.store q0a4 q0v1
-  q0a5 = i64.const 1192
+  q0a5 = i64.const 20520
   i64.store q0a5 q0v1
-  q0a6 = i64.const 1200
+  q0a6 = i64.const 20528
   i64.store q0a6 q0v1
   vgh = call.cap 6 17 (i64) -> (i32) vinst (q0a0)
   vgr = call.cap 6 1 (i32) -> (i64) vinst (vgh)

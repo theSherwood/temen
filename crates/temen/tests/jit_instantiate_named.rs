@@ -116,39 +116,39 @@ block 0 (vci: i64) {
   cu = i32.const 117
   ce = i32.const 101
   cr = i32.const 114
-  a0 = i64.const 0
+  a0 = i64.const 16384
   i32.store8 a0 cs
-  a1 = i64.const 1
+  a1 = i64.const 16385
   i32.store8 a1 ct
-  a2 = i64.const 2
+  a2 = i64.const 16386
   i32.store8 a2 cd
-  a3 = i64.const 3
+  a3 = i64.const 16387
   i32.store8 a3 co
-  a4 = i64.const 4
+  a4 = i64.const 16388
   i32.store8 a4 cu
-  a5 = i64.const 5
+  a5 = i64.const 16389
   i32.store8 a5 ct
   len6 = i64.const 6
   hout = self.resolve a0 len6
-  a16 = i64.const 16
+  a16 = i64.const 16400
   cO = i32.const 79
   i32.store8 a16 cO
   one = i64.const 1
   wo = call.cap 0 1 (i64, i64) -> (i64) hout (a16, one)
-  a32 = i64.const 32
+  a32 = i64.const 16416
   i32.store8 a32 cs
-  a33 = i64.const 33
+  a33 = i64.const 16417
   i32.store8 a33 ct
-  a34 = i64.const 34
+  a34 = i64.const 16418
   i32.store8 a34 cd
-  a35 = i64.const 35
+  a35 = i64.const 16419
   i32.store8 a35 ce
-  a36 = i64.const 36
+  a36 = i64.const 16420
   i32.store8 a36 cr
-  a37 = i64.const 37
+  a37 = i64.const 16421
   i32.store8 a37 cr
   herr = self.resolve a32 len6
-  a40 = i64.const 40
+  a40 = i64.const 16424
   cE = i32.const 69
   i32.store8 a40 cE
   we = call.cap 0 1 (i64, i64) -> (i64) herr (a40, one)

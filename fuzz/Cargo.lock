@@ -713,6 +713,7 @@ dependencies = [
 name = "temen-fs"
 version = "0.0.0"
 dependencies = [
+ "temen-encode",
  "temen-interp",
  "temen-ir",
 ]

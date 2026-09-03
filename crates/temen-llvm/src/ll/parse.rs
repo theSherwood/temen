@@ -1056,8 +1056,9 @@ impl Parser {
             self.cur_block_idx = blocks.len() as u32;
             self.cur_phi_ord = 0;
             let mut instrs = Vec::new();
-            // Instructions until a terminator.
+            // Instructions until a terminator; `#dbg_*` debug records sit between them (LLVM ≥19).
             loop {
+                while self.dbg_record()? {}
                 if self.at_terminator() {
                     break;
                 }
@@ -1238,8 +1239,11 @@ impl Parser {
 
     /// Skip binop flags (`nsw`, `nuw`, `exact`, `disjoint`) between the opcode and the type.
     fn skip_binop_flags(&mut self) {
+        // Integer wrap flags, plus the fast-math flags a float binop carries under `-ffast-math`
+        // (`fadd fast`, `fmul nnan ninf …` — e.g. openlibm inside the Postgres build).
         while matches!(self.peek(), Some(Token::Word(w))
-            if matches!(w.as_str(), "nsw" | "nuw" | "exact" | "disjoint"))
+            if matches!(w.as_str(), "nsw" | "nuw" | "exact" | "disjoint"
+                | "nnan" | "ninf" | "nsz" | "arcp" | "contract" | "afn" | "reassoc" | "fast"))
         {
             self.pos += 1;
         }
@@ -1806,6 +1810,8 @@ impl Parser {
     /// A conversion (`trunc`/`zext`/`sext`/`fptrunc`/…/`bitcast`): `<op> [flags] <srcty> <val> to <dstty>`.
     fn conv_inst(&mut self, dest: Name) -> PResult<UnaryOp> {
         self.pos += 1; // opcode
+                       // LLVM ≥20 carries fast-math flags on the float casts (`fptrunc fast double %x to float`).
+        self.skip_fast_math_flags();
         self.skip_conv_flags();
         let srcty = self.type_()?;
         let operand = self.value_as_operand(&srcty)?;
@@ -1901,6 +1907,7 @@ impl Parser {
     /// what makes the pairs resolve identically to the bitcode reader.
     fn phi_inst(&mut self, dest: Name) -> PResult<Phi> {
         self.pos += 1; // `phi`
+        self.skip_fast_math_flags(); // a float φ may carry fast-math flags (`phi fast double …`)
         let to_type = self.type_()?;
         let mut incoming_values = Vec::new();
         let mut inc_idx = 0u32;
@@ -2526,6 +2533,50 @@ impl Parser {
             is_tail_call,
             debugloc: None,
         })
+    }
+
+    /// An LLVM ≥19 **debug record** — `#dbg_declare(ptr %a, !var, !DIExpression(), !loc)`,
+    /// `#dbg_value(<ty> <val>, !var, !expr, !loc)`, `#dbg_assign(<val>, !var, !expr, !id, <addr>,
+    /// !addrexpr, !loc)`, `#dbg_label(!label)` — the non-instruction statement form that replaced the
+    /// `llvm.dbg.*` intrinsic calls (LLVM 19 switched the printers over; 21 no longer emits the calls
+    /// at all). Captured into the same list as the calls (operand `[0]` = the located value, `[1]` =
+    /// the `!DILocalVariable`), so the §6 variable reader is version-blind. Returns `true` when a
+    /// record was consumed; an unknown `#dbg_*` kind is a parse error (fail-closed).
+    fn dbg_record(&mut self) -> PResult<bool> {
+        let declare = match self.peek() {
+            Some(Token::Word(w)) if w == "#dbg_declare" => Some(true),
+            Some(Token::Word(w)) if w == "#dbg_value" || w == "#dbg_assign" => Some(false),
+            Some(Token::Word(w)) if w == "#dbg_label" => None,
+            Some(Token::Word(w)) if w.starts_with("#dbg_") => {
+                return self.err(format!("unsupported debug record `{w}`"));
+            }
+            _ => return Ok(false),
+        };
+        self.pos += 1; // the `#dbg_*` word
+        self.expect(&Token::LParen)?;
+        let mut args = Vec::new();
+        if !self.eat(&Token::RParen) {
+            loop {
+                args.push(self.metadata_operand_value()?);
+                if !self.eat(&Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+        }
+        if let (Some(declare), Some(MetaArg::Ref(var))) = (declare, args.get(1)) {
+            let value = match &args[0] {
+                MetaArg::Value(n) => Some(n.clone()),
+                _ => None,
+            };
+            self.dbg_intrinsics.push(DbgIntrinsic {
+                func: self.current_func.clone(),
+                declare,
+                value,
+                var: *var,
+            });
+        }
+        Ok(true)
     }
 
     /// If the just-parsed call is `@llvm.dbg.declare`/`@llvm.dbg.value`, record its captured operands

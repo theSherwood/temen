@@ -168,7 +168,7 @@ fn run_emitted(
 /// Drive `guest(as, ..tail)` in `mode`, servicing a tier-up on emitted wasm with the page-check driver
 /// contract (the table refreshed from the live map). `tail` is the guest's i64 arguments after the
 /// implicit memory-cap handle. Returns the outcome.
-fn run_guest_argv(guest_src: &str, tail: &[i64], mode: Mode) -> Outcome {
+fn run_guest_argv_bytes(guest_src: &str, tail: &[i64], mode: Mode) -> (Outcome, Vec<u8>) {
     let m = build(guest_src);
     let win_size = 1usize << WIN_LOG2;
     let (back, base, layout) = shared_window(win_size);
@@ -230,9 +230,14 @@ fn run_guest_argv(guest_src: &str, tail: &[i64], mode: Mode) -> Outcome {
         }
     };
     drop(vcpu);
-    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; free the window buffer.
+    // SAFETY: the vCPU (and its `Mem` aliasing the region) is dropped; copy, then free the buffer.
+    let bytes = unsafe { std::slice::from_raw_parts(base, win_size) }.to_vec();
     unsafe { std::alloc::dealloc(base, layout) };
-    out
+    (out, bytes)
+}
+
+fn run_guest_argv(guest_src: &str, tail: &[i64], mode: Mode) -> Outcome {
+    run_guest_argv_bytes(guest_src, tail, mode).0
 }
 
 // ---- fuzz guests: a page-op entry (interp-serviced) + a pure bulk-mem leaf (emitted under paged) ----
@@ -437,4 +442,141 @@ pub fn case_from_seed(seed: u64) -> [u8; 8] {
     seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .rotate_left(29)
         .to_le_bytes()
+}
+
+// ---- #810: randomized page-state tables — three page ops, then one emitted access ----
+// The `paged_walk` generator above carves ONE contiguous Unmapped/Ro range per case. Here the guest
+// performs THREE fuzzer-chosen page ops (`unmap`, `protect` read-only, `protect` read-write, `map`
+// read-write) over page-aligned in-window ranges, so the live map the driver's table is rebuilt from
+// carries interleaved `Unmapped`/`Rw`/`Ro` runs, holes, and re-committed pages — and the leaf's
+// fuzzer-placed access (scalar widths 1/2/4/8, a `v128`, or a bulk span) straddles every kind of state
+// transition. Same invariant, same oracle, same harness; plus the window bytes must match.
+
+/// The page-state leaf bodies over `(v0 = base, vn = span)`: scalar loads/stores per width, `v128`
+/// load/store staged through an in-window scratch slot, and the bulk write/read/move walks.
+const PS_LEAVES: [&str; 13] = [
+    "  vl = i64.load8_u v0\n  return vl",
+    "  vl = i64.load16_u v0\n  return vl",
+    "  vl = i64.load32_u v0\n  return vl",
+    "  vl = i64.load v0\n  return vl",
+    "  vv = i64.const 4242\n  i64.store8 v0 vv\n  vl = i64.load8_u v0\n  return vl",
+    "  vv = i64.const 4242\n  i64.store16 v0 vv\n  vl = i64.load16_u v0\n  return vl",
+    "  vv = i64.const 4242\n  i64.store32 v0 vv\n  vl = i64.load32_u v0\n  return vl",
+    "  vv = i64.const 4242\n  i64.store v0 vv\n  vl = i64.load v0\n  return vl",
+    "  vv = v128.load v0\n  vd = i64.const 20480\n  v128.store vd vv\n  vl = i64.load vd\n  return vl",
+    "  vd = i64.const 20480\n  vv = v128.load vd\n  v128.store v0 vv\n  vl = i64.load v0\n  return vl",
+    "  vval = i32.const 0\n  mem.fill v0 vval vn\n  return v0",
+    "  vdst = i64.const 20480\n  mem.copy vdst v0 vn\n  return v0",
+    "  vsrc = i64.const 20480\n  mem.move v0 vsrc vn\n  return v0",
+];
+
+/// One page op over `[vo{i}, vo{i}+vl{i})`: `k % 4` — 0 `unmap`, 1 `protect` read-only, 2 `protect`
+/// read-write (re-admits an `Ro` page), 3 `map` read-write (re-commits an `Unmapped` page).
+fn ps_op(k: u8, i: usize) -> String {
+    match k % 4 {
+        0 => format!("  vr{i} = call.cap 5 1 (i64, i64) -> (i64) vas (vo{i}, vl{i})"),
+        1 => format!(
+            "  vp{i} = i32.const 1\n  vr{i} = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vo{i}, vl{i}, vp{i})"
+        ),
+        2 => format!(
+            "  vp{i} = i32.const 3\n  vr{i} = call.cap 5 2 (i64, i64, i32) -> (i64) vas (vo{i}, vl{i}, vp{i})"
+        ),
+        _ => format!(
+            "  vp{i} = i32.const 3\n  vr{i} = call.cap 5 0 (i64, i64, i32) -> (i64) vas (vo{i}, vl{i}, vp{i})"
+        ),
+    }
+}
+
+/// The guest `(as, o0, l0, o1, l1, o2, l2, base, span)`: three page ops, then the leaf at `base`.
+fn ps_guest_src(kinds: u8, leaf: usize) -> String {
+    let ops = [ps_op(kinds, 0), ps_op(kinds >> 2, 1), ps_op(kinds >> 4, 2)].join("\n");
+    let leaf = PS_LEAVES[leaf];
+    format!(
+        r#"memory 17
+func (i32, i64, i64, i64, i64, i64, i64, i64, i64) -> (i64) {{
+block 0 (vas: i32, vo0: i64, vl0: i64, vo1: i64, vl1: i64, vo2: i64, vl2: i64, vbase: i64, vspan: i64) {{
+{ops}
+  v1 = call 1 (vbase, vspan)
+  return v1
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, vn: i64) {{
+{leaf}
+  }}
+}}
+"#
+    )
+}
+
+/// One page-state differential: decode a case from `data` (three page ops + one access), run the guest
+/// on the interpreter (oracle) and on the paged emitted tier, and assert outcomes and window bytes match.
+pub fn fuzz_one_pagestate(data: &[u8]) -> Cat {
+    let mut b = [0u8; 12];
+    let n = data.len().min(b.len());
+    b[..n].copy_from_slice(&data[..n]);
+
+    let page = page_size();
+    let win: u64 = 1u64 << WIN_LOG2;
+    let npages = win / page;
+
+    let leaf = (b[0] as usize) % PS_LEAVES.len();
+    let kinds = b[1];
+    // Three page-aligned ranges, each a non-empty whole number of pages kept **inside the window** (the
+    // ops are interp-serviced on both tiers; the emitted access is what is under test — a range past
+    // the window is the #1191 decline-class shape `nested_paged` also keeps out of scope).
+    let mut tail = Vec::with_capacity(8);
+    for i in 0..3 {
+        let rpage = (b[2 + 2 * i] as u64) % npages;
+        let rpages = 1 + (b[3 + 2 * i] as u64) % (npages - rpage);
+        tail.push((rpage * page) as i64);
+        tail.push((rpages * page) as i64);
+    }
+    let base = edge_offset(b[8], b[9], page, npages);
+    let span = edge_span(b[10], b[11], page);
+    tail.push(base as i64);
+    tail.push(span as i64);
+
+    let src = ps_guest_src(kinds, leaf);
+    let (interp, ibytes) = run_guest_argv_bytes(&src, &tail, Mode::Interp);
+    let (paged, pbytes) = run_guest_argv_bytes(&src, &tail, Mode::PagedSynced);
+
+    if matches!(interp, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other))
+        || matches!(paged, Outcome::Trap(TrapKind::OutOfFuel | TrapKind::Other))
+    {
+        return Cat::Skipped;
+    }
+
+    assert_eq!(
+        interp, paged,
+        "paged access over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
+        &tail[..6]
+    );
+    assert!(
+        ibytes == pbytes,
+        "paged window bytes over a randomized page map diverged from the interpreter oracle: leaf#{leaf} kinds={kinds:#x} ranges={:?} base={base} span={span} page={page}",
+        &tail[..6]
+    );
+
+    match interp {
+        Outcome::Trap(TrapKind::MemoryFault) => Cat::Trapped,
+        Outcome::Vals(_) => Cat::Passed,
+        _ => Cat::Skipped,
+    }
+}
+
+/// The 12-byte seed transform for the page-state sweep — deterministic, distinct scramble per seed.
+pub fn case_from_seed_pagestate(seed: u64) -> [u8; 12] {
+    let a = seed
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(29)
+        .to_le_bytes();
+    let c = seed
+        .wrapping_mul(0xD6E8_FEB8_6659_FD93)
+        .rotate_left(17)
+        .to_le_bytes();
+    let mut out = [0u8; 12];
+    out[..8].copy_from_slice(&a);
+    out[8..].copy_from_slice(&c[..4]);
+    out
 }

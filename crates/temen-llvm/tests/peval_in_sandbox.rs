@@ -1,6 +1,6 @@
 //! **The in-sandbox `temen-peval` pipeline (DESIGN.md §20c), folded into a test.**
 //!
-//! The manual probe — `rustc +1.81 --emit=llvm-bc` → `llvm-link-18` → `opt-18 internalize,globaldce`
+//! The manual probe — `rustc --emit=llvm-bc` → `llvm-link` → `opt internalize,globaldce`
 //! → translate → verify → run — was a scratch-dir dance. This test runs it on the in-repo fixture
 //! `tests/fixtures/peval_probe`: a `no_std` powerbox program that builds a small module and calls
 //! `temen_peval::specialize` (the `default-features = false`, no-`libm` in-temen build). It then asserts
@@ -8,8 +8,8 @@
 //! host-side — a differential: in-sandbox specializer == host specializer.
 //!
 //! This regression-proofs the *whole* `specialize` closure end-to-end in-sandbox (the ZST-layout fix
-//! only added a unit-level test). It auto-skips when the toolchain (`rustc +1.81.0`, `llvm-link-18`,
-//! `opt-18`) is unavailable — the same posture as the `rust_*` tests in `translate.rs`.
+//! only added a unit-level test). It auto-skips when the toolchain (`rustc`, `llvm-link`,
+//! `opt`) is unavailable — the same posture as the `rust_*` tests in `translate.rs`.
 
 use temen_ir::{BinOp, Block, Func, Inst, IntTy, Module, Terminator, ValType};
 

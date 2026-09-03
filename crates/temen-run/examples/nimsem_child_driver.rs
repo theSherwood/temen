@@ -40,11 +40,19 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     }
 }
 
-/// The op-13 parent: four grant records `{fs, stdout, exit, exec}` at 1024.., their names at 2048.., and
-/// `argv` at `carve + POWERBOX_ARGS_BASE`. Spawns the child (window `child_sl`, carve at `carve_off`).
+/// The op-13 parent: four grant records `{fs, stdout, exit, exec}`, their names, and `argv`, all laid
+/// out for the **#1094 guarded window** — the grant records/cap-names sit in the parent window (read by
+/// the op-13 handler in the parent's context), but the parent is itself a guarded module, so they must
+/// live **above** the NULL guard `[0, POWERBOX_NULL_GUARD)`: records at `guard + 1024..`, names at
+/// `guard + 2048..`, and `argv` at `carve + module_args_base()` (the child reads its args there, one
+/// guard up). This mirrors `crates/temen-run/tests/nifler_child_asset.rs`; before #1094 they sat at
+/// 1024../2048../`carve + POWERBOX_ARGS_BASE`, which now falls inside the guard and NULL-faults.
 fn parent_src(child_sl: u32, carve_off: u64, argv: &[String]) -> String {
     let parent_sl = child_sl + 1;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
+    let guard = temen_ir::POWERBOX_NULL_GUARD;
+    let rec_base = guard + 1024;
+    let name_base = guard + 2048;
+    let argv_off = carve_off + temen_ir::module_args_base();
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes());
@@ -53,34 +61,29 @@ fn parent_src(child_sl: u32, carve_off: u64, argv: &[String]) -> String {
         blob.push(0);
     }
     let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    // record `i` at 1024+i*16: word0 = name_off | (name_len<<32) at that offset, handle (param v(2+i)) at +8.
-    let names = [
-        ("fs", 2u64, 2048u64),
-        ("stdout", 6, 2064),
-        ("exit", 4, 2080),
-        ("exec", 4, 2096),
-    ];
+    // record `i` at rec_base + i*16: word0 = name_off | (name_len<<32) at that offset, handle (param
+    // v(2+i)) at +8. Cap-name bytes at name_base + i*16.
+    let names = [("fs", 2u64), ("stdout", 6), ("exit", 4), ("exec", 4)];
     let mut records = String::new();
-    for (i, (_n, len, noff)) in names.iter().enumerate() {
-        let off = 1024 + i as u64 * 16;
+    let mut name_data = String::new();
+    for (i, (n, len)) in names.iter().enumerate() {
+        let off = rec_base + i as u64 * 16;
+        let noff = name_base + i as u64 * 16;
         let w0 = noff | (len << 32);
         records.push_str(&format!(
             "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n  h{off} = i64.extend_i32_u v{vi}\n  oh{off} = i64.const {hoff}\n  i64.store oh{off} h{off}\n",
             vi = 2 + i,
             hoff = off + 8,
         ));
+        name_data.push_str(&format!("data {noff} \"{n}\"\n"));
     }
     format!(
         r#"memory {parent_sl}
-data 2048 "fs"
-data 2064 "stdout"
-data 2080 "exit"
-data 2096 "exec"
-data {argv_off} "{argv_esc}"
+{name_data}data {argv_off} "{argv_esc}"
 func (i32, i32, i32, i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32, v5: i32) {{
 {records}  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const {rec_base}
   vgn = i64.const 4
   ventry = i64.const 0
   voff = i64.const {carve_off}

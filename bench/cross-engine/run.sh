@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Cross-engine micro-benchmark runner: native (clang -O2), wasm32 + wasm64 (clang → Node/V8), pure JS
-# (V8), the three Temen engines (jit / bytecode / tree-walk) via the real LLVM frontend, and CPython.
+# (V8), the three Temen engines (jit / bytecode / tree-walk) via the real LLVM frontend, CPython, and
+# Lua (PUC 5.4, optional).
 # Each engine reports `engine,kernel,ns_per_iter` for the same kernels, with per-iteration compute
 # isolated by large/small-`n` subtraction and taken as the min over reps.
 #
@@ -18,7 +19,8 @@
 #     on-ramp's determinism-fixed legalization), so native leads vadd by ~2x and temen-jit ≈ wasm.
 #
 # Requires: clang, node, python3; the Temen rows additionally need the LLVM-18 CLI tools
-# (llvm-dis, for temen-llvm's textual reader — no libLLVM is linked). Run:
+# (llvm-dis, for temen-llvm's textual reader — no libLLVM is linked); the lua row needs `lua` (5.3+)
+# on PATH and is skipped with a note otherwise. Run:
 #   bench/cross-engine/run.sh
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -45,3 +47,11 @@ fi
 
 # --- CPython ---
 python3 bench.py
+
+# --- Lua (PUC 5.3+: 64-bit integers + native bitops; Debian installs it as `lua5.4`) ---
+LUA=${LUA:-$(command -v lua5.4 || command -v lua || true)}
+if [ -n "$LUA" ]; then
+  "$LUA" bench.lua
+else
+  echo "note: lua row skipped (needs lua 5.3+ on PATH, or LUA=/path/to/lua)" >&2
+fi

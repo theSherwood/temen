@@ -111,7 +111,14 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   let f0, instance;
   // #1153: the emitted `"mapped"` bound, re-synced after each `vm_map`-growing bounce so a grown store
   // admits (parity with the coop tier — the single-shot on-ramp path no longer pre-sizes a fixed window).
-  let mappedGlobal = null;
+  // #1201: a PAGED run (the guest `unmap`s/`protect`s its pages) also exports `"pagestate"` — the cdylib
+  // rebuilds the page-state table after each bounce and `"mapped"` is then its coverage; re-point both
+  // before `f0` and after every bounce (the `syncPaged` contract of the §14 codegen Worker / coop driver).
+  let mappedGlobal = null, pagestateGlobal = null;
+  const syncGlobals = () => {
+    if (pagestateGlobal) pagestateGlobal.value = Number(ex.temen_onramp_jit_run_pagestate_ptr());
+    if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
+  };
   try {
     ({ f0, instance } = await cachedInstanceF0(
       memory,
@@ -126,9 +133,10 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
         if (ex.temen_onramp_jit_run_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
         // A `vm_map` grow in the bounce advanced the run's committed extent — re-sync the emitted
         // `"mapped"` (the `driveCoopTierupRun` scalar pattern; on-ramp guests grow scalar, no paged
-        // pagestate). Inert until the global is registered just below (and on a cached instance the
-        // first Run's closure carries it, reading the current run's extent via the FFI each time).
-        if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
+        // pagestate on the mask-only emit; a paged run re-points its table too). Inert until the
+        // globals are registered just below (and on a cached instance the first Run's closure carries
+        // them, reading the current run's state via the FFI each time).
+        syncGlobals();
       },
     ));
   } catch (e) {
@@ -136,11 +144,12 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
     throw e;
   }
   mappedGlobal = instance.exports.mapped ?? null;
+  pagestateGlobal = instance.exports.pagestate ?? null;
   // #1153: reset the bound to THIS run's committed extent before `f0` runs. A cached instance (issue
   // #803) carries the prior Run's grown `"mapped"`; each Run re-opens a cold window at the declared
   // extent, so without this reset an early emitted access (before the Run's first `vm_map` bounce)
   // could admit against a stale-high bound. `temen_onramp_jit_run_mapped` reads the current run.
-  if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
+  syncGlobals();
 
   const env = Number(ex.temen_alloc(envBytes));
   new DataView(memory.buffer).setBigInt64(env, 1n << 60n, true); // huge dispatcher-fuel budget

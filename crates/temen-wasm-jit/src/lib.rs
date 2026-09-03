@@ -1846,30 +1846,54 @@ pub fn check_child_carve(
     parent_base: u64,
     guard: u64,
 ) -> Result<u64, Error> {
-    // A `size_log2` of 64+ would overflow the shift (and no real window is that large) — reject it
-    // before the shift, so a wild bounce arg faults closed rather than wrapping.
+    child_carve_fits(
+        child.memory.as_ref().map(|mc| mc.size_log2),
+        off,
+        carve_log2,
+        parent_mapped,
+        parent_base,
+        guard,
+    )
+    .ok_or(Error::Unsupported(
+        "child carve fails the confinement gate (undersized, misaligned, out of window, or in the NULL guard)",
+    ))
+}
+
+/// The **pure geometry** half of [`check_child_carve`] (§2/§4 confinement): given the child's declared
+/// window size-log2 (`None` if it declares no linear memory) and the requested carve `(off, carve_log2)`
+/// inside a parent window `[parent_base, parent_base + parent_mapped)` reserving a NULL guard
+/// `[0, guard)`, return `Some(carve_bytes)` iff the carve is a confinement-safe placement — else `None`
+/// (fail-closed), computed **overflow-free**:
+///
+/// - `carve_log2 < 64` (a wild bounce arg faults closed before the shift wraps),
+/// - `carve >= 1 << declared` — a larger carve is a safe superset (the child still masks every access
+///   to the carve, and needs the room to grow its heap into `[1 << declared, carve)`, FORK.md §8.6/#773);
+///   a carve **smaller** than declared is refused,
+/// - the carve lies wholly inside `[0, parent_mapped)`, is power-of-two-aligned to its own size, and
+///   clears the reserved NULL region (`parent_base + off >= guard`).
+///
+/// Factored out of [`check_child_carve`] (which just maps `None -> Err` and reads the size-log2 off the
+/// child `Module`) so this security-critical admission gate is **fuzzed as its own unit** — the `child_carve`
+/// libFuzzer target drives it against a `u128` oracle, the CLAUDE.md confinement hinge, alongside the
+/// masking [`temen_mask::Window::sub`] the `mask` target already fuzzes.
+pub fn child_carve_fits(
+    declared_log2: Option<u8>,
+    off: u64,
+    carve_log2: u32,
+    parent_mapped: u64,
+    parent_base: u64,
+    guard: u64,
+) -> Option<u64> {
     if carve_log2 >= 64 {
-        return Err(Error::Unsupported("child carve size_log2 out of range"));
+        return None;
     }
     let carve = 1u64 << carve_log2;
-    let declared_log2 = child.memory.as_ref().map(|mc| mc.size_log2);
-    // A larger carve is a safe superset — confinement still masks every access to the carve — and the
-    // child *needs* `carve >= 1 << declared` so its bump allocator can grow the heap into
-    // `[1 << declared, carve)` (FORK.md §8.6 / #773). A carve smaller than declared is refused.
     let mod_ok = declared_log2.is_none_or(|d| u32::from(d) <= carve_log2);
-    // The carve must lie wholly inside the parent window, power-of-two-aligned to its own size, and
-    // clear of the reserved NULL region — mirroring the native `fits` predicate.
     let fits = carve <= parent_mapped
         && off & (carve - 1) == 0
         && off.checked_add(carve).is_some_and(|e| e <= parent_mapped)
         && parent_base.checked_add(off).is_some_and(|a| a >= guard);
-    if mod_ok && fits {
-        Ok(carve)
-    } else {
-        Err(Error::Unsupported(
-            "child carve fails the confinement gate (undersized, misaligned, out of window, or in the NULL guard)",
-        ))
-    }
+    (mod_ok && fits).then_some(carve)
 }
 
 /// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
@@ -2468,6 +2492,51 @@ pub fn compile_module_reactor_budgeted(
     module_budget: usize,
     split_target: Option<(usize, usize)>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_inner(
+        m,
+        entry,
+        shared_memory,
+        cap,
+        module_budget,
+        split_target,
+        None,
+    )
+}
+
+/// #1201 — [`compile_module_reactor`] in **paged** mode (#750): the wasm-driven, entry-rooted emit whose
+/// every access also consults the host-maintained page-state table, so a guest that `unmap`s/`protect`s
+/// its own pages runs on the single-shot tier instead of declining to the interpreter. The driver
+/// contract is [`compile_module_tierup_paged`]'s (refresh the table from the live map after each
+/// bounce, `"mapped"` = its coverage); the page-op cap calls themselves ride the outlined cross-tier
+/// wrappers (`outline_cap_calls`), interp-serviced. `SharedRegion` aliasing (iface 4) stays gated —
+/// the caller ([`compile_jit_paged`]) checks it, as the paged tier-up entry does.
+pub fn compile_module_reactor_paged(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    compile_module_reactor_inner(
+        m,
+        entry,
+        shared_memory,
+        MAX_EMITTED_FUNC_BYTES,
+        MAX_EST_EMITTED_MODULE_BYTES,
+        None,
+        Some(page_log2),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_module_reactor_inner(
+    m: &Module,
+    entry: u32,
+    shared_memory: bool,
+    cap: usize,
+    module_budget: usize,
+    split_target: Option<(usize, usize)>,
+    paged: Option<u8>,
+) -> Result<(Vec<u8>, Vec<bool>), Error> {
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
@@ -2537,7 +2606,7 @@ pub fn compile_module_reactor_budgeted(
             &cross,
             None,
             false,
-            None,
+            paged,
             emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
             &split_plan,
@@ -3137,6 +3206,55 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
             // suspending cross-tier callee it can't safely unwind) — closing that latent sharp edge.
             if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
                 if let Ok((wasm, emitted)) = compile_module_reactor(m, entry, shared_memory) {
+                    return Ok(Artifact {
+                        wasm,
+                        emitted,
+                        drive: DriveMode::WasmDriven { entry },
+                    });
+                }
+            }
+            interp_driven(m)
+        }
+    }
+}
+
+/// #1201 — [`compile_jit`] for a host whose driver carries the **paged** contract (#750: it refreshes the
+/// page-state table from the live map after each cross-tier bounce and points `"pagestate"`/`"mapped"`
+/// at it). A module that `unmap`s/`protect`s its own pages ([`module_uses_unmap_protect`]) then emits
+/// **paged** instead of `compile_jit`'s emit-nothing decline — wasm-driven when rooted and
+/// suspension-free (`compile_module_reactor_paged`), else interpreter-driven paged tier-up
+/// (`compile_module_tierup_paged`). Everything else is exactly `compile_jit` (a `map`-only guest keeps
+/// the mask-only emit + the live `"mapped"` bound, #1153), so a non-page-op guest emits byte-identical
+/// code. `SharedRegion` aliasing (iface 4) still fails closed to the whole interpreter — a `Backed`
+/// page's bytes live outside the window, which no trap check can honor.
+pub fn compile_jit_paged(
+    m: &Module,
+    shape: Shape,
+    shared_memory: bool,
+    page_log2: u8,
+) -> Result<Artifact, Error> {
+    if !module_uses_unmap_protect(m) {
+        return compile_jit(m, shape, shared_memory);
+    }
+    if m.funcs.iter().any(func_uses_region_ops) {
+        return compile_interp_only(m, shared_memory, false);
+    }
+    let interp_driven = |m: &Module| -> Result<Artifact, Error> {
+        let (wasm, emitted) = compile_module_tierup_paged(m, shared_memory, page_log2)?;
+        Ok(Artifact {
+            wasm,
+            emitted,
+            drive: DriveMode::InterpDriven,
+        })
+    };
+    match shape {
+        Shape::Threaded => interp_driven(m),
+        Shape::Batch { entry } | Shape::Reactor { entry } => {
+            // The same wasm-drivability gate as `compile_jit`: rooted, no suspension, no setjmp.
+            if !reachable_concurrency(m, entry) && !reachable_setjmp(m, entry) {
+                if let Ok((wasm, emitted)) =
+                    compile_module_reactor_paged(m, entry, shared_memory, page_log2)
+                {
                     return Ok(Artifact {
                         wasm,
                         emitted,

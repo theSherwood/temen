@@ -32,16 +32,28 @@ NIM_BIN="$(dirname "$(command -v nim)")"
 # it via `../nativenif`); both are repo-root submodules, so that sibling layout holds.
 git submodule update --init nimony nativenif
 
-# setup-nim installs a *prebuilt* nightly that can lag `devel`; overlay fresh compiler sources so
-# nifler (which compiles Nim's own parser) can parse current syntax — exactly what nimony CI does.
-if [ ! -d nim-src ]; then
-  git clone --depth 1 --branch devel https://github.com/nim-lang/Nim nim-src
+# setup-nim installs the *prebuilt* devel nightly, cut daily and lagging devel's head by hours to
+# a day (or months when nightlies stall). nifler compiles Nim's own parser, so it needs current
+# compiler sources; nimony's CI overlays devel HEAD's `compiler/` onto the nightly for that. An
+# unpinned HEAD over an older nightly splits the sources in two — Nim#26139 changed `docgen.nim`
+# and `rstgen.nim` together, and the nightly's `lib/` no longer matched the overlaid `compiler/`
+# (#1220). So: pin the source commit (bump deliberately, like the nimony submodule) and overlay
+# both `compiler/` and `lib/` from it — one coherent source tree, the nightly only the bootstrap
+# binary (Nim's own bootstrap compiles devel sources with an older binary the same way).
+NIM_SRC_REV=973065b279d2ae5b3954c25348c7dc4a02335f2b # nim-lang/Nim devel, 2026-09-03
+if [ ! -d nim-src/.git ]; then
+  git init -q nim-src
+  git -C nim-src remote add origin https://github.com/nim-lang/Nim
 fi
+git -C nim-src fetch -q --depth 1 origin "$NIM_SRC_REV"
+git -C nim-src checkout -q FETCH_HEAD
 # The Nim install directory is the parent of its bin/.
 NIM_ROOT="$(dirname "$NIM_BIN")"
-if [ -d "$NIM_ROOT/compiler" ]; then
-  cp -a nim-src/compiler/. "$NIM_ROOT/compiler/"
-fi
+for d in compiler lib; do
+  if [ -d "$NIM_ROOT/$d" ]; then
+    cp -a "nim-src/$d/." "$NIM_ROOT/$d/"
+  fi
+done
 # hastur resolves the frontend's NIF libs via `nim/dist/nimony` — point it at our submodule checkout.
 mkdir -p "$NIM_ROOT/dist"
 rm -rf "$NIM_ROOT/dist/nimony"

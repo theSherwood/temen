@@ -110,12 +110,60 @@ argument. (Critical edges get split first — standard.)
   with a differential harness running the existing C demos through *stock LLVM* and
   matching native `clang`.
 
-### Toolchain present in the dev container (confirmed)
-- `clang` 18.1.3, `llvm-config` 18.1.3 (`/usr/lib/llvm-18/lib`).
-- `libLLVM.so.18.1` present (plus 17/20/21 — we **pin 18**, the `clang` default here).
+### Toolchain pin
+The pinned LLVM lives in **one place, `scripts/ci/install-llvm.sh`** (`LLVM_MAJOR`, currently
+**22**), which every CI job runs to get `clang`/`llvm-dis`/`llvm-link`/`opt` from apt.llvm.org and
+puts first on `PATH`; the rest of the tree uses **unversioned** tool names. The pin is chosen to
+**equal the stable rustc's LLVM major** (`rustc -vV`; `RUST_STABLE` in ci.yml — 1.97 = LLVM 22), so
+the `peval_*` probes can feed default-`rustc` IR straight to `llvm-link`/`opt` (which only ingest IR
+of their own version or older) with no second rustc toolchain; `ci_tool_canary` asserts the two
+majors agree. Bump both together when rustc moves. The reader itself is version-tolerant (§8 Q1a):
+it takes textual IR from any recent LLVM, including the LLVM ≥19 `#dbg_*` debug records, the
+LLVM ≥20 `llvm.fake.use` liveness marker, and the `llvm.eh.typeid.for.p0` spelling.
 
-So the pinned baseline is **LLVM 18**. (Re-pin deliberately, never drift; a bitcode
-produced by a different major version is rejected, not best-effort parsed.)
+*What the 18 → 22 bump surfaced* (each found by running the full suite under clang 21 and 22, each
+now a regression test): (1) the `#dbg_*` records above — every `-g` path parse-failed, invisible
+while CI's LLVM-21 lane ran without `-g`; (2) `llvm.fake.use` at `-Og`; (3) the `.p0` EH intrinsic;
+(4) **LLVM 22's x86-64 `__int128` ABI** — clang no longer coerces `i128` params/returns to
+`(i64, i64)` pairs itself but passes a bare `i128`, so the on-ramp now does that split
+(`param_vtypes`/`agg_vtypes`: two `i64` signature slots, the `(lo, hi)` pair the value is held as
+everywhere else, fanned out at call sites and bound as a two-result return) — the Temen-side ABI is
+unchanged; (5) LLVM ≥21's loop-idiom pass synthesizes `wcslen` from a `while (s[i]) i++` over
+`wchar_t` (the Postgres `libc_shim` now defines it); (6) rustc ≥1.83 moved `Vec` growth into a
+non-generic `RawVecInner::grow_one` inside precompiled `liballoc` (and the closure creeps on:
+`String::from_utf8_lossy` → `libcore`'s `Utf8Chunks` → hashbrown → std), real code `--emit=llvm-ir`
+never sees and no stub can stand in for — so **every Rust probe now builds std from source**
+(`-Z build-std`, `panic_immediate_abort`; the one builder `tests/common::build_fixture_bc`, std built
+once into a shared target dir), which needs `rust-src` on the stable toolchain (the CI `temen-llvm`
+job installs it; `ci_tool_canary` checks). Linking the sysroot rlibs' embedded bitcode instead was
+tried and rejected: it is `panic=unwind` code, and the reachable set keeps growing crate by crate.
+
+*And what CI on clang 22 then surfaced* (the Postgres whole-program build and Embench, both compiled
+from source in CI — each fixed with a regression test): (7) `-ffast-math` code (openlibm in the
+Postgres build) carries fast-math flags on the float **casts** (LLVM ≥20: `fptrunc fast`), `phi`
+and the binops, which the reader skipped only on `fcmp`/`select`/`fneg`/`call`; (8) the i128
+three-way compare intrinsic `llvm.scmp.i32.i128` (Postgres's `int128` interval math) — two orderings
+on the `(lo, hi)` pairs; (9) `frem` (clang ≥22 folds a constant-divisor `fmod(x, C)` into it under
+`-fno-math-errno`) — lowered to the synthesized `__temen_fmod`; (10) a **silent miscompile**, the
+only one of the bump: clang 22's SLP vectorizer emits picojpeg's byte clamp as `icmp sgt <4 x i16>
+%v, splat (i16 -1)` on a 64-bit vector, and `vec_explode` handed the sub-128 *tail lanes* to the
+signed compare without sign-extending them out of their i32 container (`i16 -1` read as 65535) —
+the same §3b narrow-int hazard the scalar `icmp` path already guarded. Tail lanes are now canonically
+extended per the consumer's signedness. Found by the Embench differential (`picojpeg: MISCOMPILE`
+on all three engines), bisected with the example's new `EMBENCH_ONLY`/`EMBENCH_CFLAGS` to
+"vectorization + AVX2", then to the one function whose vector code differed between clang 21 and 22. (11) After all of
+that the browser card *booted* Postgres and then trapped on `ORDER BY`: clang 22 emits `llvm.log.f64`
+for `cost_tuplesort`'s `log()` where clang 21 emitted the libcall that resolved to the linked
+openlibm, and an unrecognized intrinsic fell to an unresolved-extern trap stub. An otherwise-unhandled
+`llvm.<fn>.f64|f32` now resolves to the guest-defined `<fn>`/`<fn>f` when the program links one
+(`libm_intrinsic_target`). Reproduced and fixed on the reference host with the new
+`examples/pg_single.rs` driver (`TEMEN_TRAP_TRACE=1` names the trapping function index,
+`PG_SINGLE_FUNCS` + `TEMEN_STUB_DEBUG=1` map it to a name), which boots the module against an
+`initdb`'d cluster with the card's SQL.
+
+*History:* the on-ramp was born pinned to **LLVM 18** — the dev container's `clang` default and the
+`llvm-ir` crate's binding — and bitcode from any other major was rejected outright. The textual
+reader removed that coupling; the remaining pin is the rustc↔`llvm-link` pairing above.
 
 ---
 

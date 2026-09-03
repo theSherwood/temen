@@ -1059,6 +1059,13 @@ guard is **unconditional** (#1094 — the one canonical layout): every producer
 NULL semantics. The `__null_guard` marker export that once gated the layout is
 **retired** (#1094), and `temen-llvm-translate --null-guard` is a redundant
 no-op. The host seeds args at `temen_ir::module_args_base` (`guard + 128`).
+The guard holds for **every window**, not just the root's (#1206): a §14
+confined child's carve and a spawned thread's view of its window seed it too
+(`Mem::nested_view` — the chokepoint every engine's nested arm shares — and the
+resumable `Vcpu::new_confined_child*` / thread-spawn constructors), so a child
+storing at NULL traps identically on the interpreter and the emitted tier. A
+carve smaller than the guard skips the seed (it would unmap the whole window),
+so a sub-guard grandchild stays fully usable and its own carves may sit low.
 
 ### Deferred
 `File`/`Directory`/`openAt`, `Connector`/networking (§7), async submit/complete
@@ -2295,7 +2302,11 @@ divergence, never an escape. The escalation past emit-nothing — a per-access *
 **landed** as the paged entry (#750, `compile_module_tierup_paged`), which the browser's cooperative
 tier-up selects whenever the module carries a `readonly` data segment or reaches `unmap`/`protect`
 (`module_uses_unmap_protect`; #1009 — every real card write-protects its rodata, so this is the
-shipped default for them, not an opt-in): every
+shipped default for them, not an opt-in), and which the **single-shot** run selects for a guest that
+reaches `unmap`/`protect` (#1201: `compile_jit_paged` → the wasm-driven `compile_module_reactor_paged`;
+`JitOnrampRun` rebuilds the table from each bounce's live map and the driver re-points
+`"pagestate"`/`"mapped"` — so a root on-ramp guest and an op-13 separate-module child run emitted
+instead of declining, invariant 14's runtime-backend × nesting cells): every
 confined access in a paged module also consults a host-maintained byte-per-page state table
 (`Unmapped`/`Rw`/`Ro`; base in the exported `"pagestate"` global, refreshed per emitted call from
 `Mem::map_info` — page state is frozen while emitted code runs, since page ops are `call.cap`s

@@ -9,7 +9,7 @@
 //! The host translates the guest, passes its on-ramp-assigned window `size_log2` as `argv[1]` (so the
 //! residual satisfies the `Jit.compile` memory-match precondition), runs it under `run_powerbox`, and
 //! asserts the guest reports `0` mismatches and that the residual collapsed to a single straight-line
-//! block (no dispatch loop left). Auto-skips without `rustc +1.81.0` / `llvm-link-18` / `opt-18`.
+//! block (no dispatch loop left). Auto-skips without `rustc` / `llvm-link` / `opt`.
 
 mod common;
 

@@ -45,11 +45,17 @@ fn collect(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
     }
 }
 
-/// The op-13 parent for a phase spawn: `caps` grant records at 1024.. (names at 2048..), `argv` at
-/// `carve + POWERBOX_ARGS_BASE`. Params: `(inst, module, cap0, cap1, …)`.
+/// The op-13 parent for a phase spawn: `caps` grant records and names, plus `argv`, laid out for the
+/// #1094 guarded window — records at `guard + 1024..`, names at `guard + 2048..`, `argv` at
+/// `carve + module_args_base()` (all above the NULL guard `[0, POWERBOX_NULL_GUARD)`; the pre-#1094
+/// 1024../2048../`carve + POWERBOX_ARGS_BASE` layout now falls inside the guard and NULL-faults).
+/// Params: `(inst, module, cap0, cap1, …)`.
 fn parent_src(child_sl: u32, carve_off: u64, argv: &[String], caps: &[&str]) -> String {
     let parent_sl = child_sl + 1;
-    let argv_off = carve_off + temen_ir::POWERBOX_ARGS_BASE;
+    let guard = temen_ir::POWERBOX_NULL_GUARD;
+    let rec_base = guard + 1024;
+    let name_base = guard + 2048;
+    let argv_off = carve_off + temen_ir::module_args_base();
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes());
@@ -67,9 +73,9 @@ fn parent_src(child_sl: u32, carve_off: u64, argv: &[String], caps: &[&str]) -> 
     let mut data = String::new();
     let mut records = String::new();
     for (i, name) in caps.iter().enumerate() {
-        let noff = 2048 + i as u64 * 16;
+        let noff = name_base + i as u64 * 16;
         data.push_str(&format!("data {noff} \"{name}\"\n"));
-        let off = 1024 + i as u64 * 16;
+        let off = rec_base + i as u64 * 16;
         let w0 = noff | ((name.len() as u64) << 32);
         records.push_str(&format!(
             "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n  h{off} = i64.extend_i32_u v{vi}\n  oh{off} = i64.const {hoff}\n  i64.store oh{off} h{off}\n",
@@ -84,7 +90,7 @@ fn parent_src(child_sl: u32, carve_off: u64, argv: &[String], caps: &[&str]) -> 
 func ({sig}) -> (i64) {{
 block 0 ({bparams}) {{
 {records}  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const {rec_base}
   vgn = i64.const {gn}
   ventry = i64.const 0
   voff = i64.const {carve_off}

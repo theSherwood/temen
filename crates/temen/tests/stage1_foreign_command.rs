@@ -19,26 +19,27 @@ use temen_verify::verify_module;
 
 const WIN: usize = 128 << 10;
 const CARVE: u64 = 64 << 10;
-const OUT_OFF: u64 = 8; // child copies argv here; parent forwards from CARVE + OUT_OFF
+const ARGV_OFF: u64 = 16384; // the parent seeds argv here (above the child's NULL guard, #1206)
+const OUT_OFF: u64 = ARGV_OFF + 8; // child copies argv here; parent forwards from CARVE + OUT_OFF
 
-/// The foreign command module: reads a 3-byte argv the parent seeded at offset 0, copies it to
+/// The foreign command module: reads a 3-byte argv the parent seeded at `ARGV_OFF`, copies it to
 /// `OUT_OFF` (its "stdout buffer"), and returns the byte count. A standalone binary — its output
 /// leaves via the shared carve, not a granted stream.
 fn child_src() -> &'static str {
     "memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  s0 = i64.const 0
+  s0 = i64.const 16384
   b0 = i32.load8_u s0
-  d0 = i64.const 8
+  d0 = i64.const 16392
   i32.store8 d0 b0
-  s1 = i64.const 1
+  s1 = i64.const 16385
   b1 = i32.load8_u s1
-  d1 = i64.const 9
+  d1 = i64.const 16393
   i32.store8 d1 b1
-  s2 = i64.const 2
+  s2 = i64.const 16386
   b2 = i32.load8_u s2
-  d2 = i64.const 10
+  d2 = i64.const 16394
   i32.store8 d2 b2
   n = i64.const 3
   return n
@@ -55,7 +56,7 @@ fn parent_src(token: &[u8; 3]) -> String {
         .iter()
         .enumerate()
         .map(|(i, &b)| {
-            let addr = CARVE + i as u64;
+            let addr = CARVE + ARGV_OFF + i as u64;
             format!("  q{i} = i64.const {addr}\n  c{i} = i32.const {b}\n  i32.store8 q{i} c{i}\n")
         })
         .collect();

@@ -25,13 +25,14 @@ use temen_verify::verify_module;
 const WIN: usize = 256 << 10;
 const CARVE: u64 = 128 << 10; // the child's carve — its declared `memory 17` (128 KiB)
 
-/// The child ("command"): a 128 KiB window, data `"VM"` at 100; child-entry `(i64 starter) -> (i64)`
-/// returns its data byte + 1000. (It ignores its re-granted `stdout` — this test isolates the spawn.)
+/// The child ("command"): a 128 KiB window, data `"VM"` at 16 KiB + 100 (above the NULL guard its carve
+/// reserves, #1206); child-entry `(i64 starter) -> (i64)` returns its data byte + 1000. (It ignores its
+/// re-granted `stdout` — this test isolates the spawn.)
 const CHILD: &str = "memory 17
-data 100 \"VM\"
+data 16484 \"VM\"
 func (i64) -> (i64) {
 block 0 (v0: i64) {
-  v1 = i64.const 100
+  v1 = i64.const 16484
   v2 = i32.load8_u v1
   v5 = i64.extend_i32_u v2
   v6 = i64.const 1000

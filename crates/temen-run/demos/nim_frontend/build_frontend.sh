@@ -19,8 +19,8 @@
 # `.idx` offsets those paths shift, and the module-identity hashes they seed) — a seeding artifact,
 # not a sema difference; the path-normalized diff below is byte-exact.
 #
-#   needs: nimony submodule, stock nim (2.3.x), the built nimony/nifler/hexer binaries, clang-18/
-#          llvm-18, cargo. Fail-soft SKIP if absent (NIM.md §2). The .temen are build artifacts.
+#   needs: nimony submodule, stock nim (2.3.x), the built nimony/nifler/hexer binaries, clang/
+#          llvm, cargo. Fail-soft SKIP if absent (NIM.md §2). The .temen are build artifacts.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../../../.." && pwd)"
@@ -35,7 +35,7 @@ BIN="${NIMONY_TOOLCHAIN_BIN:-$REPO/.nimtool/nimony/bin}"
 NIMONY="${NIMONY_BIN:-$(command -v nimony || echo "$BIN/nimony")}"
 NIMSEM_ORACLE="${NIMSEM_BIN:-$BIN/nimsem}"
 [ -x "$NIMONY" ] && [ -x "$NIMSEM_ORACLE" ] || { echo "SKIP: nimony/nimsem binaries absent (NIM.md §2)"; exit 0; }
-CLANG="${CLANG:-clang-18}"; command -v "$CLANG" >/dev/null || CLANG=clang
+CLANG="${CLANG:-clang}"
 NM=llvm-nm; TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 [ -x "$TR" ] || cargo build --release --bin temen-llvm-translate --manifest-path "$REPO/crates/temen-llvm/Cargo.toml"
 NIMLIB="$(nim dump 2>/dev/null | grep -m1 '/lib$' || true)"; [ -f "$NIMLIB/nimbase.h" ] || NIMLIB="$NIMLIB_FALLBACK"

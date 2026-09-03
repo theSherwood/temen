@@ -210,8 +210,10 @@ fn instantiate_child_tick_replays_deterministically() {
 // Confinement composes to depth 2 under the scheduled debugger: the root (func 0) instantiates a child
 // (func 1) in a 32 KiB window at 64 KiB; the child, handed an `Instantiator` over *its* window, itself
 // instantiates a grandchild (func 2) in a 1 KiB window at its own offset 16384 (a nested carve must
-// clear the #1094 NULL guard, so the child window is sized to hold a carve at 16384). Each joins the
-// next; the grandchild returns 77, propagated up. Same fixture as `bytecode_instantiate.rs::DEPTH_TWO`.
+// clear the #1094 NULL guard, so the child window is sized to hold a carve at 16384; the child's own
+// marker and spawn record sit above its guard too — #1206 seeds it on the child's carve — at 20 KiB,
+// clear of the grandchild carve). Each joins the next; the grandchild returns 77, propagated up. Same
+// fixture as `bytecode_instantiate.rs::DEPTH_TWO`.
 const DEPTH_TWO: &str = r#"memory 17
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -243,7 +245,7 @@ block 0 (v0: i32) {
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i32.wrap_i64 v0
-  v2 = i64.const 0
+  v2 = i64.const 20480
   v3 = i32.const 171
   i32.store8 v2 v3
   ; spawn via record (op 17): entry=2 off=16384 sl=10 quota=0
@@ -252,19 +254,19 @@ block 0 (v0: i64) {
   q2v2 = i64.const -4294967286
   q2v3 = i64.const 4294967295
   q2v4 = i64.const 0
-  q2a0 = i64.const 1280
+  q2a0 = i64.const 20544
   i64.store q2a0 q2v0
-  q2a1 = i64.const 1288
+  q2a1 = i64.const 20552
   i64.store q2a1 q2v1
-  q2a2 = i64.const 1296
+  q2a2 = i64.const 20560
   i64.store q2a2 q2v2
-  q2a3 = i64.const 1304
+  q2a3 = i64.const 20568
   i64.store q2a3 q2v3
-  q2a4 = i64.const 1312
+  q2a4 = i64.const 20576
   i64.store q2a4 q2v4
-  q2a5 = i64.const 1320
+  q2a5 = i64.const 20584
   i64.store q2a5 q2v4
-  q2a6 = i64.const 1328
+  q2a6 = i64.const 20592
   i64.store q2a6 q2v4
   v8 = call.cap 6 17 (i64) -> (i32) v1 (q2a0)
   v9 = call.cap 6 1 (i32) -> (i64) v1 (v8)
