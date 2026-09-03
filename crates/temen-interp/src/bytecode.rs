@@ -3249,6 +3249,7 @@ impl<'p> Vcpu<'p> {
             entry,
             back,
             size_log2,
+            size_log2, // carve == declared: a non-growing child, fully committed
             fuel,
             Host::new(),
             install_grants,
@@ -3278,8 +3279,37 @@ impl<'p> Vcpu<'p> {
             entry,
             back,
             size_log2,
+            size_log2, // carve == declared: a non-growing child, fully committed
             fuel,
             host,
+            &mut |_| {},
+        )
+    }
+
+    /// A **growable** §14 confined child (#1123 slice 4): the parent grants a carve of `1<<carve_log2`
+    /// (the child's `Instantiator`/`AddressSpace` span it) but the child's committed window starts at
+    /// its smaller declared `1<<declared_log2`, growing into the carve via `vm_map` — your rule: a
+    /// child's carve may grow because the parent granted it that room. `back` must cover the whole
+    /// carve (`len == 1<<carve_log2`). With `carve_log2 == declared_log2` this is exactly
+    /// [`new_confined_child`](Self::new_confined_child).
+    pub fn new_confined_child_grow(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        declared_log2: u8,
+        carve_log2: u8,
+        fuel: u64,
+    ) -> Result<Vcpu<'p>, Trap> {
+        Self::new_confined_child_core(
+            prog,
+            module,
+            entry,
+            back,
+            declared_log2,
+            carve_log2,
+            fuel,
+            Host::new(),
             &mut |_| {},
         )
     }
@@ -3291,11 +3321,17 @@ impl<'p> Vcpu<'p> {
         entry: u32,
         back: std::sync::Arc<super::Region>,
         size_log2: u8,
+        carve_log2: u8,
         fuel: u64,
         mut host: Host,
         install_grants: &mut dyn FnMut(&mut Host),
     ) -> Result<Vcpu<'p>, Trap> {
-        if size_log2 >= 64 {
+        // `size_log2` is the child's initially-committed (declared) window — its starting `mapped`.
+        // `carve_log2` is the parent-granted carve the child's authority (`Instantiator`/`AddressSpace`)
+        // spans; the child may `vm_map`-grow its committed window from `1<<size_log2` up to `1<<carve_log2`
+        // (#1123 slice 4 — the parent grants the carve, the child grows into it). For a non-growing child
+        // `carve_log2 == size_log2` (carve == declared, fully committed). `back` must cover the carve.
+        if carve_log2 >= 64 || size_log2 > carve_log2 {
             return Err(Trap::Malformed);
         }
         let cunit = prog
@@ -3308,12 +3344,15 @@ impl<'p> Vcpu<'p> {
             .sigs
             .get(entry as usize)
             .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-        let child_size = 1u64 << size_log2;
+        // The starter caps span the parent-granted **carve** (`1<<carve_log2`), not the smaller declared
+        // window — so a growing child's `vm_map` into `[1<<size_log2, 1<<carve_log2)` is authorized (the
+        // parent granted that range). The committed `mapped` still starts at the declared window below.
+        let carve_size = 1u64 << carve_log2;
         // `host` may already carry re-granted caps (op-13, via `new_confined_child_over_host`); the
         // starter `Instantiator`+`AddressSpace` are granted on top. `install_grants` is the closure form
         // (op-13 via `new_confined_child_granted`), run after the starter caps.
-        let cinst = host.grant_instantiator(0, child_size);
-        let cas = host.grant_address_space(0, child_size);
+        let cinst = host.grant_instantiator(0, carve_size);
+        let cas = host.grant_address_space(0, carve_size);
         // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
         // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
         install_grants(&mut host);
