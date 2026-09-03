@@ -253,8 +253,11 @@ jobs:
       # (LLVM on-ramp source oracle), wasm_transpile, spec_ops, roundtrip (format identity), opt_*
       # (SSA round-trip / SCCP), coverage_walk, paged_walk (interp⇄wasm-JIT paged bulk-mem per-page walk,
       # #1081 — the fourth confinement lowering, which wasm_diff can't reach), nested_paged (interp⇄wasm-JIT
-      # nested paged scalar page check with the page-op bounce serviced on a real vCPU, #1151), and the durable freeze/thaw
-      # family (interp + JIT). Keep this list in lockstep with fuzz/fuzz_targets/*.rs.
+      # nested paged scalar page check with the page-op bounce serviced on a real vCPU, #1151), live_mapped
+      # (interp⇄wasm-JIT mask-only tier over a guest-shaped window: the emitted bound reads the driver-synced
+      # live "mapped" global, #810) and pagestate (interp⇄wasm-JIT paged tier over randomized multi-run page
+      # tables, #810), and the durable freeze/thaw family (interp + JIT). Keep this list in lockstep with
+      # fuzz/fuzz_targets/*.rs.
       matrix:
         target:
           [
@@ -273,6 +276,8 @@ jobs:
             coverage_walk,
             paged_walk,
             nested_paged,
+            live_mapped,
+            pagestate,
             durable,
             durable_fiber,
             durable_jit,
@@ -380,30 +385,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: ${{ env.RUST_STABLE }}
-          components: rustfmt, clippy
+          # rust-src: the Rust probes (`peval_*`, `w5_leng_*`) build std from source (`-Z build-std`).
+          components: rustfmt, clippy, rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
-      - name: install LLVM/clang 18 (out-of-process build tools, no dev headers)
+      - name: install LLVM/clang (out-of-process build tools, no dev headers)
         # The on-ramp now reads **textual `.ll`** via an in-house parser — it no longer links
         # libLLVM, so the `-dev` headers/lib are gone. The test harness still shells out to two
         # ordinary build-time tools: `clang` (compile the C/C++ corpus to bitcode) and `llvm-dis`
-        # (disassemble it to `.ll` for the reader). Both ship in the base `llvm-18`/`clang-18`
-        # packages, as do the `llvm-link-18`/`opt-18` the peval probe uses.
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
-      - name: install Rust 1.81 (LLVM 18) for the peval Futamura probe only
-        # NOT for the Rust breadth lane anymore — that runs on the default stable `rustc` (its LLVM
-        # flows through the textual reader; the version-tolerance proof). This pin remains solely for
-        # the multi-crate `peval_*` probe (`tests/common/mod.rs`): it links the whole fixture closure
-        # with `llvm-link-18` and DCEs it with `opt-18`, and those LLVM-18 CLI tools can only ingest
-        # LLVM-18 IR — so the fixture must be built by a version-matched `rustc` (1.81 = LLVM 18.1).
-        # Without it the `peval_futamura`/`peval_jit`/`peval_in_sandbox` tests auto-skip (don't fail).
-        run: rustup toolchain install 1.81.0 --profile minimal
+        # (disassemble it to `.ll` for the reader), plus the `llvm-link`/`opt` the peval probe uses.
+        # The version lives in `scripts/ci/install-llvm.sh` — pinned to the stable rustc's LLVM major
+        # so the peval probe can feed default-`rustc` IR straight to `llvm-link`/`opt` (no second
+        # rustc toolchain); `ci_tool_canary` asserts the two agree.
+        run: bash scripts/ci/install-llvm.sh
       - name: fmt · clippy · test
         working-directory: crates/temen-llvm
         run: |
@@ -468,7 +462,7 @@ jobs:
       - name: install clang (native reference compiler)
         # The differential clang-builds a *native* chibicc reference (chibicc_ref) and `make`s the
         # chibicc fork with the system cc. `make`/`cc` are preinstalled on the runner; clang may not
-        # be — the test prefers `clang-18` and falls back to `clang`, so plain `clang` suffices.
+        # be — the test uses plain `clang` (any version the on-ramp's textual reader accepts).
         # ISSUES.md I34: bound the fetch so a wedged mirror fails fast into a re-run.
         timeout-minutes: 15
         run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y clang
@@ -543,15 +537,9 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
-      - name: install LLVM/clang 18 (for the on-ramp)
-        # clang-18 + llvm-dis, same out-of-process on-ramp tools as the temen-llvm job.
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install LLVM/clang (for the on-ramp)
+        # clang + llvm-dis, same out-of-process on-ramp tools as the temen-llvm job.
+        run: bash scripts/ci/install-llvm.sh
       # temen-llvm is workspace-excluded, so run from its own directory (like the `temen-llvm` job) rather
       # than `-p temen-llvm`. The trailing `${{ matrix.tier }}` is the libtest name filter: it selects the
       # `*_bytecode` or `*_tree_walker` ignored tests in the binary (the `*_jit` variants aren't #[ignore]d,
@@ -579,16 +567,10 @@ jobs:
           toolchain: ${{ env.RUST_STABLE }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
-      - name: install LLVM/clang 18 (+ make/curl for the capstone fetchers)
-        # clang-18 + llvm-dis for the on-ramp; make + curl let the Tcl/sqlite capstones fetch and build
+      - name: install LLVM/clang (+ make/curl for the capstone fetchers)
+        # clang + llvm-dis for the on-ramp; make + curl let the Tcl/sqlite capstones fetch and build
         # their sources rather than self-skip.
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18 make curl
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+        run: bash scripts/ci/install-llvm.sh make curl
       # `translate`'s ignored set is the three capstones (both #[ignore]d Tcl demos + the full sqlite
       # sweep) — no perf benches ride along.
       - name: whole-language capstones (Tcl REPL/init, full sqlite sweep)
@@ -791,14 +773,8 @@ jobs:
         with: { components: rust-src }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: crates/temen-llvm }
-      - name: install LLVM/clang 18 (build tools for the temen-llvm test harness)
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install LLVM/clang (build tools for the temen-llvm test harness)
+        run: bash scripts/ci/install-llvm.sh
       - name: cargo test -p temen-llvm setjmp (ASan, JIT path live)
         run: cargo test --manifest-path crates/temen-llvm/Cargo.toml --tests -Z build-std --target x86_64-unknown-linux-gnu setjmp
         env:
@@ -852,14 +828,8 @@ jobs:
       # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
       # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (temen-llvm links no
       # libLLVM). clang/flex/bison are Postgres's own build deps — used only on a cold input cache.
-      - name: install LLVM/clang 18 (+ Postgres build deps)
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18 flex bison
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install LLVM/clang (+ Postgres build deps)
+        run: bash scripts/ci/install-llvm.sh flex bison
 
       # Regenerate the Postgres artifacts from current code and stage them into web/assets/, so the
       # `browser-test.mjs` Postgres check BOOTS instead of SKIPping (it skips when unstaged). That boot
@@ -1114,14 +1084,8 @@ jobs:
           workspaces: |
             crates/temen-llvm
             bench/cross-engine/wasmtime-rs
-      - name: install LLVM/clang 18 (clang for the kernels & wasm, llvm-dis for the on-ramp)
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install LLVM/clang (clang for the kernels & wasm, llvm-dis for the on-ramp)
+        run: bash scripts/ci/install-llvm.sh
       - name: fetch Embench-IoT (not vendored — mixed per-kernel licenses)
         # -f + retries: codeload sometimes serves an error page instead of the tarball, which
         # `curl -sS | tar xz` can't detect ("not in gzip format" — ISSUES.md I18 class 4).
@@ -1155,14 +1119,8 @@ jobs:
           workspaces: |
             crates/temen-llvm
             browser
-      - name: install LLVM/clang 18 (clang for the kernels, llvm-dis for the on-ramp)
-        run: |
-          # ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient
-          # 403/outage from those mirrors can't fail `apt-get update` before we install anything.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
-          sudo apt-get update
-          sudo apt-get install -y llvm-18 clang-18
-          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: install LLVM/clang (clang for the kernels, llvm-dis for the on-ramp)
+        run: bash scripts/ci/install-llvm.sh
       - run: rustup target add wasm32-unknown-unknown
       - name: build the temen-browser wasm32 cdylib (so the temen-bytecode-wasm row runs)
         run: cargo build --release --lib --target wasm32-unknown-unknown --manifest-path browser/Cargo.toml
@@ -1240,8 +1198,7 @@ jobs:
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - name: install workload toolchains
         run: |
-          rustup toolchain install 1.81.0 --profile minimal
-          rustup +1.81.0 target add wasm32-unknown-unknown
+          rustup target add wasm32-unknown-unknown
           rustup toolchain install nightly --profile minimal --component rust-src
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: bench }
