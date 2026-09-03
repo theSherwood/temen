@@ -1238,7 +1238,7 @@ block 0 (v0: i64) {
   vk32 = i32.load8_u vz
   vk = i64.extend_i32_u vk32
   ventry = i64.const 1
-  voff = i64.const 0
+  voff = i64.const 32768
   vslog = i64.const 10
   vquota = i64.const 0
   vch = call.cap 6 0 (i64, i64, i64, i64) -> (i32) vinst (ventry, voff, vslog, vquota)

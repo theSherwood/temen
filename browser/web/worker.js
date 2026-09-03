@@ -207,7 +207,10 @@ self.onmessage = async (e) => {
         // native harness (crates/temen-wasm-jit/tests/nested_vm.rs).
         instantiate: (cwin, _inst, centry, off, cslog, quota) => {
           const gsize = 1 << Number(cslog), goff = Number(off);
-          if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize)
+          // #1206: a carve may not dip into this child's own NULL guard (`[0, 16 KiB)`, seeded on any
+          // window of at least the guard's size — the engine's `carve_fits` rule, `POWERBOX_NULL_GUARD`).
+          const guard = winSize >= 16384 ? 16384 : 0;
+          if (gsize > winSize || (goff & (gsize - 1)) !== 0 || goff + gsize > winSize || goff < guard)
             throw new Error('bad nested carve');
           const gslot = ex.temen_par_alloc(SLOT);
           const gstackTop = ex.temen_par_alloc(STACK) + STACK;

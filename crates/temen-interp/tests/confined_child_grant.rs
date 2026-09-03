@@ -14,19 +14,19 @@ use temen_interp::{bytecode, ForkedProc, Host, HostProc, Region, Trap, Value};
 use temen_text::parse_module;
 
 // The child entry (its `Instantiator` handle arrives as `v0`, unused here) seeds the name `"fs"` into
-// its window (`0x7366` little-endian = 'f','s'), resolves it to a handle, and calls the granted
+// its window (`0x7366` little-endian = 'f','s') — at 16 KiB, just above the NULL guard a confined
+// child's carve reserves like any window (#1206) — resolves it to a handle, and calls the granted
 // `HOST_PROC` cap (type 13, op 0) — returning the handler's result. A granted counter returns its
 // post-increment value, so a correct run returns 1.
 const CHILD: &str = r#"memory 16
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   vname = i64.const 29542
-  vzero = i64.const 0
-  i64.store vzero vname
-  vp0 = i64.const 0
+  vnp = i64.const 16384
+  i64.store vnp vname
   vl2 = i64.const 2
-  vh = self.resolve vp0 vl2
-  vr = call.cap 13 0 (i64) -> (i64) vh (vp0)
+  vh = self.resolve vnp vl2
+  vr = call.cap 13 0 (i64) -> (i64) vh (vnp)
   return vr
   }
 }

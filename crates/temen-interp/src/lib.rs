@@ -23619,7 +23619,7 @@ impl Mem {
     /// domains share **bytes**, not page-protection state — cross-domain memory sharing is §13, and
     /// lazy paging is the parent fielding the child's faults (co-fiber), not a shared map.
     fn nested_view(&self, abs_base: u64, size_log2: u8) -> Mem {
-        Mem {
+        let mut v = Mem {
             window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
             page: self.page,
             back: Arc::clone(&self.back),
@@ -23631,7 +23631,12 @@ impl Mem {
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
-        }
+        };
+        // #964/#1094/#1206: a §14 child's carve reserves `[0, POWERBOX_NULL_GUARD)` like any window —
+        // the one canonical layout, on every engine's nested arm (this is the chokepoint they share).
+        // A carve smaller than the guard skips (`seed_null_guard`), so a tiny grandchild stays usable.
+        v.seed_null_guard(temen_ir::module_null_guard());
+        v
     }
 
     /// One page's access state: `None` ⇒ faults (unmapped), `Some(writable)` ⇒ committed. A page
