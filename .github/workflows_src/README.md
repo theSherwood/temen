@@ -16,21 +16,6 @@ identical until the next agent edit.
 
 ## Pending changes not yet copied over
 
-- **`live_mapped` + `pagestate` in the `fuzz` job matrix (`ci.yml`, #810)** — two rows added after
-  `nested_paged` (plus comment lines): the new `fuzz/fuzz_targets/live_mapped.rs` and
-  `fuzz/fuzz_targets/pagestate.rs` targets — the runtime-aware confinement surface (#810) fuzzed as its
-  own unit. `live_mapped`: the mask-only tier's emitted bounds check reads the driver-synced live
-  `"mapped"` global; a guest `vm_map`-grows its own reserved window (contiguous, above or filling a hole), a leaf tiers up,
-  and the outcome + window bytes must match the interpreter (with a canary past the reservation pinning
-  the escape property). `pagestate`: the paged tier's per-access check over a live map built from three
-  fuzzer-chosen page ops (interleaved Unmapped/Rw/Ro runs, holes, re-commits) with scalar widths 1..16
-  and bulk walks straddling the transitions. Both have stable seed-driven peers in `crates/temen/tests/`
-  (`live_mapped_diff.rs`, `pagestate_diff.rs`) that gate every PR. Run like every other target
-  (`cargo +nightly fuzz run live_mapped`). (Until copied over, the `workflows-in-sync` guard **and** the
-  `fuzz targets wired` lockstep check stay red — the new `fuzz_targets/*.rs` + `[[bin]]` entries have no
-  matching matrix row in `.github/workflows/ci.yml` yet; `cp .github/workflows_src/*.yml
-  .github/workflows/` drains both.)
-
 - **`nested_paged` in the `fuzz` job matrix (`ci.yml`, #1151)** — one row added after `paged_walk`
   (plus a comment line): the new `fuzz/fuzz_targets/nested_paged.rs` target (the emitted §14 nested
   paged scalar page check vs the interpreter oracle, page-op bounce serviced on a real vCPU). Until
@@ -47,6 +32,19 @@ identical until the next agent edit.
   the committed nim assets + `nifler_ce.temen.gz` (stages a temp gunzipped copy it deletes); reuses the
   threads wasm the job already builds. Verified locally in Chromium. (Until copied over, the
   `workflows-in-sync` guard stays red; `cp .github/workflows_src/*.yml .github/workflows/` drains it.)
+
+- **`live_mapped` + `pagestate` in the `fuzz` job matrix (`ci.yml`, #810)** — two rows added after
+  `nested_paged` (plus comment lines): the new `fuzz/fuzz_targets/live_mapped.rs` and
+  `fuzz/fuzz_targets/pagestate.rs` targets — the runtime-aware confinement surface (#810) fuzzed as its
+  own unit. `live_mapped`: the mask-only tier's emitted bounds check reads the driver-synced live
+  `"mapped"` global; a guest `vm_map`-grows its own reserved window (contiguous, above or filling a hole), a leaf tiers up,
+  and the outcome + window bytes must match the interpreter (with a canary past the reservation pinning
+  the escape property). `pagestate`: the paged tier's per-access check over a live map built from three
+  fuzzer-chosen page ops (interleaved Unmapped/Rw/Ro runs, holes, re-commits) with scalar widths 1..16
+  and bulk walks straddling the transitions. Both have stable seed-driven peers in `crates/temen/tests/`
+  (`live_mapped_diff.rs`, `pagestate_diff.rs`) that gate every PR. Run like every other target
+  (`cargo +nightly fuzz run live_mapped`). (Copied over on the PR branch by the owner, so the
+  `workflows-in-sync` and `fuzz targets wired` checks are green there; listed for the record.)
 
 - **`browser-op13jit-nifler-test.mjs` in the `browser-real` job (`ci.yml`, #1025 Path 1, real nifler)** —
   one line added after `node browser-op13jit-e2e-test.mjs`: `node browser-op13jit-nifler-test.mjs`. It scales
