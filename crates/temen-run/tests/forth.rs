@@ -132,11 +132,54 @@ const THREADS: &str = ": work ( x -- y ) 1000 * ;\n\
     1 2 c cas . c atomic@ . 5 c atomic! c @ . cr\n";
 const THREADS_OUT: &str = "7000 \n0 200 \n200 200 5 \n";
 
+/// Typed `execute` (#1237): a runtime `call.dyn` dispatching on an xt (`' word`) at run time —
+/// `execute0 ( xt -- )`, `execute1 ( x xt -- y )`, `execute2 ( a b xt -- y )`. Proves first-class,
+/// runtime-dispatched execution: the last line stores an xt in a variable and calls it back
+/// (a deferred word / dispatch-table cell), byte-identical interp == JIT.
+#[test]
+fn forth_typed_execute() {
+    let out = forth(EXECUTE);
+    assert_eq!(out, EXECUTE_OUT);
+}
+
+const EXECUTE: &str = ": sq ( n -- n ) dup * ;\n\
+    6 ' sq execute1 . cr\n\
+    : showit ( -- ) 42 . cr ;\n\
+    ' showit execute0\n\
+    : add3 ( a b -- n ) + 3 + ;\n\
+    7 10 ' add3 execute2 . cr\n\
+    variable xt\n\
+    ' sq xt !\n\
+    9 xt @ execute1 . cr\n";
+const EXECUTE_OUT: &str = "36 \n42 \n20 \n81 \n";
+
+/// `exit` (#1237): an early return from a colon definition. It terminates the current word body
+/// with whatever the stack effect promises on every path, so a guarded `exit` and the fall-through
+/// must agree — proving the compiler closes the live block at `exit` exactly as it does at `;`.
+#[test]
+fn forth_exit() {
+    let out = forth(EXIT);
+    assert_eq!(out, EXIT_OUT);
+}
+
+const EXIT: &str = ": g ( n -- n ) dup 10 < if exit then 99 + ;\n\
+    5 g . 20 g . cr\n\
+    : h ( n -- n ) dup 0 < if drop 0 exit then dup * ;\n\
+    -4 h . 4 h . cr\n\
+    : e ( -- ) 1 . exit 2 . ;\n\
+    e cr\n";
+const EXIT_OUT: &str = "5 119 \n0 16 \n1 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
 fn forth_on_the_bytecode_engine() {
-    for (program, expected) in [(FIBERS, FIBERS_OUT), (THREADS, THREADS_OUT)] {
+    for (program, expected) in [
+        (FIBERS, FIBERS_OUT),
+        (THREADS, THREADS_OUT),
+        (EXECUTE, EXECUTE_OUT),
+        (EXIT, EXIT_OUT),
+    ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();
         let cfg = RunConfig {

@@ -27,6 +27,12 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   min max`, `@ ! c@ c! +! cells`, `variable create allot here ,`, `emit type cr space spaces . u.`,
   `." text"`, `s" text"` (pushes `addr len`), `' word` (pushes the xt = its `call.dyn` slot),
   `\` and `( … )` comments.
+- **Runtime dispatch (typed `execute`):** `execute0 ( xt -- )`, `execute1 ( x xt -- y )`,
+  `execute2 ( a b xt -- y )` call an xt (from `' word`, or stored in a variable) at run time — a
+  `call.dyn` on the runtime funcref, so deferred words and dispatch tables work. Untyped `execute`
+  (a runtime-arity call) stays out of the typed model.
+- **Early return:** `exit` terminates the current colon definition. Every path (the guarded `exit`
+  and the fall-through) must satisfy the word's stack effect.
 - **Fibers:** `task ( xt -- f )`, `resume ( f x -- status y )` (status `0` = suspended, `1` =
   returned), `yield ( x -- y )`. A task body is any word `( x -- y )`; it may be resumed from any
   later line.
@@ -34,8 +40,8 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   `wait ( addr expected -- status )` / `notify ( addr n -- woken )` are the futex; atomics:
   `atomic@ ( addr -- x )`, `atomic! ( x addr -- )`, `atomic+! ( n addr -- old )`,
   `atomic-xchg ( n addr -- old )`, `cas ( expected new addr -- old )`.
-- **Not in v0:** dynamic stack effects (`?dup`, `pick`, untyped `execute`), forward declarations,
-  floats.
+- **Not in v0:** dynamic stack effects (`?dup`, `pick`, untyped `execute`), `do`/`loop`, `constant`,
+  forward declarations (`defer`), floats. (Tracked as #1237 follow-ups.)
 
 ## How it works
 
