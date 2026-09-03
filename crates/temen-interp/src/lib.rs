@@ -4397,8 +4397,8 @@ enum Blocked {
     /// deadline fires with no progress is re-admitted with [`Pending::SvcTimeout`] and its
     /// re-executed `svc.wait` returns `0` instead of re-parking — the multi-consumer
     /// wind-down primitive (a spare consumer can otherwise never exit: any sibling may
-    /// work-steal every dispatch). A §2.2 pager whose demand child finished gets the same
-    /// `0` (#1217, [`pager_client_gone_locked`]) so it reaches its `join`.
+    /// work-steal every dispatch). A server whose client child finished gets the same `0`
+    /// (#1217, [`client_gone_locked`]) so it can return instead of waiting forever.
     SvcWait { key: usize, deadline_ns: i64 },
     /// CALLS.md 4b — the caller of an instanced offer whose **animated handler parked mid-run**.
     /// The provider world was handed back to the instance (`busy` reopened) and the handler fiber
@@ -4448,7 +4448,7 @@ enum Pending {
     /// frame was rewound at the park, so nothing is pushed here — the flag makes the
     /// re-executed serve arm return `0` instead of re-parking (concurrent work that raced the
     /// timer is still admitted first; a non-zero count wins over the timeout). Also delivered
-    /// to a §2.2 pager whose demand child finished (#1217): the same no-progress `0`.
+    /// to a server whose client child finished (#1217): the same no-progress `0`.
     SvcTimeout,
 }
 
@@ -4686,16 +4686,16 @@ fn svc_wake_locked(s: &mut Sched, key: usize) -> bool {
     }
 }
 
-/// #1217 — a §2.2 demand child bound to pager domain `pager` has finished (returned, exited, or
-/// trapped — before, during, or after its first fault). Its pager can no longer be woken by that
-/// client, so a consumer parked in `svc.wait` there is re-admitted with [`Pending::SvcTimeout`]
-/// (its re-executed `svc.wait` returns `0`, the timed form's no-progress answer) and reaches its
-/// `join`, which raises the child's outcome. With no consumer parked yet, a one-shot token is left
-/// for the domain's next `svc.wait` park ([`Sched::pager_client_gone`]). A pager with other live
-/// clients sees a spurious `0` and simply waits again — the wake-all contract of
-/// [`Sched::svc_waiters`].
-fn pager_client_gone_locked(s: &mut Sched, pager: usize) {
-    match s.svc_waiters.remove(&pager) {
+/// #1217 — a client §14 child of service domain `service` has finished (returned, exited, or
+/// trapped — before, during, or after its first request). The service can no longer be woken by
+/// that client, so a consumer parked in `svc.wait` there is re-admitted with
+/// [`Pending::SvcTimeout`] (its re-executed `svc.wait` returns `0`, the timed form's no-progress
+/// answer) and can return, so its `join` raises the outcome. With no consumer parked yet, a
+/// one-shot token is left for the domain's next `svc.wait` park ([`Sched::client_gone`]). A
+/// server with other live clients sees a spurious `0` and simply waits again — the wake-all
+/// contract of [`Sched::svc_waiters`].
+fn client_gone_locked(s: &mut Sched, service: usize) {
+    match s.svc_waiters.remove(&service) {
         Some(vs) => {
             for mut v in vs {
                 v.pending = Some(Pending::SvcTimeout);
@@ -4703,17 +4703,36 @@ fn pager_client_gone_locked(s: &mut Sched, pager: usize) {
             }
         }
         None => {
-            s.pager_client_gone.insert(pager);
+            s.client_gone.insert(service);
         }
     }
 }
 
-/// #1217 — the pager domain a finishing vCPU was a §2.2 demand client of, if any. Locks only the
-/// pager's host cell; call it before taking the scheduler lock.
-fn pager_domain_of(v: &VCpu) -> Option<usize> {
-    v.pager
-        .as_ref()
-        .map(|p| p.cell.lock_unpoisoned().domain_id() as usize)
+/// #1217 — the service domains a finishing vCPU was a client of, whose `svc.wait` its end
+/// releases: its §2.2 pager, and — for a §14 child's entry vCPU (`nested_child`: the child
+/// domain's end, not a thread of it finishing) — the provider of every live offer its powerbox
+/// still holds ([`Binding::LiveImpl`], the re-granted `child_offer` shape). Instanced offers
+/// (CALLS.md 4x, animated on the caller's own vCPU) never park a provider on this client, so they
+/// are not listed. Locks the host cells briefly, never nested; call it before taking the
+/// scheduler lock.
+fn client_gone_targets(v: &VCpu) -> Vec<usize> {
+    let mut cells: Vec<Arc<Mutex<Host>>> = v.pager.iter().map(|p| Arc::clone(&p.cell)).collect();
+    if v.nested_child {
+        let hg = v.host.lock_unpoisoned();
+        cells.extend(hg.table.iter().filter_map(|slot| match slot.entry {
+            Some(Binding::LiveImpl(i)) => {
+                hg.live_impls.get(i as usize).map(|e| Arc::clone(&e.callee))
+            }
+            _ => None,
+        }));
+    }
+    let mut ids: Vec<usize> = cells
+        .iter()
+        .map(|c| c.lock_unpoisoned().domain_id() as usize)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 /// FORK.md §8.6 — wake every reader parked on `pipe` under an **already-held** scheduler lock (the
@@ -4769,14 +4788,16 @@ struct Sched {
     results: BTreeMap<TaskId, Outcome>,
     /// A vCPU parked in `join`, keyed by the child it awaits.
     join_waiters: BTreeMap<TaskId, Box<VCpu>>,
-    /// #1217 — pager domains (by [`Host::domain_id`]) whose §2.2 demand child has **finished** (any
-    /// outcome) while no consumer of theirs was parked in `svc.wait`. A one-shot token consumed by
-    /// that domain's next `svc.wait` park: instead of parking, the consumer is re-admitted with
-    /// [`Pending::SvcTimeout`] and returns `0`. A child that dies before its first fault, or
-    /// returns without ever faulting, would otherwise strand its pager forever — no client can
-    /// request, nothing wakes the waiter, and the run hangs instead of the `join` raising the
-    /// child's outcome (INVARIANTS.md #9). See [`pager_client_gone_locked`].
-    pager_client_gone: BTreeSet<usize>,
+    /// #1217 — service domains (by [`Host::domain_id`]) one of whose **client** §14 child domains
+    /// has finished (any outcome) while no consumer of theirs was parked in `svc.wait`: the pager
+    /// of a §2.2 demand child, and every provider of a live offer the child held (a `child_offer`
+    /// re-granted by name). A one-shot token consumed by that domain's next `svc.wait` park:
+    /// instead of parking, the consumer is re-admitted with [`Pending::SvcTimeout`] and returns
+    /// `0`. A client that dies (or returns) before its first request would otherwise strand a
+    /// server waiting for it forever — nothing can request, nothing wakes the waiter, and the run
+    /// hangs instead of the server returning and its `join` raising the outcome (INVARIANTS.md
+    /// #9). See [`client_gone_locked`].
+    client_gone: BTreeSet<usize>,
     /// FORK.md §8.6 — twin `TaskId`s minted by pid-mode `clone_caller`, each mapped to its [`Twin`]
     /// record (forking parent domain + POSIX process group). The only ids `reap` (servicer-side
     /// `wait()`) will act on, *scoped to the parent*: a `wait(pid)` / `wait(-1)` / `wait(-pgid)` only
@@ -6007,11 +6028,11 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         trap_fiber: None,
     };
     let id = v.id;
-    // #1217 — a reaped §2.2 demand child releases its pager's parked `svc.wait` too.
-    let pager_gone = pager_domain_of(&v);
+    // #1217 — a reaped client child releases its services' parked `svc.wait` too.
+    let gone = client_gone_targets(&v);
     drop(v);
-    if let Some(pager) = pager_gone {
-        pager_client_gone_locked(s, pager);
+    for service in gone {
+        client_gone_locked(s, service);
     }
     if let Some(parent) = s.join_waiters.remove(&id) {
         s.runnable.push_back(parent);
@@ -6623,8 +6644,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let hg = v.host.lock_unpoisoned();
                     (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
                 };
-                // #1217 — a §2.2 demand child finishing releases its pager's parked `svc.wait`.
-                let pager_gone = pager_domain_of(&v);
+                // #1217 — a finishing client child releases the parked `svc.wait` of every
+                // service it could have called (its pager, its granted live offers).
+                let gone = client_gone_targets(&v);
                 let mut outcome = Outcome {
                     result,
                     mem: v.mem.take(),
@@ -6634,9 +6656,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 drop(v);
                 let mut s = sched.lock();
-                // (Never during a freeze unwind: the pager is quiesced by freeze-on-quiesce, not run.)
-                if let Some(pager) = pager_gone.filter(|_| !froze) {
-                    pager_client_gone_locked(&mut s, pager);
+                // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
+                if !froze {
+                    for service in gone {
+                        client_gone_locked(&mut s, service);
+                    }
                 }
                 for pipe in &pipe_eofs {
                     wake_pipe_readers_locked(&mut s, *pipe);
@@ -7073,11 +7097,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     .handler_parks
                     .keys()
                     .any(|slot| v.registry.slot_woken(*slot));
-                // #1217 — a demand client of this domain finished before we parked: take the
-                // one-shot token and return `0` (the timed form's answer) instead of parking on a
-                // queue no client can ever fill. Consulted only where we would otherwise park, so
-                // queued work is served first and the token outlives it.
-                if empty && !woken_handler && s.pager_client_gone.remove(&key) {
+                // #1217 — a client of this domain finished before we parked: take the one-shot
+                // token and return `0` (the timed form's answer) instead of parking on a queue no
+                // client can ever fill. Consulted only where we would otherwise park, so queued
+                // work is served first and the token outlives it.
+                if empty && !woken_handler && s.client_gone.remove(&key) {
                     let mut v = v;
                     v.pending = Some(Pending::SvcTimeout);
                     s.runnable.push_back(v);

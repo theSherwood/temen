@@ -1834,7 +1834,11 @@ and diff harnesses compare only the root outcome + effects that happened-before 
 a timeout (`MAX_WAIT` is an anti-wedge backstop, not semantics); in-flight host I/O
 quiesces before window read-back; cross-domain callers parked through the dying domain
 complete with a probeable errno (D37 death-is-revocation — the §3.6 machinery), never
-hang; a nested child's exit/trap ends the *child* domain only, surfacing to its owner as
+hang, and the mirror: a server parked in `svc.wait` whose **client** child domain ends
+(its §2.2 pager, the providers of the live offers it held) is released with the
+no-progress `0` — the timed form's answer — so it can return and be joined instead of
+waiting forever for a request that can never come (#1217); a nested child's exit/trap ends
+the *child* domain only, surfacing to its owner as
 an outcome (supervision: `poll` → trapped → detach + respawn, per I37). Before this rule
 the engines had divergent incidental residues (interpreter: join-all + a 10 s wait clamp;
 JIT: trap flag no parked waiter ever observed) — the jacl timed-wait regression report

@@ -304,6 +304,116 @@ fn pager_svc_wait_after_the_child_is_joined_returns_zero() {
     }
 }
 
+/// #1217, the granted-offer shape: the root spawns a **server** child (func 1: one `svc.wait`,
+/// returning its count), mints a `child_offer` over its export, and spawns a **guest** child
+/// (func 3, `guest`) with that offer re-granted by name as `"fork"`; then `join`s the server and
+/// exits its count. The guest's 4-KiB carve is below the guard size, so it stages the name at 0.
+fn granted_client_program(guest: &str) -> String {
+    format!(
+        "\
+memory 18
+data 16384 \"vm\"
+data 16684 \"fork\"
+type 0 func (i64) -> (i64)
+type 1 interface {{ op: 0 }}
+export 0 interface \"fork\" 1 {{ op: 2 }}
+import 0 \"exit\" (i32) -> ()
+func 0 () -> () {{
+block 0 () {{
+  vp = i64.const 16384
+  vl = i64.const 2
+  v0 = self.resolve vp vl
+  vf0 = i64.const 4294967296
+  vf8 = i64.const 65536
+  vf16 = i64.const -4294967284
+  vf24 = i64.const 4294967295
+  vf32 = i64.const 0
+  vf40 = i64.const 0
+  vf48 = i64.const 0
+{server_rec}
+  vsp = i64.const 17536
+  vs = call.cap 6 17 (i64) -> (i32) v0 (vsp)
+  vz0 = i64.const 0
+  voff = call.cap 6 14 (i32, i64) -> (i32) v0 (vs, vz0)
+  va0 = i64.const 16640
+  vnp0 = i32.const 16684
+  i32.store va0 vnp0
+  va1 = i64.const 16644
+  vfour = i32.const 4
+  i32.store va1 vfour
+  va2 = i64.const 16648
+  i32.store va2 voff
+  vg0 = i64.const 12884901888
+  vg8 = i64.const 131072
+  vg40 = i64.const 16640
+  vg48 = i64.const 1
+{guest_rec}
+  vgp = i64.const 17600
+  vg = call.cap 6 17 (i64) -> (i32) v0 (vgp)
+  vjs = call.cap 6 1 (i32) -> (i64) v0 (vs)
+  vc = i32.wrap_i64 vjs
+  call.import 0 (vc)
+  unreachable
+  }}
+}}
+func 1 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vz = i32.const 0
+  vs = svc.wait vz
+  return vs
+  }}
+}}
+func 2 (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  vseven = i64.const 7
+  return vseven
+  }}
+}}
+func 3 (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{guest}
+  }}
+}}
+",
+        server_rec = store_record(17536),
+        guest_rec = store_record(17600)
+            .replace("vra", "vgra")
+            .replace("vf0", "vg0")
+            .replace("vf8", "vg8")
+            .replace("vf40", "vg40")
+            .replace("vf48", "vg48"),
+        guest = guest,
+    )
+}
+
+/// The healthy exchange, pinning the program shape: the guest resolves `"fork"` and calls it once
+/// (the handler returns 7), the server's `svc.wait` counts 1, the root exits 1.
+#[test]
+fn granted_client_that_calls_once_is_served() {
+    let src = granted_client_program(
+        "  vfn = i64.const 1802661734
+  vz8 = i64.const 0
+  i64.store vz8 vfn
+  vl4 = i64.const 4
+  vfork = self.resolve vz8 vl4
+  vr = call.cap 268435456 0 (i64) -> (i64) vfork (vz8)
+  return vr",
+    );
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 1, "{b:?}");
+    }
+}
+
+/// #1217: the guest traps before calling. The server's only client is gone, so its `svc.wait`
+/// returns `0` (never parks forever), it returns, and the root's `join` delivers `0`.
+#[test]
+fn granted_client_that_dies_before_calling_releases_the_server() {
+    let src = granted_client_program("  unreachable");
+    for b in BACKENDS {
+        assert_eq!(run_bounded(b, &src).expect("run"), 0, "{b:?}");
+    }
+}
+
 /// A record with a nonzero version — or a nonzero reserved budget field (§3b's slot) — fails
 /// the spawn closed before any child state exists.
 #[test]
