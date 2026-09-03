@@ -4994,6 +4994,16 @@ fn c_a_sigkill_terminates_a_running_child_and_waitpid_reports_the_signal() {
         "coop bytecode (the browser tier): the killed domain is finalized at the scheduler loop top \
          and retired WIFSIGNALED — the `kill -9` no-op / hang is fixed, matching the oracle"
     );
+    // #1246 — the genuinely-parallel driver: the spinning child runs on its OWN OS thread, so it must
+    // observe the kill ITSELF via the per-op `term_flag` safepoint in `resume` (the loop-top sweep the
+    // cooperative driver uses cannot reach a concurrently-running thread). Was a hang before #1246.
+    let p = run_bytecode_parallel_only(&killspin_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(3009)],
+        "parallel bytecode: the killed child self-terminated at its per-op term safepoint on its own \
+         OS thread and waitpid reaped the WIFSIGNALED SIGKILL(9) death, matching the oracle"
+    );
 }
 
 fn killstopped_src() -> String {
@@ -5045,5 +5055,15 @@ fn c_a_sigkill_terminates_a_stopped_child_and_waitpid_reports_the_signal() {
         vec![Value::I32(3009)],
         "coop bytecode (the browser tier): a stopped (benched) domain is finalized by the loop-top \
          kill sweep and retired WIFSIGNALED — a stopped bg job is really killed, matching the oracle"
+    );
+    // #1246 — the genuinely-parallel driver: a "stopped" child busy-waits on its own OS thread (the
+    // parallel driver never benches — it spins until SIGCONT), so the per-op `term_flag` safepoint in
+    // `resume` catches the SIGKILL and terminates it, exactly as for a running child.
+    let p = run_bytecode_parallel_only(&killstopped_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(3009)],
+        "parallel bytecode: SIGKILL of the stopped child self-terminated it at its per-op term \
+         safepoint and waitpid reaped the WIFSIGNALED SIGKILL(9) death, matching the oracle"
     );
 }

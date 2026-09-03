@@ -21891,6 +21891,25 @@ impl Host {
         }
     }
 
+    /// #1246 — wire this domain's **default-action terminate** door for the genuinely-parallel driver
+    /// (`drive_parallel`). A `SIG_DFL` SIGKILL/SIGTERM/(uncaught)SIGINT delivered through the
+    /// personality fires this closure, which sets the domain's `term_flag` — the lock-free per-op
+    /// safepoint the bytecode `resume` loop polls on the parallel path so a killed vCPU on its own OS
+    /// thread self-terminates mid-execution (`Trap::ThreadFault`; the exit hook then retires it
+    /// `WIFSIGNALED` via the personality's `term_sig`). This is the tree-walker's `set_kill` shape,
+    /// minus the scheduler wakes it does for parked callers: a parallel vCPU busy-waits even when
+    /// "stopped", so it observes its own flag with no central sweep to notify. The **cooperative**
+    /// driver deliberately does NOT call this — it finalizes a killed domain at its single-threaded
+    /// loop top (#1215) — so its `term_flag` stays clear and the shared `resume` poll is inert there.
+    pub(crate) fn wire_kill_door(&self) {
+        let term_flag = self.term_flag.clone();
+        if let Some((_, source)) = self.signal_poll() {
+            source.set_kill(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+            }));
+        }
+    }
+
     pub(crate) fn exec_carry(
         &mut self,
         child: &mut Host,

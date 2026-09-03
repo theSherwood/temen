@@ -12990,6 +12990,12 @@ fn drive_parallel(
     // (#748) carries its OWN host cell minted at runtime — per-process powerboxes, the parallel twin
     // of the cooperative driver's `extra_envs`. `scope` joins all vCPUs before returning, so every
     // clone is dropped and the unwrap below is the sole owner.
+    // #1246 — wire the ROOT domain's default-action terminate door (invariant 14): a `SIG_DFL`
+    // terminate delivered to the root (an embedder raise, or a twin's `kill` of its parent) sets the
+    // root's `term_flag`, which its `resume` loop polls per op and self-terminates on — matching the
+    // tree-walker and the cooperative driver. Inert until a terminate actually fires. Fork twins get
+    // theirs at mint (the `ForkSelf` arm); a `thread.spawn` sibling shares this same host/`term_flag`.
+    host.wire_kill_door();
     let shared = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(host)));
     let out = std::thread::scope(|scope| {
         run_vcpu_parallel(
@@ -13195,6 +13201,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                         // personality with no park delegate, and without one the twin's own
                         // `fork()`/`waitpid()` cannot park (`-ENOSYS`/the ECHILD poll).
                         twin_host.wire_park_door();
+                        // #1246 — and its OWN kill door: a `SIG_DFL` terminate to this twin sets its
+                        // `term_flag`, which its `resume` loop polls per op and self-terminates on
+                        // (the parallel driver has no loop-top sweep like the cooperative one). Its
+                        // exit hook then retires it `WIFSIGNALED` via `term_sig`.
+                        twin_host.wire_kill_door();
                         let mut twin_active = vt.active.clone();
                         twin_active.set(dst, Reg::from_i64(0));
                         let twin_vt = VTask {
@@ -14058,6 +14069,18 @@ impl Vm {
         // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
         // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
         let signal_poll = host.with(|h| h.signal_poll());
+        // #1246 — the default-action TERMINATE safepoint for the genuinely-parallel driver. A domain
+        // killed by a `SIG_DFL` terminate has its `term_flag` set (via the `wire_kill_door` closure the
+        // parallel driver installs per domain); fetched once per resume (a cheap `Arc` clone), then
+        // polled per op below so a killed vCPU on its own OS thread self-terminates mid-execution — the
+        // tree-walker's per-op `term_flag` safepoint, which the cooperative driver deliberately avoids
+        // (it sweeps at its single-threaded loop top instead, #1215). Only for a personality run
+        // (`signal_poll` Some) — a pure-compute / JIT-bench vCPU has no killer, so it stays `None` and
+        // the per-op branch is free. The cooperative driver never wires the kill door, so its
+        // `term_flag` is clear and this poll is inert there too.
+        let term_flag = signal_poll
+            .as_ref()
+            .map(|_| host.with(|h| std::sync::Arc::clone(&h.term_flag)));
 
         macro_rules! r {
             ($i:expr) => {
@@ -14113,6 +14136,17 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
+            // #1246 — die at this op boundary if a `SIG_DFL` terminate has fired (the parallel driver:
+            // the kill door set this domain's `term_flag`). Checked BEFORE signal delivery below —
+            // death beats a caught-signal redirect, matching the tree-walker's kill-before-deliver
+            // order. The vCPU is terminating, so no cursor persistence: the `Err` unwinds `resume` →
+            // `step_vcpu` → `run_vcpu_parallel`, whose caller fires the exit hook (`WIFSIGNALED` from
+            // `term_sig`). Free when unarmed (`term_flag` `None`, or clear on the cooperative tier).
+            if let Some(tf) = &term_flag {
+                if tf.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(Trap::ThreadFault);
+                }
+            }
             // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
             // unmasked signal pending (its cheap `armed` flag) and we are not already
             // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
