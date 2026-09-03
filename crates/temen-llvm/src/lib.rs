@@ -21326,7 +21326,7 @@ fn vec_explode(
         // consumer — sign-extended for a signed use, zero-extended otherwise. Without this, a signed
         // lane compare against `splat (i16 -1)` (held as 65535) is wrong for every positive lane
         // (clang ≥22's SLP-vectorized byte clamp in picojpeg's `pjpeg_decode_mcu`).
-        let w = layout.shape.lane_bytes() as u32 * 8;
+        let w = layout.shape.lane_bytes() * 8;
         for t in 0..layout.tail_lanes {
             let v = parts[layout.full_chunks + t];
             out.push(if w < 32 {
