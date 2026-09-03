@@ -11159,6 +11159,75 @@ fn vec4i16_byte_clamp_select_sext_mask() {
     }
 }
 
+/// Arithmetic shift-right of a **>128-bit narrow vector** whose lane count isn't a chunk multiple,
+/// so it legalizes to one `i16x8` chunk + a scalar **tail** (`<10 x i16>` → 8 + 2). The chunk lanes
+/// shift on the hardware `VShift` (correct at true lane width); the tail lanes shift as `IntBin` in
+/// their `i32` container, where a **negative** narrow lane is held zero-extended (§3b) — so `ashr`
+/// must sign-extend the lane to the container first, exactly as the scalar `bin()` path does, or it
+/// shifts in zeros from bit 31 and reads a negative `i16` as positive. Tail lanes 8/9 = -4/-8, `>>1`
+/// → -2/-4, summed = -6. (The sibling of the picojpeg tail-lane miscompile, on the shift path.)
+#[test]
+fn wide_narrow_ashr_tail_lane_sign() {
+    let z = "i16 0, i16 0, i16 0, i16 0, i16 0, i16 0, i16 0, i16 0";
+    let ll = format!(
+        "define i32 @main() {{\n\
+        entry:\n  \
+        %s = ashr <10 x i16> <{z}, i16 -4, i16 -8>, \
+             <i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1>\n  \
+        %e8 = extractelement <10 x i16> %s, i32 8\n  \
+        %e9 = extractelement <10 x i16> %s, i32 9\n  \
+        %z8 = sext i16 %e8 to i32\n  \
+        %z9 = sext i16 %e9 to i32\n  \
+        %sum = add i32 %z8, %z9\n  \
+        ret i32 %sum\n}}"
+    );
+    let t = temen_llvm::translate_ll_str(&ll).expect("translate wide ashr .ll");
+    temen_verify::verify_module(&t.module).expect("verify wide ashr");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run wide ashr");
+    assert_eq!(
+        r,
+        vec![Value::I32(-6)],
+        "ashr(-4,1)+ashr(-8,1) = -2 + -4 = -6 (tail lanes sign-extended)"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, -6, "JIT wide ashr tail lane"),
+        other => panic!("JIT wide ashr tail lane: unexpected {other:?}"),
+    }
+}
+
+/// `sitofp` of a **narrow** integer vector (`<8 x i16> → <8 x float>`): each lane is held in an `i32`
+/// container, zero-extended (§3b), so a *signed* int→float that reads the container at `i32` width
+/// turns a negative `i16` lane into a large positive float. The source lanes must be sign-extended
+/// from their true width first. Lane 0 = -5 → -5.0; `fptosi` back to `i32` must give -5, not 65531.
+#[test]
+fn vec_narrow_sitofp_sign() {
+    let ll = "define i32 @main() {\n\
+        entry:\n  \
+        %f = sitofp <8 x i16> <i16 -5, i16 3, i16 0, i16 0, i16 0, i16 0, i16 0, i16 0> \
+             to <8 x float>\n  \
+        %e = extractelement <8 x float> %f, i32 0\n  \
+        %i = fptosi float %e to i32\n  \
+        ret i32 %i\n}";
+    let t = temen_llvm::translate_ll_str(ll).expect("translate vec sitofp .ll");
+    temen_verify::verify_module(&t.module).expect("verify vec sitofp");
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let r = temen_interp::run(&t.module, 0, &full, &mut fuel).expect("interp run vec sitofp");
+    assert_eq!(
+        r,
+        vec![Value::I32(-5)],
+        "sitofp of a negative i16 lane is -5.0, not 65531.0"
+    );
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&t.module, 0, &slots) {
+        Ok(JitOutcome::Returned(s)) => assert_eq!(s[0] as i32, -5, "JIT vec narrow sitofp"),
+        other => panic!("JIT vec narrow sitofp: unexpected {other:?}"),
+    }
+}
+
 /// A float math **intrinsic** (`llvm.log.f64`, `llvm.exp.f32`, … — clang ≥22 emits these under
 /// `-fno-math-errno` where older clangs emitted the libcall) resolves to the guest-**defined** libm
 /// function of that name when the program links one (Postgres bundles openlibm; its `cost_tuplesort`

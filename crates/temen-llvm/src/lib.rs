@@ -19796,6 +19796,45 @@ fn wide_int_binop(
 /// path): each `v128` chunk shifts via `VShift` (one scalar amount for all its lanes), each scalar tail
 /// lane via `IntBin`. The amount must be a constant splat — `const_splat_int` — since `VShift` takes a
 /// single scalar count; a per-lane-varying amount stays fail-closed (rare in auto-vectorized code).
+/// One **scalar tail-lane** shift for [`wide_int_shift`], narrow-correct in its `i32`/`i64` container.
+/// A `> 128`-bit narrow vector (`<N x i8>`/`<N x i16>`, `N` not a chunk multiple) legalizes to full
+/// `v128` chunks plus scalar tail lanes held in `i32` containers (`lane_bits` < container). A negative
+/// narrow lane is stored **zero-extended** (§3b), so an arithmetic `ShrS` in the container would shift
+/// in zeros from bit 31 and read it as positive — sign-extend the lane to the container first, exactly
+/// as the scalar [`bin`] path does. De-normalizing shifts (`Shl`/`ShrS`) then mask back to `lane_bits`
+/// to keep the lane canonical for the next reader (`ShrU` of a canonical lane stays canonical). The
+/// chunk lanes need none of this — they shift on the hardware `VShift` at true lane width.
+fn narrow_tail_shift(
+    ctx: &mut BlockCtx,
+    tail_ty: IntTy,
+    lane_bits: u32,
+    op: BinOp,
+    lane: ValIdx,
+    amt: ValIdx,
+) -> ValIdx {
+    let cw = if tail_ty == IntTy::I64 { 64 } else { 32 };
+    let a = if op == BinOp::ShrS && lane_bits < cw {
+        emit_ext(ctx, lane, lane_bits, cw, true)
+    } else {
+        lane
+    };
+    let r = ctx.push(Inst::IntBin {
+        ty: tail_ty,
+        op,
+        a,
+        b: amt,
+    });
+    if lane_bits < cw && matches!(op, BinOp::Shl | BinOp::ShrS) {
+        if cw == 64 {
+            mask_to_i64(ctx, r, lane_bits)
+        } else {
+            mask_to(ctx, r, lane_bits)
+        }
+    } else {
+        r
+    }
+}
+
 fn wide_int_shift(
     ctx: &mut BlockCtx,
     types: &Types,
@@ -19815,23 +19854,22 @@ fn wide_int_shift(
         let pa = ctx.wide_operand(a, layout)?;
         let pb = ctx.wide_operand(b, layout)?;
         let tail_ty = int_ty(layout.shape.lane_val())?;
+        let lane_bits = layout.shape.lane_bytes() * 8;
         let mut out = Vec::with_capacity(layout.nparts());
         for i in 0..layout.full_chunks {
             out.push(v128_lane_shift(ctx, layout.shape, tail_op, pa[i], pb[i])?);
         }
         for i in layout.full_chunks..layout.nparts() {
-            out.push(ctx.push(Inst::IntBin {
-                ty: tail_ty,
-                op: tail_op,
-                a: pa[i],
-                b: pb[i],
-            }));
+            out.push(narrow_tail_shift(
+                ctx, tail_ty, lane_bits, tail_op, pa[i], pb[i],
+            ));
         }
         ctx.bind_wide(dest, out);
         return Ok(true);
     };
     let pa = ctx.wide_operand(a, layout)?;
     let tail_ty = int_ty(layout.shape.lane_val())?;
+    let lane_bits = layout.shape.lane_bytes() * 8;
     // `VShift`'s amount is a scalar `i32` (one count for every lane of every chunk); the scalar tail
     // shifts by the same count in the lane's own integer type.
     let amt_i32 = ctx.push(Inst::ConstI32(amt as i32));
@@ -19849,12 +19887,9 @@ fn wide_int_shift(
         }));
     }
     for &lane in pa.iter().take(layout.nparts()).skip(layout.full_chunks) {
-        out.push(ctx.push(Inst::IntBin {
-            ty: tail_ty,
-            op: tail_op,
-            a: lane,
-            b: tail_amt,
-        }));
+        out.push(narrow_tail_shift(
+            ctx, tail_ty, lane_bits, tail_op, lane, tail_amt,
+        ));
     }
     ctx.bind_wide(dest, out);
     Ok(true)
@@ -21807,7 +21842,13 @@ fn lower_vec_fp_convert(
         .ok_or_else(|| Error::Unsupported("vector fp-convert: bad source shape".into()))?;
     let to_shape = vec_lane_shape(to_type)
         .ok_or_else(|| Error::Unsupported("vector fp-convert: bad dest shape".into()))?;
-    let lanes = vec_explode(ctx, operand, types, false)?;
+    // A **signed** int→float reads each source lane at its container width, but a narrow lane
+    // (`i8`/`i16` → `float`/`double`) is held zero-extended (§3b) — so explode it **sign-extended**,
+    // or a negative lane converts as a large positive (`sitofp i16 -5` would be `65531.0`). The other
+    // kinds don't need it: `uitofp` wants the zero-extended form; the float→int and float-resize kinds
+    // read float lanes, where the flag is moot.
+    let signed_src = matches!(kind, FpConv::SIToF);
+    let lanes = vec_explode(ctx, operand, types, signed_src)?;
     let mut out = Vec::with_capacity(lanes.len());
     for v in lanes {
         let inst = match kind {
