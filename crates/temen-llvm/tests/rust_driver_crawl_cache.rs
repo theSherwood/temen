@@ -155,10 +155,11 @@ unsafe fn add_path(base: i64, nwl: i64, path: i64, plen: i64) -> i64 {
     nwl + 1
 }
 
-unsafe fn scan_imports(base: i64, dbuf: i64, n: i64, mut nwl: i64) -> i64 {
+unsafe fn scan_imports(base: i64, dbuf: i64, n: i64, mut nwl: i64, dir: i64, dirlen: i64) -> i64 {
     let imp = b"(import";
     let frm = b"(fromimport";
     let inf = b"(infix";
+    let pfx = b"(prefix";
     let mut i = 0i64;
     while i < n {
         // Match `(import` (7) or `(fromimport` (11) — nimc::parse_imports scans both keywords.
@@ -174,40 +175,67 @@ unsafe fn scan_imports(base: i64, dbuf: i64, n: i64, mut nwl: i64) -> i64 {
             if m { kwend = i + 11; }
         }
         if kwend < 0 { i += 1; continue; }
-        // Skip whitespace, then require `(infix` (the `/lib/…`-resolving form). A `(when …)`-guarded
-        // import leads with `(when`, and a bare `(import foo)` with an ident — both fail this and are
-        // skipped, matching parse_imports (which drops non-infix/prefix and `when`-guarded blocks).
-        // Prefix/relative imports (`(prefix \2E/ x)`) are a follow-on.
+        // Skip whitespace after the keyword, then classify: `(infix …)` resolves under /lib
+        // (`std/x`), `(prefix …)` resolves relative to the importer's dir (`./x`). A `(when …)`-guarded
+        // import leads with `(when` and a bare `(import foo)` with an ident — both match neither and are
+        // skipped, matching parse_imports (which drops `when`-guarded and non-infix/prefix blocks).
         let mut q = kwend;
         while q < n { let c = rd(dbuf + q); if c == b' ' || c == 10 || c == 9 { q += 1; } else { break; } }
         let mut is_inf = true; let mut j = 0i64;
         while j < 6 { if rd(dbuf + q + j) != inf[j as usize] { is_inf = false; break; } j += 1; }
-        if !is_inf { i = kwend; continue; }
+        let mut is_pre = true; let mut j = 0i64;
+        while j < 7 { if rd(dbuf + q + j) != pfx[j as usize] { is_pre = false; break; } j += 1; }
+        if !is_inf && !is_pre { i = kwend; continue; }
         let ip = base + SCR;
-        let pre = b"/lib/"; let mut w = 0i64;
-        let mut kk = 0i64; while kk < 5 { wr(ip + w, pre[kk as usize]); w += 1; kk += 1; }
-        let mut p = q + 6;
-        let mut depth = 1i32;
-        let mut nseg = 0i64;
-        while p < n && depth > 0 {
-            let c = rd(dbuf + p);
-            if c == b'(' { depth += 1; p += 1; continue; }
-            if c == b')' { depth -= 1; p += 1; continue; }
-            if c == b' ' || c == 10 || c == 9 { p += 1; continue; }
-            if c == b'/' { p += 1; continue; }
-            if is_ident(c) {
-                if nseg > 0 { wr(ip + w, b'/'); w += 1; }
-                while p < n { let cc = rd(dbuf + p); if is_ident(cc) { wr(ip + w, cc); w += 1; p += 1; } else { break; } }
-                nseg += 1;
-            } else { p += 1; }
-        }
-        if nseg > 0 {
-            let suf = b".nim"; let mut kk = 0i64; while kk < 4 { wr(ip + w, suf[kk as usize]); w += 1; kk += 1; }
-            nwl = add_path(base, nwl, ip, w);
-        }
-        i = p;
+        let start = if is_inf { q + 6 } else { q + 7 };
+        let ret = resolve_segments(base, dbuf, start, n, is_inf, dir, dirlen, ip);
+        let plen = ret & 0xffffff;
+        if plen > 0 { nwl = add_path(base, nwl, ip, plen); }
+        i = ret >> 24;
     }
     nwl
+}
+
+// Resolve an `(infix …)` / `(prefix …)` block into `ip`; returns `(end << 24) | path_len` (path_len 0
+// if no segments). Uses inline copies (advancing the loop's own cursor) throughout: the on-ramp
+// translator miscompiles a separate-counter inner write loop through a parameter pointer (spurious
+// MemoryFault), so every byte copy walks the same cursor the loop condition tests.
+unsafe fn resolve_segments(base: i64, dbuf: i64, start: i64, n: i64, is_inf: bool, dir: i64, dirlen: i64, ip: i64) -> i64 {
+    let _ = base;
+    let mut w = 0i64;
+    if is_inf {
+        let lib = b"/lib/"; let mut kk = 0i64; while kk < 5 { wr(ip + w, lib[kk as usize]); w += 1; kk += 1; }
+    } else {
+        let mut d = 0i64; while d < dirlen { wr(ip + w, rd(dir + d)); w += 1; d += 1; }
+        wr(ip + w, b'/'); w += 1;
+    }
+    let mut p = start;
+    let mut depth = 1i32;
+    let mut nseg = 0i64;
+    while p < n && depth > 0 {
+        let c = rd(dbuf + p);
+        if c == b'(' { depth += 1; p += 1; continue; }
+        if c == b')' { depth -= 1; p += 1; continue; }
+        if c == b'/' || c == b' ' || c == 10 || c == 9 { p += 1; continue; }
+        if is_ident(c) {
+            // prefix drops the escaped-dot run "2E" (nifler emits `\2E/` for `./`); peek for it.
+            let is2e = !is_inf && c == b'2' && p + 1 < n && rd(dbuf + p + 1) == b'E'
+                && (p + 2 >= n || !is_ident(rd(dbuf + p + 2)));
+            if is2e {
+                p += 2;
+            } else {
+                if nseg > 0 { wr(ip + w, b'/'); w += 1; }
+                while p < n && is_ident(rd(dbuf + p)) { wr(ip + w, rd(dbuf + p)); w += 1; p += 1; }
+                nseg += 1;
+            }
+        } else { p += 1; }
+    }
+    if nseg > 0 {
+        let suf = b".nim"; let mut kk = 0i64; while kk < 4 { wr(ip + w, suf[kk as usize]); w += 1; kk += 1; }
+        (p << 24) | w
+    } else {
+        p << 24
+    }
 }
 
 #[no_mangle]
@@ -263,8 +291,10 @@ pub extern "C" fn run() -> i64 {
             let mut kk = 0i64; while kk < 9 { wr(dk + w2, ncr[kk as usize]); w2 += 1; kk += 1; }
             let mut kk = 0i64; while kk < slen { wr(dk + w2, rd(stem + kk)); w2 += 1; kk += 1; }
             let dsuf = b".p.deps.nif"; let mut kk = 0i64; while kk < 11 { wr(dk + w2, dsuf[kk as usize]); w2 += 1; kk += 1; }
+            let mut lastslash = 0i64; let mut ls = 0i64;
+            while ls < plen { if rd(path + ls) == b'/' { lastslash = ls; } ls += 1; }
             let n = fs_read(fs, dk, w2, base + DBUF, 65536);
-            if n > 0 { nwl = scan_imports(base, base + DBUF, n, nwl); }
+            if n > 0 { nwl = scan_imports(base, base + DBUF, n, nwl, path, lastslash); }
             crawled += 1;
             i += 1;
         }
@@ -505,4 +535,40 @@ fn rust_driver_guest_crawl_handles_fromimport_and_skips_when_guarded() {
         )),
         "the when-guarded import must not have been crawled"
     );
+}
+
+#[test]
+fn rust_driver_guest_crawl_resolves_prefix_relative_imports() {
+    let Some(nifler_bytes) = inflate(NIFLER_CE_GZ) else {
+        eprintln!("note: skipping (gzip unavailable)");
+        return;
+    };
+    // A relative import (`import ./sib`) from a module in a subdir: nifler emits it as
+    // `(import (prefix \2E/ sib))`, which nimc::parse_imports resolves against the importer's own dir —
+    // here /lib/std -> /lib/std/sib.nim, NOT /lib/sib.nim. main reaches it via an infix `std/sub`, so
+    // the crawl exercises both forms and a non-empty importer dir.
+    let seed = vec![
+        ("main.nim".into(), b"import std/sub\n".to_vec()),
+        ("lib/std/sub.nim".into(), b"import ./sib\n".to_vec()),
+        ("lib/std/sib.nim".into(), b"proc s(): int = 1\n".to_vec()),
+    ];
+    let dirs = vec!["lib".into(), "lib/std".into(), "nimcache".into()];
+    let Some((crawled, handle)) = run_crawl(&nifler_bytes, seed, dirs) else {
+        eprintln!("note: skipping (rustc unavailable)");
+        return;
+    };
+    assert_eq!(
+        crawled, 3,
+        "crawled main -> std/sub -> ./sib (the relative import resolved against /lib/std)"
+    );
+
+    let (files, _dirs) = handle.seed();
+    let has = |k: &str| files.iter().any(|(n, _)| n == k);
+    for path in ["/main.nim", "/lib/std/sub.nim", "/lib/std/sib.nim"] {
+        let stem = module_suffix(path);
+        assert!(
+            has(&format!("nimcache/{stem}.p.nif")),
+            "crawled {path} (prefix import resolved to its importer's dir)"
+        );
+    }
 }
