@@ -414,6 +414,35 @@ fn granted_client_that_dies_before_calling_releases_the_server() {
     }
 }
 
+/// #1228: the **daemon** shape #1217 cannot cover. The server is written as an unconditional
+/// `loop { svc.wait }` (the fork-manager server shape), not a wait-once-and-return, so the
+/// client-death token (#1217) gives it one spurious `0` and the loop re-parks it, untimed,
+/// forever. With its only client gone and the root `join`ing it, the run is a genuine
+/// join-deadlock: the root parked in `join`, the daemon parked in `svc.wait`, nothing else live
+/// and no external wake source. INVARIANTS.md #9 forbids a hang, so the run must **trap**
+/// `ThreadFault`. The cooperative bytecode driver already does; this pins the tree-walk executor
+/// (and the JIT, which declines these ops to the oracle) to the identical outcome — the #1228 fix.
+#[test]
+fn joined_daemon_whose_client_is_gone_deadlocks_to_threadfault() {
+    let base = granted_client_program("  unreachable");
+    // Re-spell the wait-once server (func 1) as an unconditional `loop { svc.wait }` daemon.
+    let src = base.replace(
+        "block 0 (v0: i64) {\n  vz = i32.const 0\n  vs = svc.wait vz\n  return vs\n  }",
+        "block 0 (v0: i64) {\n  br 1()\n  }\nblock 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()\n  }",
+    );
+    assert!(
+        src.contains("block 1 () {\n  vz = i32.const 0\n  vs = svc.wait vz\n  br 1()"),
+        "the daemon rewrite must apply"
+    );
+    for b in BACKENDS {
+        let e = run_bounded(b, &src).expect_err("the join-deadlock must trap, not hang");
+        assert!(
+            e.contains("ThreadFault"),
+            "{b:?}: the all-parked join-deadlock traps ThreadFault, got: {e}"
+        );
+    }
+}
+
 /// A record with a nonzero version — or a nonzero reserved budget field (§3b's slot) — fails
 /// the spawn closed before any child state exists.
 #[test]
