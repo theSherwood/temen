@@ -59,11 +59,14 @@ host asserts the emitted `.s.nif` is byte-identical to a committed expected (`ni
 for a fixed memfs). These are **wire-format-coupled** — regenerate them together on any IR/encoder/
 frontend change:
 
-- `fixtures/nimsem_ce.temen.gz` — `nimsem` built `--child-entry` (the op-13 child).
+- `fixtures/nimsem_ce.temen.gz` — `nimsem` built `--child-entry` (the op-13 child, step 9).
 - `fixtures/syslib.tar.gz` — the 26-file system import closure (`lib/std/system.nim` + its include set
   under `lib/std/system/` + `lib/std/errorcodes/`) the `nifler` grandchildren parse.
 - `fixtures/sysvq0asl.p.nif` — the seeded parsed `system` module (`sys` = its nimony stem).
-- `fixtures/sysvq0asl.s.nif.gz` — the expected sema output.
+- `fixtures/sysvq0asl.s.nif.gz` — nimsem's expected sema output (step 9), and **hexer's input** (step 10).
+- `fixtures/hexer_ce.temen.gz` — `hexer` built `--child-entry` (the op-13 child, step 10).
+- `fixtures/sysvq0asl.s.idx.nif` — the `.s.nif`'s index, read alongside it by hexer.
+- `fixtures/sysvq0asl.x.nif.gz` — hexer's expected Leng output (step 10).
 
 The `exec`'s nifler is the already-committed top-level `browser/web/assets/nifler.temen.gz` (either
 nifler yields identical output). **Regenerate** with `TEMEN_NIMSEM_EMIT_ASSET=1 bash build_frontend.sh`

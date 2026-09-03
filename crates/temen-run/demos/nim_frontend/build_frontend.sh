@@ -140,6 +140,17 @@ if [ -x "$HEXER_BIN" ]; then
     echo "FAILED (chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$chainout/nimcache/$sys.x.nif" | head -1; exit 1
   fi
 
+  # emit the step-10 hexer driver-guest fixtures (crates/temen-llvm/tests/rust_driver_hexer.rs): the
+  # guest op-13-spawns THIS hexer_ce over the .s.nif nimsem produced, reproducing this .x.nif (hexer is
+  # deterministic for a fixed input). The .s.nif/.s.idx.nif are the same nimsem output step 9 committed.
+  if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
+    FX="$HERE/fixtures"; mkdir -p "$FX"
+    gzip -9 -c "$CACHE/hexer_ce_raw.temen" > "$FX/hexer_ce.temen.gz"
+    cp "$chainout/nimcache/$sys.s.idx.nif" "$FX/$sys.s.idx.nif"
+    gzip -9 -c "$chainout/nimcache/$sys.x.nif" > "$FX/$sys.x.nif.gz"
+    echo "  emitted hexer driver-guest fixtures -> $FX (hexer_ce + $sys.s.idx.nif + $sys.x.nif.gz)"
+  fi
+
   # ---- [7/7] the SAME chain, but every phase op-13-spawned on the CRANELIFT JIT --------------------
   # The tier-up-capable engine a browser wasm-JIT compile card uses. The op-13 `mod_ok` relaxation
   # (`declared <= carve`, matching the interpreter — FORK.md §8.6 / #773) is what lets these

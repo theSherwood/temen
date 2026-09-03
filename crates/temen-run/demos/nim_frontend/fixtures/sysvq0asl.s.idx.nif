@@ -1,0 +1,8 @@
+(.nif27)
+(index
+(converter
+ (kv openArray.0.sysvq0asl toOpenArray.0.sysvq0asl)
+ (kv openArray.0.sysvq0asl toOpenArray.1.sysvq0asl)
+ (kv openArray.0.sysvq0asl toOpenArray.2.sysvq0asl))
+(checksum "F8FC30D55DA04DBEAE0FC26EDC6370F3BA04E36B")
+)
