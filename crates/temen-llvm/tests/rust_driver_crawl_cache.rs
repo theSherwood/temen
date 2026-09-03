@@ -156,18 +156,33 @@ unsafe fn add_path(base: i64, nwl: i64, path: i64, plen: i64) -> i64 {
 }
 
 unsafe fn scan_imports(base: i64, dbuf: i64, n: i64, mut nwl: i64) -> i64 {
-    let needle = b"(import";
+    let imp = b"(import";
+    let frm = b"(fromimport";
     let inf = b"(infix";
     let mut i = 0i64;
-    while i + 7 <= n {
-        let mut m = true; let mut j = 0i64;
-        while j < 7 { if rd(dbuf + i + j) != needle[j as usize] { m = false; break; } j += 1; }
-        if !m { i += 1; continue; }
-        let mut q = i + 7;
+    while i < n {
+        // Match `(import` (7) or `(fromimport` (11) — nimc::parse_imports scans both keywords.
+        let mut kwend = -1i64;
+        if i + 7 <= n {
+            let mut m = true; let mut j = 0i64;
+            while j < 7 { if rd(dbuf + i + j) != imp[j as usize] { m = false; break; } j += 1; }
+            if m { kwend = i + 7; }
+        }
+        if kwend < 0 && i + 11 <= n {
+            let mut m = true; let mut j = 0i64;
+            while j < 11 { if rd(dbuf + i + j) != frm[j as usize] { m = false; break; } j += 1; }
+            if m { kwend = i + 11; }
+        }
+        if kwend < 0 { i += 1; continue; }
+        // Skip whitespace, then require `(infix` (the `/lib/…`-resolving form). A `(when …)`-guarded
+        // import leads with `(when`, and a bare `(import foo)` with an ident — both fail this and are
+        // skipped, matching parse_imports (which drops non-infix/prefix and `when`-guarded blocks).
+        // Prefix/relative imports (`(prefix \2E/ x)`) are a follow-on.
+        let mut q = kwend;
         while q < n { let c = rd(dbuf + q); if c == b' ' || c == 10 || c == 9 { q += 1; } else { break; } }
         let mut is_inf = true; let mut j = 0i64;
         while j < 6 { if rd(dbuf + q + j) != inf[j as usize] { is_inf = false; break; } j += 1; }
-        if !is_inf { i += 7; continue; }
+        if !is_inf { i = kwend; continue; }
         let ip = base + SCR;
         let pre = b"/lib/"; let mut w = 0i64;
         let mut kk = 0i64; while kk < 5 { wr(ip + w, pre[kk as usize]); w += 1; kk += 1; }
@@ -348,20 +363,24 @@ fn module_suffix(file: &str) -> String {
     stem
 }
 
-#[test]
-fn rust_driver_guest_crawls_with_stem_named_cache_outputs() {
-    let Some(nifler_bytes) = inflate(NIFLER_CE_GZ) else {
-        eprintln!("note: skipping (gzip unavailable)");
-        return;
-    };
-    let dir = std::env::temp_dir().join(format!("rust_driver_crawl_cache_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+/// Translate the crawl guest, grant it the caps over a memfs seeded with `seed`+`dirs`, run it, and
+/// return `(crawled count, shared handle)` — or `None` if rustc/gzip are unavailable (skip).
+fn run_crawl(
+    nifler_bytes: &[u8],
+    seed: Vec<(String, Vec<u8>)>,
+    dirs: Vec<String>,
+) -> Option<(i64, temen_run::fs::MemFsHandle)> {
+    let dir = std::env::temp_dir().join(format!(
+        "rust_driver_crawl_cache_{}_{}",
+        std::process::id(),
+        seed.len()
+    ));
+    std::fs::create_dir_all(&dir).ok()?;
     let src = dir.join("g.rs");
     let ll = dir.join("g.ll");
-    std::fs::write(&src, CRAWL_SRC).unwrap();
+    std::fs::write(&src, CRAWL_SRC).ok()?;
     if !rustc_emit_ll(&src, &ll) {
-        eprintln!("note: skipping (rustc unavailable)");
-        return;
+        return None;
     }
     let t = temen_llvm::translate_ll_path(&ll).expect("translate crawl guest");
     temen_verify::verify_module(&t.module).expect("driver verifies");
@@ -373,17 +392,10 @@ fn rust_driver_guest_crawls_with_stem_named_cache_outputs() {
         .1;
     let sp = t.entry_sp as i64;
 
-    let nifler = temen_encode::decode_module(&nifler_bytes).expect("decode nifler_ce.temen");
+    let nifler = temen_encode::decode_module(nifler_bytes).expect("decode nifler_ce.temen");
     temen_verify::verify_module(&nifler).expect("nifler verifies");
 
-    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(
-        vec![
-            ("main.nim".into(), b"import std/foo\n".to_vec()),
-            ("lib/std/foo.nim".into(), b"import std/bar\n".to_vec()),
-            ("lib/std/bar.nim".into(), b"proc b(): int = 1\n".to_vec()),
-        ],
-        vec!["lib".into(), "lib/std".into(), "nimcache".into()],
-    );
+    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(seed, dirs);
     let factory = Arc::new(factory);
 
     let mut host = Host::new();
@@ -419,6 +431,25 @@ fn rust_driver_guest_crawls_with_stem_named_cache_outputs() {
         [Value::I32(x)] => *x as i64,
         other => panic!("driver result: {other:?}"),
     };
+    Some((crawled, handle))
+}
+
+#[test]
+fn rust_driver_guest_crawls_with_stem_named_cache_outputs() {
+    let Some(nifler_bytes) = inflate(NIFLER_CE_GZ) else {
+        eprintln!("note: skipping (gzip unavailable)");
+        return;
+    };
+    let seed = vec![
+        ("main.nim".into(), b"import std/foo\n".to_vec()),
+        ("lib/std/foo.nim".into(), b"import std/bar\n".to_vec()),
+        ("lib/std/bar.nim".into(), b"proc b(): int = 1\n".to_vec()),
+    ];
+    let dirs = vec!["lib".into(), "lib/std".into(), "nimcache".into()];
+    let Some((crawled, handle)) = run_crawl(&nifler_bytes, seed, dirs) else {
+        eprintln!("note: skipping (rustc unavailable)");
+        return;
+    };
     assert_eq!(crawled, 3, "crawled main -> std/foo -> std/bar");
 
     let (files, _dirs) = handle.seed();
@@ -432,4 +463,46 @@ fn rust_driver_guest_crawls_with_stem_named_cache_outputs() {
             "the crawl wrote `{key}` (stem for {path}) — nimc-cache-correct output naming"
         );
     }
+}
+
+#[test]
+fn rust_driver_guest_crawl_handles_fromimport_and_skips_when_guarded() {
+    let Some(nifler_bytes) = inflate(NIFLER_CE_GZ) else {
+        eprintln!("note: skipping (gzip unavailable)");
+        return;
+    };
+    // main uses `from std/foo import x` (fromimport) AND a `when`-guarded `import winlean`. The crawl
+    // must follow std/foo but must NOT chase the platform-guarded winlean (which isn't in the memfs) —
+    // exactly nimc::parse_imports' behavior (it scans `fromimport` too, and skips `(when …)` blocks).
+    let seed = vec![
+        (
+            "main.nim".into(),
+            b"from std/foo import x\nwhen defined(windows):\n  import winlean\n".to_vec(),
+        ),
+        ("lib/std/foo.nim".into(), b"proc f(): int = 1\n".to_vec()),
+    ];
+    let dirs = vec!["lib".into(), "lib/std".into(), "nimcache".into()];
+    let Some((crawled, handle)) = run_crawl(&nifler_bytes, seed, dirs) else {
+        eprintln!("note: skipping (rustc unavailable)");
+        return;
+    };
+    assert_eq!(
+        crawled, 2,
+        "crawled main + std/foo (via fromimport); the when-guarded winlean was skipped, not chased"
+    );
+
+    let (files, _dirs) = handle.seed();
+    let has = |k: &str| files.iter().any(|(n, _)| n == k);
+    for path in ["/main.nim", "/lib/std/foo.nim"] {
+        let stem = module_suffix(path);
+        assert!(has(&format!("nimcache/{stem}.p.nif")), "crawled {path}");
+    }
+    // winlean was never sought — no nifler run, no output for it.
+    assert!(
+        !has(&format!(
+            "nimcache/{}.p.nif",
+            module_suffix("/lib/winlean.nim")
+        )),
+        "the when-guarded import must not have been crawled"
+    );
 }
