@@ -23,7 +23,15 @@
 //! ```
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+// A **deterministic**-hasher `HashMap` (fixed-key `DefaultHasher`, not `RandomState`) so the parser
+// pulls no OS entropy — `RandomState` seeds via getrandom (syscall / `/dev/urandom`), which is not on
+// the LLVM on-ramp's extern allowlist, so a plain `HashMap` makes `temen_text::parse_module` un-buildable
+// as a guest (e.g. the nim→powerbox link guest, which parses the compute shim). These maps are
+// lookup-only (name/label → index), never iterated for output, so a fixed hasher is behavior-neutral.
+// The leng analog is `temen_leng::dethash` (#1025 3c).
+use std::collections::hash_map::DefaultHasher;
+use std::hash::BuildHasherDefault;
+type HashMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<DefaultHasher>>;
 use std::fmt::Write as _;
 
 use temen_ir::{
@@ -2026,7 +2034,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::RBrace)?;
 
         // Resolve block labels to indices.
-        let mut labels: HashMap<String, u32> = HashMap::new();
+        let mut labels: HashMap<String, u32> = HashMap::default();
         for (i, b) in pblocks.iter().enumerate() {
             if labels.insert(b.label.clone(), i as u32).is_some() {
                 return err(format!("duplicate block label `{}`", b.label));
@@ -2313,7 +2321,7 @@ impl<'a> Parser<'a> {
         }
         let label = n.to_string();
         // Per-block value-name table; parameters take indices 0..k.
-        let mut names: HashMap<String, u32> = HashMap::new();
+        let mut names: HashMap<String, u32> = HashMap::default();
         let mut params = Vec::new();
         // Auto debug positions (only filled when synthesizing debug info).
         let mut dbg = PBlockDbg::default();

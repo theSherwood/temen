@@ -194,6 +194,15 @@ if want nim_driver_guest; then
   else
     note "nim_driver_guest SKIP/✗ (nimony toolchain — see build_frontend.sh; then refresh the expected via the test)"
   fi
+  # The nim->powerbox link guest (link-in-guest) — separate build-std pipeline (rustc 1.81 / LLVM 18);
+  # no nimony toolchain, only rustc +1.81.0 + rust-src + llvm-18. Gzips fixtures/nim-link.temen.gz itself.
+  if bash crates/temen-run/demos/nim_frontend/build_nim_link.sh >/dev/null 2>&1 \
+     && gunzip -c "$FX/nim-link.temen.gz" > /tmp/rebuild_nim_link.temen 2>/dev/null \
+     && validate /tmp/rebuild_nim_link.temen; then
+    note "nim_link ✓ (nim-link.temen.gz)"
+  else
+    note "nim_link SKIP/✗ (rustc +1.81.0 + rust-src + llvm-18 — see build_nim_link.sh)"
+  fi
 fi
 
 # --- 7) lua_snapshot.temen (Lua 5.4.7 core+libs + the two-phase snapshot harness → translate) -------
