@@ -1709,6 +1709,19 @@ impl SignalSource for SignalDoor {
             .is_some()
     }
 
+    /// #1215 — has a `SIG_DFL` terminate-action delivery set this domain's `term_sig` (SIGKILL, or a
+    /// SIGTERM/SIGINT default that was actionable — not held while stopped/masked)? The cooperative
+    /// driver finalizes a killed domain from this. `deliver_signal` sets `term_sig` only when the
+    /// terminate actually fires (SIGKILL always; others when neither stopped nor masked), so this is
+    /// exactly "should die now".
+    fn killed(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .term_sig
+            .is_some()
+    }
+
     /// #796 block-during-handler — an injected handler frame returned: restore the pre-delivery
     /// mask pushed by [`SignalDoor::take_deliverable`], then act on what the unblocking exposes —
     /// a now-deliverable caught signal re-arms (the running vCPU picks it up at its next per-op

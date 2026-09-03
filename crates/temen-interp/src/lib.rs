@@ -17341,6 +17341,18 @@ pub trait SignalSource: Send + Sync {
         false
     }
 
+    /// #1215 — has this domain been **terminated** by a `SIG_DFL` terminate-action signal (SIGKILL,
+    /// SIGTERM, an uncaught SIGINT, …), i.e. is its `term_sig` bookkeeping set and actionable now? The
+    /// cooperative driver has no per-op terminate poll (the tree-walker's `term_flag` safepoint), so its
+    /// scheduler consults this at the loop top to FINALIZE every task of a killed domain — running,
+    /// stopped, or parked — before the pick, dying with the WIFSIGNALED status the exit hook then reaps.
+    /// A signal HELD while stopped/masked (a plain SIGTERM to a stopped job) is not yet actionable, so it
+    /// stays `false` until continued — matching the personality's own gate. Default `false` — sources
+    /// without a default-action terminate story never die here.
+    fn killed(&self) -> bool {
+        false
+    }
+
     /// #1171 — **read-and-clear** the one-shot "a child of this domain transitioned (stop/continue)"
     /// edge. The cooperative driver's all-parked sweep consults this to re-admit a task parked in a
     /// blocking personality `waitpid(WUNTRACED/WCONTINUED)` when a child stopped/continued — even with
