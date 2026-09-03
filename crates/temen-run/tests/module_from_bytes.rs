@@ -89,9 +89,15 @@ block 0 (vstarter: i64) {
 /// Build the parent with `child_bytes` seeded at [`CHILD_BYTES_OFF`] as a data segment.
 fn parent_with_child_bytes(child_bytes: &[u8]) -> Module {
     let mut parent = parse_module(PARENT).expect("parse parent");
+    // `readonly: false` — the bytes are transient input to `from_bytes` (decode copies them out), so
+    // they need no RO protection. It also matters for correctness on large-page platforms: `init_data`
+    // RO-protects a readonly segment's whole *page*, and on macOS/arm64 (16 KiB pages) that page
+    // (`[16384, 32768)`) also contains the parent's writable grant-record store targets (17408/17416) —
+    // RO-protecting it would fault the parent's `i64.store` with a `MemoryFault` (4 KiB-page Linux
+    // splits them across pages and hides the straddle).
     parent.data.push(Data {
         offset: CHILD_BYTES_OFF,
-        readonly: true,
+        readonly: false,
         bytes: child_bytes.to_vec(),
     });
     temen_verify::verify_module(&parent).expect("parent verifies");
@@ -183,9 +189,11 @@ block 0 (v0: i32, v1: i32) {
 
 fn probe(bytes: &[u8]) -> i64 {
     let mut m = parse_module(PROBE).expect("parse probe");
+    // `readonly: false` — transient `from_bytes` input; see `parent_with_child_bytes` for why RO
+    // protection is both unnecessary and, on large-page platforms, harmful.
     m.data.push(Data {
         offset: CHILD_BYTES_OFF,
-        readonly: true,
+        readonly: false,
         bytes: bytes.to_vec(),
     });
     temen_verify::verify_module(&m).expect("probe verifies");
