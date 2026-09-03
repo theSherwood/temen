@@ -26,7 +26,13 @@ extern void *memcpy(void *, const void *, unsigned long);
 extern void *memset(void *, int, unsigned long);
 extern void *malloc(unsigned long);
 
-#define CAP 4096 /* ring capacity = one page (the SharedRegion map granularity) */
+/* The ring capacity is **one region-map page, queried at runtime** (`SharedRegion` op 3), not a
+ * hardcoded 4 KiB: the map granularity is the host page (16 KiB on Apple Silicon, 64 KiB on Windows),
+ * and the runtime rejects a `SharedRegion.map` whose window offset isn't a multiple of it — a fixed
+ * 4 KiB `SharedRegion.map` `EINVAL`s on any coarser-page host (#737 family). The demo's output is
+ * capacity-independent (a read-back always returns exactly what was written, wrapping or not), so the
+ * guest's queried page and the native oracle's `sysconf` page need not agree. */
+#define RING_MAX_PAGE 65536 /* provisional region size: ≥ any host map granularity, sliced to `cap` */
 #define NMSG 200
 
 #ifdef TEMEN_GUEST
@@ -36,7 +42,7 @@ extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
 extern long __vm_region_call(int h, int op, long a, long b, long c, long d);
 
 enum { FS_OPEN = 0, FS_MAP_REGION = 13 };
-enum { SR_MAP = 0 };
+enum { SR_MAP = 0, SR_PAGE_SIZE = 3 };
 enum { CAP_O_READ = 1, CAP_O_WRITE = 2, CAP_O_CREATE = 16 };
 enum { CAP_PROT_READ = 1, CAP_PROT_WRITE = 2 };
 
@@ -46,16 +52,21 @@ static long cstrlen(const char *s) {
   return n;
 }
 
-/* Reserve `2*CAP` page-aligned window bytes and alias the `CAP`-byte region over both halves. */
-static char *ring_setup(unsigned cap) {
+/* Mint the region, ask it for the host's map granularity (`SR_PAGE_SIZE`, op 3), and alias one such
+ * page over two adjacent window offsets. Reports the capacity actually used via `*cap_out`. */
+static char *ring_setup(unsigned *cap_out) {
   int fs = __vm_cap_resolve("fs", 2);
   if (fs < 0) return 0;
   const char *path = "ring.dat";
   int fd = (int)__vm_host_call(fs, FS_OPEN, (long)path, cstrlen(path),
                                CAP_O_READ | CAP_O_WRITE | CAP_O_CREATE, 0);
   if (fd < 0) return 0;
-  long region = __vm_host_call(fs, FS_MAP_REGION, fd, 0, cap, 0);
+  /* Mint at the provisional max page (the region only needs to be ≥ the granularity we then map). */
+  long region = __vm_host_call(fs, FS_MAP_REGION, fd, 0, RING_MAX_PAGE, 0);
   if (region < 0) return 0;
+  long g = __vm_region_call((int)region, SR_PAGE_SIZE, 0, 0, 0, 0);
+  if (g <= 0 || g > RING_MAX_PAGE) return 0;
+  unsigned cap = (unsigned)g;
   /* over-allocate by `cap` (a page) so we can round the base up to a page boundary. */
   char *raw = (char *)malloc((unsigned long)cap * 3);
   if (!raw) return 0;
@@ -64,11 +75,15 @@ static char *ring_setup(unsigned cap) {
   long prot = CAP_PROT_READ | CAP_PROT_WRITE;
   if (__vm_region_call((int)region, SR_MAP, (long)base, 0, cap, prot) != 0) return 0;
   if (__vm_region_call((int)region, SR_MAP, (long)(base + cap), 0, cap, prot) != 0) return 0;
+  *cap_out = cap;
   return base;
 }
 #else
 /* ---- native oracle: a memfd double-mapped with raw mmap ------------------------------------- */
-static char *ring_setup(unsigned cap) {
+static char *ring_setup(unsigned *cap_out) {
+  long pg = sysconf(_SC_PAGESIZE); /* one host page — the OS mmap granularity, mirroring the guest */
+  if (pg <= 0) return 0;
+  unsigned cap = (unsigned)pg;
   int fd = memfd_create("ring", 0);
   if (fd < 0) return 0;
   if (ftruncate(fd, cap) != 0) return 0;
@@ -78,31 +93,33 @@ static char *ring_setup(unsigned cap) {
   if (mmap(base, cap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) return 0;
   if (mmap(base + cap, cap, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED)
     return 0;
+  *cap_out = cap;
   return base;
 }
 #endif
 
 int main(void) {
-  char *base = ring_setup(CAP);
+  unsigned cap = 0;
+  char *base = ring_setup(&cap);
   if (!base) {
     printf("ring setup failed\n");
     return 1;
   }
 
   /* 1. Cross-boundary contiguous access: push then pop `NMSG` variable-length messages, each a
-   *    SINGLE memcpy at `pos % CAP`. Whenever `pos % CAP + len > CAP` the copy runs off the end of
+   *    SINGLE memcpy at `pos % cap`. Whenever `pos % cap + len > cap` the copy runs off the end of
    *    the ring and continues at the start — correct only because the second mapping aliases the
    *    first. A wrong alias would corrupt the read-back and the checksum. */
   unsigned wpos = 0, rpos = 0;
   unsigned long long sum = 0;
   for (int i = 0; i < NMSG; i++) {
-    int len = 20 + (i * 37) % 200; /* 20..219 bytes; sum ≫ CAP so it wraps many times */
+    int len = 20 + (i * 37) % 200; /* 20..219 bytes; total ≫ a 4/16 KiB page so it wraps */
     char msg[256];
     for (int j = 0; j < len; j++) msg[j] = (char)('A' + ((i * 7 + j * 3) % 26));
-    memcpy(base + (wpos % CAP), msg, (unsigned long)len);
+    memcpy(base + (wpos % cap), msg, (unsigned long)len);
     wpos += len;
     char out[256];
-    memcpy(out, base + (rpos % CAP), (unsigned long)len);
+    memcpy(out, base + (rpos % cap), (unsigned long)len);
     rpos += len;
     for (int j = 0; j < len; j++) {
       if (out[j] != msg[j]) {
@@ -116,16 +133,16 @@ int main(void) {
 
   /* 2. Explicit alias witness: a 12-byte write straddling the end reads back contiguously through
    *    the second mapping, and its 7-byte overflow is physically visible at the very start. */
-  memset(base, 0, CAP);
+  memset(base, 0, cap);
   const char *sentinel = "WRAPWRAPWRAP";
-  int slen = 12, at = CAP - 5;
+  int slen = 12, at = (int)cap - 5;
   memcpy(base + at, sentinel, (unsigned long)slen);
   char rb[16];
   memcpy(rb, base + at, (unsigned long)slen);
   rb[slen] = 0;
   char head[8];
   /* Read the aliased head through `volatile`: the C abstract machine can't see that `base[0..7)` is
-   * the same physical memory as `base[CAP..CAP+7)`, so an optimizer (clang ≥21) would otherwise forward
+   * the same physical memory as `base[cap..cap+7)`, so an optimizer (clang ≥21) would otherwise forward
    * the `memset` zeros here and never load what the straddling write left at offset 0. */
   for (int j = 0; j < 7; j++) head[j] = ((volatile char *)base)[j];
   head[7] = 0;

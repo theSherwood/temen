@@ -42,7 +42,7 @@ enum {
 };
 enum { CAP_O_READ = 1, CAP_O_WRITE = 2, CAP_O_APPEND = 4, CAP_O_TRUNC = 8, CAP_O_CREATE = 16 };
 /* SharedRegion ops (called on the region handle FS_MAP_REGION returns, not on the fs handle). */
-enum { SR_MAP = 0, SR_UNMAP = 1 };
+enum { SR_MAP = 0, SR_UNMAP = 1, SR_PAGE_SIZE = 3 };
 /* Capability prot bits (map_region in temen-run): read = 1, write = 2. */
 enum { CAP_PROT_READ = 1, CAP_PROT_WRITE = 2 };
 
@@ -180,10 +180,16 @@ void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
   if (off == 0) {
     long region = hc(FS_MAP_REGION, fd, 0, (long)len, 0);
     if (region >= 0) {
-      void *base = __builtin_malloc(len + SHIM_PAGE);
+      /* Align the window buffer to the region's map granularity (`SR_PAGE_SIZE`, op 3 — the host
+       * page: 16 KiB on Apple Silicon, 64 KiB on Windows), not a hardcoded 4 KiB. The runtime rejects
+       * a `SharedRegion.map` whose window offset isn't a multiple of that page, so a fixed 4 KiB
+       * alignment `EINVAL`s on any coarser-page host and silently drops us to the copy-in emulation
+       * below (#737 family). `SHIM_PAGE` stays the defensive floor if the query is unavailable. */
+      long gp = __vm_region_call((int)region, SR_PAGE_SIZE, 0, 0, 0, 0);
+      unsigned long g = gp > 0 ? (unsigned long)gp : SHIM_PAGE;
+      void *base = __builtin_malloc(len + g);
       if (base) {
-        void *aligned =
-            (void *)(((unsigned long)base + SHIM_PAGE - 1) & ~((unsigned long)SHIM_PAGE - 1));
+        void *aligned = (void *)(((unsigned long)base + g - 1) & ~(g - 1));
         if (__vm_region_call((int)region, SR_MAP, (long)aligned, 0, (long)len, cprot) == 0) {
           m->addr = aligned;
           m->base = base;
