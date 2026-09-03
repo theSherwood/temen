@@ -13082,12 +13082,15 @@ fn demo_bash_translates_and_verifies() {
     // keystrokes land with no dedicated wake; on the cooperative driver the all-parked pump
     // BLOCKS on the #1122 external-wake doorbell (armed by the terminal grant) and the feed's
     // pipe-wake ring re-admits it — pre-doorbell this session was the pump's deadlock
-    // (`ThreadFault`). On both, the `^C` is fed but its ONLY assertable effect is the swallow:
-    // async delivery into the parked read is an interpreter-only tier (#796 L2), so the interrupt
-    // is absorbed at the feed-time line discipline and `$?` stays 0 — pinned as `rc=0` (when
-    // async delivery lands on the bytecode tier, this flips to `rc=130` and the pin should move
-    // to match the tree-walker session above). The session must still fully work around it:
-    // prompt loop, the typed command runs, `^D` exits with the farewell.
+    // (`ThreadFault`). On both, the `^C` is fed but its delivery is a **race** against bash
+    // re-parking in its terminal read: async delivery into a parked read is an interpreter-only
+    // tier (#796 L2 / #1146), so if the `^C` lands before the prompt read is parked it is absorbed
+    // at the feed-time line discipline and `$?` stays 0 (`rc=0`); if it lands into the parked read
+    // it aborts the line and `$?` becomes 130 (`rc=130`, the tree-walker's deterministic result).
+    // Both outcomes are legitimate until #1146 makes bytecode-tier delivery deterministic, so the
+    // assertion below accepts either — pinning one polarity made this the flaky #1252 (the native
+    // twin of the browser-card #1223). The session must still fully work around the race: prompt
+    // loop, the typed command runs, `^D` exits with the farewell.
     for parallel in [false, true] {
         let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
         let feeder = {
@@ -13133,9 +13136,10 @@ fn demo_bash_translates_and_verifies() {
             "bash -i ({label}): the typed command echoed and ran (stdout: {out:?})"
         );
         assert!(
-            out.contains("rc=0"),
-            "bash -i ({label}): the fed ^C is absorbed without async delivery (the pinned \
-             bytecode-tier gap — see the comment above) (stdout: {out:?})"
+            out.contains("rc=0") || out.contains("rc=130"),
+            "bash -i ({label}): the fed ^C either is absorbed (`rc=0`) or aborts the line \
+             (`rc=130`) — both legitimate until bytecode-tier async delivery is deterministic \
+             (#1146); see the comment above (stdout: {out:?})"
         );
         assert!(
             err.matches("$ ").count() >= 2,
