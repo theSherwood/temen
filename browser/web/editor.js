@@ -35,7 +35,7 @@ CM.defineSimpleMode('temen', {
 const MODE = { temen: 'temen', lua: 'lua', sql: 'text/x-sql', c: 'text/x-csrc', js: 'text/javascript',
   // The CodeMirror bundle carries no shell or Nim grammar; plain text (no mis-highlighting) suits the
   // shell-script and Nim front-end cards fine.
-  shell: 'text/plain', nim: 'text/plain' };
+  shell: 'text/plain', nim: 'text/plain', forth: 'text/plain' };
 
 const instances = [];
 

@@ -29,6 +29,10 @@ patched*.wasm
 !/web/assets/bounce.temen
 !/web/assets/life.temen
 !/web/assets/mandelzoom.temen
+# forth.temen — the sectorforth-class Forth kernel (`crates/temen-run/demos/forth/forth.temt`, hand-written
+# Temen text IR) for the "Forth" card; needs no toolchain (`ONLY=forth bash scripts/rebuild-assets.sh`),
+# committed so the card works out of the box; gated by `browser/tests/forth_asset.rs` (issue #1214).
+!/web/assets/forth.temen
 # QuickJS is committed prebuilt: its build needs a guest libm (openlibm) fetched from GitHub, which
 # the Pages pipeline can't reach — so the translated `.temen` ships in-tree (like `hello_c`) and the
 # playground's JS demo works out of the box. `build-onramp-assets.mjs` rebuilds it in place when the

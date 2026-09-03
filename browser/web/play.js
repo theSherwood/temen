@@ -604,6 +604,53 @@ block 0 (sp2: i64, arg2: i64) {
   // ---- on-ramp modules: real C/C++ guests, compiled through clang → temen-llvm and run as a
   //      pre-built .temen via `temen_run_onramp` (no in-browser parse). Built by
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
+  'Forth (a JIT-compiling Forth written in Temen IR)': {
+    kind: 'module',
+    jit: false, // the kernel runs on the bytecode engine; the words it defines are §22 guest-JIT units
+    editable: true,
+    lang: 'forth',
+    url: './assets/forth.temen',
+    mode: 'io',
+    desc: 'crates/temen-run/demos/forth/forth.temt — a sectorforth-class Forth whose **kernel is ' +
+      'hand-written Temen text IR** (no C, no runtime) and whose every colon definition is compiled ' +
+      'to a verified Temen IR unit through the guest-driven **Jit** capability (DESIGN.md §22), ' +
+      'inside the sandbox, in your browser. The data stack is SSA, not memory: a word’s declared ' +
+      'stack effect `( a b -- c )` *is* its function signature, `dup`/`swap`/`over` cost nothing, and ' +
+      '`if`/`begin` are IR blocks whose params carry the live stack. Fibers are words over ' +
+      '`cont.new`/`cont.resume`/`suspend` (`task`/`resume`/`yield`), threads over `thread.spawn` ' +
+      '(`spawn`/`join`), atomics are one-op templates. Each line you type is itself compiled as an ' +
+      'anonymous unit, installed, called, and uninstalled. Edit the Forth on the left and click Run: ' +
+      'it is fed to the kernel as stdin and the output appears below. Issue #1214.',
+    src: `\ Forth on Temen: every word below is JIT-compiled to a verified IR unit.
+: sq ( n -- n ) dup * ;
+: fact ( n -- n ) dup 1 > if dup 1- recurse * else drop 1 then ;
+5 sq . 10 fact . cr
+
+\ loops: begin/until, begin/while/repeat
+: countdown ( n -- ) begin dup . 1- dup 0= until drop cr ;
+5 countdown
+: sum-to ( n -- s ) 0 swap begin dup 0 > while tuck + swap 1- repeat drop ;
+100 sum-to . cr
+
+\ memory: variables, strings, the heap
+variable x   42 x !   x @ 1+ x !   x @ . cr
+." hello, forth" cr
+
+\ fibers: a generator word is a task; resume it from any later line
+: counter ( x -- y ) begin 1+ dup yield drop again ;
+' counter task
+dup 0 resume . . cr
+dup 10 resume . . cr
+drop
+
+\ threads: run a word on another vCPU, join its result; atomics on a shared cell
+: work ( x -- y ) 1000 * ;
+' work 7 spawn join . cr
+variable hits
+: bump ( n -- y ) begin dup 0 > while 1 hits atomic+! drop 1- repeat ;
+' bump 100 spawn ' bump 100 spawn join swap join + . hits @ . cr
+`,
+  },
   'hello (C → Temen)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
