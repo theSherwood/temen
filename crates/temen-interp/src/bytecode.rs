@@ -12963,6 +12963,23 @@ impl ThreadRegistry {
     }
 }
 
+/// #1246 — wire a parallel domain's default-action TERMINATE door: the personality's `set_kill`
+/// closure stores into this host's `term_flag`, the atomic every vCPU of the domain polls per op in
+/// [`Vm::resume`] and traps on. No scheduler wake is needed (the OS-thread vCPU polls it itself, unlike
+/// the cooperative driver which finalizes a killed domain at its loop top, #1215). Called on the root
+/// host and on each fork twin's freshly-minted host; a host with no signal personality is a no-op.
+fn wire_kill_flag(host: &std::sync::Arc<std::sync::Mutex<Host>>) {
+    let (term_flag, source) = {
+        let hg = host.lock_unpoisoned();
+        (hg.term_flag.clone(), hg.signal_poll().map(|(_, s)| s))
+    };
+    if let Some(source) = source {
+        source.set_kill(std::sync::Arc::new(move || {
+            term_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+    }
+}
+
 /// THREADS.md step 4c — the **parallel** driver (the host-selected `Parallel` mode). One guest's vCPUs
 /// run on **separate OS threads** sharing **one** `Region::shared` window, instead of the cooperative
 /// `drive`'s single-thread `tasks` loop. `std::thread::scope` borrows the `&Domain` (which is `Sync`)
@@ -12991,6 +13008,9 @@ fn drive_parallel(
     // of the cooperative driver's `extra_envs`. `scope` joins all vCPUs before returning, so every
     // clone is dropped and the unwrap below is the sole owner.
     let shared = std::sync::Arc::new(std::sync::Mutex::new(std::mem::take(host)));
+    // #1246 — wire the root domain's terminate door (a guest that kills its own group, or is killed
+    // by an embedder, dies at its next per-op poll). Fork twins get theirs at mint (the `ForkSelf` arm).
+    wire_kill_flag(&shared);
     let out = std::thread::scope(|scope| {
         run_vcpu_parallel(
             scope,
@@ -13206,6 +13226,10 @@ fn run_vcpu_parallel<'scope, 'env>(
                             invoke_step_into: false,
                         };
                         let twin_host = std::sync::Arc::new(std::sync::Mutex::new(twin_host));
+                        // #1246 — wire the twin's terminate door so a SIGKILL/SIGTERM to it sets its
+                        // `term_flag` and its resume loop traps at the next op (the parent's `waitpid`
+                        // then reaps the WIFSIGNALED death via the exit hook fired at thread return).
+                        wire_kill_flag(&twin_host);
                         let hooks_host = std::sync::Arc::clone(&twin_host);
                         // The twin continues the SAME image as its parent, so it dispatches over the
                         // same table (post-exec parents included — cf. the coop arm's fresh primary
@@ -14058,6 +14082,16 @@ impl Vm {
         // `Arc` clones per quantum, not per op. `None` on any run without a signal personality (JIT
         // bench, pure compute), so the per-op check in the loop is a single predictable branch there.
         let signal_poll = host.with(|h| h.signal_poll());
+        // #1246 — the per-op default-action TERMINATE poll (the bytecode twin of the tree-walker's
+        // `term_flag` safepoint). Fetched once per resume, and only when a signal personality is present
+        // (`None` on a pure-compute / JIT-bench run, so the per-op check is skipped entirely). This is
+        // the GENUINELY-PARALLEL driver's kill mechanism: its OS-thread vCPUs run concurrently, so a
+        // killed thread must observe the kill mid-execution (it can't wait for a scheduler sweep). The
+        // cooperative driver never sets this flag — it finalizes a killed domain at its loop top (#1215)
+        // — so the load is dead (always `false`) there.
+        let term_flag = signal_poll
+            .as_ref()
+            .map(|_| host.with(|h| h.term_flag.clone()));
 
         macro_rules! r {
             ($i:expr) => {
@@ -14113,6 +14147,17 @@ impl Vm {
                 return Ok(Outcome::Suspended);
             }
             budget -= 1;
+            // #1246 default-action terminate: a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered to this
+            // domain set its `term_flag` (via the personality's `set_kill` closure, wired on the
+            // parallel driver by `wire_kill_flag`). Die at this op — the vCPU's thread returns the trap,
+            // and the driver's exit hook reports term-by-signal from the personality's `term_sig`
+            // bookkeeping (WIFSIGNALED), exactly like the tree-walker. Checked before the async-signal
+            // redirect (death beats a caught delivery).
+            if let Some(tf) = &term_flag {
+                if tf.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(Trap::ThreadFault);
+                }
+            }
             // #1146 async signal delivery: at this per-op safepoint, if the personality has a caught,
             // unmasked signal pending (its cheap `armed` flag) and we are not already
             // `MAX_SIG_HANDLER_NEST` deep, redirect this vCPU into the guest handler
