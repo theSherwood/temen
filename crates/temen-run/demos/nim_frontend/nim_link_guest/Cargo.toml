@@ -1,0 +1,23 @@
+# The nim->powerbox linker wrapped as a powerbox program (#1025 3c, link+run): read the hexer Leng
+# `.x.nif` units (packed on stdin), call `temen_leng::link_nim_powerbox`, write the encoded linked Temen
+# module to stdout. Built through the LLVM on-ramp (build_nim_link.sh) into a committed asset. Not part
+# of the escape-TCB — everything it emits is re-verified by temen-verify (DESIGN.md §2a). Own workspace.
+[package]
+name = "nim-link-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+temen-leng = { path = "../../../../temen-leng" }
+temen-encode = { path = "../../../../temen-encode" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+overflow-checks = false
+
+[workspace]
