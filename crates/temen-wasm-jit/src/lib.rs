@@ -1846,30 +1846,54 @@ pub fn check_child_carve(
     parent_base: u64,
     guard: u64,
 ) -> Result<u64, Error> {
-    // A `size_log2` of 64+ would overflow the shift (and no real window is that large) — reject it
-    // before the shift, so a wild bounce arg faults closed rather than wrapping.
+    child_carve_fits(
+        child.memory.as_ref().map(|mc| mc.size_log2),
+        off,
+        carve_log2,
+        parent_mapped,
+        parent_base,
+        guard,
+    )
+    .ok_or(Error::Unsupported(
+        "child carve fails the confinement gate (undersized, misaligned, out of window, or in the NULL guard)",
+    ))
+}
+
+/// The **pure geometry** half of [`check_child_carve`] (§2/§4 confinement): given the child's declared
+/// window size-log2 (`None` if it declares no linear memory) and the requested carve `(off, carve_log2)`
+/// inside a parent window `[parent_base, parent_base + parent_mapped)` reserving a NULL guard
+/// `[0, guard)`, return `Some(carve_bytes)` iff the carve is a confinement-safe placement — else `None`
+/// (fail-closed), computed **overflow-free**:
+///
+/// - `carve_log2 < 64` (a wild bounce arg faults closed before the shift wraps),
+/// - `carve >= 1 << declared` — a larger carve is a safe superset (the child still masks every access
+///   to the carve, and needs the room to grow its heap into `[1 << declared, carve)`, FORK.md §8.6/#773);
+///   a carve **smaller** than declared is refused,
+/// - the carve lies wholly inside `[0, parent_mapped)`, is power-of-two-aligned to its own size, and
+///   clears the reserved NULL region (`parent_base + off >= guard`).
+///
+/// Factored out of [`check_child_carve`] (which just maps `None -> Err` and reads the size-log2 off the
+/// child `Module`) so this security-critical admission gate is **fuzzed as its own unit** — the `child_carve`
+/// libFuzzer target drives it against a `u128` oracle, the CLAUDE.md confinement hinge, alongside the
+/// masking [`temen_mask::Window::sub`] the `mask` target already fuzzes.
+pub fn child_carve_fits(
+    declared_log2: Option<u8>,
+    off: u64,
+    carve_log2: u32,
+    parent_mapped: u64,
+    parent_base: u64,
+    guard: u64,
+) -> Option<u64> {
     if carve_log2 >= 64 {
-        return Err(Error::Unsupported("child carve size_log2 out of range"));
+        return None;
     }
     let carve = 1u64 << carve_log2;
-    let declared_log2 = child.memory.as_ref().map(|mc| mc.size_log2);
-    // A larger carve is a safe superset — confinement still masks every access to the carve — and the
-    // child *needs* `carve >= 1 << declared` so its bump allocator can grow the heap into
-    // `[1 << declared, carve)` (FORK.md §8.6 / #773). A carve smaller than declared is refused.
     let mod_ok = declared_log2.is_none_or(|d| u32::from(d) <= carve_log2);
-    // The carve must lie wholly inside the parent window, power-of-two-aligned to its own size, and
-    // clear of the reserved NULL region — mirroring the native `fits` predicate.
     let fits = carve <= parent_mapped
         && off & (carve - 1) == 0
         && off.checked_add(carve).is_some_and(|e| e <= parent_mapped)
         && parent_base.checked_add(off).is_some_and(|a| a >= guard);
-    if mod_ok && fits {
-        Ok(carve)
-    } else {
-        Err(Error::Unsupported(
-            "child carve fails the confinement gate (undersized, misaligned, out of window, or in the NULL guard)",
-        ))
-    }
+    (mod_ok && fits).then_some(carve)
 }
 
 /// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
