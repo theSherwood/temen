@@ -10363,6 +10363,36 @@ impl CoopSched {
                     t.state = TaskState::Runnable;
                 }
             }
+            // #1215 — the default-action TERMINATE, cooperative form (invariant 14). A domain the
+            // personality has terminated (a `SIG_DFL` SIGKILL/SIGTERM/SIGINT delivered through the gate,
+            // `term_sig` set) must DIE. The tree-walker benches every vCPU of the domain at its per-op
+            // `term_flag` safepoint and traps it; the cooperative driver has no per-op poll, so finalize
+            // each task of a killed domain HERE — running, stopped (#1198-benched), or parked — as a
+            // fatal completion. Because the driver is single-threaded round-robin, a killed task is never
+            // mid-step when its signaller ran, so finalizing at the loop top loses no work; and it runs
+            // before the exit-hook step below, so the twin retires (WIFSIGNALED via `term_sig`) and the
+            // signaller's `waitpid` reaps it in the same settle. Domain-scoped (invariant 12).
+            let killed: Vec<usize> = tasks
+                .iter()
+                .enumerate()
+                .filter_map(|(ti2, t)| {
+                    if matches!(t.state, TaskState::Done(_)) {
+                        return None;
+                    }
+                    let dead = match t.env {
+                        Some(k) => extra_envs[k]
+                            .host
+                            .lock_unpoisoned()
+                            .signal_poll()
+                            .is_some_and(|(_, s)| s.killed()),
+                        None => host.signal_poll().is_some_and(|(_, s)| s.killed()),
+                    };
+                    dead.then_some(ti2)
+                })
+                .collect();
+            for ti2 in killed {
+                complete(tasks, ti2, Err(Trap::ThreadFault));
+            }
             // #799/#1080 — a **fork twin** finishing fires its personality exit hooks ONCE (Live →
             // Zombie in the process table), the bytecode port of the tree-walker's death-hook step. It
             // runs BEFORE the reap wakes below so a personality `waitpid` re-execution finds the twin

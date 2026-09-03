@@ -1007,6 +1007,11 @@ jobs:
           # boundary instead of spinning on -ERESTART, and the prompt stays usable with no input steal;
           # `fg %1` + ^D resumes and ends it. SKIPs with the batch when bash.temen/bin_cat.temen is absent.
           node browser-bash-bg-tty-test.mjs
+          # Kill of a stopped job (#1215): `kill -9 %1` on a SIGTTIN-stopped `cat &` really terminates
+          # it — the cooperative driver's loop-top kill sweep finalizes the benched domain (retired
+          # WIFSIGNALED) — the job leaves the table (`[1]+ Killed/Signal`) and `^D` exits cleanly with no
+          # "There are stopped jobs" hold. SKIPs with the batch when bash.temen/bin_cat.temen is absent.
+          node browser-bash-kill-stopped-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs

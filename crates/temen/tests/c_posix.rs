@@ -4945,3 +4945,105 @@ fn c_a_background_terminal_write_does_not_stop_without_tostop() {
          SIGTTOU; the write goes through and the job completes, matching the oracle"
     );
 }
+
+fn killspin_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+static int status;\n\
+static long pid;\n\
+static volatile long spin;\n\
+int main(void){{\n\
+  pid = __px_fork(0,0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0){{ while(spin == 0){{}} return 5; }}\n\
+  if (__px_kill(0, pid, 9) != 0) return 2;\n\
+  long h; while ((h = __px_waitpid(0, pid, (long)&status, 0)) == -4){{}}\n\
+  if (h != pid) return 3;\n\
+  if ((status & 0x7f) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  if ((status & 0x7f) != 0) return 3000 + (status & 0x7f);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1215 — the **default-action terminate** path across engines (invariant 14). A parent forks a
+// child that spins forever, then `SIGKILL`s it and reaps: `waitpid` must report the SIGNAL death
+// (`WIFSIGNALED`, `(status & 0x7f) == 9`), not hang and not an exit code — so the guest returns
+// 3009. The tree-walker benches the killed vCPU at its per-op `term_flag` safepoint; the cooperative
+// bytecode engine (the browser tier) had NO terminate path at all — the kill set `term_sig` but
+// nothing ever finalized the domain, so the spinning child ran forever and the shell's `waitpid`
+// never returned (a `kill -9` no-op). The fix finalizes a killed domain at the scheduler loop top
+// (single-threaded round-robin: the target is never mid-step when its signaller ran), and the exit
+// hook retires it `WIFSIGNALED`. Differentialled tree-walker ≡ cooperative bytecode.
+#[test]
+fn c_a_sigkill_terminates_a_running_child_and_waitpid_reports_the_signal() {
+    let e = run_interp_only(&killspin_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(3009)],
+        "tree-walker: SIGKILL terminated the spinning child (per-op term safepoint) and waitpid \
+         reported the WIFSIGNALED SIGKILL(9) death"
+    );
+    let b = run_bytecode_only(&killspin_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(3009)],
+        "coop bytecode (the browser tier): the killed domain is finalized at the scheduler loop top \
+         and retired WIFSIGNALED — the `kill -9` no-op / hang is fixed, matching the oracle"
+    );
+}
+
+fn killstopped_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_sigcheck(int cap, long a);\n\
+static int status;\n\
+static long pid;\n\
+int main(void){{\n\
+  pid = __px_fork(0,0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0){{ while(__px_sigcheck(0,0) != 77){{}} return 5; }}\n\
+  if (__px_kill(0, pid, 20) != 0) return 2;\n\
+  long h; while ((h=__px_waitpid(0, pid, (long)&status, 2)) == -4){{}}\n\
+  if (h != pid) return 3;\n\
+  if ((status & 0xff) != 0x7f) return 4;\n\
+  if (((status>>8)&0xff) != 20) return 6;\n\
+  if (__px_kill(0, pid, 9) != 0) return 7;\n\
+  while ((h=__px_waitpid(0, pid, (long)&status, 0)) == -4){{}}\n\
+  if (h != pid) return 8;\n\
+  if ((status & 0x7f) == 0x7f) return 4000 + ((status>>8)&0xff);\n\
+  if ((status & 0x7f) != 0) return 3000 + (status & 0x7f);\n\
+  return 5000 + ((status>>8)&0xff);\n\
+}}\n"
+    )
+}
+
+// #1215 — SIGKILL of a **stopped** child (the browser `kill -9 %n` of a `^Z`/`SIGTTIN`-stopped bg
+// job). The child spins on a syscall, so a `SIGTSTP` benches it (the #1198 stop boundary) on both
+// engines; `waitpid(WUNTRACED)` reports the stop (20), then `SIGKILL` — which fires even on a stopped
+// process — terminates it and `waitpid` reaps the WIFSIGNALED(9) death (3009). Before the coop
+// terminate path, the stopped job stayed on the job table (`kill -9` a no-op); now the loop-top
+// finalize kills a stopped domain too. Differentialled tree-walker ≡ cooperative bytecode.
+#[test]
+fn c_a_sigkill_terminates_a_stopped_child_and_waitpid_reports_the_signal() {
+    let e = run_interp_only(&killstopped_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(3009)],
+        "tree-walker: SIGKILL terminated the stopped child (death beats stop) and waitpid reported \
+         the WIFSIGNALED SIGKILL(9) death"
+    );
+    let b = run_bytecode_only(&killstopped_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(3009)],
+        "coop bytecode (the browser tier): a stopped (benched) domain is finalized by the loop-top \
+         kill sweep and retired WIFSIGNALED — a stopped bg job is really killed, matching the oracle"
+    );
+}
