@@ -10259,7 +10259,17 @@ impl CoopSched {
                 // through it and never runs its EINTR sweep. The tree-walker points `set_wake` at
                 // `interrupt_interruptible_parks`; the cooperative pump needs only the ring — waking
                 // re-enters the `None` arm, whose sweep does the interrupting.
+                let bell_cw = std::sync::Arc::clone(&bell);
                 source.set_wake(std::sync::Arc::new(move || {
+                    let (gen, cv) = &*bell_cw;
+                    *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                    cv.notify_all();
+                }));
+                // #1213 — the child-transition nudge rings the same bell: the cooperative pump's
+                // settle scan reads `reap_pending` and re-admits the blocked `waitpid`, so an
+                // embedder-raised child stop/continue while the pump is all-parked is not slept
+                // through. (The tree-walker points this at the clean `rescan_reap_parks`.)
+                source.set_chld_wake(std::sync::Arc::new(move || {
                     let (gen, cv) = &*bell;
                     *gen.lock().unwrap_or_else(|e| e.into_inner()) += 1;
                     cv.notify_all();
