@@ -12,17 +12,22 @@
 // Widths 4/8; `off` naturally aligned. A registry is per agent (page or Worker): a Memory registered
 // here is addressable by the engine instance(s) of THIS agent.
 
-const mems = [];
+const mems = []; // id -> { m: WebAssembly.Memory, base: byte offset of region offset 0 within it }
 
-/** Register a child `WebAssembly.Memory`; returns the id the engine names it by. */
-export function registerForeign(memory) {
-  mems.push(memory);
+/**
+ * Register a child `WebAssembly.Memory`; returns the id the engine names it by. `base` is where the
+ * engine's region offset 0 lands in the memory — a detached child's window starts one host header page
+ * in (`temen_detached_header_bytes()`), so its region is `[base, …)` and the header below stays the
+ * host's (DETACHED_JIT.md §3.1).
+ */
+export function registerForeign(memory, base = 0) {
+  mems.push({ m: memory, base });
   return mems.length - 1;
 }
 
-/** The registered Memory for `id` (e.g. to grow it or read a result out). */
+/** The registered Memory for `id` (e.g. to read a result out). */
 export function foreignMemory(id) {
-  return mems[id];
+  return mems[id].m;
 }
 
 /** The `temen_host` import entries for an engine instance whose linear memory is `engineMemory`. */
@@ -43,10 +48,11 @@ export function foreignImports(engineMemory) {
     return eu8;
   };
   const u8s = [], i32s = [], i64s = [];
+  // `end` is the memory-absolute end of the access (region offset + base + length).
   const child = (id, end) => {
     const v = u8s[id];
     if (v !== undefined && end <= v.byteLength) return v;
-    const buf = mems[id].buffer;
+    const buf = mems[id].m.buffer;
     i32s[id] = new Int32Array(buf);
     i64s[id] = new BigInt64Array(buf);
     return (u8s[id] = new Uint8Array(buf));
@@ -54,22 +60,36 @@ export function foreignImports(engineMemory) {
   const RMW = [null, null, 'add', 'sub', 'and', 'or', 'xor', 'exchange'];
   return {
     foreign_read: (id, off, dst, len) => {
+      off += mems[id].base;
       const e = eng(dst + len), c = child(id, off + len);
       if (len <= 16) for (let i = 0; i < len; i++) e[dst + i] = c[off + i];
       else e.set(c.subarray(off, off + len), dst);
     },
     foreign_write: (id, off, src, len) => {
+      off += mems[id].base;
       const e = eng(src + len), c = child(id, off + len);
       if (len <= 16) for (let i = 0; i < len; i++) c[off + i] = e[src + i];
       else c.set(e.subarray(src, src + len), off);
     },
     foreign_fill: (id, off, len, b) => {
+      off += mems[id].base;
       child(id, off + len).fill(b, off, off + len);
     },
     foreign_copy: (id, dst, src, len) => {
+      const base = mems[id].base;
+      dst += base; src += base;
       child(id, Math.max(dst, src) + len).copyWithin(dst, src, src + len);
     },
+    // Make `len` region bytes addressable: grow the memory by whole pages. 1 = ok, 0 = refused (at the
+    // memory's `maximum`). The cached views go stale-short and refresh on their next miss.
+    foreign_grow: (id, len) => {
+      const { m, base } = mems[id];
+      const need = base + len, have = m.buffer.byteLength;
+      if (need <= have) return 1;
+      try { m.grow(Math.ceil((need - have) / 65536)); return 1; } catch { return 0; }
+    },
     foreign_atomic: (id, kind, off, width, ab) => {
+      off += mems[id].base;
       eng(ab + 16);
       child(id, off + width);
       let old;

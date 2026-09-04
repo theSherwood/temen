@@ -54,7 +54,9 @@ export function jitCacheClear() {
 // invoked **only on a compile miss** (so a hit skips the ~12.7 MB byte copy), and `callInterp` becomes
 // the instance's `env.call_interp`. Returns the emitted `f0`. A `hits`/`compiles` bump mirrors the
 // Module-cache accounting (an instance hit is a compile skip). `cacheKey === undefined` disables caching.
-async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entryName = 'f0') {
+// `reuseInstance = false` (#1285, a detached child): reuse the compiled Module by `cacheKey` but always
+// instantiate afresh — an Instance is bound to its imported memory, and each detached child has its own.
+async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entryName = 'f0', reuseInstance = true) {
   // The emit exports one `f{temen_idx}` per Temen function; `entryName` picks the one this run drives. The
   // single-shot `_start` path is `f0`; the warm+JIT path drives `eval_run`'s export (`f{eval_fn}`), NOT
   // `f0` (= the cold `_start`) — see `runWarmJit` (#865).
@@ -63,7 +65,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
     if (typeof f !== 'function') throw new Error(`emitted module has no ${entryName} export`);
     return f;
   };
-  const cached = cacheKey === undefined ? undefined : jitInstanceCache.get(cacheKey);
+  const cached = cacheKey === undefined || !reuseInstance ? undefined : jitInstanceCache.get(cacheKey);
   if (cached) {
     jitCacheStats.hits++;
     return { f0: pick(cached.instance), instance: cached.instance };
@@ -77,7 +79,7 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
   const instance = await WebAssembly.instantiate(module, {
     env: { memory, trap: () => {}, call_interp: callInterp },
   });
-  if (cacheKey !== undefined) {
+  if (cacheKey !== undefined && reuseInstance) {
     if (jitInstanceCache.size >= JIT_MODULE_CACHE_MAX && !jitInstanceCache.has(cacheKey)) {
       jitInstanceCache.delete(jitInstanceCache.keys().next().value);
     }
@@ -185,6 +187,85 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   // A trap on the emitted tier is a refusal, not a result: throw so the caller runs the guest on the
   // interpreter oracle instead of surfacing a truncated run (INVARIANT 9 — diverge toward refusal).
   if (status === 3 /* STATUS_TRAP */) throw new Error('emitted run trapped (declined to the interpreter): ' + trapMsg);
+  return status;
+}
+
+// Drive an opened **detached** single-shot run (#1285, DETACHED_JIT.md §3.1): the emitted `_start`
+// instance is bound to the CHILD's own `WebAssembly.Memory` (`childMemory`, registered as the run's foreign
+// memory), not the engine's. `win` is the host header page the cdylib reports; the `env` bounce cell lives
+// at child offset 0 (the emitted code stores its scratch slots through ITS memory), so each `call_interp`
+// mirrors the cell into an engine-side scratch for the bounce and back after. A paged run's `pagestate`
+// table is copied into the header at `temen_detached_pagestate_off()` on every sync. Everything else —
+// `"mapped"` re-sync, report/finish/close, trap ⇒ decline — is `driveJitRun`'s contract.
+export async function driveDetachedRun(ex, memory, childMemory, cacheKey, afterFinish) {
+  const eu8 = () => new Uint8Array(memory.buffer);
+  const cu8 = () => new Uint8Array(childMemory.buffer);
+  const win = Number(ex.temen_onramp_jit_run_win_ptr()); // = temen_detached_header_bytes()
+  const envBytes = ex.temen_onramp_jit_run_env_bytes();
+  const pagestateOff = ex.temen_detached_pagestate_off();
+  if (envBytes > pagestateOff) throw new Error('env cell does not fit the detached header');
+  const slots = [];
+  for (let i = 0, n = ex.temen_onramp_jit_run_slot_count(); i < n; i++) slots.push(ex.temen_onramp_jit_run_slot(i));
+  const env = 0; // the header page starts the child memory; the cell sits at its bottom
+  const scratch = Number(ex.temen_alloc(envBytes)); // engine-side mirror of the cell for bounces
+  let mappedGlobal = null, pagestateGlobal = null;
+  const syncGlobals = () => {
+    if (pagestateGlobal) {
+      const p = Number(ex.temen_onramp_jit_run_pagestate_ptr()), n = ex.temen_onramp_jit_run_pagestate_len();
+      if (pagestateOff + n > win) throw new Error('pagestate table does not fit the detached header');
+      cu8().set(eu8().subarray(p, p + n), pagestateOff);
+      pagestateGlobal.value = pagestateOff;
+    }
+    if (mappedGlobal) mappedGlobal.value = ex.temen_onramp_jit_run_mapped();
+  };
+  let f0, instance;
+  try {
+    ({ f0, instance } = await cachedInstanceF0(
+      childMemory,
+      cacheKey,
+      () => {
+        const wptr = Number(ex.temen_onramp_jit_run_wasm_ptr());
+        const wlen = ex.temen_onramp_jit_run_wasm_len();
+        return eu8().slice(wptr, wptr + wlen);
+      },
+      (func, argsPtr) => {
+        eu8().set(cu8().subarray(env, env + envBytes), scratch);
+        const st = ex.temen_onramp_jit_run_call_interp(func, scratch + (argsPtr - env));
+        // Copy back even on a stop: the cell is the child's, and a later read must see the results.
+        cu8().set(eu8().subarray(scratch, scratch + envBytes), env);
+        if (st !== 0) throw new Error('cross-tier stop');
+        syncGlobals();
+      },
+      'f0',
+      false,
+    ));
+  } catch (e) {
+    ex.temen_dealloc(scratch, envBytes);
+    ex.temen_onramp_jit_run_close();
+    throw e;
+  }
+  mappedGlobal = instance.exports.mapped ?? null;
+  pagestateGlobal = instance.exports.pagestate ?? null;
+  syncGlobals();
+  new DataView(childMemory.buffer).setBigInt64(env, 1n << 60n, true); // dispatcher-fuel budget
+  let threw = 0, value = 0n;
+  try {
+    const r = f0(win, env, ...slots);
+    value = r === undefined || r === null ? 0n : BigInt(r);
+  } catch {
+    threw = 1;
+  }
+  ex.temen_dealloc(scratch, envBytes);
+  ex.temen_onramp_jit_run_report(threw, value);
+  const status = ex.temen_onramp_jit_run_finish();
+  if (afterFinish) afterFinish(ex);
+  let trapMsg = '';
+  if (status === 3) {
+    const tl = ex.temen_onramp_jit_run_trap_len();
+    trapMsg = tl ? new TextDecoder().decode(eu8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + tl)) : '';
+  }
+  ex.temen_onramp_jit_run_close();
+  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted detached run trapped (declined to the interpreter): ' + trapMsg);
   return status;
 }
 

@@ -104,12 +104,15 @@ pub enum Region {
 /// implementation may trust them. `atomic` is the one seq-cst primitive: `kind` 0 = load, 1 = store
 /// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
 /// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
+/// `grow` asks the embedder to make at least `len` bytes addressable (a `memory.grow` of the foreign
+/// memory); `false` = refused, the region keeps its old length.
 pub struct ForeignOps {
     pub read: fn(id: u32, off: u64, out: &mut [u8]),
     pub write: fn(id: u32, off: u64, data: &[u8]),
     pub fill: fn(id: u32, off: u64, len: u64, b: u8),
     pub copy_within: fn(id: u32, dst: u64, src: u64, len: u64),
     pub atomic: fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
+    pub grow: fn(id: u32, len: u64) -> bool,
 }
 
 /// The [`ForeignOps::atomic`] kind for a plain load / store / compare-exchange.
@@ -210,6 +213,31 @@ impl Region {
     pub fn set_foreign_len(&self, len: u64) {
         if let Region::Foreign(f) = self {
             f.len.fetch_max(len, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether this is a proxied [`Region::Foreign`] (the one variant whose length can grow).
+    pub fn is_foreign(&self) -> bool {
+        matches!(self, Region::Foreign(_))
+    }
+
+    /// Make at least `len` bytes addressable. A `Foreign` region asks its embedder to grow the foreign
+    /// memory ([`ForeignOps::grow`]) and records the new length; every other variant is fixed-size, so
+    /// this is simply whether `len` already fits. `false` = the backing cannot cover `len` — the caller
+    /// fails closed rather than run over a backing shorter than its window (#1191).
+    pub fn grow_to(&self, len: u64) -> bool {
+        match self {
+            Region::Foreign(f) => {
+                if len <= f.len.load(Ordering::Acquire) {
+                    return true;
+                }
+                let ok = (f.ops.grow)(f.id, len);
+                if ok {
+                    f.len.fetch_max(len, Ordering::AcqRel);
+                }
+                ok
+            }
+            _ => len <= self.len(),
         }
     }
 
@@ -1555,12 +1583,22 @@ mod mock_foreign {
         old
     }
 
+    fn grow(id: u32, len: u64) -> bool {
+        let mut g = MEMS.lock().unwrap();
+        let m = &mut g[id as usize];
+        if m.len() < len as usize {
+            m.resize(len as usize, 0);
+        }
+        true
+    }
+
     pub static OPS: ForeignOps = ForeignOps {
         read,
         write,
         fill,
         copy_within,
         atomic,
+        grow,
     };
 }
 
@@ -1601,10 +1639,15 @@ mod foreign_tests {
             0,
             "past the current length: dropped / reads zero"
         );
-        r.set_foreign_len(8192);
+        assert!(r.grow_to(8192), "the mock grows");
         assert_eq!(r.len(), 8192);
         r.set_foreign_len(100);
         assert_eq!(r.len(), 8192, "never shrinks");
+        assert!(r.grow_to(100), "already fits");
+        assert!(
+            !Region::paged(64, 64).grow_to(65),
+            "a fixed backing cannot grow"
+        );
         r.write_word(5000, 4, 0xdead_beef);
         assert_eq!(r.read_word(5000, 4), 0xdead_beef);
         assert_eq!(r.atomic_rmw(5000, 4, RmwOp::Add, 1), 0xdead_beef);

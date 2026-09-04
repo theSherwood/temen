@@ -3410,6 +3410,16 @@ pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
     temen_ir::write_args_blob(argv, &[])
 }
 
+/// The window prefix that seeds `argv` where a `_start` reads it: zeros up to `module_args_base()`,
+/// then the [`pg_args_blob`]. Shared by the detached JIT run and its interpreter oracle (#1285).
+pub(crate) fn args_init_mem(argv: &[&[u8]]) -> Vec<u8> {
+    let blob = pg_args_blob(argv);
+    let base = temen_ir::module_args_base() as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    init_mem
+}
+
 /// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
 /// gate the module shape, grant `stdout/stdin/exit/memory` (registered by name and bound to the
 /// manifest slots — the paramless `_start` takes no handle args) + the in-memory `fs` cap over the
@@ -5420,6 +5430,16 @@ enum RunInput {
         /// guest (chibicc), whose handle is dropped.
         readback: Option<String>,
     },
+    /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
+    /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
+    /// the op-13 convention (a parent data segment landing inside the child's carve) has no analogue
+    /// across memories. The window is the child's own foreign memory (`open_foreign_run`). Constructed
+    /// only by the wasm32 threads-build FFI (`temen_detached_jit_run_open`); dead on native.
+    #[allow(dead_code)]
+    Detached {
+        stdin: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+    },
     /// A **caller-provided granted powerbox** (#1025 Path 1) — the run executes its emitted `_start` over
     /// `host` verbatim instead of building the on-ramp powerbox from stdin/an fs image. This is what an
     /// op-13 nested phase child uses: its `host` is the powerbox the parent marshaled across the
@@ -5463,7 +5483,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5567,6 +5586,41 @@ impl JitOnrampRun {
         )
     }
 
+    /// Open a single-shot JIT run over a **detached child's own memory** (#1285, DETACHED_JIT.md §3.1):
+    /// the page-registered foreign memory `mem_id` (`web/foreign-mem.js`), addressed through
+    /// `Region::Foreign`. The child's window starts one host header page into that memory (`win` =
+    /// [`DETACHED_HEADER_BYTES`]; the header holds the emitted tier's `env` cell and `pagestate`, unreachable
+    /// by the guest since every span is checked against `"mapped"` before `win` is added). The memory is
+    /// grown here to the module's declared window and later by each `vm_map` bounce
+    /// ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no carve: the parent cannot address a
+    /// byte of it.
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    pub(crate) fn open_foreign_run(
+        m: &temen_ir::Module,
+        mem_id: u32,
+        shared_memory: bool,
+        input: RunInput,
+        cached: Option<CachedEmit>,
+    ) -> Result<JitOnrampRun, i32> {
+        let size_log2 = m.memory.map(|mc| mc.size_log2).ok_or(STATUS_UNSUPPORTED)?;
+        let declared = 1u64 << size_log2;
+        let back = std::sync::Arc::new(foreign_region(mem_id, 0));
+        if !back.grow_to(declared) {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            declared,
+            DETACHED_HEADER_BYTES as usize,
+            size_log2,
+            shared_memory,
+            input,
+            cached,
+        )
+    }
+
     /// The run's cached-emit products, cheaply `Arc`-cloned for the nifler emit cache (#1011 slice 1).
     fn cached_emit(&self) -> CachedEmit {
         (
@@ -5608,7 +5662,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5647,7 +5700,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5688,7 +5740,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5741,7 +5792,6 @@ impl JitOnrampRun {
             m,
             back,
             Some(backing),
-            ptr,
             win_size,
             win_base,
             win_log2,
@@ -5818,7 +5868,6 @@ impl JitOnrampRun {
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
         backing: Option<Box<[u8]>>,
-        win_ptr: *mut u8,
         win_size: u64,
         win_base: usize,
         win_log2: u8,
@@ -5879,6 +5928,15 @@ impl JitOnrampRun {
                 let fs_readback = readback.map(|key| (fsh, key));
                 (host, init_mem, frame, fs_readback, 0, 0)
             }
+            RunInput::Detached { stdin, argv } => {
+                // The on-ramp powerbox, exactly as `Stdin`, plus argv at the module's args base — the
+                // one thing a detached child cannot receive in-band (#1285).
+                let mut host = Host::new();
+                host.stdin = stdin;
+                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+                (host, args_init_mem(&refs), frame, None, 0, 0)
+            }
             RunInput::PreGranted {
                 host,
                 init_mem,
@@ -5915,18 +5973,17 @@ impl JitOnrampRun {
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
         // module's data page (65 KiB), so they never overlap the argv prefix at POWERBOX_ARGS_BASE.
-        // SAFETY: `[win_ptr, win_size)` is a live window (owned backing or the caller's linear memory).
-        unsafe {
-            let win = core::slice::from_raw_parts_mut(win_ptr, win_size as usize);
-            if init_mem.len() <= win.len() {
-                win[..init_mem.len()].copy_from_slice(&init_mem);
-            }
-            for seg in &module.data {
-                let off = seg.offset as usize;
-                let end = off.saturating_add(seg.bytes.len());
-                if end <= win.len() {
-                    win[off..end].copy_from_slice(&seg.bytes);
-                }
+        // Through the backing, not a raw pointer: a detached child's backing is a foreign memory this
+        // cdylib cannot address (#1285); for a flat backing `write_from` is the same memcpy.
+        let win_len = back.len();
+        if init_mem.len() as u64 <= win_len {
+            back.write_from(0, &init_mem);
+        }
+        for seg in &module.data {
+            let off = seg.offset;
+            let end = off.saturating_add(seg.bytes.len() as u64);
+            if end <= win_len {
+                back.write_from(off, &seg.bytes);
             }
         }
         // #1153 growth state. `mapped` starts at the guest's declared extent (the emitted `"mapped"`
@@ -6157,6 +6214,13 @@ impl JitOnrampRun {
                     self.prots = None;
                     return Err(Trap::CapFault);
                 }
+            }
+            // #1285: a detached child's backing is its own foreign memory — grow it to cover the new
+            // committed extent (the interpreter bounds accesses to the backing, #1191; the emitted tier
+            // to `"mapped"`). A refused grow fails the run closed rather than running short.
+            if self.back.is_foreign() && !self.back.grow_to(self.mapped) {
+                self.prots = None;
+                return Err(Trap::CapFault);
             }
             r
         } else {
@@ -12804,6 +12868,7 @@ mod foreign_mem {
         fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
         fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
         fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
+        fn foreign_grow(id: u32, len: u32) -> u32;
     }
 
     fn read(id: u32, off: u64, out: &mut [u8]) {
@@ -12832,6 +12897,11 @@ mod foreign_mem {
         u64::from_le_bytes(ab[..8].try_into().unwrap())
     }
 
+    fn grow(id: u32, len: u64) -> bool {
+        // SAFETY: no cdylib memory is touched. A child memory is < 4 GiB by wasm32 construction.
+        u32::try_from(len).is_ok_and(|l| unsafe { foreign_grow(id, l) } != 0)
+    }
+
     /// The one table every `Region::foreign` in this cdylib uses.
     pub static OPS: ForeignOps = ForeignOps {
         read,
@@ -12839,8 +12909,17 @@ mod foreign_mem {
         fill,
         copy_within,
         atomic,
+        grow,
     };
 }
+
+/// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
+/// emitted tier's `env` bounce cell (at 0) and, for a paged run, its `pagestate` table (at
+/// [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the header is unreachable by
+/// the guest (spans are bounded by `"mapped"` before `win` is added) and never moves on `memory.grow`.
+pub const DETACHED_HEADER_BYTES: u64 = 65536;
+/// Where the paged run's page-state table lives inside the header (after the `env` cell).
+pub const DETACHED_PAGESTATE_OFF: u64 = 4096;
 
 /// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
@@ -12924,4 +13003,149 @@ pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32)
     // SAFETY: same layout; `shared` dropped above.
     unsafe { std::alloc::dealloc(base, layout) };
     sum
+}
+
+/// The detached child's header size (the `win` the JS driver passes and the page it must keep clear).
+#[no_mangle]
+pub extern "C" fn temen_detached_header_bytes() -> usize {
+    DETACHED_HEADER_BYTES as usize
+}
+
+/// The header offset of a paged detached run's `pagestate` table.
+#[no_mangle]
+pub extern "C" fn temen_detached_pagestate_off() -> usize {
+    DETACHED_PAGESTATE_OFF as usize
+}
+
+/// Split a NUL-separated argv payload `[ptr, len)` into its strings (empty entries dropped).
+fn argv_from_payload(ptr: *const u8, len: usize) -> Vec<Vec<u8>> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the host guarantees `[ptr, len)` is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    bytes
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Open a **detached single-shot wasm-JIT run** (#1285): the module at `[mod_ptr, mod_len)` runs with the
+/// on-ramp powerbox, `argv` from the NUL-separated payload `[args_ptr, args_len)` seeded at its args base,
+/// stdin from `[stdin_ptr, stdin_len)`, over the page-registered foreign memory `mem_id` — its own
+/// `WebAssembly.Memory`, grown here to the declared window. Drive it with `driveDetachedRun`
+/// (`web/wasmjit-module.js`) and the usual `temen_onramp_jit_run_*` exports. Returns `0`, else a negative
+/// `STATUS_*` (also in [`LAST_STATUS`]). Replaces any prior single-shot run.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_detached_jit_run_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    mem_id: u32,
+    args_ptr: *const u8,
+    args_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: same host guarantee for the stdin range.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    let m = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    let input = RunInput::Detached {
+        stdin,
+        argv: argv_from_payload(args_ptr, args_len),
+    };
+    match JitOnrampRun::open_foreign_run(&m, mem_id, true, input, None) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by the export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// The **interpreter oracle** of [`temen_detached_jit_run_open`] (INVARIANT 9): the same module, argv
+/// payload and stdin run on the bytecode engine over a fresh root-sized reservation — which is exactly
+/// what a detached window is — with the same on-ramp powerbox. Stashes stdout/stderr/exit/value into
+/// the shared slots like [`temen_run_onramp`]; returns the value, status in [`LAST_STATUS`]
+/// ([`STATUS_UNSUPPORTED`] if the module needs the tree-walker: threads, nesting).
+#[no_mangle]
+pub extern "C" fn temen_detached_oracle_run(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let mut host = Host::new();
+    if !stdin_ptr.is_null() && stdin_len != 0 {
+        // SAFETY: same host guarantee for the stdin range.
+        host.stdin = unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec();
+    }
+    let (_frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    let argv = argv_from_payload(args_ptr, args_len);
+    let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+    let init_mem = args_init_mem(&refs);
+    let mut fuel = u64::MAX;
+    let outcome = bytecode::compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    );
+    let (status, value, code) = match outcome {
+        Some((Ok(vals), _)) => (
+            STATUS_OK,
+            vals.first().map_or(0, |v| match v {
+                Value::I64(x) => *x,
+                Value::I32(x) => *x as i64,
+                _ => 0,
+            }),
+            0,
+        ),
+        Some((Err(Trap::Exit(c)), _)) => (STATUS_EXIT, 0, c),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        None => (STATUS_UNSUPPORTED, 0, 0),
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        EXIT_CODE = code;
+        RUN_VALUE = value;
+    }
+    set(status);
+    value
 }
