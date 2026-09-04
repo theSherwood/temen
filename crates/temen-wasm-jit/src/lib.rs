@@ -1896,59 +1896,6 @@ pub fn child_carve_fits(
     (mod_ok && fits).then_some(carve)
 }
 
-/// One wasm page (`memory.grow`'s granularity), the alignment [`child_carve_fits_growable`] requires of
-/// a growable carve's offset.
-pub const WASM_PAGE: u64 = 1 << 16;
-
-/// The **growable-backing** carve gate (#1253) — the admission predicate for a §14 op-13 child whose
-/// physical backing *grows under a fixed grant ceiling* instead of being fully present at spawn, so its
-/// window can start at its declared size and grow in place (no 8×/buddy pre-size). Returns the carve
-/// (grant) byte size iff the placement is confinement-safe, else `None` (fail-closed).
-///
-/// It differs from [`child_carve_fits`] in exactly two ways, each sound **only** for the tiers the op-13
-/// child actually runs on — the emitted wasm-JIT tier (base added raw, bound = live `"mapped"`) and the
-/// interpreter over a [`temen_mem::Region`] whose base is used raw (`with_reservation_over`, *not*
-/// `Window::sub`):
-///
-/// 1. **The offset is only wasm-page-aligned, not carve-size-aligned.** Carve-alignment is load-bearing
-///    for `temen_mask::Window::sub` (it rounds an unaligned base *down*, so a misaligned sub-window would
-///    reach *below* its carve — an escape) and for the native Cranelift `& (carve−1)` mask. The op-13
-///    tiers use neither: the confined address is `base + (addr < mapped)` with the carve base added raw,
-///    so a page-aligned base walls every admitted access to `[base, base + mapped) ⊆ [base, base + carve)`
-///    regardless of alignment. This lets the driver keep its grant records in `[0, off)` below the child
-///    with **no collision** — the child can never name an address below its own base. **Never call this
-///    for a `Window::sub`-backed child** (threads/durable §14): use [`child_carve_fits`] there.
-/// 2. **The carve is a ceiling in the holder's *reservation*, not its backed extent.** `carve <=
-///    parent_reserved` (the holder's confinement window) replaces `carve <= parent_mapped` (its physical
-///    backing). Escape-safety chains through reservations — the child confines to `mapped <= carve` and
-///    `[base, base+carve) ⊆ [parent_base, parent_base+parent_reserved)` — while the servicer grows the
-///    physical backing to cover `mapped` on demand (an access past the live backing faults ⇒ declines,
-///    never a host read). Physical feasibility (fitting the `WebAssembly.Memory` maximum) is the
-///    servicer's runtime concern (a failed `memory.grow` declines), not this static escape gate.
-///
-/// Overflow-free in `u64` (a wild `carve_log2 >= 64`, or an `off + carve` / `parent_base + off` past
-/// `u64`, yields `None`, never a wrapping placement). Fuzzed against a `u128` oracle in
-/// `tests/child_carve_gate.rs` alongside [`child_carve_fits`].
-pub fn child_carve_fits_growable(
-    declared_log2: Option<u8>,
-    off: u64,
-    carve_log2: u32,
-    parent_reserved: u64,
-    parent_base: u64,
-    guard: u64,
-) -> Option<u64> {
-    if carve_log2 >= 64 {
-        return None;
-    }
-    let carve = 1u64 << carve_log2;
-    let mod_ok = declared_log2.is_none_or(|d| u32::from(d) <= carve_log2);
-    let fits = carve <= parent_reserved
-        && off & (WASM_PAGE - 1) == 0
-        && off.checked_add(carve).is_some_and(|e| e <= parent_reserved)
-        && parent_base.checked_add(off).is_some_and(|a| a >= guard);
-    (mod_ok && fits).then_some(carve)
-}
-
 /// **The §14 nested front door** — the nesting analogue of [`compile_jit`], picking the drive mode
 /// from the IR so a nesting parent always yields a runnable [`Artifact`] (never `Err` for a verified
 /// module). Two modes, forced by wasm's inability to unwind a frame across a fiber stack switch:
