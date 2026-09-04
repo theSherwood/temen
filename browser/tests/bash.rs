@@ -40,6 +40,16 @@ fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
         ("/bin/grep", include_bytes!("fixtures/bin_grep.temen")),
         ("/bin/tr", include_bytes!("fixtures/bin_tr.temen")),
         ("/bin/cut", include_bytes!("fixtures/bin_cut.temen")),
+        ("/bin/tail", include_bytes!("fixtures/bin_tail.temen")),
+        ("/bin/tac", include_bytes!("fixtures/bin_tac.temen")),
+        ("/bin/rev", include_bytes!("fixtures/bin_rev.temen")),
+        ("/bin/nl", include_bytes!("fixtures/bin_nl.temen")),
+        ("/bin/fold", include_bytes!("fixtures/bin_fold.temen")),
+        (
+            "/bin/basename",
+            include_bytes!("fixtures/bin_basename.temen"),
+        ),
+        ("/bin/dirname", include_bytes!("fixtures/bin_dirname.temen")),
     ];
     raw.iter()
         .map(|(path, bytes)| {
@@ -256,6 +266,44 @@ fn bash_dash_c_cut_pipeline() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "b:d\nbcd\nr s\nnodlim\nx\n"
+    );
+}
+
+/// #801 — the **tier-1 + tier-2 coreutil batch** in real `bash -c` pipelines: `tail -n`, `rev`,
+/// `tac`, `nl`, `fold -w`, and the args-only `basename`/`dirname` path staples, each exec'd on the
+/// bytecode engine and byte-verified against the GNU shapes. Rounds out bash's `/bin` so scripts can
+/// filter and re-shape streams (and munge paths) the way a real shell does.
+#[test]
+fn bash_dash_c_tier1_tier2_coreutils() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_tier1_tier2_coreutils — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let script = "seq 1 5 | tail -n 2; \
+                  echo 'x y z' | rev; \
+                  printf 'a\\nb\\nc\\n' | tac; \
+                  printf 'p\\nq\\n' | nl; \
+                  echo abcdef | fold -w2; \
+                  basename /usr/local/bin.txt .txt; \
+                  dirname /usr/local/bin";
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", script.as_bytes()], b"", &bin_refs);
+    // The final simple command (`dirname`) is exec'd on the root via bash's process-saving
+    // optimization, so it *returns* its status (STATUS_OK, 0) rather than going through
+    // bash's own `exit_shell` — the same contract as `bash_dash_c_external_seq_last`.
+    assert_eq!(
+        out.status,
+        temen_browser::STATUS_OK,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "4\n5\nz y x\nc\nb\na\n     1\tp\n     2\tq\nab\ncd\nef\nbin\n/usr/local\n"
     );
 }
 
