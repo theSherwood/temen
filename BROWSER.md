@@ -438,7 +438,7 @@ in session discussion; collected here so the next slice has a home to be picked 
   `temen_alloc`/`temen_dealloc` ABI conversion skipped.
 - [x] **A real-language playground tab.** Landed, well past the original ask — the "pre-compiled
   modules first" half: the playground's demo sidebar now runs C reactor guests (bounce / life /
-  mandelzoom), **DOOM**, an editable **Lua** evaluator, a **SQLite** REPL, a **QuickJS** REPL
+  mandelzoom / the **Uxn** virtual machine over its Varvara devices), **DOOM**, an editable **Lua** evaluator, a **SQLite** REPL, a **QuickJS** REPL
   (editor JS piped as stdin, JS syntax highlighting), and a persistent **PostgreSQL** session
   (boot once, query many; survives page reloads via a data-dir snapshot) — all compiled through
   the `temen-llvm` on-ramp and tracked in `LLVM.md` / `crates/temen-run/demos/*`, not here. The
@@ -1205,7 +1205,7 @@ partitioning is per-function anyway). Revisit fibers when JSPI / core stack-swit
   → 4000, and the **playground** (`/web/play.html`) parses typed Temen text in-browser and runs it in
   every powerbox mode, incl. the parse-reject negative. (Build the threads module + `gencorpus`
   first; see the header of `browser-test.mjs`.) `node browser/browser-jit-reactor-test.mjs` adds the
-  **wasm-JIT reactor differential**: each committed reactor guest (bounce/life/mandelzoom) renders
+  **wasm-JIT reactor differential**: each committed reactor guest (bounce/life/mandelzoom/uxn) renders
   byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining) — the emitter's
   "verified ⇒ same on both tiers" contract, on real f64 guest code.
 - **Confinement intact:** `temen-mask` property/fuzz tests compile and pass unchanged.

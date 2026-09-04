@@ -39,29 +39,50 @@ const res = await page.evaluate(async () => {
     for (let i = 0; i < px.length; i++) { hsh ^= px[i]; hsh = Math.imul(hsh, 0x01000193) >>> 0; }
     return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
   };
-  const runInterp = (bytes) => {
+  // `file` = { name, data } served to the guest through the `fs` capability (the Uxn ROM), or null.
+  const runInterp = (bytes, file) => {
     const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
-    const opened = eng.ex.temen_onramp_open(p, bytes.length); eng.ex.temen_dealloc(p, bytes.length);
+    let opened;
+    if (file) {
+      const nameBytes = new TextEncoder().encode(file.name);
+      const nameP = eng.ex.temen_alloc(nameBytes.length);
+      const dataP = eng.ex.temen_alloc(file.data.length);
+      const view = new Uint8Array(eng.memory.buffer);
+      view.set(nameBytes, nameP);
+      view.set(file.data, dataP);
+      opened = eng.ex.temen_onramp_open_fs(p, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
+      eng.ex.temen_dealloc(nameP, nameBytes.length);
+      eng.ex.temen_dealloc(dataP, file.data.length);
+    } else {
+      opened = eng.ex.temen_onramp_open(p, bytes.length);
+    }
+    eng.ex.temen_dealloc(p, bytes.length);
     if (opened !== 0) throw new Error(`interp open failed: ${opened}`);
     const hs = [];
     for (let i = 0; i < NFRAMES; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
     eng.ex.temen_onramp_close();
     return hs;
   };
-  const runJit = async (bytes) => {
-    const r = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', null); // throws if tick isn't emittable
+  const runJit = async (bytes, file) => {
+    // throws if tick isn't emittable
+    const r = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
     const hs = [];
     for (let i = 0; i < NFRAMES; i++) { if (r.frame() !== 0) break; hs.push(hashFB()); }
     r.close();
     return hs;
   };
   const out = {};
-  for (const name of ['bounce', 'life', 'mandelzoom']) {
+  // uxn: the Uxn VM + Varvara compositor as one tick(), over its demo ROM served as boot.rom (fs).
+  const FILES = { uxn: { url: './assets/uxn_demo.rom', name: 'boot.rom' } };
+  for (const name of ['bounce', 'life', 'mandelzoom', 'uxn']) {
     const bytes = new Uint8Array(await (await fetch(`./assets/${name}.temen`)).arrayBuffer());
+    const file = FILES[name]
+      ? { name: FILES[name].name, data: new Uint8Array(await (await fetch(FILES[name].url)).arrayBuffer()) }
+      : null;
     let emitted = true, interpH = [], jitH = [];
     try {
-      interpH = runInterp(bytes);
-      jitH = await runJit(bytes);
+      interpH = runInterp(bytes, file);
+      jitH = await runJit(bytes, file);
     } catch (e) {
       out[name] = { error: e.message };
       continue;
@@ -82,7 +103,7 @@ console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 await browser.close(); server.close();
 
-const demos = ['bounce', 'life', 'mandelzoom'];
+const demos = ['bounce', 'life', 'mandelzoom', 'uxn'];
 const ok = errors.length === 0 && demos.every((n) => res[n] && res[n].identical);
 for (const n of demos) {
   const r = res[n] || {};

@@ -743,7 +743,8 @@ variable arr   variable lim
   'DOOM (1993 — arrow keys, Ctrl fires)': {
     kind: 'reactor',
     url: './assets/doom.temen',
-    wad: './assets/doom1.wad',
+    file: './assets/doom1.wad', // served to the guest through the `fs` capability as `fileName`
+    fileName: 'doom1.wad',
     jit: true, // the whole tick() is wasm-JIT-emittable — the "wasm-JIT" toggle runs it near-natively
     mode: 'io',
     desc: 'Shareware DOOM (via doomgeneric), compiled from id Software’s C through the LLVM on-ramp ' +
@@ -755,6 +756,23 @@ variable arr   variable lim
       'the renderer is byte-exact to a native build (the §18 differential). Toggle "wasm-JIT" to run ' +
       'the whole tick() on emitted wasm (near-native) instead of the interpreter — it multiplies the ' +
       'frame rate (shown live). Click Stop to end.',
+  },
+  'Uxn (Varvara — arrow keys, letters cycle the palette)': {
+    kind: 'reactor',
+    url: './assets/uxn.temen',
+    file: './assets/uxn_demo.rom',
+    fileName: 'boot.rom',
+    jit: true, // tick() (the whole Uxn interpreter + compositor) emits — toggle "wasm-JIT" to run it near-natively
+    mode: 'io',
+    desc: 'crates/temen-run/demos/uxn — the Uxn virtual machine (an 8-bit stack machine, 32 opcodes × ' +
+      'three mode bits) with its Varvara devices (System, Console, Screen, Controller, Datetime), written ' +
+      'in C from the spec and compiled through the LLVM on-ramp as a reactor guest. Click Run: _start reads ' +
+      'the demo ROM (demo.tal, assembled by the in-tree uxnasm) through the `fs` capability and runs its ' +
+      'reset vector; then each animation frame the page calls tick(), which drains the `keyboard` ' +
+      'capability into the Controller device, fires the Screen vector, and presents the two composed 2-bit ' +
+      'layers as RGBA through `display`. Arrow keys steer the player; any letter key cycles the palette; ' +
+      'Space resets the swarm. A frame-hash differential pins the guest byte-exact to a native build of ' +
+      'the same C. Click Stop to end.',
   },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
@@ -2976,25 +2994,25 @@ async function runReactor(c) {
   // Open the reactor: alloc, copy the module in, run _start (decode + grant powerbox). A guest that
   // needs a served file (Doom reads its WAD at _start) is opened with temen_onramp_open_fs, which grants
   // the `fs` capability over the fetched blob; every other reactor guest uses plain temen_onramp_open.
-  let wad = null;
-  if (ex.wad) {
+  let file = null; // { name, data } served to the guest through the `fs` capability, if the card has one
+  if (ex.file) {
     try {
-      wad = await fetchTimed(rec, c, ex.wad);
+      file = { name: ex.fileName, data: await fetchTimed(rec, c, ex.file) };
     } catch (e) {
-      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the WAD`);
+      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate the file`);
       runNote(rec, { fetchError: e.message });
       runEnd(rec, { ok: false });
       return;
     }
-    logTo(c, `fetched ${ex.wad}: ${wad.length}B file (served through the fs capability)`);
+    logTo(c, `fetched ${ex.file}: ${file.data.length}B file (served through the fs capability as ${file.name})`);
   }
   setState(c, 'running',
-    ex.wad ? `booting DOOM… (reading the WAD, building the renderer — a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
+    ex.file ? `booting… (${file.name} read through fs at _start — Doom builds its renderer here, a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
       : 'running…');
   const tOpen = performance.now();
   if (useJit) {
     try {
-      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
       logTo(c, `wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
     } catch (e) {
       jitReactor = null;
@@ -3003,26 +3021,7 @@ async function runReactor(c) {
     }
   }
   if (!jitReactor) {
-    let opened;
-    if (ex.wad) {
-      const nameBytes = new TextEncoder().encode('doom1.wad');
-      const modP = eng.ex.temen_alloc(bytes.length);
-      const nameP = eng.ex.temen_alloc(nameBytes.length);
-      const wadP = eng.ex.temen_alloc(wad.length);
-      const view = new Uint8Array(eng.memory.buffer);
-      view.set(bytes, modP);
-      view.set(nameBytes, nameP);
-      view.set(wad, wadP);
-      opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
-      eng.ex.temen_dealloc(modP, bytes.length);
-      eng.ex.temen_dealloc(nameP, nameBytes.length);
-      eng.ex.temen_dealloc(wadP, wad.length);
-    } else {
-      const p = eng.ex.temen_alloc(bytes.length);
-      new Uint8Array(eng.memory.buffer).set(bytes, p);
-      opened = eng.ex.temen_onramp_open(p, bytes.length);
-      eng.ex.temen_dealloc(p, bytes.length);
-    }
+    const opened = openInterpReactor(bytes, file);
     if (opened !== 0) {
       setState(c, 'error', `reactor open failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
       logTo(c, `temen_onramp_open failed: ${opened}`);
@@ -3108,28 +3107,37 @@ function hashFB() {
   return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
 }
 
-// Open the interpreter reactor, run up to `n` frames, hashing each presented frame; close. Synchronous.
-function framesInterp(bytes, wad, n) {
+// Open the interpreter reactor over `bytes`: alloc, copy the module in, run _start (decode + grant the
+// powerbox). A guest that needs a served file (Doom's WAD, Uxn's ROM) is opened with
+// temen_onramp_open_fs, which grants the `fs` capability over `file.data` under `file.name`; every other
+// reactor guest uses plain temen_onramp_open. Returns the open status (0 = ok).
+function openInterpReactor(bytes, file) {
   let opened;
-  if (wad) {
-    const nameBytes = new TextEncoder().encode('doom1.wad');
+  if (file) {
+    const nameBytes = new TextEncoder().encode(file.name);
     const modP = eng.ex.temen_alloc(bytes.length);
     const nameP = eng.ex.temen_alloc(nameBytes.length);
-    const wadP = eng.ex.temen_alloc(wad.length);
+    const dataP = eng.ex.temen_alloc(file.data.length);
     const view = new Uint8Array(eng.memory.buffer);
     view.set(bytes, modP);
     view.set(nameBytes, nameP);
-    view.set(wad, wadP);
-    opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, wadP, wad.length);
+    view.set(file.data, dataP);
+    opened = eng.ex.temen_onramp_open_fs(modP, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
     eng.ex.temen_dealloc(modP, bytes.length);
     eng.ex.temen_dealloc(nameP, nameBytes.length);
-    eng.ex.temen_dealloc(wadP, wad.length);
+    eng.ex.temen_dealloc(dataP, file.data.length);
   } else {
     const p = eng.ex.temen_alloc(bytes.length);
     new Uint8Array(eng.memory.buffer).set(bytes, p);
     opened = eng.ex.temen_onramp_open(p, bytes.length);
     eng.ex.temen_dealloc(p, bytes.length);
   }
+  return opened;
+}
+
+// Open the interpreter reactor, run up to `n` frames, hashing each presented frame; close. Synchronous.
+function framesInterp(bytes, file, n) {
+  const opened = openInterpReactor(bytes, file);
   if (opened !== 0) throw new Error(`interpreter open failed: status ${eng.ex.temen_status()}`);
   const hs = [];
   for (let i = 0; i < n; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
@@ -3138,8 +3146,8 @@ function framesInterp(bytes, wad, n) {
 }
 
 // Open the wasm-JIT reactor (throws if the tick isn't emittable), run up to `n` frames, hashing each.
-async function framesJit(bytes, wad, n) {
-  const r = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', wad);
+async function framesJit(bytes, file, n) {
+  const r = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
   const hs = [];
   for (let i = 0; i < n; i++) { if (r.frame() !== 0) break; hs.push(hashFB()); }
   r.close();
@@ -3153,10 +3161,10 @@ async function proveParity(c) {
   setState(c, 'running', 'proving interpreter ≡ wasm-JIT…');
   c.el.run.disabled = true;
   c.el.prove.disabled = true;
-  let bytes, wad = null;
+  let bytes, file = null;
   try {
     bytes = await fetchModule(ex.url);
-    if (ex.wad) wad = await fetchModule(ex.wad);
+    if (ex.file) file = { name: ex.fileName, data: await fetchModule(ex.file) };
   } catch (e) {
     setState(c, 'error', `${e.message}`);
     c.el.run.disabled = broken;
@@ -3167,8 +3175,8 @@ async function proveParity(c) {
   try {
     // Yield a paint so "proving…" lands before the synchronous interpreter frames block the thread.
     await new Promise((r) => setTimeout(r, 30));
-    const interpH = framesInterp(bytes, wad, N);
-    const jitH = await framesJit(bytes, wad, N);
+    const interpH = framesInterp(bytes, file, N);
+    const jitH = await framesJit(bytes, file, N);
     const n = Math.min(interpH.length, jitH.length);
     let mismatch = -1;
     for (let i = 0; i < n; i++) if (interpH[i] !== jitH[i]) { mismatch = i; break; }
@@ -4177,8 +4185,9 @@ async function main() {
   // menus / Shift run / the letter keys). Only while a loop is running. `preventDefault` is limited to
   // the keys whose default would disrupt play (arrows/Space/Tab scroll or move focus), and never fires
   // for a browser shortcut (Ctrl/Meta + a letter — e.g. Ctrl+R), so reload etc. still work.
-  const REACTOR_KEYS = new Set([37, 38, 39, 40, 17, 32, 13, 27, 9, 16]);
-  for (let k = 65; k <= 90; k++) REACTOR_KEYS.add(k);
+  const REACTOR_KEYS = new Set([37, 38, 39, 40, 17, 32, 13, 27, 9, 16, 18, 36, 8]);
+  for (let k = 65; k <= 90; k++) REACTOR_KEYS.add(k); // letters
+  for (let k = 48; k <= 57; k++) REACTOR_KEYS.add(k); // digits
   const SWALLOW = new Set([37, 38, 39, 40, 32, 9]);
   const forward = (pressed) => (e) => {
     if (reactorRAF === null || !REACTOR_KEYS.has(e.keyCode)) return;
