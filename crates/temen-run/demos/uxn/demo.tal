@@ -1,0 +1,201 @@
+( demo.tal — the playground's Uxn demo ROM.
+  A 256x192 screen: a striped background, "UXN ON TEMEN" set in a tiny 1bpp font, a swarm of 2bpp
+  sprites bouncing off the walls on the foreground layer, and a player sprite you steer with the arrow
+  keys. Any letter key cycles the palette; Space resets the swarm.
+  Build: uxnasm demo.tal demo.rom )
+
+( devices )
+|00 @System &vector $2 &expansion $2 &wst $1 &rst $1 &metadata $2 &r $2 &g $2 &b $2 &debug $1 &state $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+|80 @Controller &vector $2 &button $1 &key $1
+
+( zero page )
+|0000
+@px $2 @py $2 ( the player )
+@theme $1
+@balls $30 ( 8 balls x { x* y* dx dy } )
+
+|0100 @on-reset ( -> )
+  #0100 .Screen/width DEO2
+  #00c0 .Screen/height DEO2
+  #00 .theme STZ
+  set-palette
+  draw-background
+  draw-title
+  #0078 .px STZ2
+  #0058 .py STZ2
+  reset-balls
+  ;on-frame .Screen/vector DEO2
+  ;on-key .Controller/vector DEO2
+BRK
+
+@on-frame ( -> )
+  ( erase: the foreground with color 0 is transparent )
+  #40 draw-balls
+  #40 draw-player
+  ( the held arrows move the player )
+  .Controller/button DEI
+  DUP #10 AND #00 EQU ?{ .py LDZ2 #0001 SUB2 .py STZ2 }
+  DUP #20 AND #00 EQU ?{ .py LDZ2 INC2 .py STZ2 }
+  DUP #40 AND #00 EQU ?{ .px LDZ2 #0001 SUB2 .px STZ2 }
+  #80 AND #00 EQU ?{ .px LDZ2 INC2 .px STZ2 }
+  .px LDZ2 #00f8 clamp .px STZ2
+  .py LDZ2 #00b8 clamp .py STZ2
+  step-balls
+  ( redraw )
+  #c7 draw-balls
+  #c7 draw-player
+BRK
+
+@on-key ( -> )
+  .Controller/key DEI
+  DUP #20 EQU #00 EQU ?{ reset-balls }
+  DUP #61 LTH ?{ .theme LDZ INC .theme STZ set-palette }
+  POP
+BRK
+
+( --- palette ----------------------------------------------------------------------------------- )
+
+@set-palette ( -- )
+  .theme LDZ #03 AND #06 MUL #00 SWP ;palettes ADD2 ( addr* )
+  DUP2 LDA2 .System/r DEO2
+  INC2 INC2 DUP2 LDA2 .System/g DEO2
+  INC2 INC2 LDA2 .System/b DEO2
+JMP2r
+
+( --- background: 16px bands of colors 1 and 2, painted top-down with the fill op -------------- )
+
+@draw-background ( -- )
+  #0000 .Screen/x DEO2
+  #00
+  &loop ( i )
+    DUP #10 MUL #00 SWP .Screen/y DEO2
+    DUP #01 AND INC #80 ORA .Screen/pixel DEO
+    INC DUP #0c NEQ ?&loop
+  POP
+JMP2r
+
+( --- title: glyph indices from the table, 8px apart via auto-x ------------------------------- )
+
+@draw-title ( -- )
+  #0050 .Screen/x DEO2
+  #0008 .Screen/y DEO2
+  #01 .Screen/auto DEO
+  ;title
+  &loop ( addr* )
+    LDAk ( addr* g )
+    DUP #ff EQU ?&done
+    #00 SWP #30 SFT2 ;font ADD2 .Screen/addr DEO2
+    #03 .Screen/sprite DEO
+    INC2 !&loop
+  &done POP POP2
+  #00 .Screen/auto DEO
+JMP2r
+
+( --- the swarm ------------------------------------------------------------------------------- )
+
+@reset-balls ( -- )
+  #40 draw-balls
+  ;ball-init ;balls #30
+  &loop ( src* dst* n )
+    STH
+    OVR2 LDA ROT ROT STAk ROT POP
+    INC2 SWP2 INC2 SWP2
+    STHr #01 SUB DUP ?&loop
+  POP POP2 POP2
+JMP2r
+
+@draw-balls ( color -- )
+  ;ball-sprite .Screen/addr DEO2
+  ;balls #08
+  &loop ( color addr* n )
+    STH
+    DUP2 LDA2 .Screen/x DEO2
+    DUP2 INC2 INC2 LDA2 .Screen/y DEO2
+    ROT DUP .Screen/sprite DEO ROT ROT
+    #0006 ADD2
+    STHr #01 SUB DUP ?&loop
+  POP POP2 POP
+JMP2r
+
+@step-balls ( -- )
+  ;balls #08
+  &loop ( addr* n )
+    STH
+    DUP2 #00f8 bounce-axis
+    DUP2 INC2 INC2 #00b8 bounce-axis
+    #0006 ADD2
+    STHr #01 SUB DUP ?&loop
+  POP POP2
+JMP2r
+
+( advance one coordinate by its delta (4 bytes further on); past the limit, flip the delta instead )
+@bounce-axis ( paddr* limit* -- )
+  STH2
+  DUP2 LDA2
+  OVR2 #0004 ADD2 LDA sext ADD2 ( paddr* p'* )
+  DUP2 STH2r GTH2 ?{ SWP2 STA2 JMP2r }
+  POP2 #0004 ADD2 ( daddr* )
+  DUP2 LDA #00 SWP SUB ( daddr* -d )
+  ROT ROT STA
+JMP2r
+
+( --- helpers ---------------------------------------------------------------------------------- )
+
+@draw-player ( color -- )
+  ;player-sprite .Screen/addr DEO2
+  .px LDZ2 .Screen/x DEO2
+  .py LDZ2 .Screen/y DEO2
+  .Screen/sprite DEO
+JMP2r
+
+@clamp ( v* max* -- v'* ) ( a wrapped-negative v clamps to 0 )
+  OVR2 #8000 GTH2 ?{
+    OVR2 OVR2 GTH2 ?{ POP2 JMP2r }
+    NIP2 JMP2r }
+  POP2 POP2 #0000
+JMP2r
+
+@sext ( b -- s* )
+  DUP #80 AND #00 EQU ?{ #ff SWP JMP2r }
+  #00 SWP
+JMP2r
+
+( --- data ------------------------------------------------------------------------------------- )
+
+@palettes ( r* g* b* per theme )
+  123f 134f 246f
+  2eff 16af 123e
+  0f8f 0c4f 1e2f
+  fff0 f0f0 ff00
+
+@ball-init ( x* y* dx dy )
+  0010 0020 01 01
+  0030 0050 ff 02
+  0050 0030 02 ff
+  0070 0070 01 ff
+  0090 0040 ff ff
+  00b0 0060 02 01
+  00d0 0038 01 02
+  00e8 0080 ff 01
+
+@ball-sprite ( 2bpp: a white ring around a colored core )
+  3c7e ffff ffff 7e3c
+  0018 3c3c 3c18 0000
+
+@player-sprite ( 2bpp: a white outline around a dark core )
+  183c 6699 8181 66c3
+  0000 1866 7e18 0000
+
+@title ( glyph indices, ff-terminated: UXN ON TEMEN )
+  00 01 02 07 03 02 07 04 05 06 05 02 ff
+
+@font ( 1bpp glyphs: U X N O T E M space )
+  6666 6666 6666 3c00
+  6666 3c18 3c66 6600
+  6676 7e7e 6e66 6600
+  3c66 6666 6666 3c00
+  7e18 1818 1818 1800
+  7e60 607c 6060 7e00
+  667e 7e6a 6262 6200
+  0000 0000 0000 0000

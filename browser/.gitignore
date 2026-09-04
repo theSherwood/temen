@@ -29,6 +29,9 @@ patched*.wasm
 !/web/assets/bounce.temen
 !/web/assets/life.temen
 !/web/assets/mandelzoom.temen
+# The Uxn card (crates/temen-run/demos/uxn): a small clang-translated guest, committed with its ROM
+# (`uxn_demo.rom`, not ignored) so the card works out of the box; `ONLY=uxn bash scripts/rebuild-assets.sh`.
+!/web/assets/uxn.temen
 # forth.temen — the sectorforth-class Forth kernel (`crates/temen-run/demos/forth/forth.temt`, hand-written
 # Temen text IR) for the "Forth" card; needs no toolchain (`ONLY=forth bash scripts/rebuild-assets.sh`),
 # committed so the card works out of the box; gated by `browser/tests/forth_asset.rs` (issue #1214).

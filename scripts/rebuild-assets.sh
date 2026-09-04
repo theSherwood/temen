@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc onramp shell forth nifler nim_hello nim_phases nim_driver_guest lua_snapshot
+#   Steps:  leng chibicc onramp shell forth uxn nifler nim_hello nim_phases nim_driver_guest lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -129,6 +129,20 @@ if want forth; then
     && validate browser/web/assets/forth.temen \
     && note "forth ✓ (forth.temen)" \
     || note "forth ✗ (prep_temen failed on forth.temt?)"
+fi
+
+# --- 4c) uxn.temen + uxn_demo.rom (crates/temen-run/demos/uxn: cc for the assembler, clang → translate) ---
+if want uxn; then
+  echo "=== [uxn] crates/temen-run/demos/uxn/build.sh → browser/web/assets/{uxn.temen,uxn_demo.rom} ==="
+  UXN_OUT="${TEMEN_UXN_CACHE:-/tmp/temen_uxn_cache}"
+  if sh crates/temen-run/demos/uxn/build.sh "$UXN_OUT"; then
+    cp "$UXN_OUT/uxn.temen" browser/web/assets/uxn.temen
+    cp "$UXN_OUT/uxn_demo.rom" browser/web/assets/uxn_demo.rom
+    validate browser/web/assets/uxn.temen \
+      && note "uxn ✓ (uxn.temen + uxn_demo.rom)" || note "uxn ✗ (rebuilt but failed re-validate)"
+  else
+    note "uxn SKIP/✗ (cc / clang / translator?)"
+  fi
 fi
 
 # --- 5) nifler.temen.gz (nimony pipeline; TEMEN_NIFLER_EMIT_ASSET gzips it + the expected fixtures) --
