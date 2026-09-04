@@ -4986,6 +4986,87 @@ fn c_foreground_pipeline_group_is_terminated_by_a_group_sigint() {
     );
 }
 
+fn reapkill_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long s, g;\n\
+static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
+static int fs[2];  /* subshell -> root sync pipe */\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
+int main(void){{\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
+  s = __px_fork(0,0);\n\
+  if (s < 0) return 1;\n\
+  if (s == 0){{\n\
+    /* the subshell: fork a grandchild that blocks forever, then PARK in waitpid on it. */\n\
+    g = __px_fork(0,0);\n\
+    if (g < 0) return 80;\n\
+    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    return 7;    /* only if g exits before we are killed */\n\
+  }}\n\
+  /* root: wait until the subshell is about to park, then KILL it while it blocks in waitpid. */\n\
+  rd1(fs[0]);\n\
+  __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid */\n\
+  wr1(fb[1]);                  /* release the grandchild so its OS thread returns (no orphan hang) */\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  if (h != s) return 100;\n\
+  if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #1267 follow-up — terminate a twin PARKED in `waitpid` (a subshell blocked reaping its own child,
+// e.g. `^C` of a `$(…)` command substitution). This pins that the parallel driver's reap park is
+// airtight for terminate WITHOUT a dedicated `term_flag` escape: unlike the pipe poll #1267 fixed
+// (whose readiness never flips on terminate), the reap condvar SELF-HEALS. A subshell parked in
+// `waitpid` can only be cleanly terminated by also terminating its child (else the child's OS thread
+// hangs the run); the killed child's forced exit wakes `wait_fork_exit`, the parent's rewound
+// `waitpid` re-executes and dies at its per-op `term_flag` safepoint (WIFSIGNALED SIGKILL, reaped as
+// 3009→42). Here the subshell forks a grandchild that blocks forever and parks reaping it; root
+// SIGKILLs the subshell and releases the grandchild so its thread returns. Returns 42 on the
+// tree-walker, the cooperative bytecode engine, and the parallel driver — verified to hold with the
+// driver UNCHANGED (the reap/join condvar sites need no term_flag poll; only the pipe polls did, #1267).
+#[test]
+fn c_terminate_a_twin_parked_in_waitpid() {
+    let e = run_interp_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the subshell parked in waitpid was SIGKILL-terminated and reaped WIFSIGNALED"
+    );
+    let b = run_bytecode_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode: same — the loop-top kill sweep finalized the reap-parked subshell"
+    );
+    let p = run_bytecode_parallel_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: the killed grandchild's exit woke the subshell's condvar reap wait, and the \
+         subshell's re-run died at its per-op term_flag safepoint — no dedicated escape needed, matching \
+         the oracle"
+    );
+}
+
 // #798 pipeline-as-a-job — a foreground pipeline (`a | b`) is ONE job whose stages share ONE process
 // group, so a job-control signal (^Z/SIGTSTP, ^C, SIGCONT via `fg`/`bg`) must fan out to EVERY member
 // of the group, not just the leader. Two twins are forked, the second `setpgid`'d into the FIRST's
