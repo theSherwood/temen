@@ -2265,13 +2265,19 @@ fn drive_over_cell(
                     s.interrupt_interruptible_parks(root_dom, true);
                 }
             }));
-            // #798 slice 2 — the stop/continue closure, same weak discipline as the wake.
-            let sched_weak = Arc::downgrade(&sched);
-            source.set_stop(Arc::new(move |stopped| {
+            // #798 slice 2 / #1259 — the stop/continue mirror, split for ordering. The reorder-critical
+            // `stop_depth` write is the INLINE apply (fired synchronously in program order by the
+            // personality); only the order-independent stopped-park drain stays deferred in `set_stop`.
+            source.set_stop_apply(Arc::new(move |stopped| {
                 if stopped {
                     stop_depth.fetch_add(1, Ordering::SeqCst);
                 } else {
                     stop_depth.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+            let sched_weak = Arc::downgrade(&sched);
+            source.set_stop(Arc::new(move |stopped| {
+                if !stopped {
                     if let Some(s) = sched_weak.upgrade() {
                         s.wake_stopped(root_dom);
                     }
@@ -2285,12 +2291,15 @@ fn drive_over_cell(
                     s.rescan_reap_parks(root_dom);
                 }
             }));
-            // #796 default actions — the terminate closure: flag up, then wake everything the
-            // domain has parked (interruptible parks AND stopped vCPUs) so each runs to its next
-            // per-op poll and dies. Death beats stop, so a woken stopped vCPU cannot re-park.
+            // #796 default actions / #1259 — terminate, split for ordering. The `term_flag` write is the
+            // INLINE apply; the deferred `set_kill` closure only wakes what the domain has parked
+            // (interruptible parks AND stopped vCPUs) so each runs to its next per-op poll and observes
+            // the already-set flag and dies. Death beats stop, so a woken stopped vCPU cannot re-park.
+            source.set_kill_apply(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+            }));
             let sched_weak = Arc::downgrade(&sched);
             source.set_kill(Arc::new(move || {
-                term_flag.store(true, Ordering::SeqCst);
                 if let Some(s) = sched_weak.upgrade() {
                     s.interrupt_interruptible_parks(root_dom, false);
                     s.wake_stopped(root_dom);
@@ -5604,13 +5613,18 @@ impl Scheduler {
                     sc.interrupt_interruptible_parks(dom, true);
                 }
             }));
-            // #798 slice 2 — the stop/continue closure, minted with the wake.
-            let sched_weak = Arc::downgrade(self);
-            source.set_stop(Arc::new(move |stopped| {
+            // #798 slice 2 / #1259 — stop/continue, split: the `stop_depth` write is the INLINE apply,
+            // the stopped-park drain stays deferred.
+            source.set_stop_apply(Arc::new(move |stopped| {
                 if stopped {
                     stop_depth.fetch_add(1, Ordering::SeqCst);
                 } else {
                     stop_depth.fetch_sub(1, Ordering::SeqCst);
+                }
+            }));
+            let sched_weak = Arc::downgrade(self);
+            source.set_stop(Arc::new(move |stopped| {
+                if !stopped {
                     if let Some(sc) = sched_weak.upgrade() {
                         sc.wake_stopped(dom);
                     }
@@ -5623,10 +5637,13 @@ impl Scheduler {
                     sc.rescan_reap_parks(dom);
                 }
             }));
-            // #796 default actions — the terminate closure, minted with the wake/stop.
+            // #796 default actions / #1259 — terminate, split: the `term_flag` write is the INLINE
+            // apply, the wake of parked/stopped vCPUs stays deferred.
+            source.set_kill_apply(Arc::new(move || {
+                term_flag.store(true, Ordering::SeqCst);
+            }));
             let sched_weak = Arc::downgrade(self);
             source.set_kill(Arc::new(move || {
-                term_flag.store(true, Ordering::SeqCst);
                 if let Some(sc) = sched_weak.upgrade() {
                     sc.interrupt_interruptible_parks(dom, false);
                     sc.wake_stopped(dom);
@@ -11459,14 +11476,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.interrupt_interruptible_parks(dom, true);
                                             }
                                         }));
-                                        // #798 slice 2 — and its stop/continue closure.
+                                        // #798 slice 2 / #1259 — stop/continue, split: `stop_depth` write
+                                        // is the INLINE apply, the stopped-park drain stays deferred.
                                         let stop_depth = ch.stop_depth.clone();
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_stop(Arc::new(move |stopped| {
+                                        source.set_stop_apply(Arc::new(move |stopped| {
                                             if stopped {
                                                 stop_depth.fetch_add(1, Ordering::SeqCst);
                                             } else {
                                                 stop_depth.fetch_sub(1, Ordering::SeqCst);
+                                            }
+                                        }));
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            if !stopped {
                                                 if let Some(sc) = sched_weak.upgrade() {
                                                     sc.wake_stopped(dom);
                                                 }
@@ -11479,11 +11501,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.rescan_reap_parks(dom);
                                             }
                                         }));
-                                        // #796 default actions — and its terminate closure.
+                                        // #796 default actions / #1259 — terminate, split: `term_flag`
+                                        // write is the INLINE apply, the vCPU wake stays deferred.
                                         let term_flag = ch.term_flag.clone();
+                                        source.set_kill_apply(Arc::new(move || {
+                                            term_flag.store(true, Ordering::SeqCst);
+                                        }));
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_kill(Arc::new(move || {
-                                            term_flag.store(true, Ordering::SeqCst);
                                             if let Some(sc) = sched_weak.upgrade() {
                                                 sc.interrupt_interruptible_parks(dom, false);
                                                 sc.wake_stopped(dom);
@@ -11915,14 +11940,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.interrupt_interruptible_parks(dom, true);
                                             }
                                         }));
-                                        // #798 slice 2 — and its stop/continue closure.
+                                        // #798 slice 2 / #1259 — stop/continue, split: `stop_depth` write
+                                        // is the INLINE apply, the stopped-park drain stays deferred.
                                         let stop_depth = ch.stop_depth.clone();
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_stop(Arc::new(move |stopped| {
+                                        source.set_stop_apply(Arc::new(move |stopped| {
                                             if stopped {
                                                 stop_depth.fetch_add(1, Ordering::SeqCst);
                                             } else {
                                                 stop_depth.fetch_sub(1, Ordering::SeqCst);
+                                            }
+                                        }));
+                                        let sched_weak = Arc::downgrade(rs);
+                                        source.set_stop(Arc::new(move |stopped| {
+                                            if !stopped {
                                                 if let Some(sc) = sched_weak.upgrade() {
                                                     sc.wake_stopped(dom);
                                                 }
@@ -11935,11 +11965,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                 sc.rescan_reap_parks(dom);
                                             }
                                         }));
-                                        // #796 default actions — and its terminate closure.
+                                        // #796 default actions / #1259 — terminate, split: `term_flag`
+                                        // write is the INLINE apply, the vCPU wake stays deferred.
                                         let term_flag = ch.term_flag.clone();
+                                        source.set_kill_apply(Arc::new(move || {
+                                            term_flag.store(true, Ordering::SeqCst);
+                                        }));
                                         let sched_weak = Arc::downgrade(rs);
                                         source.set_kill(Arc::new(move || {
-                                            term_flag.store(true, Ordering::SeqCst);
                                             if let Some(sc) = sched_weak.upgrade() {
                                                 sc.interrupt_interruptible_parks(dom, false);
                                                 sc.wake_stopped(dom);
@@ -17474,6 +17507,17 @@ pub trait SignalSource: Send + Sync {
     /// job-control story need not store it.
     fn set_stop(&self, _stop: Arc<dyn Fn(bool) + Send + Sync>) {}
 
+    /// #1259 — install the **inline** half of the stop/continue mirror update: `apply(true)` records
+    /// the domain as stopped in this engine's scheduler-visible flag (`stop_depth += 1`), `apply(false)`
+    /// records it running (`stop_depth -= 1`). The personality fires this **synchronously, in program
+    /// order, under its `Proc` lock** the instant it decides a stop/continue — NOT deferred — so a
+    /// program-order stop→continue can never latch as continue→stop (the #1213 reorder). It must be a
+    /// lock-free write (an atomic store) so it is safe to run while the engine holds the domain's `Host`
+    /// lock; the order-independent *notification* (draining stopped parks) stays in the deferred
+    /// [`Self::set_stop`] closure. Default no-op — engines that read the personality's own stop state
+    /// directly (the cooperative driver) keep no mirror and install nothing here.
+    fn set_stop_apply(&self, _apply: Arc<dyn Fn(bool) + Send + Sync>) {}
+
     /// #1213 — install the run's **child-transition nudge**: `chld_wake()` re-admits this domain's
     /// blocked `waitpid` parks for a clean re-scan ([`Scheduler::rescan_reap_parks`]). The
     /// personality invokes it when a child of this process stops, continues, or exits and the parent
@@ -17561,6 +17605,16 @@ pub trait SignalSource: Send + Sync {
     /// SIGTERM, …); the core never sees a signal number, it only kills a domain on request.
     /// Default no-op — a source with no default-action story need not store it.
     fn set_kill(&self, _kill: Arc<dyn Fn() + Send + Sync>) {}
+
+    /// #1259 — install the **inline** half of the terminate mirror update: firing it records the domain
+    /// as terminated in this engine's scheduler-visible flag (`term_flag ← true`), the atomic every vCPU
+    /// polls per op. The personality fires this **synchronously, under its `Proc` lock** the instant a
+    /// `SIG_DFL` terminate becomes actionable — NOT deferred — so the flag is set before the (deferred,
+    /// order-independent) [`Self::set_kill`] wake runs, and no reorder can leave a killed domain marked
+    /// live. Must be a lock-free write (an atomic store), safe while the engine holds the domain's `Host`
+    /// lock. Default no-op — the cooperative driver reads the personality's own `term_sig` directly and
+    /// keeps no mirror, so it installs nothing here.
+    fn set_kill_apply(&self, _apply: Arc<dyn Fn() + Send + Sync>) {}
 
     /// #799 — store the run's **park-request closure**: the personality fires it *during* one of
     /// its own dispatches to ask that the calling vCPU be benched on a [`ParkEvent`] instead of

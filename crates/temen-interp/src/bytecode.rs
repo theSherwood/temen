@@ -13030,7 +13030,10 @@ fn wire_kill_flag(host: &std::sync::Arc<std::sync::Mutex<Host>>) {
         (hg.term_flag.clone(), hg.signal_poll().map(|(_, s)| s))
     };
     if let Some(source) = source {
-        source.set_kill(std::sync::Arc::new(move || {
+        // #1259 — the `term_flag` write is the INLINE apply (fired synchronously by the personality),
+        // not a deferred wake: a per-op-polling parallel vCPU needs no scheduler notify, and applying it
+        // in program order keeps it reorder-free by construction.
+        source.set_kill_apply(std::sync::Arc::new(move || {
             term_flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }));
     }
