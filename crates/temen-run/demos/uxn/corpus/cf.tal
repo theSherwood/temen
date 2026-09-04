@@ -1,0 +1,21 @@
+( control-flow coverage: every jump form in byte and short mode, keep, return, lambdas, subroutines )
+|0100
+  #01 #02 ,&skip JMP #ff &skip ADD           ( byte relative JMP: 03 )
+  ;&abs JMP2 #ee &abs #10 ADD                 ( absolute JMP2: 13 )
+  #01 ,&t JCN #99 &t #20 ADD                  ( JCN taken )
+  #00 ,&nt JCN #40 &nt ADD                    ( JCN not taken: 33+40 = 73 )
+  #01 ;&t2 JCN2 #77 &t2 INC                   ( JCN2 taken: 74 )
+  ,sub JSR #05 ADD                           ( JSR: 74*2+5 = ed )
+  ;sub2 JSR2                                 ( JSR2: ed+1 = ee )
+  sub2 sub2                                   ( JSI x2: f0 )
+  !&jmi &skipped #00 #00 &jmi                    ( JMI )
+  #01 ?&jci #00 &jci                          ( JCI taken )
+  #00 ?&jcin #0a ADD &jcin                    ( JCI not taken: fa )
+  { #11 } STH2r POP2                          ( lambda address, dropped )
+  #01 ?{ #22 ADD } #00 ?{ #01 ADD }           ( ?{ }: only the second runs: fb )
+  STH ,&r JMP #00 &r STHr                     ( through the return stack )
+  #03 #04 ,&kj JMPk POP #0a ADD &kj ADD       ( JMPk: keeps the offset: 3+4+0a... see oracle )
+  LITr 05 LITr 06 ADDr STHr ADD
+BRK
+@sub #02 MUL JMP2r
+@sub2 INC JMP2r
