@@ -6151,7 +6151,7 @@ impl JitOnrampRun {
                 // one thing a detached child cannot receive in-band (#1285).
                 let mut host = Host::new();
                 host.stdin = stdin;
-                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
                 let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
                 (host, args_init_mem(&refs), frame, None, 0, 0)
             }
@@ -13465,7 +13465,7 @@ pub extern "C" fn temen_detached_oracle_run(
         // SAFETY: same host guarantee for the stdin range.
         host.stdin = unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec();
     }
-    let (_frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    let (_frame, _keys, _mouse) = grant_onramp_caps(&mut host, &m, None);
     let argv = argv_from_payload(args_ptr, args_len);
     let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let init_mem = args_init_mem(&refs);
