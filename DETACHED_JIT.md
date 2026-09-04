@@ -62,7 +62,7 @@ would plausibly run coreutils detached and its own helper coroutines nested."*
 **Consequence for #1253:** the ticket's mechanism ("grow the backing in place via
 `memory.grow`" inside the shared window) is the wrong lever. The right lever is *running the
 big phases as detached children on the JIT tier*, which needs the work below. PR #1268's
-merged cap-and-reserve stays as the interim for nested children (it fixes the invariant-9
+cap-and-reserve (commit 5d19eca, unmerged) stays as the interim for nested children (it fixes the invariant-9
 divergence and the 2 GiB failure); its slices 1–2 (a single top-of-memory grower) should be
 **reverted** — they implement the mechanism this note retires.
 
