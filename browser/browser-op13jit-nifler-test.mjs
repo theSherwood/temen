@@ -64,12 +64,17 @@ const res = await page.evaluate(async () => {
   const opened = ex.temen_op13jit_phase_open(cp, niflerCe.length, fp2, fb.length, op2, ob.length, sp2, src.length);
   ex.temen_dealloc(cp, niflerCe.length); ex.temen_dealloc(fp2, fb.length); ex.temen_dealloc(op2, ob.length); ex.temen_dealloc(sp2, src.length);
   if (opened !== 0) return { err: `phase_open failed: ${opened}`, bcStatus };
-  let steps = 0, drove = 0, driveErr = null;
+  // #1253: the staged child now commits nifler_ce's DECLARED window (not an 8×-pre-sized carve) and
+  // `vm_map`-grows its `"mapped"` into the carve on demand — capture the declared start as a witness that
+  // the child spawns small, not pre-sized (the grow itself is exercised by the >=256 MiB native
+  // differential `op13jit_grow_phase.rs`; a tiny crawl source stays inside the declared window).
+  let steps = 0, drove = 0, driveErr = null, mappedInitial = 0;
   for (;;) {
     if (steps++ > 8) { ex.temen_op13jit_close(); return { err: 'loop did not terminate', bcStatus }; }
     const s = ex.temen_op13jit_step();
     if (s === 0) break;
     if (s === 1) {
+      if (!mappedInitial) mappedInitial = Number(ex.temen_onramp_jit_run_mapped());
       try { await driveJitRun(ex, memory, 'op13jit-nifler'); }
       catch (e) { driveErr = String(e && e.message || e); ex.temen_op13jit_close(); return { err: `driveJitRun: ${driveErr}`, bcStatus }; }
       ex.temen_op13jit_deliver(); drove++; continue;
@@ -88,6 +93,7 @@ const res = await page.evaluate(async () => {
     oracleLen: oracle.length, emittedLen: emitted.length,
     pnifEq: eq(oracle, emitted),
     head: new TextDecoder().decode(oracle.slice(0, 60)),
+    mappedInitial, declaredSpawn: mappedInitial > 0,
   };
 });
 
@@ -95,7 +101,7 @@ await browser.close(); server.close();
 try { rmSync(CE_TMP); } catch {}
 console.log('RESULT', JSON.stringify(res, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
-const ok = !res.err && res.pnifEq && res.emittedLen > 0 && res.oracleLen > 0;
-console.log(`  op13jit-nifler: .p.nif≡=${res.pnifEq} (emitted ${res.emittedLen}B / oracle ${res.oracleLen}B) driver=${res.result} childrenDriven=${res.drove}${res.err ? ` · ERR ${res.err}` : ''}`);
-console.log(ok ? 'PASS — real nifler_ce ran nested on the EMITTED tier; .p.nif ≡ interpreter oracle' : 'FAIL');
+const ok = !res.err && res.pnifEq && res.emittedLen > 0 && res.oracleLen > 0 && res.declaredSpawn;
+console.log(`  op13jit-nifler: .p.nif≡=${res.pnifEq} (emitted ${res.emittedLen}B / oracle ${res.oracleLen}B) driver=${res.result} childrenDriven=${res.drove} spawn@mapped=${res.mappedInitial}${res.err ? ` · ERR ${res.err}` : ''}`);
+console.log(ok ? 'PASS — real nifler_ce ran nested on the EMITTED tier, spawned at its declared window (no 8× pre-size); .p.nif ≡ interpreter oracle' : 'FAIL');
 process.exit(ok ? 0 : 1);

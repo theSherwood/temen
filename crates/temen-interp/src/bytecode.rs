@@ -3314,6 +3314,36 @@ impl<'p> Vcpu<'p> {
         )
     }
 
+    /// [`new_confined_child_grow`](Self::new_confined_child_grow) over a **caller-built powerbox**
+    /// (the [`new_confined_child_over_host`](Self::new_confined_child_over_host) shape): the op-13
+    /// arm's re-granted child `Host` runs a phase child whose committed window starts at its declared
+    /// `1<<declared_log2` and grows via `vm_map` into the parent-granted `1<<carve_log2` carve (#1253 —
+    /// the interpreter twin of the emitted phase child, whose `"mapped"` likewise starts at the
+    /// declared window over a carve-sized backing, so a decline runs byte-identical to the emit).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_confined_child_grow_over_host(
+        prog: &'p VcpuProgram,
+        module: u32,
+        entry: u32,
+        back: std::sync::Arc<super::Region>,
+        declared_log2: u8,
+        carve_log2: u8,
+        fuel: u64,
+        host: Host,
+    ) -> Result<Vcpu<'p>, Trap> {
+        Self::new_confined_child_core(
+            prog,
+            module,
+            entry,
+            back,
+            declared_log2,
+            carve_log2,
+            fuel,
+            host,
+            &mut |_| {},
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_confined_child_core(
         prog: &'p VcpuProgram,

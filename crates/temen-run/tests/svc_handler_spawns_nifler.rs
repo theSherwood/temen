@@ -60,7 +60,7 @@ fn inflate(gz: &[u8]) -> Option<Vec<u8>> {
 /// `carve_off + args_base` (a data segment), then joins it. Mirrors `nimc::op13_parent_src`'s record /
 /// argv layout, but the spawn lives in a serve dispatch rather than the parent's own `main`.
 fn servicer_src() -> String {
-    let child_sl: u64 = 24; // nifler's 16 MiB carve (matches rust_driver_nifler / run_phase_op13)
+    let child_sl: u64 = 24; // nifler's 16 MiB carve (matches rust_driver_nifler)
     let carve_off: u64 = 1 << child_sl;
     let parent_sl: u64 = child_sl + 1; // 32 MiB window; the carve is its upper half
     let args_base: u64 = 16512; // POWERBOX_NULL_GUARD(16384) + POWERBOX_ARGS_BASE(128)
