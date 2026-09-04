@@ -39,6 +39,7 @@ fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
         ("/bin/pwd", include_bytes!("fixtures/bin_pwd.temen")),
         ("/bin/grep", include_bytes!("fixtures/bin_grep.temen")),
         ("/bin/tr", include_bytes!("fixtures/bin_tr.temen")),
+        ("/bin/cut", include_bytes!("fixtures/bin_cut.temen")),
     ];
     raw.iter()
         .map(|(path, bytes)| {
@@ -222,6 +223,40 @@ fn bash_dash_c_pipeline_echo_cat() {
         String::from_utf8_lossy(&out.stderr),
     );
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+}
+
+/// #801 — the **`cut` coreutil** in real pipelines: field mode (`-d`/`-f` with a comma list and an
+/// open `N-` range), char mode (`-c` range), and the GNU no-delimiter passthrough — each `echo`/`printf`
+/// piped into `/bin/cut`, exec'd on the bytecode engine. Outputs are byte-verified against native
+/// `cut` (`b:d` / `bcd` / `r s` / the passthrough+field / multi-line field). Adds `cut` to bash's `/bin`
+/// so real pipelines like `ls | grep .txt | cut -d. -f1` run in the card.
+#[test]
+fn bash_dash_c_cut_pipeline() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_cut_pipeline — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let script = "echo 'a:b:c:d' | cut -d: -f2,4; \
+                  echo abcdef | cut -c2-4; \
+                  echo 'p q r s' | cut -d' ' -f3-; \
+                  printf 'nodlim\\nx:y\\n' | cut -d: -f1";
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", script.as_bytes()], b"", &bin_refs);
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // Byte-for-byte the native `cut` output for the same four pipelines.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "b:d\nbcd\nr s\nnodlim\nx\n"
+    );
 }
 
 /// #1080 — a **three-stage coreutil pipeline** in the browser: `seq 5 | head -n 3 | wc -l` → `3`. Three
