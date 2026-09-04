@@ -253,6 +253,75 @@ const RSTACK: &str = ": rot3 ( a b c -- b c a ) >r swap r> swap ;\n\
     10 20 30 rsum3 . cr\n";
 const RSTACK_OUT: &str = "1 3 2 \n7 7 \n65 122 \n2 1 4 3 \n2 1 4 3 2 1 \n60 \n";
 
+/// A whole program, not one feature: the sieve of Eratosthenes counts the primes below N. It leans on
+/// everything at once — `variable`/`here`/`allot` for a byte array, a nested `do` loop whose inner
+/// bound is `+loop`-stepped by the outer prime (`j`), `i`/`c@`/`c!` to mark multiples, and `if`/`0=`.
+/// That it is byte-identical across interp == JIT (and the bytecode leg) is the language validated as
+/// a whole, not just per-word.
+#[test]
+fn forth_sieve_of_eratosthenes() {
+    let out = forth(SIEVE);
+    assert_eq!(out, SIEVE_OUT);
+}
+
+const SIEVE: &str = "variable arr\n\
+    variable lim\n\
+    : primes ( n -- c )\n\
+      lim !\n\
+      here arr !\n\
+      lim @ allot\n\
+      0\n\
+      lim @ 2 do\n\
+        arr @ i + c@ 0= if\n\
+          1+\n\
+          i dup * lim @ < if\n\
+            lim @ i dup * do\n\
+              1 arr @ i + c!\n\
+            j +loop\n\
+          then\n\
+        then\n\
+      loop ;\n\
+    10 primes . 30 primes . 100 primes . cr\n";
+const SIEVE_OUT: &str = "4 10 25 \n";
+
+/// Concurrency meets counted loops: a generator fiber (`gen` yields the running count) is `resume`d
+/// N times from inside a `do` loop, summing the yields. Nothing else exercises fibers and loops in
+/// one program; byte-identical interp == JIT and on the bytecode engine.
+#[test]
+fn forth_fiber_driven_loop() {
+    let out = forth(FIBER_LOOP);
+    assert_eq!(out, FIBER_LOOP_OUT);
+}
+
+const FIBER_LOOP: &str = ": gen ( x -- y ) begin 1+ dup yield drop again ;\n\
+    : takes ( f n -- s ) 0 swap 0 do over 0 resume nip + loop nip ;\n\
+    ' gen task 5 takes . cr\n\
+    ' gen task 10 takes . cr\n";
+const FIBER_LOOP_OUT: &str = "15 \n55 \n";
+
+/// An in-place array reverse over a cell array (`@`/`!`/`cells`, not the sieve's byte array), swapping
+/// each end pair in a half-length `do` loop. Exercises cell-indexed addressing end to end.
+#[test]
+fn forth_array_reverse() {
+    let out = forth(ARRAY_REV);
+    assert_eq!(out, ARRAY_REV_OUT);
+}
+
+const ARRAY_REV: &str = "variable a\n\
+    variable n\n\
+    : adr ( i -- x ) cells a @ + ;\n\
+    : rev ( k -- )\n\
+      n ! here a ! n @ cells allot\n\
+      n @ 0 do i i adr ! loop\n\
+      n @ 2 / 0 do\n\
+        i adr @ n @ 1- i - adr @\n\
+        i adr !\n\
+        n @ 1- i - adr !\n\
+      loop\n\
+      n @ 0 do i adr @ . loop cr ;\n\
+    6 rev 7 rev\n";
+const ARRAY_REV_OUT: &str = "5 4 3 2 1 0 \n6 5 4 3 2 1 0 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
@@ -266,6 +335,9 @@ fn forth_on_the_bytecode_engine() {
         (DEFER, DEFER_OUT),
         (DO_LOOP, DO_LOOP_OUT),
         (RSTACK, RSTACK_OUT),
+        (SIEVE, SIEVE_OUT),
+        (FIBER_LOOP, FIBER_LOOP_OUT),
+        (ARRAY_REV, ARRAY_REV_OUT),
     ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();
