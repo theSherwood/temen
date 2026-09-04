@@ -209,6 +209,12 @@ pub const OP_TCGETATTR: u32 = 54;
 pub const OP_TCSETATTR: u32 = 55;
 /// #797 — `tcgetwinsize(fd, ws_ptr)`: `{ i32 row; i32 col }` (8 bytes), the `TIOCGWINSZ` shape.
 pub const OP_TCGETWINSIZE: u32 = 56;
+/// #797 — `ttyname_r(fd, buf, buflen) -> 0 | -errno`: the controlling terminal's name. Writes the
+/// proto-terminal's fixed name (`/dev/tty\0`) to `buf` when `fd` is the terminal (the same
+/// duplicated-sentinel test `isatty` uses), `-ENOTTY` off it, `-ERANGE` when `buf` is too small.
+/// The `isatty` companion — real programs (`tty(1)`, `getlogin`, ncurses) call it; bash's shim used
+/// to fake `/dev/tty` unconditionally, which is wrong for a non-terminal fd.
+pub const OP_TTYNAME: u32 = 57;
 
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
@@ -1536,6 +1542,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "tcgetattr" => OP_TCGETATTR,
         "tcsetattr" => OP_TCSETATTR,
         "tcgetwinsize" => OP_TCGETWINSIZE,
+        "ttyname" | "ttyname_r" => OP_TTYNAME,
         "dup2" => OP_DUP2,
         "dup" => OP_DUP,
         "fcntl" => OP_FCNTL,
@@ -1847,6 +1854,7 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
         ("tcgetattr", 2),    // 54
         ("tcsetattr", 2),    // 55
         ("tcgetwinsize", 2), // 56
+        ("ttyname", 3),      // 57
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -2284,6 +2292,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_TCGETATTR => st.tcgetattr(args, mem),
                 OP_TCSETATTR => st.tcsetattr(args, mem),
                 OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
+                OP_TTYNAME => st.ttyname(args, mem),
                 OP_DUP2 => Ok(vec![st.dup2(args)]),
                 OP_DUP => Ok(vec![st.dup(args)]),
                 OP_FCNTL => Ok(vec![st.fcntl(args)]),
@@ -3687,6 +3696,27 @@ impl Ctx<'_> {
     fn isatty(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&0);
         i64::from(self.fd_is_terminal(fd))
+    }
+
+    /// [`OP_TTYNAME`] — `ttyname_r(fd, buf, buflen) -> 0 | -errno`: write the proto-terminal's name
+    /// (`/dev/tty\0`) to `buf` when `fd` is the terminal (the same duplicated-sentinel test `isatty`
+    /// gates on), `-ENOTTY` off it, `-ERANGE` when `buf` is too small for the name + NUL. The
+    /// `isatty` companion — unlike the old shim fake (`/dev/tty` for any fd), this is honest for a
+    /// non-terminal fd.
+    fn ttyname(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let buflen = (*args.get(2).ok_or(Trap::Malformed)?).max(0) as u64;
+        if !self.fd_is_terminal(fd) {
+            return Ok(vec![ENOTTY]);
+        }
+        let name = b"/dev/tty\0"; // 9 bytes incl. the NUL
+        if buflen < name.len() as u64 {
+            return Ok(vec![ERANGE]);
+        }
+        mem.write_bytes(ptr, name).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
     }
 
     /// [`OP_FORK`] (#799) — request the return-twice clone through the caller-request door and

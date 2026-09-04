@@ -56,6 +56,7 @@ enum {
   PX_SIGPROCMASK = 40, PX_SIGACTION = 41, PX_SIGALTSTACK = 42, PX_GETPID = 44, PX_SETPGID = 45,
   PX_GETPGID = 46, PX_TCGETPGRP = 47, PX_TCSETPGRP = 48, PX_ISATTY = 49, PX_GETPPID = 50,
   PX_FORK = 51, PX_PIPE_ADOPT = 52, PX_TCGETATTR = 54, PX_TCSETATTR = 55, PX_TCGETWINSIZE = 56,
+  PX_TTYNAME = 57,
 };
 
 static int px_handle_ = -1;
@@ -475,7 +476,12 @@ int gethostname(char *buf, unsigned long n) {
   if (n) buf[i] = 0;
   return 0;
 }
-char *ttyname(int fd) { (void)fd; return "/dev/tty"; }
+char *ttyname(int fd) {
+  static char buf[32];
+  /* #797 — the real personality op: honest NULL for a non-terminal fd (was a blanket "/dev/tty"). */
+  if (px_call_(PX_TTYNAME, fd, (long)buf, sizeof buf, 0) != 0) return 0;
+  return buf;
+}
 int getdtablesize(void) { return 256; }
 long sysconf(int name) {
   if (name == 2) return 100;  /* _SC_CLK_TCK */
