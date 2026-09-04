@@ -86,8 +86,8 @@ fn forth_errors_recover_per_line() {
     );
     assert_eq!(
         out,
-        "3 \nunknown word near bogus\n7 \nstack effect mismatch near ;\n5 \n6 \n\
-         stack underflow near if\n7 \nstack underflow near drop\n8 \n"
+        "3 \nline 2: unknown word near bogus\n7 \nline 4: stack effect mismatch near ;\n5 \n6 \n\
+         line 8: stack underflow near if\n7 \nline 10: stack underflow near drop\n8 \n"
     );
 }
 
@@ -170,6 +170,46 @@ const EXIT: &str = ": g ( n -- n ) dup 10 < if exit then 99 + ;\n\
     e cr\n";
 const EXIT_OUT: &str = "5 119 \n0 16 \n1 \n";
 
+/// `constant` (#1237): `<value> constant name` fixes a value at definition time; each use loads it
+/// back. Implemented as a read-only cell, so the value can come from any computation, and a constant
+/// composes with colon definitions — byte-identical interp == JIT.
+#[test]
+fn forth_constant() {
+    let out = forth(CONSTANT);
+    assert_eq!(out, CONSTANT_OUT);
+}
+
+const CONSTANT: &str = ": sq ( n -- n ) dup * ;\n\
+    10 constant ten\n\
+    ten . cr\n\
+    ten ten + . cr\n\
+    ten sq . cr\n\
+    : area ( r -- a ) sq 3 * ;\n\
+    ten area . cr\n\
+    2 3 + constant five\n\
+    five . cr\n";
+const CONSTANT_OUT: &str = "10 \n20 \n100 \n300 \n5 \n";
+
+/// `defer`/`is` (#1237): a forward-declared word whose behavior is bound (and rebound) later. The
+/// deferred word inlines a load-from-cell + `execute` at its declared effect, so it composes inside
+/// colon definitions and `is` swaps the target at run time — byte-identical interp == JIT.
+#[test]
+fn forth_defer_is() {
+    let out = forth(DEFER);
+    assert_eq!(out, DEFER_OUT);
+}
+
+const DEFER: &str = ": sq ( n -- n ) dup * ;\n\
+    : neg ( n -- n ) 0 swap - ;\n\
+    defer ( n -- n ) op\n\
+    ' sq is op\n\
+    5 op . cr\n\
+    ' neg is op\n\
+    5 op . cr\n\
+    : apply3 ( n -- n ) op op op ;\n\
+    2 apply3 . cr\n";
+const DEFER_OUT: &str = "25 \n-5 \n-2 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
@@ -179,6 +219,8 @@ fn forth_on_the_bytecode_engine() {
         (THREADS, THREADS_OUT),
         (EXECUTE, EXECUTE_OUT),
         (EXIT, EXIT_OUT),
+        (CONSTANT, CONSTANT_OUT),
+        (DEFER, DEFER_OUT),
     ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();

@@ -65,6 +65,6 @@ fn forth_card_reports_errors_and_recovers() {
     assert_eq!(out.status, STATUS_OK);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "3 \nunknown word near bogus\nstack effect mismatch near ;\n3 \n"
+        "3 \nline 2: unknown word near bogus\nline 3: stack effect mismatch near ;\n3 \n"
     );
 }
