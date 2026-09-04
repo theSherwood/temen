@@ -142,6 +142,11 @@ prim +loop 2 0 0 39
 prim i 2 0 0 40
 prim j 2 0 0 41
 prim leave 2 0 0 42
+prim >r 2 0 0 43
+prim r> 2 0 0 44
+prim r@ 2 0 0 45
+prim char 2 0 0 46
+prim [char] 2 0 0 47
 prim + 1 2 1 64
 prim - 1 2 1 65
 prim * 1 2 1 66
@@ -184,6 +189,8 @@ prim cas 9 3 1 0
 : 2dup ( a b -- a b a b ) over over ;
 : 2drop ( a b -- ) drop drop ;
 : -rot ( a b c -- c a b ) rot rot ;
+: 2swap ( a b c d -- c d a b ) >r -rot r> -rot ;
+: 2over ( a b c d -- a b c d a b ) >r >r 2dup r> r> 2swap ;
 : cr ( -- ) 10 emit ;
 : space ( -- ) 32 emit ;
 : spaces ( n -- ) begin dup 0 > while space 1- repeat drop ;
@@ -1972,7 +1979,7 @@ block 14 (ni: i64, no: i64, pay: i64) {
 func (i64) -> () {
 block 0 (id: i64) {
   id32 = i32.wrap_i64 id
-  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34(), 40(id), 40(id), 40(id), 40(id), 40(id), 40(id)] 16()
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34(), 40(id), 40(id), 40(id), 40(id), 40(id), 40(id), 41(), 43(), 46(), 48(), 48()] 16()
   }
 block 1 () {
   call 45 ()
@@ -2265,6 +2272,100 @@ block 40 (id: i64) {
   call 73 (id)
   return
   }
+; >r(43) ( x -- ): move the top of the data stack onto the return stack (RVS).
+block 41 () {
+  one = i64.const 1
+  call 11 (one)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 16() 42()
+  }
+block 42 () {
+  v = call 12 ()
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  eight = i64.const 8
+  off = i64.mul rd eight
+  base = i64.const 65824
+  a = i64.add base off
+  i64.store a v
+  one = i64.const 1
+  rd1 = i64.add rd one
+  i64.store rvp rd1
+  return
+  }
+; r>(44) ( -- x ): move the top of the return stack back onto the data stack.
+block 43 () {
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  z = i64.const 0
+  under = i64.le_s rd z
+  br_if under 44() 45(rd)
+  }
+block 44 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+block 45 (rd: i64) {
+  one = i64.const 1
+  rd1 = i64.sub rd one
+  rvp = i64.const 65816
+  i64.store rvp rd1
+  eight = i64.const 8
+  off = i64.mul rd1 eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; r@(45) ( -- x ): copy the top of the return stack onto the data stack.
+block 46 () {
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  z = i64.const 0
+  under = i64.le_s rd z
+  br_if under 44() 47(rd)
+  }
+block 47 (rd: i64) {
+  one = i64.const 1
+  rd1 = i64.sub rd one
+  eight = i64.const 8
+  off = i64.mul rd1 eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; char(46)/[char](47) ( -- c ): push the first byte of the next token as a literal.
+block 48 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 49() 50()
+  }
+block 49 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 50 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  ch = i64.load8_u t
+  v = call 22 (ch)
+  call 10 (v)
+  return
+  }
 }
 
 ; 45 do_colon(): `: name ( in -- out )` — flush the top-level unit, then open the word's unit.
@@ -2361,7 +2462,11 @@ block 2 () {
   cs = i64.load csp
   z = i64.const 0
   open = i64.ne cs z
-  br_if open 3() 4()
+  rvp = i64.const 65816
+  rv = i64.load rvp
+  rvopen = i64.ne rv z
+  bad = i32.or open rvopen
+  br_if bad 3() 4()
   }
 block 3 () {
   m = i64.const 32832

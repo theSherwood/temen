@@ -232,6 +232,27 @@ const DO_LOOP: &str = ": sumn ( n -- s ) 0 swap 0 do i + loop ;\n\
     downby\n";
 const DO_LOOP_OUT: &str = "10 45 \n42 \n0 0  0 1  1 0  1 1  \n4 \n10 8 6 4 2 0 \n";
 
+/// Return-stack access and a few more primitives (#1237): `>r`/`r>`/`r@` move values to and from the
+/// RVS the counted loops introduced, `char`/`[char]` push a character literal, and `2swap`/`2over`
+/// (defined in the prelude over `>r`/`r>`) permute the top two cell-pairs. Byte-identical interp ==
+/// JIT and on the bytecode engine.
+#[test]
+fn forth_return_stack_and_chars() {
+    let out = forth(RSTACK);
+    assert_eq!(out, RSTACK_OUT);
+}
+
+const RSTACK: &str = ": rot3 ( a b c -- b c a ) >r swap r> swap ;\n\
+    1 2 3 rot3 . . . cr\n\
+    : dupr ( a -- a a ) >r r@ r> ;\n\
+    7 dupr . . cr\n\
+    char A . [char] z . cr\n\
+    1 2 3 4 2swap . . . . cr\n\
+    1 2 3 4 2over . . . . . . cr\n\
+    : rsum3 ( a b c -- s ) >r + r> + ;\n\
+    10 20 30 rsum3 . cr\n";
+const RSTACK_OUT: &str = "1 3 2 \n7 7 \n65 122 \n2 1 4 3 \n2 1 4 3 2 1 \n60 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
@@ -244,6 +265,7 @@ fn forth_on_the_bytecode_engine() {
         (CONSTANT, CONSTANT_OUT),
         (DEFER, DEFER_OUT),
         (DO_LOOP, DO_LOOP_OUT),
+        (RSTACK, RSTACK_OUT),
     ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();
