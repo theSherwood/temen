@@ -6,8 +6,16 @@
 //! `exec`), then hexer `{fs, stdout, exit}` to lower that `.s.nif` into the same store (`.x.nif`), then
 //! the **memfs-I/O linker** `{fs}` (`nim-link-fs`, the child-entry `temen_leng::link_nim_powerbox`) to
 //! link that `.x.nif` into a runnable Temen module (`.temen`). The guest is the compiler driver; every
-//! phase is a sandboxed child; each hands its output to the next through one shared store. The host
-//! asserts both the emitted Leng `.x.nif` **and** the linked `.temen` are **byte-identical** to native.
+//! phase is a sandboxed child; each hands its output to the next through one shared store.
+//!
+//! The link phase is **opt-in** (the guest runs it iff a `link` module is granted), split across two
+//! tests over one guest binary:
+//! - `..._nimsem_then_hexer_chain_byte_exact` — the **per-PR** gate (2-phase, no linker): asserts the
+//!   emitted Leng `.x.nif` is byte-identical to native. Heavy (nimsem's semcheck) but within the job cap.
+//! - `..._nimsem_hexer_link_pipeline_byte_exact` — the full **capstone** (3-phase): asserts the linked
+//!   `.temen` too. `#[ignore]`d per-PR — the 512 MiB link on the debug tree-walker would push this suite
+//!   past the temen-llvm job's 45-min cap; run on demand with `--ignored`. (The link byte-exactness is
+//!   gated per-PR toolchain-free by `temen-run`'s `nim_link_fs_asset.rs`.)
 //!
 //! Reuses **every** committed fixture from steps 9–12 (`nimsem_ce`/`hexer_ce`/`syslib`/`sysvq0asl.p.nif`
 //! /`sysvq0asl.x.nif`/`nim-link-fs`) plus the committed top-level `browser/web/assets/nifler.temen.gz`
@@ -15,9 +23,9 @@
 //! toolchain-gated finale (`nimsem`/`nimony` aren't vendored per-PR, so only the system-module chain is
 //! toolchain-free); `examples/nim_chain_op13.rs` is the host-conductor counterpart this guest-drives.
 //!
-//! Heavy: three carves back to back — nimsem+hexer at 256 MiB, then the linker at 512 MiB (its no-free
-//! bump heap; it reuses the joined phases' region to keep the window at ~1 GiB). nimsem's semcheck
-//! dominates; the test takes a couple of minutes. Gated Linux + rustc + gzip + tar.
+//! Heavy: nimsem+hexer at 256 MiB carves; the (opt-in) linker at a 512 MiB carve reusing the joined
+//! phases' region to keep the window at ~1 GiB. nimsem's semcheck dominates. Gated Linux + rustc + gzip
+//! + tar.
 
 #![cfg(target_os = "linux")]
 
@@ -105,7 +113,9 @@ pub extern "C" fn run() -> i64 {
         let out = __vm_cap_resolve(b"stdout".as_ptr(), 6);
         let ex = __vm_cap_resolve(b"exit".as_ptr(), 4);
         let exe = __vm_cap_resolve(b"exec".as_ptr(), 4);
-        if inst < 0 || nimsem < 0 || hexer < 0 || link < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 { return -1; }
+        // `link` is optional: when the driver isn't granted a `link` module (the lighter per-PR gate),
+        // the guest stops after hexer. When it is (the full-pipeline test), it runs the link phase too.
+        if inst < 0 || nimsem < 0 || hexer < 0 || fs < 0 || out < 0 || ex < 0 || exe < 0 { return -1; }
         let base = core::ptr::addr_of_mut!(POOL) as i64;
 
         // Four grant records {fs, stdout, exit, exec}; hexer's spawn passes grants_n=3 to drop exec.
@@ -146,6 +156,9 @@ pub extern "C" fn run() -> i64 {
         let c2 = __vm_instantiate(inst, hexer as i64, base, 3, 0, carve1, 28, 0);
         let s2 = __vm_join(inst, c2);
         if s2 != 0 { return -20 + s2; }
+
+        // No linker granted → the 2-phase gate stops here (nimsem -> hexer, the .x.nif is asserted).
+        if link < 0 { return s2; }
 
         // Phase 3: link (1-cap {fs}) — the memfs-I/O linker reads the `.x.nif` hexer wrote and writes the
         // linked `.temen` back into the same store. It needs ~512 MiB (its no-free bump heap), so it gets
@@ -233,33 +246,30 @@ fn unpack_syslib(dir: &Path) -> Option<()> {
         .then_some(())
 }
 
-#[test]
-fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
-    let (
-        Some(nimsem_bytes),
-        Some(hexer_bytes),
-        Some(link_bytes),
-        Some(nifler_bytes),
-        Some(expected),
-    ) = (
+/// Drive the guest over the shared memfs, optionally granting the `link` module (`with_link`): without
+/// it the guest stops after hexer (the 2-phase per-PR gate); with it the guest runs the link phase too
+/// (the full pipeline). Returns the produced memfs files, or `None` if a prerequisite is missing (SKIP).
+fn drive_pipeline(with_link: bool) -> Option<Vec<(String, Vec<u8>)>> {
+    let (Some(nimsem_bytes), Some(hexer_bytes), Some(nifler_bytes)) = (
         inflate(NIMSEM_CE_GZ),
         inflate(HEXER_CE_GZ),
-        inflate(NIM_LINK_FS_GZ),
         inflate(NIFLER_TL_GZ),
-        inflate(EXPECTED_XNIF_GZ),
-    )
-    else {
+    ) else {
         eprintln!("note: skipping (gzip unavailable)");
-        return;
+        return None;
     };
 
-    let dir = std::env::temp_dir().join(format!("rust_driver_chain_{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "rust_driver_chain_{}_{}",
+        with_link as u8,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     let libdir = dir.join("lib");
     std::fs::create_dir_all(&libdir).unwrap();
     if unpack_syslib(&libdir).is_none() {
         eprintln!("note: skipping (tar unavailable)");
-        return;
+        return None;
     }
 
     let src = dir.join("g.rs");
@@ -267,7 +277,7 @@ fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
     std::fs::write(&src, GUEST).unwrap();
     if !rustc_emit_ll(&src, &ll) {
         eprintln!("note: skipping (rustc unavailable)");
-        return;
+        return None;
     }
     let t = temen_llvm::translate_ll_path(&ll).expect("translate chain guest");
     temen_verify::verify_module(&t.module).expect("driver verifies");
@@ -318,15 +328,12 @@ fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
     temen_verify::verify_module(&nimsem).expect("nimsem_ce verifies");
     let hexer = temen_encode::decode_module(&hexer_bytes).expect("decode hexer_ce");
     temen_verify::verify_module(&hexer).expect("hexer_ce verifies");
-    let link = temen_encode::decode_module(&link_bytes).expect("decode nim-link-fs");
-    temen_verify::verify_module(&link).expect("nim-link-fs verifies");
 
     let mut host = Host::new();
     let win = 1u64 << t.module.memory.as_ref().expect("driver window").size_log2;
     let inst = host.grant_instantiator(0, win);
     let nimsem_h = host.grant_module(&nimsem);
     let hexer_h = host.grant_module(&hexer);
-    let link_h = host.grant_module(&link);
     let fs_init: HostProc = (*factory)();
     let fs_fork: HostProcFork = {
         let f = Arc::clone(&factory);
@@ -339,40 +346,80 @@ fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
     host.register_cap_name("inst", inst);
     host.register_cap_name("nimsem", nimsem_h);
     host.register_cap_name("hexer", hexer_h);
-    host.register_cap_name("link", link_h);
     host.register_cap_name("fs", fs_h);
     host.register_cap_name("stdout", stdout_h);
     host.register_cap_name("exit", exit_h);
     host.register_cap_name("exec", exec_h);
+    // Only the full-pipeline run grants the linker (the guest runs the link phase iff `link` resolves).
+    if with_link {
+        let link_bytes = inflate(NIM_LINK_FS_GZ).expect("inflate nim-link-fs");
+        let link = temen_encode::decode_module(&link_bytes).expect("decode nim-link-fs");
+        temen_verify::verify_module(&link).expect("nim-link-fs verifies");
+        let link_h = host.grant_module(&link);
+        host.register_cap_name("link", link_h);
+    }
 
     let mut fuel = 3_000_000_000_000u64;
     let r = run_with_host(&t.module, entry, &[Value::I64(sp)], &mut fuel, &mut host);
     assert!(
         matches!(r.as_deref(), Ok([Value::I64(0)]) | Ok([Value::I32(0)])),
-        "the guest-driven pipeline (nimsem -> hexer -> link) joined with status 0: {r:?}"
+        "the guest-driven pipeline joined with status 0 (with_link={with_link}): {r:?}"
     );
+    Some(handle.seed().0)
+}
 
-    let (produced, _) = handle.seed();
-    let get = |k: &str| -> Option<Vec<u8>> {
+/// The per-PR gate (2-phase, no linker granted): one guest drives nimsem -> hexer over a shared memfs,
+/// and the emitted Leng `.x.nif` is byte-identical to the committed expected. Heavy (nimsem's semcheck),
+/// but within the temen-llvm job budget — the link phase (another ~512 MiB run) is the `#[ignore]`d test
+/// below so it does not push the suite over the job timeout.
+#[test]
+fn rust_driver_guest_drives_nimsem_then_hexer_chain_byte_exact() {
+    let Some(produced) = drive_pipeline(false) else {
+        return;
+    };
+    let get = |k: &str| {
         produced
             .iter()
-            .find(|(name, _)| name == k)
+            .find(|(n, _)| n == k)
             .map(|(_, v)| v.clone())
     };
-    let x_nif = get("nimcache/sysvq0asl.x.nif").expect("the pipeline produced no sysvq0asl.x.nif");
-    // Confirm each phase's intermediate really flowed through the shared store to the next.
+    let x_nif = get("nimcache/sysvq0asl.x.nif").expect("the chain produced no sysvq0asl.x.nif");
     assert!(
         get("nimcache/sysvq0asl.s.nif").is_some(),
         "nimsem's .s.nif must be present in the shared store the guest handed to hexer"
     );
+    let expected = inflate(EXPECTED_XNIF_GZ).expect("inflate expected .x.nif");
     assert_eq!(
         x_nif, expected,
         "the guest-driven nimsem->hexer lowering's Leng must be byte-identical to the committed expected"
     );
+}
 
-    // The capstone: the link phase read that `.x.nif` and wrote the linked `.temen` back into the same
-    // store — the whole compile pipeline (sema -> lower -> link) driven by one guest. It must be
-    // byte-identical to native `link_nim_powerbox` over the same Leng (the `nim_link_fs_asset.rs` oracle).
+/// The full compile-pipeline capstone (3-phase): the same guest, now granted the linker, drives
+/// nimsem -> hexer -> link — and the linked `.temen` it writes is byte-identical to native
+/// `link_nim_powerbox`. `#[ignore]` per-PR: the link phase runs the whole 512 MiB linker on the debug
+/// tree-walker (~5+ min), which pushes this (already heavy) temen-llvm suite past its 45-min job cap.
+/// The link byte-exactness is gated per-PR toolchain-free by `temen-run`'s `nim_link_fs_asset.rs`
+/// decode+verify test; run this end-to-end capstone on demand with `--ignored` (fast in release).
+#[test]
+#[ignore = "heavy (whole 512 MiB link on the debug tree-walker) — would exceed the temen-llvm job cap; run with --ignored"]
+fn rust_driver_guest_drives_nimsem_hexer_link_pipeline_byte_exact() {
+    let Some(produced) = drive_pipeline(true) else {
+        return;
+    };
+    let get = |k: &str| {
+        produced
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.clone())
+    };
+    let x_nif = get("nimcache/sysvq0asl.x.nif").expect("the pipeline produced no sysvq0asl.x.nif");
+    let expected = inflate(EXPECTED_XNIF_GZ).expect("inflate expected .x.nif");
+    assert_eq!(
+        x_nif, expected,
+        "the .x.nif must match the committed expected"
+    );
+
     let produced_temen =
         get("nimcache/sysvq0asl.temen").expect("the link phase produced no sysvq0asl.temen");
     let src = String::from_utf8(x_nif).expect("x.nif is UTF-8");
