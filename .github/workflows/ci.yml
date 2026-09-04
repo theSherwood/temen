@@ -1018,6 +1018,12 @@ jobs:
           # output prints) and `cat` bounces back to `[1]+ Stopped`. SKIPs with the batch when
           # bash.temen/bin_cat.temen/bin_echo.temen is absent.
           node browser-bash-bg-resume-test.mjs
+          # Interactive ^C of a foreground job (#1262): a foreground `cat` blocks reading the terminal;
+          # ^C (VINTR→SIGINT at the fg group) TERMINATES it (default action) and the shell returns to a
+          # usable prompt — `$?` is 130 (128+SIGINT) and a following command runs. Before #1262 the coop
+          # pump slept through the terminate of a parked twin (no `set_kill` bell ring) and deadlocked.
+          # SKIPs with the batch when bash.temen/bin_cat.temen is absent.
+          node browser-bash-ctrl-c-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
