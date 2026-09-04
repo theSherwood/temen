@@ -632,6 +632,10 @@ block 0 (sp2: i64, arg2: i64) {
 : sum-to ( n -- s ) 0 swap begin dup 0 > while tuck + swap 1- repeat drop ;
 100 sum-to . cr
 
+\ counted loops: do/loop, i is the index; the accumulator stays on the data stack
+: sumsq ( n -- s ) 0 swap 0 do i i * + loop ;
+5 sumsq . cr
+
 \ memory: variables, strings, the heap
 variable x   42 x !   x @ 1+ x !   x @ . cr
 ." hello, forth" cr

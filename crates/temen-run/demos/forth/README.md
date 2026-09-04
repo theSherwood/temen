@@ -21,6 +21,10 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   permute the compile-time virtual stack and emit nothing.
 - **Control flow:** `if … else … then`, `begin … until`, `begin … again`, `begin … while … repeat`.
   Both arms / every loop iteration must leave the same stack depth. `recurse` calls the word itself.
+- **Counted loops:** `limit start do … loop`, `… +loop` (a runtime step), `i` / `j` (the current and
+  next-outer index), `leave` (early exit). The index and limit live on a **return stack** carried
+  through every branch as block params, so the data stack stays clean — an accumulator below the loop
+  is reachable (`: sum ( n -- s ) 0 swap 0 do i + loop ;`). The body must be stack-neutral.
 - **Top level.** Each line is compiled as an anonymous unit, `Jit.install`ed, called, and
   uninstalled. Values left on the stack persist in a REPL stack between lines.
 - **Words:** `+ - * / mod and or xor lshift rshift = <> < u< <= > >= 0= negate invert 1+ 1- abs
@@ -47,10 +51,8 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   `wait ( addr expected -- status )` / `notify ( addr n -- woken )` are the futex; atomics:
   `atomic@ ( addr -- x )`, `atomic! ( x addr -- )`, `atomic+! ( n addr -- old )`,
   `atomic-xchg ( n addr -- old )`, `cas ( expected new addr -- old )`.
-- **Not yet:** counted loops (`do`/`loop`/`+loop`/`i`) — the loop-carried index needs a return-stack
-  region threaded through every branch, tracked as a focused follow-up on #1237. Permanently out (they
-  need a runtime stack, against the static-stack design): dynamic stack effects `?dup`/`pick` and
-  untyped (runtime-arity) `execute`. Also absent: floats.
+- **Permanently out** (they need a runtime data stack, against the static-stack design): dynamic
+  stack effects `?dup`/`pick` and untyped (runtime-arity) `execute`. Also absent: floats.
 
 ## How it works
 
