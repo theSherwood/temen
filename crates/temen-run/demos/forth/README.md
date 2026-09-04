@@ -25,6 +25,9 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   next-outer index), `leave` (early exit). The index and limit live on a **return stack** carried
   through every branch as block params, so the data stack stays clean — an accumulator below the loop
   is reachable (`: sum ( n -- s ) 0 swap 0 do i + loop ;`). The body must be stack-neutral.
+- **Return stack:** `>r ( x -- )`, `r> ( -- x )`, `r@ ( -- x )` move cells to and from that same
+  return stack (which must be balanced at `;`). `2swap` / `2over` are defined over them in the prelude.
+- **Character literals:** `char <name>` / `[char] <name>` push the first byte of the next token.
 - **Top level.** Each line is compiled as an anonymous unit, `Jit.install`ed, called, and
   uninstalled. Values left on the stack persist in a REPL stack between lines.
 - **Words:** `+ - * / mod and or xor lshift rshift = <> < u< <= > >= 0= negate invert 1+ 1- abs
