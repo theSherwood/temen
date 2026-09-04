@@ -116,37 +116,42 @@ fn guest_frame_hashes_match_native() {
         "the swarm animates (frames differ)"
     );
 
-    // Guest: translate, then run `_start` on each backend with the ROM on stdin.
+    // Guest: translate, then run `_start` on each backend with the ROM on stdin — and again with the
+    // demo's Uxntal SOURCE on stdin, which the guest assembles itself (uxnasm_core.c): the in-sandbox
+    // assembler + CPU + devices must reproduce the native ROM run's frames exactly.
     let t = temen_llvm::translate_ll_path(&ll).expect("translate uxn_diff.c");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
-    let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
-        },
-        stdin: rom,
-        memory_size_log2: None,
-        args: vec![],
-        env: vec![],
-        ..RunConfig::default()
-    };
-    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
-        let run = inst
-            .run(backend, &config)
-            .unwrap_or_else(|e| panic!("{backend:?} run failed: {e}"));
-        match run.outcome {
-            Outcome::Returned(_) | Outcome::Exited(0) => {}
-            other => panic!("{backend:?}: unexpected outcome {other:?}"),
+    let tal = std::fs::read(demo_dir().join("demo.tal")).expect("demo.tal");
+    for (label, stdin) in [("rom", rom), ("tal", tal)] {
+        let config = RunConfig {
+            limits: Limits {
+                fuel: None,
+                deadline: None,
+                max_fibers: 0,
+                max_vcpus: 0,
+            },
+            stdin,
+            memory_size_log2: None,
+            args: vec![],
+            env: vec![],
+            ..RunConfig::default()
+        };
+        for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+            let run = inst
+                .run(backend, &config)
+                .unwrap_or_else(|e| panic!("{backend:?}/{label} run failed: {e}"));
+            match run.outcome {
+                Outcome::Returned(_) | Outcome::Exited(0) => {}
+                other => panic!("{backend:?}/{label}: unexpected outcome {other:?}"),
+            }
+            let guest = String::from_utf8(run.stdout).unwrap();
+            assert_eq!(
+                guest, native,
+                "{backend:?}/{label}: frame hashes differ from native"
+            );
         }
-        let guest = String::from_utf8(run.stdout).unwrap();
-        assert_eq!(
-            guest, native,
-            "{backend:?}: frame hashes differ from native"
-        );
     }
-    eprintln!("uxn_diff: {FRAMES} frames byte-identical to native on TreeWalk/Bytecode/Jit");
+    eprintln!("uxn_diff: {FRAMES} frames byte-identical to native on TreeWalk/Bytecode/Jit, from the ROM and from the source");
 }
 
 /// The CPU against the **golden opcode corpus** (`demos/uxn/corpus/opcodes.corpus`): 303 programs

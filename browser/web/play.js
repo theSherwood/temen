@@ -778,6 +778,79 @@ variable arr   variable lim
       'run it instead of the demo (it is served to the guest as boot.rom). A frame-hash differential pins the ' +
       'guest byte-exact to a native build of the same C. Click Stop to end.',
   },
+  'Uxntal (write & run — assembled in the sandbox)': {
+    kind: 'reactor',
+    editable: true,
+    lang: 'tal',
+    url: './assets/uxn.temen',
+    fileName: 'boot.tal', // the editor text is served to the guest under this name; it assembles it at _start
+    mouse: true,
+    jit: true,
+    mode: 'io',
+    desc: 'Write Uxntal (the Uxn assembly language) on the left and click Run: the same uxn.temen guest as ' +
+      'the Uxn card receives your source as boot.tal through the `fs` capability, assembles it **inside the ' +
+      'sandbox** with the in-tree uxnasm (compiled into the guest), and runs the ROM — the Screen vector per ' +
+      'frame, the Controller and Mouse devices fed from the keyboard and the canvas. An assembly error ' +
+      'appears in the stdout pane with its line. The starter is a paint program: drag with the left button ' +
+      'to draw, 1–3 pick a color, Space clears. Console/write output shows up in stdout too.',
+    src: `( paint.tal — draw with the mouse. Keys 1-3 pick a color, Space clears. )
+
+|00 @System &vector $2 &expansion $2 &wst $1 &rst $1 &metadata $2 &r $2 &g $2 &b $2 &debug $1 &state $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+|80 @Controller &vector $2 &button $1 &key $1
+|90 @Mouse &vector $2 &x $2 &y $2 &state $1 &pad $3 &scrollx $2 &scrolly $2
+
+|0000
+@color $1
+
+|0100 @on-reset ( -> )
+  #0180 .Screen/width DEO2
+  #00f0 .Screen/height DEO2
+  ( palette: 0 ink-dark, 1 white, 2 orange, 3 sky )
+  #1ff3 .System/r DEO2
+  #1f5b .System/g DEO2
+  #1f3f .System/b DEO2
+  #02 .color STZ
+  ;on-mouse .Mouse/vector DEO2
+  ;on-key .Controller/vector DEO2
+  ( say hello on the console — it shows in the stdout pane )
+  ;hello print
+BRK
+
+@on-mouse ( -> )
+  ( left button held: stamp the brush at the pointer, on the background layer )
+  .Mouse/state DEI #01 AND #00 EQU ?{
+    .Mouse/x DEI2 #0003 SUB2 .Screen/x DEO2
+    .Mouse/y DEI2 #0003 SUB2 .Screen/y DEO2
+    ;brush .Screen/addr DEO2
+    .color LDZ .Screen/sprite DEO }
+BRK
+
+@on-key ( -> )
+  .Controller/key DEI
+  ( Space: fill the background with color 0 from the origin )
+  DUP #20 EQU #00 EQU ?{
+    #0000 .Screen/x DEO2
+    #0000 .Screen/y DEO2
+    #80 .Screen/pixel DEO }
+  ( '1'..'3': pick a color )
+  #31 SUB DUP #03 LTH #00 EQU ?{ POP BRK }
+  INC .color STZ
+BRK
+
+@print ( str* -- )
+  &loop
+    LDAk #18 DEO
+    INC2 LDAk ?&loop
+  POP2
+JMP2r
+
+@hello "Uxntal, 20 "assembled 20 "in 20 "the 20 "sandbox. 0a 00
+
+@brush ( 1bpp, a round dot )
+  3c7e ffff ffff 7e3c
+`,
+  },
   'Lua (5.4.7 — write & run)': {
     kind: 'module',
     warm: true, // issue #805: the two-phase `lua_snapshot` driver (warmup + eval_run) — init the Lua
@@ -3008,7 +3081,10 @@ async function runReactor(c) {
   // needs a served file (Doom reads its WAD at _start) is opened with temen_onramp_open_fs, which grants
   // the `fs` capability over the fetched blob; every other reactor guest uses plain temen_onramp_open.
   let file = null; // { name, data } served to the guest through the `fs` capability, if the card has one
-  if (c.userFile) {
+  if (ex.editable) {
+    // An editable reactor (the Uxntal card) serves the editor text as its file — the guest assembles it.
+    file = { name: ex.fileName, data: new TextEncoder().encode(c.editor.getValue()) };
+  } else if (c.userFile) {
     file = c.userFile; // a .rom the user picked / dropped (`pickFile` cards) — served under the card's name
     logTo(c, `serving your ${c.userFileLabel} (${file.data.length}B) as ${file.name}`);
   } else if (ex.file) {
@@ -3063,6 +3139,12 @@ async function runReactor(c) {
   const loop = () => {
     const status = jitReactor ? jitReactor.frame() : eng.ex.temen_onramp_frame();
     presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
+    // The tick's stdout (a guest's console output; the Uxntal card's assembly error) — appended live.
+    const outLen = eng.ex.temen_stdout_len();
+    if (outLen > 0) {
+      const p = eng.ex.temen_stdout_ptr();
+      c.el.stdout.textContent += new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + outLen));
+    }
     frames++;
     if (reactorRun) reactorRun.frames = frames;
     fpsFrames++;
@@ -3180,7 +3262,8 @@ async function proveParity(c) {
   let bytes, file = null;
   try {
     bytes = await fetchModule(ex.url);
-    if (c.userFile) file = c.userFile;
+    if (ex.editable) file = { name: ex.fileName, data: new TextEncoder().encode(c.editor.getValue()) };
+    else if (c.userFile) file = c.userFile;
     else if (ex.file) file = { name: ex.fileName, data: await fetchModule(ex.file) };
   } catch (e) {
     setState(c, 'error', `${e.message}`);
