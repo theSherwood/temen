@@ -110,6 +110,19 @@ pub mod cap_id {
     /// the child rides the same §12 executor). Holding the handle is the authority to nest (D19: a
     /// child can only get what the parent sub-allocates).
     pub const INSTANTIATOR: u32 = 6;
+    /// `ModuleLoader` — the authority to **promote guest bytes to a spawnable `Module`** (§14 slice:
+    /// run-in-guest). op 0 `from_bytes(ptr, len) -> module_handle | -errno` reads a wire-encoded module
+    /// from `[ptr, ptr+len)` in the holder's window, has the host **decode + verify** it (the same
+    /// trusted floor as a host-granted module — the verification *is* the boundary, §2a; the decode is
+    /// the copy, so no wire byte is ever executed and the result never aliases the guest's mutable
+    /// buffer), and mints a `MODULE` handle (id 8) the holder can then spawn via the `Instantiator`'s
+    /// module ops. Fail-closed: a malformed or unverifiable module is `-EINVAL`, nothing is minted. It
+    /// is the missing input side of the nesting primitive — a guest that *produces* a module (a linker,
+    /// a JIT-driver) can now run it, without the host pre-granting every module it might build. Emitting
+    /// bytes confers no new authority over the host: the minted module can only be *spawned* into a carve
+    /// of the holder's own window (which it already controls), and the verifier gates it unconditionally.
+    /// Host-granted (non-ambient), like `exec`/`fs`.
+    pub const MODULE_LOADER: u32 = 7;
     /// `Module` — a host-granted, host-**verified** module a guest may instantiate (§14). The handle
     /// confers only the authority to pass it to the `Instantiator`'s module ops (5/6/7 —
     /// `instantiate_module` / `spawn_coroutine_module` / `spawn_demand_coroutine_module`), which
