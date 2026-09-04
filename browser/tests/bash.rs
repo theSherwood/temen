@@ -50,6 +50,13 @@ fn load_coreutils() -> Vec<(&'static str, temen_ir::Module, u8)> {
             include_bytes!("fixtures/bin_basename.temen"),
         ),
         ("/bin/dirname", include_bytes!("fixtures/bin_dirname.temen")),
+        ("/bin/tee", include_bytes!("fixtures/bin_tee.temen")),
+        ("/bin/touch", include_bytes!("fixtures/bin_touch.temen")),
+        ("/bin/mkdir", include_bytes!("fixtures/bin_mkdir.temen")),
+        ("/bin/rmdir", include_bytes!("fixtures/bin_rmdir.temen")),
+        ("/bin/rm", include_bytes!("fixtures/bin_rm.temen")),
+        ("/bin/cp", include_bytes!("fixtures/bin_cp.temen")),
+        ("/bin/mv", include_bytes!("fixtures/bin_mv.temen")),
     ];
     raw.iter()
         .map(|(path, bytes)| {
@@ -304,6 +311,39 @@ fn bash_dash_c_tier1_tier2_coreutils() {
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         "4\n5\nz y x\nc\nb\na\n     1\tp\n     2\tq\nab\ncd\nef\nbin\n/usr/local\n"
+    );
+}
+
+/// #801 — the **tier-3 filesystem writers** through real bash: `tee` writes a file (and echoes),
+/// `cp`/`mv` move its bytes, `cat` reads each result back, `touch` makes an empty file, `mkdir`/`rmdir`
+/// create and drop a directory — all exec'd coreutils mutating bash's shared memfs. Proves the write
+/// surface (`open(O_CREAT)` + `file_write`, `unlink`, `rename`, `mkdir`, `rmdir`) is reachable from a
+/// real shell in the browser, not just filter pipelines.
+#[test]
+fn bash_dash_c_fs_writers() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_fs_writers — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    // tee echoes "one" and writes it to `a`; cp→b, mv b→c, cat each; touch an empty `t` (cat prints
+    // nothing); rm/mkdir/rmdir mutate silently; the builtin `echo done` ends the run via exit_shell.
+    let script = "echo one | tee a; cp a b; cat b; mv b c; cat c; \
+                  touch t; cat t; rm a; mkdir d; rmdir d; echo done";
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", script.as_bytes()], b"", &bin_refs);
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "one\none\none\ndone\n"
     );
 }
 
