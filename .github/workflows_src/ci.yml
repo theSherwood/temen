@@ -732,7 +732,7 @@ jobs:
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
-            --test setjmp --test pg_snapshot_roundtrip
+            --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)

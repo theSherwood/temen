@@ -39,29 +39,50 @@ const res = await page.evaluate(async () => {
     for (let i = 0; i < px.length; i++) { hsh ^= px[i]; hsh = Math.imul(hsh, 0x01000193) >>> 0; }
     return `${w}x${h}:${(hsh >>> 0).toString(16)}`;
   };
-  const runInterp = (bytes) => {
+  // `file` = { name, data } served to the guest through the `fs` capability (the Uxn ROM), or null.
+  const runInterp = (bytes, file) => {
     const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
-    const opened = eng.ex.temen_onramp_open(p, bytes.length); eng.ex.temen_dealloc(p, bytes.length);
+    let opened;
+    if (file) {
+      const nameBytes = new TextEncoder().encode(file.name);
+      const nameP = eng.ex.temen_alloc(nameBytes.length);
+      const dataP = eng.ex.temen_alloc(file.data.length);
+      const view = new Uint8Array(eng.memory.buffer);
+      view.set(nameBytes, nameP);
+      view.set(file.data, dataP);
+      opened = eng.ex.temen_onramp_open_fs(p, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
+      eng.ex.temen_dealloc(nameP, nameBytes.length);
+      eng.ex.temen_dealloc(dataP, file.data.length);
+    } else {
+      opened = eng.ex.temen_onramp_open(p, bytes.length);
+    }
+    eng.ex.temen_dealloc(p, bytes.length);
     if (opened !== 0) throw new Error(`interp open failed: ${opened}`);
     const hs = [];
     for (let i = 0; i < NFRAMES; i++) { if (eng.ex.temen_onramp_frame() !== 0) break; hs.push(hashFB()); }
     eng.ex.temen_onramp_close();
     return hs;
   };
-  const runJit = async (bytes) => {
-    const r = await openJitReactor(eng.ex, eng.memory, bytes, 'doom1.wad', null); // throws if tick isn't emittable
+  const runJit = async (bytes, file) => {
+    // throws if tick isn't emittable
+    const r = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
     const hs = [];
     for (let i = 0; i < NFRAMES; i++) { if (r.frame() !== 0) break; hs.push(hashFB()); }
     r.close();
     return hs;
   };
   const out = {};
-  for (const name of ['bounce', 'life', 'mandelzoom']) {
+  // uxn: the Uxn VM + Varvara compositor as one tick(), over its demo ROM served as boot.rom (fs).
+  const FILES = { uxn: { url: './assets/uxn_demo.rom', name: 'boot.rom' } };
+  for (const name of ['bounce', 'life', 'mandelzoom', 'uxn']) {
     const bytes = new Uint8Array(await (await fetch(`./assets/${name}.temen`)).arrayBuffer());
+    const file = FILES[name]
+      ? { name: FILES[name].name, data: new Uint8Array(await (await fetch(FILES[name].url)).arrayBuffer()) }
+      : null;
     let emitted = true, interpH = [], jitH = [];
     try {
-      interpH = runInterp(bytes);
-      jitH = await runJit(bytes);
+      interpH = runInterp(bytes, file);
+      jitH = await runJit(bytes, file);
     } catch (e) {
       out[name] = { error: e.message };
       continue;
@@ -76,14 +97,53 @@ const res = await page.evaluate(async () => {
       firstMismatch: mismatch,
     };
   }
+  // The `mouse` capability on both tiers: a click over the Uxn guest (kind 0, payload
+  // (buttons << 24) | (x << 12) | y) must change the next frame on the interpreter AND on the wasm-JIT
+  // tier, and the two post-click frames must still agree — the cap-call outlining carries the new
+  // waist exactly like `keyboard`.
+  {
+    const bytes = new Uint8Array(await (await fetch('./assets/uxn.temen')).arrayBuffer());
+    const file = { name: 'boot.rom', data: new Uint8Array(await (await fetch(FILES.uxn.url)).arrayBuffer()) };
+    const click = [(1 << 24) | (200 << 12) | 100, (200 << 12) | 100];
+    const withClick = async (tier) => {
+      let r = null;
+      if (tier === 'jit') r = await openJitReactor(eng.ex, eng.memory, bytes, file.name, file.data);
+      else {
+        const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
+        const nameBytes = new TextEncoder().encode(file.name);
+        const nameP = eng.ex.temen_alloc(nameBytes.length), dataP = eng.ex.temen_alloc(file.data.length);
+        const view = new Uint8Array(eng.memory.buffer); view.set(nameBytes, nameP); view.set(file.data, dataP);
+        const opened = eng.ex.temen_onramp_open_fs(p, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
+        eng.ex.temen_dealloc(p, bytes.length); eng.ex.temen_dealloc(nameP, nameBytes.length); eng.ex.temen_dealloc(dataP, file.data.length);
+        if (opened !== 0) throw new Error(`interp open failed: ${opened}`);
+      }
+      const frame = () => (r ? r.frame() : eng.ex.temen_onramp_frame());
+      const push = (kind, payload) => (r ? eng.ex.temen_onramp_jit_mouse(kind, payload) : eng.ex.temen_onramp_mouse(kind, payload));
+      frame(); frame();
+      const before = hashFB();
+      push(0, click[0]); push(0, click[1]);
+      frame();
+      const after = hashFB();
+      if (r) r.close(); else eng.ex.temen_onramp_close();
+      return { before, after };
+    };
+    try {
+      const i = await withClick('interp'), j = await withClick('jit');
+      out.uxnMouse = { changed: i.before !== i.after && j.before !== j.after, tiersAgree: i.after === j.after, i, j };
+    } catch (e) {
+      out.uxnMouse = { error: e.message };
+    }
+  }
   return out;
 });
 console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 await browser.close(); server.close();
 
-const demos = ['bounce', 'life', 'mandelzoom'];
-const ok = errors.length === 0 && demos.every((n) => res[n] && res[n].identical);
+const demos = ['bounce', 'life', 'mandelzoom', 'uxn'];
+const mouseOk = !!(res.uxnMouse && res.uxnMouse.changed && res.uxnMouse.tiersAgree);
+console.log(`  uxn mouse: ${res.uxnMouse && res.uxnMouse.error ? `ERROR ${res.uxnMouse.error}` : `click changes the frame on both tiers=${mouseOk}`}`);
+const ok = errors.length === 0 && mouseOk && demos.every((n) => res[n] && res[n].identical);
 for (const n of demos) {
   const r = res[n] || {};
   console.log(`  ${n}: ${r.error ? `ERROR ${r.error}` : `${r.frames} frames, JIT≡interp=${r.identical}`}`);

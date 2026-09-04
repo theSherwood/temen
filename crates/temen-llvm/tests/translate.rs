@@ -12911,9 +12911,9 @@ fn demo_bash_translates_and_verifies() {
         "{ true; }; echo $?; { false; }; echo $?; ! false; echo $?; true && echo a || echo b",
         // Round 6 — an exotic-surface language-differential survey (a 25-construct probe found ALL of
         // these already byte-identical to native; pinned here as regression gates, no temen bug found).
-        // The kill-based async trap (`kill -USR1 $$`) matches native on the tree-walker; on the coop and
-        // parallel tiers async delivery into a running C handler is interp-only (#796 L2), so it prints
-        // less there — coherently between the two, which is what the coop==parallel assertion below checks.
+        // The kill-based async trap (`kill -USR1 $$`) matches native on ALL three tiers: async delivery
+        // into a running C handler is now on the bytecode engine too (#1146, the #796 L2 safepoint
+        // redirect on both drivers), which the coop==native / parallel==native assertions below check.
         // getopts: combined flags, optarg, `--` terminator, silent-mode missing-arg, invalid option.
         "set -- -ab -c val x y; while getopts 'abc:' o; do echo \"$o=${OPTARG:-}\"; done; echo \"rest=${*:$OPTIND}\"",
         "set -- -x -- -y; while getopts 'xy' o; do echo \"$o\"; done; shift $((OPTIND-1)); echo \"rest=$*\"",
@@ -12983,32 +12983,43 @@ fn demo_bash_translates_and_verifies() {
             "bash -c {script:?}: stdout differs from the oracle"
         );
 
-        // ▶ #748 — the **dual-driver pin**: the same script on the cooperative bytecode tier and
-        // on `drive_parallel` (every bash fork twin a real OS thread, waitpid a condvar block,
-        // pipes level-triggered polls) must agree WITH EACH OTHER on status + stdout. The two
-        // drivers are each other's oracle here, not native: async signal delivery into a running
-        // C handler is an interpreter-only tier (#796 L2), so the kill-based trap scripts print
-        // less on the bytecode tier under BOTH drivers, coherently.
+        // ▶ #1146 / #748 — the **bytecode tiers now match NATIVE too**. With async signal delivery
+        // ported to the bytecode engine (the #796 L2 safepoint redirect on both the cooperative
+        // browser tier and `drive_parallel`), the kill-based trap scripts run their C handlers on
+        // both bytecode drivers exactly as on the tree-walker — so native is the single oracle for
+        // all three engines here. (Previously async delivery was interpreter-only, so these printed
+        // less on the bytecode tier and were only pinned coop==parallel; #1146 closed that gap.)
+        let native_code = native.status.code().unwrap_or(-1);
+        let native_out = String::from_utf8_lossy(&native.stdout);
         let (cap_c, posix_c) = temen_run::posix::posix_cap(0, 0, Vec::new());
         let coop = inst
             .run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap_c)])
             .unwrap_or_else(|e| panic!("bash -c {script:?} (coop bytecode) failed: {e}"));
+        assert_eq!(
+            bash_exit_code(&coop.outcome),
+            native_code,
+            "bash -c {script:?}: coop bytecode exit differs from the oracle (outcome {:?})",
+            coop.outcome
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&posix_c.stdout()),
+            native_out,
+            "bash -c {script:?}: coop bytecode stdout differs from the oracle"
+        );
         let (cap_p, posix_p) = temen_run::posix::posix_cap(0, 0, Vec::new());
         let par = inst
             .run_with_caps_parallel(&config, &[("posix", cap_p)])
             .unwrap_or_else(|e| panic!("bash -c {script:?} (parallel) failed: {e}"));
         assert_eq!(
-            bash_exit_code(&coop.outcome),
             bash_exit_code(&par.outcome),
-            "bash -c {script:?}: coop and parallel drivers disagree on the exit status \
-             (coop {:?}, parallel {:?})",
-            coop.outcome,
+            native_code,
+            "bash -c {script:?}: parallel driver exit differs from the oracle (outcome {:?})",
             par.outcome
         );
         assert_eq!(
-            String::from_utf8_lossy(&posix_c.stdout()),
             String::from_utf8_lossy(&posix_p.stdout()),
-            "bash -c {script:?}: coop and parallel drivers disagree on stdout"
+            native_out,
+            "bash -c {script:?}: parallel driver stdout differs from the oracle"
         );
     }
 
@@ -13229,15 +13240,16 @@ fn demo_bash_translates_and_verifies() {
     // keystrokes land with no dedicated wake; on the cooperative driver the all-parked pump
     // BLOCKS on the #1122 external-wake doorbell (armed by the terminal grant) and the feed's
     // pipe-wake ring re-admits it — pre-doorbell this session was the pump's deadlock
-    // (`ThreadFault`). On both, the `^C` is fed but its delivery is a **race** against bash
-    // re-parking in its terminal read: async delivery into a parked read is an interpreter-only
-    // tier (#796 L2 / #1146), so if the `^C` lands before the prompt read is parked it is absorbed
-    // at the feed-time line discipline and `$?` stays 0 (`rc=0`); if it lands into the parked read
-    // it aborts the line and `$?` becomes 130 (`rc=130`, the tree-walker's deterministic result).
-    // Both outcomes are legitimate until #1146 makes bytecode-tier delivery deterministic, so the
-    // assertion below accepts either — pinning one polarity made this the flaky #1252 (the native
-    // twin of the browser-card #1223). The session must still fully work around the race: prompt
-    // loop, the typed command runs, `^D` exits with the farewell.
+    // (`ThreadFault`). Async delivery of the `^C` into bash's parked terminal read now works on the
+    // bytecode tier (#1146: the #796 L2 safepoint redirect + the slice-2a/parallel interruptible-park
+    // EINTR sweep), and the interactive `^C`→`rc=130` headline is proven DETERMINISTICALLY in
+    // Chromium (#1162, 3/3 stable over the real `bash.temen`). This NATIVE harness, though, feeds via
+    // a sleep-timed thread, so whether the `^C` lands before or after bash re-parks its prompt read
+    // is a genuine feed-timing race — absorbed at the line discipline (`rc=0`) or delivered into the
+    // parked read (`rc=130`) are both legitimate outcomes here; pinning one polarity made this the
+    // flaky #1252, so the assertion below stays tolerant (the browser E2E is the deterministic proof).
+    // The session must still fully work around the race: prompt loop, the typed command runs, `^D`
+    // exits with the farewell.
     for parallel in [false, true] {
         let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
         let feeder = {

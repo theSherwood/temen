@@ -1922,6 +1922,54 @@ int main(void) {
     );
 }
 
+/// #973 — **`waitpid(-pgid)` is group-scoped on the personality: it never reaps a child in another
+/// group.** The scoping dual of the grouping test above, ported from the retired core `__wait(-pgid)`
+/// worldlet (#973) to the surviving single pgid channel (the personality). Two twins run in *separate*
+/// groups (each its own leader via `setpgid(p, p)`). `kill(-p1)` fells only group `p1`; `waitpid(-p1)`
+/// reaps exactly p1; a second `waitpid(-p1)` returns `-ECHILD` — proving p2 (in group p2) was NOT
+/// over-reaped by p1's group wait — and p2 is finally felled and reaped by its own `-p2` group.
+#[test]
+fn c_waitpid_by_group_does_not_reap_other_groups() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_setpgid(int cap, long pid, long pgid);
+long __px_kill(int cap, long pid, long sig);
+static int status;
+static long p1;
+static long p2;
+static long h;
+static volatile long acc;
+int main(void) {
+  p1 = __px_fork(0, 0);
+  if (p1 < 0) return 1;
+  if (p1 == 0) { while (1) acc = acc + 1; }       /* group p1, runs until killed */
+  p2 = __px_fork(0, 0);
+  if (p2 < 0) return 2;
+  if (p2 == 0) { while (1) acc = acc + 1; }       /* group p2, a DIFFERENT group */
+  if (__px_setpgid(0, p1, p1) != 0) return 3;     /* p1 leads its own group */
+  if (__px_setpgid(0, p2, p2) != 0) return 4;     /* p2 leads its own group */
+  if (__px_kill(0, -p1, 9) != 0) return 5;        /* fell ONLY group p1 */
+  h = __px_waitpid(0, -p1, (long)&status, 0);      /* reaps p1 */
+  while (h == -10) h = __px_waitpid(0, -p1, (long)&status, 0);
+  if (h != p1) return 6;
+  if (__px_waitpid(0, -p1, (long)&status, 0) != -10) return 7;  /* group p1 empty — p2 NOT reaped */
+  if (__px_kill(0, -p2, 9) != 0) return 8;        /* now fell group p2 */
+  h = __px_waitpid(0, -p2, (long)&status, 0);      /* reaps p2 */
+  while (h == -10) h = __px_waitpid(0, -p2, (long)&status, 0);
+  if (h != p2) return 9;
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "waitpid(-p1) group-reaped only p1's group and never p2 (a different group), on the \
+         personality — the scoping the retired core __wait(-pgid) used to serve"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).
@@ -3689,6 +3737,76 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
             include_str!("../../temen-run/demos/posix_utils/cut.c"),
             false,
         ),
+        (
+            "tail",
+            include_str!("../../temen-run/demos/posix_utils/tail.c"),
+            false,
+        ),
+        (
+            "tac",
+            include_str!("../../temen-run/demos/posix_utils/tac.c"),
+            false,
+        ),
+        (
+            "rev",
+            include_str!("../../temen-run/demos/posix_utils/rev.c"),
+            false,
+        ),
+        (
+            "nl",
+            include_str!("../../temen-run/demos/posix_utils/nl.c"),
+            false,
+        ),
+        (
+            "fold",
+            include_str!("../../temen-run/demos/posix_utils/fold.c"),
+            false,
+        ),
+        (
+            "basename",
+            include_str!("../../temen-run/demos/posix_utils/basename.c"),
+            false,
+        ),
+        (
+            "dirname",
+            include_str!("../../temen-run/demos/posix_utils/dirname.c"),
+            false,
+        ),
+        (
+            "tee",
+            include_str!("../../temen-run/demos/posix_utils/tee.c"),
+            false,
+        ),
+        (
+            "touch",
+            include_str!("../../temen-run/demos/posix_utils/touch.c"),
+            false,
+        ),
+        (
+            "mkdir",
+            include_str!("../../temen-run/demos/posix_utils/mkdir.c"),
+            false,
+        ),
+        (
+            "rmdir",
+            include_str!("../../temen-run/demos/posix_utils/rmdir.c"),
+            false,
+        ),
+        (
+            "rm",
+            include_str!("../../temen-run/demos/posix_utils/rm.c"),
+            false,
+        ),
+        (
+            "cp",
+            include_str!("../../temen-run/demos/posix_utils/cp.c"),
+            false,
+        ),
+        (
+            "mv",
+            include_str!("../../temen-run/demos/posix_utils/mv.c"),
+            false,
+        ),
     ];
     for want in names {
         let (_, src, rx) = TOOLS
@@ -3973,6 +4091,287 @@ int main(void) {{\n\
         vec![Value::I32(42)],
         "parallel driver: parent-fed cut across four exec'd thread rounds, matching both oracles"
     );
+}
+
+/// #801 coreutils — **the tier-1 stream filters**: `tail -n 2`, `tac`, `rev`, `nl`, and `fold -w2`,
+/// each a parent-fed fork→exec of `/bin/<tool>` whose output is byte-checked against the GNU shape
+/// (tail's last-N window, tac's reversed line order, rev's reversed chars, nl's `%6d\t` numbering,
+/// fold's fixed-width wrap). Same read-park + reap composition as the grep/cut witnesses, over five
+/// exec rounds, verified across all three engines.
+#[test]
+fn c_coreutils_tail_tac_rev_nl_fold() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runin(char **av, char *in, long inlen, char *exp, long explen) {{\n\
+  int ip[2]; int op[2];\n\
+  if (pipe(ip) != 0 || pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, ip[0], 0); __px_dup2(0, op[1], 1);\n\
+    close(ip[0]); close(ip[1]); close(op[0]); close(op[1]);\n\
+    execvp(av[0], av); return 99;\n\
+  }}\n\
+  close(ip[0]); close(op[1]);\n\
+  if (write(ip[1], in, inlen) != inlen) return 3;\n\
+  close(ip[1]);\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avtail[] = {{ \"tail\", \"-n\", \"2\", 0 }};\n\
+static char *avtac[]  = {{ \"tac\", 0 }};\n\
+static char *avrev[]  = {{ \"rev\", 0 }};\n\
+static char *avnl[]   = {{ \"nl\", 0 }};\n\
+static char *avfold[] = {{ \"fold\", \"-w2\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runin(avtail, \"1\\n2\\n3\\n4\\n5\\n\", 10, \"4\\n5\\n\", 4);               if (r) return 10 + r;\n\
+  r = runin(avtac,  \"a\\nb\\nc\\n\", 6, \"c\\nb\\na\\n\", 6);                     if (r) return 20 + r;\n\
+  r = runin(avrev,  \"abc\\n\", 4, \"cba\\n\", 4);                            if (r) return 30 + r;\n\
+  r = runin(avnl,   \"x\\ny\\n\", 4, \"     1\\tx\\n     2\\ty\\n\", 18);          if (r) return 40 + r;\n\
+  r = runin(avfold, \"abcdef\\n\", 7, \"ab\\ncd\\nef\\n\", 9);                   if (r) return 50 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tier-1 filters: tail window, tac reverse, rev chars, nl numbering, fold wrap"
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: tier-1 stream filters across five exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: tier-1 stream filters across five exec'd thread rounds, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **the tier-2 path staples** `basename` / `dirname`: args-only tools (no stdin)
+/// that real scripts lean on. `basename /a/b/c.txt .txt` → `c`, `basename /usr/` → `usr`,
+/// `dirname /a/b/c` → `/a/b`, `dirname a` → `.`. Each an exec'd program whose stdout is captured
+/// and byte-checked across all three engines.
+#[test]
+fn c_coreutils_basename_dirname() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runargs(char **av, char *exp, long explen) {{\n\
+  int op[2];\n\
+  if (pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, op[1], 1); close(op[0]); close(op[1]);\n\
+    execvp(av[0], av); return 99;\n\
+  }}\n\
+  close(op[1]);\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avb1[] = {{ \"basename\", \"/a/b/c.txt\", \".txt\", 0 }};\n\
+static char *avb2[] = {{ \"basename\", \"/usr/\", 0 }};\n\
+static char *avd1[] = {{ \"dirname\", \"/a/b/c\", 0 }};\n\
+static char *avd2[] = {{ \"dirname\", \"a\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runargs(avb1, \"c\\n\", 2);       if (r) return 10 + r;\n\
+  r = runargs(avb2, \"usr\\n\", 4);     if (r) return 20 + r;\n\
+  r = runargs(avd1, \"/a/b\\n\", 5);    if (r) return 30 + r;\n\
+  r = runargs(avd2, \".\\n\", 2);       if (r) return 40 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tier-2 path staples: basename with/without suffix, dirname to a parent and to \".\""
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: basename/dirname path munging across exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: basename/dirname across exec'd thread rounds, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **the tier-3 filesystem writers**: `tee`, `cp`, `mv`, `rm`, `touch`, `mkdir`,
+/// `rmdir`, exec'd as real programs that mutate the shared memfs through the personality's write
+/// surface (`open(O_CREAT/O_TRUNC)` + `file_write`, `unlink`, `rename`, `mkdir`, `rmdir`). One guest
+/// runs the whole workflow — `tee` fills `f`, `cp f g`, `mv g h`, `rm h`, `touch t`, `mkdir dd` /
+/// `rmdir dd` — and reads each result back through `open` to prove it, returning 42. The host also
+/// reads `f` back via `read_file` (the `file_f` effect). Verified across all three engines: the
+/// forked twins on coop/parallel share one memfs, so a child's write is visible to a later child.
+#[test]
+fn c_coreutils_fs_writes() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+long __px_open(int cap, long path, long len, long flags);\n\
+long __px_opendir(int cap, long path, long len);\n\
+long __px_closedir(int cap, long dir);\n\
+static char ob[64];\n\
+static long slen(char *s) {{ long n = 0; while (s[n]) n = n + 1; return n; }}\n\
+/* run av; if feed != 0, pipe it to the child's stdin. Returns the child's exit code, or -1. */\n\
+static int runv(char **av, char *feed, long flen) {{\n\
+  int ip[2];\n\
+  int needin = (feed != 0);\n\
+  if (needin && pipe(ip) != 0) return -1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return -1;\n\
+  if (pid == 0) {{\n\
+    if (needin) {{ __px_dup2(0, ip[0], 0); close(ip[0]); close(ip[1]); }}\n\
+    execvp(av[0], av); return 99;\n\
+  }}\n\
+  if (needin) {{ close(ip[0]); write(ip[1], feed, flen); close(ip[1]); }}\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return -1;\n\
+  return (int)((st >> 8) & 0xff);\n\
+}}\n\
+/* open `path` and compare its whole contents to exp[0..explen). 0 = match. */\n\
+static int slurp(char *path, char *exp, long explen) {{\n\
+  long fd = __px_open(0, (long)path, slen(path), 0);\n\
+  if (fd < 0) return -1;\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(fd, ob + got, 64 - got);\n\
+    if (n < 0) {{ close(fd); return -2; }}\n\
+    if (n == 0) break;\n\
+    got = got + n;\n\
+  }}\n\
+  close(fd);\n\
+  if (got != explen) return -3;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return -4;\n\
+  return 0;\n\
+}}\n\
+static int absent(char *path) {{ /* 1 if the path cannot be opened (removed) */\n\
+  long fd = __px_open(0, (long)path, slen(path), 0);\n\
+  if (fd < 0) return 1;\n\
+  close(fd); return 0;\n\
+}}\n\
+static int dir_ok(char *p) {{ long d = __px_opendir(0, (long)p, slen(p)); if (d < 0) return 0; __px_closedir(0, d); return 1; }}\n\
+static char *av_tee[]   = {{ \"tee\", \"f\", 0 }};\n\
+static char *av_cp[]    = {{ \"cp\", \"f\", \"g\", 0 }};\n\
+static char *av_mv[]    = {{ \"mv\", \"g\", \"h\", 0 }};\n\
+static char *av_rm[]    = {{ \"rm\", \"h\", 0 }};\n\
+static char *av_touch[] = {{ \"touch\", \"t\", 0 }};\n\
+static char *av_mkdir[] = {{ \"mkdir\", \"dd\", 0 }};\n\
+static char *av_rmdir[] = {{ \"rmdir\", \"dd\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  if (runv(av_tee, \"hello\\n\", 6) != 0) return 11;\n\
+  if (slurp(\"f\", \"hello\\n\", 6) != 0) return 12;   /* tee wrote the file (and echoed to stdout) */\n\
+  if (runv(av_cp, 0, 0) != 0) return 21;\n\
+  if (slurp(\"g\", \"hello\\n\", 6) != 0) return 22;\n\
+  if (runv(av_mv, 0, 0) != 0) return 31;\n\
+  if (slurp(\"h\", \"hello\\n\", 6) != 0) return 32;\n\
+  if (!absent(\"g\")) return 33;                       /* mv removed the source */\n\
+  if (runv(av_rm, 0, 0) != 0) return 51;\n\
+  if (!absent(\"h\")) return 52;                       /* rm removed the file */\n\
+  if (runv(av_touch, 0, 0) != 0) return 61;\n\
+  if (slurp(\"t\", \"\", 0) != 0) return 62;            /* touch created an empty file */\n\
+  if (runv(av_mkdir, 0, 0) != 0) return 71;\n\
+  if (!dir_ok(\"dd\")) return 72;\n\
+  if (runv(av_rmdir, 0, 0) != 0) return 73;\n\
+  if (dir_ok(\"dd\")) return 74;                        /* rmdir removed the directory */\n\
+  return 42;\n\
+}}\n"
+    );
+    let fs_tools = &["tee", "cp", "mv", "rm", "touch", "mkdir", "rmdir"];
+    let e = run_interp_setup(&src, |host, posix| stage_coreutils(host, posix, fs_tools));
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tier-3 writers: tee/cp/mv/rm/touch/mkdir/rmdir mutate the memfs, each read back"
+    );
+    assert_eq!(
+        e.file_f.as_deref(),
+        Some(b"hello\n".as_slice()),
+        "the host reads back the file tee wrote"
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| stage_coreutils(host, posix, fs_tools));
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: tier-3 fs writers across exec'd twins sharing one memfs — matching the oracle"
+    );
+    assert_eq!(eb.file_f.as_deref(), Some(b"hello\n".as_slice()));
+    let ep =
+        run_bytecode_parallel_setup(&src, |host, posix| stage_coreutils(host, posix, fs_tools));
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: tier-3 fs writers across exec'd OS-thread twins sharing one memfs"
+    );
+    assert_eq!(ep.file_f.as_deref(), Some(b"hello\n".as_slice()));
 }
 
 /// #801 coreutils — **grep is the posix_libc ERE engine running as a

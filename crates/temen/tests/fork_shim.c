@@ -4,7 +4,7 @@
  *   pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);
  * instead of hand-marshalling the §3e powerbox args buffer and driving the raw self-ops. It rides:
  *   - the `__fork`/`__wait` **offers** (granted into the powerbox by name — the manager topology), and
- *   - the `__vm_resolve` / `__vm_exec_module` / `__vm_setpgid` **self-ops** (chibicc builtins).
+ *   - the `__vm_resolve` / `__vm_exec_module` **self-ops** (chibicc builtins).
  *
  * Every entry point is `static`, so chibicc's dead-code pass drops the ones a program never calls: a
  * *command* that only reads its environment pulls in `getenv`/`strlen`, NOT `fork`/`execvp` — so its
@@ -14,7 +14,6 @@
 /* Self-namespace builtins (recognized by the frontend; no grant needed — they are `cap.self` ops). */
 long __vm_resolve(const char *name, long len);
 long __vm_exec_module(long mod, long grants, long n, long entry, long sl);
-long __vm_setpgid(long pid, long pgid);
 /* The fork/wait offers — bound by the manifest to the granted `__fork`/`__wait` powerbox entries. */
 long __fork(int h, long a);
 long __wait(int h, long pid);
@@ -53,9 +52,6 @@ static inline long wait_pid(long pid) {
   while (st == -11) st = __wait(0, pid);
   return st;
 }
-
-/* setpgid(pid, pgid): put child `pid` in process group `pgid` (`0` → its own leader). 0 / -errno. */
-static inline int setpgid(long pid, long pgid) { return (int)__vm_setpgid(pid, pgid); }
 
 /* pipe(fds): POSIX pipe — fds[0] = read end, fds[1] = write end (Stream handles); 0 / -errno. A shell
  * grants the write end to a stage's `stdout` and the read end to the next stage's `stdin`. */
