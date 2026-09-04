@@ -132,7 +132,7 @@ fn drive(
     mut store: Store<Drv>,
     memory: Memory,
     slots: Vec<Val>,
-) -> (i64, u32, u64) {
+) -> (i64, u32, u64, u64) {
     let emitted_wasm = store.data().run.as_ref().unwrap().emitted_wasm().to_vec();
     let module = WModule::new(engine, &emitted_wasm).expect("emitted module validates");
     let mut linker: Linker<Drv> = Linker::new(engine);
@@ -225,7 +225,7 @@ fn drive(
     let value = results[0].i64().expect("i64 result");
     let run = store.data().run.as_ref().unwrap();
     assert!(!run.exited(), "a return, not an exit");
-    (value, store.data().bounces, run.mapped())
+    (value, store.data().bounces, run.mapped(), run.backing_len())
 }
 
 #[test]
@@ -295,7 +295,7 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
     assert_eq!(slots.len(), 2, "(inst, as) starter handles");
     store.data_mut().run = Some(run);
 
-    let (got, bounces, high_water) = drive(&engine, store, memory, slots);
+    let (got, bounces, high_water, _backing) = drive(&engine, store, memory, slots);
     assert_eq!(
         got, want,
         "emitted phase child diverged from the interpreter"
@@ -304,5 +304,90 @@ fn phase_scale_child_grows_to_the_full_carve_matching_the_interpreter() {
     assert_eq!(
         high_water, carve,
         "\"mapped\" grew to the whole 256 MiB carve — the scale the 8× pre-size could not back"
+    );
+}
+
+/// #1253 slice 2 — the same child, but its **physical backing grows in place** under the grant ceiling:
+/// the run is opened with only its DECLARED window backed (`win_log2 = DECL`, `backing_len == 1<<DECL`)
+/// and `set_carve_ceiling(1<<CARVE)`, so each `vm_map` bounce grows `back` from the declared window up to
+/// the touched high-water — the real "grow the window in place" the 8×/pre-reserve avoided. Byte-identical
+/// to the fully-backed growable-child oracle is the proof: had the backing NOT grown, every sentinel past
+/// the declared window would read zero (`Region` out-of-range) and the sum would diverge. (Natively the
+/// wasmi memory is fully allocated, so the grow is the `back`-swap over already-live pages; in the browser
+/// the swap follows a `memory.grow` that appends the pages — same swap, real lazy backing.)
+#[test]
+fn phase_child_grows_its_backing_from_the_declared_window() {
+    let m = build();
+    let want = oracle(&m);
+    assert_eq!(want, 15000);
+
+    let mut host = Host::new();
+    let carve = 1u64 << CARVE;
+    let cinst = host.grant_instantiator(0, carve);
+    let cas = host.grant_address_space(0, carve);
+    let engine = Engine::default();
+    let mut store: Store<Drv> = Store::new(
+        &engine,
+        Drv {
+            run: None,
+            bounces: 0,
+        },
+    );
+    let pages = ((WIN_BASE as u64 + carve) as u32).div_ceil(1 << 16) + 1;
+    let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages))).unwrap();
+    // SAFETY: the child's window lives inside the fixed wasmi memory for the run's lifetime.
+    let win_ptr = unsafe {
+        memory
+            .data_mut(&mut store)
+            .as_mut_ptr()
+            .add(WIN_BASE as usize)
+    };
+    // Open with only the DECLARED window backed (win_log2 = DECL), then arm growth to the carve ceiling.
+    let mut run = unsafe {
+        JitOnrampRun::open_shared_run_over_host(
+            &m,
+            win_ptr,
+            1u64 << DECL,
+            DECL,
+            false,
+            host,
+            Vec::new(),
+            None,
+            cinst as u64,
+            cas as u64,
+            None,
+        )
+    }
+    .expect("a map-only op-13 child opens with its declared window backed");
+    assert_eq!(
+        run.backing_len(),
+        1u64 << DECL,
+        "the backing STARTS at the declared window — below the child's 256 MiB high-water"
+    );
+    run.set_carve_ceiling(carve);
+    let slots: Vec<Val> = run
+        .slots()
+        .iter()
+        .map(|v| match v {
+            Value::I64(x) => Val::I64(*x),
+            Value::I32(x) => Val::I32(*x),
+            _ => Val::I64(0),
+        })
+        .collect();
+    store.data_mut().run = Some(run);
+
+    let (got, bounces, high_water, backing) = drive(&engine, store, memory, slots);
+    assert_eq!(
+        got, want,
+        "the grown-backing child diverged from the interpreter — a sentinel past the declared window \
+         read zero, so the backing did not grow to cover it"
+    );
+    assert_eq!(bounces, 4, "the four outlined `vm_map` leaves bounced");
+    assert_eq!(high_water, carve, "\"mapped\" grew to the whole carve");
+    assert!(
+        backing >= high_water && backing > (1u64 << DECL),
+        "the physical backing grew from the declared window ({}) to cover the high-water ({high_water}), \
+         landing at {backing}",
+        1u64 << DECL
     );
 }
