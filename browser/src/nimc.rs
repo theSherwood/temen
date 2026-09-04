@@ -234,8 +234,23 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 /// list `{fs, stdout, exit}` and `argv` seeded at `carve + args_base`. Mirrors `nifler_child_asset.rs` /
 /// `spawn_child_fs.rs`; the guarded child's `module_args_base` places records at 17408.., names at
 /// 18432.. (above the #1094 NULL guard the parent itself carries), argv at `carve + args_base`.
-pub(crate) fn op13_parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[&str]) -> String {
+/// Build an op-13 parent that re-grants `caps` (by name, in order — the child resolves them by name and
+/// its manifest binds them) to a `--child-entry` child spawned into `[carve_off, carve_off+2^child_sl)`
+/// with `argv` seeded at `carve_off + args_base`. N-cap: 3 for nifler/hexer (`{fs,stdout,exit}`), 4 for
+/// nimsem (`+exec`). The parent's params are `(inst, module, cap0, …, cap{N-1})`; the 16-byte grant
+/// records live at `guard+1024`, their names at `guard+2048` — both above the #1094 NULL guard (the
+/// layout `nifler_child_asset.rs::guarded_parent_src` proves). `grants_n = N`.
+pub(crate) fn op13_parent_src(
+    child_sl: u32,
+    carve_off: u64,
+    args_base: u64,
+    argv: &[&str],
+    caps: &[&str],
+) -> String {
     let parent_sl = child_sl + 1;
+    let guard = temen_ir::POWERBOX_NULL_GUARD;
+    let rec_base = guard + 1024;
+    let name_base = guard + 2048;
     let argv_off = carve_off + args_base;
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
@@ -245,32 +260,36 @@ pub(crate) fn op13_parent_src(child_sl: u32, carve_off: u64, args_base: u64, arg
         blob.push(0);
     }
     let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-    let rec = |off: u64, name_off: u64, name_len: u64| -> String {
-        let w0 = name_off | (name_len << 32);
-        format!(
-            "  x{off} = i64.const {w0}\n  o{off} = i64.const {off}\n  i64.store o{off} x{off}\n"
-        )
-    };
+
+    let n = caps.len();
+    let mut data = String::new();
+    let mut records = String::new();
+    for (i, name) in caps.iter().enumerate() {
+        let noff = name_base + i as u64 * 16;
+        let roff = rec_base + i as u64 * 16;
+        data.push_str(&format!("data {noff} \"{name}\"\n"));
+        let w0 = noff | ((name.len() as u64) << 32);
+        // record word0 = {name_off:u32 | name_len:u32<<32} at roff; the cap handle (param v{2+i}) at roff+8.
+        records.push_str(&format!(
+            "  xr{roff} = i64.const {w0}\n  or{roff} = i64.const {roff}\n  i64.store or{roff} xr{roff}\n  \
+             h{roff} = i64.extend_i32_u v{vi}\n  oh{roff} = i64.const {hoff}\n  i64.store oh{roff} h{roff}\n",
+            vi = 2 + i,
+            hoff = roff + 8,
+        ));
+    }
+    let sig: String = vec!["i32"; 2 + n].join(", ");
+    let bparams: String = (0..2 + n)
+        .map(|i| format!("v{i}: i32"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         r#"memory {parent_sl}
-data 18432 "fs"
-data 18448 "stdout"
-data 18464 "exit"
-data {argv_off} "{argv_esc}"
-func (i32, i32, i32, i32, i32) -> (i64) {{
-block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
-{r0}  hf = i64.extend_i32_u v2
-  ohf = i64.const 17416
-  i64.store ohf hf
-{r1}  hs = i64.extend_i32_u v3
-  ohs = i64.const 17432
-  i64.store ohs hs
-{r2}  he = i64.extend_i32_u v4
-  ohe = i64.const 17448
-  i64.store ohe he
-  vmh = i64.extend_i32_u v1
-  vgptr = i64.const 17408
-  vgn = i64.const 3
+{data}data {argv_off} "{argv_esc}"
+func ({sig}) -> (i64) {{
+block 0 ({bparams}) {{
+{records}  vmh = i64.extend_i32_u v1
+  vgptr = i64.const {rec_base}
+  vgn = i64.const {n}
   ventry = i64.const 0
   voff = i64.const {carve_off}
   vsl = i64.const {child_sl}
@@ -281,9 +300,6 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   }}
 }}
 "#,
-        r0 = rec(17408, 18432, 2),
-        r1 = rec(17424, 18448, 6),
-        r2 = rec(17440, 18464, 4),
     )
 }
 
@@ -345,7 +361,13 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
     let child_sl = (decl + 3).max(24);
     let carve_off = 1u64 << child_sl;
-    let src = op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), argv);
+    let src = op13_parent_src(
+        child_sl,
+        carve_off,
+        temen_ir::module_args_base(),
+        argv,
+        &["fs", "stdout", "exit"],
+    );
     let Ok(parent) = temen_text::parse_module(&src) else {
         return -1;
     };
@@ -419,7 +441,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
 /// `op13_nifler_crawl_matches_inline`), which is what nimsem reads back — so the grandchild's stdout is
 /// unobserved (empty), matching the phase-1 crawl's discard. Without `nifler_ce`, the inline
 /// [`run_phase`] path is kept (identical output either way).
-fn make_exec(
+pub(crate) fn make_exec(
     nifler: Arc<Module>,
     nifler_ce: Option<Arc<Module>>,
     fs_factory: FsFactory,

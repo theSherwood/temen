@@ -8942,6 +8942,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             vec![(file_key, src)],
             readback,
             0,
+            None,
         )
     }
 }
@@ -8990,6 +8991,62 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
             seeds,
             readback,
             carve_log2,
+            None,
+        )
+    }
+}
+
+/// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
+/// a 4th cap — **`exec`** (`make_exec` over the shared memfs, running nifler on the interpreter) — so a
+/// tiered-up nimsem can shell out to nifler for stdlib parsing it didn't get pre-crawled. `exec` is a
+/// `HOST_PROC`, so nimsem-emitted's `exec` call bounces to `call_interp` over the granted host exactly
+/// like `fs`; the nifler sub-spawns run host-side while nimsem's **sema** (the dominant cost) tiers up.
+/// `nifler` is the top-level nifler module the exec spawns. Everything else matches `phase_open_argv`
+/// (packed argv/seeds, output key, `carve_log2` — nimsem passes `28` for its ~256 MiB peak).
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs + carve size
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_nimsem_open(
+    child_ptr: *const u8,
+    child_len: usize,
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    carve_log2: u32,
+) -> i32 {
+    temen_op13jit_close();
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&nifler).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
+        .trim_start_matches('/')
+        .to_string();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    unsafe {
+        op13_phase_open_impl(
+            sl(child_ptr, child_len),
+            &argv_refs,
+            seeds,
+            readback,
+            carve_log2,
+            Some(std::sync::Arc::new(nifler)),
         )
     }
 }
@@ -9054,6 +9111,7 @@ unsafe fn op13_phase_open_impl(
     seeds: Vec<(String, Vec<u8>)>,
     readback: String,
     carve_log2: u32,
+    exec_nifler: Option<std::sync::Arc<temen_ir::Module>>,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
     let Ok(child) = temen_encode::decode_module(child_bytes) else {
@@ -9063,9 +9121,11 @@ unsafe fn op13_phase_open_impl(
         return -STATUS_VERIFY_ERR;
     }
 
-    // The shared memfs the child reads its inputs from + writes its output into.
+    // The shared memfs the child reads its inputs from + writes its output into. Typed as the `dyn`
+    // factory (nimc's `FsFactory`) so it re-grants to the child AND feeds `make_exec` (the exec cap).
     let (factory, handle) = temen_fs::mem_fs_shared_factory(seeds, vec!["nimcache".into()]);
-    let factory = std::sync::Arc::new(factory);
+    let factory: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+        std::sync::Arc::new(factory);
 
     // The real phase driver (mirrors nimc::run_phase_op13): a buddy-half carve sized for the phase heap.
     // `carve_log2 == 0` → the nifler-default `(declared+3).max(24)`; else the caller-supplied size (e.g.
@@ -9077,7 +9137,21 @@ unsafe fn op13_phase_open_impl(
         carve_log2.max(decl)
     };
     let carve_off = 1u64 << child_sl;
-    let driver_src = nimc::op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), argv);
+    // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
+    // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
+    // exactly like `fs`, so its nifler sub-spawns run host-side while the phase's own compute tiers up.
+    let caps: &[&str] = if exec_nifler.is_some() {
+        &["fs", "stdout", "exit", "exec"]
+    } else {
+        &["fs", "stdout", "exit"]
+    };
+    let driver_src = nimc::op13_parent_src(
+        child_sl,
+        carve_off,
+        temen_ir::module_args_base(),
+        argv,
+        caps,
+    );
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
         return -STATUS_DECODE_ERR;
     };
@@ -9101,6 +9175,34 @@ unsafe fn op13_phase_open_impl(
     let win = 1u64 << (child_sl + 1);
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
+    // Grant args in the order the parent's params expect: inst, module, then the caps. The exec (when
+    // present) is granted forkable so op-13's `regrant_into_child` can carry it (`can_regrant`).
+    let mut grant_args = vec![
+        Value::I32(inst),
+        Value::I32(modh),
+        Value::I32(fs_h),
+        Value::I32(stdout_h),
+        Value::I32(exit_h),
+    ];
+    if let Some(nifler) = exec_nifler {
+        // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`), running nifler on the
+        // interpreter (no `nifler_ce` → no re-entrant tier-up). Forkable so op-13 can re-grant it.
+        let exec_init: temen_interp::HostProc =
+            nimc::make_exec(nifler.clone(), None, std::sync::Arc::clone(&factory));
+        let exec_fork: temen_interp::HostProcFork = {
+            let nifler = std::sync::Arc::clone(&nifler);
+            let factory = std::sync::Arc::clone(&factory);
+            std::sync::Arc::new(move |_pid| {
+                temen_interp::ForkedProc::shared(nimc::make_exec(
+                    nifler.clone(),
+                    None,
+                    std::sync::Arc::clone(&factory),
+                ))
+            })
+        };
+        let exec_h = host.grant_host_proc_forkable(exec_init, exec_fork);
+        grant_args.push(Value::I32(exec_h));
+    }
 
     let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
         unsafe { drop(Box::from_raw(prog)) };
@@ -9118,13 +9220,7 @@ unsafe fn op13_phase_open_impl(
     let root = match bytecode::Vcpu::new_root_with_powerbox(
         unsafe { &*prog },
         0,
-        &[
-            Value::I32(inst),
-            Value::I32(modh),
-            Value::I32(fs_h),
-            Value::I32(stdout_h),
-            Value::I32(exit_h),
-        ],
+        &grant_args,
         std::sync::Arc::clone(&back),
         &[],
         host,
