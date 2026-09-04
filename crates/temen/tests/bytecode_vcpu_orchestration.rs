@@ -276,7 +276,8 @@ fn drive<'s, 'e>(
             | bytecode::VcpuEvent::JitInvoke { .. }
             | bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::StdinPark
-            | bytecode::VcpuEvent::Instantiate { .. } => {
+            | bytecode::VcpuEvent::Instantiate { .. }
+            | bytecode::VcpuEvent::InstantiateDetached { .. } => {
                 unreachable!(
                     "no JIT/tier-up/§14 in the compute/threads/futex orchestration kernels"
                 )

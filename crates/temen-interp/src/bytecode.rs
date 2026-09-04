@@ -505,6 +505,22 @@ enum Op {
         /// inherited `stdout` by name — the shell "exec" primitive.
         grants: Option<(u32, u32)>,
     },
+    /// PROCESS.md §5 `Instantiator.instantiate_detached(minter, module, grants_ptr, grants_n, entry,
+    /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
+    /// window** minted through a `WindowMinter` — no carve, no alias; the host owns the window. The
+    /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
+    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve").
+    InstantiateDetached {
+        handle: u32,
+        minter: u32,
+        module: u32,
+        grants: Option<(u32, u32)>,
+        entry: u32,
+        size_log2: u32,
+        quota: u32,
+        args: Option<(u32, u32)>,
+        dst: u32,
+    },
     /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
     /// The 56-byte record is **runtime data** (entry, carve, module, budget, grants — see the
     /// tree-walker's op-17 arm for the layout), so unlike the scalar spawns above the fields are
@@ -1694,6 +1710,20 @@ fn compile_inst(
                     quota: g(args[6]),
                     dst,
                     grants: Some((g(args[1]), g(args[2]))),
+                },
+                // op 15 = instantiate_detached (#1286): (minter, module, grants_ptr, grants_n, entry,
+                // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
+                // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
+                (cap_id::INSTANTIATOR, 15) if args.len() >= 7 => Op::InstantiateDetached {
+                    handle: g(*handle),
+                    minter: g(args[0]),
+                    module: g(args[1]),
+                    grants: Some((g(args[2]), g(args[3]))),
+                    entry: g(args[4]),
+                    size_log2: g(args[5]),
+                    quota: g(args[6]),
+                    args: (args.len() >= 9).then(|| (g(args[7]), g(args[8]))),
+                    dst,
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
                 // arg; every other spawn parameter is data in the record, read at exec time.
@@ -2889,6 +2919,27 @@ pub enum VcpuEvent {
         /// when the guest passed no quota).
         fuel: u64,
     },
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): start a child vCPU in a **fresh window
+    /// the host mints** — no carve, nothing of it in the parent's window. Admission (child entry,
+    /// window = declared memory, `WindowMinter` quota) and the module compile + push already happened;
+    /// the re-granted child powerbox is stashed for [`Vcpu::take_granted_host`]. The host allocates a
+    /// window of `1 << size_log2` (grown by the child's `vm_map`s), seeds the module's data segments
+    /// and `args` at `module_args_base()`, runs the child with
+    /// [`Vcpu::new_confined_child_grow_over_host`]`(prog, module, entry, back, size_log2,
+    /// DEFAULT_RESERVED_LOG2, fuel, host)` (the committed window starts at the declared size; the
+    /// starter caps span the reservation, as a root's do, so `vm_map` grows it — the tree-walker's
+    /// op-15 arm grants the same), and
+    /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
+    /// carve.
+    InstantiateDetached {
+        module: u32,
+        entry: u32,
+        size_log2: u8,
+        fuel: u64,
+        /// The spawn-time args payload (empty for the 7-arg form), to seed at the child's
+        /// `module_args_base()` before start.
+        args: Vec<u8>,
+    },
     /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
     /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
     /// The read did **not** complete (nothing written, pc un-advanced); the host pushes more bytes with
@@ -3773,6 +3824,44 @@ impl<'p> Vcpu<'p> {
                         Err(t) => return VcpuEvent::Trapped(t),
                     }
                 }
+                // op 15 (`instantiate_detached`, #1286): the fresh-window twin of the op-13 arm above —
+                // parse + gate the grant list first, commit (minter quota take, module compile + push,
+                // payload read) in `event_instantiate_detached`, then re-grant and stash the child
+                // powerbox for the driver. The window itself is the host's to mint: the event carries
+                // no carve.
+                Ok(VcpuStop::InstantiateDetached {
+                    minter,
+                    mh,
+                    entry,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    args,
+                }) => {
+                    let glist = match grants {
+                        Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
+                            Ok(l) => Some(l),
+                            Err(t) => return VcpuEvent::Trapped(t),
+                        },
+                        None => None,
+                    };
+                    match self.event_instantiate_detached(
+                        minter, mh, entry, size_log2, quota, args, dst,
+                    ) {
+                        Ok(Some(ev)) => {
+                            if let Some(list) = glist {
+                                match self.regrant_list_into_child(&list) {
+                                    Ok(h) => self.pending_granted_host = Some(h),
+                                    Err(t) => return VcpuEvent::Trapped(t),
+                                }
+                            }
+                            return ev;
+                        }
+                        Ok(None) => {} // -EINVAL landed in place — keep running
+                        Err(t) => return VcpuEvent::Trapped(t),
+                    }
+                }
                 // Blocking-stdin park: the guest read an exhausted stdin under `set_stdin_blocking`.
                 // Nothing to deliver — `pc` was left at the read, so pushing input + `run()` again
                 // re-issues it. Surface to the host, which pumps the session.
@@ -3979,6 +4068,99 @@ impl<'p> Vcpu<'p> {
             carve,
             size_log2: size_log2 as u8,
             fuel,
+        }))
+    }
+
+    /// Validate + commit a §5 `instantiate_detached` (op 15, #1286) and produce its
+    /// [`VcpuEvent::InstantiateDetached`], or land `-EINVAL` in place (`Ok(None)`). The tree-walker's
+    /// admission, exactly: the entry is a child entry, the window equals the module's declared memory
+    /// (§14 transparency: a detached window has no superset room — it grows into its own reservation),
+    /// the payload fits the args region, and the `WindowMinter` quota covers the window (a forged /
+    /// exhausted minter refuses, charging nothing). The child's data segments are **not** seeded here:
+    /// the host owns the fresh window and seeds `module.data` + the payload before start.
+    #[allow(clippy::too_many_arguments)]
+    fn event_instantiate_detached(
+        &mut self,
+        minter: i32,
+        mh: i32,
+        entry: i64,
+        size_log2: i64,
+        quota: i64,
+        args: Option<(u64, u64)>,
+        dst: u32,
+    ) -> Result<Option<VcpuEvent>, Trap> {
+        let (cfuncs, cmem_log2, cimports, ctypes) = match self.shared_host {
+            Some(m) => {
+                let g = m.lock_unpoisoned();
+                let g = g.resolve_module(mh)?;
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
+            }
+            None => {
+                let g = self.host.resolve_module(mh)?;
+                (
+                    g.funcs.clone(),
+                    g.memory_log2,
+                    g.imports.clone(),
+                    g.types.clone(),
+                )
+            }
+        };
+        let child_compiled = compile_module(&cfuncs, &ctypes)
+            .ok_or(Trap::Malformed)?
+            .with_manifest(cimports, ctypes);
+        let ok_entry = child_compiled
+            .sigs
+            .get(entry as usize)
+            .is_some_and(|(p, r)| child_entry_ok(p, r));
+        let child_size = if (0..64).contains(&size_log2) {
+            1u64 << size_log2
+        } else {
+            0
+        };
+        let mod_ok = cmem_log2 == Some(size_log2 as u8);
+        // The payload is read from THIS vCPU's window (a bad range is a fault, as any window read);
+        // an over-long one refuses probeably.
+        let payload: Vec<u8> = match args {
+            Some((ptr, len)) => self
+                .mem
+                .as_ref()
+                .ok_or(Trap::Malformed)?
+                .read_window(ptr, len as usize)?,
+            None => Vec::new(),
+        };
+        let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
+        let payload_ok = payload.len() as u64 <= args_room;
+        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return Ok(None);
+        }
+        // Admission = the minter's quota take (the commit; every refusal above charged nothing).
+        let admitted = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().window_minter_take(minter, child_size),
+            None => self.host.window_minter_take(minter, child_size),
+        };
+        if !admitted {
+            self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            return Ok(None);
+        }
+        let cm = self.prog.dom.source.push(child_compiled);
+        let fuel = if quota <= 0 {
+            self.fuel
+        } else {
+            (quota as u64).min(self.fuel)
+        };
+        self.pending = Some(dst);
+        Ok(Some(VcpuEvent::InstantiateDetached {
+            module: cm as u32,
+            entry: entry as u32,
+            size_log2: size_log2 as u8,
+            fuel,
+            args: payload,
         }))
     }
 
@@ -6788,6 +6970,11 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
+            // §5 `instantiate_detached` (op 15): not driven by the debugger path (no window minting).
+            Outcome::InstantiateDetached { .. } => {
+                *turn += 1;
+                dbg_complete(tasks, ti, Err(Trap::Malformed));
+            }
             // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
             Outcome::InstantiateModule {
                 ibase,
@@ -8557,6 +8744,19 @@ enum Outcome {
         /// §3d (op 17): the record's `Budget` handle (`0` = none) — see [`Outcome::Instantiate`].
         budget: i32,
     },
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
+    /// host-minted window. `minter` is the `WindowMinter` handle (admission = quota take), `grants`
+    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window.
+    InstantiateDetached {
+        minter: i32,
+        mh: i32,
+        entry: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+        grants: Option<(u64, u64)>,
+        args: Option<(u64, u64)>,
+    },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
     MemoryWait {
@@ -9326,6 +9526,17 @@ enum VcpuStop {
         /// §3d (op 17): the record's `Budget` handle (`0` = none) — see above.
         budget: i32,
     },
+    /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
+    InstantiateDetached {
+        minter: i32,
+        mh: i32,
+        entry: i64,
+        size_log2: i64,
+        quota: i64,
+        dst: u32,
+        grants: Option<(u64, u64)>,
+        args: Option<(u64, u64)>,
+    },
     Wait {
         base: u64,
         expected: u64,
@@ -9823,6 +10034,27 @@ fn step_vcpu(
                     dst,
                     grants,
                     budget,
+                })
+            }
+            Outcome::InstantiateDetached {
+                minter,
+                mh,
+                entry,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                args,
+            } => {
+                return Ok(VcpuStop::InstantiateDetached {
+                    minter,
+                    mh,
+                    entry,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    args,
                 })
             }
             Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
@@ -11770,6 +12002,14 @@ impl CoopSched {
                     let handle = tasks[ti].threads.len() as i32;
                     tasks[ti].threads.push(Some(cidx));
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+                }
+                // §5 `instantiate_detached` (op 15, #1286): the cooperative scheduler hosts no fresh
+                // window yet — refuse probeably (`-EINVAL`), as the JIT tiers do, never a trap.
+                Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
+                    tasks[ti]
+                        .vt
+                        .active
+                        .set(dst, Reg::from_i32(super::EINVAL as i32));
                 }
                 Ok(VcpuStop::InstantiateModule {
                     ibase,
@@ -13719,6 +13959,8 @@ fn run_vcpu_parallel<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
+            // §5 `instantiate_detached` (op 15): the OS-thread parallel driver mints no windows.
+            Ok(VcpuStop::InstantiateDetached { .. }) => return (Err(Trap::Malformed), mem),
             // §14 `Instantiator.instantiate_module` (THREADS.md 4c-domain) — a **separate-module**
             // confined child: the host (which holds the powerbox) is locked to resolve + clone the
             // granted `Module`, it is compiled to bytecode and **pushed to the shared source** (so it
@@ -15485,6 +15727,47 @@ impl Vm {
                         dst,
                         grants,
                         budget: 0,
+                    });
+                }
+                // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
+                // CapFault, as every op above); the minter's quota take and the module resolve happen at
+                // the driver's commit site (`event_instantiate_detached`), peek-then-drain like op 13.
+                Op::InstantiateDetached {
+                    handle,
+                    minter,
+                    module: module_reg,
+                    grants,
+                    entry,
+                    size_log2,
+                    quota,
+                    args,
+                    dst,
+                } => {
+                    let ih = r!(*handle).i32();
+                    host.with(|p| p.resolve_instantiator(ih))?;
+                    let minter = r!(*minter).i64() as i32;
+                    let mh = r!(*module_reg).i64() as i32;
+                    let entry = r!(*entry).i64();
+                    let size_log2 = r!(*size_log2).i64();
+                    let quota = r!(*quota).i64();
+                    let grants = grants
+                        .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
+                        .filter(|(_, n)| *n != 0);
+                    let args = args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64));
+                    let dst = *dst;
+                    self.module = module;
+                    self.cur = cur;
+                    self.base = base;
+                    self.pc = pc + 1;
+                    return Ok(Outcome::InstantiateDetached {
+                        minter,
+                        mh,
+                        entry,
+                        size_log2,
+                        quota,
+                        dst,
+                        grants,
+                        args,
                     });
                 }
                 // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from

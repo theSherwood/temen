@@ -19,6 +19,7 @@
 // fresh instance, window, and env cell are built per Run, so no guest state crosses Runs. A missing
 // key (undefined) disables caching for that call. Bounded so a session that Runs many distinct modules
 // can't grow it without limit.
+import { foreignMemory } from './foreign-mem.js';
 const jitModuleCache = new Map();
 const JIT_MODULE_CACHE_MAX = 16;
 function cacheGet(key) {
@@ -248,12 +249,13 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey, afterF
   pagestateGlobal = instance.exports.pagestate ?? null;
   syncGlobals();
   new DataView(childMemory.buffer).setBigInt64(env, 1n << 60n, true); // dispatcher-fuel budget
-  let threw = 0, value = 0n;
+  let threw = 0, value = 0n, unwound = '';
   try {
     const r = f0(win, env, ...slots);
     value = r === undefined || r === null ? 0n : BigInt(r);
-  } catch {
+  } catch (e) {
     threw = 1;
+    unwound = String(e && e.message || e); // a wasm trap, a bounce stop, or a host-import exception
   }
   ex.temen_dealloc(scratch, envBytes);
   ex.temen_onramp_jit_run_report(threw, value);
@@ -265,7 +267,7 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey, afterF
     trapMsg = tl ? new TextDecoder().decode(eu8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + tl)) : '';
   }
   ex.temen_onramp_jit_run_close();
-  if (status === 3 /* STATUS_TRAP */) throw new Error('emitted detached run trapped (declined to the interpreter): ' + trapMsg);
+  if (status === 3 /* STATUS_TRAP */) throw new Error(`emitted detached run trapped (declined to the interpreter): ${trapMsg || unwound}`);
   return status;
 }
 
@@ -899,6 +901,12 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
       if (s === 0) break;             // DONE
       if (s === 1) {                  // CHILD — run nifler_ce emitted
         try { await driveJitRun(ex, memory, cacheKey); }
+        catch { ex.temen_op13jit_close(); return null; }
+        ex.temen_op13jit_deliver();
+        continue;
+      }
+      if (s === 2) {                  // CHILD_DETACHED (#1286) — run it in its own Memory
+        try { await driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), cacheKey); }
         catch { ex.temen_op13jit_close(); return null; }
         ex.temen_op13jit_deliver();
         continue;

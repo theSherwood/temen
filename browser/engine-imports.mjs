@@ -16,7 +16,7 @@ export function engineImports(memory) {
   // to satisfy the import — a call would mean a bug, hence they throw. Kept in step with foreign-mem.js.
   const noForeign = () => { throw new Error('foreign memory access in a harness without foreign-mem.js'); };
   const foreign = Object.fromEntries(
-    ['foreign_read', 'foreign_write', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow'].map((n) => [n, noForeign]));
+    ['foreign_read', 'foreign_write', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow', 'foreign_mint'].map((n) => [n, noForeign]));
   const imports = { temen_host: { ...foreign, webgpu_op: () => -1n, stdout_chunk: () => {} } };
   if (memory) imports.env = { memory };
   return imports;

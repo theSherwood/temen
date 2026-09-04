@@ -11843,6 +11843,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let entry = argn(4)? as u64;
                             let size_log2 = argn(5)?;
                             let quota = argn(6)?;
+                            // #1286 — optional spawn-time args payload `(args_ptr, args_len)` (args
+                            // 7–8): bytes of this domain's window copied to the child's
+                            // `module_args_base()` before start — the detached twin of the op-13
+                            // convention (a parent data segment landing inside the carve), which has
+                            // no analogue across windows. The 7-arg form seeds nothing; an over-long
+                            // payload refuses probeably.
+                            let payload: Option<Vec<u8>> = match (args.get(7), args.get(8)) {
+                                (Some(&p), Some(&l)) => {
+                                    let ptr = get(&frames[top].vals, p)?.i64() as u64;
+                                    let len = get(&frames[top].vals, l)?.i64() as usize;
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    Some(m.read_window(ptr, len)?)
+                                }
+                                _ => None,
+                            };
+                            let payload_ok = payload.as_ref().is_none_or(|p| {
+                                p.len() as u64
+                                    <= temen_ir::module_args_end() - temen_ir::module_args_base()
+                            });
                             // The module grant (a forged module handle is a CapFault, as ops
                             // 5/13); the child runs it as its own program + self module.
                             let cm = {
@@ -11896,6 +11915,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && ok_entry
                                 && child_size != 0
                                 && mod_ok
+                                && payload_ok
                                 && host
                                     .lock_unpoisoned()
                                     .window_minter_take(minter, child_size);
@@ -11908,13 +11928,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
                                 fm.init_data(&cm.data);
                                 fm.seed_null_guard(temen_ir::module_null_guard()); // #964
+                                if let Some(p) = &payload {
+                                    let _ = fm.write_bytes(temen_ir::module_args_base(), p);
+                                }
                                 let mut ch = Host::new();
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
                                     hg.detached_child_attestation()
                                 });
-                                let cinst = ch.grant_instantiator(0, child_size);
-                                let cas = ch.grant_address_space(0, child_size);
+                                // #1286: the starter caps span the child's whole **reservation**, as a
+                                // root run's `grant_memory` does — a detached window has no carve to be
+                                // bounded by, and bounding `AddressSpace` to the declared size would
+                                // refuse every `vm_map` past it (the growth a detached window exists
+                                // for). The minter quota governs *minting*; growth is bounded by the
+                                // reservation (and, on wasm, the minted memory's `maximum`).
+                                let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                                let cinst = ch.grant_instantiator(0, reservation);
+                                let cas = ch.grant_address_space(0, reservation);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -20964,7 +20994,7 @@ impl Host {
     /// Deduct `bytes` from the minter behind `handle` — the detached-spawn admission check.
     /// `false` (nothing deducted) for a forged/wrong-type handle or an exhausted quota: the
     /// spawn refuses probeably, never a trap.
-    fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
+    pub(crate) fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
         let idx = match self.resolve(handle, cap_id::WINDOW_MINTER) {
             Ok(Binding::WindowMinter(i)) => i as usize,
             _ => return false,

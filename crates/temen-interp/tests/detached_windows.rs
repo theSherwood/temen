@@ -336,3 +336,128 @@ fn a_detached_child_does_not_rendezvous_with_its_parent_on_anonymous_memory() {
         "detached child's wait must time out (2) with no parent notify landing (woke_any = 0)"
     );
 }
+
+/// A detached child that reads the first argv word at `module_args_base() + 8` and adds its attest (1).
+const ARGV_CHILD: &str = r#"
+memory 16
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vab = i64.const 16520
+  va = i64.load vab
+  vz = i32.const 0
+  vat = call.cap 4294967295 4 () -> (i64) vz ()
+  vs = i64.add va vat
+  return vs
+  }
+}
+"#;
+
+/// The parent stores the args blob (`argc 1`, `"hello-detached\0"`) at 18432 in ITS window and passes
+/// `(18432, 24)` as the optional 8th/9th op-15 args (#1286): the host copies it to the child's
+/// `module_args_base()` before start — the detached twin of the op-13 "data segment in the carve".
+const ARGV_PARENT: &str = r#"
+memory 17
+
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vb0 = i64.const 18432
+  vw0 = i64.const 1
+  i64.store vb0 vw0
+  vb1 = i64.const 18440
+  vw1 = i64.const 7306014452085450088
+  i64.store vb1 vw1
+  vb2 = i64.const 18448
+  vw2 = i64.const 28265164885364
+  i64.store vb2 vw2
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 16
+  vq = i64.const 0
+  vap = i64.const 18432
+  val = i64.const 24
+  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq, vap, val)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vD)
+  return vj
+  }
+}
+"#;
+
+#[test]
+fn a_detached_child_receives_the_spawn_time_args_payload() {
+    let a = module(ARGV_PARENT);
+    let b = module(ARGV_CHILD);
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_window_minter(1 << 16);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hw)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    // "hello-de" as a little-endian i64, plus attest = 1 (tier 1, window_exposed = false).
+    assert_eq!(
+        r,
+        vec![Value::I64(i64::from_le_bytes(*b"hello-de") + 1)],
+        "the payload landed at the child's args base; the child is unexposed"
+    );
+}
+
+/// A detached child that `vm_map`s past its declared 64 KiB window (via the child-manifest `vm_map`
+/// import), stores the argv word on the grown page, loads it back and returns it plus attest.
+const GROWING_CHILD: &str = r#"
+memory 16
+import 0 "vm_map" (i64, i64, i32) -> (i64)
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vab = i64.const 16520
+  va = i64.load vab
+  vz = i32.const 0
+  vat = call.cap 4294967295 4 () -> (i64) vz ()
+  voff = i64.const 65536
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vg = call.import 0 (voff, vlen, vprot)
+  vp = i64.const 65600
+  i64.store vp va
+  vld = i64.load vp
+  vs = i64.add vld vat
+  return vs
+  }
+}
+"#;
+
+/// #1286 — a detached window **grows**: its starter `AddressSpace` spans the reservation (a root's
+/// shape), not the declared size, so a `vm_map` past 64 KiB is admitted and the grown page is usable.
+/// (Bounding the grant to the declared window refused the map and the store then faulted.)
+#[test]
+fn a_detached_child_grows_past_its_declared_window() {
+    let a = module(ARGV_PARENT);
+    let b = module(GROWING_CHILD);
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_window_minter(1 << 16);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hw)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(i64::from_le_bytes(*b"hello-de") + 1)],
+        "the word round-tripped through a page above the declared window"
+    );
+}

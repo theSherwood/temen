@@ -47,6 +47,9 @@ child in its own address space.** In temen that structure already has a name.
 | `WindowMinter` cap (`cap_id` 15), embedder-granted, byte quota, `window_minter_take` at each mint | `lib.rs` 16256, 20950–20975 | **Built** |
 | Detached child = **fresh reservation + guard exactly like a root run's**: `Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)` — so it `vm_map`-grows into a 2^40 reservation, natively | `lib.rs` ~11900 | **Built** |
 | Detached window size must equal the module's declared (`mod_ok = memory_log2 == size_log2`, §14 transparency) | `lib.rs` ~11889 | **Built** |
+| Detached child's starter `Instantiator`/`AddressSpace` span its **reservation** (a root's shape), so `vm_map` grows the window. **Corrected in #1286**: the built arm bounded them to the declared size, which refused every `vm_map` past it — a detached interpreter child could not actually grow | `lib.rs` ~11940; `detached_windows::a_detached_child_grows_past_its_declared_window` | **Fixed** |
+| op 15 optional trailing `(args_ptr, args_len)` — the spawn-time args payload copied to the child's `module_args_base()` (#1286) | `lib.rs` op-15 arm; `bytecode.rs` `Op::InstantiateDetached` | **Built** (both engines) |
+| Resumable-engine op 15: `VcpuEvent::InstantiateDetached { module, entry, size_log2, fuel, args }` — the host mints the window (#1286) | `bytecode.rs`; browser `temen_op13jit_step` + `foreign_mint` | **Built** |
 | `self.attest` → `tier \| window_exposed<<8 \| freeze_exposed<<9`; detached attests `window_exposed = false` | `lib.rs` 16358–16385, 19496 | **Built** (PROCESS.md §6) |
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
@@ -540,10 +543,11 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    the interpreter's detached child (`detached_windows.rs` oracle shape) — byte-identical or
    decline. `self.attest` on the JIT reads `window_exposed = false`. Includes the **spawn-time
    args payload** on op 15 (interpreter arm + servicer) so a detached phase can take argv.
-3. **#1286 — Concurrent detached children** on the wasm-JIT tier (the playground shape): N instances,
-   N memories, independent growth; a Worker-hosted detached child (grandchild spawn posts the
-   `Memory`). Plus the coop-engine op-15 event arm (`VcpuEvent::InstantiateDetached`) so a
-   *guest* parent on the browser coop engine can issue op 15.
+3. **#1286 — guest-issued op 15 + concurrent detached children.** 3a (**done**): the resumable-engine
+   event arm (`VcpuEvent::InstantiateDetached`, args payload, minter admission), the op-13 servicer
+   minting a child `Memory` per spawn (`foreign_mint`) and staging `OP13JIT_CHILD_DETACHED`, and
+   the starter-caps correction above. 3b (after slices 4–5): N Worker-hosted detached children
+   (grandchild spawn posts the `Memory`), independent growth, the V8-limits probe.
 4. **#1287 — Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
    root-sized; seed segments directly; delete the two memcpys — R5 parity, and a perf win.
 5. **#1288 — op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete #1253

@@ -80,6 +80,16 @@ export function foreignImports(engineMemory) {
       dst += base; src += base;
       child(id, Math.max(dst, src) + len).copyWithin(dst, src, src + len);
     },
+    // Mint a fresh shared child memory of `initial`..`maximum` bytes (header included) and register it
+    // with `base` as the region origin (#1286). Returns the id, or -1 if the constructor refused.
+    foreign_mint: (base, initial, maximum) => {
+      try {
+        const m = new WebAssembly.Memory({
+          initial: Math.ceil(initial / 65536), maximum: Math.ceil(maximum / 65536), shared: true,
+        });
+        return registerForeign(m, base);
+      } catch { return -1; }
+    },
     // Make `len` region bytes addressable: grow the memory by whole pages. 1 = ok, 0 = refused (at the
     // memory's `maximum`). The cached views go stale-short and refresh on their next miss.
     foreign_grow: (id, len) => {
