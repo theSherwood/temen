@@ -5853,45 +5853,45 @@ impl JitOnrampRun {
             u64,
             u64,
         ) = match input {
-                RunInput::Stdin(stdin) => {
-                    let mut host = Host::new();
-                    host.stdin = stdin;
-                    // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
-                    // by name; `display` too (unused by a pure compute guest, present for parity with
-                    // `onramp_exec`). No `fs` (input comes from stdin).
-                    let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
-                    (host, Vec::new(), frame, None, 0, 0)
-                }
-                RunInput::Fs {
-                    image,
-                    argv,
-                    stdin,
-                    readback,
-                } => {
-                    // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as
-                    // the bytecode `onramp_fs_exec` builds it. The `MemFsHandle` is retained only when a
-                    // `readback` key was requested (a file-output phase guest like nifler); otherwise it is
-                    // dropped, as a stdout guest (chibicc) needs no snapshot.
-                    let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
-                    let (mut host, init_mem, fsh) = pg_setup(&module, &image, &argv_refs)?;
-                    host.stdin = stdin;
-                    let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                    let fs_readback = readback.map(|key| (fsh, key));
-                    (host, init_mem, frame, fs_readback, 0, 0)
-                }
-                RunInput::PreGranted {
-                    host,
-                    init_mem,
-                    readback,
-                    entry_sp,
-                    entry_as,
-                } => {
-                    // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
-                    // here; the parent granted exactly what the child holds (the confinement default).
-                    let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
-                    (*host, init_mem, frame, readback, entry_sp, entry_as)
-                }
-            };
+            RunInput::Stdin(stdin) => {
+                let mut host = Host::new();
+                host.stdin = stdin;
+                // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
+                // by name; `display` too (unused by a pure compute guest, present for parity with
+                // `onramp_exec`). No `fs` (input comes from stdin).
+                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                (host, Vec::new(), frame, None, 0, 0)
+            }
+            RunInput::Fs {
+                image,
+                argv,
+                stdin,
+                readback,
+            } => {
+                // The headless memfs powerbox (`fs` image + argv at POWERBOX_ARGS_BASE), exactly as
+                // the bytecode `onramp_fs_exec` builds it. The `MemFsHandle` is retained only when a
+                // `readback` key was requested (a file-output phase guest like nifler); otherwise it is
+                // dropped, as a stdout guest (chibicc) needs no snapshot.
+                let argv_refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+                let (mut host, init_mem, fsh) = pg_setup(&module, &image, &argv_refs)?;
+                host.stdin = stdin;
+                let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let fs_readback = readback.map(|key| (fsh, key));
+                (host, init_mem, frame, fs_readback, 0, 0)
+            }
+            RunInput::PreGranted {
+                host,
+                init_mem,
+                readback,
+                entry_sp,
+                entry_as,
+            } => {
+                // Run over the caller's marshaled granted powerbox verbatim — no on-ramp caps are added
+                // here; the parent granted exactly what the child holds (the confinement default).
+                let frame = std::sync::Arc::new(std::sync::Mutex::new(None));
+                (*host, init_mem, frame, readback, entry_sp, entry_as)
+            }
+        };
         // The emitted `f{entry}` is called `f{entry}(win, env, ...declared params)`. A paramless `_start`
         // adds no trailing slots; a §14 child-entry (`[I64]->[I64]` / `[I64,I64]->[I64]`) takes its
         // starter `Instantiator` as the first param (`entry_sp`) and its `AddressSpace` as the second
@@ -8925,25 +8925,8 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
     let file = String::from_utf8_lossy(sl(file_ptr, file_len)).into_owned();
     let out = String::from_utf8_lossy(sl(out_ptr, out_len)).into_owned();
     let src = sl(src_ptr, src_len).to_vec();
-    let child_key = nifler_module_key(sl(child_ptr, child_len));
-    let Ok(child) = temen_encode::decode_module(sl(child_ptr, child_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    if temen_verify::verify_module(&child).is_err() {
-        return -STATUS_VERIFY_ERR;
-    }
-
-    // The shared memfs the child reads its source from + writes its `.p.nif` into.
     let file_key = file.trim_start_matches('/').to_string();
     let readback = out.trim_start_matches('/').to_string();
-    let (factory, handle) =
-        temen_fs::mem_fs_shared_factory(vec![(file_key, src)], vec!["nimcache".into()]);
-    let factory = std::sync::Arc::new(factory);
-
-    // The real phase driver (mirrors nimc::run_phase_op13): a buddy-half carve sized for the phase heap.
-    let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
-    let child_sl = (decl + 3).max(24);
-    let carve_off = 1u64 << child_sl;
     let argv = [
         "nifler",
         "--portablePaths",
@@ -8952,8 +8935,149 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
         file.as_str(),
         out.as_str(),
     ];
-    let driver_src =
-        nimc::op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), &argv);
+    unsafe {
+        op13_phase_open_impl(
+            sl(child_ptr, child_len),
+            &argv,
+            vec![(file_key, src)],
+            readback,
+            0,
+        )
+    }
+}
+
+/// The **phase-agnostic** op-13 tier-up driver (#1025 3a.3): drive any 3-cap `{fs, stdout, exit}`
+/// `--child-entry` phase (nifler, hexer, …) on emitted wasm. `argv_packed` = `[argc: u32][per arg:
+/// len: u32, utf8 bytes]`; `seed_packed` = `[count: u32][per file: name_len: u32, name, data_len: u32,
+/// data]` (files seeded into the shared memfs at their **relative** keys — the child reads its inputs
+/// from them); `out` = the memfs key to read back with [`temen_op13jit_phase_output`]. `carve_log2` is
+/// the child's carve size (`0` = the nifler-default `(declared+3).max(24)` heuristic; a heavy phase like
+/// hexer passes `28` for its ~256 MiB peak). Drive exactly like [`temen_op13jit_phase_open`]. (nimsem's
+/// 4-cap `exec` form — spawning nifler grandchildren — is a separate driver.) Returns `0` or a negative
+/// status.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: packed (ptr,len) pairs + carve size
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
+    child_ptr: *const u8,
+    child_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    carve_log2: u32,
+) -> i32 {
+    temen_op13jit_close();
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
+        .trim_start_matches('/')
+        .to_string();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    unsafe {
+        op13_phase_open_impl(
+            sl(child_ptr, child_len),
+            &argv_refs,
+            seeds,
+            readback,
+            carve_log2,
+        )
+    }
+}
+
+/// Parse `[count: u32][per item: len: u32, bytes]` (LE) into UTF-8 strings — `None` on malformation.
+fn parse_packed_strs(b: &[u8]) -> Option<Vec<String>> {
+    let mut p = 0usize;
+    let rd_u32 = |b: &[u8], p: &mut usize| -> Option<usize> {
+        let e = *p + 4;
+        let v = u32::from_le_bytes(b.get(*p..e)?.try_into().ok()?) as usize;
+        *p = e;
+        Some(v)
+    };
+    let n = rd_u32(b, &mut p)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let len = rd_u32(b, &mut p)?;
+        let bytes = b.get(p..p + len)?;
+        p += len;
+        out.push(String::from_utf8(bytes.to_vec()).ok()?);
+    }
+    Some(out)
+}
+
+/// Parse `[count: u32][per file: name_len: u32, name, data_len: u32, data]` (LE) into
+/// `(name, data)` seed pairs (names trimmed of a leading `/` for the relative-only memfs) — `None` on
+/// malformation.
+#[allow(clippy::type_complexity)]
+fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
+    let mut p = 0usize;
+    let rd_u32 = |b: &[u8], p: &mut usize| -> Option<usize> {
+        let e = *p + 4;
+        let v = u32::from_le_bytes(b.get(*p..e)?.try_into().ok()?) as usize;
+        *p = e;
+        Some(v)
+    };
+    let n = rd_u32(b, &mut p)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let nl = rd_u32(b, &mut p)?;
+        let name = std::str::from_utf8(b.get(p..p + nl)?).ok()?;
+        p += nl;
+        let dl = rd_u32(b, &mut p)?;
+        let data = b.get(p..p + dl)?.to_vec();
+        p += dl;
+        out.push((name.trim_start_matches('/').to_string(), data));
+    }
+    Some(out)
+}
+
+/// Shared core of the op-13 tier-up phase drivers: decode+verify the `--child-entry` phase module,
+/// seed `seeds` into a shared memfs, build the 3-cap `{fs, stdout, exit}` `nimc::op13_parent_src`
+/// driver over `argv`, and stand up the resumable root the JS loop ([`temen_op13jit_step`]) drives —
+/// emitting the child to wasm. `readback` is the memfs key [`temen_op13jit_phase_output`] returns.
+/// Phase-agnostic: nifler, hexer, and any other 3-cap phase differ only in `argv`/`seeds`/`readback`.
+///
+/// # Safety
+/// `child_bytes` must be a live slice for the duration of the call.
+unsafe fn op13_phase_open_impl(
+    child_bytes: &[u8],
+    argv: &[&str],
+    seeds: Vec<(String, Vec<u8>)>,
+    readback: String,
+    carve_log2: u32,
+) -> i32 {
+    let child_key = nifler_module_key(child_bytes);
+    let Ok(child) = temen_encode::decode_module(child_bytes) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&child).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+
+    // The shared memfs the child reads its inputs from + writes its output into.
+    let (factory, handle) = temen_fs::mem_fs_shared_factory(seeds, vec!["nimcache".into()]);
+    let factory = std::sync::Arc::new(factory);
+
+    // The real phase driver (mirrors nimc::run_phase_op13): a buddy-half carve sized for the phase heap.
+    // `carve_log2 == 0` → the nifler-default `(declared+3).max(24)`; else the caller-supplied size (e.g.
+    // hexer's 28 for its ~256 MiB peak — its small declared window would otherwise undersize the carve).
+    let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
+    let child_sl = if carve_log2 == 0 {
+        (decl + 3).max(24)
+    } else {
+        carve_log2.max(decl)
+    };
+    let carve_off = 1u64 << child_sl;
+    let driver_src = nimc::op13_parent_src(child_sl, carve_off, temen_ir::module_args_base(), argv);
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
         return -STATUS_DECODE_ERR;
     };
@@ -9165,9 +9289,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     return OP13JIT_TRAP;
                 }
                 let _ = entry; // the emitted entry is `f{entry}` (0 for the phase drivers here)
-                // The child-entry's starter handles, exactly as the interpreter passes them
-                // (`[Instantiator, AddressSpace]` for the two-param shape) — #1201: a page-op child's
-                // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`.
+                               // The child-entry's starter handles, exactly as the interpreter passes them
+                               // (`[Instantiator, AddressSpace]` for the two-param shape) — #1201: a page-op child's
+                               // outlined leaf `call.cap`s on the second, so it must be the real handle, not `0`.
                 let run = unsafe {
                     JitOnrampRun::open_shared_run_over_host(
                         &d.child,
