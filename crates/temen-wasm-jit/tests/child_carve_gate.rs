@@ -3,7 +3,7 @@
 //! precondition for routing a nested child's live `"mapped"` global to its carve, so it is exercised
 //! directly here (its carve arithmetic is also fuzzed transitively via `temen_mask::Window::sub`).
 
-use temen_wasm_jit::{check_child_carve, child_carve_fits};
+use temen_wasm_jit::{check_child_carve, child_carve_fits, child_carve_fits_growable};
 
 /// A minimal verified child module declaring `memory {log2}` (the only field the gate reads).
 fn child(log2: u8) -> temen_ir::Module {
@@ -196,6 +196,131 @@ fn child_carve_fits_matches_u128_oracle() {
             assert!(
                 off.checked_add(carve).is_some_and(|e| e <= parent_mapped),
                 "admitted carve straddles the parent window"
+            );
+            assert!(
+                parent_base.checked_add(off).is_some_and(|a| a >= guard),
+                "admitted carve dips into the NULL guard"
+            );
+        }
+    }
+}
+
+// ---- #1253: the growable-backing carve gate as its own confinement unit ------------------------------
+//
+// `child_carve_fits_growable` admits a §14 op-13 child whose backing grows under a fixed grant ceiling
+// (no 8×/buddy pre-size): the offset is only **wasm-page**-aligned (the driver's grant records sit in
+// `[0, off)` below the child — a small offset the strict, carve-aligned `child_carve_fits` would refuse)
+// and the carve is a ceiling in the holder's **reservation**, not its backed extent. The escape property
+// is unchanged — an admitted carve is a power of two, wholly inside `[0, parent_reserved)`,
+// page-aligned, and clears the NULL guard — so the same `u128` overflow-free oracle re-derives it, with
+// `parent_reserved` in place of `parent_mapped` and page- for carve-alignment. This pins that decoupling
+// the backing from the grant did **not** widen what geometry is admitted (still no straddle, no
+// guard-dip), and the alignment relaxation admits *exactly* the page-aligned offsets, no more.
+
+const WASM_PAGE: u64 = 1 << 16;
+
+/// The independent oracle for [`child_carve_fits_growable`] — the growable twin of [`oracle`]: carve is a
+/// ceiling in `parent_reserved`, the offset is wasm-page-aligned. `u128` throughout so no clause can wrap.
+fn oracle_growable(
+    declared: Option<u8>,
+    off: u64,
+    carve_log2: u32,
+    parent_reserved: u64,
+    parent_base: u64,
+    guard: u64,
+) -> Option<u64> {
+    if carve_log2 >= 64 {
+        return None;
+    }
+    let carve = 1u128 << carve_log2;
+    let mod_ok = declared.is_none_or(|d| u32::from(d) <= carve_log2);
+    let aligned = (off as u128) & (WASM_PAGE as u128 - 1) == 0;
+    let carve_le_res = carve <= parent_reserved as u128;
+    let fits_win = (off as u128 + carve) <= parent_reserved as u128;
+    let base_sum = parent_base as u128 + off as u128;
+    let clears_guard = base_sum <= u64::MAX as u128 && base_sum >= guard as u128;
+    (mod_ok && carve_le_res && aligned && fits_win && clears_guard).then_some(carve as u64)
+}
+
+#[test]
+fn child_carve_fits_growable_matches_u128_oracle() {
+    let mut rng = Rng(0x9053_1253_600D_5EED);
+    for i in 0..3_000_000u64 {
+        let structured = i & 1 == 0;
+
+        let declared = match rng.next() % 4 {
+            0 => None,
+            _ => Some((rng.next() % 66) as u8),
+        };
+        let carve_log2 = match rng.next() % 8 {
+            0 => (rng.next() % 256) as u32,
+            1 => 60 + (rng.next() % 8) as u32,
+            _ => (rng.next() % 40) as u32,
+        };
+        let guard: u64 = if rng.next().is_multiple_of(4) {
+            rng.next() % 65536
+        } else {
+            16384
+        };
+
+        let (off, parent_reserved, parent_base) = if structured && carve_log2 < 40 {
+            // A large reservation (the growable holder addresses far past its live backing) with a
+            // **page-aligned** offset holding a small driver header below the child — the accept path the
+            // buddy gate could never reach (a page-sized offset is never carve-aligned for a big carve).
+            let rlog = 20 + (rng.next() % 20) as u32; // 1 MiB .. 1 TiB reservation
+            let parent_reserved = 1u64 << rlog;
+            // Offsets: exact page multiples (the header sizes a real driver would use), plus a few past
+            // the reservation, plus the occasional non-page value to exercise the reject path.
+            let off = match rng.next() % 6 {
+                0 => 0,
+                1 => WASM_PAGE, // one-page header (the real layout)
+                2 => WASM_PAGE * (1 + rng.next() % 4), // a few pages of header
+                3 => parent_reserved.wrapping_sub(WASM_PAGE), // near the top
+                4 => (rng.next() % (parent_reserved + WASM_PAGE)) & !(WASM_PAGE - 1), // random aligned
+                _ => rng.next() % (parent_reserved + WASM_PAGE), // random (mostly non-page ⇒ reject)
+            };
+            let parent_base = if rng.next().is_multiple_of(3) {
+                rng.next() % 32768
+            } else {
+                1u64 << (rlog + 1)
+            };
+            (off, parent_reserved, parent_base)
+        } else {
+            (rng.next(), rng.next(), rng.next())
+        };
+
+        let got = child_carve_fits_growable(
+            declared,
+            off,
+            carve_log2,
+            parent_reserved,
+            parent_base,
+            guard,
+        );
+        let want = oracle_growable(
+            declared,
+            off,
+            carve_log2,
+            parent_reserved,
+            parent_base,
+            guard,
+        );
+        assert_eq!(
+            got, want,
+            "child_carve_fits_growable != u128 oracle: declared={declared:?} off={off} \
+             carve_log2={carve_log2} parent_reserved={parent_reserved} parent_base={parent_base} \
+             guard={guard}"
+        );
+        if let Some(carve) = got {
+            assert!(carve.is_power_of_two(), "admitted a non-power-of-two carve");
+            assert_eq!(
+                off & (WASM_PAGE - 1),
+                0,
+                "admitted a non-page-aligned offset"
+            );
+            assert!(
+                off.checked_add(carve).is_some_and(|e| e <= parent_reserved),
+                "admitted carve straddles the holder reservation"
             );
             assert!(
                 parent_base.checked_add(off).is_some_and(|a| a >= guard),
