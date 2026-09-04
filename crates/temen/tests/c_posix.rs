@@ -4851,6 +4851,174 @@ fn c_stop_continue_reap_dispatch_is_reorder_free_under_stress() {
     }
 }
 
+fn pipejob_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pa, pb;\n\
+static int fa[2]; static int fb[2];\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }}\n\
+int main(void){{\n\
+  int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  pa = __px_fork(0,0);\n\
+  if (pa < 0) return 1;\n\
+  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 2;\n\
+  /* the SECOND stage joins the FIRST's group: the pipeline is ONE job in one process group */\n\
+  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  __px_setpgid(0, pa, pa);\n\
+  __px_setpgid(0, pb, pa);\n\
+  /* stop the WHOLE pipeline with one group signal — it must reach BOTH parked members. */\n\
+  __px_kill(0, -pa, 20);\n\
+  int sa=0, sb=0, k;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){{}}\n\
+    if (h < 0) return 100+k;\n\
+    if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
+    if (h==pa) sa++; else if (h==pb) sb++; else return 200+k;\n\
+  }}\n\
+  if (sa!=1 || sb!=1) return 300;\n\
+  /* continue the whole group with one signal, feed both stages, reap both. */\n\
+  __px_kill(0,-pa,18);\n\
+  wr1(fa[1]); wr1(fb[1]);\n\
+  int ea=0, eb=0;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+    if (h < 0) return 4000 + (int)(-h);\n\
+    if ((status & 0x7f) != 0) return 500 + (status & 0xffff);\n\
+    int code = (status>>8)&0xff;\n\
+    if (h==pa){{ if(code!=7) return 601; ea++; }}\n\
+    else if (h==pb){{ if(code!=9) return 602; eb++; }}\n\
+    else return 603;\n\
+  }}\n\
+  if (ea!=1 || eb!=1) return 700;\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+fn pipekill_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pa, pb;\n\
+static int fa[2]; static int fb[2];\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+int main(void){{\n\
+  int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  pa = __px_fork(0,0);\n\
+  if (pa < 0) return 1;\n\
+  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 2;\n\
+  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  __px_setpgid(0, pa, pa);\n\
+  __px_setpgid(0, pb, pa);\n\
+  /* ^C the whole pipeline: SIGINT (no handler ⇒ TERMINATE) must reach and kill BOTH parked members. */\n\
+  __px_kill(0, -pa, 2);\n\
+  int ka=0, kb=0, k;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+    if (h < 0) return 100+k;\n\
+    if ((status & 0x7f) != 2) return 2000 + (status & 0xffff);  /* both WIFSIGNALED(SIGINT) */\n\
+    if (h==pa) ka++; else if (h==pb) kb++; else return 200+k;\n\
+  }}\n\
+  if (ka!=1 || kb!=1) return 300;\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #798/#1262 pipeline terminate — ^C of a foreground pipeline must kill EVERY stage. Two twins share
+// one process group and both park on a pipe read; a single `kill(-pgid, SIGINT)` (no handler ⇒ default
+// TERMINATE) must terminate BOTH parked members, each reaped WIFSIGNALED(SIGINT). This is the
+// group-fan-out of the #1262 terminate-a-parked-job fix: on the cooperative driver ONE bell ring must
+// wake the pump so its loop-top kill sweep finalizes BOTH killed twins in the same settle (not just the
+// first). Returns 42 across the tree-walker, the cooperative bytecode engine, and the parallel driver.
+#[test]
+fn c_foreground_pipeline_group_is_terminated_by_a_group_sigint() {
+    let e = run_interp_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: one SIGINT to the pipeline group terminated both parked stages, each reaped \
+         WIFSIGNALED(SIGINT)"
+    );
+    let b = run_bytecode_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the group SIGINT woke the pump and the loop-top kill sweep \
+         finalized both killed members — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: both parked members of the group self-terminated at their per-op term_flag \
+         poll — matching the oracle"
+    );
+}
+
+// #798 pipeline-as-a-job — a foreground pipeline (`a | b`) is ONE job whose stages share ONE process
+// group, so a job-control signal (^Z/SIGTSTP, ^C, SIGCONT via `fg`/`bg`) must fan out to EVERY member
+// of the group, not just the leader. Two twins are forked, the second `setpgid`'d into the FIRST's
+// group (the pipeline group), and both park on a pipe read; a single `kill(-pgid, SIGTSTP)` must stop
+// BOTH, the shell collects two `waitpid(-1, WUNTRACED)` stop reports, a single `kill(-pgid, SIGCONT)`
+// resumes BOTH, and each is fed a byte and reaped with its own exit. This is the group-fan-out shape
+// behind `cat | cat` + `^Z`/`fg`: `c_multiple_background_jobs_...` covers one member per group; this
+// covers two members in one group. Returns 42 on the tree-walker, the cooperative bytecode engine, and
+// the parallel driver.
+#[test]
+fn c_foreground_pipeline_group_stops_and_continues_all_members() {
+    let e = run_interp_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: one SIGTSTP to the pipeline group stopped both stages, both stops were reported, \
+         one SIGCONT resumed both, and each was reaped with its own exit"
+    );
+    let b = run_bytecode_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the group signal reached both parked members of the one \
+         pipeline group — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: the same one-group two-member stop/continue over real OS threads — matching the oracle"
+    );
+}
+
 // #797 — ^D (VEOF) is a ONE-SHOT EOF, not a permanent terminal close. The guest reads the terminal
 // twice: a ^D on the first (empty) read returns 0 (EOF), and a SECOND read then BLOCKS for fresh
 // input — a later `x\n` completes it. Before the fix, the empty-line VEOF dropped the terminal's
