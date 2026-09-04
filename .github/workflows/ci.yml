@@ -954,6 +954,12 @@ jobs:
           # interpreter oracle (top-level nifler on the tree-walker). nimc.rs phase-1 nifler crawl, nested +
           # JIT'd. Uses the committed nifler_ce.temen.gz + web/assets/nifler.temen.gz; reuses the threads module.
           node browser-op13jit-nifler-test.mjs
+          # #1025 3a.3 (real hexer): the phase-agnostic op-13 tier-up (`temen_op13jit_phase_open_argv`) on the
+          # second front-end phase — a driver marshals {fs,stdout,exit} to hexer_ce (child-entry), seeds the
+          # committed semchecked system module (`.s.nif` + `.s.idx.nif`), and JS runs hexer_ce's `_start` on
+          # emitted wasm over its 256 MiB carve; the Leng `.x.nif` it writes is byte-identical to the committed
+          # expected (hexer is deterministic — the `rust_driver_hexer.rs` oracle). Reuses the threads module.
+          node browser-op13jit-hexer-test.mjs
           # #1025 Path 1 (whole card): drive the WHOLE nim card through the op-13 loop — the compile's phase-1
           # nifler crawl runs each module as a nested op-13 emitted child (nifler_ce, {fs,stdout,exit}
           # marshaled, emit cached across modules), then nimsem/hexer/link/run finish. The card's output is
