@@ -1,6 +1,6 @@
 # Detached windows on the JIT tiers, and the default-spawn question  [DRAFT — proposed as PROCESS.md §5a]
 
-**Status:** design draft for owner decision. Nothing here is built; the interpreter half it
+**Status:** owner-accepted 2026-09-04 — Decision A in progress (#1253 tracks the slices), Decision B tracked in #1289 pending the §4a rulings. Nothing here is built; the interpreter half it
 rests on **is** built (PROCESS.md §5, 2026-07-23). Written for #1253 / epic #706 after the
 op-13 phase-child sizing work exposed that "grow the window in place" cannot be delivered by
 the sub-window model at all.
@@ -63,8 +63,8 @@ would plausibly run coreutils detached and its own helper coroutines nested."*
 `memory.grow`" inside the shared window) is the wrong lever. The right lever is *running the
 big phases as detached children on the JIT tier*, which needs the work below. PR #1268's
 cap-and-reserve (commit 5d19eca, unmerged) stays as the interim for nested children (it fixes the invariant-9
-divergence and the 2 GiB failure); its slices 1–2 (a single top-of-memory grower) should be
-**reverted** — they implement the mechanism this note retires.
+divergence and the 2 GiB failure); its slices 1–2 (a single top-of-memory grower) are **reverted** on the PR — they implemented the
+mechanism this note retires.
 
 ## 2. Requirements (accumulated from the #1253 thread)
 
@@ -520,37 +520,37 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 
 **Decision A (no default change; no invariant renegotiation):**
 
-0. **File and fix the `FutexKey::Anon` collision** on the interpreter's op-15 path (a
+0. **#1283 — File and fix the `FutexKey::Anon` collision** on the interpreter's op-15 path (a
    pre-existing bug; the regression test in §6.5). Independent of everything else and a
    prerequisite for slice 3.
-1. **`Region::Foreign` on wasm** (§3.3): the JS-proxied child-memory backing below the
+1. **#1284 — `Region::Foreign` on wasm** (§3.3): the JS-proxied child-memory backing below the
    `GuestMem` chokepoint, carrying the decline path too. Additive, `cfg(wasm)`. Lands with a
    micro-benchmark of interpreted access over `Foreign` vs `Shared` — the **measured gate** for
    the declined-body cost; if unacceptable, the escalation is the sweep's option (4), not a
    silent regression.
-2. **wasm-JIT detached child, single**: JS mints a per-child shared `WebAssembly.Memory`
+2. **#1285 — wasm-JIT detached child, single**: JS mints a per-child shared `WebAssembly.Memory`
    (`maximum` = grant); header page at `[0, 64 KiB)` holding the `env` cell and `pagestate`,
    `win = 65536`; the servicer runs a detached `JitOnrampRun` over `Region::Foreign`;
    `call_interp` copies the slots; grow happens on the child's memory from JS; differential vs
    the interpreter's detached child (`detached_windows.rs` oracle shape) — byte-identical or
    decline. `self.attest` on the JIT reads `window_exposed = false`. Includes the **spawn-time
    args payload** on op 15 (interpreter arm + servicer) so a detached phase can take argv.
-3. **Concurrent detached children** on the wasm-JIT tier (the playground shape): N instances,
+3. **#1286 — Concurrent detached children** on the wasm-JIT tier (the playground shape): N instances,
    N memories, independent growth; a Worker-hosted detached child (grandchild spawn posts the
    `Memory`). Plus the coop-engine op-15 event arm (`VcpuEvent::InstantiateDetached`) so a
    *guest* parent on the browser coop engine can issue op 15.
-4. **Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
+4. **#1287 — Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
    root-sized; seed segments directly; delete the two memcpys — R5 parity, and a perf win.
-5. **op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete #1253
+5. **#1288 — op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete #1253
    payoff: no carve ceiling, no 2 GiB module, parent shrinks to KiB. Playground parent calls
    op 15 explicitly.
 6. **Fuzz**: `nested_paged` gets an isolated twin; `pagestate`/`live_mapped`/`paged_walk` are
    parameterized over an isolated window; `grant_marshal_fuzz` keeps its authority half verbatim
    and re-plumbs its source window. `mask.rs` needs **no** twin (base-0 = `with_mapped`, already
    fuzzed). Open the missing nested-durability fuzz coverage DURABILITY.md already asks for.
-7. **Revert #1268 slices 1–2** (the single top-of-memory grower this retires).
+7. **Revert #1268 slices 1–2** — done (the single top-of-memory grower this retires).
 
-**Decision B (gated on the three §4a rulings, recorded in INVARIANTS.md first):**
+**Decision B — #1289 (gated on the three §4a rulings, recorded in INVARIANTS.md first):**
 
 8. **Default flip** in the PROCESS.md §3 substrate (`create(window)` defaults to a minted
    detached window; **durable ⇒ nested**), `WindowMinter` quota folded into `Budget.mem`.
