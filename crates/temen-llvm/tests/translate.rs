@@ -12909,6 +12909,43 @@ fn demo_bash_translates_and_verifies() {
         "x=y; y=hit; echo \"${!x}\"; declare -n r=y; echo \"$r\"; r=changed; echo \"$y\"",
         // Command grouping exit status, negation !, && / || short-circuit.
         "{ true; }; echo $?; { false; }; echo $?; ! false; echo $?; true && echo a || echo b",
+        // Round 6 — an exotic-surface language-differential survey (a 25-construct probe found ALL of
+        // these already byte-identical to native; pinned here as regression gates, no temen bug found).
+        // The kill-based async trap (`kill -USR1 $$`) matches native on the tree-walker; on the coop and
+        // parallel tiers async delivery into a running C handler is interp-only (#796 L2), so it prints
+        // less there — coherently between the two, which is what the coop==parallel assertion below checks.
+        // getopts: combined flags, optarg, `--` terminator, silent-mode missing-arg, invalid option.
+        "set -- -ab -c val x y; while getopts 'abc:' o; do echo \"$o=${OPTARG:-}\"; done; echo \"rest=${*:$OPTIND}\"",
+        "set -- -x -- -y; while getopts 'xy' o; do echo \"$o\"; done; shift $((OPTIND-1)); echo \"rest=$*\"",
+        "set -- -c; while getopts ':c:' o; do echo \"$o/${OPTARG:-none}\"; done",
+        "set -- -q z; while getopts 'a' o; do echo \"$o\"; done 2>/dev/null; echo \"after opt=$OPTIND\"",
+        // ${var@…} transforms: U/L/u case, A declare-form, a attributes, E escape-expand, k assoc pairs.
+        "v=Hello; echo \"${v@U}/${v@L}/${v@u}\"",
+        "v=x; echo \"${v@A}\"",
+        "declare -i n=5; echo \"${n@a}\"",
+        "v='a\\tb\\n'; echo \"${v@E}\"",
+        "declare -A m=([a]=1 [b]=2); echo \"${m[@]@k}\"",
+        // extended globs (extglob): +(…)/@(…)/!(…) in replace, [[, case, and quantified patterns.
+        "shopt -s extglob; v=foobarbaz; echo \"${v//+([ao])/_}\"; [[ abc == @(abc|xyz) ]] && echo m1; [[ aXXc == a+(X)c ]] && echo m2",
+        "shopt -s extglob; for f in a.txt b.log c.md; do case $f in *.@(txt|md)) echo \"keep $f\";; esac; done",
+        "shopt -s extglob; [[ 123abc == +([0-9])+([a-z]) ]] && echo match; [[ x == !(y) ]] && echo neg",
+        // trap edges: -p print, nested EXIT in a subshell, synchronous DEBUG count, $? snapshot, async kill.
+        "trap 'echo hi' INT; trap -p INT",
+        "trap 'echo outer' EXIT; (trap 'echo inner' EXIT; echo sub); echo main",
+        "n=0; trap 'echo \"d$((++n))\"' DEBUG; true; :; echo end",
+        "trap 'echo \"got=$?\"' USR1; f() { return 4; }; f; kill -USR1 $$; echo after",
+        // printf edges: 'A char-code idiom, bases in %d, %c first-char, -v capture + width reuse.
+        "printf '%d %d\\n' \"'A\" \"'z\"",
+        "printf '%d %d %d\\n' 0x1f 010 42",
+        "printf '%c%c%c\\n' abc def ghi",
+        "printf -v out '[%5s|%-5s]' hi yo; echo \"$out\"",
+        // integer attribute (arith on assign + +=), readonly (failed-assign status), local -n nameref.
+        "declare -i x; x='5+3*2'; echo \"$x\"; x+=4; echo \"$x\"",
+        "x=5; readonly x; { x=9; } 2>/dev/null; echo \"$x/$?\"",
+        "f() { local -n ref=$1; ref=changed; }; v=orig; f v; echo \"$v\"",
+        // select (menu → stderr, REPLY from a fed line); coproc round-trip through its two pipes.
+        "select x in a b c; do echo \"picked=$x\"; break; done <<< '2' 2>/dev/null",
+        "coproc { read line; echo \"reply:$line\"; }; echo ping >&\"${COPROC[1]}\"; read -u \"${COPROC[0]}\" r; echo \"$r\"; wait 2>/dev/null",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
