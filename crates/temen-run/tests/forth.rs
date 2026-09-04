@@ -253,6 +253,37 @@ const RSTACK: &str = ": rot3 ( a b c -- b c a ) >r swap r> swap ;\n\
     10 20 30 rsum3 . cr\n";
 const RSTACK_OUT: &str = "1 3 2 \n7 7 \n65 122 \n2 1 4 3 \n2 1 4 3 2 1 \n60 \n";
 
+/// A whole program, not one feature: the sieve of Eratosthenes counts the primes below N. It leans on
+/// everything at once — `variable`/`here`/`allot` for a byte array, a nested `do` loop whose inner
+/// bound is `+loop`-stepped by the outer prime (`j`), `i`/`c@`/`c!` to mark multiples, and `if`/`0=`.
+/// That it is byte-identical across interp == JIT (and the bytecode leg) is the language validated as
+/// a whole, not just per-word.
+#[test]
+fn forth_sieve_of_eratosthenes() {
+    let out = forth(SIEVE);
+    assert_eq!(out, SIEVE_OUT);
+}
+
+const SIEVE: &str = "variable arr\n\
+    variable lim\n\
+    : primes ( n -- c )\n\
+      lim !\n\
+      here arr !\n\
+      lim @ allot\n\
+      0\n\
+      lim @ 2 do\n\
+        arr @ i + c@ 0= if\n\
+          1+\n\
+          i dup * lim @ < if\n\
+            lim @ i dup * do\n\
+              1 arr @ i + c!\n\
+            j +loop\n\
+          then\n\
+        then\n\
+      loop ;\n\
+    10 primes . 30 primes . 100 primes . cr\n";
+const SIEVE_OUT: &str = "4 10 25 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
@@ -266,6 +297,7 @@ fn forth_on_the_bytecode_engine() {
         (DEFER, DEFER_OUT),
         (DO_LOOP, DO_LOOP_OUT),
         (RSTACK, RSTACK_OUT),
+        (SIEVE, SIEVE_OUT),
     ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();
