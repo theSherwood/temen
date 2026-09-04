@@ -2697,11 +2697,19 @@ pub(crate) fn onramp_check(m: &temen_ir::Module) -> Result<(), ()> {
 /// empty (the doomgeneric `DG_GetKey` shape: pump until empty each frame).
 type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>>;
 
+/// A shared **mouse event queue** (the `mouse` capability's backing) — the keyboard queue's twin, for
+/// the Uxn Varvara Mouse device. Packed event layout (an `i64`, always `>= 0`): `(kind << 32) |
+/// payload`. kind 0 = pointer: `payload = (buttons << 24) | (x << 12) | y` — `buttons` bit 0 left,
+/// bit 1 middle, bit 2 right; `x`/`y` 12-bit pixel coordinates in the presented frame. kind 1 = wheel:
+/// `payload = ((dx & 0xffff) << 16) | (dy & 0xffff)`, signed 16-bit deltas. `poll` returns `-1` when
+/// empty.
+type MouseQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i64>>>;
+
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
-/// plus the two by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
-/// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell) and
-/// `keyboard` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
+/// plus the by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
+/// `present(ptr, w, h)`, copies `w*h*4` RGBA bytes out of the window into the returned frame cell),
+/// `keyboard` and `mouse` (op 0 = `poll()`, dequeues one packed event from the returned queue, or `-1`).
 ///
 /// The on-ramp entry is the phase-4 powerbox shape (mirroring `temen-run`'s `grant_caps`): a
 /// **paramless** `_start` whose manifest imports bind to slot bindings at instantiation, and which
@@ -2715,7 +2723,11 @@ fn grant_onramp_caps(
     host: &mut Host,
     m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
-) -> (std::sync::Arc<std::sync::Mutex<Option<Frame>>>, KeyQueue) {
+) -> (
+    std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    KeyQueue,
+    MouseQueue,
+) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let handles: [i32; 5] = [
         host.grant_stream(StreamRole::Out),
@@ -2822,6 +2834,20 @@ fn grant_onramp_caps(
         }));
         host.register_cap_name("keyboard", handle);
     }
+    // `mouse` — the pointer waist (the Uxn card's Varvara Mouse device): the keyboard's twin, `poll()`
+    // dequeues one packed pointer/wheel event (see [`MouseQueue`]), or `-1` if empty.
+    let mouse: MouseQueue =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    {
+        let mouse = std::sync::Arc::clone(&mouse);
+        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
+            if op != 0 {
+                return Ok(vec![-1]); // only poll(0) is defined
+            }
+            Ok(vec![mouse.lock().unwrap().pop_front().unwrap_or(-1)])
+        }));
+        host.register_cap_name("mouse", handle);
+    }
     // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via the
     // `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0) and asks the
     // host to present a frame each tick (op 1); the parallel pixel work runs on the GPU and only tiny
@@ -2924,7 +2950,7 @@ fn grant_onramp_caps(
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
     }
-    (frame, keys)
+    (frame, keys, mouse)
 }
 
 /// #816: whether [`grant_onramp_caps`] additionally grants the opt-in `"instantiator"` capability.
@@ -2985,7 +3011,7 @@ pub fn onramp_exec_with_tee(
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let (frame, _keys) = grant_onramp_caps(&mut host, m, None);
+    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, m, None);
     let mut fuel = u64::MAX;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
@@ -4826,6 +4852,7 @@ pub struct OnrampReactor {
     tick: temen_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
+    mouse: MouseQueue,
     /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
     last_trap: Option<String>,
 }
@@ -4862,7 +4889,7 @@ impl OnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
+        let (frame, keys, mouse) = grant_onramp_caps(&mut host, m, fs);
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
         // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
@@ -4879,6 +4906,7 @@ impl OnrampReactor {
             tick,
             frame,
             keys,
+            mouse,
             last_trap: None,
         })
     }
@@ -4921,6 +4949,15 @@ impl OnrampReactor {
             .unwrap()
             .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
     }
+
+    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
+    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
+    pub fn push_mouse(&self, kind: i32, payload: i32) {
+        self.mouse
+            .lock()
+            .unwrap()
+            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+    }
 }
 
 /// Like [`OnrampReactor`], but the guest window lives in a **caller-provided region of this module's
@@ -4950,6 +4987,7 @@ pub struct SharedOnrampReactor {
     tick: temen_ir::FuncIdx,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
+    mouse: MouseQueue,
     last_trap: Option<String>,
 }
 
@@ -5015,7 +5053,7 @@ impl SharedOnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (frame, keys) = grant_onramp_caps(&mut host, m, fs);
+        let (frame, keys, mouse) = grant_onramp_caps(&mut host, m, fs);
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
         // slot bindings deliver the capabilities) to run the C initializer, seeding +
         // data-initialising the window (the once). The window then persists in the shared backing
@@ -5032,6 +5070,7 @@ impl SharedOnrampReactor {
             tick,
             frame,
             keys,
+            mouse,
             last_trap: None,
         })
     }
@@ -5080,6 +5119,15 @@ impl SharedOnrampReactor {
             .unwrap()
             .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
     }
+
+    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
+    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
+    pub fn push_mouse(&self, kind: i32, payload: i32) {
+        self.mouse
+            .lock()
+            .unwrap()
+            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+    }
 }
 
 /// A **wasm-JIT reactor** over an on-ramp guest (BROWSER.md § "wasm-JIT tier", slice 5c): the guest's
@@ -5121,6 +5169,7 @@ pub struct JitOnrampReactor {
     emitted: Vec<bool>,
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
+    mouse: MouseQueue,
     last_trap: Option<String>,
 }
 
@@ -5198,7 +5247,7 @@ impl JitOnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let (frame, keys) = grant_onramp_caps(&mut host, &module, fs);
+        let (frame, keys, mouse) = grant_onramp_caps(&mut host, &module, fs);
         // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
@@ -5237,6 +5286,7 @@ impl JitOnrampReactor {
             emitted,
             frame,
             keys,
+            mouse,
             last_trap: None,
         })
     }
@@ -5314,6 +5364,15 @@ impl JitOnrampReactor {
             .lock()
             .unwrap()
             .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+    }
+
+    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
+    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
+    pub fn push_mouse(&self, kind: i32, payload: i32) {
+        self.mouse
+            .lock()
+            .unwrap()
+            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
     }
 }
 
@@ -5859,7 +5918,7 @@ impl JitOnrampRun {
                 // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
                 // by name; `display` too (unused by a pure compute guest, present for parity with
                 // `onramp_exec`). No `fs` (input comes from stdin).
-                let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+                let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
                 (host, Vec::new(), frame, None, 0, 0)
             }
             RunInput::Fs {
@@ -6002,7 +6061,7 @@ impl JitOnrampRun {
         // The powerbox the interpreter warm path grants (`temen_warm_eval`) — a fresh host is re-granted per
         // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
         let mut host = Host::new();
-        let (frame, _keys) = grant_onramp_caps(&mut host, &module, None);
+        let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
         // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
         let program = std::sync::Arc::new(
             bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
@@ -6074,7 +6133,7 @@ impl JitOnrampRun {
         if let Some(t) = stream_tee() {
             host.set_stdout_tee(t);
         }
-        let (frame, _keys) = grant_onramp_caps(&mut host, &self.module, None);
+        let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &self.module, None);
         self.host = host;
         self.frame = frame;
         self.exit_code = 0;
@@ -7246,7 +7305,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let (frame, _keys) = grant_onramp_caps(&mut host, &wc.m, None);
+    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &wc.m, None);
     // The B2 table/unit-emitter arming, exactly as `temen_coop_open` (the emit was made with the
     // same `table_log2`/window, so the engine table and the emitted mask agree).
     if wc.all_shimmable {
@@ -7945,6 +8004,16 @@ pub extern "C" fn temen_onramp_key(keycode: i32, pressed: i32) {
     }
 }
 
+/// Enqueue a mouse event for the open reactor's guest to `poll` next frame (`kind` 0 = pointer, 1 =
+/// wheel; `payload` per [`MouseQueue`]). No-op if no reactor is open.
+#[no_mangle]
+pub extern "C" fn temen_onramp_mouse(kind: i32, payload: i32) {
+    // SAFETY: single-threaded wasm; shared read of the reactor's mouse queue.
+    if let Some(reactor) = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() } {
+        reactor.push_mouse(kind, payload);
+    }
+}
+
 /// Close the open reactor, freeing its instance. Idempotent.
 #[no_mangle]
 pub extern "C" fn temen_onramp_close() {
@@ -8306,6 +8375,16 @@ pub extern "C" fn temen_onramp_jit_key(keycode: i32, pressed: i32) {
     // SAFETY: single-threaded wasm; shared read of the reactor's key queue.
     if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
         r.push_key(keycode, pressed);
+    }
+}
+
+/// Enqueue a mouse event for the JIT reactor's guest to `poll` next frame (`kind` 0 = pointer, 1 =
+/// wheel; `payload` per [`MouseQueue`]).
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_mouse(kind: i32, payload: i32) {
+    // SAFETY: single-threaded wasm; shared read of the reactor's mouse queue.
+    if let Some(r) = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() } {
+        r.push_mouse(kind, payload);
     }
 }
 
@@ -11819,7 +11898,7 @@ pub extern "C" fn temen_coop_open(
         // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let (frame, _keys) = grant_onramp_caps(&mut host, &m, None);
+    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &m, None);
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds

@@ -30,10 +30,13 @@ static void print_dec(int v) {
   write(1, s + n, (unsigned long)(12 - n));
 }
 
-/* The key script: (frame, button mask, key byte) — arrows held for a stretch, a couple of key taps. */
-static const struct { int frame; Uint8 button, key; } script[] = {
-  {5, 0x80, 0}, {25, 0xa0, 0}, {40, 0x20, 0}, {55, 0x00, 0}, {60, 0x00, 'a'}, {70, 0x40, 0},
-  {90, 0x50, 0}, {100, 0x00, 0}, {105, 0x00, ' '},
+/* The input script: (frame, kind, a, b, c) — kind 0 = controller (button mask, key byte), 1 = mouse
+ * (x, y, state), 2 = wheel (dx, dy). Arrows held for a stretch, key taps, clicks, a wheel notch. */
+static const struct { int frame, kind, a, b, c; } script[] = {
+  {5, 0, 0x80, 0, 0},   {25, 0, 0xa0, 0, 0},  {40, 0, 0x20, 0, 0},  {55, 0, 0x00, 0, 0},
+  {60, 0, 0x00, 'a', 0}, {70, 0, 0x40, 0, 0},  {75, 1, 200, 100, 0}, {76, 1, 200, 100, 1},
+  {77, 1, 200, 100, 0},  {90, 0, 0x50, 0, 0},  {95, 2, 0, 1, 0},     {100, 0, 0x00, 0, 0},
+  {105, 0, 0x00, ' ', 0}, {110, 1, 30, 150, 1}, {111, 1, 30, 150, 0},
 };
 
 int main(void) {
@@ -46,7 +49,9 @@ int main(void) {
   int si = 0, w, h;
   for (int f = 0; f < UXN_DIFF_FRAMES && !varvara_halted(&u); f++) {
     while (si < (int)(sizeof script / sizeof script[0]) && script[si].frame == f) {
-      varvara_controller(&u, script[si].button, script[si].key);
+      if (script[si].kind == 0) varvara_controller(&u, (Uint8)script[si].a, (Uint8)script[si].b);
+      else if (script[si].kind == 1) varvara_mouse(&u, script[si].a, script[si].b, (Uint8)script[si].c);
+      else varvara_wheel(&u, script[si].a, script[si].b);
       si++;
     }
     varvara_screen_vector(&u);

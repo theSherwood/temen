@@ -5,7 +5,8 @@
 //! with key events pushed through `keyboard`. The pixels themselves are pinned byte-exact to a native
 //! build of the same C by `crates/temen-llvm/tests/uxn_diff.rs`; this proves the *reactor wiring*: the
 //! ROM arrives, the Screen vector runs each frame, the swarm animates, and key events reach the
-//! Controller device (a letter cycles the palette, the arrows move the player).
+//! Controller device (a letter cycles the palette, the arrows move the player), and pointer events
+//! pushed through `mouse` reach the Mouse device (a click puts the player under the pointer).
 //!
 //! Both assets are code-coupled: rebuild them with `ONLY=uxn bash scripts/rebuild-assets.sh` after an
 //! IR/wire change (they decode as `BadOpcode` otherwise) or a change to the demo sources.
@@ -96,4 +97,43 @@ fn keys_reach_the_controller() {
         fa = step(&mut again);
     }
     assert_eq!(fa.rgba, fi.rgba, "an input-free run is deterministic");
+}
+
+#[test]
+fn mouse_reaches_the_mouse_device() {
+    // A left click at (200, 100) — kind 0, payload (buttons << 24) | (x << 12) | y — moves the player
+    // under the pointer: its white (color 3) outline appears in the 8x8 box at (196, 96) on the next
+    // frame, where an input-free run has only background.
+    let click = |buttons: i32| (buttons << 24) | (200 << 12) | 100;
+    let mut idle = open();
+    let mut clicked = open();
+    step(&mut idle);
+    step(&mut clicked);
+    clicked.push_mouse(0, click(1));
+    clicked.push_mouse(0, click(0));
+    let fi = step(&mut idle);
+    let fc = step(&mut clicked);
+    let white = |f: &Frame| {
+        (96..104)
+            .flat_map(|y| (196..204).map(move |x| (x, y)))
+            .filter(|&(x, y)| pixel(f, x, y) == [0xff, 0xff, 0xff, 0xff])
+            .count()
+    };
+    assert_eq!(
+        white(&fi),
+        0,
+        "nothing white under the pointer without a click"
+    );
+    assert!(
+        white(&fc) >= 8,
+        "the player's outline is under the pointer after the click"
+    );
+    // A wheel notch (kind 1, dy = 1) cycles the palette, like a letter key.
+    clicked.push_mouse(1, 1);
+    let f = step(&mut clicked);
+    assert_eq!(
+        pixel(&f, 0, 0),
+        [0xee, 0x66, 0x22, 0xff],
+        "theme 1 after a wheel notch"
+    );
 }

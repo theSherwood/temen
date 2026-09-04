@@ -1,13 +1,15 @@
 ( demo.tal — the playground's Uxn demo ROM.
   A 256x192 screen: a striped background, "UXN ON TEMEN" set in a tiny 1bpp font, a swarm of 2bpp
   sprites bouncing off the walls on the foreground layer, and a player sprite you steer with the arrow
-  keys. Any letter key cycles the palette; Space resets the swarm.
+  keys, or click to put it under the pointer. Any letter key or a wheel notch cycles the palette;
+  Space resets the swarm.
   Build: uxnasm demo.tal demo.rom )
 
 ( devices )
 |00 @System &vector $2 &expansion $2 &wst $1 &rst $1 &metadata $2 &r $2 &g $2 &b $2 &debug $1 &state $1
 |20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
 |80 @Controller &vector $2 &button $1 &key $1
+|90 @Mouse &vector $2 &x $2 &y $2 &state $1 &pad $3 &scrollx $2 &scrolly $2
 
 ( zero page )
 |0000
@@ -27,6 +29,7 @@
   reset-balls
   ;on-frame .Screen/vector DEO2
   ;on-key .Controller/vector DEO2
+  ;on-mouse .Mouse/vector DEO2
 BRK
 
 @on-frame ( -> )
@@ -52,6 +55,16 @@ BRK
   DUP #20 EQU #00 EQU ?{ reset-balls }
   DUP #61 LTH ?{ .theme LDZ INC .theme STZ set-palette }
   POP
+BRK
+
+@on-mouse ( -> )
+  ( a left click moves the player under the pointer: erase it first, the frame redraws it )
+  .Mouse/state DEI #01 AND #00 EQU ?{
+    #40 draw-player
+    .Mouse/x DEI2 #0004 SUB2 #00f8 clamp .px STZ2
+    .Mouse/y DEI2 #0004 SUB2 #00b8 clamp .py STZ2 }
+  ( a wheel notch cycles the palette )
+  .Mouse/scrolly DEI2 #0000 EQU2 ?{ .theme LDZ INC .theme STZ set-palette }
 BRK
 
 ( --- palette ----------------------------------------------------------------------------------- )
