@@ -3689,6 +3689,41 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
             include_str!("../../temen-run/demos/posix_utils/cut.c"),
             false,
         ),
+        (
+            "tail",
+            include_str!("../../temen-run/demos/posix_utils/tail.c"),
+            false,
+        ),
+        (
+            "tac",
+            include_str!("../../temen-run/demos/posix_utils/tac.c"),
+            false,
+        ),
+        (
+            "rev",
+            include_str!("../../temen-run/demos/posix_utils/rev.c"),
+            false,
+        ),
+        (
+            "nl",
+            include_str!("../../temen-run/demos/posix_utils/nl.c"),
+            false,
+        ),
+        (
+            "fold",
+            include_str!("../../temen-run/demos/posix_utils/fold.c"),
+            false,
+        ),
+        (
+            "basename",
+            include_str!("../../temen-run/demos/posix_utils/basename.c"),
+            false,
+        ),
+        (
+            "dirname",
+            include_str!("../../temen-run/demos/posix_utils/dirname.c"),
+            false,
+        ),
     ];
     for want in names {
         let (_, src, rx) = TOOLS
@@ -3972,6 +4007,172 @@ int main(void) {{\n\
         ep.result,
         vec![Value::I32(42)],
         "parallel driver: parent-fed cut across four exec'd thread rounds, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **the tier-1 stream filters**: `tail -n 2`, `tac`, `rev`, `nl`, and `fold -w2`,
+/// each a parent-fed fork→exec of `/bin/<tool>` whose output is byte-checked against the GNU shape
+/// (tail's last-N window, tac's reversed line order, rev's reversed chars, nl's `%6d\t` numbering,
+/// fold's fixed-width wrap). Same read-park + reap composition as the grep/cut witnesses, over five
+/// exec rounds, verified across all three engines.
+#[test]
+fn c_coreutils_tail_tac_rev_nl_fold() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runin(char **av, char *in, long inlen, char *exp, long explen) {{\n\
+  int ip[2]; int op[2];\n\
+  if (pipe(ip) != 0 || pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, ip[0], 0); __px_dup2(0, op[1], 1);\n\
+    close(ip[0]); close(ip[1]); close(op[0]); close(op[1]);\n\
+    execvp(av[0], av); return 99;\n\
+  }}\n\
+  close(ip[0]); close(op[1]);\n\
+  if (write(ip[1], in, inlen) != inlen) return 3;\n\
+  close(ip[1]);\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avtail[] = {{ \"tail\", \"-n\", \"2\", 0 }};\n\
+static char *avtac[]  = {{ \"tac\", 0 }};\n\
+static char *avrev[]  = {{ \"rev\", 0 }};\n\
+static char *avnl[]   = {{ \"nl\", 0 }};\n\
+static char *avfold[] = {{ \"fold\", \"-w2\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runin(avtail, \"1\\n2\\n3\\n4\\n5\\n\", 10, \"4\\n5\\n\", 4);               if (r) return 10 + r;\n\
+  r = runin(avtac,  \"a\\nb\\nc\\n\", 6, \"c\\nb\\na\\n\", 6);                     if (r) return 20 + r;\n\
+  r = runin(avrev,  \"abc\\n\", 4, \"cba\\n\", 4);                            if (r) return 30 + r;\n\
+  r = runin(avnl,   \"x\\ny\\n\", 4, \"     1\\tx\\n     2\\ty\\n\", 18);          if (r) return 40 + r;\n\
+  r = runin(avfold, \"abcdef\\n\", 7, \"ab\\ncd\\nef\\n\", 9);                   if (r) return 50 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tier-1 filters: tail window, tac reverse, rev chars, nl numbering, fold wrap"
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: tier-1 stream filters across five exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["tail", "tac", "rev", "nl", "fold"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: tier-1 stream filters across five exec'd thread rounds, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **the tier-2 path staples** `basename` / `dirname`: args-only tools (no stdin)
+/// that real scripts lean on. `basename /a/b/c.txt .txt` → `c`, `basename /usr/` → `usr`,
+/// `dirname /a/b/c` → `/a/b`, `dirname a` → `.`. Each an exec'd program whose stdout is captured
+/// and byte-checked across all three engines.
+#[test]
+fn c_coreutils_basename_dirname() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runargs(char **av, char *exp, long explen) {{\n\
+  int op[2];\n\
+  if (pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, op[1], 1); close(op[0]); close(op[1]);\n\
+    execvp(av[0], av); return 99;\n\
+  }}\n\
+  close(op[1]);\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avb1[] = {{ \"basename\", \"/a/b/c.txt\", \".txt\", 0 }};\n\
+static char *avb2[] = {{ \"basename\", \"/usr/\", 0 }};\n\
+static char *avd1[] = {{ \"dirname\", \"/a/b/c\", 0 }};\n\
+static char *avd2[] = {{ \"dirname\", \"a\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runargs(avb1, \"c\\n\", 2);       if (r) return 10 + r;\n\
+  r = runargs(avb2, \"usr\\n\", 4);     if (r) return 20 + r;\n\
+  r = runargs(avd1, \"/a/b\\n\", 5);    if (r) return 30 + r;\n\
+  r = runargs(avd2, \".\\n\", 2);       if (r) return 40 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tier-2 path staples: basename with/without suffix, dirname to a parent and to \".\""
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: basename/dirname path munging across exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["basename", "dirname"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: basename/dirname across exec'd thread rounds, matching both oracles"
     );
 }
 

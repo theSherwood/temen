@@ -1290,6 +1290,31 @@ fn gen_browser_bash_coreutils() {
             "cut",
             include_str!("../../temen-run/demos/posix_utils/cut.c"),
         ),
+        (
+            "tail",
+            include_str!("../../temen-run/demos/posix_utils/tail.c"),
+        ),
+        (
+            "tac",
+            include_str!("../../temen-run/demos/posix_utils/tac.c"),
+        ),
+        (
+            "rev",
+            include_str!("../../temen-run/demos/posix_utils/rev.c"),
+        ),
+        ("nl", include_str!("../../temen-run/demos/posix_utils/nl.c")),
+        (
+            "fold",
+            include_str!("../../temen-run/demos/posix_utils/fold.c"),
+        ),
+        (
+            "basename",
+            include_str!("../../temen-run/demos/posix_utils/basename.c"),
+        ),
+        (
+            "dirname",
+            include_str!("../../temen-run/demos/posix_utils/dirname.c"),
+        ),
     ];
     for (name, src) in utils {
         let full = if *name == "grep" {
