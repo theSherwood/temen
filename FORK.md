@@ -558,22 +558,19 @@ gets `-ECHILD` (the global twin set is non-empty — it holds the child itself u
 so without scoping this would deadlock), and the parent reaps only its own child. Stable 40/40 under
 stress.
 
-**Process groups — `setpgid` + `waitpid(-pgid)`. DONE.** Job control's grouping primitive, built on
-the per-parent table. Each twin's [`Twin`] record now also carries a `pgid` (POSIX process group),
-defaulting to the twin's own id at fork — every child starts its own group leader. `setpgid(pid, pgid)`
-is a **direct self-op** (op 15) the *parent* drives — the caller *is* the parent, so its own
-`domain_id` scopes the change with no serve round-trip (unlike `reap`, which needs the servicer to
-reach the parked caller); it retargets a child's `pgid` (`pgid == 0` → the child's own id), confined to
-real children of the caller (`-ESRCH` otherwise). `reap` grew a group form: `reap_any_parked_caller`
-became `reap_group_parked_caller(…, target: Option<TaskId>)` — `None` for `wait(-1)` (any child),
-`Some(pgid)` for `waitpid(-pgid)` (any child in that group) — and the parked-waiter queue carries the
-target so a finishing child wakes only a waiter of its parent whose group it matches. The `waitpid` pid
-selector now decodes POSIX fully enough for a shell: `-1` any child, `< -1` the group `|pid|`, `> 0` a
-named twin. Exposed to compiled C as `__vm_setpgid(pid, pgid)` (chibicc builtin → op 15) alongside the
-existing `__fork`/`__wait`. Proven in `c_fork.rs`: `setpgid_groups_children_and_waitpid_reaps_the_group`
-(fork A/B, `setpgid` B into A's group, `wait(-a_pid)` reaps both → 30; a failed move would sum 0) and
-`waitpid_by_group_does_not_reap_other_groups` (the dual — `wait(-a_pid)` reaps only A, then `-ECHILD`,
-while B waits in its own group). Both stable 30/30 under stress.
+**Process groups — `setpgid` + `waitpid(-pgid)`. RETIRED from the core (#973); lives on the
+personality.** The core once carried its own job-control worldlet: a `pgid` on each [`Twin`], a
+`setpgid` direct self-op (op 15) → `__vm_setpgid` chibicc builtin, and a group form of `reap`
+(`reap_group_parked_caller(…, target: Option<TaskId>)` with a `< -1` `waitpid` selector). Once the
+POSIX personality's own table learned process groups — `__px_setpgid` (op 45) and `__px_waitpid(-pgid)`
+(op 28), keeping the authoritative `pgid` on `Proc` — that core copy was a **second, divergeable pgid
+channel** (#798). #973 removed it: the core `Twin` now carries only its parent (reap scoping), `reap`
+serves just `wait(-1)` (any child of the caller) and `wait(pid)` (a named twin), op 15 is retired-and-
+reserved (a self-call on 15 declines), and `__vm_setpgid` is gone from the frontend. Group job control
+is now the personality's alone, proven by `c_posix.rs`: `c_waitpid_by_group_reaps_a_personality_job`
+(one `kill(-pgid)` fells a two-member job, `waitpid(-pgid)` group-reaps exactly them) and
+`c_waitpid_by_group_does_not_reap_other_groups` (the scoping dual — `waitpid(-p1)` never over-reaps a
+child in another group).
 
 **Shell viability — a real command-dispatch loop runs on the surface.** With the process model in
 place we pointed a shell at it (a compiled-C **microshell**, not the Instantiator-spawn Stage-0 shell):
@@ -602,7 +599,7 @@ follow-up (a shim, not a substrate concern).
 - **~~argv/env-seeding ergonomics~~ — a process libc shim. DONE.** `crates/temen/tests/fork_shim.c` is the
   guest-side layer a shell links so it writes the idiomatic loop —
   `pid = fork(); if (pid == 0) execvp(cmd, argv); else wait_pid(pid);` — over a NUL-terminated `argv[]`,
-  instead of hand-marshalling the buffer: `fork`/`wait_pid`(`pid`/`-1`/`-pgid`)/`setpgid`/`execvp`
+  instead of hand-marshalling the buffer: `fork`/`wait_pid`(`pid`/`-1`)/`execvp`
   (packs argv **and** `environ` into the §3e buffer, resolves the module by name, inherits `stdout`,
   image-replaces) + `getenv`/`strlen`. Every entry point is **`static inline`**, so chibicc's dead-code
   pass drops the ones a program doesn't call — a command that only reads its env pulls in `getenv`, not
@@ -693,8 +690,9 @@ follow-up (a shim, not a substrate concern).
 BSS zero, durable-domain exec, exec from a nested serve context). `WUNTRACED`/`WCONTINUED` are **done**
 (#798: stop/continue signals exist — the personality's `waitpid` reports fresh stops/continues from its
 process table; the core's contribution is the domain stop park, `Blocked::Stopped`). With
-`fork`/`execve`/`wait`(`pid`/`-1`/`-pgid`)/`setpgid` in place and a microshell running on them, the
-core process-model surface a shell drives is complete.
+`fork`/`execve`/`wait`(`pid`/`-1`) in place and a microshell running on them, the core process-model
+surface a shell drives is complete. (Process groups — `setpgid`/`waitpid(-pgid)` — are the
+personality's, not the core's, since #973; see the §8.6 note above.)
 
 ## 9. Fast-backend fork parity — bytecode DONE, Cranelift next
 

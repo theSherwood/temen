@@ -157,8 +157,8 @@ pointer tagging"; the fiber 40→32 trim.)
 
 A domain can enumerate, address, or affect only its own descendant tree, and every domain
 it *can* name arrived through its ancestry: `fork` returns the twin's pid to the parent
-alone (the fork factory serving that fork learns the same pid at mint), reap and `setpgid`
-are parent-scoped (`-ECHILD` for anyone else). The core manufactures no reachability — no
+alone (the fork factory serving that fork learns the same pid at mint), and reap is
+parent-scoped (`-ECHILD` for anyone else). The core manufactures no reachability — no
 domain-enumeration surface, no signal-an-arbitrary-id op, no global namespaces. Global
 views (a POSIX pid table, cross-tree `kill`) are **personality policy**, assembled from
 capabilities passed down the ancestry chain (temen-posix's shared `World` rides the
