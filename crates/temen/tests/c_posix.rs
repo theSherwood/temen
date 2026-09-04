@@ -4819,6 +4819,38 @@ fn c_multiple_background_jobs_stop_and_continue_across_process_groups() {
     );
 }
 
+// #1259 guardrail — the two-group stop→continue→reap shape (the #1213 repro) run many times, so a
+// dispatch that reorders the stop/continue mirror writes surfaces as a DETERMINISTIC hang here instead
+// of a 1-in-N CI flake. The reorder bit only the engines that keep a scheduler-visible mirror of the
+// stop/kill flags (the tree-walker's `stop_depth`, the parallel driver's `term_flag`) — the two run
+// here; the cooperative driver reads the personality's own `stopped_sig`/`term_sig` directly (always
+// in-order) and is not a reorder site. Before #1259 the two mirror writes were deferred onto per-call
+// detached threads with no ordering, so a program-order stop→continue could latch as continue→stop and
+// wedge a job; #1259 applies the flag inline in program order (only the idempotent scheduler notify
+// stays deferred), making a reorder impossible by construction. Each iteration must return 42 — a
+// single hung iteration fails the whole test under CI's job timeout.
+#[test]
+fn c_stop_continue_reap_dispatch_is_reorder_free_under_stress() {
+    let src = mjobs_src();
+    for i in 0..60 {
+        let e = run_interp_only(&src, |_| {});
+        assert_eq!(
+            e.result,
+            vec![Value::I32(42)],
+            "tree-walker iteration {i}: the stop→continue mirror applied in program order (no reorder \
+             latching a stale stop)"
+        );
+    }
+    for i in 0..12 {
+        let p = run_bytecode_parallel_only(&src, |_| {});
+        assert_eq!(
+            p.result,
+            vec![Value::I32(42)],
+            "parallel driver iteration {i}: the term_flag/stop mirror applied in order across OS threads"
+        );
+    }
+}
+
 // #797 — ^D (VEOF) is a ONE-SHOT EOF, not a permanent terminal close. The guest reads the terminal
 // twice: a ^D on the first (empty) read returns 0 (EOF), and a SECOND read then BLOCKS for fresh
 // input — a later `x\n` completes it. Before the fix, the empty-line VEOF dropped the terminal's

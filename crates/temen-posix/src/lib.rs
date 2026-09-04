@@ -958,6 +958,12 @@ struct Proc {
     /// bytecode driver, a bare unit test) degrades to bookkeeping-only stops: the table records
     /// the stop, `WUNTRACED` reports it, but the process keeps running (the L0 posture).
     stop: Option<Arc<dyn Fn(bool) + Send + Sync>>,
+    /// #1259 — the **inline** half of `stop`: the reorder-critical scheduler-flag write
+    /// (`stop_depth ± 1`), fired synchronously in program order under this `Proc`'s lock the instant a
+    /// stop/continue is decided, so a program-order stop→continue cannot latch as continue→stop (the
+    /// #1213 reorder). `None` on engines that keep no mirror (the cooperative driver reads `stopped_sig`
+    /// directly) or degrade to bookkeeping-only. See [`SignalSource::set_stop_apply`].
+    stop_apply: Option<Arc<dyn Fn(bool) + Send + Sync>>,
     /// #798 slice 2 — the signal this process is currently **stopped** by (`None` = running).
     /// Set by the delivery gate on a default-action stop signal; cleared by `SIGCONT`.
     stopped_sig: Option<i32>,
@@ -981,6 +987,11 @@ struct Proc {
     /// process exits by other means) but the process keeps running — the L0 posture, same
     /// degradation as `stop`.
     kill: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// #1259 — the **inline** half of `kill`: the reorder-critical scheduler-flag write
+    /// (`term_flag ← true`), fired synchronously under this `Proc`'s lock the instant a terminate
+    /// becomes actionable, so the flag is set before the deferred `kill` wake runs. `None` on engines
+    /// that keep no mirror. See [`SignalSource::set_kill_apply`].
+    kill_apply: Option<Arc<dyn Fn() + Send + Sync>>,
     /// #796 default actions — the signal that terminated this process (`SIG_DFL` terminate
     /// action). Read by the exit hook at retire time: set ⇒ the zombie's wait status is the
     /// `WIFSIGNALED` shape (`sig` in the low 7 bits) instead of the exit-code encode.
@@ -1678,9 +1689,21 @@ impl SignalSource for SignalDoor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).stop = Some(stop);
     }
 
+    /// #1259 — store the core's **inline** stop/continue mirror-apply closure (the reorder-critical
+    /// `stop_depth` write, fired synchronously in program order; see [`SignalSource::set_stop_apply`]).
+    fn set_stop_apply(&self, apply: Arc<dyn Fn(bool) + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).stop_apply = Some(apply);
+    }
+
     /// #796 default actions — store the core's terminate closure for this process's domain.
     fn set_kill(&self, kill: Arc<dyn Fn() + Send + Sync>) {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).kill = Some(kill);
+    }
+
+    /// #1259 — store the core's **inline** terminate mirror-apply closure (the reorder-critical
+    /// `term_flag` write, fired synchronously; see [`SignalSource::set_kill_apply`]).
+    fn set_kill_apply(&self, apply: Arc<dyn Fn() + Send + Sync>) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).kill_apply = Some(apply);
     }
 
     /// #799 — store the core's park-request closure for this process's domain.
@@ -2178,11 +2201,13 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         chld_wake: None,
         pipe_wake: None,
         stop: None,
+        stop_apply: None,
         stopped_sig: None,
         stop_fresh: false,
         cont_fresh: false,
         reap_wake: false,
         kill: None,
+        kill_apply: None,
         term_sig: None,
         handler_mask_stack: Vec::new(),
         restart_ok: false,
@@ -2355,6 +2380,9 @@ impl Proc {
                 if was_stopped {
                     self.cont_fresh = true;
                     self.stop_fresh = false; // an unreported stop superseded by the continue
+                                             // #1259 — publish the continue to the scheduler mirror SYNCHRONOUSLY (in program
+                                             // order with the matching stop's inline apply), before the deferred wake below.
+                    self.fire_stop_apply(false);
                 }
                 if disposition(self, SIGCONT) > SIG_IGN {
                     self.sig_pending |= 1 << SIGCONT;
@@ -2411,6 +2439,10 @@ impl Proc {
                         return None;
                     }
                     self.term_sig = Some(sig);
+                    // #1259 — publish the terminate to the scheduler mirror SYNCHRONOUSLY (term_flag),
+                    // so it is set before the deferred `kill` wake runs; the wake only pokes vCPUs to
+                    // observe the already-set flag.
+                    self.fire_kill_apply();
                     return self.kill.clone();
                 }
                 // Caught: pend + arm. A stopped process holds delivery until continued
@@ -2457,6 +2489,7 @@ impl Proc {
             if self.sig_handler.get(&s).copied().unwrap_or(SIG_DFL) == SIG_DFL {
                 self.sig_pending &= !(1u64 << s);
                 self.term_sig = Some(s);
+                self.fire_kill_apply(); // #1259 — publish term_flag synchronously before the deferred wake
                 return self.kill.clone();
             }
         }
@@ -2472,9 +2505,29 @@ impl Proc {
         self.stopped_sig = Some(sig);
         self.stop_fresh = true;
         self.cont_fresh = false;
+        // #1259 — publish the stop to the engine's scheduler mirror SYNCHRONOUSLY, in program order,
+        // before returning the deferred wake. The apply is a lock-free atomic store, so it is safe
+        // under this `Proc` lock even while the engine holds the domain's `Host` lock; the reorder that
+        // wedged #1213 came from deferring this store onto a per-call thread.
+        self.fire_stop_apply(true);
         self.stop
             .clone()
             .map(|f| -> Arc<dyn Fn() + Send + Sync> { Arc::new(move || f(true)) })
+    }
+
+    /// #1259 — fire the inline stop/continue mirror-apply (`stop_depth ± 1`) synchronously, if the
+    /// engine installed one. No-op on engines that keep no mirror (the cooperative driver).
+    fn fire_stop_apply(&self, stopped: bool) {
+        if let Some(a) = self.stop_apply.clone() {
+            a(stopped);
+        }
+    }
+
+    /// #1259 — fire the inline terminate mirror-apply (`term_flag ← true`) synchronously, if installed.
+    fn fire_kill_apply(&self) {
+        if let Some(a) = self.kill_apply.clone() {
+            a();
+        }
     }
 
     /// authoritative and disarms if nothing is actually deliverable, so an over-eager arm costs only one
@@ -2571,11 +2624,13 @@ impl Proc {
             chld_wake: None,
             pipe_wake: None,
             stop: None, // the twin's own domain gets its closure at mint (like the wake)
+            stop_apply: None, // ditto — the twin's own inline mirror-apply lands at mint (#1259)
             stopped_sig: None,
             stop_fresh: false,
             cont_fresh: false,
             reap_wake: false,
-            kill: None, // ditto — the twin's own terminate closure lands at mint
+            kill: None,       // ditto — the twin's own terminate closure lands at mint
+            kill_apply: None, // ditto (#1259)
             term_sig: None,
             handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
             restart_ok: self.restart_ok,
