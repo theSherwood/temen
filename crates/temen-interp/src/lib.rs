@@ -20994,7 +20994,7 @@ impl Host {
     /// Deduct `bytes` from the minter behind `handle` — the detached-spawn admission check.
     /// `false` (nothing deducted) for a forged/wrong-type handle or an exhausted quota: the
     /// spawn refuses probeably, never a trap.
-    pub(crate) fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
+    pub fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
         let idx = match self.resolve(handle, cap_id::WINDOW_MINTER) {
             Ok(Binding::WindowMinter(i)) => i as usize,
             _ => return false,
@@ -22029,6 +22029,32 @@ impl Host {
         grants: &[(String, i32)],
         child_size: u64,
     ) -> Option<(Host, i32, i32)> {
+        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        let attestation = self.child_attestation(false);
+        self.spawn_child_powerbox(grants, child_size, attestation)
+    }
+
+    /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
+    /// re-grants, but the child attests `window_exposed = false` (no ancestor below the platform holds
+    /// read authority over its minted window) and its starter caps span `reservation` — the whole
+    /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-15
+    /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
+    /// both backends stamp the same attestation and caps.
+    pub fn spawn_detached_child(
+        &mut self,
+        grants: &[(String, i32)],
+        reservation: u64,
+    ) -> Option<(Host, i32, i32)> {
+        let attestation = self.detached_child_attestation();
+        self.spawn_child_powerbox(grants, reservation, attestation)
+    }
+
+    fn spawn_child_powerbox(
+        &mut self,
+        grants: &[(String, i32)],
+        child_size: u64,
+        attestation: Attestation,
+    ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
         // anything (a partially-built child would leak a promoted sink / installed pipe).
         if !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
@@ -22040,8 +22066,7 @@ impl Host {
         // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
         // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
         ch.self_module = self.self_module.clone();
-        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation(false));
+        ch.set_attestation(attestation);
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         for (name, handle) in grants {

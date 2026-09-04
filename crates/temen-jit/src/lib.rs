@@ -761,10 +761,26 @@ pub struct BudgetTaken {
     pub spawn: i64,
 }
 
+/// PROCESS.md §5 / #1287 — the `WindowMinter` admission for a detached spawn: deduct `bytes` (the
+/// child's declared window) from the minter behind `minter` on the parent `Host`. Returns nonzero when
+/// admitted; `0` for a forged/wrong-type handle or an exhausted quota — the spawn refuses probeably
+/// (`-EINVAL`), charging nothing, exactly the interpreter's `window_minter_take`.
+///
+/// # Safety
+/// `ctx` is the run's `cap_ctx` (the parent `Host`).
+pub type MinterTaker =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, minter: i32, bytes: u64) -> i32;
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
     pub build_named: GrantNamedChildBuilder,
+    /// PROCESS.md §5 / #1287 — build a **detached** child's powerbox: the by-name grant list as
+    /// `build_named`, but the child attests `window_exposed = false` and its starter caps span
+    /// `child_size` = the window **reservation** (a root's shape — no carve bounds it).
+    pub build_detached: GrantNamedChildBuilder,
+    /// #1287 — the `WindowMinter` quota take (see [`MinterTaker`]).
+    pub minter_take: MinterTaker,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
@@ -2878,6 +2894,8 @@ impl CompiledModule {
                 instantiate_module_named_thunk: instantiator_rt::instantiate_module_named
                     as *const () as i64,
                 child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
+                instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const ()
+                    as i64,
             }
         } else {
             InstEnv::null()
@@ -4624,6 +4642,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 as i64,
             instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
+            instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
         },
         None => InstEnv::null(),
     };
@@ -4999,11 +5018,51 @@ fn compile_child(
     // block of `CompiledModule::compile`, child twin). Empty ⇒ a child that offers nothing.
     serve_handlers: &[u32],
 ) -> Result<ChildCode, JitError> {
+    compile_child_windowed(
+        funcs,
+        types,
+        child_entry,
+        child_size_log2,
+        child_size_log2,
+        cap_thunk,
+        cap_ctx,
+        epoch_addr,
+        fuel_addr,
+        futex_sched,
+        inst_env,
+        serve_handlers,
+    )
+}
+
+/// [`compile_child`] over a **decoupled** window: `mapped_log2` committed bytes inside a
+/// `reserved_log2` reservation (#1287, the detached child — a root's shape). The confinement mask is
+/// the reservation, the thunks see `(mapped, reserved)` so the child's `vm_map` commits tail pages
+/// through the same path a root run's does, and an access past the committed extent faults on the
+/// inaccessible tail. `mapped_log2 == reserved_log2` is the fully-mapped carve child.
+#[allow(clippy::too_many_arguments)]
+fn compile_child_windowed(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    child_entry: FuncIdx,
+    mapped_log2: u8,
+    reserved_log2: u8,
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    epoch_addr: usize,
+    fuel_addr: usize,
+    futex_sched: usize,
+    inst_env: InstEnv,
+    serve_handlers: &[u32],
+) -> Result<ChildCode, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
-    // it keeps the invariant local instead of relying on the cross-module parent-size cap).
-    if child_size_log2 > MAX_JIT_WINDOW_LOG2 {
+    // it keeps the invariant local instead of relying on the cross-module parent-size cap). The
+    // reservation may exceed the committed cap (a root's lazy reservation), never the other way.
+    if mapped_log2 > MAX_JIT_WINDOW_LOG2
+        || reserved_log2 < mapped_log2
+        || reserved_log2 > temen_ir::DEFAULT_RESERVED_LOG2
+    {
         return Err(JitError::Unsupported(
             "child window exceeds the reference JIT's max",
         ));
@@ -5036,8 +5095,9 @@ fn compile_child(
             ));
         }
     }
-    let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
-    let mask = child_size - 1;
+    let mapped = 1u64 << mapped_log2; // bounded ≤ MAX by the reject above (audit #3)
+    let reserved = 1u64 << reserved_log2;
+    let mask = reserved - 1;
 
     let mut module = new_jit_module()?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
@@ -5077,9 +5137,9 @@ fn compile_child(
             &mut ctx.func,
             f,
             mask,
-            child_size, // the child is fully mapped (reserved == mapped == size)
-            0,          // top-level confinement over the child's own window
-            guard_offset_of(child_size), // its own window's trailing guard
+            mapped, // the committed prefix (== reserved for a carve child; the declared size detached)
+            0,      // top-level confinement over the child's own window
+            guard_offset_of(reserved), // its own window's trailing guard
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
             (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
@@ -5324,6 +5384,50 @@ pub(crate) unsafe fn run_child_code_then(
     }
     // Run the teardown (e.g. free a granted child's powerbox host) while `child_window` is alive —
     // see the doc comment: the host's region-canon purge must precede the window VA becoming reusable.
+    teardown();
+    (results.first().copied().unwrap_or(0), trap_cell)
+}
+
+/// PROCESS.md §5 / #1287: run a compiled **detached** child in a window that is its own — `mapped_log2`
+/// committed bytes inside a `reserved_log2` lazy reservation (a root run's shape), seeded by `init`
+/// (the module's data segments + the argv payload) and never copied anywhere: no parent carve exists,
+/// so there is no copy-in and no copy-back. `vm_map` commits tail pages through the child's own
+/// `AddressSpace` (the thunks see `(mapped, reserved)`), an access past the committed extent faults on
+/// the inaccessible tail. `teardown` runs while the window is alive (as [`run_child_code_then`]).
+///
+/// # Safety
+/// `code` was compiled by [`compile_child_windowed`] for exactly `(mapped_log2, reserved_log2)`;
+/// `args` matches the entry's arity.
+#[cfg(fiber_rt)]
+pub(crate) unsafe fn run_detached_child_then(
+    code: &ChildCode,
+    mapped_log2: u8,
+    reserved_log2: u8,
+    init: impl FnOnce(&mut [u8]),
+    args: &[i64],
+    n_results: usize,
+    teardown: impl FnOnce(),
+) -> (i64, i64) {
+    let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
+    let base = window.base();
+    init(window.rw_mut());
+    let mut results = vec![0i64; n_results];
+    let mut trap_cell: i64 = 0;
+    // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (the reservation is the
+    // baked mask; the tail + guard fault); the guard is re-entrant so a child fault is caught here.
+    let faulted = mem::run_guarded(
+        &window,
+        code.code,
+        args.as_ptr(),
+        results.as_mut_ptr(),
+        base,
+        code.fn_table.as_ptr() as *const core::ffi::c_void,
+        &mut trap_cell,
+    );
+    if faulted {
+        trap_cell = mem::FAULT_TRAP;
+    }
+    window.restore_rw();
     teardown();
     (results.first().copied().unwrap_or(0), trap_cell)
 }
@@ -5664,6 +5768,10 @@ struct InstEnv {
     // CALLS.md 5c.0 — op 14 (`child_offer`): mint a live-callee offer over a spawned granted
     // child's nursery-retained shared powerbox.
     child_offer_thunk: i64,
+    // PROCESS.md §5 / #1287 — op 15 (`instantiate_detached`): a separate-module child in its **own**
+    // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
+    // `WindowMinter`; argv rides as the optional spawn-time payload.
+    instantiate_detached_thunk: i64,
 }
 
 impl InstEnv {
@@ -5678,6 +5786,7 @@ impl InstEnv {
             instantiate_module_named_thunk: 0,
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
+            instantiate_detached_thunk: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
@@ -8339,6 +8448,10 @@ fn lower_instantiator(
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL).
         14 => Some((&[VI32, VI64], &[VI32])),
+        // PROCESS.md §5 / #1287 instantiate_detached: (minter, module, grants_ptr, grants_n, entry,
+        // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
+        // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
+        15 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         _ => None,
     };
     // Width-tolerant shape check (matches the interpreter, which reads every arg as an i64 slot and
@@ -8352,18 +8465,6 @@ fn lower_instantiator(
     // introduces no ABI mismatch. A non-scalar (or too-few args, or an unknown op) still lowers to an
     // unconditional runtime CapFault — never a compile-time rejection of a verified module.
     let is_scalar_int = |t: &ValType| matches!(t, ValType::I32 | ValType::I64);
-    // PROCESS.md §5 op 15 (`instantiate_detached`) is eval-loop-serviced — it spawns into a
-    // fresh interpreter-owned window, which the JIT runtime does not host. Answer a probeable
-    // `-EINVAL` result instead of trapping (the oracle's own bad-input refusal shape), so a
-    // guest probes and falls back — parity is refusal, never a wrong answer. (Op 14
-    // `child_offer` is JIT-native since CALLS.md 5c.0 — the contract row above.)
-    if op == 15 && sig.results.iter().all(is_scalar_int) {
-        for t in &sig.results {
-            let v = b.ins().iconst(clif_ty(*t), -22);
-            vals.push(v);
-        }
-        return Ok(());
-    }
     let shape_ok = contract.is_some_and(|(need, res)| {
         sig.params.len() >= need.len()
             && sig.params[..need.len()].iter().all(is_scalar_int)
@@ -8553,6 +8654,56 @@ fn lower_instantiator(
                 &[
                     nursery, mem_base, mem_size, h, modh, grants_ptr, grants_n, entry, off,
                     size_log2, fuel, trap_out,
+                ],
+            );
+            emit_trap_propagate(b, lower);
+            let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
+            vals.push(r);
+        }
+        15 => {
+            // PROCESS.md §5 / #1287 instantiate_detached(nursery, mem_base, mem_size, handle:i32,
+            //   minter:i64, module:i64, grants_ptr:i64, grants_n:i64, entry:i64, size_log2:i64,
+            //   fuel:i64, args_ptr:i64, args_len:i64, trap_out:i64) -> handle:i32. The fresh-window
+            // spawn: no carve — the thunk mints a root-shaped window (declared size committed, a
+            // lazy reservation above it), seeds the module's data + the argv payload, and runs the
+            // child there. Grant records and the payload are read from THIS window (reserved-bounded,
+            // as op 13). The 7-arg form passes `(0, 0)` for the payload — no seed.
+            let h = slot_i32(b, get(vals, handle)?);
+            let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
+            let mem_size = b.ins().iconst(I64, win_reserved as i64);
+            let a = |b: &mut FunctionBuilder, i: usize| -> Result<Value, JitError> {
+                Ok(slot_i64(
+                    b,
+                    get(vals, *args.get(i).ok_or(JitError::Malformed)?)?,
+                ))
+            };
+            let minter = a(b, 0)?;
+            let modh = a(b, 1)?;
+            let grants_ptr = a(b, 2)?;
+            let grants_n = a(b, 3)?;
+            let entry = a(b, 4)?;
+            let size_log2 = a(b, 5)?;
+            let fuel = a(b, 6)?;
+            let (args_ptr, args_len) = if args.len() >= 9 {
+                (a(b, 7)?, a(b, 8)?)
+            } else {
+                (b.ins().iconst(I64, 0), b.ins().iconst(I64, 0))
+            };
+            let mut tsig = module.make_signature();
+            for t in [
+                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
+            ] {
+                tsig.params.push(AbiParam::new(t));
+            }
+            tsig.returns.push(AbiParam::new(I32));
+            let tref = b.import_signature(tsig);
+            let thunk = b.ins().iconst(I64, lower.inst.instantiate_detached_thunk);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[
+                    nursery, mem_base, mem_size, h, minter, modh, grants_ptr, grants_n, entry,
+                    size_log2, fuel, args_ptr, args_len, trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);

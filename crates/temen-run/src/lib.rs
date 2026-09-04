@@ -1972,6 +1972,8 @@ pub fn production_grant_hooks() -> temen_jit::GrantChildHooks {
     temen_jit::GrantChildHooks {
         build: grant_child_build,
         build_named: grant_named_child_build,
+        build_detached: grant_detached_child_build,
+        minter_take,
         release: grant_child_release,
         bind_imports: child_bind_imports,
         mint: child_offer_mint,
@@ -2418,6 +2420,67 @@ pub unsafe extern "C" fn grant_named_child_build(
     out: *mut temen_jit::GrantChild,
     trap_out: *mut i64,
 ) -> i32 {
+    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, trap_out)
+    else {
+        return 0;
+    };
+    let parent = &mut *(ctx as *mut Host);
+    let built = parent.spawn_named_child(&grants, child_size);
+    finish_child_build(parent, built, out, trap_out)
+}
+
+/// PROCESS.md §5 / #1287 — the **detached** child's powerbox builder ([`temen_jit::GrantChildHooks::
+/// build_detached`]): the same by-name grant records as [`grant_named_child_build`], built through
+/// [`Host::spawn_detached_child`] — the child attests `window_exposed = false` and its starter caps span
+/// `child_size` = the window reservation (a root's shape; the JIT thunk passes it).
+///
+/// # Safety
+/// As [`grant_named_child_build`].
+pub unsafe extern "C" fn grant_detached_child_build(
+    ctx: *mut c_void,
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    child_size: u64,
+    out: *mut temen_jit::GrantChild,
+    trap_out: *mut i64,
+) -> i32 {
+    let Some(grants) = read_grant_records(mem_base, mem_size, grants_ptr, grants_n, trap_out)
+    else {
+        return 0;
+    };
+    let parent = &mut *(ctx as *mut Host);
+    let built = parent.spawn_detached_child(&grants, child_size);
+    finish_child_build(parent, built, out, trap_out)
+}
+
+/// PROCESS.md §5 / #1287 — the `WindowMinter` admission for a detached spawn on the JIT
+/// ([`temen_jit::MinterTaker`]): deduct `bytes` from the minter behind `minter` on the parent `Host`.
+/// `1` = admitted; `0` = forged/wrong-type handle or exhausted quota (nothing deducted) — the spawn
+/// refuses probeably, exactly the interpreter's `window_minter_take`.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn minter_take(ctx: *mut c_void, minter: i32, bytes: u64) -> i32 {
+    let parent = &mut *(ctx as *mut Host);
+    i32::from(parent.window_minter_take(minter, bytes))
+}
+
+/// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative
+/// `grants_ptr` (bounded to `[0, mem_size)`) into `(name, handle)` pairs — the shared parse of the
+/// by-name builders. `None` with `*trap_out` set: `MemoryFault` for an out-of-window record/name,
+/// `CapFault` for a non-UTF-8 name.
+///
+/// # Safety
+/// `[mem_base, mem_base + mem_size)` is the parent's readable window.
+unsafe fn read_grant_records(
+    mem_base: *mut u8,
+    mem_size: u64,
+    grants_ptr: u64,
+    grants_n: u64,
+    trap_out: *mut i64,
+) -> Option<Vec<(String, i32)>> {
     // Bounded read of `[off, off+len)` within the parent's mapped window, or `None` (out of window).
     let read = |off: u64, len: u64| -> Option<Vec<u8>> {
         let end = off.checked_add(len)?;
@@ -2433,41 +2496,40 @@ pub unsafe extern "C" fn grant_named_child_build(
     };
     let mut grants: Vec<(String, i32)> = Vec::with_capacity(grants_n as usize);
     for i in 0..grants_n {
-        let rec_off = match grants_ptr.checked_add(i.wrapping_mul(16)) {
-            Some(o) => o,
-            None => {
-                *trap_out = TrapKind::MemoryFault as i64;
-                return 0;
-            }
+        let Some(rec_off) = grants_ptr.checked_add(i.wrapping_mul(16)) else {
+            *trap_out = TrapKind::MemoryFault as i64;
+            return None;
         };
-        let rec = match read(rec_off, 16) {
-            Some(r) => r,
-            None => {
-                *trap_out = TrapKind::MemoryFault as i64;
-                return 0;
-            }
+        let Some(rec) = read(rec_off, 16) else {
+            *trap_out = TrapKind::MemoryFault as i64;
+            return None;
         };
         let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
         let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
         let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-        let name_bytes = match read(name_off, name_len) {
-            Some(n) => n,
-            None => {
-                *trap_out = TrapKind::MemoryFault as i64;
-                return 0;
-            }
+        let Some(name_bytes) = read(name_off, name_len) else {
+            *trap_out = TrapKind::MemoryFault as i64;
+            return None;
         };
-        let name = match String::from_utf8(name_bytes) {
-            Ok(s) => s,
-            Err(_) => {
-                *trap_out = TrapKind::CapFault as i64;
-                return 0;
-            }
+        let Ok(name) = String::from_utf8(name_bytes) else {
+            *trap_out = TrapKind::CapFault as i64;
+            return None;
         };
         grants.push((name, handle));
     }
-    let parent = &mut *(ctx as *mut Host);
-    match parent.spawn_named_child(&grants, child_size) {
+    Some(grants)
+}
+
+/// Wrap a built child powerbox as the two counted shared refs the JIT expects (see
+/// [`grant_child_build`]): arm the wake signal, inherit the kill cell, fill `out`. `None` (a
+/// non-re-grantable handle) is the fail-closed `CapFault`.
+unsafe fn finish_child_build(
+    parent: &Host,
+    built: Option<(Host, i32, i32)>,
+    out: *mut temen_jit::GrantChild,
+    trap_out: *mut i64,
+) -> i32 {
+    match built {
         Some((child, inst_handle, as_handle)) => {
             // 5c.0 — shared child powerbox, two counted refs (see `grant_child_build`).
             let mut child = child;

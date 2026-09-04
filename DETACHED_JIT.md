@@ -53,7 +53,7 @@ child in its own address space.** In temen that structure already has a name.
 | `self.attest` → `tier \| window_exposed<<8 \| freeze_exposed<<9`; detached attests `window_exposed = false` | `lib.rs` 16358–16385, 19496 | **Built** (PROCESS.md §6) |
 | Spawner keeps kill/join/fuel; detachment severs **read**, not lifecycle; live offers work (`child_offer`, op 14) | PROCESS.md §5; `detached_windows.rs` | **Built** |
 | Durable domain **refuses** detached (multi-window freeze = O6, deferred) | `lib.rs` 19593–19651 | **Built (fail-closed)** |
-| Native JIT (`temen-jit`) answer to op 15 | `crates/temen-jit/src/lib.rs` 8355 | **probeable `-EINVAL`** — "spawns into a fresh interpreter-owned window, which the JIT runtime does not host" |
+| Native JIT (`temen-jit`) hosts op 15 (#1287): `instantiate_detached` thunk → `compile_child_windowed` (declared committed inside a root-sized lazy reservation) → `run_detached_child_then` (no carve, no copy-in/copy-back); powerbox via `Host::spawn_detached_child` (`window_exposed = false`, caps over the reservation); minter admission via the `minter_take` hook | `instantiator_rt.rs`; `temen-run` `grant_detached_child_build`/`minter_take`; `detached_child_jit.rs` | **Built** — differential vs the tree-walker |
 | wasm-JIT (`temen-wasm-jit`) nested emit lowers INSTANTIATOR ops **0, 1, 13, 17 only** | `crates/temen-wasm-jit/src/lib.rs` 769 | **op 15 not lowered** |
 | JIT children are **position-independent** (base is a runtime arg; compile cache reuses across offsets) | PROCESS.md §4 S1; `jit_instantiate_cache.rs` | **Built** — the emit needs no change to run in a different memory |
 | Native JIT nested children **already run in their own window**: `compile_child` lowers with `sub_base = 0` and the runners allocate a fresh `GuestWindow`, copying the carve in before and back out after (S1c: "own guarded window", parent-domain shared futex) | `crates/temen-jit/src/lib.rs` 4974, 5081, 5283–5325, 4651–4658, 4788–4793 | **Built** — the native tier is one deletion (the two memcpys) away from detached semantics |
@@ -146,12 +146,15 @@ The sweep found that it very nearly does already: `compile_child` lowers every c
 `compile_child_and_run`) allocate a **fresh `GuestWindow`** per spawn, `memcpy` the carve in
 before the run and back out after. A native nested child is thus *already* a private window
 with copy-in/copy-out semantics; only the copies make it look like an alias. Hosting op 15 is
-therefore a **deletion plus a size change**: allocate the child window with a root-sized
-reservation (`Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)`, lazy commit), seed data
-segments directly into it (`instantiator_rt::write_data_segments` currently targets the parent
-carve, then copies), and drop the two memcpys — for a 256 MiB phase carve that removes ~512 MiB
-of copying per spawn. `run_guarded` already takes the base as a runtime argument (S1). The
-native tier then matches the interpreter's detached semantics exactly, and R5 holds: detached
+therefore the same runner **minus the copies** (built, #1287): `run_detached_child_then` allocates
+`GuestWindow::new(1 << declared, 1 << DEFAULT_RESERVED_LOG2)` — the declared window committed
+inside a root-sized lazy reservation — seeds the module's data segments and the argv payload
+directly into it, runs under the same re-entrant guard, and copies nothing in or out (there is no
+carve to mirror). `compile_child_windowed` bakes the reservation as the mask and the declared size
+as the thunks' `mapped`, so the child's `vm_map` commits tail pages through its own `AddressSpace`
+exactly as a root run's does. The nested path keeps its two memcpys — they *are* the alias
+semantics a nested child is for. `run_guarded` already takes the base as a runtime argument (S1).
+The native tier then matches the interpreter's detached semantics exactly, and R5 holds: detached
 costs the same thing everywhere — a copy at the cap boundary — and grows the same way
 everywhere — into its own reservation.
 
@@ -548,8 +551,9 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    minting a child `Memory` per spawn (`foreign_mint`) and staging `OP13JIT_CHILD_DETACHED`, and
    the starter-caps correction above. 3b (after slices 4–5): N Worker-hosted detached children
    (grandchild spawn posts the `Memory`), independent growth, the V8-limits probe.
-4. **#1287 — Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
-   root-sized; seed segments directly; delete the two memcpys — R5 parity, and a perf win.
+4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
+   decoupled-window child compile, the copy-free detached runner, the `build_detached` /
+   `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.
 5. **#1288 — phase drivers → detached** (**done**): `nimc::detached_parent_src` spawns every phase
    (nifler/hexer/nimsem) with op 15 + the args payload; `PHASE_CARVE_MAX`, `phase_carve_log2`,
    `phase_window_log2` and the 2× buddy parent are deleted; the driver window is 64 KiB of grant
