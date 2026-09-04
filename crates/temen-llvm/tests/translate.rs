@@ -12868,6 +12868,47 @@ fn demo_bash_translates_and_verifies() {
         // A key=value state-machine parse (IFS read into an array + trim + %%/# expansions):
         "input='name=alice; age=30; city=wonderland'; IFS=';' read -ra ps <<< \"$input\"; \
          for p in \"${ps[@]}\"; do p=\"${p# }\"; echo \"[${p%%=*}] -> [${p#*=}]\"; done",
+        // Round 5 — a builtin-only language-differential survey (a ~28-construct probe found all of
+        // these already byte-identical to native; pinned here as regression gates). No temen bug was
+        // found — the only probe "divergence" was the ORACLE's own broken float printf (%f/%e/%g print
+        // `nan` under the bring-up config's `ac_cv_type_long_double=no`, while temen prints correctly),
+        // so float formats are deliberately not pinned against this oracle.
+        // Parameter expansion: :- / :+ / length; case-mod ^^ ,, ^ ,; substring (incl. negative); pattern
+        // replace // and /, prefix/suffix trim # ## % %%; :=; @Q and %q quoting.
+        "v=hello; echo \"${v:-def}/${u:-def}/${v:+set}/${#v}\"",
+        "v=HeLLo; echo \"${v^^}/${v,,}/${v^}/${v,}\"",
+        "v=abcdef; echo \"${v:1:3}/${v: -2}/${v:2}\"",
+        "v=a.b.c.d; echo \"${v//./_}/${v/./_}/${v#*.}/${v##*.}/${v%.*}/${v%%.*}\"",
+        "unset u; echo \"${u:=default}\"; echo \"$u\"",
+        "printf '%q\\n' \"a b'c\"",
+        "v='a b'; printf '%s\\n' \"${v@Q}\"",
+        // Arrays: @ vs *, length, negative index, keys, slice; += append; associative (fixed keys).
+        "a=(x y z w); echo \"${a[@]}|${#a[@]}|${a[-1]}|${!a[@]}|${a[@]:1:2}\"",
+        "a=(); a+=(p); a+=(q r); echo \"${a[*]}/${#a[@]}\"",
+        "declare -A m=([one]=1 [two]=2 [three]=3); echo \"${m[one]}${m[two]}${m[three]}/${#m[@]}\"",
+        // Brace expansion: numeric range, cartesian, zero-pad, reverse, step.
+        "echo {1..5} {a,b}{1,2} {01..03} {5..1} {1..10..3}",
+        // Arithmetic: pre/post ++, bases, ternary, ** % << |; ((…)) and let commands.
+        "x=5; echo $((x++))/$x/$((++x))/$x",
+        "echo $((2**10)) $((17%5)) $((1<<4)) $((0xff)) $((2#101)) $(( 5>3?100:200 ))",
+        "i=0; ((i++)); ((i+=5)); echo $i; let 'y=3+4'; echo $y",
+        // Control flow: C-style for, until, case with a glob + a ;;& fallthrough.
+        "for ((i=0;i<3;i++)); do echo \"c$i\"; done",
+        "i=0; until ((i>=3)); do echo \"u$i\"; ((i++)); done",
+        "case abc in a*) echo one;;& *bc) echo two;; esac",
+        // [[ ]]: glob vs quoted-literal, numeric, string ordering. printf %b, format reuse.
+        "[[ abc == a* ]] && echo glob; [[ abc == 'a*' ]] || echo lit; [[ 5 -gt 3 ]] && echo num; [[ abc < abd ]] && echo slt",
+        "printf '%b\\n' 'a\\tb\\nc'",
+        "printf '[%s]' a b c; echo",
+        // read -a, IFS-split read; positional params $# $* ${@:o:l} shift.
+        "read -a arr <<< 'one two three'; echo \"${arr[1]}/${#arr[@]}\"",
+        "IFS=: read -r a b c <<< 'x:y:z'; echo \"$a-$b-$c\"",
+        "set -- a b c d; echo \"$#/${*}/${@:2:2}\"; shift 2; echo \"$@\"",
+        // mapfile from process substitution; indirect ${!x} + declare -n nameref (read + write-through).
+        "mapfile -t lines < <(printf 'l1\\nl2\\nl3\\n'); echo \"${#lines[@]}/${lines[1]}\"",
+        "x=y; y=hit; echo \"${!x}\"; declare -n r=y; echo \"$r\"; r=changed; echo \"$y\"",
+        // Command grouping exit status, negation !, && / || short-circuit.
+        "{ true; }; echo $?; { false; }; echo $?; ! false; echo $?; true && echo a || echo b",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
