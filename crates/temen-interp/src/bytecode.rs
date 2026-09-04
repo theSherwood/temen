@@ -12103,7 +12103,7 @@ impl CoopSched {
                         (
                             tmem.map(|m| m.atomic_value(base, width)).unwrap_or(0),
                             tmem.map(|m| m.futex_key(base))
-                                .unwrap_or(super::FutexKey::Anon(base)),
+                                .unwrap_or(super::FutexKey::Anon(0, base)),
                         )
                     };
                     if cur != expected {
@@ -12130,7 +12130,7 @@ impl CoopSched {
                             Some(k) => extra_envs[k].mem.as_ref(),
                         };
                         tmem.map(|m| m.futex_key(base))
-                            .unwrap_or(super::FutexKey::Anon(base))
+                            .unwrap_or(super::FutexKey::Anon(0, base))
                     };
                     let want = count as u32;
                     let mut woken = 0u32;

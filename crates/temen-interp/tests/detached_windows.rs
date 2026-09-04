@@ -249,3 +249,90 @@ fn a_forged_minter_refuses_probeably() {
     .expect("run — refusal, not a trap");
     assert_eq!(r, vec![Value::I64(-22)], "-EINVAL, probeable");
 }
+
+/// A detached child that parks on an anonymous futex word in **its own** window (offset 32768) with
+/// a 300 ms timeout and reports the wait status: `WAIT_TIMED_OUT` = 2 if nothing woke it.
+const DETACHED_WAITER: &str = r#"
+memory 16
+
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 32768
+  vexp = i32.const 0
+  vto = i64.const 300000000
+  vst = i32.atomic.wait vaddr vexp vto
+  vst64 = i64.extend_i32_s vst
+  return vst64
+  }
+}
+"#;
+
+/// The parent spawns the waiter DETACHED, then hammers `atomic.notify` on the same offset 32768 of
+/// **its own** window, OR-ing the woken counts, and joins. Composite: `join + 10 * woke_any`.
+const NOTIFYING_PARENT: &str = r#"
+memory 17
+
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 16
+  vq = i64.const 0
+  vD = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vi0 = i64.const 0
+  vw0 = i32.const 0
+  br 1(v0, vD, vi0, vw0)
+  }
+block 1 (vh: i32, vd: i32, vi: i64, vw: i32) {
+  vaddr = i64.const 32768
+  vcnt = i32.const 1
+  vn = atomic.notify vaddr vcnt
+  vw2 = i32.or vw vn
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 200000
+  vdone = i64.eq vi2 vlim
+  br_if vdone 2(vh, vd, vw2) 1(vh, vd, vi2, vw2)
+  }
+block 2 (vh2: i32, vd2: i32, vwf: i32) {
+  vj = call.cap 6 1 (i32) -> (i64) vh2 (vd2)
+  vwe = i64.extend_i32_u vwf
+  vk = i64.const 10
+  vm = i64.mul vwe vk
+  vs = i64.add vj vm
+  return vs
+  }
+}
+"#;
+
+/// #1283: a detached child's anonymous futex words are **its own**. The parent and the detached child
+/// both have `window.base() == 0`, so before the fix the same guest offset produced the same
+/// `FutexKey::Anon` and the parent's `notify` woke the child (`join` = 0, `woke_any` = 1 → 10). Now
+/// the key carries the backing identity: the child times out untouched (2) and no parent notify ever
+/// finds a waiter (0). The only timing dependence is that a slow child park can make a *buggy* build
+/// pass; a fixed build can never fail.
+#[test]
+fn a_detached_child_does_not_rendezvous_with_its_parent_on_anonymous_memory() {
+    let a = module(NOTIFYING_PARENT);
+    let b = module(DETACHED_WAITER);
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_window_minter(1 << 17);
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hw)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(
+        r,
+        vec![Value::I64(2)],
+        "detached child's wait must time out (2) with no parent notify landing (woke_any = 0)"
+    );
+}
