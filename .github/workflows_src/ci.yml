@@ -909,6 +909,10 @@ jobs:
           # A guest-issued op 15 on the op-13 loop (#1286): the driver's child is minted its own Memory by
           # the servicer and driven emitted; args payload, attest, growth.
           node browser-op13jit-detached-test.mjs
+          # Concurrent detached children on the parallel Worker driver (#1286 slice 3b): three op-15
+          # children, each on its own Worker in its own minted WebAssembly.Memory, grown on vm_map;
+          # the exhausted WindowMinter refuses a fourth.
+          node browser-par-detached-test.mjs
           # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
           # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
           # Reuses the threads module built above + the committed `.temen` assets — no extra toolchain.

@@ -423,7 +423,7 @@ async function main() {
       u8().set(unit, uptr);
       ulen = unit.length;
     }
-    if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
+    if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen, 0n) !== 1) {
       console.log('FAIL: temen_par_powerbox_inst returned 0'); process.exit(1);
     }
   }

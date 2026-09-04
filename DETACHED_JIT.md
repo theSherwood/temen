@@ -546,11 +546,21 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    the interpreter's detached child (`detached_windows.rs` oracle shape) — byte-identical or
    decline. `self.attest` on the JIT reads `window_exposed = false`. Includes the **spawn-time
    args payload** on op 15 (interpreter arm + servicer) so a detached phase can take argv.
-3. **#1286 — guest-issued op 15 + concurrent detached children.** 3a (**done**): the resumable-engine
+3. **#1286 — guest-issued op 15 + concurrent detached children** (**done**). 3a: the resumable-engine
    event arm (`VcpuEvent::InstantiateDetached`, args payload, minter admission), the op-13 servicer
    minting a child `Memory` per spawn (`foreign_mint`) and staging `OP13JIT_CHILD_DETACHED`, and
-   the starter-caps correction above. 3b (after slices 4–5): N Worker-hosted detached children
-   (grandchild spawn posts the `Memory`), independent growth, the V8-limits probe.
+   the starter-caps correction above. 3b: the parallel Worker driver hosts op 15 as
+   `PAR_INSTANTIATE_DETACHED` — the spawning Worker mints + seeds the child's shared `Memory` from
+   the event's segment blob (the event now carries the module's data segments, since the minting
+   host has no view of the resolved module) and posts it to a new Worker, which runs
+   `temen_par_child_detached` over `Region::Foreign`; `Mem::map` grows a Foreign backing in place
+   (`grow_to` → `foreign_grow`, `-ENOMEM` at the memory's `maximum`); futex waits/notifies address
+   the child memory; N children run concurrently, one Worker + one memory each
+   (`browser-par-detached-test.mjs`: three children + a refused fourth). Fail-closed on this
+   driver: a detached vCPU's nested **carve** (op 13) or `thread.spawn` traps (the sibling Worker
+   would alias the engine memory at `win`), and a spawn with a re-granted cap list traps (no
+   cross-Worker path for the powerbox; the op-13 arm has the same shape). Threads inside a detached
+   child are the natural follow-up (a `temen_par_child` over the same foreign id).
 4. **#1287 — Native JIT hosting of op 15** (**done**): the `instantiate_detached` thunk, the
    decoupled-window child compile, the copy-free detached runner, the `build_detached` /
    `minter_take` hooks; `detached_child_jit.rs` is the differential vs the tree-walker.

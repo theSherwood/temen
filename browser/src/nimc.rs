@@ -230,10 +230,6 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 // (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted into it (`vm_map`
 // auto-binds to the child's AddressSpace), argv is seeded into its carve, and its joined status returns.
 
-/// The op-13 phase child's **carve** log2, per its declared window `decl` (#1253) — `None` when the
-/// phase is past the crawl's ceiling (fail closed).
-///
-
 /// Build the **detached** phase parent (#1288): re-grants `caps` (by name, in order — the child
 /// resolves them by name and its manifest binds them) to a `--child-entry` child spawned
 /// `instantiate_detached` (op 15) into a **fresh window** of the child's declared `1 << child_log2`,
@@ -308,8 +304,9 @@ block 0 ({bparams}) {{
 /// `new_confined_child_grow_over_host` (committed window = the declared size, starter caps over the
 /// reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a grandchild carve) the child
 /// aliases the sub-window at `base + carve`. `Join` delivers the child's result. Single-threaded here,
-/// so the window base travels as a raw ptr. `child` is the module the *root* driver spawns (its data
-/// segments seed a detached window; its declared size starts a nested one); `None` for a grandchild.
+/// so the window base travels as a raw ptr. `child` is the module the *root* driver spawns (its
+/// declared size starts a nested carve); `None` for a grandchild. A detached spawn needs no module in
+/// hand — the event carries the segments — so it works at any depth.
 pub(crate) fn drive_op13<'p>(
     prog: &'p bytecode::VcpuProgram,
     base: *mut u8,
@@ -327,15 +324,13 @@ pub(crate) fn drive_op13<'p>(
                 size_log2,
                 fuel,
                 args,
+                data,
             } => {
-                let Some(cm) = child else {
-                    return Err(Trap::Malformed); // a grandchild's detached spawn: no module to seed
-                };
                 let back = std::sync::Arc::new(Region::new(
                     1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
                     temen_interp::host_page_size(),
                 ));
-                for seg in &cm.data {
+                for seg in data.iter() {
                     back.write_from(seg.offset, &seg.bytes);
                 }
                 back.write_from(temen_ir::module_args_base(), &args);

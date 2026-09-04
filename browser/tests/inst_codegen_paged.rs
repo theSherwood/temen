@@ -204,7 +204,7 @@ fn drive(root: &temen_ir::Module, unit: &temen_ir::Module) -> Outcome {
     let root_bytes = temen_encode::encode_module(root);
     let unit_bytes = temen_encode::encode_module(unit);
     assert_eq!(
-        temen_par_powerbox_inst(1 << ROOT_LOG2, unit_bytes.as_ptr(), unit_bytes.len()),
+        temen_par_powerbox_inst(1 << ROOT_LOG2, unit_bytes.as_ptr(), unit_bytes.len(), 0),
         1,
         "publish the §14 run recipe with the granted unit"
     );

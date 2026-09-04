@@ -59,7 +59,9 @@ export async function loadEngine() {
 // `temen_parse` product). Options:
 //   `jit`     ⇒ build the Rust-side §22 powerbox + reserve the JIT dispatch table;
 //   `inst`    ⇒ publish the §14 recipe (root `Instantiator` over the window + the optional granted
-//               `unit` module bytes) — the root vCPU builds its powerbox from it;
+//               `unit` module bytes + a `WindowMinter` of `minter` bytes when > 0, #1286) — the root
+//               vCPU builds its powerbox from it; a root's `instantiate_detached` then spawns each
+//               child into its OWN `WebAssembly.Memory` on its own Worker (concurrently);
 //   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every vCPU
 //               dispatches `call.cap` through; read stdout back via `temen_par_stdout_*` after);
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
@@ -73,7 +75,7 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
@@ -116,7 +118,7 @@ export function makeRunner({ module, memory, ex }) {
         u8().set(unit, uptr);
         ulen = unit.length;
       }
-      if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen) !== 1) {
+      if (ex.temen_par_powerbox_inst(BigInt(winSize), uptr, ulen, BigInt(minter)) !== 1) {
         throw new Error('temen_par_powerbox_inst failed');
       }
     }
@@ -141,8 +143,9 @@ export function makeRunner({ module, memory, ex }) {
           w.onmessage = (e) => {
             const m = e.data;
             if (m.kind === 'spawn') {
-              // Plain or §14-confined child: relay the message's cfg verbatim (a confined child's
-              // message carries its own win/winSize — the carve — overriding the run defaults).
+              // Plain, §14-confined or §5-detached child: relay the message's cfg verbatim (a confined
+              // child's message carries its own win/winSize — the carve; a detached child's carries its
+              // own `childMem`, a shared Memory that transfers by reference — overriding the run defaults).
               const { kind, ...cfg2 } = m;
               startVcpu({ role: 'child', ...cfg2 });
             } else if (m.kind === 'done') {

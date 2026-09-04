@@ -102,11 +102,17 @@ fn drive(
                 size_log2,
                 fuel,
                 args,
+                data,
             } => {
                 seen_payload.push(args.clone());
+                assert_eq!(
+                    &data[..],
+                    &child_mod.data[..],
+                    "the event carries the child's segments"
+                );
                 // The fresh window: the host's to allocate — nothing of it in the parent's.
                 let back = Arc::new(Region::new(1u64 << size_log2, 4096));
-                for seg in &child_mod.data {
+                for seg in data.iter() {
                     back.write_from(seg.offset, &seg.bytes);
                 }
                 back.write_from(temen_ir::module_args_base(), &args);

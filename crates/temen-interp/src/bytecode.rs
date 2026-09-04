@@ -2939,6 +2939,10 @@ pub enum VcpuEvent {
         /// The spawn-time args payload (empty for the 7-arg form), to seed at the child's
         /// `module_args_base()` before start.
         args: Vec<u8>,
+        /// The child module's data segments, to seed into the fresh window before start. Carried on
+        /// the event because the host that mints the window (a page, another Worker) has no view of
+        /// the resolved `Module` — only the engine that resolved the handle does.
+        data: std::sync::Arc<[temen_ir::Data]>,
     },
     /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
     /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
@@ -4089,7 +4093,7 @@ impl<'p> Vcpu<'p> {
         args: Option<(u64, u64)>,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        let (cfuncs, cmem_log2, cimports, ctypes) = match self.shared_host {
+        let (cfuncs, cmem_log2, cimports, ctypes, cdata) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
@@ -4098,6 +4102,7 @@ impl<'p> Vcpu<'p> {
                     g.memory_log2,
                     g.imports.clone(),
                     g.types.clone(),
+                    g.data.clone(),
                 )
             }
             None => {
@@ -4107,6 +4112,7 @@ impl<'p> Vcpu<'p> {
                     g.memory_log2,
                     g.imports.clone(),
                     g.types.clone(),
+                    g.data.clone(),
                 )
             }
         };
@@ -4161,6 +4167,7 @@ impl<'p> Vcpu<'p> {
             size_log2: size_log2 as u8,
             fuel,
             args: payload,
+            data: cdata,
         }))
     }
 

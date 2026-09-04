@@ -25447,12 +25447,23 @@ impl GuestMem for Mem {
     /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). Works
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
-    /// misaligned → `-EINVAL`.
+    /// misaligned → `-EINVAL`. Over a [`Region::Foreign`] (a detached child's own embedder memory,
+    /// #1286) the embedder is asked to grow it to cover the pages first; a refusal (the memory's
+    /// `maximum`) is `-ENOMEM`, probeable, before a byte of protection state changes. (A fixed
+    /// backing shorter than the reservation keeps its #1153 contract: the op succeeds and accesses
+    /// past the backing are dropped/read zero — `region_backing_bound.rs`.)
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        if self.back.is_foreign()
+            && !self
+                .back
+                .grow_to(self.window.base() + (pages.end() + 1) * self.page)
+        {
+            return ENOMEM;
+        }
         {
             let mut space = self.space_write();
             for page in pages.clone() {
