@@ -23,6 +23,8 @@
 ;   kind 6 = constant (payload = value; `variable`/`create`) kind 8 = i64.eqz (`0=`)
 ;   kind 7 = i64 atomic rmw `( n addr -- old )` (payload = rmw op)  kind 9 = cmpxchg `( exp new addr -- old )`
 ;   kind 10 = atomic load `( addr -- x )`                 kind 11 = atomic store `( x addr -- )`
+;   kind 12 = constant cell (payload = addr; load the stored value)  kind 13 = deferred word
+;     (payload = xt cell; load and `execute` at the declared effect — `defer`/`is`)
 ;   kind 2 = compiler word (payload = an id dispatched by `br_table` in func 44)
 ;
 ; Memory map (window 2^20):
@@ -39,7 +41,14 @@
 ;   65664 OUT_LEN   65672 DEAD      65680 TOK_PTR   65688 TOK_LEN   65696 DEF_NAME_PTR
 ;   65704 DEF_NAME_LEN  65712 ERR   65720 CUR_PARAMS  65728 NTYPES  65736 BLOB_LEN
 ;   65744 ARENA_LEN 65752 IN_BASE   65760 NUM       65768 STR_PTR   65776 STR_LEN
-;   65792.. 24-byte digit scratch
+;   65784 LINE (1-based, reset before stdin)   65792.. 20-byte digit scratch
+;   65816 RVS_DEPTH (loop return-stack depth)  65824.. RVS (loop index/limit value ids)
+;
+; The return stack (RVS) carries `do`-loop index and limit as extra block params on *every* branch,
+; so they never sit on the data stack (an accumulator below the loop stays reachable). `write_edge`
+; appends the RVS after the data stack, `vs_params` renumbers both, and `open_block` sizes each block
+; to data + RVS params — so if/begin/while thread the loop vars for free. RVS_DEPTH is 0 outside a
+; loop and reset at each unit entry.
 ;
 ; Function index table (keep in sync — `call N` is by index):
 ;    0 _start            1 emit(c)           2 type(a,n)         3 allot(n)        4 comma(x)
@@ -57,6 +66,7 @@
 ;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
+;   72 find_do(skip)    73 do_loop(id)
 
 memory 20
 
@@ -86,6 +96,8 @@ data 33024 "--"
 data 33040 "install error "
 data 33056 "not compiling"
 data 33072 "expected a name"
+data 33088 "line "
+data 33104 ": "
 
 ; ---- the prelude (0x9000 = 36864, NUL-terminated): the primitive table + the library, in Forth ----
 data 36864 "prim : 2 0 0 1
@@ -121,6 +133,20 @@ prim execute0 2 0 0 30
 prim execute1 2 0 0 31
 prim execute2 2 0 0 32
 prim exit 2 0 0 33
+prim constant 2 0 0 34
+prim defer 2 0 0 35
+prim is 2 0 0 36
+prim do 2 0 0 37
+prim loop 2 0 0 38
+prim +loop 2 0 0 39
+prim i 2 0 0 40
+prim j 2 0 0 41
+prim leave 2 0 0 42
+prim >r 2 0 0 43
+prim r> 2 0 0 44
+prim r@ 2 0 0 45
+prim char 2 0 0 46
+prim [char] 2 0 0 47
 prim + 1 2 1 64
 prim - 1 2 1 65
 prim * 1 2 1 66
@@ -163,6 +189,8 @@ prim cas 9 3 1 0
 : 2dup ( a b -- a b a b ) over over ;
 : 2drop ( a b -- ) drop drop ;
 : -rot ( a b c -- c a b ) rot rot ;
+: 2swap ( a b c d -- c d a b ) >r -rot r> -rot ;
+: 2over ( a b c d -- a b c d a b ) >r >r 2dup r> r> 2swap ;
 : cr ( -- ) 10 emit ;
 : space ( -- ) 32 emit ;
 : spaces ( n -- ) begin dup 0 > while space 1- repeat drop ;
@@ -187,6 +215,9 @@ block 0 () {
   pp = i64.const 36864
   pl = call 54 (pp)
   call 42 (pp, pl)
+  lnp = i64.const 65784
+  onel = i64.const 1
+  i64.store lnp onel
   n = call 48 ()
   ib = i64.const 327680
   call 42 (ib, n)
@@ -519,20 +550,24 @@ block 0 () {
   }
 }
 
-; 14 open_block(idx, nparams)
+; 14 open_block(idx, nparams): nparams is the DATA-stack param count; the block's real param count is
+; that plus the current RVS depth (the loop index/limit carried through every block).
 func (i64, i64) -> () {
 block 0 (idx: i64, np: i64) {
   cb = i64.const 65600
   i64.store cb idx
+  rp = i64.const 65816
+  r = i64.load rp
+  total = i64.add np r
   cp = i64.const 65720
-  i64.store cp np
+  i64.store cp total
   z = i64.const 0
   sl = i64.const 65608
   i64.store sl z
   ci = i64.const 65616
   i64.store ci z
   nx = i64.const 65584
-  i64.store nx np
+  i64.store nx total
   dd = i64.const 65672
   i64.store dd z
   return
@@ -612,13 +647,17 @@ block 0 (c: i64, t: i64, e: i64) {
   }
 }
 
-; 18 write_edge(t): uleb target, then the whole virtual stack as branch args.
+; 18 write_edge(t): uleb target, then the whole data stack followed by the RVS as branch args (count
+; = VS_DEPTH + RVS_DEPTH) — so every branch carries the loop index/limit alongside the data stack.
 func (i64) -> () {
 block 0 (t: i64) {
   call 7 (t)
   dp = i64.const 65576
   d = i64.load dp
-  call 7 (d)
+  rp = i64.const 65816
+  r = i64.load rp
+  total = i64.add d r
+  call 7 (total)
   z = i64.const 0
   br 1(d, z)
   }
@@ -638,6 +677,27 @@ block 2 (d: i64, i: i64) {
   br 1(d, i1)
   }
 block 3 () {
+  rp = i64.const 65816
+  r = i64.load rp
+  z = i64.const 0
+  br 4(r, z)
+  }
+block 4 (r: i64, k: i64) {
+  c = i64.ge_s k r
+  br_if c 6() 5(r, k)
+  }
+block 5 (r: i64, k: i64) {
+  eight = i64.const 8
+  off = i64.mul k eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 7 (v)
+  one = i64.const 1
+  k1 = i64.add k one
+  br 4(r, k1)
+  }
+block 6 () {
   return
   }
 }
@@ -1166,6 +1226,10 @@ block 6 (pos: i64, a: i64) {
   pp = i64.const 65544
   pos1 = i64.add pos one
   i64.store pp pos1
+  lnp = i64.const 65784
+  ln = i64.load lnp
+  ln1 = i64.add ln one
+  i64.store lnp ln1
   return one
   }
 block 7 (pos: i64) {
@@ -1373,6 +1437,15 @@ block 4 () {
 func (i64, i64) -> () {
 block 0 (msg: i64, len: i64) {
   call 5 ()
+  linestr = i64.const 33088
+  five = i64.const 5
+  call 2 (linestr, five)
+  lnp = i64.const 65784
+  ln = i64.load lnp
+  call 39 (ln)
+  colon = i64.const 33104
+  two = i64.const 2
+  call 2 (colon, two)
   call 2 (msg, len)
   near = i64.const 32976
   six = i64.const 6
@@ -1459,6 +1532,8 @@ block 0 () {
   i64.store alp z
   csp = i64.const 65624
   i64.store csp z
+  rvp = i64.const 65816
+  i64.store rvp z
   b = call 13 ()
   two = i64.const 2
   call 14 (b, two)
@@ -1743,7 +1818,7 @@ block 0 (e: i64) {
   no = i64.load32_s e offset=20
   pay = i64.load e offset=24
   k32 = i32.wrap_i64 kind
-  br_table k32 [5(ni, no, pay), 6(pay), 12(), 7(pay), 8(pay), 9(pay), 10(pay), 1(pay), 11(), 2(), 3(), 4()] 12()
+  br_table k32 [5(ni, no, pay), 6(pay), 12(), 7(pay), 8(pay), 9(pay), 10(pay), 1(pay), 11(), 2(), 3(), 4(), 13(pay), 14(ni, no, pay)] 12()
   }
 block 1 (pay: i64) {
   two = i64.const 2
@@ -1881,13 +1956,30 @@ block 11 () {
 block 12 () {
   return
   }
+; kind 12: constant cell — push the value stored at the cell (read-only, set at define time).
+block 13 (pay: i64) {
+  addr = call 22 (pay)
+  op = i64.const 241
+  v = call 24 (op, addr)
+  call 10 (v)
+  return
+  }
+; kind 13: deferred word — load the current xt from the cell and `execute` it (`defer`/`is`).
+block 14 (ni: i64, no: i64, pay: i64) {
+  addr = call 22 (pay)
+  op = i64.const 241
+  xt = call 24 (op, addr)
+  call 10 (xt)
+  call 71 (ni, no)
+  return
+  }
 }
 
 ; 44 do_imm(id): the compiler words, dispatched by id.
 func (i64) -> () {
 block 0 (id: i64) {
   id32 = i32.wrap_i64 id
-  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24()] 16()
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34(), 40(id), 40(id), 40(id), 40(id), 40(id), 40(id), 41(), 43(), 46(), 48(), 48()] 16()
   }
 block 1 () {
   call 45 ()
@@ -2050,6 +2142,230 @@ block 26 () {
   i64.store ddp one
   return
   }
+; constant(34): `<value> constant name` — allot a cell, emit a `store TOS -> cell`, and define
+; name as kind 12 (load-from-cell). The value is whatever is on top when the line runs.
+block 27 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 28() 29()
+  }
+block 28 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 29 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  nlen = i64.load tl
+  twelve = i64.const 12
+  zero = i64.const 0
+  one = i64.const 1
+  call 35 (t, nlen, twelve, zero, one, h)
+  addr = call 22 (h)
+  val = call 12 ()
+  op = i64.const 133
+  call 25 (op, addr, val)
+  return
+  }
+; defer(35): `defer ( a b -- c ) name` — a cell (default xt 0) and a kind-13 word that loads and
+; executes it, so `is` can rebind it. The declared effect fixes the word's signature.
+block 30 () {
+  call 51 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 16() 31()
+  }
+block 31 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 32() 33()
+  }
+block 32 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 33 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  zero = i64.const 0
+  i64.store h zero
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  nlen = i64.load tl
+  thirteen = i64.const 13
+  nip = i64.const 65648
+  ni = i64.load nip
+  nop = i64.const 65656
+  no = i64.load nop
+  call 35 (t, nlen, thirteen, ni, no, h)
+  return
+  }
+; is(36): `' word is name` — store the xt on top into the deferred word `name`'s cell.
+block 34 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 35() 36(len)
+  }
+block 35 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 36 (len: i64) {
+  tp = i64.const 65680
+  t = i64.load tp
+  e = call 34 (t, len)
+  z = i64.const 0
+  miss = i64.eq e z
+  br_if miss 37() 38(e)
+  }
+block 37 () {
+  m = i64.const 32992
+  n = i64.const 12
+  call 38 (m, n)
+  return
+  }
+block 38 (e: i64) {
+  kind = i64.load32_s e offset=12
+  thirteen = i64.const 13
+  isdef = i64.eq kind thirteen
+  br_if isdef 39(e) 37()
+  }
+block 39 (e: i64) {
+  cell = i64.load e offset=24
+  addr = call 22 (cell)
+  val = call 12 ()
+  op = i64.const 133
+  call 25 (op, addr, val)
+  return
+  }
+block 40 (id: i64) {
+  call 73 (id)
+  return
+  }
+; >r(43) ( x -- ): move the top of the data stack onto the return stack (RVS).
+block 41 () {
+  one = i64.const 1
+  call 11 (one)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 16() 42()
+  }
+block 42 () {
+  v = call 12 ()
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  eight = i64.const 8
+  off = i64.mul rd eight
+  base = i64.const 65824
+  a = i64.add base off
+  i64.store a v
+  one = i64.const 1
+  rd1 = i64.add rd one
+  i64.store rvp rd1
+  return
+  }
+; r>(44) ( -- x ): move the top of the return stack back onto the data stack.
+block 43 () {
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  z = i64.const 0
+  under = i64.le_s rd z
+  br_if under 44() 45(rd)
+  }
+block 44 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+block 45 (rd: i64) {
+  one = i64.const 1
+  rd1 = i64.sub rd one
+  rvp = i64.const 65816
+  i64.store rvp rd1
+  eight = i64.const 8
+  off = i64.mul rd1 eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; r@(45) ( -- x ): copy the top of the return stack onto the data stack.
+block 46 () {
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  z = i64.const 0
+  under = i64.le_s rd z
+  br_if under 44() 47(rd)
+  }
+block 47 (rd: i64) {
+  one = i64.const 1
+  rd1 = i64.sub rd one
+  eight = i64.const 8
+  off = i64.mul rd1 eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; char(46)/[char](47) ( -- c ): push the first byte of the next token as a literal.
+block 48 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 49() 50()
+  }
+block 49 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 50 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  ch = i64.load8_u t
+  v = call 22 (ch)
+  call 10 (v)
+  return
+  }
 }
 
 ; 45 do_colon(): `: name ( in -- out )` — flush the top-level unit, then open the word's unit.
@@ -2112,6 +2428,8 @@ block 5 () {
   i64.store alp z
   csp = i64.const 65624
   i64.store csp z
+  rvp = i64.const 65816
+  i64.store rvp z
   b = call 13 ()
   nip = i64.const 65648
   ni = i64.load nip
@@ -2144,7 +2462,11 @@ block 2 () {
   cs = i64.load csp
   z = i64.const 0
   open = i64.ne cs z
-  br_if open 3() 4()
+  rvp = i64.const 65816
+  rv = i64.load rvp
+  rvopen = i64.ne rv z
+  bad = i32.or open rvopen
+  br_if bad 3() 4()
   }
 block 3 () {
   m = i64.const 32832
@@ -2449,7 +2771,8 @@ block 10 () {
   }
 }
 
-; 52 vs_params(n): the virtual stack becomes the open block's n params (values 0..n).
+; 52 vs_params(n): the virtual stack becomes the open block's first n params (values 0..n), and the
+; RVS entries become the next params (values n..n+RVS_DEPTH) — the loop index/limit carried in.
 func (i64) -> () {
 block 0 (n: i64) {
   dp = i64.const 65576
@@ -2459,7 +2782,7 @@ block 0 (n: i64) {
   }
 block 1 (n: i64, i: i64) {
   done = i64.ge_s i n
-  br_if done 3() 2(n, i)
+  br_if done 3(n) 2(n, i)
   }
 block 2 (n: i64, i: i64) {
   eight = i64.const 8
@@ -2471,7 +2794,28 @@ block 2 (n: i64, i: i64) {
   i1 = i64.add i one
   br 1(n, i1)
   }
-block 3 () {
+block 3 (n: i64) {
+  rp = i64.const 65816
+  r = i64.load rp
+  z = i64.const 0
+  br 4(n, r, z)
+  }
+block 4 (n: i64, r: i64, k: i64) {
+  done = i64.ge_s k r
+  br_if done 6() 5(n, r, k)
+  }
+block 5 (n: i64, r: i64, k: i64) {
+  eight = i64.const 8
+  off = i64.mul k eight
+  base = i64.const 65824
+  a = i64.add base off
+  val = i64.add n k
+  i64.store a val
+  one = i64.const 1
+  k1 = i64.add k one
+  br 4(n, r, k1)
+  }
+block 6 () {
   return
   }
 }
@@ -2700,7 +3044,7 @@ block 0 (id: i64) {
   three = i64.const 3
   k = i64.sub id three
   k32 = i32.wrap_i64 k
-  br_table k32 [1(), 3(), 6(), 13(), 14(), 19(), 23(), 27()] 31()
+  br_table k32 [1(), 3(), 6(), 15(), 16(), 21(), 25(), 29()] 33()
   }
 ; ---- if ----
 block 1 () {
@@ -2709,7 +3053,7 @@ block 1 () {
   err = i64.load ep
   z = i64.const 0
   bad = i64.ne err z
-  br_if bad 31() 2(x)
+  br_if bad 33() 2(x)
   }
 block 2 (x: i64) {
   c = call 59 (x)
@@ -2730,13 +3074,13 @@ block 3 () {
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 4(e)
+  br_if none 34() 4(e)
   }
 block 4 (e: i64) {
   kind = i64.load e
   one = i64.const 1
   isif = i64.eq kind one
-  br_if isif 5(e) 32()
+  br_if isif 5(e) 34()
   }
 block 5 (e: i64) {
   eblk = i64.load e offset=8
@@ -2757,7 +3101,7 @@ block 6 () {
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 7(e)
+  br_if none 34() 7(e)
   }
 block 7 (e: i64) {
   kind = i64.load e
@@ -2773,7 +3117,7 @@ block 8 (e: i64) {
   br 11(blk, d)
   }
 block 9 (e: i64, iselse: i32) {
-  br_if iselse 10(e) 32()
+  br_if iselse 10(e) 34()
   }
 block 10 (e: i64) {
   blk = i64.load e offset=8
@@ -2781,19 +3125,33 @@ block 10 (e: i64) {
   br 11(blk, d)
   }
 block 11 (blk: i64, d: i64) {
+  ddp = i64.const 65672
+  dead = i64.load ddp
+  z = i64.const 0
+  isdead = i64.ne dead z
+  br_if isdead 14(blk, d) 12(blk, d)
+  }
+block 12 (blk: i64, d: i64) {
   dp = i64.const 65576
   cur = i64.load dp
   same = i64.eq cur d
-  br_if same 12(blk, d) 33()
+  br_if same 13(blk, d) 35()
   }
-block 12 (blk: i64, d: i64) {
+block 13 (blk: i64, d: i64) {
   call 16 (blk)
   call 14 (blk, d)
   call 52 (d)
   return
   }
+; a dead arm (terminated by exit/leave/again): close it as unreachable — no edge, no depth check.
+block 14 (blk: i64, d: i64) {
+  call 20 ()
+  call 14 (blk, d)
+  call 52 (d)
+  return
+  }
 ; ---- begin ----
-block 13 () {
+block 15 () {
   h = call 13 ()
   dp = i64.const 65576
   d = i64.load dp
@@ -2806,36 +3164,36 @@ block 13 () {
   return
   }
 ; ---- until ----
-block 14 () {
+block 16 () {
   x = call 12 ()
   ep = i64.const 65712
   err = i64.load ep
   z = i64.const 0
   bad = i64.ne err z
-  br_if bad 31() 15(x)
+  br_if bad 33() 17(x)
   }
-block 15 (x: i64) {
+block 17 (x: i64) {
   c = call 59 (x)
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 16(e, c)
+  br_if none 34() 18(e, c)
   }
-block 16 (e: i64, c: i64) {
+block 18 (e: i64, c: i64) {
   kind = i64.load e
   three = i64.const 3
   ok = i64.eq kind three
-  br_if ok 17(e, c) 32()
+  br_if ok 19(e, c) 34()
   }
-block 17 (e: i64, c: i64) {
+block 19 (e: i64, c: i64) {
   h = i64.load e offset=8
   d = i64.load e offset=32
   dp = i64.const 65576
   cur = i64.load dp
   same = i64.eq cur d
-  br_if same 18(h, d, c) 33()
+  br_if same 20(h, d, c) 35()
   }
-block 18 (h: i64, d: i64, c: i64) {
+block 20 (h: i64, d: i64, c: i64) {
   x = call 13 ()
   call 17 (c, x, h)
   call 14 (x, d)
@@ -2843,27 +3201,27 @@ block 18 (h: i64, d: i64, c: i64) {
   return
   }
 ; ---- again ----
-block 19 () {
+block 21 () {
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 20(e)
+  br_if none 34() 22(e)
   }
-block 20 (e: i64) {
+block 22 (e: i64) {
   kind = i64.load e
   three = i64.const 3
   ok = i64.eq kind three
-  br_if ok 21(e) 32()
+  br_if ok 23(e) 34()
   }
-block 21 (e: i64) {
+block 23 (e: i64) {
   h = i64.load e offset=8
   d = i64.load e offset=32
   dp = i64.const 65576
   cur = i64.load dp
   same = i64.eq cur d
-  br_if same 22(h, d) 33()
+  br_if same 24(h, d) 35()
   }
-block 22 (h: i64, d: i64) {
+block 24 (h: i64, d: i64) {
   call 16 (h)
   x = call 13 ()
   call 14 (x, d)
@@ -2874,28 +3232,28 @@ block 22 (h: i64, d: i64) {
   return
   }
 ; ---- while ----
-block 23 () {
+block 25 () {
   x = call 12 ()
   ep = i64.const 65712
   err = i64.load ep
   z = i64.const 0
   bad = i64.ne err z
-  br_if bad 31() 24(x)
+  br_if bad 33() 26(x)
   }
-block 24 (x: i64) {
+block 26 (x: i64) {
   c = call 59 (x)
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 25(e, c)
+  br_if none 34() 27(e, c)
   }
-block 25 (e: i64, c: i64) {
+block 27 (e: i64, c: i64) {
   kind = i64.load e
   three = i64.const 3
   ok = i64.eq kind three
-  br_if ok 26(e, c) 32()
+  br_if ok 28(e, c) 34()
   }
-block 26 (e: i64, c: i64) {
+block 28 (e: i64, c: i64) {
   h = i64.load e offset=8
   dh = i64.load e offset=32
   b = call 13 ()
@@ -2910,19 +3268,19 @@ block 26 (e: i64, c: i64) {
   return
   }
 ; ---- repeat ----
-block 27 () {
+block 29 () {
   e = call 50 ()
   z = i64.const 0
   none = i64.eq e z
-  br_if none 32() 28(e)
+  br_if none 34() 30(e)
   }
-block 28 (e: i64) {
+block 30 (e: i64) {
   kind = i64.load e
   four = i64.const 4
   ok = i64.eq kind four
-  br_if ok 29(e) 32()
+  br_if ok 31(e) 34()
   }
-block 29 (e: i64) {
+block 31 (e: i64) {
   h = i64.load e offset=8
   x = i64.load e offset=16
   dx = i64.load e offset=24
@@ -2930,24 +3288,24 @@ block 29 (e: i64) {
   dp = i64.const 65576
   cur = i64.load dp
   same = i64.eq cur dh
-  br_if same 30(h, x, dx) 33()
+  br_if same 32(h, x, dx) 35()
   }
-block 30 (h: i64, x: i64, dx: i64) {
+block 32 (h: i64, x: i64, dx: i64) {
   call 16 (h)
   call 14 (x, dx)
   call 52 (dx)
   return
   }
-block 31 () {
+block 33 () {
   return
   }
-block 32 () {
+block 34 () {
   m = i64.const 32832
   n = i64.const 26
   call 38 (m, n)
   return
   }
-block 33 () {
+block 35 () {
   m = i64.const 32864
   n = i64.const 21
   call 38 (m, n)
@@ -3441,6 +3799,288 @@ block 7 (no: i64) {
   br 6(no1)
   }
 block 8 () {
+  return
+  }
+}
+
+; 72 find_do(skip) -> address of the (skip)-th DO control-stack entry from the top (0 = nearest),
+; or 0 if there aren't that many. Lets `i`/`j` find their loop through intervening if/begin frames.
+func (i64) -> (i64) {
+block 0 (skip: i64) {
+  csp = i64.const 65624
+  n = i64.load csp
+  one = i64.const 1
+  i = i64.sub n one
+  br 1(skip, i)
+  }
+block 1 (skip: i64, i: i64) {
+  z = i64.const 0
+  neg = i64.lt_s i z
+  br_if neg 6() 2(skip, i)
+  }
+block 2 (skip: i64, i: i64) {
+  forty = i64.const 40
+  off = i64.mul i forty
+  base = i64.const 68608
+  e = i64.add base off
+  kind = i64.load e
+  five = i64.const 5
+  isdo = i64.eq kind five
+  br_if isdo 3(skip, i, e) 4(skip, i)
+  }
+block 3 (skip: i64, i: i64, e: i64) {
+  z = i64.const 0
+  hit = i64.le_s skip z
+  br_if hit 7(e) 5(skip, i)
+  }
+block 4 (skip: i64, i: i64) {
+  one = i64.const 1
+  i1 = i64.sub i one
+  br 1(skip, i1)
+  }
+block 5 (skip: i64, i: i64) {
+  one = i64.const 1
+  skip1 = i64.sub skip one
+  i1 = i64.sub i one
+  br 1(skip1, i1)
+  }
+block 6 () {
+  z = i64.const 0
+  return z
+  }
+block 7 (e: i64) {
+  return e
+  }
+}
+
+; 73 do_loop(id): do(37) loop(38) +loop(39) i(40) j(41) leave(42). The loop index and limit live on
+; the RVS (return stack), pushed by `do` and carried through every branch as block params — so the
+; data stack stays clean and an accumulator below the loop is reachable. A DO control entry (kind 5)
+; records a=header, b=exit, c=index RVS slot, depth=floor (the data depth inside the loop). `i`/`j`
+; read the RVS slot; `loop`/`+loop` bump the index, test, and pop the RVS frame after opening the
+; exit; `leave` jumps to the pre-allocated exit (#1237).
+func (i64) -> () {
+block 0 (id: i64) {
+  c37 = i64.const 37
+  k = i64.sub id c37
+  k32 = i32.wrap_i64 k
+  br_table k32 [1(), 3(), 7(), 11(), 13(), 15()] 19()
+  }
+; ---- do ( limit start -- ) ----
+block 1 () {
+  two = i64.const 2
+  call 11 (two)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 19() 2()
+  }
+block 2 () {
+  start = call 12 ()
+  limit = call 12 ()
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  eight = i64.const 8
+  base = i64.const 65824
+  loff = i64.mul rd eight
+  la = i64.add base loff
+  i64.store la limit
+  one = i64.const 1
+  rd1 = i64.add rd one
+  ioff = i64.mul rd1 eight
+  ia = i64.add base ioff
+  i64.store ia start
+  two = i64.const 2
+  rd2 = i64.add rd two
+  i64.store rvp rd2
+  dp = i64.const 65576
+  floor = i64.load dp
+  h = call 13 ()
+  x = call 13 ()
+  call 16 (h)
+  call 14 (h, floor)
+  call 52 (floor)
+  five = i64.const 5
+  call 49 (five, h, x, rd1, floor)
+  return
+  }
+; ---- loop ----
+block 3 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 18() 4(e)
+  }
+block 4 (e: i64) {
+  kind = i64.load e
+  five = i64.const 5
+  isdo = i64.eq kind five
+  br_if isdo 5(e) 18()
+  }
+block 5 (e: i64) {
+  h = i64.load e offset=8
+  x = i64.load e offset=16
+  islot = i64.load e offset=24
+  floor = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur floor
+  br_if same 6(h, x, islot, floor) 18()
+  }
+block 6 (h: i64, x: i64, islot: i64, floor: i64) {
+  eight = i64.const 8
+  base = i64.const 65824
+  ioff = i64.mul islot eight
+  ia = i64.add base ioff
+  idx = i64.load ia
+  one = i64.const 1
+  lslot = i64.sub islot one
+  loff = i64.mul lslot eight
+  la = i64.add base loff
+  lim = i64.load la
+  onev = call 22 (one)
+  addop = i64.const 64
+  idx1 = call 23 (addop, idx, onev)
+  geop = i64.const 89
+  cond = call 23 (geop, idx1, lim)
+  i64.store ia idx1
+  call 17 (cond, x, h)
+  call 14 (x, floor)
+  call 52 (floor)
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  two = i64.const 2
+  rd2 = i64.sub rd two
+  i64.store rvp rd2
+  return
+  }
+; ---- +loop ( n -- ) ----
+block 7 () {
+  e = call 50 ()
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 18() 8(e)
+  }
+block 8 (e: i64) {
+  kind = i64.load e
+  five = i64.const 5
+  isdo = i64.eq kind five
+  br_if isdo 9(e) 18()
+  }
+block 9 (e: i64) {
+  h = i64.load e offset=8
+  x = i64.load e offset=16
+  islot = i64.load e offset=24
+  floor = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  one = i64.const 1
+  fp1 = i64.add floor one
+  same = i64.eq cur fp1
+  br_if same 10(h, x, islot, floor) 18()
+  }
+block 10 (h: i64, x: i64, islot: i64, floor: i64) {
+  step = call 12 ()
+  eight = i64.const 8
+  base = i64.const 65824
+  ioff = i64.mul islot eight
+  ia = i64.add base ioff
+  idx = i64.load ia
+  one = i64.const 1
+  lslot = i64.sub islot one
+  loff = i64.mul lslot eight
+  la = i64.add base loff
+  lim = i64.load la
+  addop = i64.const 64
+  idx1 = call 23 (addop, idx, step)
+  subop = i64.const 65
+  od = call 23 (subop, idx, lim)
+  nnd = call 23 (subop, idx1, lim)
+  xorop = i64.const 73
+  cross = call 23 (xorop, od, nnd)
+  zconst = i64.const 0
+  zc = call 22 (zconst)
+  ltop = i64.const 83
+  cond = call 23 (ltop, cross, zc)
+  i64.store ia idx1
+  call 17 (cond, x, h)
+  call 14 (x, floor)
+  call 52 (floor)
+  rvp = i64.const 65816
+  rd = i64.load rvp
+  two = i64.const 2
+  rd2 = i64.sub rd two
+  i64.store rvp rd2
+  return
+  }
+; ---- i ( -- n ) ----
+block 11 () {
+  z = i64.const 0
+  e = call 72 (z)
+  none = i64.eq e z
+  br_if none 18() 12(e)
+  }
+block 12 (e: i64) {
+  islot = i64.load e offset=24
+  eight = i64.const 8
+  off = i64.mul islot eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; ---- j ( -- n ) ----
+block 13 () {
+  one = i64.const 1
+  e = call 72 (one)
+  z = i64.const 0
+  none = i64.eq e z
+  br_if none 18() 14(e)
+  }
+block 14 (e: i64) {
+  islot = i64.load e offset=24
+  eight = i64.const 8
+  off = i64.mul islot eight
+  base = i64.const 65824
+  a = i64.add base off
+  v = i64.load a
+  call 10 (v)
+  return
+  }
+; ---- leave ----
+block 15 () {
+  z = i64.const 0
+  e = call 72 (z)
+  none = i64.eq e z
+  br_if none 18() 16(e)
+  }
+block 16 (e: i64) {
+  x = i64.load e offset=16
+  floor = i64.load e offset=32
+  dp = i64.const 65576
+  cur = i64.load dp
+  same = i64.eq cur floor
+  br_if same 17(x, floor) 18()
+  }
+block 17 (x: i64, floor: i64) {
+  call 16 (x)
+  d2 = call 13 ()
+  call 14 (d2, floor)
+  call 52 (floor)
+  ddp = i64.const 65672
+  one = i64.const 1
+  i64.store ddp one
+  return
+  }
+block 18 () {
+  m = i64.const 32832
+  n = i64.const 26
+  call 38 (m, n)
+  return
+  }
+block 19 () {
   return
   }
 }

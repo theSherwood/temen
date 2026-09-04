@@ -3684,6 +3684,11 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
             include_str!("../../temen-run/demos/posix_utils/pwd.c"),
             false,
         ),
+        (
+            "cut",
+            include_str!("../../temen-run/demos/posix_utils/cut.c"),
+            false,
+        ),
     ];
     for want in names {
         let (_, src, rx) = TOOLS
@@ -3883,6 +3888,90 @@ int main(void) {{\n\
         ep.result,
         vec![Value::I32(42)],
         "parallel driver: parent-fed sort | uniq -c across exec'd threads, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **parent-fed `cut`** in its four shapes: field mode with a comma list
+/// (`-d: -f2,4` → `b:d`, fields re-joined by the delimiter in ascending order), char mode
+/// (`-c2-4` → `bcd`), an open-ended field range (`-d' ' -f3-` → `r s`), and the GNU
+/// no-delimiter passthrough (a line without the delimiter emerges unchanged). Each shape is a
+/// fresh fork→exec of `/bin/cut` fed from a parent pipe and byte-checked — repeated exec rounds
+/// exercising the argv-pack + read-park + reap path the same way the grep/sort witnesses do.
+#[test]
+fn c_coreutils_cut_fields_and_chars() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runcut(char **av, char *in, long inlen, char *exp, long explen) {{\n\
+  int ip[2]; int op[2];\n\
+  if (pipe(ip) != 0 || pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, ip[0], 0); __px_dup2(0, op[1], 1);\n\
+    close(ip[0]); close(ip[1]); close(op[0]); close(op[1]);\n\
+    execvp(\"cut\", av); return 99;\n\
+  }}\n\
+  close(ip[0]); close(op[1]);\n\
+  if (write(ip[1], in, inlen) != inlen) return 3;\n\
+  close(ip[1]);                               /* EOF so cut's u_rdline terminates */\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avf[] = {{ \"cut\", \"-d:\", \"-f2,4\", 0 }};\n\
+static char *avc[] = {{ \"cut\", \"-c2-4\", 0 }};\n\
+static char *avo[] = {{ \"cut\", \"-d \", \"-f3-\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runcut(avf, \"a:b:c:d\\n\", 8, \"b:d\\n\", 4);       if (r) return 10 + r;\n\
+  r = runcut(avc, \"abcdef\\n\", 7, \"bcd\\n\", 4);         if (r) return 20 + r;\n\
+  r = runcut(avo, \"p q r s\\n\", 8, \"r s\\n\", 4);        if (r) return 30 + r;\n\
+  r = runcut(avf, \"nodlim\\n\", 7, \"nodlim\\n\", 7);      if (r) return 40 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "parent-fed cut: field list, char range, open field range, and no-delim passthrough"
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: parent-fed cut across four exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: parent-fed cut across four exec'd thread rounds, matching both oracles"
     );
 }
 
@@ -4816,6 +4905,287 @@ fn c_multiple_background_jobs_stop_and_continue_across_process_groups() {
         p.result,
         vec![Value::I32(42)],
         "parallel driver: the same two-group stop/continue/reap over real OS threads — matching the oracle"
+    );
+}
+
+// #1259 guardrail — the two-group stop→continue→reap shape (the #1213 repro) run many times, so a
+// dispatch that reorders the stop/continue mirror writes surfaces as a DETERMINISTIC hang here instead
+// of a 1-in-N CI flake. The reorder bit only the engines that keep a scheduler-visible mirror of the
+// stop/kill flags (the tree-walker's `stop_depth`, the parallel driver's `term_flag`) — the two run
+// here; the cooperative driver reads the personality's own `stopped_sig`/`term_sig` directly (always
+// in-order) and is not a reorder site. Before #1259 the two mirror writes were deferred onto per-call
+// detached threads with no ordering, so a program-order stop→continue could latch as continue→stop and
+// wedge a job; #1259 applies the flag inline in program order (only the idempotent scheduler notify
+// stays deferred), making a reorder impossible by construction. Each iteration must return 42 — a
+// single hung iteration fails the whole test under CI's job timeout.
+#[test]
+fn c_stop_continue_reap_dispatch_is_reorder_free_under_stress() {
+    let src = mjobs_src();
+    for i in 0..60 {
+        let e = run_interp_only(&src, |_| {});
+        assert_eq!(
+            e.result,
+            vec![Value::I32(42)],
+            "tree-walker iteration {i}: the stop→continue mirror applied in program order (no reorder \
+             latching a stale stop)"
+        );
+    }
+    for i in 0..12 {
+        let p = run_bytecode_parallel_only(&src, |_| {});
+        assert_eq!(
+            p.result,
+            vec![Value::I32(42)],
+            "parallel driver iteration {i}: the term_flag/stop mirror applied in order across OS threads"
+        );
+    }
+}
+
+fn pipejob_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pa, pb;\n\
+static int fa[2]; static int fb[2];\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char g='x'; long r=__px_write(0,fd,(long)&g,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&g,1); }}\n\
+int main(void){{\n\
+  int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  pa = __px_fork(0,0);\n\
+  if (pa < 0) return 1;\n\
+  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 2;\n\
+  /* the SECOND stage joins the FIRST's group: the pipeline is ONE job in one process group */\n\
+  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  __px_setpgid(0, pa, pa);\n\
+  __px_setpgid(0, pb, pa);\n\
+  /* stop the WHOLE pipeline with one group signal — it must reach BOTH parked members. */\n\
+  __px_kill(0, -pa, 20);\n\
+  int sa=0, sb=0, k;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 2)) == -4){{}}\n\
+    if (h < 0) return 100+k;\n\
+    if ((status & 0xff) != 0x7f) return 2000 + (status & 0xffff);\n\
+    if (h==pa) sa++; else if (h==pb) sb++; else return 200+k;\n\
+  }}\n\
+  if (sa!=1 || sb!=1) return 300;\n\
+  /* continue the whole group with one signal, feed both stages, reap both. */\n\
+  __px_kill(0,-pa,18);\n\
+  wr1(fa[1]); wr1(fb[1]);\n\
+  int ea=0, eb=0;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+    if (h < 0) return 4000 + (int)(-h);\n\
+    if ((status & 0x7f) != 0) return 500 + (status & 0xffff);\n\
+    int code = (status>>8)&0xff;\n\
+    if (h==pa){{ if(code!=7) return 601; ea++; }}\n\
+    else if (h==pb){{ if(code!=9) return 602; eb++; }}\n\
+    else return 603;\n\
+  }}\n\
+  if (ea!=1 || eb!=1) return 700;\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+fn pipekill_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_setpgid(int cap, long pid, long pgid);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long pa, pb;\n\
+static int fa[2]; static int fb[2];\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+int main(void){{\n\
+  int ha[2]; __vm_pipe(ha); __px_pipe_adopt(0, ha[0], ha[1], (long)fa);\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  pa = __px_fork(0,0);\n\
+  if (pa < 0) return 1;\n\
+  if (pa == 0){{ __px_setpgid(0,0,0); if (rd1(fa[0])<=0) return 90; return 7; }}\n\
+  pb = __px_fork(0,0);\n\
+  if (pb < 0) return 2;\n\
+  if (pb == 0){{ __px_setpgid(0,0,pa); if (rd1(fb[0])<=0) return 91; return 9; }}\n\
+  __px_setpgid(0, pa, pa);\n\
+  __px_setpgid(0, pb, pa);\n\
+  /* ^C the whole pipeline: SIGINT (no handler ⇒ TERMINATE) must reach and kill BOTH parked members. */\n\
+  __px_kill(0, -pa, 2);\n\
+  int ka=0, kb=0, k;\n\
+  for (k=0;k<2;k++){{\n\
+    long h; while ((h = __px_waitpid(0, -1, (long)&status, 0)) == -4){{}}\n\
+    if (h < 0) return 100+k;\n\
+    if ((status & 0x7f) != 2) return 2000 + (status & 0xffff);  /* both WIFSIGNALED(SIGINT) */\n\
+    if (h==pa) ka++; else if (h==pb) kb++; else return 200+k;\n\
+  }}\n\
+  if (ka!=1 || kb!=1) return 300;\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #798/#1262 pipeline terminate — ^C of a foreground pipeline must kill EVERY stage. Two twins share
+// one process group and both park on a pipe read; a single `kill(-pgid, SIGINT)` (no handler ⇒ default
+// TERMINATE) must terminate BOTH parked members, each reaped WIFSIGNALED(SIGINT). This is the
+// group-fan-out of the #1262 terminate-a-parked-job fix: on the cooperative driver ONE bell ring must
+// wake the pump so its loop-top kill sweep finalizes BOTH killed twins in the same settle (not just the
+// first). Returns 42 across the tree-walker, the cooperative bytecode engine, and the parallel driver.
+#[test]
+fn c_foreground_pipeline_group_is_terminated_by_a_group_sigint() {
+    let e = run_interp_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: one SIGINT to the pipeline group terminated both parked stages, each reaped \
+         WIFSIGNALED(SIGINT)"
+    );
+    let b = run_bytecode_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the group SIGINT woke the pump and the loop-top kill sweep \
+         finalized both killed members — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(&pipekill_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: both parked members of the group self-terminated at their per-op term_flag \
+         poll — matching the oracle"
+    );
+}
+
+fn reapkill_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long s, g;\n\
+static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
+static int fs[2];  /* subshell -> root sync pipe */\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
+int main(void){{\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
+  s = __px_fork(0,0);\n\
+  if (s < 0) return 1;\n\
+  if (s == 0){{\n\
+    /* the subshell: fork a grandchild that blocks forever, then PARK in waitpid on it. */\n\
+    g = __px_fork(0,0);\n\
+    if (g < 0) return 80;\n\
+    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    return 7;    /* only if g exits before we are killed */\n\
+  }}\n\
+  /* root: wait until the subshell is about to park, then KILL it while it blocks in waitpid. */\n\
+  rd1(fs[0]);\n\
+  __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid */\n\
+  wr1(fb[1]);                  /* release the grandchild so its OS thread returns (no orphan hang) */\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  if (h != s) return 100;\n\
+  if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+// #1267 follow-up — terminate a twin PARKED in `waitpid` (a subshell blocked reaping its own child,
+// e.g. `^C` of a `$(…)` command substitution). This pins that the parallel driver's reap park is
+// airtight for terminate WITHOUT a dedicated `term_flag` escape: unlike the pipe poll #1267 fixed
+// (whose readiness never flips on terminate), the reap condvar SELF-HEALS. A subshell parked in
+// `waitpid` can only be cleanly terminated by also terminating its child (else the child's OS thread
+// hangs the run); the killed child's forced exit wakes `wait_fork_exit`, the parent's rewound
+// `waitpid` re-executes and dies at its per-op `term_flag` safepoint (WIFSIGNALED SIGKILL, reaped as
+// 3009→42). Here the subshell forks a grandchild that blocks forever and parks reaping it; root
+// SIGKILLs the subshell and releases the grandchild so its thread returns. Returns 42 on the
+// tree-walker, the cooperative bytecode engine, and the parallel driver — verified to hold with the
+// driver UNCHANGED (the reap/join condvar sites need no term_flag poll; only the pipe polls did, #1267).
+#[test]
+fn c_terminate_a_twin_parked_in_waitpid() {
+    let e = run_interp_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: the subshell parked in waitpid was SIGKILL-terminated and reaped WIFSIGNALED"
+    );
+    let b = run_bytecode_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode: same — the loop-top kill sweep finalized the reap-parked subshell"
+    );
+    let p = run_bytecode_parallel_only(&reapkill_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: the killed grandchild's exit woke the subshell's condvar reap wait, and the \
+         subshell's re-run died at its per-op term_flag safepoint — no dedicated escape needed, matching \
+         the oracle"
+    );
+}
+
+// #798 pipeline-as-a-job — a foreground pipeline (`a | b`) is ONE job whose stages share ONE process
+// group, so a job-control signal (^Z/SIGTSTP, ^C, SIGCONT via `fg`/`bg`) must fan out to EVERY member
+// of the group, not just the leader. Two twins are forked, the second `setpgid`'d into the FIRST's
+// group (the pipeline group), and both park on a pipe read; a single `kill(-pgid, SIGTSTP)` must stop
+// BOTH, the shell collects two `waitpid(-1, WUNTRACED)` stop reports, a single `kill(-pgid, SIGCONT)`
+// resumes BOTH, and each is fed a byte and reaped with its own exit. This is the group-fan-out shape
+// behind `cat | cat` + `^Z`/`fg`: `c_multiple_background_jobs_...` covers one member per group; this
+// covers two members in one group. Returns 42 on the tree-walker, the cooperative bytecode engine, and
+// the parallel driver.
+#[test]
+fn c_foreground_pipeline_group_stops_and_continues_all_members() {
+    let e = run_interp_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "tree-walker: one SIGTSTP to the pipeline group stopped both stages, both stops were reported, \
+         one SIGCONT resumed both, and each was reaped with its own exit"
+    );
+    let b = run_bytecode_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        b.result,
+        vec![Value::I32(42)],
+        "coop bytecode (the browser tier): the group signal reached both parked members of the one \
+         pipeline group — matching the oracle"
+    );
+    let p = run_bytecode_parallel_only(&pipejob_src(), |_| {});
+    assert_eq!(
+        p.result,
+        vec![Value::I32(42)],
+        "parallel driver: the same one-group two-member stop/continue over real OS threads — matching the oracle"
     );
 }
 

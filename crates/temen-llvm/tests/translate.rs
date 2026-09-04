@@ -12868,6 +12868,84 @@ fn demo_bash_translates_and_verifies() {
         // A key=value state-machine parse (IFS read into an array + trim + %%/# expansions):
         "input='name=alice; age=30; city=wonderland'; IFS=';' read -ra ps <<< \"$input\"; \
          for p in \"${ps[@]}\"; do p=\"${p# }\"; echo \"[${p%%=*}] -> [${p#*=}]\"; done",
+        // Round 5 — a builtin-only language-differential survey (a ~28-construct probe found all of
+        // these already byte-identical to native; pinned here as regression gates). No temen bug was
+        // found — the only probe "divergence" was the ORACLE's own broken float printf (%f/%e/%g print
+        // `nan` under the bring-up config's `ac_cv_type_long_double=no`, while temen prints correctly),
+        // so float formats are deliberately not pinned against this oracle.
+        // Parameter expansion: :- / :+ / length; case-mod ^^ ,, ^ ,; substring (incl. negative); pattern
+        // replace // and /, prefix/suffix trim # ## % %%; :=; @Q and %q quoting.
+        "v=hello; echo \"${v:-def}/${u:-def}/${v:+set}/${#v}\"",
+        "v=HeLLo; echo \"${v^^}/${v,,}/${v^}/${v,}\"",
+        "v=abcdef; echo \"${v:1:3}/${v: -2}/${v:2}\"",
+        "v=a.b.c.d; echo \"${v//./_}/${v/./_}/${v#*.}/${v##*.}/${v%.*}/${v%%.*}\"",
+        "unset u; echo \"${u:=default}\"; echo \"$u\"",
+        "printf '%q\\n' \"a b'c\"",
+        "v='a b'; printf '%s\\n' \"${v@Q}\"",
+        // Arrays: @ vs *, length, negative index, keys, slice; += append; associative (fixed keys).
+        "a=(x y z w); echo \"${a[@]}|${#a[@]}|${a[-1]}|${!a[@]}|${a[@]:1:2}\"",
+        "a=(); a+=(p); a+=(q r); echo \"${a[*]}/${#a[@]}\"",
+        "declare -A m=([one]=1 [two]=2 [three]=3); echo \"${m[one]}${m[two]}${m[three]}/${#m[@]}\"",
+        // Brace expansion: numeric range, cartesian, zero-pad, reverse, step.
+        "echo {1..5} {a,b}{1,2} {01..03} {5..1} {1..10..3}",
+        // Arithmetic: pre/post ++, bases, ternary, ** % << |; ((…)) and let commands.
+        "x=5; echo $((x++))/$x/$((++x))/$x",
+        "echo $((2**10)) $((17%5)) $((1<<4)) $((0xff)) $((2#101)) $(( 5>3?100:200 ))",
+        "i=0; ((i++)); ((i+=5)); echo $i; let 'y=3+4'; echo $y",
+        // Control flow: C-style for, until, case with a glob + a ;;& fallthrough.
+        "for ((i=0;i<3;i++)); do echo \"c$i\"; done",
+        "i=0; until ((i>=3)); do echo \"u$i\"; ((i++)); done",
+        "case abc in a*) echo one;;& *bc) echo two;; esac",
+        // [[ ]]: glob vs quoted-literal, numeric, string ordering. printf %b, format reuse.
+        "[[ abc == a* ]] && echo glob; [[ abc == 'a*' ]] || echo lit; [[ 5 -gt 3 ]] && echo num; [[ abc < abd ]] && echo slt",
+        "printf '%b\\n' 'a\\tb\\nc'",
+        "printf '[%s]' a b c; echo",
+        // read -a, IFS-split read; positional params $# $* ${@:o:l} shift.
+        "read -a arr <<< 'one two three'; echo \"${arr[1]}/${#arr[@]}\"",
+        "IFS=: read -r a b c <<< 'x:y:z'; echo \"$a-$b-$c\"",
+        "set -- a b c d; echo \"$#/${*}/${@:2:2}\"; shift 2; echo \"$@\"",
+        // mapfile from process substitution; indirect ${!x} + declare -n nameref (read + write-through).
+        "mapfile -t lines < <(printf 'l1\\nl2\\nl3\\n'); echo \"${#lines[@]}/${lines[1]}\"",
+        "x=y; y=hit; echo \"${!x}\"; declare -n r=y; echo \"$r\"; r=changed; echo \"$y\"",
+        // Command grouping exit status, negation !, && / || short-circuit.
+        "{ true; }; echo $?; { false; }; echo $?; ! false; echo $?; true && echo a || echo b",
+        // Round 6 — an exotic-surface language-differential survey (a 25-construct probe found ALL of
+        // these already byte-identical to native; pinned here as regression gates, no temen bug found).
+        // The kill-based async trap (`kill -USR1 $$`) matches native on the tree-walker; on the coop and
+        // parallel tiers async delivery into a running C handler is interp-only (#796 L2), so it prints
+        // less there — coherently between the two, which is what the coop==parallel assertion below checks.
+        // getopts: combined flags, optarg, `--` terminator, silent-mode missing-arg, invalid option.
+        "set -- -ab -c val x y; while getopts 'abc:' o; do echo \"$o=${OPTARG:-}\"; done; echo \"rest=${*:$OPTIND}\"",
+        "set -- -x -- -y; while getopts 'xy' o; do echo \"$o\"; done; shift $((OPTIND-1)); echo \"rest=$*\"",
+        "set -- -c; while getopts ':c:' o; do echo \"$o/${OPTARG:-none}\"; done",
+        "set -- -q z; while getopts 'a' o; do echo \"$o\"; done 2>/dev/null; echo \"after opt=$OPTIND\"",
+        // ${var@…} transforms: U/L/u case, A declare-form, a attributes, E escape-expand, k assoc pairs.
+        "v=Hello; echo \"${v@U}/${v@L}/${v@u}\"",
+        "v=x; echo \"${v@A}\"",
+        "declare -i n=5; echo \"${n@a}\"",
+        "v='a\\tb\\n'; echo \"${v@E}\"",
+        "declare -A m=([a]=1 [b]=2); echo \"${m[@]@k}\"",
+        // extended globs (extglob): +(…)/@(…)/!(…) in replace, [[, case, and quantified patterns.
+        "shopt -s extglob; v=foobarbaz; echo \"${v//+([ao])/_}\"; [[ abc == @(abc|xyz) ]] && echo m1; [[ aXXc == a+(X)c ]] && echo m2",
+        "shopt -s extglob; for f in a.txt b.log c.md; do case $f in *.@(txt|md)) echo \"keep $f\";; esac; done",
+        "shopt -s extglob; [[ 123abc == +([0-9])+([a-z]) ]] && echo match; [[ x == !(y) ]] && echo neg",
+        // trap edges: -p print, nested EXIT in a subshell, synchronous DEBUG count, $? snapshot, async kill.
+        "trap 'echo hi' INT; trap -p INT",
+        "trap 'echo outer' EXIT; (trap 'echo inner' EXIT; echo sub); echo main",
+        "n=0; trap 'echo \"d$((++n))\"' DEBUG; true; :; echo end",
+        "trap 'echo \"got=$?\"' USR1; f() { return 4; }; f; kill -USR1 $$; echo after",
+        // printf edges: 'A char-code idiom, bases in %d, %c first-char, -v capture + width reuse.
+        "printf '%d %d\\n' \"'A\" \"'z\"",
+        "printf '%d %d %d\\n' 0x1f 010 42",
+        "printf '%c%c%c\\n' abc def ghi",
+        "printf -v out '[%5s|%-5s]' hi yo; echo \"$out\"",
+        // integer attribute (arith on assign + +=), readonly (failed-assign status), local -n nameref.
+        "declare -i x; x='5+3*2'; echo \"$x\"; x+=4; echo \"$x\"",
+        "x=5; readonly x; { x=9; } 2>/dev/null; echo \"$x/$?\"",
+        "f() { local -n ref=$1; ref=changed; }; v=orig; f v; echo \"$v\"",
+        // select (menu → stderr, REPLY from a fed line); coproc round-trip through its two pipes.
+        "select x in a b c; do echo \"picked=$x\"; break; done <<< '2' 2>/dev/null",
+        "coproc { read line; echo \"reply:$line\"; }; echo ping >&\"${COPROC[1]}\"; read -u \"${COPROC[0]}\" r; echo \"$r\"; wait 2>/dev/null",
     ] {
         let config = temen_run::RunConfig {
             args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],

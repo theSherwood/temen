@@ -12,7 +12,7 @@ make -s -C "$ROOT/frontend/chibicc"
 CC="$ROOT/frontend/chibicc/chibicc"
 UT="$HERE/../posix_utils"
 PL="$HERE/../posix_libc"
-for t in true false echo cat seq head wc sort uniq ls pwd grep tr; do
+for t in true false echo cat seq head wc sort uniq ls pwd grep tr cut; do
   tu="$OUT/_$t.c"
   if [ "$t" = grep ]; then
     cat "$UT/util.c" "$PL/regex.c" "$UT/$t.c" >"$tu"

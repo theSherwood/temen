@@ -21,18 +21,32 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   permute the compile-time virtual stack and emit nothing.
 - **Control flow:** `if … else … then`, `begin … until`, `begin … again`, `begin … while … repeat`.
   Both arms / every loop iteration must leave the same stack depth. `recurse` calls the word itself.
+- **Counted loops:** `limit start do … loop`, `… +loop` (a runtime step), `i` / `j` (the current and
+  next-outer index), `leave` (early exit). The index and limit live on a **return stack** carried
+  through every branch as block params, so the data stack stays clean — an accumulator below the loop
+  is reachable (`: sum ( n -- s ) 0 swap 0 do i + loop ;`). The body must be stack-neutral.
+- **Return stack:** `>r ( x -- )`, `r> ( -- x )`, `r@ ( -- x )` move cells to and from that same
+  return stack (which must be balanced at `;`). `2swap` / `2over` are defined over them in the prelude.
+- **Character literals:** `char <name>` / `[char] <name>` push the first byte of the next token.
 - **Top level.** Each line is compiled as an anonymous unit, `Jit.install`ed, called, and
   uninstalled. Values left on the stack persist in a REPL stack between lines.
 - **Words:** `+ - * / mod and or xor lshift rshift = <> < u< <= > >= 0= negate invert 1+ 1- abs
-  min max`, `@ ! c@ c! +! cells`, `variable create allot here ,`, `emit type cr space spaces . u.`,
-  `." text"`, `s" text"` (pushes `addr len`), `' word` (pushes the xt = its `call.dyn` slot),
-  `\` and `( … )` comments.
+  min max`, `@ ! c@ c! +! cells`, `variable create allot here ,`, `constant`, `emit type cr space
+  spaces . u.`, `." text"`, `s" text"` (pushes `addr len`), `' word` (pushes the xt = its `call.dyn`
+  slot), `\` and `( … )` comments.
+- **Constants:** `<value> constant name` fixes a value at definition time; each use loads it back. It
+  is a read-only cell, so the value can come from any computation (`2 3 + constant five`).
 - **Runtime dispatch (typed `execute`):** `execute0 ( xt -- )`, `execute1 ( x xt -- y )`,
   `execute2 ( a b xt -- y )` call an xt (from `' word`, or stored in a variable) at run time — a
   `call.dyn` on the runtime funcref, so deferred words and dispatch tables work. Untyped `execute`
   (a runtime-arity call) stays out of the typed model.
+- **Deferred words:** `defer ( a b -- c ) name` forward-declares a word; `' impl is name` binds (and
+  rebinds) it at run time. The declared effect is the word's signature; each call inlines a
+  load-from-cell + `execute`, so a deferred word composes inside colon definitions.
 - **Early return:** `exit` terminates the current colon definition. Every path (the guarded `exit`
   and the fall-through) must satisfy the word's stack effect.
+- **Errors** are reported per line: `line <n>: <message> near <token>`, and the kernel resynchronizes
+  at the next line so later definitions still compile.
 - **Fibers:** `task ( xt -- f )`, `resume ( f x -- status y )` (status `0` = suspended, `1` =
   returned), `yield ( x -- y )`. A task body is any word `( x -- y )`; it may be resumed from any
   later line.
@@ -40,8 +54,8 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
   `wait ( addr expected -- status )` / `notify ( addr n -- woken )` are the futex; atomics:
   `atomic@ ( addr -- x )`, `atomic! ( x addr -- )`, `atomic+! ( n addr -- old )`,
   `atomic-xchg ( n addr -- old )`, `cas ( expected new addr -- old )`.
-- **Not in v0:** dynamic stack effects (`?dup`, `pick`, untyped `execute`), `do`/`loop`, `constant`,
-  forward declarations (`defer`), floats. (Tracked as #1237 follow-ups.)
+- **Permanently out** (they need a runtime data stack, against the static-stack design): dynamic
+  stack effects `?dup`/`pick` and untyped (runtime-arity) `execute`. Also absent: floats.
 
 ## How it works
 

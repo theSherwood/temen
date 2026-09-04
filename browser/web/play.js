@@ -632,6 +632,10 @@ block 0 (sp2: i64, arg2: i64) {
 : sum-to ( n -- s ) 0 swap begin dup 0 > while tuck + swap 1- repeat drop ;
 100 sum-to . cr
 
+\ counted loops: do/loop, i is the index; the accumulator stays on the data stack
+: sumsq ( n -- s ) 0 swap 0 do i i * + loop ;
+5 sumsq . cr
+
 \ memory: variables, strings, the heap
 variable x   42 x !   x @ 1+ x !   x @ . cr
 ." hello, forth" cr
@@ -649,6 +653,19 @@ drop
 variable hits
 : bump ( n -- y ) begin dup 0 > while 1 hits atomic+! drop 1- repeat ;
 ' bump 100 spawn ' bump 100 spawn join swap join + . hits @ . cr
+
+\ capstone: a whole program — the sieve of Eratosthenes counts primes below N
+variable arr   variable lim
+: primes ( n -- c )
+  lim !  here arr !  lim @ allot  0
+  lim @ 2 do
+    arr @ i + c@ 0= if
+      1+  i dup * lim @ < if
+        lim @ i dup * do  1 arr @ i + c!  j +loop
+      then
+    then
+  loop ;
+10 primes . 100 primes . 1000 primes . cr
 `,
   },
   'hello (C → Temen)': {

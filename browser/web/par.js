@@ -25,7 +25,8 @@ export async function loadEngine() {
   if (!WebAssembly.Module.imports(module).some((i) => i.kind === 'memory')) {
     throw new Error('not a threads build (no imported memory)');
   }
-  const memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+  const maxPages = 16384; // shared-memory ceiling (× 64 KiB = 1 GiB); mirror the build's `--max-memory`.
+  const memory = new WebAssembly.Memory({ initial: 2048, maximum: maxPages, shared: true });
   // The wasm imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
   // page installs a real servicer on `globalThis.__temen_webgpu_op` (play.js does, backed by the page's
   // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it
@@ -47,7 +48,7 @@ export async function loadEngine() {
     },
   };
   const { exports: ex } = await WebAssembly.instantiate(module, importObj);
-  return { module, memory, ex };
+  return { module, memory, ex, maxPages };
 }
 
 // Build the runner over a loaded engine. The returned `runAcrossWorkers(guest, opts)` runs one

@@ -1286,6 +1286,10 @@ fn gen_browser_bash_coreutils() {
             include_str!("../../temen-run/demos/posix_utils/grep.c"),
         ),
         ("tr", include_str!("../../temen-run/demos/posix_utils/tr.c")),
+        (
+            "cut",
+            include_str!("../../temen-run/demos/posix_utils/cut.c"),
+        ),
     ];
     for (name, src) in utils {
         let full = if *name == "grep" {

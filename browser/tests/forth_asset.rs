@@ -21,6 +21,10 @@ const CARD_PROGRAM: &str = "\\ Forth on Temen: every word below is JIT-compiled 
 : sum-to ( n -- s ) 0 swap begin dup 0 > while tuck + swap 1- repeat drop ;
 100 sum-to . cr
 
+\\ counted loops: do/loop, i is the index; the accumulator stays on the data stack
+: sumsq ( n -- s ) 0 swap 0 do i i * + loop ;
+5 sumsq . cr
+
 \\ memory: variables, strings, the heap
 variable x   42 x !   x @ 1+ x !   x @ . cr
 .\" hello, forth\" cr
@@ -38,9 +42,22 @@ drop
 variable hits
 : bump ( n -- y ) begin dup 0 > while 1 hits atomic+! drop 1- repeat ;
 ' bump 100 spawn ' bump 100 spawn join swap join + . hits @ . cr
+
+\\ capstone: a whole program — the sieve of Eratosthenes counts primes below N
+variable arr   variable lim
+: primes ( n -- c )
+  lim !  here arr !  lim @ allot  0
+  lim @ 2 do
+    arr @ i + c@ 0= if
+      1+  i dup * lim @ < if
+        lim @ i dup * do  1 arr @ i + c!  j +loop
+      then
+    then
+  loop ;
+10 primes . 100 primes . 1000 primes . cr
 ";
 
-const EXPECTED: &str = "25 3628800 \n5 4 3 2 1 \n5050 \n43 \nhello, forth\n1 0 \n2 0 \n7000 \n0 200 \n";
+const EXPECTED: &str = "25 3628800 \n5 4 3 2 1 \n5050 \n30 \n43 \nhello, forth\n1 0 \n2 0 \n7000 \n0 200 \n4 25 168 \n";
 
 #[test]
 fn forth_card_program_runs_through_the_onramp() {
@@ -65,6 +82,6 @@ fn forth_card_reports_errors_and_recovers() {
     assert_eq!(out.status, STATUS_OK);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "3 \nunknown word near bogus\nstack effect mismatch near ;\n3 \n"
+        "3 \nline 2: unknown word near bogus\nline 3: stack effect mismatch near ;\n3 \n"
     );
 }
