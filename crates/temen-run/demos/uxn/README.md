@@ -22,7 +22,8 @@ against uxn5's assembler on this dialect.
   **Datetime** (a deterministic virtual clock — the on-ramp grants no wall clock, and determinism is
   what the differential wants), **Mouse** (pointer, buttons, wheel). Audio and File are absent: the
   playground has no such capabilities yet; their ports are inert bytes.
-- **`main.c`** — the reactor entry (`#include`s the two above as one translation unit). Maps JS
+- **`main.c`** — the reactor entry (`#include`s the CPU, the devices and the assembler core as one
+  translation unit): loads `boot.tal` (assembled in place) or `boot.rom` through `fs`. Maps JS
   keyCodes to the Controller (arrows; Ctrl = A, Alt = B, Shift = Select, Home = Start; letters/digits/
   punctuation/Space/Enter/Backspace/Tab/Esc as the key byte, Shift-aware on the US layout) and the
   packed `mouse` events to the Mouse device. A halted ROM (System/state) exits the guest, which ends
@@ -31,9 +32,11 @@ against uxn5's assembler on this dialect.
   from stdin, runs N frames under a fixed key script, prints an FNV-1a hash per composed frame. Built
   both as a Temen guest and as a native `cc` binary from this one file; the streams must match
   byte-for-byte. Driven by `crates/temen-llvm/tests/uxn_diff.rs` (skips without clang/cc).
-- **`uxnasm.c`** — a small Uxntal assembler (a build-time host tool, not shipped in the guest):
-  opcodes with modes, literals, raw hex, padding, labels/sublabels, every reference sigil, lambdas,
-  macros, strings, comments. No `~include`.
+- **`uxnasm_core.c`** — a small Uxntal assembler, freestanding: opcodes with modes, literals, raw
+  hex, padding, labels/sublabels, every reference sigil, lambdas, macros, strings, comments; no
+  `~include`. Compiled into the guest, so the playground's **Uxntal card** assembles the editor's
+  source in the sandbox (served as `boot.tal`; an error comes back on stdout with its line).
+  **`uxnasm.c`** is the stdio front-end over it, the build-time host tool.
 - **`demo.tal`** — the demo ROM: a 256×192 striped screen, a title set in a 1bpp font, a swarm of
   2bpp sprites bouncing on the foreground layer, a player steered by the arrow keys or placed with a
   click; any letter or a wheel notch cycles the palette, Space resets the swarm.
@@ -42,6 +45,11 @@ against uxn5's assembler on this dialect.
   and primes) with end states recorded from uxn5's spec-compliant core. `uxn_corpus.c` replays them on
   `uxn.c`; `corpus/gencorpus.mjs` documents how the corpus was produced. Run by
   `crates/temen-llvm/tests/uxn_diff.rs` (`cpu_matches_golden_corpus`).
+- **`bench.tal`** + **`uxn_bench.c`** — the benchmark: a bunnymark-style stress ROM (512 sprites
+  bouncing on 320×240; one fill, 512 sprite blits and a full composite per frame) and a headless
+  N-frame driver printing the last frame's hash. `crates/temen-llvm/examples/uxn_bench.rs` times it
+  on native `cc`, the bytecode interpreter and the Cranelift JIT (`cargo run --release --example
+  uxn_bench` in `crates/temen-llvm`); the playground's Uxn card shows the wasm tiers' live fps.
 - **`build.sh`** — assembles the ROM and builds the guest (see the header). The committed assets
   `browser/web/assets/uxn.temen` + `uxn_demo.rom` come from `ONLY=uxn bash scripts/rebuild-assets.sh`.
 
