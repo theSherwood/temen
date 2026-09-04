@@ -5403,16 +5403,6 @@ pub struct JitOnrampRun {
     /// before `f0` and after each bounce — the single-shot twin of the coop tier's `sync_pagestate`.
     paged: bool,
     pagestate: Vec<u8>,
-    /// #1253 — **growable backing** ceiling: when non-zero, this run's `back`ing physically *grows* under
-    /// a fixed grant of `carve_ceiling` bytes instead of being fully present at spawn. After a cross-tier
-    /// bounce advances `mapped` past the live backing (`back.len()`), [`grow_backing_to_mapped`] extends
-    /// the shared linear memory (`memory.grow`, whose fresh pages the host zero-inits — exactly what a
-    /// `vm_map` commit would write) and re-points `back` at a larger `Region` over the same base, so the
-    /// interpreter bounce and the emitted `win + addr` accesses both see the grown region. `0` keeps the
-    /// pre-#1253 behavior (backing fixed at the window size). The emitted confinement bound stays `mapped`
-    /// (≤ backing ≤ `carve_ceiling`), so a bounce that can't grow the backing declines rather than
-    /// reading past it — never a host over-read.
-    carve_ceiling: u64,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -5975,7 +5965,6 @@ impl JitOnrampRun {
             mapped,
             paged,
             pagestate,
-            carve_ceiling: 0,
         })
     }
 
@@ -6070,7 +6059,6 @@ impl JitOnrampRun {
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
-            carve_ceiling: 0,
         })
     }
 
@@ -6164,13 +6152,6 @@ impl JitOnrampRun {
                         self.mapped = mapped;
                     }
                     self.prots = Some(info.3);
-                    // #1253: if this bounce's `vm_map` grew `mapped` past the live backing, physically
-                    // grow the window (a growable-backing run) so the emitted `win + addr` accesses that
-                    // follow land in real memory. A grow that can't be satisfied fails the run closed
-                    // (the caller declines) rather than letting the emitted tier read past the backing.
-                    if !self.grow_backing_to_mapped() {
-                        return Err(Trap::CapFault);
-                    }
                 }
                 None => {
                     self.prots = None;
@@ -6202,68 +6183,6 @@ impl JitOnrampRun {
     /// coop tier's `temen_coop_mapped`.
     pub fn mapped(&self) -> u64 {
         self.mapped
-    }
-
-    /// #1253 — mark this run's backing **growable** under a `ceiling`-byte grant: the window starts at
-    /// its declared size and [`grow_backing_to_mapped`] physically grows it (never past `ceiling`) as
-    /// `vm_map` bounces advance `mapped`, so a phase child needs no pre-sized/pre-committed carve. Call
-    /// once after opening the run, before the first drive. `ceiling` must be `>= back.len()` (the
-    /// declared start) and the window must sit at the **top** of linear memory (its base + backing is the
-    /// memory high-water) so `memory.grow`'s appended pages extend it contiguously.
-    pub fn set_carve_ceiling(&mut self, ceiling: u64) {
-        self.carve_ceiling = ceiling;
-    }
-
-    /// The live physical backing length (bytes) of this run's window — its declared size until a
-    /// growable-backing run ([`set_carve_ceiling`]) grows it.
-    pub fn backing_len(&self) -> u64 {
-        self.back.len()
-    }
-
-    /// #1253 — grow the physical backing to cover `self.mapped`, for a growable-backing run. A no-op
-    /// unless [`set_carve_ceiling`] armed growth and the last bounce advanced `mapped` past the live
-    /// backing. Extends the shared linear memory with `memory.grow` (whose fresh pages the host
-    /// zero-inits — the same zero-fill a `vm_map` commit performs) so the window's tail becomes real
-    /// memory, then re-points `back` at a `Region` over the same base with the grown length. Returns
-    /// `false` (leaving the backing unchanged) when the memory cannot grow to cover `mapped` — the caller
-    /// then declines rather than letting the emitted tier read past the live backing. `mapped` is already
-    /// bounded by the grant (`<= carve_ceiling`) upstream, so the grown length never exceeds the grant.
-    #[allow(unused_mut)]
-    fn grow_backing_to_mapped(&mut self) -> bool {
-        if self.carve_ceiling == 0 || self.mapped <= self.back.len() {
-            return true; // fixed backing, or the live backing already covers `mapped`
-        }
-        // Round the target up to a wasm page (`memory.grow`'s granularity) but never past the grant.
-        const PAGE: u64 = 1 << 16;
-        let want = self
-            .mapped
-            .div_ceil(PAGE)
-            .saturating_mul(PAGE)
-            .min(self.carve_ceiling);
-        if want <= self.back.len() {
-            return true;
-        }
-        // The window's tail must be physically present up to `win_base + want`. On wasm the only way to
-        // get pages is `memory.grow` (append-only), so a growable-backing run must be the top-of-memory
-        // arena: `win_base + back.len()` is the current high-water, and the appended pages extend it.
-        #[cfg(target_arch = "wasm32")]
-        {
-            let need_top = (self.win_base as u64).saturating_add(want) as usize;
-            let have = core::arch::wasm32::memory_size::<0>() << 16;
-            if need_top > have {
-                let extra_pages = (need_top - have).div_ceil(PAGE as usize);
-                if core::arch::wasm32::memory_grow::<0>(extra_pages) == usize::MAX {
-                    return false; // out of `WebAssembly.Memory` — decline, don't over-read
-                }
-            }
-        }
-        // SAFETY: on wasm the grow above made `[win_base, win_base + want)` live; off-wasm (the native
-        // differential) the caller backs the whole `carve_ceiling` up front, so `want <= ceiling` is live.
-        // `win_base` is 8-aligned (a window base) and the region is exclusively this run's.
-        self.back = std::sync::Arc::new(unsafe {
-            temen_interp::Region::shared(self.win_base as *mut u8, want)
-        });
-        true
     }
 
     /// #1201 — whether the run emitted **paged** (the module `unmap`s/`protect`s); the driver then
