@@ -1922,6 +1922,54 @@ int main(void) {
     );
 }
 
+/// #973 — **`waitpid(-pgid)` is group-scoped on the personality: it never reaps a child in another
+/// group.** The scoping dual of the grouping test above, ported from the retired core `__wait(-pgid)`
+/// worldlet (#973) to the surviving single pgid channel (the personality). Two twins run in *separate*
+/// groups (each its own leader via `setpgid(p, p)`). `kill(-p1)` fells only group `p1`; `waitpid(-p1)`
+/// reaps exactly p1; a second `waitpid(-p1)` returns `-ECHILD` — proving p2 (in group p2) was NOT
+/// over-reaped by p1's group wait — and p2 is finally felled and reaped by its own `-p2` group.
+#[test]
+fn c_waitpid_by_group_does_not_reap_other_groups() {
+    let src = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_setpgid(int cap, long pid, long pgid);
+long __px_kill(int cap, long pid, long sig);
+static int status;
+static long p1;
+static long p2;
+static long h;
+static volatile long acc;
+int main(void) {
+  p1 = __px_fork(0, 0);
+  if (p1 < 0) return 1;
+  if (p1 == 0) { while (1) acc = acc + 1; }       /* group p1, runs until killed */
+  p2 = __px_fork(0, 0);
+  if (p2 < 0) return 2;
+  if (p2 == 0) { while (1) acc = acc + 1; }       /* group p2, a DIFFERENT group */
+  if (__px_setpgid(0, p1, p1) != 0) return 3;     /* p1 leads its own group */
+  if (__px_setpgid(0, p2, p2) != 0) return 4;     /* p2 leads its own group */
+  if (__px_kill(0, -p1, 9) != 0) return 5;        /* fell ONLY group p1 */
+  h = __px_waitpid(0, -p1, (long)&status, 0);      /* reaps p1 */
+  while (h == -10) h = __px_waitpid(0, -p1, (long)&status, 0);
+  if (h != p1) return 6;
+  if (__px_waitpid(0, -p1, (long)&status, 0) != -10) return 7;  /* group p1 empty — p2 NOT reaped */
+  if (__px_kill(0, -p2, 9) != 0) return 8;        /* now fell group p2 */
+  h = __px_waitpid(0, -p2, (long)&status, 0);      /* reaps p2 */
+  while (h == -10) h = __px_waitpid(0, -p2, (long)&status, 0);
+  if (h != p2) return 9;
+  return 42;
+}
+"#;
+    let e = run_interp_only(src, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "waitpid(-p1) group-reaped only p1's group and never p2 (a different group), on the \
+         personality — the scoping the retired core __wait(-pgid) used to serve"
+    );
+}
+
 /// #796 — guest wrappers for the signal ops, matching the `__px_` (dummy-handle-first) shim convention.
 /// `sigprocmask`/`sigaction` take pointers to this personality's simple ABI: a `sigset_t` is a `u64`
 /// bitset; a `struct sigaction` is `{ long sa_handler; unsigned long sa_mask; long sa_flags; }` (24 bytes).

@@ -1490,25 +1490,6 @@ static int gen_builtin_exec_module(Node *node) {
   return r;
 }
 
-// FORK.md §8.6 — `__vm_setpgid(pid, pgid)`: POSIX process-group assignment for job control. Lowers
-// to the self-namespace op `call.cap 4294967295 15` — the calling vCPU (the parent) sets a forked
-// child's process group directly, so a later `__wait(-pgid)` reaps any child in that group. Both args
-// are i64; returns 0 or -errno (`-ESRCH` if `pid` is not a live child of the caller).
-static int gen_builtin_setpgid(Node *node) {
-  int argc = 0;
-  for (Node *a = node->args; a; a = a->next)
-    argc++;
-  if (argc != 2)
-    error_tok(node->tok, "codegen_ir: __vm_setpgid(pid, pgid) expects 2 arguments");
-  Node *a = node->args;
-  int pid = widen_i64(gen_expr(a), a->ty);
-  int pgid = widen_i64(gen_expr(a->next), a->next->ty);
-  int h = dummy_handle();
-  int r = nv++;
-  cg("  v%d = call.cap 4294967295 15 (i64, i64) -> (i64) v%d (v%d, v%d)\n", r, h, pid, pgid);
-  return r;
-}
-
 // FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
 // `call.cap 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
 // end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
@@ -1987,8 +1968,6 @@ static int gen_expr(Node *node) {
           return gen_builtin_resolve(node);
         if (!strcmp(fname, "__vm_exec_module"))
           return gen_builtin_exec_module(node);
-        if (!strcmp(fname, "__vm_setpgid"))
-          return gen_builtin_setpgid(node);
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))
