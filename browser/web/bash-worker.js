@@ -17,6 +17,7 @@
 // whole lifecycle: keystrokes that land while the instantiate is still in flight are BUFFERED and
 // fed on ready (the page enables its input the moment the Workers exist, so this race is real).
 
+import { foreignImports } from './foreign-mem.js';
 let ex = null;
 let memory = null;
 let drainBuf = 0;
@@ -53,7 +54,7 @@ async function init(cfg) {
     ({ exports } = await WebAssembly.instantiate(module, {
       env: { memory },
       // No GPU surface and no card-output streaming in a bash Worker → both host seams stubbed.
-      temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} },
+      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {} },
     }));
     exports.__stack_pointer.value = stackTop;
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);

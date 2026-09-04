@@ -899,6 +899,10 @@ jobs:
             -Clink-arg=--export=__wasm_init_tls" \
             cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
           node browser-test.mjs
+          # Region::Foreign (#1284): the engine addresses a second, JS-owned WebAssembly.Memory through the
+          # temen_host.foreign_* imports — 20k-op differential vs the safe Paged reference + the per-access
+          # cost ratio the detached-window decline path is gated on.
+          node browser-foreign-mem-test.mjs
           # wasm-JIT reactor differential: each committed reactor guest (bounce/life/mandelzoom) must
           # render byte-identically on the interpreter and the emitted-wasm tier (cap-call outlining).
           # Reuses the threads module built above + the committed `.temen` assets — no extra toolchain.

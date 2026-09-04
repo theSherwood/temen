@@ -40,8 +40,16 @@
 //! embedder-owned memory — the browser's window-in-linear-memory shape) and **`Owned`** (an
 //! eagerly-allocated heap buffer — the portable flat backing a fork twin's private window needs
 //! where `Paged` would apply, #816).
+//!
+//! And one **proxied** backing: **`Foreign`** (#1284, `DETACHED_JIT.md` §3.3) — a region whose bytes
+//! live in memory this process cannot address (a detached child's own `WebAssembly.Memory` on
+//! wasm32, where the engine's pointers are offsets into *its* one linear memory). Every accessor
+//! calls through a caller-supplied [`ForeignOps`] table; the browser cdylib fills it with JS host
+//! imports, a native test fills it with a mock. Not flat-addressable (`raw_base` is `None`), so a
+//! consumer that needs a `base + off` pointer view declines it, as for `Paged`.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 /// The six read-modify-write operations (§12), mirrored from `temen_ir::AtomicRmwOp` without taking a
@@ -54,6 +62,14 @@ pub enum RmwOp {
     Or,
     Xor,
     Xchg,
+}
+
+impl RmwOp {
+    /// The wire code a [`ForeignOps::atomic`] call carries: `2 + discriminant` (0/1 are load/store,
+    /// 8 is compare-exchange — see [`ForeignOps`]).
+    pub fn code(self) -> u32 {
+        2 + self as u32
+    }
 }
 
 /// A guest window's anonymous-page backing store. See the crate docs for the two variants and the
@@ -76,6 +92,58 @@ pub enum Region {
     Owned(Owned),
     /// Portable fallback: zeroed pages in a `Mutex`-guarded map (serialized, not the parallel path).
     Paged(Paged),
+    /// **Proxied**: bytes in memory this process cannot address, reached through a [`ForeignOps`]
+    /// table (a detached child's own `WebAssembly.Memory`, #1284). Every accessor is one call into the
+    /// table — bulk where the API is bulk (`read_into`/`write_from`/`fill`/`copy_within`), one call
+    /// per word or byte otherwise. Not flat-addressable. Built via [`Region::foreign`].
+    Foreign(Foreign),
+}
+
+/// The accessor table behind [`Region::Foreign`]: how to reach the bytes of foreign backing `id`.
+/// Offsets are region-relative and already bounded to `[0, len)` by `Region` before the call, so an
+/// implementation may trust them. `atomic` is the one seq-cst primitive: `kind` 0 = load, 1 = store
+/// (`a` = value), 2..=7 = read-modify-write ([`RmwOp::code`], `a` = operand), 8 = compare-exchange
+/// (`a` = expected, `b` = replacement); it returns the **old** value (`width` 4 or 8, `off` aligned).
+pub struct ForeignOps {
+    pub read: fn(id: u32, off: u64, out: &mut [u8]),
+    pub write: fn(id: u32, off: u64, data: &[u8]),
+    pub fill: fn(id: u32, off: u64, len: u64, b: u8),
+    pub copy_within: fn(id: u32, dst: u64, src: u64, len: u64),
+    pub atomic: fn(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64,
+}
+
+/// The [`ForeignOps::atomic`] kind for a plain load / store / compare-exchange.
+pub const FOREIGN_ATOMIC_LOAD: u32 = 0;
+pub const FOREIGN_ATOMIC_STORE: u32 = 1;
+pub const FOREIGN_ATOMIC_CMPXCHG: u32 = 8;
+
+/// A proxied backing (see [`Region::Foreign`]): the foreign memory's id in the embedder's registry,
+/// its current addressable length (the foreign memory can grow; the owner bumps it with
+/// [`Region::set_foreign_len`]), and the accessor table.
+pub struct Foreign {
+    id: u32,
+    len: AtomicU64,
+    ops: &'static ForeignOps,
+}
+
+impl Foreign {
+    fn word(&self, off: u64, width: u32) -> u64 {
+        let mut b = [0u8; 8];
+        (self.ops.read)(self.id, off, &mut b[..width as usize]);
+        u64::from_le_bytes(b)
+    }
+    fn set_word(&self, off: u64, width: u32, val: u64) {
+        let b = val.to_le_bytes();
+        (self.ops.write)(self.id, off, &b[..width as usize]);
+    }
+}
+
+/// Which accessor body serves a [`Region`]: the one raw-pointer body (`Shared`, which `Mapped` and
+/// `Owned` wrap), the safe `Paged` reference, or the proxied `Foreign` table.
+enum Backing<'a> {
+    Raw(&'a Shared),
+    Paged(&'a Paged),
+    Foreign(&'a Foreign),
 }
 
 impl Region {
@@ -127,26 +195,55 @@ impl Region {
         Owned::new(size, page).map(Region::Owned)
     }
 
-    /// The raw-backed variants (`Mapped`, `Shared`) both dispatch to the one accessor body in
-    /// [`Shared`] — `Mapped` *is* a `Shared` plus an owned `mmap` — so a single `Ok(&Shared)` arm
-    /// serves both; `Paged` (the safe reference) is the `Err` arm. This collapses every accessor's
-    /// former three-arm match to two, with no `Mapped`/`Shared` duplication to keep in step.
+    /// A proxied region over foreign backing `id` with `len` addressable bytes, reached through `ops`
+    /// (#1284). `len` may later grow ([`Region::set_foreign_len`]); it never shrinks.
+    pub fn foreign(id: u32, len: u64, ops: &'static ForeignOps) -> Region {
+        Region::Foreign(Foreign {
+            id,
+            len: AtomicU64::new(len),
+            ops,
+        })
+    }
+
+    /// Record that a `Foreign` backing grew to `len` bytes (the embedder grew the foreign memory).
+    /// A no-op on every other variant, and never shrinks.
+    pub fn set_foreign_len(&self, len: u64) {
+        if let Region::Foreign(f) = self {
+            f.len.fetch_max(len, Ordering::AcqRel);
+        }
+    }
+
+    /// The raw-backed variants (`Mapped`, `Shared`, `Owned`) all dispatch to the one accessor body in
+    /// [`Shared`] — `Mapped` *is* a `Shared` plus an owned `mmap` — so a single `Raw` arm serves
+    /// them; `Paged` (the safe reference) and `Foreign` (the proxied table) are the other two. No
+    /// `Mapped`/`Shared` duplication to keep in step.
     #[inline]
-    fn backing(&self) -> Result<&Shared, &Paged> {
+    fn backing(&self) -> Backing<'_> {
         match self {
             #[cfg(unix)]
-            Region::Mapped(m) => Ok(&m.raw),
-            Region::Shared(s) => Ok(s),
-            Region::Owned(o) => Ok(&o.raw),
-            Region::Paged(p) => Err(p),
+            Region::Mapped(m) => Backing::Raw(&m.raw),
+            Region::Shared(s) => Backing::Raw(s),
+            Region::Owned(o) => Backing::Raw(&o.raw),
+            Region::Paged(p) => Backing::Paged(p),
+            Region::Foreign(f) => Backing::Foreign(f),
+        }
+    }
+
+    /// The flat raw body, if this region has one (`Paged`/`Foreign` do not).
+    #[inline]
+    fn flat(&self) -> Option<&Shared> {
+        match self.backing() {
+            Backing::Raw(s) => Some(s),
+            _ => None,
         }
     }
 
     /// The addressable length `[0, size)`.
     pub fn len(&self) -> u64 {
         match self.backing() {
-            Ok(s) => s.size,
-            Err(p) => p.size,
+            Backing::Raw(s) => s.size,
+            Backing::Paged(p) => p.size,
+            Backing::Foreign(f) => f.len.load(Ordering::Acquire),
         }
     }
 
@@ -158,7 +255,7 @@ impl Region {
     /// Reading or writing through the returned pointer is subject to the same safety contract as
     /// the region's construction; bounds are the caller's to keep.
     pub fn raw_base(&self) -> Option<*mut u8> {
-        self.backing().ok().map(|s| s.base_ptr())
+        self.flat().map(|s| s.base_ptr())
     }
 
     /// #816: the raw address of flat offset `off` — [`raw_base`](Region::raw_base)` + off`,
@@ -166,7 +263,7 @@ impl Region {
     /// `None` for `Paged` or an out-of-region offset. Lives here (not in the `unsafe`-free callers)
     /// because the in-allocation pointer add is `unsafe`; the bound makes it sound.
     pub fn raw_base_at(&self, off: u64) -> Option<*mut u8> {
-        let s = self.backing().ok()?;
+        let s = self.flat()?;
         if off > s.size {
             return None;
         }
@@ -186,8 +283,9 @@ impl Region {
             return 0;
         }
         match self.backing() {
-            Ok(s) => s.byte(off),
-            Err(p) => p.byte(off),
+            Backing::Raw(s) => s.byte(off),
+            Backing::Paged(p) => p.byte(off),
+            Backing::Foreign(f) => f.word(off, 1) as u8,
         }
     }
 
@@ -197,8 +295,9 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.set_byte(off, b),
-            Err(p) => p.set_byte(off, b),
+            Backing::Raw(s) => s.set_byte(off, b),
+            Backing::Paged(p) => p.set_byte(off, b),
+            Backing::Foreign(f) => f.set_word(off, 1, b as u64),
         }
     }
 
@@ -210,8 +309,9 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.zero(off, len),
-            Err(p) => p.zero(off, len),
+            Backing::Raw(s) => s.zero(off, len),
+            Backing::Paged(p) => p.zero(off, len),
+            Backing::Foreign(f) => (f.ops.fill)(f.id, off, len, 0),
         }
     }
 
@@ -225,8 +325,9 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.fill(off, len, b),
-            Err(p) => p.fill(off, len, b),
+            Backing::Raw(s) => s.fill(off, len, b),
+            Backing::Paged(p) => p.fill(off, len, b),
+            Backing::Foreign(f) => (f.ops.fill)(f.id, off, len, b),
         }
     }
 
@@ -241,8 +342,9 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.copy_within(dst, src, len),
-            Err(p) => p.copy_within(dst, src, len),
+            Backing::Raw(s) => s.copy_within(dst, src, len),
+            Backing::Paged(p) => p.copy_within(dst, src, len),
+            Backing::Foreign(f) => (f.ops.copy_within)(f.id, dst, src, len),
         }
     }
 
@@ -251,8 +353,16 @@ impl Region {
     /// backing bulk-copies rather than dispatching per byte.
     pub fn read_into(&self, off: u64, out: &mut [u8]) {
         match self.backing() {
-            Ok(s) => s.read_into(off, out),
-            Err(p) => p.read_into(off, out),
+            Backing::Raw(s) => s.read_into(off, out),
+            Backing::Paged(p) => p.read_into(off, out),
+            Backing::Foreign(f) => {
+                // Zero-fill past the end (the flat body's contract), read the in-range prefix.
+                let n = clamp_len(off, out.len() as u64, self.len()) as usize;
+                out[n..].fill(0);
+                if n != 0 {
+                    (f.ops.read)(f.id, off, &mut out[..n]);
+                }
+            }
         }
     }
 
@@ -263,8 +373,14 @@ impl Region {
     /// single-threaded contract as [`Region::fill`].
     pub fn write_from(&self, off: u64, data: &[u8]) {
         match self.backing() {
-            Ok(s) => s.write_from(off, data),
-            Err(p) => p.write_from(off, data),
+            Backing::Raw(s) => s.write_from(off, data),
+            Backing::Paged(p) => p.write_from(off, data),
+            Backing::Foreign(f) => {
+                let n = clamp_len(off, data.len() as u64, self.len()) as usize;
+                if n != 0 {
+                    (f.ops.write)(f.id, off, &data[..n]);
+                }
+            }
         }
     }
 
@@ -291,8 +407,9 @@ impl Region {
             return 0;
         }
         match self.backing() {
-            Ok(s) => s.read_word(off, width),
-            Err(p) => p.read_word(off, width),
+            Backing::Raw(s) => s.read_word(off, width),
+            Backing::Paged(p) => p.read_word(off, width),
+            Backing::Foreign(f) => f.word(off, width),
         }
     }
 
@@ -304,8 +421,9 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.write_word(off, width, val),
-            Err(p) => p.write_word(off, width, val),
+            Backing::Raw(s) => s.write_word(off, width, val),
+            Backing::Paged(p) => p.write_word(off, width, val),
+            Backing::Foreign(f) => f.set_word(off, width, val),
         }
     }
 
@@ -316,8 +434,9 @@ impl Region {
             return 0;
         }
         match self.backing() {
-            Ok(s) => s.atomic_load(off, width),
-            Err(p) => p.atomic_load(off, width),
+            Backing::Raw(s) => s.atomic_load(off, width),
+            Backing::Paged(p) => p.atomic_load(off, width),
+            Backing::Foreign(f) => (f.ops.atomic)(f.id, FOREIGN_ATOMIC_LOAD, off, width, 0, 0),
         }
     }
 
@@ -327,8 +446,11 @@ impl Region {
             return;
         }
         match self.backing() {
-            Ok(s) => s.atomic_store(off, width, val),
-            Err(p) => p.atomic_store(off, width, val),
+            Backing::Raw(s) => s.atomic_store(off, width, val),
+            Backing::Paged(p) => p.atomic_store(off, width, val),
+            Backing::Foreign(f) => {
+                (f.ops.atomic)(f.id, FOREIGN_ATOMIC_STORE, off, width, val, 0);
+            }
         }
     }
 
@@ -338,8 +460,9 @@ impl Region {
             return 0;
         }
         match self.backing() {
-            Ok(s) => s.atomic_rmw(off, width, op, val),
-            Err(p) => p.atomic_rmw(off, width, op, val),
+            Backing::Raw(s) => s.atomic_rmw(off, width, op, val),
+            Backing::Paged(p) => p.atomic_rmw(off, width, op, val),
+            Backing::Foreign(f) => (f.ops.atomic)(f.id, op.code(), off, width, val, 0),
         }
     }
 
@@ -350,8 +473,16 @@ impl Region {
             return 0;
         }
         match self.backing() {
-            Ok(s) => s.atomic_cmpxchg(off, width, expected, replacement),
-            Err(p) => p.atomic_cmpxchg(off, width, expected, replacement),
+            Backing::Raw(s) => s.atomic_cmpxchg(off, width, expected, replacement),
+            Backing::Paged(p) => p.atomic_cmpxchg(off, width, expected, replacement),
+            Backing::Foreign(f) => (f.ops.atomic)(
+                f.id,
+                FOREIGN_ATOMIC_CMPXCHG,
+                off,
+                width,
+                expected,
+                replacement,
+            ),
         }
     }
 }
@@ -386,6 +517,139 @@ fn clamp_len(off: u64, len: u64, size: u64) -> u64 {
     } else {
         len.min(size - off)
     }
+}
+
+/// **Differential check of one backing against another** (the §18 interp-as-oracle discipline applied
+/// to the memory substrate): `ops` seeded-random operations — mixed atomic / non-atomic, 4- and 8-byte
+/// widths, cross-page offsets, out-of-range bytes (which both must confine inertly), bulk zero/fill/
+/// overlapping copy — applied to both regions, every result compared, then the final images compared
+/// byte-for-byte. `Err` names the first divergence. Deterministic in `seed`, so a failure replays.
+/// Used by the unit tests (`Shared` vs `Paged`, mock `Foreign` vs `Paged`) and by the browser cdylib's
+/// real-Chromium self-test of `Foreign` over a JS-owned `WebAssembly.Memory` (#1284).
+pub fn differential(
+    a: &Region,
+    b: &Region,
+    size: u64,
+    page: u64,
+    ops: usize,
+    seed: u64,
+) -> Result<(), String> {
+    macro_rules! check {
+        ($x:expr, $y:expr, $($msg:tt)+) => {{
+            let (x, y) = ($x, $y);
+            if x != y {
+                return Err(format!("{}: {:?} vs {:?}", format!($($msg)+), x, y));
+            }
+        }};
+    }
+    fn xs(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
+    let mut s = seed;
+    // Atomic location: a `width`-aligned (4 or 8) in-bounds offset (the caller's contract).
+    let aligned = |s: &mut u64| -> (u64, u32) {
+        let width: u32 = if xs(s) & 1 == 0 { 4 } else { 8 };
+        let slots = size / width as u64;
+        let off = (xs(s) % slots) * width as u64;
+        (off, width)
+    };
+    for _ in 0..ops {
+        match xs(&mut s) % 9 {
+            0 => {
+                // byte read, sometimes out of range (must read 0 / confine on both).
+                let off = xs(&mut s) % (size + 64);
+                check!(a.byte(off), b.byte(off), "byte({off}) diverged");
+            }
+            1 => {
+                // byte write, sometimes out of range (must drop on both).
+                let off = xs(&mut s) % (size + 64);
+                let v = xs(&mut s) as u8;
+                a.set_byte(off, v);
+                b.set_byte(off, v);
+            }
+            2 => {
+                let (off, w) = aligned(&mut s);
+                check!(
+                    a.atomic_load(off, w),
+                    b.atomic_load(off, w),
+                    "atomic_load({off},{w}) diverged"
+                );
+            }
+            3 => {
+                let (off, w) = aligned(&mut s);
+                let v = xs(&mut s);
+                a.atomic_store(off, w, v);
+                b.atomic_store(off, w, v);
+            }
+            4 => {
+                let (off, w) = aligned(&mut s);
+                let op = [
+                    RmwOp::Add,
+                    RmwOp::Sub,
+                    RmwOp::And,
+                    RmwOp::Or,
+                    RmwOp::Xor,
+                    RmwOp::Xchg,
+                ][(xs(&mut s) % 6) as usize];
+                let v = xs(&mut s);
+                check!(
+                    a.atomic_rmw(off, w, op, v),
+                    b.atomic_rmw(off, w, op, v),
+                    "atomic_rmw({off},{w},{op:?}) diverged"
+                );
+            }
+            5 => {
+                let (off, w) = aligned(&mut s);
+                // Bias `expected` toward a hit half the time by reading the current value first
+                // (both backings agree on it, so this stays a pure differential).
+                let expected = if xs(&mut s) & 1 == 0 {
+                    a.atomic_load(off, w)
+                } else {
+                    xs(&mut s)
+                };
+                let rep = xs(&mut s);
+                check!(
+                    a.atomic_cmpxchg(off, w, expected, rep),
+                    b.atomic_cmpxchg(off, w, expected, rep),
+                    "atomic_cmpxchg({off},{w}) diverged"
+                );
+            }
+            6 => {
+                // zero a random (clamped) range.
+                let off = xs(&mut s) % size;
+                let len = xs(&mut s) % (2 * page);
+                a.zero(off, len);
+                b.zero(off, len);
+            }
+            7 => {
+                // fill a random (clamped) range with an arbitrary byte.
+                let off = xs(&mut s) % size;
+                let len = xs(&mut s) % (2 * page);
+                let byte = xs(&mut s) as u8;
+                a.fill(off, len, byte);
+                b.fill(off, len, byte);
+            }
+            _ => {
+                // overlap-safe copy of a random (clamped) range — dst/src freely overlap.
+                let src = xs(&mut s) % size;
+                let dst = xs(&mut s) % size;
+                let len = xs(&mut s) % (2 * page);
+                a.copy_within(dst, src, len);
+                b.copy_within(dst, src, len);
+            }
+        }
+    }
+    let mut ai = vec![0u8; size as usize];
+    let mut bi = vec![0u8; size as usize];
+    a.read_into(0, &mut ai);
+    b.read_into(0, &mut bi);
+    check!(ai, bi, "final region images diverge");
+    Ok(())
 }
 
 // ============================== unix: the mmap-backed shared region ==============================
@@ -1191,124 +1455,11 @@ mod tests {
         unsafe { std::alloc::dealloc(base, layout) };
     }
 
-    /// **Differential fuzzer** body: run the same random op sequence against an `unsafe` raw-pointer
-    /// backing `a` (`Mapped` or `Shared`) and the `Paged` reference `b` (a `BTreeMap` + explicit value
-    /// math), asserting every op agrees and the final images are byte-identical. The §18 interp-as-
-    /// oracle discipline applied to the memory substrate: the `unsafe` backing is checked against the
-    /// safe model across thousands of randomized accesses — mixed atomic / non-atomic, 4- and 8-byte
-    /// widths, cross-page offsets, and out-of-range bytes (which both must confine inertly).
-    /// Deterministic (seeded xorshift), so a failure replays. (`spans pages`: the Paged chunk boundary
-    /// is exercised.)
+    /// The in-tree differential ([`differential`]) with the test seed and op count (miri runs every op
+    /// through its interpreter + provenance/race checkers, so far fewer there).
     fn fuzz_against(a: &Region, b: &Region, size: u64, page: u64) {
-        fn xs(s: &mut u64) -> u64 {
-            let mut x = *s;
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *s = x;
-            x
-        }
-        let mut s = 0x9e37_79b9_7f4a_7c15u64;
-        // Atomic location: a `width`-aligned (4 or 8) in-bounds offset (the caller's contract).
-        let aligned = |s: &mut u64| -> (u64, u32) {
-            let width: u32 = if xs(s) & 1 == 0 { 4 } else { 8 };
-            let slots = size / width as u64;
-            let off = (xs(s) % slots) * width as u64;
-            (off, width)
-        };
-        // miri runs every op through its interpreter + provenance/race checkers, so far fewer there.
         let ops = if cfg!(miri) { 400 } else { 20_000 };
-        for _ in 0..ops {
-            match xs(&mut s) % 9 {
-                0 => {
-                    // byte read, sometimes out of range (must read 0 / confine on both).
-                    let off = xs(&mut s) % (size + 64);
-                    assert_eq!(a.byte(off), b.byte(off), "byte({off}) diverged");
-                }
-                1 => {
-                    // byte write, sometimes out of range (must drop on both).
-                    let off = xs(&mut s) % (size + 64);
-                    let v = xs(&mut s) as u8;
-                    a.set_byte(off, v);
-                    b.set_byte(off, v);
-                }
-                2 => {
-                    let (off, w) = aligned(&mut s);
-                    assert_eq!(
-                        a.atomic_load(off, w),
-                        b.atomic_load(off, w),
-                        "atomic_load({off},{w}) diverged"
-                    );
-                }
-                3 => {
-                    let (off, w) = aligned(&mut s);
-                    let v = xs(&mut s);
-                    a.atomic_store(off, w, v);
-                    b.atomic_store(off, w, v);
-                }
-                4 => {
-                    let (off, w) = aligned(&mut s);
-                    let op = [
-                        RmwOp::Add,
-                        RmwOp::Sub,
-                        RmwOp::And,
-                        RmwOp::Or,
-                        RmwOp::Xor,
-                        RmwOp::Xchg,
-                    ][(xs(&mut s) % 6) as usize];
-                    let v = xs(&mut s);
-                    assert_eq!(
-                        a.atomic_rmw(off, w, op, v),
-                        b.atomic_rmw(off, w, op, v),
-                        "atomic_rmw({off},{w},{op:?}) diverged"
-                    );
-                }
-                5 => {
-                    let (off, w) = aligned(&mut s);
-                    // Bias `expected` toward a hit half the time by reading the current value first
-                    // (both backings agree on it, so this stays a pure differential).
-                    let expected = if xs(&mut s) & 1 == 0 {
-                        a.atomic_load(off, w)
-                    } else {
-                        xs(&mut s)
-                    };
-                    let rep = xs(&mut s);
-                    assert_eq!(
-                        a.atomic_cmpxchg(off, w, expected, rep),
-                        b.atomic_cmpxchg(off, w, expected, rep),
-                        "atomic_cmpxchg({off},{w}) diverged"
-                    );
-                }
-                6 => {
-                    // zero a random (clamped) range.
-                    let off = xs(&mut s) % size;
-                    let len = xs(&mut s) % (2 * page);
-                    a.zero(off, len);
-                    b.zero(off, len);
-                }
-                7 => {
-                    // fill a random (clamped) range with an arbitrary byte.
-                    let off = xs(&mut s) % size;
-                    let len = xs(&mut s) % (2 * page);
-                    let byte = xs(&mut s) as u8;
-                    a.fill(off, len, byte);
-                    b.fill(off, len, byte);
-                }
-                _ => {
-                    // overlap-safe copy of a random (clamped) range — dst/src freely overlap.
-                    let src = xs(&mut s) % size;
-                    let dst = xs(&mut s) % size;
-                    let len = xs(&mut s) % (2 * page);
-                    a.copy_within(dst, src, len);
-                    b.copy_within(dst, src, len);
-                }
-            }
-        }
-        let mut ai = vec![0u8; size as usize];
-        let mut bi = vec![0u8; size as usize];
-        a.read_into(0, &mut ai);
-        b.read_into(0, &mut bi);
-        assert_eq!(ai, bi, "final region images diverge");
+        differential(a, b, size, page, ops, 0x9e37_79b9_7f4a_7c15).unwrap();
     }
 
     /// The **one** raw-pointer accessor body (`Shared`, which `Mapped` now merely `mmap`-owns and
@@ -1330,6 +1481,134 @@ mod tests {
         drop(a);
         // SAFETY: same layout; `a` dropped above.
         unsafe { std::alloc::dealloc(base, layout) };
+    }
+}
+
+/// A native stand-in for the browser's JS-backed [`ForeignOps`]: each foreign id is a zeroed `Vec<u8>`
+/// behind a `Mutex`, atomics done with the same value math the `Paged` reference uses. Lets the
+/// `Foreign` dispatch (bounds, clamping, word assembly, kind codes) be gated natively; the browser's
+/// real-Chromium self-test gates the JS half over a real `WebAssembly.Memory`.
+#[cfg(test)]
+mod mock_foreign {
+    use super::{rmw_apply, width_mask, ForeignOps, RmwOp};
+    use std::sync::Mutex;
+
+    static MEMS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+    pub fn new_mem(size: u64) -> u32 {
+        let mut g = MEMS.lock().unwrap();
+        g.push(vec![0u8; size as usize]);
+        (g.len() - 1) as u32
+    }
+
+    fn read(id: u32, off: u64, out: &mut [u8]) {
+        let g = MEMS.lock().unwrap();
+        let o = off as usize;
+        out.copy_from_slice(&g[id as usize][o..o + out.len()]);
+    }
+    fn write(id: u32, off: u64, data: &[u8]) {
+        let mut g = MEMS.lock().unwrap();
+        let o = off as usize;
+        g[id as usize][o..o + data.len()].copy_from_slice(data);
+    }
+    fn fill(id: u32, off: u64, len: u64, b: u8) {
+        let mut g = MEMS.lock().unwrap();
+        let o = off as usize;
+        g[id as usize][o..o + len as usize].fill(b);
+    }
+    fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
+        let mut g = MEMS.lock().unwrap();
+        let (d, s, n) = (dst as usize, src as usize, len as usize);
+        g[id as usize].copy_within(s..s + n, d);
+    }
+    fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+        let mut g = MEMS.lock().unwrap();
+        let m = &mut g[id as usize];
+        let o = off as usize;
+        let w = width as usize;
+        let mut raw = [0u8; 8];
+        raw[..w].copy_from_slice(&m[o..o + w]);
+        let old = u64::from_le_bytes(raw) & width_mask(width);
+        let new = match kind {
+            0 => return old,
+            1 => a & width_mask(width),
+            8 => {
+                if old == (a & width_mask(width)) {
+                    b & width_mask(width)
+                } else {
+                    return old;
+                }
+            }
+            k => {
+                let op = [
+                    RmwOp::Add,
+                    RmwOp::Sub,
+                    RmwOp::And,
+                    RmwOp::Or,
+                    RmwOp::Xor,
+                    RmwOp::Xchg,
+                ][(k - 2) as usize];
+                rmw_apply(op, old, a, width)
+            }
+        };
+        m[o..o + w].copy_from_slice(&new.to_le_bytes()[..w]);
+        old
+    }
+
+    pub static OPS: ForeignOps = ForeignOps {
+        read,
+        write,
+        fill,
+        copy_within,
+        atomic,
+    };
+}
+
+#[cfg(test)]
+mod foreign_tests {
+    use super::*;
+
+    /// The proxied `Foreign` dispatch vs the `Paged` safe reference — the same 20k-op differential the
+    /// raw body is gated by. Covers bounds/clamping before the call, word assembly, and the atomic
+    /// kind codes the JS side must honour ([`ForeignOps`] contract).
+    #[test]
+    fn differential_foreign_vs_paged_fuzz() {
+        let (size, page) = (3 * 4096, 4096);
+        let id = mock_foreign::new_mem(size);
+        let a = Region::foreign(id, size, &mock_foreign::OPS);
+        differential(
+            &a,
+            &Region::paged(size, page),
+            size,
+            page,
+            20_000,
+            0x1234_5678_9abc_def1,
+        )
+        .unwrap();
+    }
+
+    /// A `Foreign` is not flat-addressable, its length follows the foreign memory's growth (never
+    /// shrinking), and accesses past the current length are inert — exactly `Paged`'s contract.
+    #[test]
+    fn foreign_length_grows_and_is_not_flat() {
+        let id = mock_foreign::new_mem(8192);
+        let r = Region::foreign(id, 4096, &mock_foreign::OPS);
+        assert!(r.raw_base().is_none());
+        assert!(r.raw_base_at(0).is_none());
+        r.set_byte(5000, 7);
+        assert_eq!(
+            r.byte(5000),
+            0,
+            "past the current length: dropped / reads zero"
+        );
+        r.set_foreign_len(8192);
+        assert_eq!(r.len(), 8192);
+        r.set_foreign_len(100);
+        assert_eq!(r.len(), 8192, "never shrinks");
+        r.write_word(5000, 4, 0xdead_beef);
+        assert_eq!(r.read_word(5000, 4), 0xdead_beef);
+        assert_eq!(r.atomic_rmw(5000, 4, RmwOp::Add, 1), 0xdead_beef);
+        assert_eq!(r.atomic_load(5000, 4), 0xdead_bef0);
     }
 }
 

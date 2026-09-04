@@ -8,6 +8,7 @@
 // child's completion slot; `memory.wait`/`notify` → `Atomics.wait`/`notify` on the futex word. A Worker
 // (not the page) is the only place a browser permits a blocking `Atomics.wait`.
 
+import { foreignImports } from './foreign-mem.js';
 const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -47,7 +48,7 @@ self.onmessage = async (e) => {
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
   // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} } }));
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {} } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW

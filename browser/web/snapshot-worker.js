@@ -8,6 +8,7 @@
 // "rare shared-memory race (a double-free)" in the shared setup. This Worker instantiates the engine over
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
+import { foreignImports } from './foreign-mem.js';
 import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
@@ -109,6 +110,7 @@ self.onmessage = async (e) => {
       ({ exports: ex } = await WebAssembly.instantiate(msg.module, {
         env: { memory },
         temen_host: {
+          ...foreignImports(memory),
           webgpu_op: () => -1n,
           // The live-stdout tee (`temen_run_onramp_stream`): while a streaming Run is active, `chunkSink`
           // relays each write to the main thread; the worker's run stays synchronous, so the main thread

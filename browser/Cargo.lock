@@ -189,6 +189,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-leng",
+ "temen-mem",
  "temen-opt",
  "temen-posix",
  "temen-snapshot",

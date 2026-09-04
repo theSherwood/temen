@@ -210,11 +210,16 @@ mapping on native. So:
   `zero`/`copy_within`/atomics; a `Foreign` arm routes each to a JS import over the child's
   `Memory`. Correct for arbitrary leaf bodies with zero change to the interpreter or the 79
   ops; the cost is one JS↔wasm import call per interpreter memory access on the **decline
-  path only** — the emitted tier runs natively in the child's memory. Estimated 3–5× slower
-  interpretation of declined bodies (import call ≈ 20–50 ns vs ≈ 10–20 ns per interpreted op);
-  cap leaves are bulk (`read_bytes`) and unaffected. This is acceptable for a fallback, and it
-  is **measurable before commitment**: slice 1 lands `Foreign` with a micro-benchmark, and if
-  the decline path proves too slow for a real consumer the fourth answer is the escalation.
+  path only** — the emitted tier runs natively in the child's memory. **Measured (slice 1,
+  #1284, real Chromium):** one import call ≈ 30 ns once the JS side stops touching
+  `WebAssembly.Memory.buffer` on the hot path (that getter alone is ≈ 90 ns; a stale view over
+  *shared* memory is never detached, only short, so "does the access fit the cached view" is the
+  staleness test). Per raw access that is ×4 (`byte`) to ×7 (8-byte word) over a direct
+  linear-memory access; against an interpreted op of ≈ 10–20 ns with a fraction of ops touching
+  memory, the expected end-to-end slowdown of a declined body is ≈ 2–4×. Cap leaves are bulk
+  (`read_bytes`) and unaffected. Acceptable for a fallback; slice 2's differential measures the
+  end-to-end number on a real declined phase, and if that proves too slow for a real consumer
+  the fourth answer is the escalation.
   `Region::Foreign` is not flat-addressable (`raw_base_at = None`), so `tierup_servable`'s
   flat-window arm declines it — correct, since tier-up *into* the child's memory is the
   emitted run itself.
@@ -573,9 +578,9 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 - **Memory-per-page** (raised and dismissed): a memory per 64 KiB page would turn every
   access into a memory-select — software paging on the fast path. Not viable; a memory per
   *child* is the right granularity.
-- **Decline-path cost over `Region::Foreign`.** Per-access JS import calls make interpreted
-  fallback bodies slower for detached children (estimate 3–5×). How often do the real phases
-  decline, and does it matter? Slice 1's benchmark answers this before slice 2 commits.
+- **Decline-path cost over `Region::Foreign`.** Measured per access ×4–7 (§3.3); the end-to-end
+  cost on a real declined body is slice 2's to measure. How often do the real phases decline,
+  and does it matter?
 - **Non-shared child memories.** A detached child that never threads could use a non-shared,
   no-`maximum` `Memory` (grows to the wasm32 ceiling with no eager reservation) — but that is
   a second emit cache key (`shared` flag) and is unusable on the Worker path. Deferred until

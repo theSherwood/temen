@@ -8,6 +8,7 @@
 // origin root (local `serve.mjs`) and under a subpath (GitHub Pages serves a project site at
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
+import { foreignImports } from './foreign-mem.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20, SLOT = 16;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -34,6 +35,7 @@ export async function loadEngine() {
   const importObj = {
     env: { memory },
     temen_host: {
+      ...foreignImports(memory), // #1284: detached children's own memories (Region::Foreign)
       webgpu_op: (op, a, b, c, ptr, len) => {
         const h = globalThis.__temen_webgpu_op;
         return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;

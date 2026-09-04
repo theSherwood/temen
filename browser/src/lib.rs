@@ -12784,3 +12784,144 @@ block 0 () {
         temen_op13jit_close();
     }
 }
+
+// ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================
+// A detached child's window on the wasm-JIT tier is its own `WebAssembly.Memory`, which this cdylib
+// cannot address (its pointers are offsets into ITS one linear memory). `temen_mem::Region::Foreign`
+// reaches such a memory through a `ForeignOps` table; here the table is the page's
+// `temen_host.foreign_*` imports (`web/foreign-mem.js`), all-`u32` (offsets are bounded by `Region`
+// first, and a child memory is < 4 GiB by wasm32 construction; atomics pass operands through a 16-byte
+// cell in this memory so no `i64`/BigInt crosses the import). Threads build only (the plain build has
+// no Workers and no detached children, and stays import-free for its Node harnesses).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+mod foreign_mem {
+    use temen_mem::ForeignOps;
+
+    #[link(wasm_import_module = "temen_host")]
+    extern "C" {
+        fn foreign_read(id: u32, off: u32, dst: *mut u8, len: u32);
+        fn foreign_write(id: u32, off: u32, src: *const u8, len: u32);
+        fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
+        fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
+        fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
+    }
+
+    fn read(id: u32, off: u64, out: &mut [u8]) {
+        // SAFETY: `out` is a live cdylib buffer of `out.len()` bytes; JS copies exactly that many in.
+        unsafe { foreign_read(id, off as u32, out.as_mut_ptr(), out.len() as u32) }
+    }
+    fn write(id: u32, off: u64, data: &[u8]) {
+        // SAFETY: `data` is a live cdylib buffer; JS reads exactly `data.len()` bytes from it.
+        unsafe { foreign_write(id, off as u32, data.as_ptr(), data.len() as u32) }
+    }
+    fn fill(id: u32, off: u64, len: u64, b: u8) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_fill(id, off as u32, len as u32, b as u32) }
+    }
+    fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_copy(id, dst as u32, src as u32, len as u32) }
+    }
+    fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+        let mut ab = [0u8; 16];
+        ab[..8].copy_from_slice(&a.to_le_bytes());
+        ab[8..].copy_from_slice(&b.to_le_bytes());
+        // SAFETY: `ab` is a live 16-byte cdylib buffer; JS reads both operands and writes the old value
+        // into its first 8 bytes.
+        unsafe { foreign_atomic(id, kind, off as u32, width, ab.as_mut_ptr()) };
+        u64::from_le_bytes(ab[..8].try_into().unwrap())
+    }
+
+    /// The one table every `Region::foreign` in this cdylib uses.
+    pub static OPS: ForeignOps = ForeignOps {
+        read,
+        write,
+        fill,
+        copy_within,
+        atomic,
+    };
+}
+
+/// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+pub fn foreign_region(id: u32, len: u64) -> temen_mem::Region {
+    temen_mem::Region::foreign(id, len, &foreign_mem::OPS)
+}
+
+/// **Self-test** of the Foreign seam over a real second `WebAssembly.Memory`: `temen_mem::differential`
+/// — `ops` seeded random operations (mixed atomics, words, bytes, bulk zero/fill/overlapping copy,
+/// out-of-range) — the proxied region vs the safe `Paged` reference. Returns 0 when every op and the
+/// final images agree; otherwise 1 with the first divergence in the stdout stash (`temen_stdout_ptr`).
+/// The browser-side twin of `differential_foreign_vs_paged_fuzz` (mock ops).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_selftest(id: u32, size: u32, ops: u32) -> u32 {
+    let page = 4096u64;
+    let a = foreign_region(id, size as u64);
+    let b = temen_mem::Region::paged(size as u64, page);
+    match temen_mem::differential(
+        &a,
+        &b,
+        size as u64,
+        page,
+        ops as usize,
+        0x1284_c0ff_ee00_0001,
+    ) {
+        Ok(()) => 0,
+        Err(msg) => {
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), msg.into_bytes()) };
+            1
+        }
+    }
+}
+
+/// Write one 32-bit word into foreign memory `id` at `off` — the page checks it landed in the CHILD
+/// memory (and nowhere in this one): the isolation half of the seam.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_poke(id: u32, off: u32, val: u32) {
+    foreign_region(id, off as u64 + 4).write_word(off as u64, 4, val as u64);
+}
+
+/// **Per-access cost probe** for the decline-path gate (#1284): `iters` seeded accesses, returning a
+/// checksum the page compares across backings. `kind` 0/1 = one `write_word` + one `read_word` (8-byte,
+/// aligned — the bytecode interpreter's path) over a flat `Shared` buffer / the Foreign memory `id`;
+/// 2/3 = one `set_byte` + one `byte` (the tree-walker's path) over the same two. The page times each.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32) -> u64 {
+    let size = size as u64;
+    let layout = Layout::from_size_align(size as usize, 8).unwrap();
+    // SAFETY: an 8-aligned zeroed buffer of `size` bytes, freed below once `shared` is dropped.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    // SAFETY: `base` is `size` valid 8-aligned bytes used only through `shared` in this scope.
+    let shared = unsafe { temen_mem::Region::shared(base, size) };
+    let region = if kind & 1 == 0 {
+        &shared
+    } else {
+        &*Box::leak(Box::new(foreign_region(id, size)))
+    };
+    // Both backings start from an all-zero image so the seeded stream yields the same checksum (the
+    // Foreign memory persists across calls; the Shared buffer is fresh).
+    region.zero(0, size);
+    let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(kind >> 1);
+    let mut sum = 0u64;
+    for _ in 0..iters {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let off = (s % (size / 8)) * 8;
+        if kind < 2 {
+            region.write_word(off, 8, s);
+            sum = sum.wrapping_add(region.read_word((off + 64) % size, 8));
+        } else {
+            region.set_byte(off, s as u8);
+            sum = sum.wrapping_add(u64::from(region.byte((off + 64) % size)));
+        }
+    }
+    drop(shared);
+    // SAFETY: same layout; `shared` dropped above.
+    unsafe { std::alloc::dealloc(base, layout) };
+    sum
+}

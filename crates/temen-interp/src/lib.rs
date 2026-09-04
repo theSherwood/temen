@@ -31,7 +31,7 @@ use temen_mem::RmwOp;
 // linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
 // The `unsafe` of borrowing host memory lives in `temen_mem::Region::shared`, keeping this crate
 // `#![forbid(unsafe_code)]`.
-pub use temen_mem::Region;
+pub use temen_mem::{ForeignOps, Region};
 
 /// The crate's **continue-through-poison** lock policy, in one documented home (#918). A poisoned
 /// lock means a thread panicked while holding it, but the data these locks guard is a plain guest
