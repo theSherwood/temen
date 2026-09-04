@@ -13383,7 +13383,16 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // twin's, or even another driver's engine) with no cross-thread doorbell into this
                 // cell yet, and a level-triggered poll cannot lose a wake. Condvar doors on the
                 // shared pipe backing are the follow-up.
+                // #1262 (parallel) — a default-action TERMINATE (this domain's `term_flag`, set by a
+                // group `^C`/SIGKILL) must break a twin blocked here even with NO caught handler: the
+                // re-run then hits the per-op `term_flag` safepoint in `resume` and the vCPU dies
+                // (WIFSIGNALED). Without this a pipeline stage parked on an empty pipe when its group is
+                // `^C`'d slept forever and the shell's reap never woke. Cheap to clone the flag once.
+                let term_flag = host.lock_unpoisoned().term_flag.clone();
                 while !host.lock_unpoisoned().pipe_read_ready(pipe) {
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     // #1146 slice 2 (parallel) — a signal reaching this OS thread while it blocks on
                     // the pipe interrupts the read: when a deliverable, non-`SA_RESTART` signal is
                     // pending, set this host's EINTR flag and break, so the re-run completes `-EINTR`
@@ -13403,7 +13412,12 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::PipeWrite { pipe }) => {
                 // The write twin: ready when the FIFO has room under `PIPE_CAP` (backpressure
                 // drained) or every reader closed (the re-run completes `-EPIPE`).
+                // #1262 (parallel) — same terminate break as the read poll below.
+                let term_flag = host.lock_unpoisoned().term_flag.clone();
                 while !host.lock_unpoisoned().pipe_write_ready(pipe) {
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     // #1146 slice 2 (parallel) — same interruptible break as the read poll above.
                     if host.lock_unpoisoned().park_interrupted() {
                         host.lock_unpoisoned().set_sig_interrupt();
