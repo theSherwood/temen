@@ -53,6 +53,7 @@ child in its own address space.** In temen that structure already has a name.
 | Native JIT (`temen-jit`) answer to op 15 | `crates/temen-jit/src/lib.rs` 8355 | **probeable `-EINVAL`** — "spawns into a fresh interpreter-owned window, which the JIT runtime does not host" |
 | wasm-JIT (`temen-wasm-jit`) nested emit lowers INSTANTIATOR ops **0, 1, 13, 17 only** | `crates/temen-wasm-jit/src/lib.rs` 769 | **op 15 not lowered** |
 | JIT children are **position-independent** (base is a runtime arg; compile cache reuses across offsets) | PROCESS.md §4 S1; `jit_instantiate_cache.rs` | **Built** — the emit needs no change to run in a different memory |
+| Native JIT nested children **already run in their own window**: `compile_child` lowers with `sub_base = 0` and the runners allocate a fresh `GuestWindow`, copying the carve in before and back out after (S1c: "own guarded window", parent-domain shared futex) | `crates/temen-jit/src/lib.rs` 4974, 5081, 5283–5325, 4651–4658, 4788–4793 | **Built** — the native tier is one deletion (the two memcpys) away from detached semantics |
 
 PROCESS.md §5 even records the motivation this note re-derives: *"nested carves subdivide
 parent VA (real in the browser's wasm32 window)"* and *"Projects choose per child; a shell
@@ -90,36 +91,66 @@ A detached child on the wasm-JIT tier is an ordinary emitted instance whose `env
 import is a **fresh** `WebAssembly.Memory` created for it, not the engine's shared memory.
 
 - **Memory**: `new WebAssembly.Memory({ initial: 1 << (size_log2 − 16), maximum: M })`. The
-  child's memory *is* its window: `win = 0`. Growth is the child's own `memory.grow` —
+  child's memory *is* its window (`win` = one host header page, below). Growth is the child's own `memory.grow` —
   independent of every other child and of the cdylib's heap. No partition, no topmost
   problem, no `mapped`-global re-pointing across children (each instance has its own).
 - **`maximum`**: a non-shared memory needs none (grows to the wasm32 ceiling); a child that
   will `thread.spawn` into Workers must be **shared**, hence needs a declared `maximum` — V8
   reserves that as *address* and commits lazily, so it can be generous (the `WindowMinter`
   quota is the natural source of `M`).
+- **Layout — a host header page below `win`.** The emitted code reads two host-owned things
+  through *its* memory: the `env` bounce cell (`ENV_CELL_BYTES` = 2576 B; scratch slots are
+  stored via `env.memory`) and the paged variant's `pagestate` table. Today both are engine-heap
+  pointers, which are meaningless in a foreign memory. Put them in the **first 64 KiB page of
+  the child's memory** and set `win = 65536`. Guest addresses are span-checked against
+  `"mapped"` *before* `win` is added (`emit_span_check` then `emit_win_addr`), so the guest can
+  never reach `[0, win)`; the header never moves on `memory.grow` (which appends at the top);
+  and no new invariant is needed — the alternative, a cell *above* `mapped`, would introduce
+  a `mapped ≤ env_cell_off` obligation with no analogue today and would have to relocate on
+  growth while `f0` holds `env` as a live parameter.
 - **Confinement**: the existing lowering is unchanged and still correct — `win + (eff &
-  MASK)` with the live `"mapped"` bound. With `win = 0` and the child alone in its memory, the
-  engine's own bounds check is a second, independent wall: an escape into the parent is
-  **impossible by construction**, not by mask. `"mapped"` still carries the guest's
-  committed-page semantics (the emitted tier has no per-page state, §14).
+  MASK)` with the live `"mapped"` bound. With the child alone in its memory, the engine's own
+  bounds check is a second, independent wall: an escape into the parent is **impossible by
+  construction**, not by mask. `"mapped"` is **still required**: the memory's page count is
+  ≥ the committed extent (64 KiB grow granularity; `mapped` may sit mid-page), so dropping
+  the bound would admit reads of uncommitted zero pages the interpreter faults on — an
+  INVARIANT #9 trap-parity divergence. The `& MASK` (2^40 − 1, already vestigial on wasm32)
+  becomes pure defense-in-depth and may be dropped later; not in this slice.
 - **Emit reuse**: because the emit is position-independent (S1), the cached
-  `nifler_ce`/`nimsem_ce` compile serves detached children unchanged. Nothing in
-  `temen-wasm-jit`'s codegen changes for this slice.
+  `nifler_ce`/`nimsem_ce` compile serves detached children unchanged (`OP13_CHILD_EMIT` keys on
+  the module hash only; `env.memory` is imported with min 0). Nothing in `temen-wasm-jit`'s
+  codegen changes for this slice. What *does* degrade: a `WebAssembly.Instance` binds its
+  memory at instantiate, so `jitInstanceCache` collapses to compiled-`Module` reuse — one
+  `instantiate` per child, cheap next to the ~2 s compile.
+- **`shared`**: `emit_for_run(…, true)` emits `shared: 0x03`, so the per-child memory must be
+  `{shared: true, maximum}` — which is also **forced** on the Worker path (a non-shared
+  `Memory` cannot be `postMessage`d, and `Atomics.wait` on the child's futex words needs a
+  SAB). Set `maximum` to the child's actual grant, not the engine's 16384 pages: V8 reserves a
+  shared memory's `maximum` eagerly. A non-shared, no-`maximum` variant would be a second emit
+  cache key — deferred.
 - **`vm_map` growth**: a `vm_map` bounce on the child's memory maps to `memory.grow` of
   *that* memory (append-only, as today's reservation prefix model). The servicer's
   `run_cross_tier` rebuilds the child `Mem` per bounce over `back`; for a detached child
-  `back` is a `Region::shared` over the child's own memory buffer, re-pointed after a grow
-  (a `memory.grow` detaches the old `ArrayBuffer` — the same stale-view refresh `worker.js`
-  already does).
+  `back` is a **`Region::Foreign`** (§3.3) — the cdylib has one linear memory and cannot form a
+  `*mut u8` into another `WebAssembly.Memory`, so `Region::shared` is not an option here. JS
+  refreshes its own `ArrayBuffer` views after a grow, as `worker.js` already does.
 
 ### 3.2 Native JIT: one mmap per detached child
 
 `temen-jit` today declines op 15 because the JIT runtime "does not host" the fresh window.
-Hosting it is the same shape as a root run: `Mem::with_reservation(DEFAULT_RESERVED_LOG2,
-size_log2)` gives the child its own 1 TiB reservation with lazy commit, and `run_guarded` takes
-the base as its runtime argument (S1). The native tier then matches the interpreter's detached
-semantics exactly, and R5 holds: detached costs the same thing everywhere — a copy at the cap
-boundary — and grows the same way everywhere — into its own reservation.
+The sweep found that it very nearly does already: `compile_child` lowers every child with
+`sub_base = 0` and its own guard, and both runners (`run_child_code_then`,
+`compile_child_and_run`) allocate a **fresh `GuestWindow`** per spawn, `memcpy` the carve in
+before the run and back out after. A native nested child is thus *already* a private window
+with copy-in/copy-out semantics; only the copies make it look like an alias. Hosting op 15 is
+therefore a **deletion plus a size change**: allocate the child window with a root-sized
+reservation (`Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2)`, lazy commit), seed data
+segments directly into it (`instantiator_rt::write_data_segments` currently targets the parent
+carve, then copies), and drop the two memcpys — for a 256 MiB phase carve that removes ~512 MiB
+of copying per spawn. `run_guarded` already takes the base as a runtime argument (S1). The
+native tier then matches the interpreter's detached semantics exactly, and R5 holds: detached
+costs the same thing everywhere — a copy at the cap boundary — and grows the same way
+everywhere — into its own reservation.
 
 ### 3.3 The data plane: a child's memory the host cannot address
 
@@ -138,26 +169,76 @@ mapping on native. So:
   the cell through a `DataView`; only *which* memory changes), but it is a real step: even
   scalar bounces cross the boundary by copy.
 - **Pointer args** (`fs` read/write buffers, path and cap-name strings, `exec` argv, stream
-  writes, `self.resolve` names, …) need a **copy-mediated deref**: the host copies the
-  referenced `[ptr, ptr+len)` range in (and results out) rather than reading in place. Two
-  implementation routes, to be settled by the chokepoint finding in §6:
-  - **(preferred)** if all cap pointer derefs go through one `Mem`/`GuestMem` accessor, give a
-    detached child a `Mem` whose backing *is* its own memory — on native that is just the
-    child's mmap (direct); on wasm a `Region` over the child's buffer that the **JS side
-    refreshes after each grow**. Then no cap changes at all: the deref lands in the right
-    memory because the child's `Mem` points there.
-  - **(fallback)** an explicit host import pair, `read_child_mem(child, ptr, len, dst)` /
-    `write_child_mem(...)`, used by the servicer wherever a cap op dereferences a pointer.
+  writes, `self.resolve` names, …) — **there is a single chokepoint, and it is already
+  copy-semantic.** Every pointer-dereferencing cap op in the tree — **79** of them across
+  the interpreter built-ins (19), POSIX (36), `temen-fs` (13), `temen-exec` (3), the browser
+  cdylib (5) and `temen-webgpu` (3) — reaches guest memory only through `GuestMem::read_bytes`
+  / `write_bytes` (`crates/temen-interp/src/lib.rs:16106`), which take/return owned bytes
+  (`Vec<u8>` in, `&[u8]` out — no window borrow exists in the trait) and are documented as
+  guest-relative: *"a §14 child names its own `[0, size)`, never its position in an
+  ancestor's window; implementations translate to their backing."* `HostProc` hands every
+  embedder personality exactly `&mut dyn GuestMem` and nothing else. So isolation for the
+  cap-call ABI needs **no per-op changes and no new `read_child_mem` API** — `read_bytes`
+  already *is* that API. What must be true is only that the detached child's `Mem` is backed
+  by its own memory:
+  - **Native**: already so — the op-15 arm mints `Mem::with_reservation(...)`, a private mmap
+    the host addresses directly. Done.
+  - **wasm-JIT**: the cdylib has one linear memory and cannot form a `*mut u8` into a foreign
+    `WebAssembly.Memory`, so the child's backing must be a **`Region::Foreign`** variant whose
+    accessors are JS host imports (`env.read_child_mem(child, ptr, len, dst)` /
+    `env.write_child_mem(...)`) that copy between the child's `Memory` and cdylib scratch —
+    bulk per `read_bytes`/`write_bytes` call, not per byte. It sits **below** the chokepoint, so
+    the 79 ops never see it. This is the one genuinely new mechanism on wasm, and it is
+    additive (a new `Region` arm, `cfg(wasm)`), not a change to any existing variant.
+  - Page ops (`vm_map`/`unmap`/`protect`, 9 of them) take **offsets, not dereferenced
+    pointers**, and act on the child's own region — unchanged. `SharedRegion.map` is the only
+    op with cross-domain byte semantics, and it is the sanctioned sharing route (§3.4).
+- **The declined-body question (the sweep's "single biggest engineering item").** A bounce
+  does not only marshal scalars: `run_cross_tier` runs the **bytecode interpreter over the
+  child's window** (`program.run_over(…, self.back, …)`) — today via `Region::shared` over a
+  raw pointer into the one memory. This is what makes #1151's "emit declined ⇒ run
+  byte-identical on the interpreter" work, and a declined *function body* dereferences
+  arbitrary guest pointers, so copying the 64-slot scratch is not enough. The emitters sweep
+  listed four answers — copy the whole window per bounce (native's old answer, O(carve),
+  lethal at 256 MiB and Lua/SQLite bounce rates), copy touched pages (needs a dirty set the
+  interpreter does not produce), multi-memory (blocked: the emit hard-codes memory index 0 in
+  every memarg and the cdylib is a single-memory wasm32 target), or move the child's leaves
+  into a second artifact sharing the child's memory (an architecture change: no interpreter
+  fallback for detached children). **`Region::Foreign` is the fifth answer and the one this
+  note proposes:** proxy *every* interpreter access, not just the cap chokepoint. `Region` is
+  an enum (`Mapped`/`Shared`/`Owned`/`Paged`) whose accessors are `byte`/`set_byte`/`read_into`/
+  `zero`/`copy_within`/atomics; a `Foreign` arm routes each to a JS import over the child's
+  `Memory`. Correct for arbitrary leaf bodies with zero change to the interpreter or the 79
+  ops; the cost is one JS↔wasm import call per interpreter memory access on the **decline
+  path only** — the emitted tier runs natively in the child's memory. Estimated 3–5× slower
+  interpretation of declined bodies (import call ≈ 20–50 ns vs ≈ 10–20 ns per interpreted op);
+  cap leaves are bulk (`read_bytes`) and unaffected. This is acceptable for a fallback, and it
+  is **measurable before commitment**: slice 1 lands `Foreign` with a micro-benchmark, and if
+  the decline path proves too slow for a real consumer the fourth answer is the escalation.
+  `Region::Foreign` is not flat-addressable (`raw_base_at = None`), so `tierup_servable`'s
+  flat-window arm declines it — correct, since tier-up *into* the child's memory is the
+  emitted run itself.
 - **Parent seeding argv / reading output**: a copy into the child's memory before `start`,
-  a copy out after `join`. PROCESS.md §3's create-suspended/`grant`/seed/`start` shape already
-  makes seeding an explicit step, so this is where the copy naturally lives.
+  a copy out after `join`. Data segments are already a copy (`init_data` on the child's own
+  `Mem`, as the op-15 arm does). **argv has no detached path today**: the op-13 convention is a
+  *parent data segment landing inside the child's carve* at `carve_off + module_args_base()`
+  (`op13_parent_src`, eight `temen-run` examples/tests, and what the Nim/C toolchains emit) —
+  guest-visible and impossible to reproduce across memories. op 15 seeds `init_data` only. So
+  op 15 needs a **spawn-time args payload** — `(args_ptr, args_len)` read from the *parent's*
+  window and copied to `module_args_base()` in the child before start (the interpreter arm is
+  one `write_bytes`; the wasm servicer one `Foreign` bulk write). PROCESS.md §3's
+  create-suspended/`grant`/seed/`start` substrate is the long-run home for this (PROPOSED,
+  not built); the payload is the minimal built form of the same step. Output already flows
+  through caps (`fs`, stdout) — `nimc::make_exec` is the model: the grandchild's product
+  leaves via the shared memfs cap, stdout discarded.
 - **The nimony memfs is already cap-mediated** (children call the `fs` cap; they never alias
   its bytes), so the phases work detached with **no** design change — only the bounce
   copies. The sub-window aliasing was only ever load-bearing for *direct* parent↔child byte
   sharing.
 - **Interpreter/declined children** run over the child's own `Mem` exactly as the built op-15
-  arm does today; on wasm a declined detached child can use `Region::Paged` (no contiguity
-  needed off the emitted tier).
+  arm does today. On wasm a detached child that **never enters the emitted tier** (whole-module
+  decline) can live in `Region::Paged` on the cdylib heap — still its own memory, still
+  attestable; one that runs emitted code must use `Region::Foreign` over its `Memory`.
 
 ### 3.4 Sharing stays available — as the explicit thing it already is
 
@@ -200,18 +281,40 @@ attestation the honest norm ("no ancestor holds read authority" is a checkable r
 and sidesteps the partition trap everywhere — the browser first, but a native parent spawning
 thousands of children or a few multi-GiB ones partitions its 1 TiB too.
 
-**Recommendation:** make **detached the default** spawn for new consumers (the playground
-parent, the `Domain::create` substrate of PROCESS.md §3), keep **nested (op 13) as the
-explicit opt-in** for tightly-coupled children, and leave every existing op-13 consumer
-untouched (they already ask for nesting explicitly by calling op 13). This flips the *default
-recommendation*, not the built ops — no migration is forced on existing code; the substrate
-`create(window)` simply defaults its `window` argument to a minted detached window.
+**Where the cost actually lives — decouple two decisions.** The blast-radius sweep (§6) shows
+that *hosting op 15 on the JIT tiers* (§3) is additive and renegotiates **no** invariant, while
+*flipping the default* is where essentially all the cost and risk sits: it renegotiates three
+invariants (§4a), re-derives three doc *arguments*, and touches ~75 doc sentences. And the
+motivating consumer does not need the flip: the playground parent is **host-authored**, so it
+can call op 15 explicitly the moment the JIT hosts it. So:
+
+- **Decision A — host op 15 on the JIT tiers.** Do this first, on its own. It delivers #1253
+  and the playground with no semantic change to anything existing.
+- **Decision B — make detached the default spawn** for new consumers (the PROCESS.md §3
+  substrate's `create(window)` defaulting to a minted detached window), nested (op 13) staying
+  the explicit opt-in, no migration forced on existing op-13 callers. **Recommended — but
+  gated** on the three rulings in §4a, each of which is an owner decision to record, not an
+  engineering step.
 
 **Counter-argument recorded:** the "child calls parent and they share data by default" pattern
 is genuinely common. Under detached-default it still works unchanged for the child; the parent
 pays a copy at a boundary that is already a bounce. Only a parent that needs to *mutate* child
 memory in place or walk large child structures zero-copy wants nesting — and that parent knows
 it. The pattern is served by the default; the specialized case opts in.
+
+### 4a. The three rulings Decision B needs (from the INVARIANTS.md sweep)
+
+| Invariant | Tension | Recommended ruling |
+|---|---|---|
+| **#3 authority moves only down the grant graph** | Today only a `WindowMinter` (embedder-granted, byte-quota'd, "spawn *evidence*") may mint an independent window. If detached becomes the default, an ordinary `Instantiator` holder mints independent VA with no minter — VA becomes ambient-under-`Instantiator`. | Fold the minter's byte quota into **`Budget.mem`** (PROCESS.md §5's budget vector already has a `mem` field; budgets attenuate down the grant graph, so a child can never mint more than its ancestors granted). The minter then stops being a separate authority and becomes the budget it always was in spirit. Alternative: an explicit owner decision that VA is not a scarce authority — **not** recommended on wasm32. |
+| **#14 one frontier (the durability cell)** | Detached windows **refuse** durable today (multi-window freeze = O6, open). Detached-by-default would make durable §14 nesting refuse *by default* — verbatim the "standing refuse workaround with no tracked plan" #14 forbids. | **Durable ⇒ nested.** A durable child must be snapshottable by its parent, and a snapshot *is* a read — so a durable child is exposed by definition. PROCESS.md §6 already states the rule: a domain may be *confidential* **or** *ancestor-durable*, **not both**. So the default is detached *unless the child is durable*, in which case the placement is nested (the alias grant is implied by durability). No O6 needed; DURABILITY.md's subtree-freeze derivation stays intact; and it is the posture the design already committed to. Evaluate this first — it is the cheapest coherent answer. |
+| **#13 one canonical form** | Detached-default + an alias placement is two live placement forms, which #13 forbids as a standing dual-mode ("a migration's own scaffolding … never a standing compatibility contract"). | **One canonical form, parameterized by a grant.** The child-side ABI is byte-identical under both placements (§4(a)); what differs is a grant the parent issues. #13 governs *forms*, not *parameters* — a `SharedRegion` mapped or not is not "two forms" either. Record this reading, dated, in INVARIANTS.md. If the owner rejects it, the alternative is a dated deadline to delete the carve path once §13 `SharedRegion` covers the Stage-1 hand-offs. |
+
+**Net effect on the invariants** (full table in §6.5): **0 violated; 6 strengthened** (#1 smaller
+default TCB, **#2 the masking hinge — "no D38 contact"**, #3, #4, #8 control≠data plane, #12);
+**4 unchanged** (#5, #6, #10, #11); **4 to renegotiate** (#7 recovery re-attach, #9 the wasm-JIT
+tier carries or declines, #13, #14). Invariant #2 strengthening is the strongest single argument
+for the whole direction: an isolated child *removes* window-access surface rather than adding it.
 
 ## 5. Platform consistency (R5)
 
@@ -234,39 +337,227 @@ Scope of the change: **add JIT-tier hosting of an existing op**, plus a default-
 flip. The nested path (op 13) is **not modified** — which bounds the blast radius sharply.
 Detailed per-site findings from the five code sweeps follow in §6.1–§6.5; the summary first.
 
-| Area | Effect | Effort |
-|---|---|---|
-| Interpreter op-15 arm, `WindowMinter`, attest, durable-refusal | **unchanged** (built) | — |
-| Interpreter nested path (`carve_fits` ×9, `sub_window`/`nested_view`, `event_instantiate`) | **unchanged** — it *is* the opt-in nested spawn | — |
-| `temen-wasm-jit` codegen | **unchanged** — position-independent emit; op 15 becomes a lowered bounce like op 13 (import + arg marshal), not new memory-access surface | S |
-| `temen-jit` native | host op 15: fresh `Mem::with_reservation` + `run_guarded(base)`; replace the `-EINVAL` stub | M |
-| Browser servicer (`temen_op13jit_step` / `JitOnrampRun`) | new detached-child run: `back` over the child's own memory, `win = 0`, re-point after grow; the op13 phase drivers gain a detached variant | M |
-| Browser JS (`driveJitRun`, `cachedInstanceF0`, `par.js`) | per-child `new WebAssembly.Memory` as `env.memory`, `win = 0`; the `env` bounce cell lives in the child's memory, so `call_interp` copies scalar arg slots into a cdylib scratch cell and results back (JS-mediated, §3.3); pointer derefs go via the §3.3 data plane; stale `ArrayBuffer` views refreshed after each child `memory.grow` | M |
-| **Cap pointer-arg data plane** (§3.3) | the substantive item: either the `Mem`-chokepoint route (small) or per-op marshalling (large) | **S or L — decided by §6.3** |
-| Durability | detached already refuses durable (fail-closed); multi-window freeze stays O6 | — (deferred, known) |
-| Fork (#816) | fork twins are nested-window children; detached children are outside the twin — same O6 shape as durability | — (deferred) |
-| Threads / Workers | a detached child that spawns threads needs a *shared* own-memory with a `maximum`; Worker fan-out of `mapped` is per-memory | M |
-| Docs | PROCESS.md §5 (this as §5a), DESIGN.md §14 "parent intrinsically sees all child memory" → "…for a nested child", BROWSER.md op-13 section, INVARIANTS (#14 satisfied, not renegotiated) | S |
-| Tests | new: detached-on-wasm-JIT differential vs the interpreter's detached child (byte-identical), attest report on JIT, quota exhaustion on JIT, concurrent detached children in Workers; existing nested suites untouched | M |
+Two columns because the two decisions have very different radii. **Decision A** = host op 15
+on the JIT tiers, nested path untouched. **Decision B** = detached becomes the default spawn
+(with the §4a rulings: durable ⇒ nested, pager ⇒ nested, minter quota → `Budget.mem`).
 
-### 6.1 – 6.5 Per-site findings
-*(filled from the code sweeps — interpreter core; durability/fork/threads; cap pointer-arg
-surface and the chokepoint question; emitters + browser JS; docs/invariants/tests.)*
+| Area | Decision A | Decision B (additional) | Effort A / B |
+|---|---|---|---|
+| Interpreter op-15 arm, `WindowMinter`, attest, durable-refusal | **unchanged** (built); + spawn-time args payload | attest default flips (`child_attestation` hardcodes `window_exposed: true`) | S / S |
+| Interpreter nested path — 60 sites swept (`carve_fits` ×9, `nested_view` ×9, `event_instantiate*`, seeding ×5, thaw, futex, pager, checkpoint) | **unchanged** — it *is* the opt-in nested spawn | 22 (a) untouched · 17 (b) parallel path · 25 (c) rewrite — minus the durability/pager (c)s the rulings avoid; see §6.1 | — / M |
+| Resumable engine (`Vcpu`/`drive`/`drive_parallel`/debug) | detached exists **only in the tree-walker**; a guest parent on the coop engine (the playground parent) needs an op-15 event arm: `VcpuEvent::InstantiateDetached` (additive ABI) + constructors already take an arbitrary `back` | the same arm becomes the default event | M / — |
+| **`FutexKey::Anon` collision** | **pre-existing bug, exposed**: keyed on confined absolute address, and every detached child has `window.base() == 0`, so two detached siblings futexing the same guest offset already rendezvous falsely on the run-global `wait_waiters` — on the built interpreter path, today. Needs a backing discriminant (PROCESS.md:838 S1c) **before** concurrent detached children ship | forced everywhere | M / — |
+| `temen-wasm-jit` codegen | **unchanged** — position-independent; `mapped` bound stays (INVARIANT #9); op 15 lowered as a bounce like op 13 | `& MASK` droppable; `fits` half of the carve gates becomes alias-only | S / S |
+| `temen-jit` native | **already isolated** (`sub_base = 0`, fresh `GuestWindow`, copy-in/out): replace the `-EINVAL` stub, reserve instead of size-exactly, seed segments directly, delete two memcpys | nothing further | S–M / — |
+| Browser servicer (`temen_op13jit_step` / `JitOnrampRun`) | 11 sites take `carve_ptr` into engine memory (§6.4) → detached variant over `Region::Foreign`, `win = 64 KiB` header page; `grow_backing_to_mapped` grows memory 0 (wrong memory) → JS-side grow of the child's | phase drivers default to detached; `op13_phase_open_impl`'s 2× buddy parent shrinks to KiB and `PHASE_CARVE_MAX` relaxes | M / S |
+| Browser JS (`wasmjit-module.js`, `worker.js`, `par.js`) | per-child `Memory` factory; env cell + `pagestate` in the header page; `call_interp` copies slots; per-child instance; `mem_wait`/`notify` on the child's buffer; grandchild spawn posts a `Memory` (must be shared) | comments and the "confined child = shifted window" model rewritten | M / S |
+| **Cap pointer-arg data plane** (§3.3) | `GuestMem` chokepoint: **0 of 79 ops change**; `Region::Foreign` below it — **plus** the decline path runs the interpreter over `Foreign` (measured gate) | none | S (+ benchmark) / — |
+| Durability | detached refuses durable (fail-closed) — unchanged | **avoided by "durable ⇒ nested"**; rejecting that ruling costs D1–D6 (multi-image artifact, freeze plumbing to child `Mem`s, STW broadcast channel, thaw re-attach, DAP checkpoint): **L** | — / — (or L) |
+| Fork (#816) | unchanged: `bare` gate refuses forking a parent with live children; `fork_private` already builds a private twin region | unchanged | — / — |
+| Threads / Workers | Worker child needs `shared:true` + `maximum`; futex hazard above; data segments ×5 engines seeded on the child's `Mem` | the 5 seeding sites converge | M / S |
+| Demand pager (op 16) | n/a (nested-only op) | **pager ⇒ nested** (a pager child is parent-writes-child by definition); else `supply_page` needs a byte-transfer leg | — / — |
+| Escape oracle (`run_capture_sub`, `compile_and_run_capture_sub`, `fuzz/mask`) | unchanged — the nested path stays and stays its subject | unchanged (the oracle is the alias grant's) | — / — |
+| Docs | PROCESS.md §5 (this as §5a), DESIGN.md §14, BROWSER.md op-13 section, INVARIANTS (#14 satisfied, not renegotiated) | ~75 sentences / 20 files; three *arguments* re-derived; D19 amended | S / M |
+| Tests | detached-on-wasm-JIT differential vs the interpreter's detached child; attest on JIT; quota on JIT; concurrent detached children in Workers; `Foreign` micro-benchmark; futex-collision regression | isolated twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk`; `grant_marshal_fuzz` re-plumbed | M / M |
+
+### 6.1 Interpreter core (60 sites; classes: (a) untouched · (b) parallel path · (c) rewrite)
+
+Under **Decision A nothing here changes** — the nested path is the opt-in spawn and the op-15
+arm is the template. The classification below is the cost of **Decision B**, and it is where
+the §4a rulings earn their keep.
+
+| Cluster | Sites | Class under B | Note |
+|---|---|---|---|
+| `carve_fits` (bytecode.rs:1129) and its 9 callers — resumable `event_instantiate{,_module}`, debug `dbg_instantiate{,_module}`, coop `drive` ×2, `run_vcpu_parallel` ×2, tree-walker INSTANTIATOR arm | 10 | (b) | every term but power-of-two is containment-in-parent; the detached gate is op 15's `child_size != 0 && mod_ok` + quota |
+| `Window::sub` / `Mem::sub_window` / `Mem::nested_view` and 9 `nested_view` callers | 12 | (a)/(b) | `temen-mask` is total and fuzzed; a detached window is the `base == 0` case it already handles. `nested_view`'s twin is `Mem::with_reservation` + `init_data` + `seed_null_guard` (lib.rs:11902–11905) |
+| `carve = pbase + ibase + off` and `VcpuEvent::Instantiate { carve, … }` | 4 | **(c) public ABI** | `carve` is meaningless detached; add `InstantiateDetached` rather than overload. Consumers: `browser/src/lib.rs` 2320–2331 (`PAR_INSTANTIATE`), 9408, `nimc.rs` 347, and 6 in-repo driver tests |
+| op-5/13 data segments materialized into the **parent's** `Mem` before spawn | 5 engines | **(c)** | becomes `init_data` on the child's `Mem` — the class of thing that drifts between engines (cf. #1094 guard divergence) |
+| `new_confined_child*` constructor family (3200–3439) | 6 | (a) code, (b) doc | **already isolation-shaped**: `with_reservation_over(…, back)`, `base() == 0`, starter caps `grant_*(0, carve_size)`. Only the *callers* build `back` as `Region::shared(carve_ptr)` — 4 sites, (c) |
+| Grant marshalling (`read_grant_list`, `regrant_list_into_child`, `take_granted_host`, coop op 11/13, tree-walker op 13/15, `spawn_named_child*`) | 14 | (a) | every read is from the **parent's** window (`guard + 1024/2048`), never the carve |
+| `child_attestation` hardcodes `window_exposed: true` (lib.rs:21196–21202) | 1 (+2 callers) | **(c)** | becomes `alias_granted`; `detached_child_attestation` is the default |
+| argv at `carve + module_args_base()` (§3.3) | 12 writers | **(c) guest-visible** | the spawn-time payload — the one item Decision A also needs |
+| Durable freeze/thaw: `NestedChildInfo.carve_off`, `FrozenNested`, STW broadcast `write_bytes(carve_off + STATE_OFF)`, thaw `abs_carve` chain, `begin_thaw`, `durable_get_sp(abs_carve + …)`, thaw `nested_view`, resume loop without geometry re-check | 11 | (c) → **avoided** | by "durable ⇒ nested" (§4a). Rejecting the ruling: see §6.2 D1–D6 |
+| Demand pager (`supply_page` "without zeroing, so the bytes the parent placed survive") | 4 | (c) → **avoided** | by "pager ⇒ nested" |
+| **`FutexKey::Anon(base)`** (lib.rs:4321–4339, 24636–24656; bytecode.rs:12106, 12133) | 3 | **(c) — and a live bug** | soundness argument "anonymous pages are never aliased across domains ⇒ address is identity" holds only because nested children have distinct non-zero bases. Detached children all have base 0 and share the run's `wait_waiters`. Fix shape: `Anon(backing_ident, rel)` mirroring `Region(ident, off)` |
+| Checkpoint/debug: `child_checkpointable`/`nested_within_prefix`, `env_snapshot`/`rebuild_env` | 4 | (c) | in-memory only, no wire format: swap per-env `prot` for a full `MemLayout`; the prefix restriction disappears |
+| Tier-up: `tierup_servable` (`ptr_eq(back) \|\| flat_win_base()`), `pending_win` | 5 | (b) | first arm goes false for a detached child; second saves a flat `Owned`/`Mapped` region; `Foreign`/`Paged` correctly decline |
+| Window-relative bookkeeping inside `Mem` (`check_prot`, fault report, `snapshot`, `zero`, …); `temen-mem` whole crate; `SharedSlots`/`ModuleSource`/`DomainTable`; op 14 `child_offer` (powerbox `Arc`, not the window); `join`/`reap` scalars | ~20 | (a) | all `base`-parameterised and fine at `base == 0` |
+
+**Totals under B:** 22 (a) · 17 (b) · 25 (c), of which 15 (c) are removed by the two rulings.
+The residual (c) set is: the `Instantiate` event ABI, the 5 seeding sites, the 4 `Region::shared`
+callers, attestation, argv, futex, checkpoint.
+
+### 6.2 Durability, fork, threads
+
+**Durability (Decision A: unchanged; Decision B: avoided by the ruling — or L).** The invariant
+being removed is stated in the code's own words four times: *"the child's entire state … lives
+in its carve … so it is already in the artifact's window image"* (lib.rs:8576–8582), *"a §14
+nested child records nothing … carve-self-describing"* (6749–6750), `temen-snapshot` 358–360,
+DURABILITY.md 149–151. If detached children were ever durable, the cost is:
+
+| # | Break | Sites | Effort |
+|---|---|---|---|
+| D1 | one `TAG_WINDOW` per artifact; §12.6 byte-identical re-freeze defined over one image; v18 format | `temen-snapshot` 379–415, 629–696, 459–466 | M–L |
+| D2 | freeze has no path to a live child's `Mem` (`NestedChildInfo` stores geometry only; parent keeps `child_hosts`, never memory) | lib.rs 2877–2941, 8559–8574, 11705 | M |
+| D3 | subtree STW broadcast writes `UNWINDING` *through the parent's `Mem`* at `carve_off + STATE_OFF`; failure mode is a **silently lost continuation**, not a trap | 6657–6663, 11622–11625 | S–M (hinge) |
+| D4 | thaw re-attaches children out of the root image (`abs_carve` accumulation, `durable_get_sp`, `nested_view`) | 2513–2539, 2601–2622, 2730 | M |
+| D5 | `FrozenNested::carve_off` semantics | 8598; snapshot 898 | S |
+| D6 | DAP/time-travel checkpoint is an independent second copy of the assumption | 25202–25264; bytecode 4762–4816 | M |
+
+The "durable ⇒ nested" ruling makes all six moot: a durable child is snapshotted by its parent,
+a snapshot is a read, so it is exposed by definition — PROCESS.md §6 already says confidential
+XOR ancestor-durable. Unchanged either way: digest gate, handle table, `TAG_SERVE`/`TAG_JIT`,
+`freeze_sink`, `completed_result`.
+
+**Fork (#816): unchanged under both decisions.** The `bare` gate (lib.rs:5682–5689) refuses to
+fork a parent with `nested_children` or `child_hosts`, so "twin inherits child carves" is
+unreachable today. `fork_private` already builds a fresh region and copies base-relative
+(FORK.md §8.6); `twin_backing`/`owned_zeroed` exist for exactly this; `tierup_servable`'s
+"fork twin's private copy" arm already serves an isolated flat window. If anything, detached
+makes relaxing `bare` later a deliberate "duplicate N regions" rather than an accident.
+
+**Threads.**
+- Native parallel driver: `nested_view` swap + seeding on the child `Mem` — S–M. `SharedSlots`,
+  `ModuleSource`, `DomainTable`, `ThreadRegistry` share *code*, not data — unchanged.
+- **Futex**: the collision in §6.1. PROCESS.md:838 names the fix and its trigger verbatim
+  ("cross-domain siblings need the backing-interned identity … folded into S1c when concurrent
+  separate-window children exist"). Concurrent detached children *are* that event; and since
+  op 15 is built, the hazard exists on the interpreter now. Under isolation the parent↔child
+  anonymous-memory futex stops working by design; only §13 `SharedRegion` rendezvous
+  (`FutexKey::Region`) survives — correct, but a behaviour change to document.
+- **Browser/Workers**: the threads sweep called a per-child `WebAssembly.Memory` "not
+  implementable" because the engine's pointers are offsets into the one imported memory and
+  `Region::shared` cannot name a byte elsewhere. That is exactly the constraint `Region::Foreign`
+  (§3.3) answers — the engine never holds a pointer, JS does. Its fallback, "own disjoint
+  region inside the one SAB", is S–M but buys only semantic isolation (no VA growth
+  independence, no attestable boundary, and it *is* the partition trap of §0 — a Worker can
+  still address every byte). Two Worker facts stand: the child memory must be `shared:true`
+  (postMessage; `Atomics.wait` at `worker.js` 265–276), and the powerbox recipes published via
+  a process-wide `static` (THREADS.md 4c-D2) are read by the **engine**, which stays on the
+  engine memory in every Worker — a child never reads that static, so this is a non-issue.
+  Completion slots are `temen_par_alloc`'d in engine memory and survive.
+
+### 6.3 Cap pointer-arg data plane (79 ops)
+
+One chokepoint — `GuestMem::read_bytes` / `write_bytes` (lib.rs:16106), owned bytes in and
+out, documented guest-relative — carries every pointer-dereferencing cap op: interpreter
+built-ins 19, POSIX 36, `temen-fs` 13, `temen-exec` 3, browser cdylib 5, `temen-webgpu` 3.
+`HostProc` hands each personality `&mut dyn GuestMem` and nothing else. **0 of 79 change.**
+Page ops (9) take offsets. `SharedRegion.map` is the one cross-domain byte op and is the
+sanctioned route. What isolation needs is only that the child's `Mem` is backed by its own
+memory: native already (a private mmap); wasm via `Region::Foreign`, which also carries the
+decline path (§3.3). One contract note: `child_offer` (op 14) args are `i64` by type and
+pointers by convention; an offer edge that passes a window pointer is already domain-relative
+today (a nested child's pointer into its carve is not a parent coordinate) — isolation changes
+nothing in kind, but any such edge becomes a copy, and `nimc::make_exec` (output via the fs cap,
+stdout discarded) is the pattern to standardize on.
+
+### 6.4 Emitters and browser JS
+
+**`temen-wasm-jit` codegen — unchanged.** `win` is param 0; `mapped` and `pagestate` are
+mutable globals; `env.memory` imports with min 0; `compile_module_nested*`, `emit_confine`,
+`emit_span_check`, `emit_page_check_one`, `emit_null_guard`, `emit_win_addr` all run unchanged
+with any `win`. The carve gates (`check_child_carve`, `child_carve_fits`, `_growable`) have
+zero production callers; their `mod_ok` half survives, their `fits` half is alias-only. The
+`env.instantiate_module` bounce keeps its 9-arg shape (`grants_ptr` is always parent-relative;
+`off` is reinterpreted); changing arity would fork `module_uses_instantiate_module` and the
+conditional import-index arithmetic. The emit cache (`OP13_CHILD_EMIT`, `CachedEmit`,
+`emit_for_run(m, shared)`) records no base — the identical ~40 MB artifact runs detached.
+
+**`temen-jit` native — already isolated** (§3.2). `SubWindow`/`sub_base` has one construction
+site (`compile_and_run_capture_sub`), the escape-oracle harness; everything downstream is the
+alias path and stays. `instantiator_rt.rs:1303–1313`: `mod_ok` survives, `fits` alias-only,
+`write_data_segments` retargets the child window.
+
+**Browser servicer — where it breaks** (`browser/src/lib.rs`): `carve_ptr = d.mem_base.add(carve)`
+(9419) and everything downstream — `Region::shared(carve_ptr)` decline (9447), `drive_op13`
+(9457), `open_shared_run_over_host` (9488), `back = Region::shared(win_ptr, …)` (5615), data
+segment seeding via `from_raw_parts_mut` (5930–5942), `run_cross_tier`'s `run_over(back)`
+(5279, 6126), `grow_backing_to_mapped`'s `memory_grow::<0>` (6255 — grows the **engine's**
+memory), the `pagestate` `Vec<u8>` pointer (5360), `temen_par_child_confined` (1978–1992).
+Parallel-path: `win_base`/`temen_onramp_jit_run_win_ptr` (→ header-page `win`), the
+`win_size == 1 << win_log2` debug assertion. Unchanged: `mapped` init, `PAR_TIERUP` shape.
+**`op13_phase_open_impl` is a straight win**: the parent window is 2× the carve purely so the
+carve can be the upper half (`phase_window_log2 = carve + 1`), and `PHASE_CARVE_MAX = 28` exists
+because "2^28 carve → 2^29 parent over the 1 GiB Memory". Detached, the parent holds grant
+records only and the cap moves up.
+
+**JS** (`wasmjit-module.js`, `worker.js`, `par.js`): `cachedInstanceF0`/`jitInstanceCache` →
+per-child instance (memory identity in the key; the #803 comment rewritten); `driveJitRun`'s
+`env = temen_alloc(…)` + `DataView(memory.buffer)` + `call_interp(func, argsPtr)` → header-page
+cell, JS copies the 64 slots each way; `syncGlobals` `pagestate` → header page; `worker.js`
+child instance `env: { memory }` → fresh shared `Memory`; `mem_wait`/`mem_notify` on the child's
+buffer; grandchild spawn posts a `Memory` handle instead of `cwin + goff` (simpler); one
+stale-view cache per `Memory`; `par.js` gains a child-memory factory beside `loadEngine`'s one
+engine `Memory`; the 1 GiB `maximum` is per-`Memory`, so the budget pressure `PHASE_CARVE_MAX`
+encodes is relieved. `driveCoopTierupRun`'s one-memory/one-table shape is untouched for the coop
+root; a detached child never enters it.
+
+### 6.5 Docs, invariants, tests
+
+**Decision A** touches four docs (PROCESS.md §5 → §5a, DESIGN.md §14 one sentence, BROWSER.md
+op-13 section, INVARIANTS #14 "satisfied") and renegotiates nothing. **Decision B** touches ~75
+sentences in 20 files, three of which are *arguments* to re-derive rather than sentences to
+edit — DURABILITY.md "subtree freeze" (265–268; survives intact under durable ⇒ nested),
+THREADS.md 4c-D2 (280–283), IMPORTS.md "confidentiality the memory model doesn't provide"
+(761–767) — plus D19 (Settled → amended, dated), D63's nested-guard redirect (removed for
+detached children: a simplification in a security-relevant lowering branch — re-run the escape
+oracle), and a GLOSSARY.md line. Invariants: **0 violated; 6 strengthened** (#1, **#2 — no D38
+contact**, #3, #4, #8, #12); **4 unchanged** (#5, #6, #10, #11); **4 renegotiated under B only**
+(#7, #9, #13, #14 — §4a).
+
+**Tests.** Decision A adds: detached-on-wasm-JIT differential against `detached_windows.rs`
+(byte-identical or decline); attest on the JIT; quota exhaustion on the JIT; N concurrent
+detached children in Workers with independent growth; a `Region::Foreign` micro-benchmark
+(the §3.3 gate); a **futex-collision regression** (two detached siblings, same guest offset,
+must not rendezvous — fails today on the interpreter). Existing nested suites, `fuzz/mask`,
+`confined_child_null_guard.rs`, `parallel_instantiate_miri.rs`, `vcpu_instantiate_miri.rs`,
+the escape oracle: untouched — they remain the alias grant's evidence. Decision B adds isolated
+twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
+`grant_marshal_fuzz`'s source window (authority half verbatim).
 
 ## 7. Slicing plan
 
-1. **Chokepoint finding (§6.3) → data-plane design.** Decides S vs L for the whole effort.
-2. **wasm-JIT detached child, single**: JS mints a per-child memory; servicer runs a detached
-   `JitOnrampRun` (`win = 0`, own `back`); differential vs the interpreter's detached child
-   (`detached_windows.rs` oracle shape) — byte-identical or decline. Attest on JIT.
+**Decision A (no default change; no invariant renegotiation):**
+
+0. **File and fix the `FutexKey::Anon` collision** on the interpreter's op-15 path (a
+   pre-existing bug; the regression test in §6.5). Independent of everything else and a
+   prerequisite for slice 3.
+1. **`Region::Foreign` on wasm** (§3.3): the JS-proxied child-memory backing below the
+   `GuestMem` chokepoint, carrying the decline path too. Additive, `cfg(wasm)`. Lands with a
+   micro-benchmark of interpreted access over `Foreign` vs `Shared` — the **measured gate** for
+   the declined-body cost; if unacceptable, the escalation is the sweep's option (4), not a
+   silent regression.
+2. **wasm-JIT detached child, single**: JS mints a per-child shared `WebAssembly.Memory`
+   (`maximum` = grant); header page at `[0, 64 KiB)` holding the `env` cell and `pagestate`,
+   `win = 65536`; the servicer runs a detached `JitOnrampRun` over `Region::Foreign`;
+   `call_interp` copies the slots; grow happens on the child's memory from JS; differential vs
+   the interpreter's detached child (`detached_windows.rs` oracle shape) — byte-identical or
+   decline. `self.attest` on the JIT reads `window_exposed = false`. Includes the **spawn-time
+   args payload** on op 15 (interpreter arm + servicer) so a detached phase can take argv.
 3. **Concurrent detached children** on the wasm-JIT tier (the playground shape): N instances,
-   N memories, independent growth; a Worker-hosted detached child with a shared own-memory.
-4. **Native JIT hosting of op 15** (replace the `-EINVAL` stub) — R5 parity.
-5. **op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete
-   #1253 payoff: no carve ceiling, no 2 GiB module.
-6. **Default flip** in the PROCESS.md §3 substrate (`create(window)` defaults to a minted
-   detached window) + doc amendments.
-7. **Revert #1268 slices 1–2** (the single top-of-memory grower).
+   N memories, independent growth; a Worker-hosted detached child (grandchild spawn posts the
+   `Memory`). Plus the coop-engine op-15 event arm (`VcpuEvent::InstantiateDetached`) so a
+   *guest* parent on the browser coop engine can issue op 15.
+4. **Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
+   root-sized; seed segments directly; delete the two memcpys — R5 parity, and a perf win.
+5. **op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete #1253
+   payoff: no carve ceiling, no 2 GiB module, parent shrinks to KiB. Playground parent calls
+   op 15 explicitly.
+6. **Fuzz**: `nested_paged` gets an isolated twin; `pagestate`/`live_mapped`/`paged_walk` are
+   parameterized over an isolated window; `grant_marshal_fuzz` keeps its authority half verbatim
+   and re-plumbs its source window. `mask.rs` needs **no** twin (base-0 = `with_mapped`, already
+   fuzzed). Open the missing nested-durability fuzz coverage DURABILITY.md already asks for.
+7. **Revert #1268 slices 1–2** (the single top-of-memory grower this retires).
+
+**Decision B (gated on the three §4a rulings, recorded in INVARIANTS.md first):**
+
+8. **Default flip** in the PROCESS.md §3 substrate (`create(window)` defaults to a minted
+   detached window; **durable ⇒ nested**), `WindowMinter` quota folded into `Budget.mem`.
+9. **Doc amendments** (§6.5): ~75 sentences across 20 files, of which three are *arguments* to
+   re-derive, not edit — DURABILITY.md §"subtree freeze" (265–268), THREADS.md 4c-D2 (280–283),
+   IMPORTS.md "confidentiality the memory model doesn't provide" (761–767); plus D19 in the
+   decision log (Settled → amended, dated) and a GLOSSARY.md one-liner.
 
 ## 8. Open questions
 
@@ -282,3 +573,10 @@ surface and the chokepoint question; emitters + browser JS; docs/invariants/test
 - **Memory-per-page** (raised and dismissed): a memory per 64 KiB page would turn every
   access into a memory-select — software paging on the fast path. Not viable; a memory per
   *child* is the right granularity.
+- **Decline-path cost over `Region::Foreign`.** Per-access JS import calls make interpreted
+  fallback bodies slower for detached children (estimate 3–5×). How often do the real phases
+  decline, and does it matter? Slice 1's benchmark answers this before slice 2 commits.
+- **Non-shared child memories.** A detached child that never threads could use a non-shared,
+  no-`maximum` `Memory` (grows to the wasm32 ceiling with no eager reservation) — but that is
+  a second emit cache key (`shared` flag) and is unusable on the Worker path. Deferred until
+  a consumer needs it.
