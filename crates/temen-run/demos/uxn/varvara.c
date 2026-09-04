@@ -254,6 +254,24 @@ void varvara_controller(Uxn *u, Uint8 button, Uint8 key) {
   d[3] = 0;
 }
 
+/* Mouse: a pointer event — position (frame pixels) and button state (bit 0 left, 1 middle, 2 right) —
+ * fires the vector; a wheel event delivers signed deltas through scrollx/scrolly, cleared afterwards. */
+void varvara_mouse(Uxn *u, int x, int y, Uint8 state) {
+  Uint8 *d = u->dev + 0x90;
+  POKE2(d + 2, x);
+  POKE2(d + 4, y);
+  d[6] = state;
+  uxn_eval(u, PEEK2(d));
+}
+void varvara_wheel(Uxn *u, int dx, int dy) {
+  Uint8 *d = u->dev + 0x90;
+  POKE2(d + 0xa, dx);
+  POKE2(d + 0xc, dy);
+  uxn_eval(u, PEEK2(d));
+  POKE2(d + 0xa, 0);
+  POKE2(d + 0xc, 0);
+}
+
 /* One frame: fire the screen vector, advance the clock. */
 void varvara_screen_vector(Uxn *u) {
   uxn_eval(u, PEEK2(u->dev + 0x20));

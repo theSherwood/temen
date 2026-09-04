@@ -123,6 +123,8 @@
       /* On-screen dpad for the interactive reactors — shown on touch / narrow screens (where there's no
          physical keyboard); the same key events the physical arrows dispatch through the keyboard cap. */
       .dpad { display: none; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.6rem; }
+      /* The ROM picker on `pickFile` cards (the canvas is the drop target too). */
+      .pick { margin-top: 0.5rem; font-size: 0.9rem; color: var(--muted, inherit); }
       .dpad .dkey { min-width: 2.6rem; padding: 0.5rem 0.55rem; touch-action: none; user-select: none;
                     font-variant-numeric: tabular-nums; }
       @media (hover: none), (max-width: 48rem) { .dpad { display: flex; } }

@@ -1,8 +1,13 @@
 /* Uxn in the playground — the reactor guest (the bounce.c / Doom shape). `_start → main` resolves the
- * `display`, `keyboard` and `fs` capabilities, reads the ROM served as "boot.rom" through `fs`, and runs
- * its reset vector. The page then calls `tick()` once per animation frame: drain the key events into the
- * Controller device, fire the Screen vector, and present the composed frame through `display` when it
- * changed. When the ROM halts (System/state), the guest exits, which ends the reactor loop. */
+ * `display`, `keyboard`, `mouse` and `fs` capabilities, reads the ROM served as "boot.rom" through
+ * `fs`, and runs its reset vector. The page then calls `tick()` once per animation frame: drain the key
+ * events into the Controller device and the pointer events into the Mouse device, fire the Screen
+ * vector, and present the composed frame through `display` when it changed. When the ROM halts
+ * (System/state), the guest exits, which ends the reactor loop.
+ *
+ *   k = __vm_cap_resolve("keyboard", 8);  e = __vm_host_call(k, 0, 0,0,0,0);  // (pressed<<16)|keyCode | -1
+ *   m = __vm_cap_resolve("mouse", 5);     e = __vm_host_call(m, 0, 0,0,0,0);  // (kind<<32)|payload | -1
+ * mouse kind 0 = pointer: payload (buttons<<24)|(x<<12)|y; kind 1 = wheel: (dx&0xffff)<<16|(dy&0xffff). */
 #include "uxn.c"
 #include "varvara.c"
 
@@ -14,7 +19,7 @@ extern void exit(int code);
 #define ROM_MAX 0xff00
 
 static Uxn u;
-static int disp, kbd, fs;
+static int disp, kbd, mouse, fs;
 
 void varvara_console_write(const Uint8 *buf, int len) { write(1, buf, (unsigned long)len); }
 
@@ -33,11 +38,24 @@ static Uint8 button_of(int code) {
   }
 }
 
-/* JS keyCode → the ASCII byte a key-down delivers, or 0. */
+/* JS keyCode → the ASCII byte a key-down delivers, or 0. Shift (the Select button) picks the upper
+ * case / the shifted punctuation, the US layout. */
 static Uint8 key_of(int code, Uint8 buttons) {
-  if (code >= 65 && code <= 90) return (Uint8)(buttons & 0x04 ? code : code + 32);
-  if (code >= 48 && code <= 57) return (Uint8)code;
+  int shift = buttons & 0x04;
+  if (code >= 65 && code <= 90) return (Uint8)(shift ? code : code + 32);
+  if (code >= 48 && code <= 57) return (Uint8)(shift ? ")!@#$%^&*("[code - 48] : code);
   switch (code) {
+  case 186: return shift ? ':' : ';';
+  case 187: return shift ? '+' : '=';
+  case 188: return shift ? '<' : ',';
+  case 189: return shift ? '_' : '-';
+  case 190: return shift ? '>' : '.';
+  case 191: return shift ? '?' : '/';
+  case 192: return shift ? '~' : '`';
+  case 219: return shift ? '{' : '[';
+  case 220: return shift ? '|' : '\\';
+  case 221: return shift ? '}' : ']';
+  case 222: return shift ? '"' : '\'';
   case 32: return ' ';
   case 13: return 0x0d;
   case 8: return 0x08;
@@ -50,6 +68,7 @@ static Uint8 key_of(int code, Uint8 buttons) {
 int main(void) {
   disp = __vm_cap_resolve("display", 7);
   kbd = __vm_cap_resolve("keyboard", 8);
+  mouse = __vm_cap_resolve("mouse", 5);
   fs = __vm_cap_resolve("fs", 2);
   u.ram = malloc(UXN_BANKS * 0x10000);
   for (long i = 0; i < UXN_BANKS * 0x10000; i++) u.ram[i] = 0;
@@ -84,6 +103,13 @@ int tick(void) {
       Uint8 key = key_of(code, buttons);
       if (key) varvara_controller(&u, buttons, key);
     }
+  }
+  for (;;) {
+    long e = __vm_host_call(mouse, 0, 0, 0, 0, 0);
+    if (e < 0) break;
+    unsigned p = (unsigned)e;
+    if ((e >> 32) == 0) varvara_mouse(&u, (p >> 12) & 0xfff, p & 0xfff, (Uint8)(p >> 24));
+    else varvara_wheel(&u, (Sint16)(p >> 16), (Sint16)p);
   }
   varvara_screen_vector(&u);
   int w, h;

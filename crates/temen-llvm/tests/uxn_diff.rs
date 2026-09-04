@@ -148,3 +148,34 @@ fn guest_frame_hashes_match_native() {
     }
     eprintln!("uxn_diff: {FRAMES} frames byte-identical to native on TreeWalk/Bytecode/Jit");
 }
+
+/// The CPU against the **golden opcode corpus** (`demos/uxn/corpus/opcodes.corpus`): 303 programs
+/// whose end states were recorded from uxn5's spec-compliant core — every non-control-flow opcode in
+/// every mode over random operands (stack and memory wrap-around included), every jump form, lambdas,
+/// subroutines, and a primes program. `uxn_corpus.c` runs them all on `uxn.c` and exits non-zero on
+/// any divergence, so the sandboxed Uxn's CPU is pinned to the reference with no dependency at test
+/// time beyond `cc`.
+#[test]
+fn cpu_matches_golden_corpus() {
+    let dir = std::env::temp_dir();
+    let exe = dir.join(format!("temen_uxn_corpus_{}", std::process::id()));
+    if cc(
+        &["-O2", demo_dir().join("uxn_corpus.c").to_str().unwrap()],
+        &exe,
+    )
+    .is_none()
+    {
+        eprintln!("note: skipping cpu_matches_golden_corpus (cc unavailable)");
+        return;
+    }
+    let out = Command::new(&exe)
+        .arg(demo_dir().join("corpus/opcodes.corpus"))
+        .output()
+        .expect("run uxn_corpus");
+    assert!(
+        out.status.success(),
+        "uxn.c diverges from the golden corpus:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout).trim());
+}
