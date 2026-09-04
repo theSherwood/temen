@@ -210,6 +210,28 @@ const DEFER: &str = ": sq ( n -- n ) dup * ;\n\
     2 apply3 . cr\n";
 const DEFER_OUT: &str = "25 \n-5 \n-2 \n";
 
+/// Counted loops (#1237): `do`/`loop`/`+loop`/`i`/`j`/`leave`. The loop index and limit ride a
+/// return stack (the RVS) carried through every branch as block params, so the data stack stays clean
+/// — `sumn`/`mul` accumulate below the loop, `box` nests `i`/`j`, `firsthit` proves `leave`, and
+/// `downby` a negative `+loop`. All byte-identical interp == JIT and on the bytecode engine.
+#[test]
+fn forth_do_loop() {
+    let out = forth(DO_LOOP);
+    assert_eq!(out, DO_LOOP_OUT);
+}
+
+const DO_LOOP: &str = ": sumn ( n -- s ) 0 swap 0 do i + loop ;\n\
+    5 sumn . 10 sumn . cr\n\
+    : mul ( a b -- p ) 0 swap 0 do over + loop nip ;\n\
+    6 7 mul . cr\n\
+    : box ( -- ) 2 0 do 2 0 do j . i . space loop loop cr ;\n\
+    box\n\
+    : firsthit ( n -- ) 0 do i dup 3 > if . leave then drop loop cr ;\n\
+    10 firsthit\n\
+    : downby ( -- ) 0 10 do i . -2 +loop cr ;\n\
+    downby\n";
+const DO_LOOP_OUT: &str = "10 45 \n42 \n0 0  0 1  1 0  1 1  \n4 \n10 8 6 4 2 0 \n";
+
 /// The playground runs the kernel on the **bytecode** engine: the same transcripts must produce the
 /// same bytes there (the card's own gate is `browser/tests/forth_asset.rs` over the built asset).
 #[test]
@@ -221,6 +243,7 @@ fn forth_on_the_bytecode_engine() {
         (EXIT, EXIT_OUT),
         (CONSTANT, CONSTANT_OUT),
         (DEFER, DEFER_OUT),
+        (DO_LOOP, DO_LOOP_OUT),
     ] {
         let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt")).unwrap();
         let inst = instantiate(m).unwrap();

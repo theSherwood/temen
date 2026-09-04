@@ -21,6 +21,10 @@ const CARD_PROGRAM: &str = "\\ Forth on Temen: every word below is JIT-compiled 
 : sum-to ( n -- s ) 0 swap begin dup 0 > while tuck + swap 1- repeat drop ;
 100 sum-to . cr
 
+\\ counted loops: do/loop, i is the index; the accumulator stays on the data stack
+: sumsq ( n -- s ) 0 swap 0 do i i * + loop ;
+5 sumsq . cr
+
 \\ memory: variables, strings, the heap
 variable x   42 x !   x @ 1+ x !   x @ . cr
 .\" hello, forth\" cr
@@ -40,7 +44,7 @@ variable hits
 ' bump 100 spawn ' bump 100 spawn join swap join + . hits @ . cr
 ";
 
-const EXPECTED: &str = "25 3628800 \n5 4 3 2 1 \n5050 \n43 \nhello, forth\n1 0 \n2 0 \n7000 \n0 200 \n";
+const EXPECTED: &str = "25 3628800 \n5 4 3 2 1 \n5050 \n30 \n43 \nhello, forth\n1 0 \n2 0 \n7000 \n0 200 \n";
 
 #[test]
 fn forth_card_program_runs_through_the_onramp() {
