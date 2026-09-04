@@ -3684,6 +3684,11 @@ fn stage_coreutils(host: &mut Host, posix: &Posix, names: &[&str]) {
             include_str!("../../temen-run/demos/posix_utils/pwd.c"),
             false,
         ),
+        (
+            "cut",
+            include_str!("../../temen-run/demos/posix_utils/cut.c"),
+            false,
+        ),
     ];
     for want in names {
         let (_, src, rx) = TOOLS
@@ -3883,6 +3888,90 @@ int main(void) {{\n\
         ep.result,
         vec![Value::I32(42)],
         "parallel driver: parent-fed sort | uniq -c across exec'd threads, matching both oracles"
+    );
+}
+
+/// #801 coreutils — **parent-fed `cut`** in its four shapes: field mode with a comma list
+/// (`-d: -f2,4` → `b:d`, fields re-joined by the delimiter in ascending order), char mode
+/// (`-c2-4` → `bcd`), an open-ended field range (`-d' ' -f3-` → `r s`), and the GNU
+/// no-delimiter passthrough (a line without the delimiter emerges unchanged). Each shape is a
+/// fresh fork→exec of `/bin/cut` fed from a parent pipe and byte-checked — repeated exec rounds
+/// exercising the argv-pack + read-park + reap path the same way the grep/sort witnesses do.
+#[test]
+fn c_coreutils_cut_fields_and_chars() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_dup2(int cap, long o, long n);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+static char ob[64];\n\
+static long olen;\n\
+static int runcut(char **av, char *in, long inlen, char *exp, long explen) {{\n\
+  int ip[2]; int op[2];\n\
+  if (pipe(ip) != 0 || pipe(op) != 0) return 1;\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 2;\n\
+  if (pid == 0) {{\n\
+    __px_dup2(0, ip[0], 0); __px_dup2(0, op[1], 1);\n\
+    close(ip[0]); close(ip[1]); close(op[0]); close(op[1]);\n\
+    execvp(\"cut\", av); return 99;\n\
+  }}\n\
+  close(ip[0]); close(op[1]);\n\
+  if (write(ip[1], in, inlen) != inlen) return 3;\n\
+  close(ip[1]);                               /* EOF so cut's u_rdline terminates */\n\
+  olen = 0;\n\
+  for (;;) {{\n\
+    long n = read(op[0], ob + olen, 64 - olen);\n\
+    if (n < 0) return 4;\n\
+    if (n == 0) break;\n\
+    olen = olen + n;\n\
+  }}\n\
+  close(op[0]);\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return 5;\n\
+  if (((st >> 8) & 0xff) != 0) return 6;\n\
+  if (olen != explen) return 7;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return 8;\n\
+  return 0;\n\
+}}\n\
+static char *avf[] = {{ \"cut\", \"-d:\", \"-f2,4\", 0 }};\n\
+static char *avc[] = {{ \"cut\", \"-c2-4\", 0 }};\n\
+static char *avo[] = {{ \"cut\", \"-d \", \"-f3-\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  int r;\n\
+  r = runcut(avf, \"a:b:c:d\\n\", 8, \"b:d\\n\", 4);       if (r) return 10 + r;\n\
+  r = runcut(avc, \"abcdef\\n\", 7, \"bcd\\n\", 4);         if (r) return 20 + r;\n\
+  r = runcut(avo, \"p q r s\\n\", 8, \"r s\\n\", 4);        if (r) return 30 + r;\n\
+  r = runcut(avf, \"nodlim\\n\", 7, \"nodlim\\n\", 7);      if (r) return 40 + r;\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "parent-fed cut: field list, char range, open field range, and no-delim passthrough"
+    );
+    let eb = run_bytecode_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: parent-fed cut across four exec rounds — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, |host, posix| {
+        stage_coreutils(host, posix, &["cut"]);
+    });
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: parent-fed cut across four exec'd thread rounds, matching both oracles"
     );
 }
 
