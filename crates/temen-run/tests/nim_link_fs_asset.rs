@@ -124,7 +124,14 @@ fn committed_nim_link_fs_asset_decodes_and_verifies_as_child_entry() {
     );
 }
 
+// `#[ignore]` in the per-PR `check` job: this runs the whole 512 MiB linker on the debug tree-walker
+// (several minutes), and that job (`cargo test --workspace`, 30 min cap) already carries one heavy link
+// (`nimlink_asset`). A second would risk the budget. The byte-exact **op-13 memfs** link property is
+// gated per-PR by `rust_driver_chain.rs` (the assembled nimsem->hexer->link pipeline, Linux-only
+// `temen-llvm` job, 45 min) — which drives this exact asset — and the fast decode+verify+shape test
+// above still guards asset drift here toolchain-free. Run on demand with `--ignored` (fast in release).
 #[test]
+#[ignore = "heavy (multi-minute debug link); covered per-PR by rust_driver_chain.rs — run with --ignored"]
 fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
     let (Some(temen), Some(xnif)) = (inflate(NIM_LINK_FS_GZ), inflate(SYS_XNIF_GZ)) else {
         eprintln!("SKIP: gzip unavailable");
