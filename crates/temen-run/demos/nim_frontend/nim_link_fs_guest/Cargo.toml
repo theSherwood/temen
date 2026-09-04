@@ -1,0 +1,26 @@
+# The nim->powerbox linker as a **child-entry, memfs-I/O** phase (#1025 3c, assemble). Unlike
+# `nim_link_guest` (a top-level powerbox reading stdin / writing stdout), this is built `--child-entry`
+# so a driver guest can op-13-spawn it like the other phases (nifler/nimsem/hexer), and it reads its
+# `.x.nif` input and writes its linked `.temen` output through the **shared memfs** (`fs` cap) — so it
+# composes into the driver's file hand-off (`.x.nif -> .temen` in the same store) instead of streams.
+# It calls `temen_leng::link_nim_powerbox`; everything it emits is re-verified by temen-verify (§2a).
+# Built through the LLVM on-ramp (build_nim_link_fs.sh) into a committed asset. Own workspace.
+[package]
+name = "nim-link-fs-guest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+temen-leng = { path = "../../../../temen-leng" }
+temen-encode = { path = "../../../../temen-encode" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2
+overflow-checks = false
+
+[workspace]
