@@ -1315,6 +1315,25 @@ fn gen_browser_bash_coreutils() {
             "dirname",
             include_str!("../../temen-run/demos/posix_utils/dirname.c"),
         ),
+        (
+            "tee",
+            include_str!("../../temen-run/demos/posix_utils/tee.c"),
+        ),
+        (
+            "touch",
+            include_str!("../../temen-run/demos/posix_utils/touch.c"),
+        ),
+        (
+            "mkdir",
+            include_str!("../../temen-run/demos/posix_utils/mkdir.c"),
+        ),
+        (
+            "rmdir",
+            include_str!("../../temen-run/demos/posix_utils/rmdir.c"),
+        ),
+        ("rm", include_str!("../../temen-run/demos/posix_utils/rm.c")),
+        ("cp", include_str!("../../temen-run/demos/posix_utils/cp.c")),
+        ("mv", include_str!("../../temen-run/demos/posix_utils/mv.c")),
     ];
     for (name, src) in utils {
         let full = if *name == "grep" {
