@@ -233,48 +233,20 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 /// The op-13 phase child's **carve** log2, per its declared window `decl` (#1253) — `None` when the
 /// phase is past the crawl's ceiling (fail closed).
 ///
-/// The carve is the parent's **grant**: the child commits its declared `1<<decl` and `vm_map`-grows its
-/// committed `mapped` into `[1<<decl, 1<<carve)` (the #1243 growable-child model — starter caps span the
-/// carve, so the grow is authorized, and the interpreter refuses a `vm_map` past it). The backing is a
-/// demand-zeroed `alloc_zeroed` (on wasm, a large allocation is served from freshly `memory.grow`n pages
-/// the host zero-inits lazily), so the untouched tail above the high-water costs no physical memory.
-///
-/// [`PHASE_CARVE_MAX`] caps the carve at the browser budget. The retired `(decl + 3).max(24)` was an
-/// **un**capped 8× — for nimsem/hexer (`decl ≈ 28`, ~256 MiB) a 2 GiB carve, 4 GiB doubled into its
-/// buddy parent, over the 1 GiB `WebAssembly.Memory`. The cap keeps a big phase's parent window inside
-/// the budget (`2^28` carve → `2^29` parent, leaving room for the emit's heap alongside it); a phase
-/// declaring past the cap can't be backed contiguously and fails closed rather than pre-sizing wild.
-/// (`decl < 24` still floors at 24 — 16 MiB heap room above a tiny declared window for the phase malloc.)
-pub(crate) const PHASE_CARVE_MAX: u8 = 28;
 
-pub(crate) fn phase_carve_log2(decl: u8) -> Option<u8> {
-    (decl <= PHASE_CARVE_MAX).then(|| (decl + 3).clamp(24, PHASE_CARVE_MAX))
-}
-
-/// The op-13 phase **parent window** log2 for a child declaring `decl` — the buddy parent of its
-/// [`phase_carve_log2`] carve (the carve is the upper half; the driver's grant records sit below).
-pub(crate) fn phase_window_log2(decl: u8) -> Option<u8> {
-    phase_carve_log2(decl).map(|c| c + 1)
-}
-
-/// Build an op-13 parent that re-grants `caps` (by name, in order — the child resolves them by name and
-/// its manifest binds them) to a `--child-entry` child spawned into `[carve_off, carve_off+2^child_sl)`
-/// with `argv` seeded at `carve_off + args_base`. N-cap: 3 for nifler/hexer (`{fs,stdout,exit}`), 4 for
-/// nimsem (`+exec`). The parent's params are `(inst, module, cap0, …, cap{N-1})`; the 16-byte grant
-/// records live at `guard+1024`, their names at `guard+2048` — both above the #1094 NULL guard (the
-/// layout `nifler_child_asset.rs::guarded_parent_src` proves). `grants_n = N`.
-pub(crate) fn op13_parent_src(
-    child_sl: u32,
-    carve_off: u64,
-    args_base: u64,
-    argv: &[&str],
-    caps: &[&str],
-) -> String {
-    let parent_sl = child_sl + 1;
+/// Build the **detached** phase parent (#1288): re-grants `caps` (by name, in order — the child
+/// resolves them by name and its manifest binds them) to a `--child-entry` child spawned
+/// `instantiate_detached` (op 15) into a **fresh window** of the child's declared `1 << child_log2`,
+/// with `argv` carried as the spawn-time args payload (the op's optional 8th/9th args — seeded by the
+/// host at the child's `module_args_base()`). No carve, no buddy parent: the parent is `memory 16` and
+/// holds only its grant records (`guard+1024`), their names (`guard+2048`) and the args blob
+/// (`guard+4096`), all above the #1094 NULL guard. Params are `(inst, module, minter, cap0, …)`;
+/// `grants_n = N` (3 for nifler/hexer `{fs,stdout,exit}`, 4 for nimsem `+exec`).
+pub(crate) fn detached_parent_src(child_log2: u8, argv: &[&str], caps: &[&str]) -> String {
     let guard = temen_ir::POWERBOX_NULL_GUARD;
     let rec_base = guard + 1024;
     let name_base = guard + 2048;
-    let argv_off = carve_off + args_base;
+    let argv_off = guard + 4096;
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
     blob.extend_from_slice(&0u32.to_le_bytes()); // envc
@@ -282,6 +254,7 @@ pub(crate) fn op13_parent_src(
         blob.extend_from_slice(s.as_bytes());
         blob.push(0);
     }
+    let argv_len = blob.len();
     let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
 
     let n = caps.len();
@@ -292,32 +265,34 @@ pub(crate) fn op13_parent_src(
         let roff = rec_base + i as u64 * 16;
         data.push_str(&format!("data {noff} \"{name}\"\n"));
         let w0 = noff | ((name.len() as u64) << 32);
-        // record word0 = {name_off:u32 | name_len:u32<<32} at roff; the cap handle (param v{2+i}) at roff+8.
+        // record word0 = {name_off:u32 | name_len:u32<<32} at roff; the cap handle (param v{3+i}) at roff+8.
         records.push_str(&format!(
             "  xr{roff} = i64.const {w0}\n  or{roff} = i64.const {roff}\n  i64.store or{roff} xr{roff}\n  \
              h{roff} = i64.extend_i32_u v{vi}\n  oh{roff} = i64.const {hoff}\n  i64.store oh{roff} h{roff}\n",
-            vi = 2 + i,
+            vi = 3 + i,
             hoff = roff + 8,
         ));
     }
-    let sig: String = vec!["i32"; 2 + n].join(", ");
-    let bparams: String = (0..2 + n)
+    let sig: String = vec!["i32"; 3 + n].join(", ");
+    let bparams: String = (0..3 + n)
         .map(|i| format!("v{i}: i32"))
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        r#"memory {parent_sl}
+        r#"memory 16
 {data}data {argv_off} "{argv_esc}"
 func ({sig}) -> (i64) {{
 block 0 ({bparams}) {{
 {records}  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
   vgptr = i64.const {rec_base}
   vgn = i64.const {n}
   ventry = i64.const 0
-  voff = i64.const {carve_off}
-  vsl = i64.const {child_sl}
+  vlog = i64.const {child_log2}
   vq = i64.const 0
-  vh = call.cap 6 13 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmh, vgptr, vgn, ventry, voff, vsl, vq)
+  vap = i64.const {argv_off}
+  val = i64.const {argv_len}
+  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgptr, vgn, ventry, vlog, vq, vap, val)
   vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
   return vr
   }}
@@ -326,24 +301,63 @@ block 0 ({bparams}) {{
     )
 }
 
-/// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`): on `Instantiate`, take
-/// the op-13 re-granted powerbox (`take_granted_host`) and run the child over it
-/// (`new_confined_child_grow_over_host`, which binds the child manifest against that powerbox); `Join`
-/// delivers the child's result. Single-threaded here (the driver worker), so the window base travels as
-/// a raw ptr. `child_decl` is the declared window of the child *this* vCPU spawns (#1253): the event's
-/// `size_log2` is the parent-granted carve, and the child's committed window starts at its declared
-/// size and `vm_map`-grows into the carve; `None` (unknown — a grandchild) commits the whole carve.
+/// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`). On a **detached**
+/// spawn (op 15, #1288 — how the phases are spawned) the host owns the fresh window: a root-sized
+/// lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged` fallback on wasm32), seeded with
+/// the child's data segments and the spawn-time args payload, run with
+/// `new_confined_child_grow_over_host` (committed window = the declared size, starter caps over the
+/// reservation, so `vm_map` grows it). On a nested `Instantiate` (op 13 — a grandchild carve) the child
+/// aliases the sub-window at `base + carve`. `Join` delivers the child's result. Single-threaded here,
+/// so the window base travels as a raw ptr. `child` is the module the *root* driver spawns (its data
+/// segments seed a detached window; its declared size starts a nested one); `None` for a grandchild.
 pub(crate) fn drive_op13<'p>(
     prog: &'p bytecode::VcpuProgram,
     base: *mut u8,
     mut vcpu: bytecode::Vcpu<'p>,
-    child_decl: Option<u8>,
+    child: Option<&Module>,
 ) -> Result<Vec<Value>, Trap> {
     let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
             bytecode::VcpuEvent::Trapped(t) => return Err(t),
+            bytecode::VcpuEvent::InstantiateDetached {
+                module,
+                entry,
+                size_log2,
+                fuel,
+                args,
+            } => {
+                let Some(cm) = child else {
+                    return Err(Trap::Malformed); // a grandchild's detached spawn: no module to seed
+                };
+                let back = std::sync::Arc::new(Region::new(
+                    1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                    temen_interp::host_page_size(),
+                ));
+                for seg in &cm.data {
+                    back.write_from(seg.offset, &seg.bytes);
+                }
+                back.write_from(temen_ir::module_args_base(), &args);
+                let reserved = temen_ir::DEFAULT_RESERVED_LOG2;
+                let c = match vcpu.take_granted_host() {
+                    Some(host) => bytecode::Vcpu::new_confined_child_grow_over_host(
+                        prog, module, entry, back, size_log2, reserved, fuel, host,
+                    ),
+                    None => bytecode::Vcpu::new_confined_child_grow(
+                        prog, module, entry, back, size_log2, reserved, fuel,
+                    ),
+                };
+                // A detached phase spawns no nested grandchildren through this loop (nimsem's nifler
+                // runs via the `exec` cap as its own detached root), so it needs no window base.
+                let r = match c {
+                    Ok(c) => drive_op13(prog, core::ptr::null_mut(), c, None),
+                    Err(t) => Err(t),
+                };
+                let handle = children.len() as i32;
+                children.push(r);
+                vcpu.deliver_handle(handle);
+            }
             bytecode::VcpuEvent::Instantiate {
                 module,
                 entry,
@@ -351,8 +365,13 @@ pub(crate) fn drive_op13<'p>(
                 size_log2,
                 fuel,
             } => {
+                if base.is_null() {
+                    return Err(Trap::Malformed); // a nested carve needs an addressable parent window
+                }
                 let granted = vcpu.take_granted_host();
-                let declared = child_decl.unwrap_or(size_log2);
+                let declared = child
+                    .and_then(|m| m.memory.as_ref().map(|mc| mc.size_log2))
+                    .unwrap_or(size_log2);
                 // SAFETY: the engine validated the carve within this vCPU's window (which outlives the
                 // child); the child region aliases that sub-window — the §14 shared data plane.
                 let child_base = unsafe { base.add(carve as usize) };
@@ -382,23 +401,16 @@ pub(crate) fn drive_op13<'p>(
     }
 }
 
-/// Run one child-entry phase `child` with `argv` as a confined §14 op-13 child over the shared memfs
-/// `factory`, on the resumable (tier-up-capable) engine. Returns the joined exit/return status. The carve
-/// is [`phase_carve_log2`] (#1253): the child commits its declared window and `vm_map`-grows into the
-/// carve; the window is a demand-zero `alloc_zeroed`, so the unused tail is free.
+/// Run one child-entry phase `child` with `argv` as a **detached** §5 child (op 15, #1288) over the
+/// shared memfs `factory`, on the resumable (tier-up-capable) engine. Returns the joined exit/return
+/// status. The child's window is its own (a root-sized lazy reservation, seeded with its data + argv
+/// payload); no carve, no cap on its growth beyond the reservation — `PHASE_CARVE_MAX` and the 2× buddy
+/// parent are gone. The parent is a 64 KiB driver holding only its grant records + the args blob.
 fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
-    let decl = child.memory.as_ref().map_or(24, |m| m.size_log2);
-    let (Some(child_sl), Some(win_sl)) = (phase_carve_log2(decl), phase_window_log2(decl)) else {
+    let Some(decl) = child.memory.as_ref().map(|m| m.size_log2) else {
         return -1;
     };
-    let carve_off = 1u64 << child_sl;
-    let src = op13_parent_src(
-        u32::from(child_sl),
-        carve_off,
-        temen_ir::module_args_base(),
-        argv,
-        &["fs", "stdout", "exit"],
-    );
+    let src = detached_parent_src(decl, argv, &["fs", "stdout", "exit"]);
     let Ok(parent) = temen_text::parse_module(&src) else {
         return -1;
     };
@@ -414,9 +426,11 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let win = 1u64 << win_sl;
+    let win = 1u64 << 16;
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(child);
+    // The minter's quota is the mint (the declared window); growth is bounded by the reservation.
+    let minter = host.grant_window_minter(1u64 << decl);
 
     let size = win as usize;
     let Ok(layout) = std::alloc::Layout::from_size_align(size, 8) else {
@@ -435,6 +449,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
         &[
             Value::I32(inst),
             Value::I32(modh),
+            Value::I32(minter),
             Value::I32(fs_h),
             Value::I32(stdout_h),
             Value::I32(exit_h),
@@ -443,7 +458,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
         &[],
         host,
     ) {
-        Ok(root) => drive_op13(&prog, mem_base, root, Some(decl)),
+        Ok(root) => drive_op13(&prog, mem_base, root, Some(child)),
         Err(t) => Err(t),
     };
     drop(back);

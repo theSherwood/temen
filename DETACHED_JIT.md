@@ -550,9 +550,11 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
    (grandchild spawn posts the `Memory`), independent growth, the V8-limits probe.
 4. **#1287 — Native JIT hosting of op 15**: replace the `-EINVAL` stub; reserve the child window
    root-sized; seed segments directly; delete the two memcpys — R5 parity, and a perf win.
-5. **#1288 — op-13 phase drivers → detached** for the big phases (nimsem/hexer) — the concrete #1253
-   payoff: no carve ceiling, no 2 GiB module, parent shrinks to KiB. Playground parent calls
-   op 15 explicitly.
+5. **#1288 — phase drivers → detached** (**done**): `nimc::detached_parent_src` spawns every phase
+   (nifler/hexer/nimsem) with op 15 + the args payload; `PHASE_CARVE_MAX`, `phase_carve_log2`,
+   `phase_window_log2` and the 2× buddy parent are deleted; the driver window is 64 KiB of grant
+   records; the native `drive_op13` hosts the detached child over a root-sized lazy reservation.
+   The interim cap-and-reserve (`5d19eca`) is thereby retired.
 6. **Fuzz**: `nested_paged` gets an isolated twin; `pagestate`/`live_mapped`/`paged_walk` are
    parameterized over an isolated window; `grant_marshal_fuzz` keeps its authority half verbatim
    and re-plumbs its source window. `mask.rs` needs **no** twin (base-0 = `with_mapped`, already

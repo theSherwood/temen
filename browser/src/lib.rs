@@ -9027,7 +9027,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
 
 /// **Open the op-13 loop over a real phase child** (#1025 Path 1 scaling to nifler): decode the
 /// child-entry phase module `child` (nifler_ce), mount a shared memfs seeded with `src` at `file`, build
-/// the real `nimc::op13_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
+/// the real `nimc::detached_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
 /// grant it `{fs, stdout, exit}` + the child `Module` + an `Instantiator`, and stand up the resumable
 /// root over a linear-memory window. Drive with [`temen_op13jit_step`] (which does the child-entry setup
 /// and runs the child EMITTED over its carve); after `OP13JIT_DONE`, read the produced `.p.nif` with
@@ -9067,7 +9067,6 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             &argv,
             vec![(file_key, src)],
             readback,
-            0,
             None,
         )
     }
@@ -9077,15 +9076,14 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
 /// `--child-entry` phase (nifler, hexer, …) on emitted wasm. `argv_packed` = `[argc: u32][per arg:
 /// len: u32, utf8 bytes]`; `seed_packed` = `[count: u32][per file: name_len: u32, name, data_len: u32,
 /// data]` (files seeded into the shared memfs at their **relative** keys — the child reads its inputs
-/// from them); `out` = the memfs key to read back with [`temen_op13jit_phase_output`]. `carve_log2` is
-/// the child's carve size (`0` = the nifler-default `(declared+3).max(24)` heuristic; a heavy phase like
-/// hexer passes `28` for its ~256 MiB peak). Drive exactly like [`temen_op13jit_phase_open`]. (nimsem's
-/// 4-cap `exec` form — spawning nifler grandchildren — is a separate driver.) Returns `0` or a negative
-/// status.
+/// from them); `out` = the memfs key to read back with [`temen_op13jit_phase_output`]. The phase runs
+/// **detached** in its own memory (#1288) — there is no carve size to pass; a heavy phase (hexer's ~256
+/// MiB peak) simply grows. Drive exactly like [`temen_op13jit_phase_open`]. (nimsem's 4-cap `exec` form
+/// — spawning nifler grandchildren — is a separate driver.) Returns `0` or a negative status.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
-#[allow(clippy::too_many_arguments)] // an FFI ABI: packed (ptr,len) pairs + carve size
+#[allow(clippy::too_many_arguments)] // an FFI ABI: packed (ptr,len) pairs
 #[no_mangle]
 pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
     child_ptr: *const u8,
@@ -9096,7 +9094,6 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
     seed_len: usize,
     out_ptr: *const u8,
     out_len: usize,
-    carve_log2: u32,
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
@@ -9110,16 +9107,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
         .trim_start_matches('/')
         .to_string();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    unsafe {
-        op13_phase_open_impl(
-            sl(child_ptr, child_len),
-            &argv_refs,
-            seeds,
-            readback,
-            carve_log2,
-            None,
-        )
-    }
+    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, None) }
 }
 
 /// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
@@ -9128,11 +9116,11 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 /// `HOST_PROC`, so nimsem-emitted's `exec` call bounces to `call_interp` over the granted host exactly
 /// like `fs`; the nifler sub-spawns run host-side while nimsem's **sema** (the dominant cost) tiers up.
 /// `nifler` is the top-level nifler module the exec spawns. Everything else matches `phase_open_argv`
-/// (packed argv/seeds, output key, `carve_log2` — nimsem passes `28` for its ~256 MiB peak).
+/// (packed argv/seeds, output key); nimsem's ~256 MiB peak grows in its own detached memory (#1288).
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
-#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs + carve size
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
 #[no_mangle]
 pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     child_ptr: *const u8,
@@ -9145,7 +9133,6 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     seed_len: usize,
     out_ptr: *const u8,
     out_len: usize,
-    carve_log2: u32,
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
@@ -9171,7 +9158,6 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
             &argv_refs,
             seeds,
             readback,
-            carve_log2,
             Some(std::sync::Arc::new(nifler)),
         )
     }
@@ -9224,10 +9210,13 @@ fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 /// Shared core of the op-13 tier-up phase drivers: decode+verify the `--child-entry` phase module,
-/// seed `seeds` into a shared memfs, build the 3-cap `{fs, stdout, exit}` `nimc::op13_parent_src`
+/// seed `seeds` into a shared memfs, build the `{fs, stdout, exit[, exec]}` `nimc::detached_parent_src`
 /// driver over `argv`, and stand up the resumable root the JS loop ([`temen_op13jit_step`]) drives —
-/// emitting the child to wasm. `readback` is the memfs key [`temen_op13jit_phase_output`] returns.
-/// Phase-agnostic: nifler, hexer, and any other 3-cap phase differ only in `argv`/`seeds`/`readback`.
+/// the phase runs **detached** (#1288): the servicer mints it its own `WebAssembly.Memory`, emits it and
+/// stages [`OP13JIT_CHILD_DETACHED`]. No carve, no `PHASE_CARVE_MAX`: the child grows into its own memory
+/// (bounded by its `maximum`), and the driver window is 64 KiB of grant records. `readback` is the memfs
+/// key [`temen_op13jit_phase_output`] returns. Phase-agnostic: nifler, hexer, nimsem differ only in
+/// `argv`/`seeds`/`readback`/`exec_nifler`.
 ///
 /// # Safety
 /// `child_bytes` must be a live slice for the duration of the call.
@@ -9236,7 +9225,6 @@ unsafe fn op13_phase_open_impl(
     argv: &[&str],
     seeds: Vec<(String, Vec<u8>)>,
     readback: String,
-    carve_log2: u32,
     exec_nifler: Option<std::sync::Arc<temen_ir::Module>>,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
@@ -9246,6 +9234,9 @@ unsafe fn op13_phase_open_impl(
     if temen_verify::verify_module(&child).is_err() {
         return -STATUS_VERIFY_ERR;
     }
+    let Some(decl) = child.memory.as_ref().map(|m| m.size_log2) else {
+        return -STATUS_UNSUPPORTED;
+    };
 
     // The shared memfs the child reads its inputs from + writes its output into. Typed as the `dyn`
     // factory (nimc's `FsFactory`) so it re-grants to the child AND feeds `make_exec` (the exec cap).
@@ -9253,24 +9244,6 @@ unsafe fn op13_phase_open_impl(
     let factory: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
         std::sync::Arc::new(factory);
 
-    // The real phase driver (mirrors nimc::run_phase_op13): the child commits its declared window and
-    // `vm_map`-grows its `mapped` into the carve (#1253). `carve_log2 == 0` → the phase default
-    // (`nimc::phase_carve_log2`, `(declared+3)` clamped to the browser budget); else the caller-supplied
-    // size (hexer/nimsem's 28 for their ~256 MiB peak), still capped at `PHASE_CARVE_MAX` so it fits the
-    // 1 GiB memory. The backing is a demand-zeroed `alloc_zeroed`, so the untouched carve tail is free.
-    let decl = child.memory.as_ref().map_or(24, |m| m.size_log2);
-    let child_sl = if carve_log2 == 0 {
-        nimc::phase_carve_log2(decl)
-    } else {
-        // Explicit override (hexer/nimsem), still bounded below by the declared window and above by the
-        // budget cap — a phase past the cap fails closed rather than pre-sizing over the 1 GiB memory.
-        let c = (carve_log2 as u8).max(decl);
-        (c <= nimc::PHASE_CARVE_MAX).then_some(c)
-    };
-    let Some(child_sl) = child_sl else {
-        return -STATUS_UNSUPPORTED;
-    };
-    let carve_off = 1u64 << child_sl;
     // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
     // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
     // exactly like `fs`, so its nifler sub-spawns run host-side while the phase's own compute tiers up.
@@ -9279,13 +9252,7 @@ unsafe fn op13_phase_open_impl(
     } else {
         &["fs", "stdout", "exit"]
     };
-    let driver_src = nimc::op13_parent_src(
-        u32::from(child_sl),
-        carve_off,
-        temen_ir::module_args_base(),
-        argv,
-        caps,
-    );
+    let driver_src = nimc::detached_parent_src(decl, argv, caps);
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
         return -STATUS_DECODE_ERR;
     };
@@ -9306,14 +9273,17 @@ unsafe fn op13_phase_open_impl(
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let win = 1u64 << (child_sl + 1);
+    let win = 1u64 << 16; // the driver's own window: grant records + the args blob
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
-    // Grant args in the order the parent's params expect: inst, module, then the caps. The exec (when
-    // present) is granted forkable so op-13's `regrant_into_child` can carry it (`can_regrant`).
+    // The minter's quota is the mint (the declared window); the minted memory's `maximum` bounds growth.
+    let minter = host.grant_window_minter(1u64 << decl);
+    // Grant args in the order the parent's params expect: inst, module, minter, then the caps. The exec
+    // (when present) is granted forkable so op-15's `regrant_into_child` can carry it (`can_regrant`).
     let mut grant_args = vec![
         Value::I32(inst),
         Value::I32(modh),
+        Value::I32(minter),
         Value::I32(fs_h),
         Value::I32(stdout_h),
         Value::I32(exit_h),
@@ -9342,9 +9312,8 @@ unsafe fn op13_phase_open_impl(
         unsafe { drop(Box::from_raw(prog)) };
         return -STATUS_UNSUPPORTED;
     };
-    // SAFETY: non-zero 8-aligned layout; owned until close. Linear-memory backed so the emitted child
-    // (and JS driver) can access it. A large `alloc_zeroed` is served from freshly `memory.grow`n pages
-    // the host zero-inits lazily — the phase's untouched carve tail costs no physical memory (#1253).
+    // SAFETY: non-zero 8-aligned layout; owned until close. The driver's 64 KiB window (the child's is
+    // its own minted memory, #1288).
     let mem_base = unsafe { std::alloc::alloc_zeroed(layout) };
     if mem_base.is_null() {
         unsafe { drop(Box::from_raw(prog)) };
@@ -12991,63 +12960,6 @@ block 0 () {
         });
         let out = c.wait_with_output().ok()?;
         out.status.success().then_some(out.stdout)
-    }
-
-    #[test]
-    fn op13jit_phase_open_stages_a_real_nifler_child() {
-        // Scaling to a real phase child: `temen_op13jit_phase_open` builds the real nimc::op13_parent_src
-        // driver over nifler_ce (child-entry) + a memfs seeded with a source, and the first `_step` marshals
-        // {fs, stdout, exit}, does the child-entry setup (starter caps + manifest bind + cinst arg), and
-        // **emits** nifler_ce over its carve — returning OP13JIT_CHILD. This validates the whole driver +
-        // marshal + child-entry-setup + emit path host-side (the emitted RUN itself is the Chromium leg,
-        // browser-op13jit-nifler-test.mjs). SKIPs if the committed nifler_ce asset / gzip is unavailable.
-        let Some(nifler_ce) = inflate("../crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz")
-        else {
-            eprintln!("SKIP: nifler_ce.temen.gz unavailable / gzip missing");
-            return;
-        };
-        let file = b"/prog.nim";
-        let out = b"/nimcache/prog.p.nif";
-        let src = b"import std/syncio\n\nwrite(stdout, \"hi\\n\")\n";
-        let st = unsafe {
-            temen_op13jit_phase_open(
-                nifler_ce.as_ptr(),
-                nifler_ce.len(),
-                file.as_ptr(),
-                file.len(),
-                out.as_ptr(),
-                out.len(),
-                src.as_ptr(),
-                src.len(),
-            )
-        };
-        assert_eq!(st, STATUS_OK, "phase_open built the driver + memfs");
-        let step = temen_op13jit_step();
-        assert_eq!(
-            step, OP13JIT_CHILD,
-            "the driver marshaled {{fs,stdout,exit}}, set up the child-entry, and emitted nifler_ce (staged)"
-        );
-        // The staged run holds the emitted nifler_ce; the emitted RUN is the Chromium leg.
-        let run = unsafe { (*core::ptr::addr_of!(JIT_RUN)).as_ref() }.expect("nifler_ce is staged");
-        // #1253: no pre-size. The staged run commits nifler_ce's DECLARED window (`"mapped"` starts
-        // there and grows on `vm_map`) over a backing that is the policy carve — the buddy half of the
-        // phase window — not `(decl + 3)` × its declared size (the retired 8× guess).
-        let decl = temen_encode::decode_module(&nifler_ce)
-            .expect("decode")
-            .memory
-            .expect("nifler_ce declares memory")
-            .size_log2;
-        assert_eq!(
-            run.mapped(),
-            1u64 << decl,
-            "the child spawns at its DECLARED window and grows `mapped` into the carve — no pre-size"
-        );
-        assert_eq!(
-            run.back.len(),
-            1u64 << nimc::phase_carve_log2(decl).expect("nifler_ce fits"),
-            "backed by the capped phase carve, not the declared window"
-        );
-        temen_op13jit_close();
     }
 }
 

@@ -38,7 +38,8 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 const res = await page.evaluate(async () => {
   const par = await import('./par.js');
-  const { driveJitRun } = await import('./wasmjit-module.js');
+  const { driveDetachedRun } = await import('./wasmjit-module.js');
+  const { foreignMemory } = await import('./foreign-mem.js');
   const eng = await par.loadEngine();
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
@@ -68,15 +69,17 @@ const res = await page.evaluate(async () => {
   // `vm_map`-grows its `"mapped"` into the carve on demand — capture the declared start as a witness that
   // the child spawns small, not pre-sized (the grow itself is exercised by the >=256 MiB native
   // differential `op13jit_grow_phase.rs`; a tiny crawl source stays inside the declared window).
-  let steps = 0, drove = 0, driveErr = null, mappedInitial = 0;
+  let steps = 0, drove = 0, driveErr = null, mappedInitial = 0, childPages = 0;
   for (;;) {
     if (steps++ > 8) { ex.temen_op13jit_close(); return { err: 'loop did not terminate', bcStatus }; }
     const s = ex.temen_op13jit_step();
     if (s === 0) break;
-    if (s === 1) {
+    if (s === 2) {                  // CHILD_DETACHED (#1288): nifler_ce runs in its own minted Memory
       if (!mappedInitial) mappedInitial = Number(ex.temen_onramp_jit_run_mapped());
-      try { await driveJitRun(ex, memory, 'op13jit-nifler'); }
-      catch (e) { driveErr = String(e && e.message || e); ex.temen_op13jit_close(); return { err: `driveJitRun: ${driveErr}`, bcStatus }; }
+      const cm = foreignMemory(ex.temen_op13jit_child_mem_id());
+      try { await driveDetachedRun(ex, memory, cm, 'op13jit-nifler'); }
+      catch (e) { driveErr = String(e && e.message || e); ex.temen_op13jit_close(); return { err: `driveDetachedRun: ${driveErr}`, bcStatus }; }
+      childPages = cm.buffer.byteLength / 65536;
       ex.temen_op13jit_deliver(); drove++; continue;
     }
     ex.temen_op13jit_close();
@@ -93,7 +96,7 @@ const res = await page.evaluate(async () => {
     oracleLen: oracle.length, emittedLen: emitted.length,
     pnifEq: eq(oracle, emitted),
     head: new TextDecoder().decode(oracle.slice(0, 60)),
-    mappedInitial, declaredSpawn: mappedInitial > 0,
+    mappedInitial, declaredSpawn: mappedInitial > 0, childPages,
   };
 });
 
@@ -102,6 +105,6 @@ try { rmSync(CE_TMP); } catch {}
 console.log('RESULT', JSON.stringify(res, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const ok = !res.err && res.pnifEq && res.emittedLen > 0 && res.oracleLen > 0 && res.declaredSpawn;
-console.log(`  op13jit-nifler: .p.nif≡=${res.pnifEq} (emitted ${res.emittedLen}B / oracle ${res.oracleLen}B) driver=${res.result} childrenDriven=${res.drove} spawn@mapped=${res.mappedInitial}${res.err ? ` · ERR ${res.err}` : ''}`);
-console.log(ok ? 'PASS — real nifler_ce ran nested on the EMITTED tier, spawned at its declared window (no 8× pre-size); .p.nif ≡ interpreter oracle' : 'FAIL');
+console.log(`  op13jit-nifler: .p.nif≡=${res.pnifEq} (emitted ${res.emittedLen}B / oracle ${res.oracleLen}B) driver=${res.result} childrenDriven=${res.drove} spawn@mapped=${res.mappedInitial} childMemPages=${res.childPages}${res.err ? ` · ERR ${res.err}` : ''}`);
+console.log(ok ? 'PASS — real nifler_ce ran DETACHED on the EMITTED tier in its own WebAssembly.Memory, spawned at its declared window (no carve, no pre-size); .p.nif ≡ interpreter oracle' : 'FAIL');
 process.exit(ok ? 0 : 1);
