@@ -23,6 +23,8 @@
 ;   kind 6 = constant (payload = value; `variable`/`create`) kind 8 = i64.eqz (`0=`)
 ;   kind 7 = i64 atomic rmw `( n addr -- old )` (payload = rmw op)  kind 9 = cmpxchg `( exp new addr -- old )`
 ;   kind 10 = atomic load `( addr -- x )`                 kind 11 = atomic store `( x addr -- )`
+;   kind 12 = constant cell (payload = addr; load the stored value)  kind 13 = deferred word
+;     (payload = xt cell; load and `execute` at the declared effect — `defer`/`is`)
 ;   kind 2 = compiler word (payload = an id dispatched by `br_table` in func 44)
 ;
 ; Memory map (window 2^20):
@@ -39,7 +41,7 @@
 ;   65664 OUT_LEN   65672 DEAD      65680 TOK_PTR   65688 TOK_LEN   65696 DEF_NAME_PTR
 ;   65704 DEF_NAME_LEN  65712 ERR   65720 CUR_PARAMS  65728 NTYPES  65736 BLOB_LEN
 ;   65744 ARENA_LEN 65752 IN_BASE   65760 NUM       65768 STR_PTR   65776 STR_LEN
-;   65792.. 24-byte digit scratch
+;   65784 LINE (1-based, reset before stdin)   65792.. 24-byte digit scratch
 ;
 ; Function index table (keep in sync — `call N` is by index):
 ;    0 _start            1 emit(c)           2 type(a,n)         3 allot(n)        4 comma(x)
@@ -86,6 +88,8 @@ data 33024 "--"
 data 33040 "install error "
 data 33056 "not compiling"
 data 33072 "expected a name"
+data 33088 "line "
+data 33104 ": "
 
 ; ---- the prelude (0x9000 = 36864, NUL-terminated): the primitive table + the library, in Forth ----
 data 36864 "prim : 2 0 0 1
@@ -121,6 +125,9 @@ prim execute0 2 0 0 30
 prim execute1 2 0 0 31
 prim execute2 2 0 0 32
 prim exit 2 0 0 33
+prim constant 2 0 0 34
+prim defer 2 0 0 35
+prim is 2 0 0 36
 prim + 1 2 1 64
 prim - 1 2 1 65
 prim * 1 2 1 66
@@ -187,6 +194,9 @@ block 0 () {
   pp = i64.const 36864
   pl = call 54 (pp)
   call 42 (pp, pl)
+  lnp = i64.const 65784
+  onel = i64.const 1
+  i64.store lnp onel
   n = call 48 ()
   ib = i64.const 327680
   call 42 (ib, n)
@@ -1166,6 +1176,10 @@ block 6 (pos: i64, a: i64) {
   pp = i64.const 65544
   pos1 = i64.add pos one
   i64.store pp pos1
+  lnp = i64.const 65784
+  ln = i64.load lnp
+  ln1 = i64.add ln one
+  i64.store lnp ln1
   return one
   }
 block 7 (pos: i64) {
@@ -1373,6 +1387,15 @@ block 4 () {
 func (i64, i64) -> () {
 block 0 (msg: i64, len: i64) {
   call 5 ()
+  linestr = i64.const 33088
+  five = i64.const 5
+  call 2 (linestr, five)
+  lnp = i64.const 65784
+  ln = i64.load lnp
+  call 39 (ln)
+  colon = i64.const 33104
+  two = i64.const 2
+  call 2 (colon, two)
   call 2 (msg, len)
   near = i64.const 32976
   six = i64.const 6
@@ -1743,7 +1766,7 @@ block 0 (e: i64) {
   no = i64.load32_s e offset=20
   pay = i64.load e offset=24
   k32 = i32.wrap_i64 kind
-  br_table k32 [5(ni, no, pay), 6(pay), 12(), 7(pay), 8(pay), 9(pay), 10(pay), 1(pay), 11(), 2(), 3(), 4()] 12()
+  br_table k32 [5(ni, no, pay), 6(pay), 12(), 7(pay), 8(pay), 9(pay), 10(pay), 1(pay), 11(), 2(), 3(), 4(), 13(pay), 14(ni, no, pay)] 12()
   }
 block 1 (pay: i64) {
   two = i64.const 2
@@ -1881,13 +1904,30 @@ block 11 () {
 block 12 () {
   return
   }
+; kind 12: constant cell — push the value stored at the cell (read-only, set at define time).
+block 13 (pay: i64) {
+  addr = call 22 (pay)
+  op = i64.const 241
+  v = call 24 (op, addr)
+  call 10 (v)
+  return
+  }
+; kind 13: deferred word — load the current xt from the cell and `execute` it (`defer`/`is`).
+block 14 (ni: i64, no: i64, pay: i64) {
+  addr = call 22 (pay)
+  op = i64.const 241
+  xt = call 24 (op, addr)
+  call 10 (xt)
+  call 71 (ni, no)
+  return
+  }
 }
 
 ; 44 do_imm(id): the compiler words, dispatched by id.
 func (i64) -> () {
 block 0 (id: i64) {
   id32 = i32.wrap_i64 id
-  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24()] 16()
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34()] 16()
   }
 block 1 () {
   call 45 ()
@@ -2048,6 +2088,132 @@ block 26 () {
   ddp = i64.const 65672
   one = i64.const 1
   i64.store ddp one
+  return
+  }
+; constant(34): `<value> constant name` — allot a cell, emit a `store TOS -> cell`, and define
+; name as kind 12 (load-from-cell). The value is whatever is on top when the line runs.
+block 27 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 28() 29()
+  }
+block 28 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 29 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  nlen = i64.load tl
+  twelve = i64.const 12
+  zero = i64.const 0
+  one = i64.const 1
+  call 35 (t, nlen, twelve, zero, one, h)
+  addr = call 22 (h)
+  val = call 12 ()
+  op = i64.const 133
+  call 25 (op, addr, val)
+  return
+  }
+; defer(35): `defer ( a b -- c ) name` — a cell (default xt 0) and a kind-13 word that loads and
+; executes it, so `is` can rebind it. The declared effect fixes the word's signature.
+block 30 () {
+  call 51 ()
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 16() 31()
+  }
+block 31 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 32() 33()
+  }
+block 32 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 33 () {
+  hp = i64.const 65536
+  h = i64.load hp
+  zero = i64.const 0
+  i64.store h zero
+  eight = i64.const 8
+  h1 = i64.add h eight
+  i64.store hp h1
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  nlen = i64.load tl
+  thirteen = i64.const 13
+  nip = i64.const 65648
+  ni = i64.load nip
+  nop = i64.const 65656
+  no = i64.load nop
+  call 35 (t, nlen, thirteen, ni, no, h)
+  return
+  }
+; is(36): `' word is name` — store the xt on top into the deferred word `name`'s cell.
+block 34 () {
+  len = call 33 ()
+  z = i64.const 0
+  none = i64.eq len z
+  isnl = call 60 ()
+  nl = i64.ne isnl z
+  bad = i32.or none nl
+  br_if bad 35() 36(len)
+  }
+block 35 () {
+  m = i64.const 33072
+  n = i64.const 15
+  call 38 (m, n)
+  return
+  }
+block 36 (len: i64) {
+  tp = i64.const 65680
+  t = i64.load tp
+  e = call 34 (t, len)
+  z = i64.const 0
+  miss = i64.eq e z
+  br_if miss 37() 38(e)
+  }
+block 37 () {
+  m = i64.const 32992
+  n = i64.const 12
+  call 38 (m, n)
+  return
+  }
+block 38 (e: i64) {
+  kind = i64.load32_s e offset=12
+  thirteen = i64.const 13
+  isdef = i64.eq kind thirteen
+  br_if isdef 39(e) 37()
+  }
+block 39 (e: i64) {
+  cell = i64.load e offset=24
+  addr = call 22 (cell)
+  val = call 12 ()
+  op = i64.const 133
+  call 25 (op, addr, val)
   return
   }
 }
