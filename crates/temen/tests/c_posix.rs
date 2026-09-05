@@ -3651,6 +3651,72 @@ int main(void) {{\n\
     );
 }
 
+/// #797 — **`ttyname` names the controlling terminal** (op 57, the `isatty` companion). On the
+/// terminal fd it writes `/dev/tty\0`; a non-terminal fd is `-ENOTTY`; a buffer too small for the
+/// name + NUL is `-ERANGE`. Replaces the old bash-shim fake that returned `/dev/tty` for any fd.
+/// Runs on the tree-walker and the cooperative bytecode engine.
+#[test]
+fn c_terminal_ttyname_names_the_terminal() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+long __px_ttyname(int cap, long fd, long buf, long buflen);\n\
+static char nm[32];\n\
+int main(void) {{\n\
+  if (__px_ttyname(0, 0, (long)nm, 32) != 0) return 1;     /* fd 0 is the terminal */\n\
+  char *want = \"/dev/tty\";\n\
+  long i;\n\
+  for (i = 0; want[i]; i = i + 1) if (nm[i] != want[i]) return 2;\n\
+  if (nm[i] != 0) return 3;                                 /* NUL-terminated */\n\
+  if (__px_ttyname(0, 7, (long)nm, 32) != -25) return 4;    /* a non-terminal fd -> -ENOTTY */\n\
+  if (__px_ttyname(0, 0, (long)nm, 4) != -34) return 5;     /* buffer too small -> -ERANGE */\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_terminal(&src, vec![], None);
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "ttyname wrote /dev/tty on the terminal, -ENOTTY off it, -ERANGE when the buffer was too small"
+    );
+    let eb = run_bytecode_terminal(&src, vec![]);
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: ttyname matches the tree-walker"
+    );
+}
+
+/// #797 — **canonical `VKILL` (^U) discards the pending line.** The default-termios line discipline
+/// honors `cc[VKILL] = ^U` (0x15): feeding `abc^Uxy\n` kills `abc`, so the completed line the parked
+/// `read(0)` returns is just `xy\n`. (The VERASE companion is
+/// `c_terminal_canonical_read_line_editing_and_echo`.) Tree-walker + cooperative bytecode.
+#[test]
+fn c_terminal_canonical_kill_discards_the_line() {
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static char b[16];\n\
+int main(void) {{\n\
+  long n = read(0, b, 16);              /* parks until the line completes */\n\
+  if (n != 3) return (int)(100 + n);\n\
+  if (b[0] != 'x' || b[1] != 'y' || b[2] != 10) return 2;\n\
+  return 42;\n\
+}}\n"
+    );
+    let feeds = vec![(60u64, b"abc\x15xy\n".to_vec())];
+    let e = run_interp_terminal(&src, feeds.clone(), None);
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "^U killed the pending line; only xy\\n reached the reader"
+    );
+    let eb = run_bytecode_terminal(&src, feeds);
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: VKILL line-discard matches the tree-walker"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // #801 — coreutils staging: a real /bin of registered executables
 // (crates/temen-run/demos/posix_utils/). Each tool is its own command module —
