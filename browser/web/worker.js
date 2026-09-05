@@ -8,11 +8,13 @@
 // child's completion slot; `memory.wait`/`notify` → `Atomics.wait`/`notify` on the futex word. A Worker
 // (not the page) is the only place a browser permits a blocking `Atomics.wait`.
 
+import { foreignImports, registerForeign } from './foreign-mem.js';
 const STACK = 1 << 20; // per-Worker stack
 const SLOT = 16; // completion slot: [done:i32 @0][result:i64 @8]
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
 // Event codes — must match browser/src/lib.rs PAR_*.
-const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8;
+const DONE = 0, TRAP = 1, SPAWN = 2, JOIN = 3, WAIT = 4, NOTIFY = 5, INSTANTIATE = 6, TIERUP = 7, JIT_INVOKE = 8,
+  INSTANTIATE_DETACHED = 9;
 
 // §22 codegen arg/result marshalling by scalar type code (0=i32, 1=i64, 2=f32, 3=f64): the engine
 // carries every arg/result as a raw i64 slot; the Worker converts to/from the JS value the emitted
@@ -31,7 +33,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
     smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
-    jitB2, jitRuntime, tierupPaged } = e.data;
+    jitB2, jitRuntime, tierupPaged, childMem } = e.data;
   // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
   // _inst_codegen, temen_par_child*) are the ones a rare shared-memory race actually trips (a double-free
@@ -47,7 +49,7 @@ self.onmessage = async (e) => {
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
   // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} } }));
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {} } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
@@ -59,6 +61,13 @@ self.onmessage = async (e) => {
   const i64 = () =>
     i64v.byteLength === memory.buffer.byteLength ? i64v : (i64v = new BigInt64Array(memory.buffer));
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
+  // A §5 'detached' child (#1286) runs over its OWN shared `WebAssembly.Memory` (`childMem`, minted +
+  // seeded by the spawning Worker below), reached by the engine through `Region::Foreign` — so its
+  // futex words live there, one host header page in, not in the engine memory at `win`. The completion
+  // slot protocol stays in the engine memory (`i32()`); only WAIT/NOTIFY switch to these views.
+  const fmem = childMem || memory, fbase = childMem ? ex.temen_detached_header_bytes() : win;
+  let fi32v = new Int32Array(fmem.buffer);
+  const fi32 = () => fi32v.byteLength === fmem.buffer.byteLength ? fi32v : (fi32v = new Int32Array(fmem.buffer));
 
   // A §14 'confined' child's `win`/`winSize` are already its carve (the parent's window + the event's
   // offset) — a confined child is just a child with a shifted, smaller window (DESIGN.md §14).
@@ -315,7 +324,9 @@ self.onmessage = async (e) => {
     ? ex.temen_par_root(prog, win, winSize, func)
     : role === 'confined'
       ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
-      : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
+      : role === 'detached'
+        ? ex.temen_par_child_detached(prog, registerForeign(childMem, fbase), slog, smod, entry, BigInt(fuel))
+        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -415,18 +426,59 @@ self.onmessage = async (e) => {
       ex.temen_par_deliver_handle(v, handle);
       continue;
     }
+    if (evc === INSTANTIATE_DETACHED) {
+      // §5 detached child (#1286 slice 3b): the engine already resolved the Instantiator, took the
+      // WindowMinter's quota and compiled the module; what is left is the window itself. Mint the child
+      // a fresh shared Memory — one host header page (env cell, page-state, DETACHED_JIT.md §3.1) +
+      // the declared window, growable in place to the detached ceiling — seed it from the event's
+      // segment blob (data segments + args payload; `{off:u64, len:u32, bytes}` records after a u32
+      // count) at `header + off`, and post it to a new Worker. A shared Memory posts by reference, so
+      // the child Worker and this one see the same bytes; the engine here never addresses them again.
+      const am = ex.temen_par_ev_a(v); // (module << 32) | entry
+      const csmod = Number(am >> 32n), centry = Number(BigInt.asUintN(32, am));
+      const cslog = Number(ex.temen_par_ev_b(v)), cfuel = ex.temen_par_ev_c(v);
+      const hdr = ex.temen_detached_header_bytes(), PAGE = 65536;
+      const cmem = new WebAssembly.Memory({
+        initial: Math.ceil((hdr + 2 ** cslog) / PAGE),
+        maximum: Math.ceil((hdr + Number(ex.temen_detached_max_bytes())) / PAGE),
+        shared: true,
+      });
+      const cu8 = new Uint8Array(cmem.buffer);
+      const sptr = Number(ex.temen_par_det_seed_ptr(v)), slen = Number(ex.temen_par_det_seed_len(v));
+      const sdv = new DataView(memory.buffer, sptr, slen), su8 = new Uint8Array(memory.buffer, sptr, slen);
+      let p = 4;
+      for (let n = sdv.getUint32(0, true); n > 0; n--) {
+        const off = Number(sdv.getBigUint64(p, true)), len = sdv.getUint32(p + 8, true);
+        cu8.set(su8.subarray(p + 12, p + 12 + len), hdr + off);
+        p += 12 + len;
+      }
+      const cslot = ex.temen_par_alloc(SLOT);
+      const cstackTop = ex.temen_par_alloc(STACK) + STACK;
+      const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
+      // No `win`/`winSize`: the child has no window in the engine memory. No tier-up: the emitted tier
+      // binds the engine memory (a separate-module child keeps the bitmap inert regardless).
+      self.postMessage({
+        kind: 'spawn', role: 'detached', childMem: cmem, smod: csmod, entry: centry, slog: cslog,
+        fuel: cfuel.toString(), win: 0, winSize: 2 ** cslog, tierup: false,
+        slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
+      });
+      const handle = handles.length;
+      handles.push(cslot);
+      ex.temen_par_deliver_handle(v, handle);
+      continue;
+    }
     if (evc === WAIT) {
       const addr = Number(ex.temen_par_ev_a(v));
       const expected = Number(BigInt.asIntN(32, ex.temen_par_ev_b(v)));
       const timeoutNs = ex.temen_par_ev_d(v);
       const ms = timeoutNs <= 0n ? Infinity : Number(timeoutNs) / 1e6;
-      const r = Atomics.wait(i32(), (win + addr) >> 2, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
+      const r = Atomics.wait(fi32(), (fbase + addr) >> 2, expected, ms); // 'ok' | 'not-equal' | 'timed-out'
       ex.temen_par_deliver_code(v, r === 'ok' ? 0 : r === 'not-equal' ? 1 : 2);
       continue;
     }
     if (evc === NOTIFY) {
       const addr = Number(ex.temen_par_ev_a(v)), count = Number(ex.temen_par_ev_b(v));
-      ex.temen_par_deliver_code(v, Atomics.notify(i32(), (win + addr) >> 2, count));
+      ex.temen_par_deliver_code(v, Atomics.notify(fi32(), (fbase + addr) >> 2, count));
       continue;
     }
     if (evc === TIERUP) {

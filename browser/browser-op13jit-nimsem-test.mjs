@@ -4,7 +4,8 @@
 // nimsem_ce (the child-entry phase). The `exec` cap is `make_exec` over the SAME shared memfs, running
 // the top-level nifler on the interpreter — so nimsem-the-tiered-up-child shells out to nifler
 // grandchildren (host-side) to parse the stdlib it imports, while nimsem's own sema (the dominant cost)
-// runs on **emitted wasm** over its 256 MiB carve. It semchecks the system module (`--isSystem`) and
+// runs on **emitted wasm** in its own detached `WebAssembly.Memory` (#1288 — no 256 MiB carve, no 2 GiB
+// engine module). It semchecks the system module (`--isSystem`) and
 // writes `sysvq0asl.s.nif`, which must be byte-identical to the committed expected — the same oracle the
 // headless `rust_driver_nimsem.rs` gate uses. This is `nimc.rs`'s phase-2 nimsem, nested under an op-13
 // driver, tiered up to JIT in the browser — the dominant piece of the ~180s card.
@@ -82,7 +83,8 @@ try {
 
   const res = await page.evaluate(async () => {
     const par = await import('./par.js');
-    const { driveJitRun } = await import('./wasmjit-module.js');
+    const { driveDetachedRun } = await import('./wasmjit-module.js');
+    const { foreignMemory } = await import('./foreign-mem.js');
     const eng = await par.loadEngine();
     const ex = eng.ex, memory = eng.memory;
     // #1025 3a.3: nimsem needs a 256 MiB carve → a 512 MiB window, and its 5.7 MB module's cross-tier
@@ -93,7 +95,8 @@ try {
     // once the ceiling is raised to 2 GiB (the build's `--max-memory=2147483648` + `par.js`'s
     // `maxPages: 32768`). Headless `nim_phase_tierup_eligible.rs` already gates that nimsem *emits*
     // WasmDriven at zero memory cost — this is the end-to-end byte-exact leg.
-    if ((eng.maxPages || 16384) < 22528) return { skip: true }; // 22528 pages = 1.4 GiB
+    // #1288: nimsem runs DETACHED in its own minted WebAssembly.Memory (1 GiB max, its ~256 MiB peak
+    // inside it), so the ENGINE's shared-memory ceiling no longer bounds the phase — no ceiling SKIP.
     const u8 = () => new Uint8Array(memory.buffer);
     const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
     const enc = new TextEncoder();
@@ -114,7 +117,7 @@ try {
     const push = (bytes) => { const p = Number(ex.temen_alloc(bytes.length)); u8().set(bytes, p); return p; };
     const cp = push(nimsemCe), np = push(nifler), ap = push(argv), sp = push(seeds), op = push(outPath);
     // carve_log2 = 28: nimsem's no-GC system semcheck peaks ~256 MiB (parent window rounds to 512 MiB).
-    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seeds.length, op, outPath.length, 28);
+    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seeds.length, op, outPath.length);
     ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length);
     ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seeds.length); ex.temen_dealloc(op, outPath.length);
     if (opened !== 0) return { err: `nimsem_open failed: ${opened}` };
@@ -124,9 +127,9 @@ try {
       if (steps++ > 8) { ex.temen_op13jit_close(); return { err: 'loop did not terminate' }; }
       const s = ex.temen_op13jit_step();
       if (s === 0) break;
-      if (s === 1) {
-        try { await driveJitRun(ex, memory, 'op13jit-nimsem'); }
-        catch (e) { ex.temen_op13jit_close(); return { err: `driveJitRun: ${String(e && e.message || e)}` }; }
+      if (s === 2) {                // CHILD_DETACHED (#1288): nimsem_ce runs in its own minted Memory
+        try { await driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), 'op13jit-nimsem'); }
+        catch (e) { ex.temen_op13jit_close(); return { err: `driveDetachedRun: ${String(e && e.message || e)}` }; }
         ex.temen_op13jit_deliver(); drove++; continue;
       }
       ex.temen_op13jit_close();
@@ -156,7 +159,7 @@ try {
   if (errors.length) console.log('ERRORS', errors.slice(0, 6));
   const ok = !res.err && res.snifEq && res.emittedLen > 0 && res.expectedLen > 0;
   console.log(`  op13jit-nimsem: .s.nif≡=${res.snifEq} (emitted ${res.emittedLen}B / expected ${res.expectedLen}B) driver=${res.result} childrenDriven=${res.drove}${res.err ? ` · ERR ${res.err}` : ''}`);
-  console.log(ok ? 'PASS — real nimsem_ce ran nested on the EMITTED tier (exec→nifler host-side); .s.nif ≡ committed expected' : 'FAIL');
+  console.log(ok ? 'PASS — real nimsem_ce ran DETACHED on the EMITTED tier in its own WebAssembly.Memory under the 1 GiB engine (exec→nifler host-side); .s.nif ≡ committed expected' : 'FAIL');
   process.exit(ok ? 0 : 1);
 } finally {
   try { rmSync(work, { recursive: true, force: true }); } catch {}

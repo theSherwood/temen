@@ -31,7 +31,7 @@ use temen_mem::RmwOp;
 // linear memory) and hand it to `compile_and_run_capture_over` — the parallel-wasm window backing.
 // The `unsafe` of borrowing host memory lives in `temen_mem::Region::shared`, keeping this crate
 // `#![forbid(unsafe_code)]`.
-pub use temen_mem::Region;
+pub use temen_mem::{ForeignOps, Region};
 
 /// The crate's **continue-through-poison** lock policy, in one documented home (#918). A poisoned
 /// lock means a thread panicked while holding it, but the data these locks guard is a plain guest
@@ -4324,9 +4324,14 @@ fn frames_to_pcs(frames: &[Frame]) -> Vec<IrPc> {
 /// page keys on its virtual address (`FUTEX_PRIVATE`), a shared page on its backing identity + offset.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 enum FutexKey {
-    /// A normal (anonymous) window page — keyed by confined absolute address. Anonymous pages are never
-    /// aliased across domains, so the address is a sound identity.
-    Anon(u64),
+    /// A normal (anonymous) window page — keyed by `(backing identity, backing-absolute address)`.
+    /// The address alone is **not** a sound identity across domains (#1283): every detached window
+    /// (op 15) and the root have `window.base() == 0`, and all of a run's domains share one
+    /// `wait_waiters`, so two detached siblings waiting on the same guest offset would rendezvous. The
+    /// backing identity (the `Arc<Region>` allocation address, stable while the window lives) separates
+    /// them; a §14 nested child shares its parent's `Arc<Region>` and its confined absolute address is
+    /// already backing-absolute, so parent↔nested-child rendezvous on anonymous memory is unchanged.
+    Anon(u64, u64),
     /// A §13 `SharedRegion`-aliased page — keyed by `(backing identity, byte offset within the
     /// region)`, so every alias of the same region byte maps to the same key regardless of which
     /// window, window offset, **or domain** names it (the S1c residue: a per-window region id was
@@ -11795,6 +11800,25 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let entry = argn(4)? as u64;
                             let size_log2 = argn(5)?;
                             let quota = argn(6)?;
+                            // #1286 — optional spawn-time args payload `(args_ptr, args_len)` (args
+                            // 7–8): bytes of this domain's window copied to the child's
+                            // `module_args_base()` before start — the detached twin of the op-13
+                            // convention (a parent data segment landing inside the carve), which has
+                            // no analogue across windows. The 7-arg form seeds nothing; an over-long
+                            // payload refuses probeably.
+                            let payload: Option<Vec<u8>> = match (args.get(7), args.get(8)) {
+                                (Some(&p), Some(&l)) => {
+                                    let ptr = get(&frames[top].vals, p)?.i64() as u64;
+                                    let len = get(&frames[top].vals, l)?.i64() as usize;
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    Some(m.read_window(ptr, len)?)
+                                }
+                                _ => None,
+                            };
+                            let payload_ok = payload.as_ref().is_none_or(|p| {
+                                p.len() as u64
+                                    <= temen_ir::module_args_end() - temen_ir::module_args_base()
+                            });
                             // The module grant (a forged module handle is a CapFault, as ops
                             // 5/13); the child runs it as its own program + self module.
                             let cm = {
@@ -11848,6 +11872,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && ok_entry
                                 && child_size != 0
                                 && mod_ok
+                                && payload_ok
                                 && host
                                     .lock_unpoisoned()
                                     .window_minter_take(minter, child_size);
@@ -11860,13 +11885,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
                                 fm.init_data(&cm.data);
                                 fm.seed_null_guard(temen_ir::module_null_guard()); // #964
+                                if let Some(p) = &payload {
+                                    let _ = fm.write_bytes(temen_ir::module_args_base(), p);
+                                }
                                 let mut ch = Host::new();
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
                                     hg.detached_child_attestation()
                                 });
-                                let cinst = ch.grant_instantiator(0, child_size);
-                                let cas = ch.grant_address_space(0, child_size);
+                                // #1286: the starter caps span the child's whole **reservation**, as a
+                                // root run's `grant_memory` does — a detached window has no carve to be
+                                // bounded by, and bounding `AddressSpace` to the declared size would
+                                // refuse every `vm_map` past it (the growth a detached window exists
+                                // for). The minter quota governs *minting*; growth is bounded by the
+                                // reservation (and, on wasm, the minted memory's `maximum`).
+                                let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                                let cinst = ch.grant_instantiator(0, reservation);
+                                let cas = ch.grant_address_space(0, reservation);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -20873,7 +20908,7 @@ impl Host {
     /// Deduct `bytes` from the minter behind `handle` — the detached-spawn admission check.
     /// `false` (nothing deducted) for a forged/wrong-type handle or an exhausted quota: the
     /// spawn refuses probeably, never a trap.
-    fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
+    pub fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
         let idx = match self.resolve(handle, cap_id::WINDOW_MINTER) {
             Ok(Binding::WindowMinter(i)) => i as usize,
             _ => return false,
@@ -21908,6 +21943,32 @@ impl Host {
         grants: &[(String, i32)],
         child_size: u64,
     ) -> Option<(Host, i32, i32)> {
+        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
+        let attestation = self.child_attestation(false);
+        self.spawn_child_powerbox(grants, child_size, attestation)
+    }
+
+    /// PROCESS.md §5 / #1287 — the **detached** twin of [`Self::spawn_named_child`]: the same by-name
+    /// re-grants, but the child attests `window_exposed = false` (no ancestor below the platform holds
+    /// read authority over its minted window) and its starter caps span `reservation` — the whole
+    /// window reservation, a root's shape, so the child's `vm_map` grows it. The native JIT's op-15
+    /// thunk builds the child powerbox through this (`temen_run::grant_detached_child_build`), so
+    /// both backends stamp the same attestation and caps.
+    pub fn spawn_detached_child(
+        &mut self,
+        grants: &[(String, i32)],
+        reservation: u64,
+    ) -> Option<(Host, i32, i32)> {
+        let attestation = self.detached_child_attestation();
+        self.spawn_child_powerbox(grants, reservation, attestation)
+    }
+
+    fn spawn_child_powerbox(
+        &mut self,
+        grants: &[(String, i32)],
+        child_size: u64,
+        attestation: Attestation,
+    ) -> Option<(Host, i32, i32)> {
         // Check every handle first — if any is non-grantable the spawn fails closed, before we mutate
         // anything (a partially-built child would leak a promoted sink / installed pipe).
         if !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
@@ -21919,8 +21980,7 @@ impl Host {
         // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
         // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
         ch.self_module = self.self_module.clone();
-        // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation(false));
+        ch.set_attestation(attestation);
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         for (name, handle) in grants {
@@ -24543,8 +24603,9 @@ impl Mem {
     /// The canonical futex rendezvous key for a confined absolute address (PROCESS.md S1b). A §13
     /// `SharedRegion`-aliased (`Backed`) page keys on `(region, byte offset within the region)`, so two
     /// aliases of the same region byte — mapped at different window offsets, in the same or different
-    /// domains — produce the **same** key and rendezvous. A normal anonymous page keys on its absolute
-    /// address (never aliased across domains). This is the wait-queue/`notify` key; the value compare
+    /// domains — produce the **same** key and rendezvous. A normal anonymous page keys on its backing
+    /// identity + absolute address (#1283: the address alone collides across independently-minted
+    /// windows, which all start at base 0). This is the wait-queue/`notify` key; the value compare
     /// still uses the absolute address.
     fn futex_key(&self, base: u64) -> FutexKey {
         if self.has_regions.load(Ordering::Relaxed) {
@@ -24566,7 +24627,14 @@ impl Mem {
                 return FutexKey::Region(ident, region_off + rel % self.page);
             }
         }
-        FutexKey::Anon(base)
+        FutexKey::Anon(self.backing_ident(), base)
+    }
+
+    /// The identity of this window's anonymous backing for the futex key (#1283): the `Arc<Region>`
+    /// allocation address. Equal across every `Mem` that shares the backing (a `thread.spawn` fork, a §14
+    /// `nested_view`), distinct for every independently-minted window (root, detached, fork twin).
+    fn backing_ident(&self) -> u64 {
+        Arc::as_ptr(&self.back) as *const u8 as u64
     }
 
     fn atomic_load(&self, addr: u64, offset: u64, ty: IntTy) -> Result<Value, Trap> {
@@ -25292,12 +25360,23 @@ impl GuestMem for Mem {
     /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). Works
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
-    /// misaligned → `-EINVAL`.
+    /// misaligned → `-EINVAL`. Over a [`Region::Foreign`] (a detached child's own embedder memory,
+    /// #1286) the embedder is asked to grow it to cover the pages first; a refusal (the memory's
+    /// `maximum`) is `-ENOMEM`, probeable, before a byte of protection state changes. (A fixed
+    /// backing shorter than the reservation keeps its #1153 contract: the op succeeds and accesses
+    /// past the backing are dropped/read zero — `region_backing_bound.rs`.)
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
+        if self.back.is_foreign()
+            && !self
+                .back
+                .grow_to(self.window.base() + (pages.end() + 1) * self.page)
+        {
+            return ENOMEM;
+        }
         {
             let mut space = self.space_write();
             for page in pages.clone() {
@@ -26520,6 +26599,32 @@ mod prot_tests {
                 );
             }
         }
+    }
+
+    /// #1283 (PROCESS.md S1c): the anonymous futex key is **per backing**, not per address. Two
+    /// independently-minted windows — the root and a detached child, or two detached siblings — all have
+    /// `window.base() == 0`, so the same guest offset is the same confined absolute address; keying on
+    /// the address alone made them share a wait queue. A §14 nested child shares its parent's backing
+    /// and must keep rendezvousing with it at the same backing-absolute byte.
+    #[test]
+    fn anon_futex_key_is_per_backing() {
+        let off = 2048u64;
+        let a = Mem::with_reservation(20, 12);
+        let b = Mem::with_reservation(20, 12);
+        assert_eq!(a.futex_key(off), a.futex_key(off));
+        assert_ne!(
+            a.futex_key(off),
+            b.futex_key(off),
+            "two independent windows at the same offset must not share a futex queue"
+        );
+        let parent = Mem::with_reservation(20, 17);
+        let child = parent.nested_view(1 << 16, 12);
+        let abs = (1u64 << 16) + 8;
+        assert_eq!(
+            parent.futex_key(abs),
+            child.futex_key(abs),
+            "a nested child shares its parent's backing: same byte, same key"
+        );
     }
 
     /// §14 nesting: a child's `AddressSpace`-style `map`/`unmap` (page protection) now works on a

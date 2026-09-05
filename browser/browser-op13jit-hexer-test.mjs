@@ -49,7 +49,8 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
 const res = await page.evaluate(async () => {
   const par = await import('./par.js');
-  const { driveJitRun } = await import('./wasmjit-module.js');
+  const { driveDetachedRun } = await import('./wasmjit-module.js');
+  const { foreignMemory } = await import('./foreign-mem.js');
   const eng = await par.loadEngine();
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
@@ -75,7 +76,7 @@ const res = await page.evaluate(async () => {
   const push = (bytes) => { const p = Number(ex.temen_alloc(bytes.length)); u8().set(bytes, p); return p; };
   const cp = push(hexerCe), ap = push(argv), sp = push(seeds), op = push(outPath);
   // carve_log2 = 28: hexer's no-GC system lowering peaks ~256 MiB (a small declared window would undersize it).
-  const opened = ex.temen_op13jit_phase_open_argv(cp, hexerCe.length, ap, argv.length, sp, seeds.length, op, outPath.length, 28);
+  const opened = ex.temen_op13jit_phase_open_argv(cp, hexerCe.length, ap, argv.length, sp, seeds.length, op, outPath.length);
   ex.temen_dealloc(cp, hexerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seeds.length); ex.temen_dealloc(op, outPath.length);
   if (opened !== 0) return { err: `phase_open_argv failed: ${opened}` };
 
@@ -84,9 +85,9 @@ const res = await page.evaluate(async () => {
     if (steps++ > 8) { ex.temen_op13jit_close(); return { err: 'loop did not terminate' }; }
     const s = ex.temen_op13jit_step();
     if (s === 0) break;
-    if (s === 1) {
-      try { await driveJitRun(ex, memory, 'op13jit-hexer'); }
-      catch (e) { ex.temen_op13jit_close(); return { err: `driveJitRun: ${String(e && e.message || e)}` }; }
+    if (s === 2) {                  // CHILD_DETACHED (#1288): hexer_ce runs in its own minted Memory
+      try { await driveDetachedRun(ex, memory, foreignMemory(ex.temen_op13jit_child_mem_id()), 'op13jit-hexer'); }
+      catch (e) { ex.temen_op13jit_close(); return { err: `driveDetachedRun: ${String(e && e.message || e)}` }; }
       ex.temen_op13jit_deliver(); drove++; continue;
     }
     ex.temen_op13jit_close();
@@ -112,5 +113,5 @@ console.log('RESULT', JSON.stringify(res, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const ok = !res.err && res.xnifEq && res.emittedLen > 0 && res.expectedLen > 0;
 console.log(`  op13jit-hexer: .x.nif≡=${res.xnifEq} (emitted ${res.emittedLen}B / expected ${res.expectedLen}B) driver=${res.result} childrenDriven=${res.drove}${res.err ? ` · ERR ${res.err}` : ''}`);
-console.log(ok ? 'PASS — real hexer_ce ran nested on the EMITTED tier; .x.nif ≡ committed expected' : 'FAIL');
+console.log(ok ? 'PASS — real hexer_ce ran DETACHED on the EMITTED tier in its own WebAssembly.Memory; .x.nif ≡ committed expected' : 'FAIL');
 process.exit(ok ? 0 : 1);

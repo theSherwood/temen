@@ -11,7 +11,13 @@
 export function engineImports(memory) {
   // `stdout_chunk` is the live-stdout tee seam (`temen_run_onramp_stream`): the page appends each chunk
   // as the guest writes it. Headless probes don't stream, so a no-op stub satisfies the import.
-  const imports = { temen_host: { webgpu_op: () => -1n, stdout_chunk: () => {} } };
+  // #1284 `Region::Foreign`: the threads build imports `temen_host.foreign_*` (detached children's own
+  // memories, `web/foreign-mem.js`). No Node harness registers a foreign memory, so these stubs only have
+  // to satisfy the import — a call would mean a bug, hence they throw. Kept in step with foreign-mem.js.
+  const noForeign = () => { throw new Error('foreign memory access in a harness without foreign-mem.js'); };
+  const foreign = Object.fromEntries(
+    ['foreign_read', 'foreign_write', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow', 'foreign_mint'].map((n) => [n, noForeign]));
+  const imports = { temen_host: { ...foreign, webgpu_op: () => -1n, stdout_chunk: () => {} } };
   if (memory) imports.env = { memory };
   return imports;
 }

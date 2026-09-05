@@ -400,10 +400,15 @@ fn run_crawl(
     seed: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
 ) -> Option<(i64, temen_run::fs::MemFsHandle)> {
+    // One scratch dir per CALL: the three tests in this binary run on parallel threads of one
+    // process, and two of them seed the same number of files, so keying on `(pid, seed.len())` made
+    // them share a dir — one test's `rustc --emit=llvm-ir` then raced the other's (`could not copy
+    // …cgu.0.rcgu.ll to g.ll`) and the loser parsed a half-written `g.ll` (flaky-ci #1294).
+    static CALL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "rust_driver_crawl_cache_{}_{}",
         std::process::id(),
-        seed.len()
+        CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).ok()?;
     let src = dir.join("g.rs");

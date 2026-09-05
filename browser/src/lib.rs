@@ -723,6 +723,18 @@ pub const PAR_TIERUP: i32 = 7;
 /// the scalar cannot represent never surfaces here; it is serviced on the interpreter instead). The
 /// Worker runs the emitted `f{entry}(win, env, …args)` and calls `temen_par_deliver_jit_invoke`/`_trap`.
 pub const PAR_JIT_INVOKE: i32 = 8;
+/// §5 `instantiate_detached` (op 15, #1286 slice 3b): the vCPU spawned a **detached** child — a
+/// separate-module child in its OWN `WebAssembly.Memory`, not a carve of this window. Everything
+/// authority-bearing already happened in-engine (the `Instantiator` resolved, the `WindowMinter` quota
+/// taken, the module compiled + pushed); the Worker mints the child a fresh shared `Memory` (one host
+/// header page + the declared window, growable to `temen_detached_max_bytes()`), seeds it from the
+/// event's segment blob ([`temen_par_det_seed_ptr`]/`_len` — the module's data segments plus the args
+/// payload at `module_args_base()`, each `{off:u64, len:u32, bytes}` after a `u32` count), and posts it
+/// to a new Worker that runs [`temen_par_child_detached`] over it through `Region::Foreign`. Operands:
+/// `temen_par_ev_a` = `(module << 32) | entry`, `_b` = `size_log2`, `_c` = fuel. Joined through the same
+/// completion-slot protocol as [`PAR_INSTANTIATE`]. Children run **concurrently**, each in its own Worker
+/// over its own memory — the reason this is a Worker event and not an in-Rust one.
+pub const PAR_INSTANTIATE_DETACHED: i32 = 9;
 
 /// A boxed resumable vCPU plus the operands of its last [`temen_par_run`] event (flattened to four
 /// `i64`s the host reads via [`temen_par_ev_a`]–[`temen_par_ev_d`]).
@@ -732,6 +744,12 @@ pub struct ParVcpu {
     b: i64,
     c: i64,
     d: i64,
+    /// Built by [`temen_par_child_detached`]: this vCPU's window is a `Region::Foreign` over its own
+    /// `WebAssembly.Memory`, which the Worker-side carve/thread protocols (a `[win + carve)` alias, a
+    /// `thread.spawn` sibling over `win`) cannot address — those events fail closed (`PAR_TRAP`).
+    detached: bool,
+    /// The seed blob of a pending [`PAR_INSTANTIATE_DETACHED`] (format: see the event).
+    det_seed: Vec<u8>,
     /// The marshalled arguments of a pending [`PAR_TIERUP`] event (raw i64 slots) — read by the
     /// Worker via [`temen_par_tierup_argv_ptr`]/[`temen_par_tierup_argv_len`] to call the emitted region.
     tierup_argv: Vec<i64>,
@@ -780,6 +798,8 @@ fn par_box(inner: bytecode::Vcpu<'static>) -> *mut ParVcpu {
         b: 0,
         c: 0,
         d: 0,
+        detached: false,
+        det_seed: Vec::new(),
         tierup_argv: Vec::new(),
         jit_argv: Vec::new(),
         jit_code: 0,
@@ -1331,10 +1351,12 @@ fn par_resolve_unit(
 // is built inside `Vcpu::new_confined_child`, so no authority ever crosses JS (the `PAR_INSTANTIATE`
 // event operands are inert integers).
 
-/// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant.
+/// The §14 run recipe: `Instantiator` authority over `[0, win_size)` + an optional `Module` grant +
+/// an optional `WindowMinter` (#1286: `minter_quota > 0` bytes of detached-window admission).
 struct ParInstCfg {
     win_size: u64,
     module: Option<temen_ir::Module>,
+    minter_quota: u64,
 }
 
 /// The leaked [`ParInstCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1342,12 +1364,15 @@ static PAR_INST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize
 
 /// Publish the §14 run recipe: the root's `Instantiator` will span `[0, win_size)`; a non-empty
 /// `[mod_ptr, mod_len)` is decoded as the **granted module** for `instantiate_module` (`0` len ⇒ no
-/// grant). Returns `1`, or `0` on a bad module. Call once (on the main thread) before the run.
+/// grant); a non-zero `minter_quota` grants the root a `WindowMinter` of that many bytes (#1286 — the
+/// admission for `instantiate_detached`; its handle follows the module's in the root's args). Returns
+/// `1`, or `0` on a bad module. Call once (on the main thread) before the run.
 #[no_mangle]
 pub extern "C" fn temen_par_powerbox_inst(
     win_size: u64,
     mod_ptr: *const u8,
     mod_len: usize,
+    minter_quota: u64,
 ) -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let module = if mod_len == 0 {
@@ -1360,7 +1385,11 @@ pub extern "C" fn temen_par_powerbox_inst(
             Err(_) => return 0,
         }
     };
-    let cfg = Box::into_raw(Box::new(ParInstCfg { win_size, module }));
+    let cfg = Box::into_raw(Box::new(ParInstCfg {
+        win_size,
+        module,
+        minter_quota,
+    }));
     PAR_INST.store(cfg as usize, std::sync::atomic::Ordering::Release);
     // Last-published run recipe wins (a page runs several kinds back to back).
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
@@ -1851,6 +1880,9 @@ pub extern "C" fn temen_par_root(
         if let Some(m) = &cfg.module {
             args.push(Value::I32(host.grant_module(m)));
         }
+        if cfg.minter_quota > 0 {
+            args.push(Value::I32(host.grant_window_minter(cfg.minter_quota)));
+        }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
             unsafe { prog_ref(prog) },
@@ -2027,6 +2059,59 @@ pub extern "C" fn temen_par_child_confined(
     }
 }
 
+/// Build a §5 **detached child** vCPU (#1286 slice 3b) over its own `WebAssembly.Memory`, registered
+/// in this Worker's foreign registry as `mem_id` (`registerForeign(childMem, header)` — region offset 0
+/// is one host header page in, DETACHED_JIT.md §3.1). The operands of a [`PAR_INSTANTIATE_DETACHED`]
+/// event, shuttled verbatim by the JS host, which already seeded the memory from the event's blob. The
+/// window starts at the declared `1 << size_log2` and `vm_map`-grows in place (`Mem::map` →
+/// `Region::grow_to` → `foreign_grow`): the starter caps span the reservation, a root's shape. Same
+/// attenuated powerbox as [`temen_par_child_confined`] — no authority crosses JS. No tier-up: the
+/// emitted tier binds the ONE engine memory, and this window is not in it (the bitmap is inert on a
+/// separate module anyway). Called on the child's Worker; null on a bad module/entry.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_par_child_detached(
+    prog: *mut bytecode::VcpuProgram,
+    mem_id: u32,
+    size_log2: u32,
+    module: u32,
+    entry: u32,
+    fuel: i64,
+) -> *mut ParVcpu {
+    if size_log2 >= 64 || !par_vcpu_admit() {
+        return core::ptr::null_mut();
+    }
+    let back = std::sync::Arc::new(foreign_region(mem_id, 1u64 << size_log2));
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    match bytecode::Vcpu::new_confined_child_grow(
+        unsafe { prog_ref(prog) },
+        module,
+        entry,
+        back,
+        size_log2 as u8,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        fuel as u64,
+    ) {
+        Ok(inner) => {
+            let v = par_box(inner);
+            // SAFETY: freshly boxed, exclusively ours until returned to the Worker.
+            unsafe { (*v).detached = true };
+            v
+        }
+        Err(_) => {
+            par_vcpu_retire();
+            core::ptr::null_mut()
+        }
+    }
+}
+
+/// The ceiling a detached child's minted memory may grow to (bytes, header excluded) — the Worker
+/// sizes the `WebAssembly.Memory`'s `maximum` from it.
+#[no_mangle]
+pub extern "C" fn temen_detached_max_bytes() -> u64 {
+    DETACHED_DEFAULT_MAX_BYTES
+}
+
 /// Pointer / length of the accumulated stdout in the run's shared I/O powerbox (4d). Call `len`
 /// **first** — it snapshots the buffer under the powerbox lock into a stable stash `ptr` then reads —
 /// after the run completes (the root's `done`; a mid-run call sees a prefix). `0` when no
@@ -2147,6 +2232,11 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 arg,
                 module,
             } => {
+                // A detached vCPU's window is not in the shared engine memory the sibling Worker would
+                // alias at `win` (see [`ParVcpu::detached`]): fail closed rather than alias garbage.
+                if v.detached {
+                    return PAR_TRAP;
+                }
                 // Pack `(module << 32) | func` exactly as the INSTANTIATE event does: the spawning
                 // frame's module rides to the child Worker so the child resolves `func` there (an
                 // installed §22 unit spawning its own functions — CONSOLIDATION.md §11).
@@ -2324,6 +2414,11 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 size_log2,
                 fuel,
             } => {
+                // A carve of a detached window is not addressable as `win + carve` in the engine
+                // memory (see [`ParVcpu::detached`]): fail closed.
+                if v.detached {
+                    return PAR_TRAP;
+                }
                 v.a = ((module as i64) << 32) | entry as i64;
                 v.b = carve as i64;
                 v.c = size_log2 as i64;
@@ -2333,6 +2428,42 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
             // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
             bytecode::VcpuEvent::StdinPark => return PAR_TRAP,
+            // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
+            // mints and seeds from this blob, then posts to a new Worker (see
+            // [`PAR_INSTANTIATE_DETACHED`]). The by-name grant list has no path across Workers on this
+            // driver (as the op-13 arm above: a par child runs on its starter caps), so a spawn that
+            // stashed re-granted caps fails closed instead of silently running the child without them.
+            bytecode::VcpuEvent::InstantiateDetached {
+                module,
+                entry,
+                size_log2,
+                fuel,
+                args,
+                data,
+            } => {
+                if v.inner.take_granted_host().is_some() {
+                    return PAR_TRAP;
+                }
+                let mut seed = Vec::new();
+                let segs = data
+                    .iter()
+                    .map(|d| (d.offset, d.bytes.as_slice()))
+                    .chain((!args.is_empty()).then(|| (temen_ir::module_args_base(), &args[..])));
+                seed.extend_from_slice(&0u32.to_le_bytes());
+                let mut n = 0u32;
+                for (off, bytes) in segs {
+                    seed.extend_from_slice(&off.to_le_bytes());
+                    seed.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                    seed.extend_from_slice(bytes);
+                    n += 1;
+                }
+                seed[..4].copy_from_slice(&n.to_le_bytes());
+                v.det_seed = seed;
+                v.a = ((module as i64) << 32) | entry as i64;
+                v.b = size_log2 as i64;
+                v.c = fuel as i64;
+                return PAR_INSTANTIATE_DETACHED;
+            }
         }
     }
 }
@@ -2409,6 +2540,20 @@ pub extern "C" fn temen_par_tierup_pagestate_len(v: *mut ParVcpu) -> usize {
 pub extern "C" fn temen_par_tierup_argv_len(v: *mut ParVcpu) -> usize {
     // SAFETY: `v` is a live `ParVcpu`.
     unsafe { (*v).tierup_argv.len() }
+}
+
+/// The seed blob of a pending [`PAR_INSTANTIATE_DETACHED`]: what the Worker writes into the child's
+/// fresh memory (at `header + off` per record) before posting it. Lives until the next event.
+#[no_mangle]
+pub extern "C" fn temen_par_det_seed_ptr(v: *mut ParVcpu) -> *const u8 {
+    // SAFETY: `v` is a live `ParVcpu`; the buffer lives until the next event overwrites it.
+    unsafe { (*v).det_seed.as_ptr() }
+}
+
+#[no_mangle]
+pub extern "C" fn temen_par_det_seed_len(v: *mut ParVcpu) -> usize {
+    // SAFETY: `v` is a live `ParVcpu`.
+    unsafe { (*v).det_seed.len() }
 }
 
 /// Deliver the results of a tier-up region (after `PAR_TIERUP`): `[results_ptr, n)` are the emitted
@@ -3434,6 +3579,30 @@ pub fn posix_shell_exec_with(
 pub(crate) fn pg_args_blob(argv: &[&[u8]]) -> Vec<u8> {
     // The shared powerbox args-buffer layout (#912); the Postgres on-ramp passes no environment.
     temen_ir::write_args_blob(argv, &[])
+}
+
+/// The window prefix that seeds `argv` where a `_start` reads it: zeros up to `module_args_base()`,
+/// then the [`pg_args_blob`]. Shared by the detached JIT run and its interpreter oracle (#1285).
+pub(crate) fn args_init_mem(argv: &[&[u8]]) -> Vec<u8> {
+    let blob = pg_args_blob(argv);
+    let base = temen_ir::module_args_base() as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(&blob);
+    init_mem
+}
+
+/// [`args_init_mem`] for an already-built args blob (the op-15 spawn-time payload, #1286): zeros up to
+/// `module_args_base()`, then the blob verbatim. An empty payload seeds nothing. Used by the wasm32
+/// threads-build servicer only (dead on native).
+#[allow(dead_code)]
+pub(crate) fn args_init_mem_raw(blob: &[u8]) -> Vec<u8> {
+    if blob.is_empty() {
+        return Vec::new();
+    }
+    let base = temen_ir::module_args_base() as usize;
+    let mut init_mem = vec![0u8; base + blob.len()];
+    init_mem[base..].copy_from_slice(blob);
+    init_mem
 }
 
 /// Shared Postgres powerbox setup (used by the one-shot [`pg_exec`] and the persistent [`PgSession`]):
@@ -5479,6 +5648,16 @@ enum RunInput {
         /// guest (chibicc), whose handle is dropped.
         readback: Option<String>,
     },
+    /// A **detached child** run (#1285, DETACHED_JIT.md §3): the on-ramp powerbox (as `Stdin`) plus
+    /// `argv` seeded at `module_args_base()` — the spawn-time args payload a detached child needs because
+    /// the op-13 convention (a parent data segment landing inside the child's carve) has no analogue
+    /// across memories. The window is the child's own foreign memory (`open_foreign_run`). Constructed
+    /// only by the wasm32 threads-build FFI (`temen_detached_jit_run_open`); dead on native.
+    #[allow(dead_code)]
+    Detached {
+        stdin: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+    },
     /// A **caller-provided granted powerbox** (#1025 Path 1) — the run executes its emitted `_start` over
     /// `host` verbatim instead of building the on-ramp powerbox from stdin/an fs image. This is what an
     /// op-13 nested phase child uses: its `host` is the powerbox the parent marshaled across the
@@ -5522,7 +5701,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5626,6 +5804,41 @@ impl JitOnrampRun {
         )
     }
 
+    /// Open a single-shot JIT run over a **detached child's own memory** (#1285, DETACHED_JIT.md §3.1):
+    /// the page-registered foreign memory `mem_id` (`web/foreign-mem.js`), addressed through
+    /// `Region::Foreign`. The child's window starts one host header page into that memory (`win` =
+    /// [`DETACHED_HEADER_BYTES`]; the header holds the emitted tier's `env` cell and `pagestate`, unreachable
+    /// by the guest since every span is checked against `"mapped"` before `win` is added). The memory is
+    /// grown here to the module's declared window and later by each `vm_map` bounce
+    /// ([`run_cross_tier`](Self::run_cross_tier)). No `Shared` alias, no carve: the parent cannot address a
+    /// byte of it.
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    pub(crate) fn open_foreign_run(
+        m: &temen_ir::Module,
+        mem_id: u32,
+        shared_memory: bool,
+        input: RunInput,
+        cached: Option<CachedEmit>,
+    ) -> Result<JitOnrampRun, i32> {
+        let size_log2 = m.memory.map(|mc| mc.size_log2).ok_or(STATUS_UNSUPPORTED)?;
+        let declared = 1u64 << size_log2;
+        let back = std::sync::Arc::new(foreign_region(mem_id, 0));
+        if !back.grow_to(declared) {
+            return Err(STATUS_UNSUPPORTED);
+        }
+        Self::open_over_run(
+            m,
+            back,
+            None,
+            declared,
+            DETACHED_HEADER_BYTES as usize,
+            size_log2,
+            shared_memory,
+            input,
+            cached,
+        )
+    }
+
     /// The run's cached-emit products, cheaply `Arc`-cloned for the nifler emit cache (#1011 slice 1).
     fn cached_emit(&self) -> CachedEmit {
         (
@@ -5667,7 +5880,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5706,7 +5918,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5747,7 +5958,6 @@ impl JitOnrampRun {
             m,
             back,
             None,
-            win_ptr,
             win_size,
             win_base,
             win_log2,
@@ -5800,7 +6010,6 @@ impl JitOnrampRun {
             m,
             back,
             Some(backing),
-            ptr,
             win_size,
             win_base,
             win_log2,
@@ -5877,7 +6086,6 @@ impl JitOnrampRun {
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
         backing: Option<Box<[u8]>>,
-        win_ptr: *mut u8,
         win_size: u64,
         win_base: usize,
         win_log2: u8,
@@ -5938,6 +6146,15 @@ impl JitOnrampRun {
                 let fs_readback = readback.map(|key| (fsh, key));
                 (host, init_mem, frame, fs_readback, 0, 0)
             }
+            RunInput::Detached { stdin, argv } => {
+                // The on-ramp powerbox, exactly as `Stdin`, plus argv at the module's args base — the
+                // one thing a detached child cannot receive in-band (#1285).
+                let mut host = Host::new();
+                host.stdin = stdin;
+                let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
+                let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+                (host, args_init_mem(&refs), frame, None, 0, 0)
+            }
             RunInput::PreGranted {
                 host,
                 init_mem,
@@ -5974,18 +6191,17 @@ impl JitOnrampRun {
         // instantiation; the emitted `_start` seeds only the heap + stashes handles): first the argv
         // prefix (`init_mem`, empty for stdin), then `.data`/`.rodata`. Data segments start at the
         // module's data page (65 KiB), so they never overlap the argv prefix at POWERBOX_ARGS_BASE.
-        // SAFETY: `[win_ptr, win_size)` is a live window (owned backing or the caller's linear memory).
-        unsafe {
-            let win = core::slice::from_raw_parts_mut(win_ptr, win_size as usize);
-            if init_mem.len() <= win.len() {
-                win[..init_mem.len()].copy_from_slice(&init_mem);
-            }
-            for seg in &module.data {
-                let off = seg.offset as usize;
-                let end = off.saturating_add(seg.bytes.len());
-                if end <= win.len() {
-                    win[off..end].copy_from_slice(&seg.bytes);
-                }
+        // Through the backing, not a raw pointer: a detached child's backing is a foreign memory this
+        // cdylib cannot address (#1285); for a flat backing `write_from` is the same memcpy.
+        let win_len = back.len();
+        if init_mem.len() as u64 <= win_len {
+            back.write_from(0, &init_mem);
+        }
+        for seg in &module.data {
+            let off = seg.offset;
+            let end = off.saturating_add(seg.bytes.len() as u64);
+            if end <= win_len {
+                back.write_from(off, &seg.bytes);
             }
         }
         // #1153 growth state. `mapped` starts at the guest's declared extent (the emitted `"mapped"`
@@ -6216,6 +6432,13 @@ impl JitOnrampRun {
                     self.prots = None;
                     return Err(Trap::CapFault);
                 }
+            }
+            // #1285: a detached child's backing is its own foreign memory — grow it to cover the new
+            // committed extent (the interpreter bounds accesses to the backing, #1191; the emitted tier
+            // to `"mapped"`). A refused grow fails the run closed rather than running short.
+            if self.back.is_foreign() && !self.back.grow_to(self.mapped) {
+                self.prots = None;
+                return Err(Trap::CapFault);
             }
             r
         } else {
@@ -8770,6 +8993,7 @@ pub extern "C" fn temen_onramp_jit_run_close() {
 /// Step codes [`temen_op13jit_step`] returns to the JS loop.
 pub const OP13JIT_DONE: i32 = 0; // the driver returned — its result is in `temen_op13jit_result`
 pub const OP13JIT_CHILD: i32 = 1; // an op-13 child is staged in `JIT_RUN` — JS drives it, then `_deliver`
+pub const OP13JIT_CHILD_DETACHED: i32 = 2; // #1286: a DETACHED child is staged — JS `driveDetachedRun`s it over `temen_op13jit_child_mem_id()`'s Memory, then `_deliver`
 pub const OP13JIT_TRAP: i32 = -1; // the driver (or a child spawn) trapped
 
 /// A live JS-orchestrated op-13 driver: the resumable driver vCPU over its linear-memory window, plus the
@@ -8792,6 +9016,9 @@ struct Op13JitDriver {
     /// Identity of the child module (`nifler_module_key`), so the step reuses the cached emit across a
     /// crawl's many `phase_open`s (the ~15 s nifler_ce emit runs once). `0` for the built-in mini child.
     child_key: u64,
+    /// #1286: the foreign-memory id of the **detached** child currently staged (`OP13JIT_CHILD_DETACHED`),
+    /// `-1` otherwise — JS looks the child's `WebAssembly.Memory` up by it to drive the run.
+    child_mem_id: i32,
 }
 static mut OP13_JIT: Option<Op13JitDriver> = None;
 
@@ -8892,10 +9119,43 @@ pub unsafe extern "C" fn temen_op13jit_open_child(ptr: *const u8, len: usize) ->
 }
 
 fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
-    temen_op13jit_close();
     let Ok(driver) = temen_text::parse_module(OP13_MINI_DRIVER) else {
         return -STATUS_DECODE_ERR;
     };
+    op13jit_open_driver(driver, child, false)
+}
+
+/// [`temen_op13jit_open`] over a **caller-provided driver AND child** for the detached spawn (#1286): the
+/// driver's entry is `(Instantiator, Module, WindowMinter) -> i64` — the third handle a 1 GiB-quota
+/// `WindowMinter` instead of the mini driver's `"fs"` (still granted + registered by name). A driver that
+/// issues op 15 stages the child as [`OP13JIT_CHILD_DETACHED`].
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled (or any readable byte range
+/// for a native caller).
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_open_detached(
+    driver_ptr: *const u8,
+    driver_len: usize,
+    child_ptr: *const u8,
+    child_len: usize,
+) -> i32 {
+    let driver = std::slice::from_raw_parts(driver_ptr, driver_len);
+    let child = std::slice::from_raw_parts(child_ptr, child_len);
+    let (Ok(driver), Ok(child)) = (
+        temen_encode::decode_module(driver),
+        temen_encode::decode_module(child),
+    ) else {
+        return -STATUS_DECODE_ERR;
+    };
+    op13jit_open_driver(driver, child, true)
+}
+
+/// The op-13 loop's common open: verify, compile the driver, grant the powerbox (`Instantiator` over the
+/// driver's `memory 16` window, the child `Module`, the forkable `"fs"` counter, and — `minter` — a
+/// `WindowMinter`), allocate the window, stand up the resumable root with `(inst, modh, fs | minter)`.
+fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter: bool) -> i32 {
+    temen_op13jit_close();
     if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
     {
         return -STATUS_VERIFY_ERR;
@@ -8929,6 +9189,13 @@ fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
     let modh = host.grant_module(&child);
     let fs_h = host.grant_host_proc_forkable(handler, fork);
     host.register_cap_name("fs", fs_h);
+    // #1286: the detached driver's third entry arg is a `WindowMinter` (byte quota = the default
+    // per-child memory ceiling) rather than the `"fs"` handle.
+    let third = if minter {
+        host.grant_window_minter(DETACHED_DEFAULT_MAX_BYTES)
+    } else {
+        fs_h
+    };
 
     let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
         unsafe { drop(Box::from_raw(prog)) };
@@ -8946,7 +9213,7 @@ fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
     let root = match bytecode::Vcpu::new_root_with_powerbox(
         unsafe { &*prog },
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(fs_h)],
+        &[Value::I32(inst), Value::I32(modh), Value::I32(third)],
         std::sync::Arc::clone(&back),
         &[],
         host,
@@ -8973,6 +9240,7 @@ fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
             fsh: None,
             readback: None,
             child_key: 0,
+            child_mem_id: -1,
         });
     }
     STATUS_OK
@@ -8980,7 +9248,7 @@ fn op13jit_open_mini(child: temen_ir::Module) -> i32 {
 
 /// **Open the op-13 loop over a real phase child** (#1025 Path 1 scaling to nifler): decode the
 /// child-entry phase module `child` (nifler_ce), mount a shared memfs seeded with `src` at `file`, build
-/// the real `nimc::op13_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
+/// the real `nimc::detached_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
 /// grant it `{fs, stdout, exit}` + the child `Module` + an `Instantiator`, and stand up the resumable
 /// root over a linear-memory window. Drive with [`temen_op13jit_step`] (which does the child-entry setup
 /// and runs the child EMITTED over its carve); after `OP13JIT_DONE`, read the produced `.p.nif` with
@@ -9020,7 +9288,6 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             &argv,
             vec![(file_key, src)],
             readback,
-            0,
             None,
         )
     }
@@ -9030,15 +9297,14 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
 /// `--child-entry` phase (nifler, hexer, …) on emitted wasm. `argv_packed` = `[argc: u32][per arg:
 /// len: u32, utf8 bytes]`; `seed_packed` = `[count: u32][per file: name_len: u32, name, data_len: u32,
 /// data]` (files seeded into the shared memfs at their **relative** keys — the child reads its inputs
-/// from them); `out` = the memfs key to read back with [`temen_op13jit_phase_output`]. `carve_log2` is
-/// the child's carve size (`0` = the nifler-default `(declared+3).max(24)` heuristic; a heavy phase like
-/// hexer passes `28` for its ~256 MiB peak). Drive exactly like [`temen_op13jit_phase_open`]. (nimsem's
-/// 4-cap `exec` form — spawning nifler grandchildren — is a separate driver.) Returns `0` or a negative
-/// status.
+/// from them); `out` = the memfs key to read back with [`temen_op13jit_phase_output`]. The phase runs
+/// **detached** in its own memory (#1288) — there is no carve size to pass; a heavy phase (hexer's ~256
+/// MiB peak) simply grows. Drive exactly like [`temen_op13jit_phase_open`]. (nimsem's 4-cap `exec` form
+/// — spawning nifler grandchildren — is a separate driver.) Returns `0` or a negative status.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
-#[allow(clippy::too_many_arguments)] // an FFI ABI: packed (ptr,len) pairs + carve size
+#[allow(clippy::too_many_arguments)] // an FFI ABI: packed (ptr,len) pairs
 #[no_mangle]
 pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
     child_ptr: *const u8,
@@ -9049,7 +9315,6 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
     seed_len: usize,
     out_ptr: *const u8,
     out_len: usize,
-    carve_log2: u32,
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
@@ -9063,16 +9328,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
         .trim_start_matches('/')
         .to_string();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    unsafe {
-        op13_phase_open_impl(
-            sl(child_ptr, child_len),
-            &argv_refs,
-            seeds,
-            readback,
-            carve_log2,
-            None,
-        )
-    }
+    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, None) }
 }
 
 /// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
@@ -9081,11 +9337,11 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 /// `HOST_PROC`, so nimsem-emitted's `exec` call bounces to `call_interp` over the granted host exactly
 /// like `fs`; the nifler sub-spawns run host-side while nimsem's **sema** (the dominant cost) tiers up.
 /// `nifler` is the top-level nifler module the exec spawns. Everything else matches `phase_open_argv`
-/// (packed argv/seeds, output key, `carve_log2` — nimsem passes `28` for its ~256 MiB peak).
+/// (packed argv/seeds, output key); nimsem's ~256 MiB peak grows in its own detached memory (#1288).
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
-#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs + carve size
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
 #[no_mangle]
 pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     child_ptr: *const u8,
@@ -9098,7 +9354,6 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     seed_len: usize,
     out_ptr: *const u8,
     out_len: usize,
-    carve_log2: u32,
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
@@ -9124,7 +9379,6 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
             &argv_refs,
             seeds,
             readback,
-            carve_log2,
             Some(std::sync::Arc::new(nifler)),
         )
     }
@@ -9177,10 +9431,13 @@ fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 /// Shared core of the op-13 tier-up phase drivers: decode+verify the `--child-entry` phase module,
-/// seed `seeds` into a shared memfs, build the 3-cap `{fs, stdout, exit}` `nimc::op13_parent_src`
+/// seed `seeds` into a shared memfs, build the `{fs, stdout, exit[, exec]}` `nimc::detached_parent_src`
 /// driver over `argv`, and stand up the resumable root the JS loop ([`temen_op13jit_step`]) drives —
-/// emitting the child to wasm. `readback` is the memfs key [`temen_op13jit_phase_output`] returns.
-/// Phase-agnostic: nifler, hexer, and any other 3-cap phase differ only in `argv`/`seeds`/`readback`.
+/// the phase runs **detached** (#1288): the servicer mints it its own `WebAssembly.Memory`, emits it and
+/// stages [`OP13JIT_CHILD_DETACHED`]. No carve, no `PHASE_CARVE_MAX`: the child grows into its own memory
+/// (bounded by its `maximum`), and the driver window is 64 KiB of grant records. `readback` is the memfs
+/// key [`temen_op13jit_phase_output`] returns. Phase-agnostic: nifler, hexer, nimsem differ only in
+/// `argv`/`seeds`/`readback`/`exec_nifler`.
 ///
 /// # Safety
 /// `child_bytes` must be a live slice for the duration of the call.
@@ -9189,7 +9446,6 @@ unsafe fn op13_phase_open_impl(
     argv: &[&str],
     seeds: Vec<(String, Vec<u8>)>,
     readback: String,
-    carve_log2: u32,
     exec_nifler: Option<std::sync::Arc<temen_ir::Module>>,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
@@ -9199,6 +9455,9 @@ unsafe fn op13_phase_open_impl(
     if temen_verify::verify_module(&child).is_err() {
         return -STATUS_VERIFY_ERR;
     }
+    let Some(decl) = child.memory.as_ref().map(|m| m.size_log2) else {
+        return -STATUS_UNSUPPORTED;
+    };
 
     // The shared memfs the child reads its inputs from + writes its output into. Typed as the `dyn`
     // factory (nimc's `FsFactory`) so it re-grants to the child AND feeds `make_exec` (the exec cap).
@@ -9206,16 +9465,6 @@ unsafe fn op13_phase_open_impl(
     let factory: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
         std::sync::Arc::new(factory);
 
-    // The real phase driver (mirrors nimc::run_phase_op13): a buddy-half carve sized for the phase heap.
-    // `carve_log2 == 0` → the nifler-default `(declared+3).max(24)`; else the caller-supplied size (e.g.
-    // hexer's 28 for its ~256 MiB peak — its small declared window would otherwise undersize the carve).
-    let decl = child.memory.as_ref().map_or(24, |m| u32::from(m.size_log2));
-    let child_sl = if carve_log2 == 0 {
-        (decl + 3).max(24)
-    } else {
-        carve_log2.max(decl)
-    };
-    let carve_off = 1u64 << child_sl;
     // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
     // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
     // exactly like `fs`, so its nifler sub-spawns run host-side while the phase's own compute tiers up.
@@ -9224,13 +9473,7 @@ unsafe fn op13_phase_open_impl(
     } else {
         &["fs", "stdout", "exit"]
     };
-    let driver_src = nimc::op13_parent_src(
-        child_sl,
-        carve_off,
-        temen_ir::module_args_base(),
-        argv,
-        caps,
-    );
+    let driver_src = nimc::detached_parent_src(decl, argv, caps);
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
         return -STATUS_DECODE_ERR;
     };
@@ -9251,14 +9494,17 @@ unsafe fn op13_phase_open_impl(
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let win = 1u64 << (child_sl + 1);
+    let win = 1u64 << 16; // the driver's own window: grant records + the args blob
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
-    // Grant args in the order the parent's params expect: inst, module, then the caps. The exec (when
-    // present) is granted forkable so op-13's `regrant_into_child` can carry it (`can_regrant`).
+    // The minter's quota is the mint (the declared window); the minted memory's `maximum` bounds growth.
+    let minter = host.grant_window_minter(1u64 << decl);
+    // Grant args in the order the parent's params expect: inst, module, minter, then the caps. The exec
+    // (when present) is granted forkable so op-15's `regrant_into_child` can carry it (`can_regrant`).
     let mut grant_args = vec![
         Value::I32(inst),
         Value::I32(modh),
+        Value::I32(minter),
         Value::I32(fs_h),
         Value::I32(stdout_h),
         Value::I32(exit_h),
@@ -9287,8 +9533,8 @@ unsafe fn op13_phase_open_impl(
         unsafe { drop(Box::from_raw(prog)) };
         return -STATUS_UNSUPPORTED;
     };
-    // SAFETY: non-zero 8-aligned layout; owned until close. Linear-memory backed so the emitted child
-    // (and JS driver) can access it.
+    // SAFETY: non-zero 8-aligned layout; owned until close. The driver's 64 KiB window (the child's is
+    // its own minted memory, #1288).
     let mem_base = unsafe { std::alloc::alloc_zeroed(layout) };
     if mem_base.is_null() {
         unsafe { drop(Box::from_raw(prog)) };
@@ -9325,6 +9571,7 @@ unsafe fn op13_phase_open_impl(
             fsh: Some(handle),
             readback: Some(readback),
             child_key,
+            child_mem_id: -1,
         });
     }
     STATUS_OK
@@ -9436,10 +9683,14 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             let back = std::sync::Arc::new(unsafe {
                                 temen_interp::Region::shared(carve_ptr, child_size)
                             });
-                            let r = match bytecode::Vcpu::new_confined_child_over_host(
-                                prog, module, entry, back, size_log2, fuel, host,
+                            // #1253: the interpreter twin of the emitted phase child — `mapped` starts
+                            // at the child's declared window over the carve-sized backing, exactly as
+                            // the emit's `"mapped"` does, so the decline runs byte-identical.
+                            let decl = d.child.memory.as_ref().map_or(size_log2, |m| m.size_log2);
+                            let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
+                                prog, module, entry, back, decl, size_log2, fuel, host,
                             ) {
-                                Ok(c) => nimc::drive_op13(prog, carve_ptr, c),
+                                Ok(c) => nimc::drive_op13(prog, carve_ptr, c, None),
                                 Err(t) => Err(t),
                             };
                             let handle = d.children.len() as i32;
@@ -9499,6 +9750,123 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Err(_) => return OP13JIT_TRAP,
                 }
             }
+            // #1286 — a DETACHED child (op 15): its window is a fresh `WebAssembly.Memory` the page mints
+            // (`foreign_mint`), reached only through `Region::Foreign`; the emitted `_start` runs bound to
+            // that memory (`driveDetachedRun`). No carve, no alias — the driver cannot address a byte of
+            // it. Same powerbox shape as the op-13 arm (starter caps over the declared window, the child
+            // manifest bound), plus the spawn-time args payload seeded at `module_args_base()`.
+            #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+            bytecode::VcpuEvent::InstantiateDetached {
+                module,
+                entry,
+                size_log2,
+                fuel,
+                args,
+                data: _, // this servicer holds the decoded child (`d.child.data`) already
+            } => {
+                // A grant-less spawn (`grants_n == 0`) stashes no powerbox: the child gets a fresh one.
+                let mut host = d.root.take_granted_host().unwrap_or_default();
+                let child_size = 1u64 << size_log2;
+                host.set_attestation(temen_interp::Attestation {
+                    tier: 1,
+                    window_exposed: false,
+                    freeze_exposed: false,
+                });
+                // Starter caps span the reservation (a root's shape; the tree-walker's op-15 arm grants
+                // the same): a detached child has no carve, and bounding `AddressSpace` to the declared
+                // window would refuse the `vm_map` growth it exists for. Growth is bounded by the minted
+                // memory's `maximum`.
+                let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
+                let cinst = host.grant_instantiator(0, reservation);
+                let cas = host.grant_address_space(0, reservation);
+                if host
+                    .bind_child_manifest(&d.child.imports, &d.child.types)
+                    .is_err()
+                {
+                    return OP13JIT_TRAP;
+                }
+                let init_mem = args_init_mem_raw(&args);
+                let cached = if d.child_key != 0 {
+                    unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
+                        .filter(|c| c.key == d.child_key)
+                        .map(|c| c.emit.clone())
+                } else {
+                    None
+                };
+                let had_cache = cached.is_some();
+                let emit = match cached {
+                    Some(c) => c,
+                    None => match JitOnrampRun::emit_for_run(&d.child, true) {
+                        Ok(e) => e,
+                        Err(_) => {
+                            // #1151 decline → the interpreter twin over a private sparse backing (the
+                            // child never enters the emitted tier, so it needs no JS-owned memory): seed
+                            // the segments + payload, run it to completion, bank the result.
+                            let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
+                            let back = std::sync::Arc::new(temen_interp::Region::paged(
+                                1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                                temen_interp::host_page_size(),
+                            ));
+                            for seg in &d.child.data {
+                                back.write_from(seg.offset, &seg.bytes);
+                            }
+                            back.write_from(0, &init_mem);
+                            let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
+                                prog,
+                                module,
+                                entry,
+                                back,
+                                size_log2,
+                                temen_ir::DEFAULT_RESERVED_LOG2,
+                                fuel,
+                                host,
+                            ) {
+                                Ok(c) => drive_detached_leaf(c),
+                                Err(t) => Err(t),
+                            };
+                            let handle = d.children.len() as i32;
+                            d.children.push(r);
+                            d.root.deliver_handle(handle);
+                            continue;
+                        }
+                    },
+                };
+                let Some(mem_id) = foreign_mem::mint(
+                    DETACHED_HEADER_BYTES + child_size,
+                    DETACHED_HEADER_BYTES + DETACHED_DEFAULT_MAX_BYTES,
+                ) else {
+                    return OP13JIT_TRAP;
+                };
+                let _ = entry;
+                match JitOnrampRun::open_foreign_run(
+                    &d.child,
+                    mem_id,
+                    true,
+                    RunInput::PreGranted {
+                        host: Box::new(host),
+                        init_mem,
+                        readback: None,
+                        entry_sp: cinst as u64,
+                        entry_as: cas as u64,
+                    },
+                    Some(emit),
+                ) {
+                    Ok(r) => {
+                        if !had_cache && d.child_key != 0 {
+                            unsafe {
+                                *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = Some(Op13ChildEmit {
+                                    key: d.child_key,
+                                    emit: r.cached_emit(),
+                                });
+                            }
+                        }
+                        unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+                        d.child_mem_id = mem_id as i32;
+                        return OP13JIT_CHILD_DETACHED;
+                    }
+                    Err(_) => return OP13JIT_TRAP,
+                }
+            }
             bytecode::VcpuEvent::Join { handle } => {
                 let banked = d
                     .children
@@ -9510,6 +9878,29 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             }
             _ => return OP13JIT_TRAP,
         }
+    }
+}
+
+/// Run a declined **detached** child to completion on the interpreter (#1286): a leaf — it may `join`
+/// nothing and spawn nothing (a detached child that itself spawns is out of this fallback's scope and
+/// fails closed), so only `Done`/`Trapped` are expected.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap> {
+    match vcpu.run() {
+        bytecode::VcpuEvent::Done(v) => Ok(v),
+        bytecode::VcpuEvent::Trapped(t) => Err(t),
+        _ => Err(Trap::Malformed),
+    }
+}
+
+/// The foreign-memory id of the detached child staged by the last [`OP13JIT_CHILD_DETACHED`] step
+/// (`-1` if none) — JS resolves it to the child's `WebAssembly.Memory` for `driveDetachedRun`.
+#[no_mangle]
+pub extern "C" fn temen_op13jit_child_mem_id() -> i32 {
+    unsafe {
+        (*core::ptr::addr_of!(OP13_JIT))
+            .as_ref()
+            .map_or(-1, |d| d.child_mem_id)
     }
 }
 
@@ -12792,46 +13183,323 @@ block 0 () {
         let out = c.wait_with_output().ok()?;
         out.status.success().then_some(out.stdout)
     }
+}
 
-    #[test]
-    fn op13jit_phase_open_stages_a_real_nifler_child() {
-        // Scaling to a real phase child: `temen_op13jit_phase_open` builds the real nimc::op13_parent_src
-        // driver over nifler_ce (child-entry) + a memfs seeded with a source, and the first `_step` marshals
-        // {fs, stdout, exit}, does the child-entry setup (starter caps + manifest bind + cinst arg), and
-        // **emits** nifler_ce over its carve — returning OP13JIT_CHILD. This validates the whole driver +
-        // marshal + child-entry-setup + emit path host-side (the emitted RUN itself is the Chromium leg,
-        // browser-op13jit-nifler-test.mjs). SKIPs if the committed nifler_ce asset / gzip is unavailable.
-        let Some(nifler_ce) = inflate("../crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz")
-        else {
-            eprintln!("SKIP: nifler_ce.temen.gz unavailable / gzip missing");
-            return;
-        };
-        let file = b"/prog.nim";
-        let out = b"/nimcache/prog.p.nif";
-        let src = b"import std/syncio\n\nwrite(stdout, \"hi\\n\")\n";
-        let st = unsafe {
-            temen_op13jit_phase_open(
-                nifler_ce.as_ptr(),
-                nifler_ce.len(),
-                file.as_ptr(),
-                file.len(),
-                out.as_ptr(),
-                out.len(),
-                src.as_ptr(),
-                src.len(),
-            )
-        };
-        assert_eq!(st, STATUS_OK, "phase_open built the driver + memfs");
-        let step = temen_op13jit_step();
-        assert_eq!(
-            step, OP13JIT_CHILD,
-            "the driver marshaled {{fs,stdout,exit}}, set up the child-entry, and emitted nifler_ce (staged)"
-        );
-        // The staged run holds the emitted nifler_ce; the emitted RUN is the Chromium leg.
-        assert!(
-            unsafe { (*core::ptr::addr_of!(JIT_RUN)).is_some() },
-            "nifler_ce is staged in JIT_RUN"
-        );
-        temen_op13jit_close();
+// ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================
+// A detached child's window on the wasm-JIT tier is its own `WebAssembly.Memory`, which this cdylib
+// cannot address (its pointers are offsets into ITS one linear memory). `temen_mem::Region::Foreign`
+// reaches such a memory through a `ForeignOps` table; here the table is the page's
+// `temen_host.foreign_*` imports (`web/foreign-mem.js`), all-`u32` (offsets are bounded by `Region`
+// first, and a child memory is < 4 GiB by wasm32 construction; atomics pass operands through a 16-byte
+// cell in this memory so no `i64`/BigInt crosses the import). Threads build only (the plain build has
+// no Workers and no detached children, and stays import-free for its Node harnesses).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+mod foreign_mem {
+    use temen_mem::ForeignOps;
+
+    #[link(wasm_import_module = "temen_host")]
+    extern "C" {
+        fn foreign_read(id: u32, off: u32, dst: *mut u8, len: u32);
+        fn foreign_write(id: u32, off: u32, src: *const u8, len: u32);
+        fn foreign_fill(id: u32, off: u32, len: u32, b: u32);
+        fn foreign_copy(id: u32, dst: u32, src: u32, len: u32);
+        fn foreign_atomic(id: u32, kind: u32, off: u32, width: u32, ab: *mut u8);
+        fn foreign_grow(id: u32, len: u32) -> u32;
+        fn foreign_mint(base: u32, initial: u32, maximum: u32) -> i32;
     }
+
+    /// Mint a fresh child memory on the page (#1286): `initial`/`maximum` bytes **including** the host
+    /// header, registered with the header as the region's base. `None` if the page refused (the
+    /// `WebAssembly.Memory` constructor threw — address-space / limits).
+    pub fn mint(initial: u64, maximum: u64) -> Option<u32> {
+        let (Ok(i), Ok(m)) = (u32::try_from(initial), u32::try_from(maximum)) else {
+            return None;
+        };
+        // SAFETY: no cdylib memory is touched.
+        let id = unsafe { foreign_mint(super::DETACHED_HEADER_BYTES as u32, i, m) };
+        u32::try_from(id).ok()
+    }
+
+    fn read(id: u32, off: u64, out: &mut [u8]) {
+        // SAFETY: `out` is a live cdylib buffer of `out.len()` bytes; JS copies exactly that many in.
+        unsafe { foreign_read(id, off as u32, out.as_mut_ptr(), out.len() as u32) }
+    }
+    fn write(id: u32, off: u64, data: &[u8]) {
+        // SAFETY: `data` is a live cdylib buffer; JS reads exactly `data.len()` bytes from it.
+        unsafe { foreign_write(id, off as u32, data.as_ptr(), data.len() as u32) }
+    }
+    fn fill(id: u32, off: u64, len: u64, b: u8) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_fill(id, off as u32, len as u32, b as u32) }
+    }
+    fn copy_within(id: u32, dst: u64, src: u64, len: u64) {
+        // SAFETY: no cdylib memory is touched.
+        unsafe { foreign_copy(id, dst as u32, src as u32, len as u32) }
+    }
+    fn atomic(id: u32, kind: u32, off: u64, width: u32, a: u64, b: u64) -> u64 {
+        let mut ab = [0u8; 16];
+        ab[..8].copy_from_slice(&a.to_le_bytes());
+        ab[8..].copy_from_slice(&b.to_le_bytes());
+        // SAFETY: `ab` is a live 16-byte cdylib buffer; JS reads both operands and writes the old value
+        // into its first 8 bytes.
+        unsafe { foreign_atomic(id, kind, off as u32, width, ab.as_mut_ptr()) };
+        u64::from_le_bytes(ab[..8].try_into().unwrap())
+    }
+
+    fn grow(id: u32, len: u64) -> bool {
+        // SAFETY: no cdylib memory is touched. A child memory is < 4 GiB by wasm32 construction.
+        u32::try_from(len).is_ok_and(|l| unsafe { foreign_grow(id, l) } != 0)
+    }
+
+    /// The one table every `Region::foreign` in this cdylib uses.
+    pub static OPS: ForeignOps = ForeignOps {
+        read,
+        write,
+        fill,
+        copy_within,
+        atomic,
+        grow,
+    };
+}
+
+/// The host header at the bottom of a detached child's memory (#1285): one wasm page holding the
+/// emitted tier's `env` bounce cell (at 0) and, for a paged run, its `pagestate` table (at
+/// [`DETACHED_PAGESTATE_OFF`]). The guest window starts here (`win`), so the header is unreachable by
+/// the guest (spans are bounded by `"mapped"` before `win` is added) and never moves on `memory.grow`.
+pub const DETACHED_HEADER_BYTES: u64 = 65536;
+/// Where the paged run's page-state table lives inside the header (after the `env` cell).
+pub const DETACHED_PAGESTATE_OFF: u64 = 4096;
+/// The default `maximum` of a minted detached child memory (its guest window, excluding the header),
+/// and the byte quota the op-13 loop's `WindowMinter` carries: 1 GiB, the engine's own ceiling. V8
+/// reserves a shared memory's `maximum` as address space, so this bounds per-child reservation; the
+/// #1286 V8-limits probe decides whether it should derive from the spawn instead.
+pub const DETACHED_DEFAULT_MAX_BYTES: u64 = 1 << 30;
+
+/// A `Region::Foreign` over the page-registered memory `id` with `len` addressable bytes.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+pub fn foreign_region(id: u32, len: u64) -> temen_mem::Region {
+    temen_mem::Region::foreign(id, len, &foreign_mem::OPS)
+}
+
+/// **Self-test** of the Foreign seam over a real second `WebAssembly.Memory`: `temen_mem::differential`
+/// — `ops` seeded random operations (mixed atomics, words, bytes, bulk zero/fill/overlapping copy,
+/// out-of-range) — the proxied region vs the safe `Paged` reference. Returns 0 when every op and the
+/// final images agree; otherwise 1 with the first divergence in the stdout stash (`temen_stdout_ptr`).
+/// The browser-side twin of `differential_foreign_vs_paged_fuzz` (mock ops).
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_selftest(id: u32, size: u32, ops: u32) -> u32 {
+    let page = 4096u64;
+    let a = foreign_region(id, size as u64);
+    let b = temen_mem::Region::paged(size as u64, page);
+    match temen_mem::differential(
+        &a,
+        &b,
+        size as u64,
+        page,
+        ops as usize,
+        0x1284_c0ff_ee00_0001,
+    ) {
+        Ok(()) => 0,
+        Err(msg) => {
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), msg.into_bytes()) };
+            1
+        }
+    }
+}
+
+/// Write one 32-bit word into foreign memory `id` at `off` — the page checks it landed in the CHILD
+/// memory (and nowhere in this one): the isolation half of the seam.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_poke(id: u32, off: u32, val: u32) {
+    foreign_region(id, off as u64 + 4).write_word(off as u64, 4, val as u64);
+}
+
+/// **Per-access cost probe** for the decline-path gate (#1284): `iters` seeded accesses, returning a
+/// checksum the page compares across backings. `kind` 0/1 = one `write_word` + one `read_word` (8-byte,
+/// aligned — the bytecode interpreter's path) over a flat `Shared` buffer / the Foreign memory `id`;
+/// 2/3 = one `set_byte` + one `byte` (the tree-walker's path) over the same two. The page times each.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_foreign_bench(id: u32, size: u32, kind: u32, iters: u32) -> u64 {
+    let size = size as u64;
+    let layout = Layout::from_size_align(size as usize, 8).unwrap();
+    // SAFETY: an 8-aligned zeroed buffer of `size` bytes, freed below once `shared` is dropped.
+    let base = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!base.is_null());
+    // SAFETY: `base` is `size` valid 8-aligned bytes used only through `shared` in this scope.
+    let shared = unsafe { temen_mem::Region::shared(base, size) };
+    let region = if kind & 1 == 0 {
+        &shared
+    } else {
+        &*Box::leak(Box::new(foreign_region(id, size)))
+    };
+    // Both backings start from an all-zero image so the seeded stream yields the same checksum (the
+    // Foreign memory persists across calls; the Shared buffer is fresh).
+    region.zero(0, size);
+    let mut s = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(kind >> 1);
+    let mut sum = 0u64;
+    for _ in 0..iters {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        let off = (s % (size / 8)) * 8;
+        if kind < 2 {
+            region.write_word(off, 8, s);
+            sum = sum.wrapping_add(region.read_word((off + 64) % size, 8));
+        } else {
+            region.set_byte(off, s as u8);
+            sum = sum.wrapping_add(u64::from(region.byte((off + 64) % size)));
+        }
+    }
+    drop(shared);
+    // SAFETY: same layout; `shared` dropped above.
+    unsafe { std::alloc::dealloc(base, layout) };
+    sum
+}
+
+/// The detached child's header size (the `win` the JS driver passes and the page it must keep clear).
+#[no_mangle]
+pub extern "C" fn temen_detached_header_bytes() -> usize {
+    DETACHED_HEADER_BYTES as usize
+}
+
+/// The header offset of a paged detached run's `pagestate` table.
+#[no_mangle]
+pub extern "C" fn temen_detached_pagestate_off() -> usize {
+    DETACHED_PAGESTATE_OFF as usize
+}
+
+/// Split a NUL-separated argv payload `[ptr, len)` into its strings (empty entries dropped).
+fn argv_from_payload(ptr: *const u8, len: usize) -> Vec<Vec<u8>> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the host guarantees `[ptr, len)` is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    bytes
+        .split(|b| *b == 0)
+        .filter(|a| !a.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// Open a **detached single-shot wasm-JIT run** (#1285): the module at `[mod_ptr, mod_len)` runs with the
+/// on-ramp powerbox, `argv` from the NUL-separated payload `[args_ptr, args_len)` seeded at its args base,
+/// stdin from `[stdin_ptr, stdin_len)`, over the page-registered foreign memory `mem_id` — its own
+/// `WebAssembly.Memory`, grown here to the declared window. Drive it with `driveDetachedRun`
+/// (`web/wasmjit-module.js`) and the usual `temen_onramp_jit_run_*` exports. Returns `0`, else a negative
+/// `STATUS_*` (also in [`LAST_STATUS`]). Replaces any prior single-shot run.
+#[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+#[no_mangle]
+pub extern "C" fn temen_detached_jit_run_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    mem_id: u32,
+    args_ptr: *const u8,
+    args_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: same host guarantee for the stdin range.
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
+    };
+    let m = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return -STATUS_DECODE_ERR;
+        }
+    };
+    let input = RunInput::Detached {
+        stdin,
+        argv: argv_from_payload(args_ptr, args_len),
+    };
+    match JitOnrampRun::open_foreign_run(&m, mem_id, true, input, None) {
+        Ok(r) => {
+            // SAFETY: single-threaded wasm; the run is touched only by the export accessors.
+            unsafe { *core::ptr::addr_of_mut!(JIT_RUN) = Some(r) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => {
+            set(status);
+            -status
+        }
+    }
+}
+
+/// The **interpreter oracle** of [`temen_detached_jit_run_open`] (INVARIANT 9): the same module, argv
+/// payload and stdin run on the bytecode engine over a fresh root-sized reservation — which is exactly
+/// what a detached window is — with the same on-ramp powerbox. Stashes stdout/stderr/exit/value into
+/// the shared slots like [`temen_run_onramp`]; returns the value, status in [`LAST_STATUS`]
+/// ([`STATUS_UNSUPPORTED`] if the module needs the tree-walker: threads, nesting).
+#[no_mangle]
+pub extern "C" fn temen_detached_oracle_run(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    args_ptr: *const u8,
+    args_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
+    let m = match temen_encode::decode_module(bytes) {
+        Ok(m) => m,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    let mut host = Host::new();
+    if !stdin_ptr.is_null() && stdin_len != 0 {
+        // SAFETY: same host guarantee for the stdin range.
+        host.stdin = unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec();
+    }
+    let (_frame, _keys, _mouse) = grant_onramp_caps(&mut host, &m, None);
+    let argv = argv_from_payload(args_ptr, args_len);
+    let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
+    let init_mem = args_init_mem(&refs);
+    let mut fuel = u64::MAX;
+    let outcome = bytecode::compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[],
+        &mut fuel,
+        &init_mem,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        &mut host,
+    );
+    let (status, value, code) = match outcome {
+        Some((Ok(vals), _)) => (
+            STATUS_OK,
+            vals.first().map_or(0, |v| match v {
+                Value::I64(x) => *x,
+                Value::I32(x) => *x as i64,
+                _ => 0,
+            }),
+            0,
+        ),
+        Some((Err(Trap::Exit(c)), _)) => (STATUS_EXIT, 0, c),
+        Some((Err(_), _)) => (STATUS_TRAP, 0, 0),
+        None => (STATUS_UNSUPPORTED, 0, 0),
+    };
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe {
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        EXIT_CODE = code;
+        RUN_VALUE = value;
+    }
+    set(status);
+    value
 }

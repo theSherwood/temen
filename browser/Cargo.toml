@@ -33,6 +33,9 @@ callprof = ["temen-interp/callprof"]
 
 [dependencies]
 temen-interp = { path = "../crates/temen-interp" }
+# `Region::Foreign` + the substrate differential (#1284): the browser fills the `ForeignOps` table with
+# the `temen_host.foreign_*` JS imports and self-tests it in real Chromium.
+temen-mem    = { path = "../crates/temen-mem" }
 temen-encode = { path = "../crates/temen-encode" }
 temen-text   = { path = "../crates/temen-text" }
 # The Debug Adapter Protocol server (DEBUGGING.md), driven over the bytecode `Debuggee` backend so

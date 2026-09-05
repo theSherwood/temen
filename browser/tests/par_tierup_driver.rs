@@ -157,7 +157,7 @@ fn par_confined_child_tiers_up_over_its_own_carve() {
 
     // The parallel drive, this test playing par.js + worker.js single-threaded.
     assert_eq!(
-        temen_par_powerbox_inst(1 << 17, core::ptr::null(), 0),
+        temen_par_powerbox_inst(1 << 17, core::ptr::null(), 0, 0),
         1,
         "publish the §14 run recipe"
     );
@@ -335,7 +335,7 @@ fn par_confined_child_paged_reflects_its_own_unmap() {
     assert_eq!(want, 22, "oracle: child f(5)=22, root joins");
 
     assert_eq!(
-        temen_par_powerbox_inst(1 << 17, core::ptr::null(), 0),
+        temen_par_powerbox_inst(1 << 17, core::ptr::null(), 0, 0),
         1,
         "publish the §14 run recipe"
     );
