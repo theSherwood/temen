@@ -137,3 +137,44 @@ fn mouse_reaches_the_mouse_device() {
         "theme 1 after a wheel notch"
     );
 }
+
+#[test]
+fn tal_source_assembles_in_the_guest() {
+    // The same guest served the demo's SOURCE as boot.tal assembles it in the sandbox (uxnasm_core.c)
+    // and runs it: its first frame is byte-identical to the committed ROM's.
+    let temen = include_bytes!("../web/assets/uxn.temen");
+    let tal = include_bytes!("../../crates/temen-run/demos/uxn/demo.tal");
+    let m = temen_encode::decode_module(temen).expect("decode uxn.temen");
+    let mut from_tal = OnrampReactor::open_with_fs(&m, "boot.tal".to_string(), tal.to_vec())
+        .expect("_start assembles boot.tal");
+    let mut from_rom = open();
+    let (a, b) = (step(&mut from_tal), step(&mut from_rom));
+    assert_eq!((a.width, a.height), (W, H));
+    assert_eq!(
+        a.rgba, b.rgba,
+        "assembled-in-guest ROM renders like the committed ROM"
+    );
+}
+
+#[test]
+fn bad_tal_reports_the_error_and_exits() {
+    // An unassemblable boot.tal: the first tick prints `uxnasm: line N: …` on stdout (the page shows
+    // it) and exits, ending the reactor loop.
+    let temen = include_bytes!("../web/assets/uxn.temen");
+    let m = temen_encode::decode_module(temen).expect("decode uxn.temen");
+    let src = b"|0100 #01 #02 ADD\n,&nope JMP BRK\n".to_vec();
+    let mut r = OnrampReactor::open_with_fs(&m, "boot.tal".to_string(), src)
+        .expect("_start survives a bad source (the error is reported by the first tick)");
+    let (status, stdout) = r.frame();
+    assert_eq!(
+        status,
+        temen_browser::STATUS_EXIT,
+        "the guest exits after reporting"
+    );
+    let text = String::from_utf8_lossy(&stdout);
+    assert_eq!(
+        text.trim(),
+        "uxnasm: line 2: unknown reference: on-reset/nope",
+        "the error names the line and the unresolved label"
+    );
+}

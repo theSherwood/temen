@@ -8576,10 +8576,17 @@ pub extern "C" fn temen_onramp_jit_call_interp(func: u32, args_ptr: *mut u8) -> 
 /// slots (the page blits it after each frame). Returns `1` if a frame was presented, else `0`.
 #[no_mangle]
 pub extern "C" fn temen_onramp_jit_present() -> i32 {
-    // SAFETY: single-threaded wasm; shared read of the reactor.
-    let frame =
-        unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.take_frame());
-    let (rgba, w, h) = match frame {
+    // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
+    let Some(r) = (unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() }) else {
+        return 0;
+    };
+    // The tick's stdout (cross-tier `write`s land in the reactor's host): drain it into the stdout
+    // slot (read via `temen_stdout_*`), exactly as `temen_onramp_frame` does for the interpreter, so a
+    // guest's console output reaches the page on this tier too.
+    let stdout = std::mem::take(&mut r.host.stdout);
+    // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), stdout) };
+    let (rgba, w, h) = match r.take_frame() {
         Some(f) => (f.rgba, f.width, f.height),
         None => return 0,
     };

@@ -1,0 +1,97 @@
+( bench.tal — a bunnymark-style stress ROM for the Uxn benchmark: 512 2bpp sprites falling under
+  gravity and bouncing off the walls on a 320x240 screen. Every frame clears the foreground with one
+  fill, steps every sprite, and blits every sprite — the sprite op and the compositor are the whole
+  cost, like the classic bunnymark. Deterministic: no input, no clock. )
+
+|00 @System &vector $2 &expansion $2 &wst $1 &rst $1 &metadata $2 &r $2 &g $2 &b $2 &debug $1 &state $1
+|20 @Screen &vector $2 &width $2 &height $2 &auto $1 &pad $1 &x $2 &y $2 &addr $2 &pixel $1 &sprite $1
+
+%SPRITES { #0200 } ( 512 sprites x { x* y16* dx dy16* } = 7 bytes each; y and dy in 1/16 px )
+%WIDTH { #0140 }
+%HEIGHT { #00f0 }
+%FLOOR { #0e80 } ( (240 - 8) * 16 )
+
+|0000
+@seed $2
+
+|0100 @on-reset ( -> )
+  WIDTH .Screen/width DEO2
+  HEIGHT .Screen/height DEO2
+  #2a5f .System/r DEO2
+  #2c7f .System/g DEO2
+  #4eaf .System/b DEO2
+  #1234 .seed STZ2
+  ( background: 8x8 tiles in colors 1 and 2 )
+  #0000 .Screen/y DEO2
+  &row
+    #0000 .Screen/x DEO2
+    &col
+      ;tile .Screen/addr DEO2
+      .Screen/x DEI2 .Screen/y DEI2 ADD2 #03 SFT2 #0001 AND2 NIP INC .Screen/sprite DEO
+      .Screen/x DEI2 #0008 ADD2 DUP2 .Screen/x DEO2 WIDTH LTH2 ?&col
+    .Screen/y DEI2 #0008 ADD2 DUP2 .Screen/y DEO2 HEIGHT LTH2 ?&row
+  ( sprites: random positions near the top, random horizontal speeds, at rest vertically )
+  ;sprites SPRITES
+  &init ( addr* n* )
+    STH2
+    random #00 SWP #0008 ADD2 OVR2 STA2
+    random #3f AND #00 SWP #40 SFT2 OVR2 INC2 INC2 STA2
+    DUP2 #0004 ADD2 random #03 AND INC ROT ROT STA
+    #0000 OVR2 #0005 ADD2 STA2
+    #0007 ADD2
+    STH2r #0001 SUB2 ORAk ?&init
+  POP2 POP2
+  ;on-frame .Screen/vector DEO2
+BRK
+
+@on-frame ( -> )
+  #0000 .Screen/x DEO2
+  #0000 .Screen/y DEO2
+  #c0 .Screen/pixel DEO ( clear the foreground )
+  ;bunny .Screen/addr DEO2
+  ;sprites SPRITES
+  &loop ( addr* n* )
+    STH2
+    DUP2 step-x
+    DUP2 step-y
+    DUP2 LDA2 .Screen/x DEO2
+    DUP2 INC2 INC2 LDA2 #04 SFT2 .Screen/y DEO2
+    #c3 .Screen/sprite DEO
+    #0007 ADD2
+    STH2r #0001 SUB2 ORAk ?&loop
+  POP2 POP2
+BRK
+
+@step-x ( addr* -- ) ( x += dx; past either edge, flip dx )
+  DUP2 LDA2 OVR2 #0004 ADD2 LDA sext ADD2
+  DUP2 #0138 GTH2 ?{ SWP2 STA2 JMP2r }
+  POP2 #0004 ADD2 DUP2 LDA #00 SWP SUB ROT ROT STA
+JMP2r
+
+@step-y ( addr* -- ) ( dy += gravity; y += dy; at the floor bounce with 3/4 restitution )
+  DUP2 #0005 ADD2 LDA2 #0008 ADD2 STH2
+  DUP2 INC2 INC2 LDA2 STH2kr ADD2
+  DUP2 FLOOR GTH2 ?{
+    OVR2 INC2 INC2 STA2
+    STH2r SWP2 #0005 ADD2 STA2 JMP2r }
+  DUP2 #8000 GTH2 ?{
+    POP2 FLOOR OVR2 INC2 INC2 STA2
+    STH2r DUP2 #02 SFT2 SUB2 #0000 SWP2 SUB2 SWP2 #0005 ADD2 STA2 JMP2r }
+  POP2 #0000 OVR2 INC2 INC2 STA2
+  STH2r POP2 #0000 SWP2 #0005 ADD2 STA2
+JMP2r
+
+@random ( -- byte ) ( a 16-bit xorshift on `seed` )
+  .seed LDZ2 DUP2 #70 SFT2 EOR2 DUP2 #09 SFT2 EOR2 DUP2 #80 SFT2 EOR2 DUP2 .seed STZ2 NIP
+JMP2r
+
+@sext ( b -- s* )
+  DUP #80 AND #00 EQU ?{ #ff SWP JMP2r }
+  #00 SWP
+JMP2r
+
+@tile 0f0f 0f0f f0f0 f0f0
+@bunny ( 2bpp: a plump blob with a lighter core )
+  3c7e ffff ffff 7e3c
+  0018 3c7e 7e3c 1800
+@sprites
