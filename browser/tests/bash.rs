@@ -347,6 +347,35 @@ fn bash_dash_c_fs_writers() {
     );
 }
 
+/// #801 — **recursive `cp -r` / `rm -r`** through real bash: build a small tree, deep-copy it,
+/// read the copy back, remove the original recursively, confirm the copy survives, then remove it
+/// too. Exercises the exec'd coreutils' opendir/readdir walk + unlink/rmdir/mkdir over bash's shared
+/// memfs (bash's `printf > file` redirection seeds the tree via its own open).
+#[test]
+fn bash_dash_c_recursive_fs() {
+    let Some(bash) = load_bash() else {
+        eprintln!("note: skipping bash_dash_c_recursive_fs — no bash.temen");
+        return;
+    };
+    let bins = load_coreutils();
+    let bin_refs: Vec<(&str, &temen_ir::Module, u8)> =
+        bins.iter().map(|(p, m, wl)| (*p, m, *wl)).collect();
+    let script = "mkdir -p d/sub; printf 'A\\n' > d/a; printf 'C\\n' > d/sub/c; \
+                  cp -r d e; cat e/a; cat e/sub/c; \
+                  rm -rf d; cat e/sub/c; echo done";
+    let out = bash_exec_with(&bash, &[b"bash", b"-c", script.as_bytes()], b"", &bin_refs);
+    assert_eq!(
+        out.status,
+        STATUS_EXIT,
+        "status={} stdout={:?} stderr={:?}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    // cat e/a, cat e/sub/c, (rm -rf d), cat e/sub/c (copy survives), echo done
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "A\nC\nC\ndone\n");
+}
+
 /// #1080 — a **three-stage coreutil pipeline** in the browser: `seq 5 | head -n 3 | wc -l` → `3`. Three
 /// forks, three `execve`d coreutils, two CorePipes, every read park + carried pipe end + EOF + reap
 /// composing under real bash on the bytecode engine — the milestone capstone.

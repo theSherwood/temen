@@ -4440,6 +4440,96 @@ int main(void) {{\n\
     assert_eq!(ep.file_f.as_deref(), Some(b"hello\n".as_slice()));
 }
 
+/// #801 coreutils — **recursive `cp -r` / `rm -r`** over a seeded memfs tree. `cp -r /d /e`
+/// deep-copies `/d` (two files + a subdir with a file) to an independent `/e`; `rm -r /d` removes
+/// the original (its inferred-only dirs vanish with their last child — `rm -r` treats that as
+/// success); the copy `/e` survives; `rm -rf /e` then clears the explicit-dir copy too. Exercises
+/// the opendir/readdir walk + unlink/rmdir/mkdir surface recursively, across all three engines
+/// (the exec'd twins share one memfs, so a child's fs mutation is visible to a later child).
+#[test]
+fn c_coreutils_recursive_rm_cp() {
+    let src = format!(
+        "{WIN_PAD_17}{PIPE_SHIM}\n{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_setenv(int cap, long name, long nlen, long val, long vlen, long ow);\n\
+long __px_open(int cap, long path, long len, long flags);\n\
+long __px_opendir(int cap, long path, long len);\n\
+long __px_closedir(int cap, long dir);\n\
+static char ob[64];\n\
+static long slen(char *s) {{ long n = 0; while (s[n]) n = n + 1; return n; }}\n\
+static int runv(char **av) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return -1;\n\
+  if (pid == 0) {{ execvp(av[0], av); return 99; }}\n\
+  int st;\n\
+  if (__px_waitpid(0, pid, (long)&st, 0) != pid) return -1;\n\
+  return (int)((st >> 8) & 0xff);\n\
+}}\n\
+static int slurp(char *path, char *exp, long explen) {{\n\
+  long fd = __px_open(0, (long)path, slen(path), 0);\n\
+  if (fd < 0) return -1;\n\
+  long got = 0;\n\
+  for (;;) {{\n\
+    long n = read(fd, ob + got, 64 - got);\n\
+    if (n < 0) {{ close(fd); return -2; }}\n\
+    if (n == 0) break;\n\
+    got = got + n;\n\
+  }}\n\
+  close(fd);\n\
+  if (got != explen) return -3;\n\
+  long i;\n\
+  for (i = 0; i < explen; i = i + 1) if (ob[i] != exp[i]) return -4;\n\
+  return 0;\n\
+}}\n\
+static int absent(char *path) {{ long fd = __px_open(0, (long)path, slen(path), 0); if (fd < 0) return 1; close(fd); return 0; }}\n\
+static int dir_ok(char *p) {{ long d = __px_opendir(0, (long)p, slen(p)); if (d < 0) return 0; __px_closedir(0, d); return 1; }}\n\
+static char *av_cp[]  = {{ \"cp\", \"-r\", \"/d\", \"/e\", 0 }};\n\
+static char *av_rmd[] = {{ \"rm\", \"-r\", \"/d\", 0 }};\n\
+static char *av_rme[] = {{ \"rm\", \"-rf\", \"/e\", 0 }};\n\
+int main(void) {{\n\
+  __px_setenv(0, (long)\"PATH\", 4, (long)\"/bin\", 4, 1);\n\
+  if (runv(av_cp) != 0) return 11;\n\
+  if (slurp(\"/e/a\", \"A\\n\", 2) != 0) return 12;\n\
+  if (slurp(\"/e/b\", \"B\\n\", 2) != 0) return 13;\n\
+  if (slurp(\"/e/sub/c\", \"C\\n\", 2) != 0) return 14;      /* the subtree copied too */\n\
+  if (runv(av_rmd) != 0) return 21;\n\
+  if (!absent(\"/d/a\")) return 22;\n\
+  if (!absent(\"/d/sub/c\")) return 23;\n\
+  if (dir_ok(\"/d\")) return 24;                            /* /d fully gone */\n\
+  if (slurp(\"/e/sub/c\", \"C\\n\", 2) != 0) return 25;      /* the copy is independent of the source */\n\
+  if (runv(av_rme) != 0) return 31;\n\
+  if (dir_ok(\"/e\")) return 32;\n\
+  if (!absent(\"/e/a\")) return 33;\n\
+  return 42;\n\
+}}\n"
+    );
+    let seed = |host: &mut Host, posix: &Posix| {
+        stage_coreutils(host, posix, &["cp", "rm"]);
+        posix.write_file("/d/a", b"A\n");
+        posix.write_file("/d/b", b"B\n");
+        posix.write_file("/d/sub/c", b"C\n");
+    };
+    let e = run_interp_setup(&src, seed);
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "cp -r deep-copied /d→/e; rm -r cleared the inferred-dir source and the explicit-dir copy"
+    );
+    let eb = run_bytecode_setup(&src, seed);
+    assert_eq!(
+        eb.result,
+        vec![Value::I32(42)],
+        "bytecode: recursive rm/cp over the shared memfs — matching the oracle"
+    );
+    let ep = run_bytecode_parallel_setup(&src, seed);
+    assert_eq!(
+        ep.result,
+        vec![Value::I32(42)],
+        "parallel driver: recursive rm/cp over exec'd twins sharing one memfs"
+    );
+}
+
 /// #801 coreutils — **grep is the posix_libc ERE engine running as a
 /// program**: an anchored alternation over a memfs file prints exactly the
 /// matching lines and exits 0; a miss prints nothing and exits 1 (the
