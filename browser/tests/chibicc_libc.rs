@@ -189,3 +189,36 @@ int main(void) {
          found=7 hex=255\n"
     );
 }
+
+/// `<sys/mman.h>` — anonymous `mmap`/`munmap` over the Memory capability (c_interpret #16 bucket 1):
+/// map two pages, write one byte in each, sum them, unmap. The mapping must be page-aligned and
+/// writable across both pages (offset 0 and 4096), returning 141 (= 42 + 99). A file-backed mapping
+/// (fd >= 0) is refused with `MAP_FAILED`.
+#[test]
+fn anonymous_mmap_maps_two_writable_pages() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let (status, out) = compile_and_run(
+        &chibicc,
+        r#"#include <sys/mman.h>
+#include <stdio.h>
+int main() {
+  char *mem = mmap((void *)0, 8192, PROT_READ | PROT_WRITE,
+                   MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (mem == MAP_FAILED) { printf("map failed\n"); return 1; }
+  mem[0] = 42;
+  mem[4096] = 99;
+  int sum = mem[0] + mem[4096];
+  munmap(mem, 8192);
+  // A file-backed request (fd >= 0) is unsupported and must fail cleanly.
+  void *bad = mmap((void *)0, 4096, PROT_READ, MAP_PRIVATE, 3, 0);
+  printf("sum=%d aligned=%d file=%d\n", sum, ((long)mem & 4095) == 0, bad == MAP_FAILED);
+  return 0;
+}
+"#,
+    );
+    assert_eq!(status, STATUS_OK, "run status");
+    assert_eq!(out, "sum=141 aligned=1 file=1\n");
+}

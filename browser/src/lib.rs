@@ -3971,6 +3971,12 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/sys/wait.h",
             include_str!("../playground-include/sys/wait.h"),
         ),
+        // Anonymous memory mapping (`mmap`/`munmap`) over the Memory capability — the map-growing
+        // allocator `malloc` already uses (`__vm_map`); file-backed mappings are unsupported.
+        (
+            "include/sys/mman.h",
+            include_str!("../playground-include/sys/mman.h"),
+        ),
     ];
     HEADERS
         .iter()
