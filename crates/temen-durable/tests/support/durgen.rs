@@ -24,8 +24,8 @@ use temen_durable::{
 };
 use temen_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use temen_ir::{
-    BinOp, Block, CmpOp, Func, FuncType, Inst, IntTy, Memory, Module, Terminator, TypeEntry,
-    ValType,
+    BinOp, Block, CastOp, CmpOp, ConvOp, FToI, Func, FuncType, IToF, Inst, IntTy, Memory, Module,
+    Terminator, TypeEntry, ValType,
 };
 
 /// The one call signature every generated durable suspend site uses: `(i32) -> (i64)` (the clock
@@ -156,7 +156,14 @@ fn gen_straightline(
             i64_vals.push(c);
             c
         } else {
-            i64_vals[g.below(i64_vals.len() as u32) as usize]
+            let x = i64_vals[g.below(i64_vals.len() as u32) as usize];
+            // #1300 Phase 2: a third of the operands first take a conversion round trip, so the
+            // shadow frame spills/reloads converted scalars (i32 / f64 intermediates) too.
+            if g.below(3) == 0 {
+                conv_roundtrip(g, insts, next, x)
+            } else {
+                x
+            }
         };
         insts.push(Inst::IntBin {
             ty: IntTy::I64,
@@ -168,6 +175,54 @@ fn gen_straightline(
         *next += 1;
         i64_vals.push(r);
     }
+}
+
+/// #1300 Phase 2 (item 3): a **total, trap-free** conversion chain over the i64 `x` that yields an
+/// i64 again — wrap + extend, reinterpret through f64 and back, or int→float + saturating
+/// float→int — so a generated prefix exercises every conversion family the transform now types
+/// without ever trapping (the equivalence property needs the program to run to completion).
+fn conv_roundtrip(g: &mut Gen, insts: &mut Vec<Inst>, next: &mut u32, x: u32) -> u32 {
+    let mid = *next;
+    *next += 1;
+    let out = *next;
+    *next += 1;
+    match g.below(3) {
+        0 => {
+            insts.push(Inst::Convert {
+                op: ConvOp::WrapI64,
+                a: x,
+            });
+            insts.push(Inst::Convert {
+                op: if g.below(2) == 0 {
+                    ConvOp::ExtendI32S
+                } else {
+                    ConvOp::ExtendI32U
+                },
+                a: mid,
+            });
+        }
+        1 => {
+            insts.push(Inst::Cast {
+                op: CastOp::ReinterpI64F64,
+                a: x,
+            });
+            insts.push(Inst::Cast {
+                op: CastOp::ReinterpF64I64,
+                a: mid,
+            });
+        }
+        _ => {
+            insts.push(Inst::IToFConv {
+                op: IToF::I64F64S,
+                a: x,
+            });
+            insts.push(Inst::FToISat {
+                op: FToI::F64I64S,
+                a: mid,
+            });
+        }
+    }
+    out
 }
 
 /// Append the suspend op(s) + their folding/suffix to `insts`, given the handle at value

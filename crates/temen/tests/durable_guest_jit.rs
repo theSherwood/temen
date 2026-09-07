@@ -98,6 +98,43 @@ fn durable_grant_admits_submitted_unit() {
     );
 }
 
+/// #1300 Phase 2 (item 3): a **may-suspend** unit whose prefix converts scalars (extend / wrap /
+/// saturating trunc / int→float / promote / trapping trunc) before its `call.cap` is admitted by the
+/// durable grant — the same unit a non-durable domain admits — instead of the `UnsupportedInst`
+/// refusal that made the durability axis narrow what a domain can compile (#14).
+#[test]
+fn durable_grant_admits_unit_with_conversions_before_its_suspend_point() {
+    let unit = blob(
+        "memory 17\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
+         v1 = i64.extend_i32_u v0\n  v2 = i32.wrap_i64 v1\n  \
+         v3 = i32.trunc_sat_f64_s vf\n  v4 = f32.convert_i32_s v3\n  v5 = f64.promote_f32 v4\n  \
+         v6 = i64.trunc_f64_s v5\n  \
+         v7 = call.cap 2 0 (i32) -> (i64) v0 (v2)\n  \
+         v8 = i64.add v1 v7\n  v9 = i64.add v8 v6\n  return v9\n  }\n}\n",
+    );
+    // The program taints the unit's `(i32, f64)->(i64)` signature (a may-suspend function of that
+    // shape establishes the `call.dyn` seam the install fence keys on — see the fence test below).
+    let guest = parse_module(
+        "memory 17\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
+         v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
+    )
+    .expect("parse program");
+    verify_module(&guest).expect("verify program");
+    let mut h = Host::new();
+    h.set_durable(true);
+    let jit = grant_jit_durable(&mut h, &guest, 0);
+    assert!(
+        matches!(h.jit_compile(jit, &unit), Ok(Ok(_))),
+        "a durable grant admits a suspending unit with conversions in its prefix"
+    );
+    let mut h2 = Host::new();
+    let jit2 = grant_jit(&mut h2, &guest, 0);
+    assert!(
+        matches!(h2.jit_compile(jit2, &unit), Ok(Ok(_))),
+        "…exactly as a non-durable domain does"
+    );
+}
+
 /// A unit outside the **strict** transform's scope fails closed on a durable grant, exactly like any
 /// other rejected blob. Here a **may-suspend** function (it does a `call.cap`) that also touches guest
 /// memory hits `GuestUsesMemory` — the strict path won't instrument a memory-using suspend point (it
