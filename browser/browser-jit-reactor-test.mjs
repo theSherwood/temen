@@ -7,7 +7,8 @@
 import { startServer } from './serve.mjs';
 import { benignAssetMiss } from './play-test-errors.mjs';
 import { fileURLToPath } from 'node:url';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
+import { readFileSync } from 'node:fs';
 const ROOT = dirname(fileURLToPath(import.meta.url));
 async function loadChromium() {
   for (const s of ['playwright', '/opt/node22/lib/node_modules/playwright/index.js']) {
@@ -24,7 +25,10 @@ page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error' && !benignAssetMiss(m)) errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`);
 
-const res = await page.evaluate(async () => {
+// The Uxntal card's path needs the demo's SOURCE, which the dev server does not serve (it lives outside
+// browser/): hand it to the page as an argument.
+const talSource = readFileSync(join(ROOT, '..', 'crates', 'temen-run', 'demos', 'uxn', 'demo.tal'), 'utf8');
+const res = await page.evaluate(async ({ talSource }) => {
   const par = await import('./par.js');
   const { openJitReactor } = await import('./wasmjit-reactor.js');
   const eng = await par.loadEngine();
@@ -134,8 +138,61 @@ const res = await page.evaluate(async () => {
       out.uxnMouse = { error: e.message };
     }
   }
+  // The Uxntal card's path on both tiers: the demo's SOURCE served as boot.tal is assembled in the guest
+  // and must render the committed ROM's exact frames; an unassemblable source must surface its error on
+  // stdout (`temen_stdout_*` after the frame — on the JIT tier via temen_onramp_jit_present) and exit.
+  {
+    const bytes = new Uint8Array(await (await fetch('./assets/uxn.temen')).arrayBuffer());
+    const tal = new TextEncoder().encode(talSource);
+    const bad = new TextEncoder().encode('|0100 #01 #02 ADD\n,&nope JMP BRK\n');
+    const openInterp = (file) => {
+      const p = eng.ex.temen_alloc(bytes.length); new Uint8Array(eng.memory.buffer).set(bytes, p);
+      const nameBytes = new TextEncoder().encode(file.name);
+      const nameP = eng.ex.temen_alloc(nameBytes.length), dataP = eng.ex.temen_alloc(file.data.length);
+      const view = new Uint8Array(eng.memory.buffer); view.set(nameBytes, nameP); view.set(file.data, dataP);
+      const opened = eng.ex.temen_onramp_open_fs(p, bytes.length, nameP, nameBytes.length, dataP, file.data.length);
+      eng.ex.temen_dealloc(p, bytes.length); eng.ex.temen_dealloc(nameP, nameBytes.length); eng.ex.temen_dealloc(dataP, file.data.length);
+      if (opened !== 0) throw new Error(`interp open failed: ${opened}`);
+    };
+    const stdoutNow = () => {
+      const n = eng.ex.temen_stdout_len(), p = eng.ex.temen_stdout_ptr();
+      return new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(p, p + n));
+    };
+    const run = async (tier, file, n) => {
+      let r = null;
+      if (tier === 'jit') r = await openJitReactor(eng.ex, eng.memory, bytes, file.name, file.data);
+      else openInterp(file);
+      const hs = [], outs = [];
+      let status = 0;
+      for (let i = 0; i < n; i++) {
+        status = r ? r.frame() : eng.ex.temen_onramp_frame();
+        outs.push(stdoutNow());
+        if (status !== 0) break;
+        hs.push(hashFB());
+      }
+      if (r) r.close(); else eng.ex.temen_onramp_close();
+      return { hs, status, stdout: outs.join('') };
+    };
+    try {
+      const romFile = { name: 'boot.rom', data: new Uint8Array(await (await fetch(FILES.uxn.url)).arrayBuffer()) };
+      const fromRom = await run('interp', romFile, 10);
+      const talI = await run('interp', { name: 'boot.tal', data: tal }, 10);
+      const talJ = await run('jit', { name: 'boot.tal', data: tal }, 10);
+      const badI = await run('interp', { name: 'boot.tal', data: bad }, 3);
+      const badJ = await run('jit', { name: 'boot.tal', data: bad }, 3);
+      const same = (a, b) => a.length === b.length && a.every((h, i) => h === b[i]);
+      const errText = 'uxnasm: line 2: unknown reference: on-reset/nope';
+      out.uxnTal = {
+        assembled: same(fromRom.hs, talI.hs) && same(fromRom.hs, talJ.hs) && fromRom.hs.length === 10,
+        errorReported: badI.status === 5 && badJ.status === 5 && badI.stdout.includes(errText) && badJ.stdout.includes(errText),
+        badI: { status: badI.status, stdout: badI.stdout }, badJ: { status: badJ.status, stdout: badJ.stdout },
+      };
+    } catch (e) {
+      out.uxnTal = { error: e.message };
+    }
+  }
   return out;
-});
+}, { talSource });
 console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 await browser.close(); server.close();
@@ -143,7 +200,9 @@ await browser.close(); server.close();
 const demos = ['bounce', 'life', 'mandelzoom', 'uxn'];
 const mouseOk = !!(res.uxnMouse && res.uxnMouse.changed && res.uxnMouse.tiersAgree);
 console.log(`  uxn mouse: ${res.uxnMouse && res.uxnMouse.error ? `ERROR ${res.uxnMouse.error}` : `click changes the frame on both tiers=${mouseOk}`}`);
-const ok = errors.length === 0 && mouseOk && demos.every((n) => res[n] && res[n].identical);
+const talOk = !!(res.uxnTal && res.uxnTal.assembled && res.uxnTal.errorReported);
+console.log(`  uxn tal: ${res.uxnTal && res.uxnTal.error ? `ERROR ${res.uxnTal.error}` : `assembled-in-guest frames match the ROM on both tiers=${!!(res.uxnTal && res.uxnTal.assembled)}, a bad source reports + exits on both tiers=${!!(res.uxnTal && res.uxnTal.errorReported)}`}`);
+const ok = errors.length === 0 && mouseOk && talOk && demos.every((n) => res[n] && res[n].identical);
 for (const n of demos) {
   const r = res[n] || {};
   console.log(`  ${n}: ${r.error ? `ERROR ${r.error}` : `${r.frames} frames, JIT≡interp=${r.identical}`}`);

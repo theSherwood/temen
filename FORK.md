@@ -356,8 +356,12 @@ structure. Split into sub-slices by risk:
 - **Increment 3a — `Host::fork_powerbox`, the powerbox crux. DONE (PR #531).** A fresh `Host` that copies
   the handle table (own namespace, same values → same bindings) over the same shared `Arc` backings POSIX
   fork shares (regions/pipes + stdout/stderr sinks), new `domain_id`. **Fails closed** on any domain with
-  closure host caps (not `Clone`), live offers, module grants, or JIT/ring/serve/freeze state — the
+  closure host caps (not `Clone`), live offers, module grants, or ring/serve/freeze state — the
   personality re-wires those (PR 3). Copy-vs-share decided per backing, never silent. Unit-tested.
+  **#1297:** live §22 guest-JIT state forks — units (`Arc`-shared IR), install occupancy and quotas
+  ride into the twin exactly as a snapshot carries them; the process-local code pointers reset (an
+  interpreter twin invokes the IR, the JIT tiers recompile on demand), and each engine gives the twin
+  its own dispatch table seeded with the parent's installs, so later installs diverge per domain.
 - **Increment 3b — wire the twin into `clone_caller`. NEXT.** The remaining sub-steps, each with a real
   primitive gap to fill:
   1. **Window deep-copy — a NEW `Mem` primitive is needed.** Both existing builders *share* the backing

@@ -1,10 +1,13 @@
-/* Headless frame-hash differential (the §18 oracle, the doom_diff.c shape): read a ROM from stdin,
- * run its reset vector, then UXN_DIFF_FRAMES frames with a fixed key script, printing an FNV-1a hash of
+/* Headless frame-hash differential (the §18 oracle, the doom_diff.c shape): read a ROM — or Uxntal
+ * source, assembled by the in-guest uxnasm_core.c (text: an ASCII first byte and no NUL among the first
+ * 256 bytes — a ROM's reset vector has a `00` operand or padding within that) — from stdin, run its
+ * reset vector, then UXN_DIFF_FRAMES frames with a fixed key script, printing an FNV-1a hash of
  * every composed frame. Built BOTH as a Temen guest (clang → on-ramp) and as a native `cc` binary from
  * this one file — only `read`/`write`/`malloc`, which the on-ramp provides — so the two hash streams
  * must be identical. Driven by the `uxn_diff` test (crates/temen-llvm/tests/uxn_diff.rs). */
 #include "uxn.c"
 #include "varvara.c"
+#include "uxnasm_core.c"
 
 extern long read(int fd, void *buf, unsigned long n);
 extern long write(int fd, const void *buf, unsigned long n);
@@ -44,7 +47,23 @@ int main(void) {
   for (long i = 0; i < UXN_BANKS * 0x10000; i++) u.ram[i] = 0;
   varvara_init(&u);
   long got = 0, n;
-  while (got < 0xff00 && (n = read(0, u.ram + 0x100 + got, (unsigned long)(0xff00 - got))) > 0) got += n;
+  char *in = malloc(1 << 20);
+  while (got < (1 << 20) && (n = read(0, in + got, (unsigned long)((1 << 20) - got))) > 0) got += n;
+  int text = got > 0 && (Uint8)in[0] < 0x80;
+  for (long i = 0; i < got && i < 256; i++)
+    if (in[i] == 0) text = 0;
+  if (text) {
+    int rom_len;
+    if (!uxnasm_assemble(in, (int)got, u.ram, &rom_len)) {
+      write(1, "uxnasm: ", 8);
+      write(1, uxnasm_error, (unsigned long)s_len(uxnasm_error));
+      write(1, "\n", 1);
+      return 1;
+    }
+  } else {
+    for (long i = 0; i < got && i < 0xff00; i++) u.ram[0x100 + i] = (Uint8)in[i];
+  }
+  free(in);
   uxn_eval(&u, 0x100);
   int si = 0, w, h;
   for (int f = 0; f < UXN_DIFF_FRAMES && !varvara_halted(&u); f++) {

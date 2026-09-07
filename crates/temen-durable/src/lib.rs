@@ -1593,7 +1593,7 @@ fn load_op(t: ValType) -> LoadOp {
 
 /// Result types of an instruction, given the types of all earlier values in the block
 /// and each function's result types. Covers the scalar/memory/call subset a Phase-1
-/// prefix can use; returns `UnsupportedInst` for anything else (SIMD, conversions,
+/// prefix can use; returns `UnsupportedInst` for anything else (SIMD, the remaining
 /// concurrency ops), so the transform fails closed rather than mis-typing a frame.
 ///
 /// Deliberately **not** `temen_verify::func_value_types` (#913): that one is whole-function and
@@ -1618,6 +1618,13 @@ fn result_types(
         IntBin { ty, .. } | IntUn { ty, .. } => vec![ty.val()],
         FBin { ty, .. } | FUn { ty, .. } => vec![ty.val()],
         IntCmp { .. } | FCmp { .. } | Eqz { .. } => vec![ValType::I32],
+        // Scalar conversions (#1300 Phase 2, item 3): each yields one scalar the shadow frame
+        // already spills/reloads (i32/i64/f32/f64), typed from the op itself — width conversions,
+        // saturating and trapping float→int, int→float, and the float casts/reinterprets.
+        Convert { op, .. } => vec![op.sig().2],
+        FToISat { op, .. } | FToITrap { op, .. } => vec![op.parts().1.val()],
+        IToFConv { op, .. } => vec![op.parts().1.val()],
+        Cast { op, .. } => vec![op.sig().2],
         AtomicLoad { ty, .. } | AtomicRmw { ty, .. } | AtomicCmpxchg { ty, .. } => vec![ty.val()],
         Store { .. } | AtomicStore { .. } | AtomicFence { .. } => vec![],
         Select { a, .. } => vec![types[*a as usize]],
@@ -1706,6 +1713,30 @@ mod tests {
             out.funcs[0].blocks.len(),
             12,
             "two-point layout: 4n+4 with n=2"
+        );
+    }
+
+    /// #1300 Phase 2 (item 3): scalar conversions in the may-suspend prefix — a value converted before
+    /// the suspend point and used after it spills as its (converted) scalar type and reloads on
+    /// resume. The instrumented function verifies; the four conversion families each yield one
+    /// scalar the shadow frame already models.
+    #[test]
+    fn conversions_in_the_prefix_instrument_and_verify() {
+        let m = parse_with_mem(
+            "func (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
+             v1 = i64.extend_i32_u v0\n  v2 = i32.wrap_i64 v1\n  \
+             v3 = i32.trunc_sat_f64_s vf\n  v4 = f32.convert_i32_s v3\n  v5 = f64.promote_f32 v4\n  \
+             v6 = i64.trunc_f64_s v5\n  \
+             v7 = call.cap 2 0 (i32) -> (i64) v0 (v2)\n  \
+             v8 = i64.add v1 v7\n  v9 = i64.add v8 v6\n  return v9\n  }\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("conversions are in the Phase-2 prefix model");
+        temen_verify::verify_module(&out).expect("instrumented IR must verify");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "one point: 4n+4 blocks with n=1"
         );
     }
 

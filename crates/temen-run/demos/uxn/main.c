@@ -1,6 +1,7 @@
 /* Uxn in the playground — the reactor guest (the bounce.c / Doom shape). `_start → main` resolves the
- * `display`, `keyboard`, `mouse` and `fs` capabilities, reads the ROM served as "boot.rom" through
- * `fs`, and runs its reset vector. The page then calls `tick()` once per animation frame: drain the key
+ * `display`, `keyboard`, `mouse` and `fs` capabilities, loads the program served through `fs` — Uxntal
+ * source as "boot.tal" (assembled here, in the sandbox, by uxnasm_core.c) or a ROM as "boot.rom" — and
+ * runs its reset vector. The page then calls `tick()` once per animation frame: drain the key
  * events into the Controller device and the pointer events into the Mouse device, fire the Screen
  * vector, and present the composed frame through `display` when it changed. When the ROM halts
  * (System/state), the guest exits, which ends the reactor loop.
@@ -10,6 +11,7 @@
  * mouse kind 0 = pointer: payload (buttons<<24)|(x<<12)|y; kind 1 = wheel: (dx&0xffff)<<16|(dy&0xffff). */
 #include "uxn.c"
 #include "varvara.c"
+#include "uxnasm_core.c"
 
 extern int __vm_cap_resolve(const char *name, long len);
 extern long __vm_host_call(int h, int op, long a, long b, long c, long d);
@@ -17,9 +19,11 @@ extern long write(int fd, const void *buf, unsigned long n);
 extern void exit(int code);
 
 #define ROM_MAX 0xff00
+#define TAL_MAX (1 << 20)
 
 static Uxn u;
 static int disp, kbd, mouse, fs;
+static int asm_failed; /* boot.tal did not assemble: the first tick reports it and exits */
 
 void varvara_console_write(const Uint8 *buf, int len) { write(1, buf, (unsigned long)len); }
 
@@ -74,21 +78,49 @@ int main(void) {
   for (long i = 0; i < UXN_BANKS * 0x10000; i++) u.ram[i] = 0;
   varvara_init(&u);
   if (fs >= 0) {
-    static const char name[] = "boot.rom";
-    long fd = __vm_host_call(fs, 0, (long)name, 8, 0, 0);
-    if (fd >= 0) {
+    static const char tal[] = "boot.tal", rom[] = "boot.rom";
+    long fd = __vm_host_call(fs, 0, (long)tal, 8, 0, 0);
+    if (fd >= 0) { /* Uxntal source: read it all, assemble straight into bank 0 */
+      char *src = malloc(TAL_MAX);
+      long got = 0, n;
+      while (got < TAL_MAX && (n = __vm_host_call(fs, 1, fd, (long)(src + got), TAL_MAX - got, 0)) > 0)
+        got += n;
+      __vm_host_call(fs, 4, fd, 0, 0, 0);
+      int rom_len;
+      asm_failed = !uxnasm_assemble(src, (int)got, u.ram, &rom_len);
+      free(src);
+    } else if ((fd = __vm_host_call(fs, 0, (long)rom, 8, 0, 0)) >= 0) {
       long got = 0, n;
       while (got < ROM_MAX && (n = __vm_host_call(fs, 1, fd, (long)(u.ram + 0x100 + got), ROM_MAX - got, 0)) > 0)
         got += n;
       __vm_host_call(fs, 4, fd, 0, 0, 0);
     }
   }
-  uxn_eval(&u, 0x100);
+  if (!asm_failed) uxn_eval(&u, 0x100);
   return 0;
+}
+
+/* "uxnasm: line N: <message>\n" on stdout — the page shows a reactor's stdout, so the editor's author
+ * sees where the source broke. */
+static void report_asm_error(void) {
+  char buf[ASM_TOKEN + 96];
+  int n = 0, line = uxnasm_error_line, digits = 1;
+  for (const char *p = "uxnasm: line "; *p; p++) buf[n++] = *p;
+  for (int t = line; t >= 10; t /= 10) digits++;
+  for (int i = digits - 1; i >= 0; i--, line /= 10) buf[n + i] = (char)('0' + line % 10);
+  n += digits;
+  buf[n++] = ':'; buf[n++] = ' ';
+  for (const char *p = uxnasm_error; *p && n < (int)sizeof buf - 1; p++) buf[n++] = *p;
+  buf[n++] = '\n';
+  write(1, buf, (unsigned long)n);
 }
 
 int tick(void) {
   static Uint8 buttons;
+  if (asm_failed) {
+    report_asm_error();
+    exit(1);
+  }
   for (;;) {
     long e = __vm_host_call(kbd, 0, 0, 0, 0, 0);
     if (e < 0) break;
