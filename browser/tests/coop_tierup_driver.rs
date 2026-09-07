@@ -3287,6 +3287,149 @@ export 1 func "eval_run" 1
     )
 }
 
+/// #1312 — a **warm** guest whose eval `vm_map`s past the 64 MiB warm window (`WARM_MAPPED_LOG2`).
+/// `warmup` seeds nothing unusual; `eval_run` grows a page at the window's end, stores a marker
+/// through it, reads it back and streams it. This is the JACL playground's shape: a compiler-guest
+/// whose heap outgrows the warm image's window while compiling.
+fn warm_grow_guest_text(mem_h: i32, out_h: i32) -> String {
+    const WARM_WIN: u64 = 1 << 26; // WARM_MAPPED_LOG2 — the session's opening window
+    const PROBE: u64 = WARM_WIN + 16;
+    // The on-ramp brk word sits one guard up on the #1094 marked layout (see `warm_coop_guest_text`).
+    let brk = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK;
+    // A `readonly` segment arms the **paged** coop tier — the mode every real on-ramp card runs in
+    // (they all lay `.rodata` out this way, and the JACL compiler-guest reports `PAGED=true`). Paged
+    // mode is also what keeps the leaf tiering up here: the per-access page check replaces the #717
+    // one-bound `scalar_extent`, which a restored warm window's explicit page entries make
+    // unrepresentable, so a non-paged warm guest declines every tier-up.
+    format!(
+        r#"memory 16
+data ro 24576 "temen-warm-grow-rodata!!"
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vbrkaddr = i64.const {brk}
+  vbrk = i64.const 40960
+  i64.store vbrkaddr vbrk
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const {WARM_WIN}
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vm = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vrw)
+  vprobe = i64.const {PROBE}
+  vmark = i64.const 424242
+  i64.store vprobe vmark
+  vld = i64.load vprobe
+  v3 = i64.const 3
+  vleaf = call 2 (v3)
+  vsum = i64.add vld vleaf
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }}
+}}
+export 0 func "warmup" 0
+export 1 func "eval_run" 1
+"#
+    )
+}
+
+/// #1312 on the **warm** tier — the path the JACL playground runs, and the one whose fixed-arena
+/// `malloc` shim exists to dodge this gap. The warm session's window opens at 64 MiB and the eval
+/// maps past it: before the growable backing that map was `-EINVAL` (the reservation was clamped to
+/// the window), the store through it faulted, and the eval trapped. Both warm tiers — the plain
+/// interpreter eval and the coop tier-up eval — must now agree with each other and grow the window.
+#[test]
+fn warm_eval_grows_past_the_warm_window_on_both_tiers() {
+    let _g = ffi_guard();
+
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let m = temen_text::parse_module(&warm_grow_guest_text(mem_h, out_h)).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let live = temen_warm_open(bytes.as_ptr(), bytes.len());
+    assert!(live > 0, "warm open (status {})", temen_status());
+
+    // The interpreter warm eval is the oracle here: it grows the window and reads its marker back.
+    let want = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "interp warm eval status");
+    assert_eq!(
+        want,
+        424242 + 16,
+        "marker through the grown page, plus the leaf"
+    );
+    // SAFETY: capture slots staged by the eval; sole accessor (FFI_LOCK).
+    let want_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+
+    assert_eq!(
+        temen_warm_coop_open(0),
+        0,
+        "warm-coop open (status {})",
+        temen_status()
+    );
+    // Two rounds: the second proves the restore still works over a window a prior eval grew (the
+    // image is copied back and `[image, dirty_end)` re-zeroed across the larger backing).
+    for round in 0..2 {
+        assert_eq!(
+            temen_warm_coop_prepare(core::ptr::null(), 0),
+            0,
+            "warm-coop prepare (round {round}, status {})",
+            temen_status()
+        );
+        let win_before = temen_coop_win_len();
+        let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+        assert_eq!(
+            temen_status(),
+            STATUS_OK,
+            "warm-coop status (round {round}) — a trap here is the #1312 symptom"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            want,
+            "warm-coop value parity with the interpreter warm eval (round {round})"
+        );
+        assert!(tierups >= 1, "the leaf must tier up (round {round})");
+        // SAFETY: capture slots staged by the DONE arm; sole accessor (FFI_LOCK).
+        let out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(out, want_out, "warm-coop stdout parity (round {round})");
+        assert!(
+            temen_coop_win_len() >= win_before,
+            "the window never shrinks (round {round})"
+        );
+    }
+    assert!(
+        temen_coop_win_len() > (1usize << 26),
+        "the eval grew the session window past its 64 MiB opening size, got {}",
+        temen_coop_win_len()
+    );
+
+    // The interpreter warm path still agrees after the coop Runs — the grown window is shared state
+    // the coop tier must leave restorable.
+    let again = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "post-coop interp eval status");
+    assert_eq!(again, want, "post-coop interp eval parity");
+    temen_warm_close();
+}
+
 /// #816 item 4 — the warm-coop differential: value/stdout parity with the interpreter warm path
 /// across repeated Runs, a non-vacuous leaf tier-up per Run, the paged coop tier armed (the guest
 /// both grows and protects), and fresh-per-Run isolation (the scratch an eval dirties never leaks
