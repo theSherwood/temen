@@ -131,6 +131,25 @@ const FUEL_DEFAULT: i64 = 1 << 61;
 /// (index 0), so its index is `1`.
 const MAPPED_GLOBAL_IDX: u32 = 1;
 
+/// The wasm global index of the **live window base** (#1312) — the linear-memory address emitted code
+/// adds its confined offset to (`win + (eff & MASK)`), historically only the `win` parameter (local 0).
+///
+/// A cooperative run's window backing can now *grow*, and a growing backing may **relocate** (it is a
+/// reallocated buffer inside this same linear memory), so a `win` handed to an emitted frame goes stale
+/// the moment a cross-tier bounce commits memory. Every emitted function therefore publishes its `win`
+/// here on entry and **re-reads local 0 from here after every call** that can run guest code; the host
+/// writes the fresh base through the exported `"win"` global after each bounce, exactly where it
+/// already writes `"mapped"`. A host whose window never moves never writes it and behaves identically
+/// to the old parameter-only shape, because the entry publish keeps the global equal to `win`.
+///
+/// It sits after `mapped`, so its index is `2` and a paged module's `pagestate` follows at
+/// [`PAGESTATE_GLOBAL_IDX`].
+const WIN_GLOBAL_IDX: u32 = 2;
+
+/// The wasm global index of the #750 page-state table base (paged modules only) — after `fuel`,
+/// `mapped` and `win`.
+const PAGESTATE_GLOBAL_IDX: u32 = 3;
+
 // ---- wasm binary encoding primitives -------------------------------------------------------------
 
 fn uleb(out: &mut Vec<u8>, mut v: u64) {
@@ -3753,8 +3772,13 @@ fn emit_module(
         //    the old baked constant; a `vm_map`-growing host writes the live size via the `"mapped"`
         //    export, and `emit_confine`/`emit_span_check` read it live. Register-allocatable; no guest
         //    store can alias it.
+        //  * global `WIN_GLOBAL_IDX` (2) — the live window base (#1312), self-initialized to `0` and
+        //    republished by every emitted function's entry (`local.get 0; global.set`), so a host with
+        //    a fixed window never has to write it. A host whose window backing *relocates* on a
+        //    `vm_map` grow writes the fresh base here after each bounce, and every call site reloads
+        //    local 0 from it — see [`WIN_GLOBAL_IDX`].
         let mut sec = Vec::new();
-        uleb(&mut sec, 2 + paged.is_some() as u64);
+        uleb(&mut sec, 3 + paged.is_some() as u64);
         // The fuel global (index 0).
         sec.push(0x7e); // i64
         sec.push(0x01); // mutable
@@ -3766,6 +3790,13 @@ fn emit_module(
         sec.push(0x01); // mutable
         sec.push(OP_I64_CONST);
         sleb64(&mut sec, mapped as i64);
+        sec.push(OP_END);
+        // The `win` global (#1312): default `0`, republished by every emitted function's entry, so
+        // it is only ever read after a publish. See `WIN_GLOBAL_IDX`.
+        sec.push(0x7f); // i32
+        sec.push(0x01); // mutable
+        sec.push(OP_I32_CONST);
+        sleb32(&mut sec, 0);
         sec.push(OP_END);
         if paged.is_some() {
             // The `pagestate` global (#750, paged modules only): the linear-memory base of the
@@ -3783,9 +3814,10 @@ fn emit_module(
     }
 
     let mut sec = Vec::new(); // export section (7): "f{temen_idx}" → its wasm index
-                              // One `f{i}` per emitted function, plus the `"fuel"` and `"mapped"` globals
-                              // (both always — #717 host sync), plus `"pagestate"` on paged modules.
-    let n_exports = emitted.len() as u64 + 2 + paged.is_some() as u64;
+                              // One `f{i}` per emitted function, plus the `"fuel"`, `"mapped"` (#717
+                              // host sync) and `"win"` (#1312 relocation) globals — all three always —
+                              // plus `"pagestate"` on paged modules.
+    let n_exports = emitted.len() as u64 + 3 + paged.is_some() as u64;
     uleb(&mut sec, n_exports);
     for &fi in emitted {
         let name = format!("f{fi}");
@@ -3809,6 +3841,15 @@ fn emit_module(
         sec.push(0x03); // global export kind
         uleb(&mut sec, MAPPED_GLOBAL_IDX as u64);
     }
+    {
+        // The live-`win` global (#1312): exported so a host whose window backing relocates on a
+        // `vm_map` grow can publish the fresh base after each cross-tier bounce.
+        let name = "win";
+        uleb(&mut sec, name.len() as u64);
+        sec.extend_from_slice(name.as_bytes());
+        sec.push(0x03); // global export kind
+        uleb(&mut sec, WIN_GLOBAL_IDX as u64);
+    }
     if paged.is_some() {
         // The page-state table base (#750, paged modules only): the driver writes it before each
         // emitted call, alongside `"mapped"`.
@@ -3816,7 +3857,7 @@ fn emit_module(
         uleb(&mut sec, name.len() as u64);
         sec.extend_from_slice(name.as_bytes());
         sec.push(0x03); // global export kind
-        uleb(&mut sec, (MAPPED_GLOBAL_IDX + 1) as u64);
+        uleb(&mut sec, PAGESTATE_GLOBAL_IDX as u64);
     }
     section(&mut out, 7, &sec);
 
@@ -4326,11 +4367,14 @@ fn emit_func(
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
-        page_check: paged.map(|pl| (pl, MAPPED_GLOBAL_IDX + 1)),
+        page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
         null_guard,
     };
 
     let mut code = Vec::new();
+    // #1312: publish this frame's window base before anything reads or writes memory, so the global
+    // every call site reloads from names *this* frame's window (see `emit_win_publish`).
+    emit_win_publish(&mut code);
     // Copy the Temen params into the entry block's param locals ($next defaults to 0 = entry).
     for (i, _) in f.params.iter().enumerate() {
         code.push(OP_LOCAL_GET);
@@ -4530,11 +4574,14 @@ fn emit_split_group(
         span_last_page_l,
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
-        page_check: paged.map(|pl| (pl, MAPPED_GLOBAL_IDX + 1)),
+        page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
         null_guard,
     };
 
     let mut code = Vec::new();
+    // #1312: publish this frame's window base first — a group function is entered both from the
+    // wrapper and by inter-group `return_call`, and either way local 0 is the window to run over.
+    emit_win_publish(&mut code);
     // ---- entry dispatch: pick the entry block from `entry` (param 2), load its params from scratch,
     // set `$next`, then fall into the main loop. `$sel` encloses the whole nest so each arm brs out of
     // selection into the loop below. Structure mirrors the block-dispatcher (innermost `end` first).
@@ -5037,9 +5084,10 @@ pub fn compile_split_fn(
     }
     section(&mut out, 3, &sec);
 
-    // Global section (6): fuel (0), mapped (1).
+    // Global section (6): fuel (0), mapped (1), win (2) — the same index layout `emit_module` uses,
+    // since both share `emit_block_body`'s lowering (which reads `WIN_GLOBAL_IDX` at every call site).
     let mut sec = Vec::new();
-    uleb(&mut sec, 2);
+    uleb(&mut sec, 3);
     sec.push(0x7e);
     sec.push(0x01);
     sec.push(OP_I64_CONST);
@@ -5050,12 +5098,18 @@ pub fn compile_split_fn(
     sec.push(OP_I64_CONST);
     sleb64(&mut sec, mapped as i64);
     sec.push(OP_END);
+    sec.push(0x7f); // win: i32, mutable, republished by each function's entry (#1312)
+    sec.push(0x01);
+    sec.push(OP_I32_CONST);
+    sleb32(&mut sec, 0);
+    sec.push(OP_END);
     section(&mut out, 6, &sec);
 
     // Export section (7): every `f{j}` (the split function's is its wrapper), plus the `fuel` global so a
-    // host/test can seed a budget and verify OutOfFuel trap-point parity with the oracle (INVARIANTS #9).
+    // host/test can seed a budget and verify OutOfFuel trap-point parity with the oracle (INVARIANTS #9),
+    // plus `win` so a relocating host can publish a fresh window base (#1312).
     let mut sec = Vec::new();
-    uleb(&mut sec, (n_funcs + 1) as u64);
+    uleb(&mut sec, (n_funcs + 2) as u64);
     for (j, w) in wasm_of.iter().enumerate() {
         let name = format!("f{j}");
         uleb(&mut sec, name.len() as u64);
@@ -5068,6 +5122,11 @@ pub fn compile_split_fn(
     sec.extend_from_slice(name.as_bytes());
     sec.push(0x03); // global export kind
     uleb(&mut sec, FUEL_GLOBAL_IDX as u64);
+    let name = "win";
+    uleb(&mut sec, name.len() as u64);
+    sec.extend_from_slice(name.as_bytes());
+    sec.push(0x03); // global export kind
+    uleb(&mut sec, WIN_GLOBAL_IDX as u64);
     section(&mut out, 7, &sec);
 
     // Code section (10).
@@ -5080,6 +5139,33 @@ pub fn compile_split_fn(
     section(&mut out, 10, &sec);
 
     Ok(out)
+}
+
+/// #1312 — **publish** this frame's `win` parameter to [`WIN_GLOBAL_IDX`]. Emitted once at the top of
+/// every function body, before any access or call, so the global always names the window the current
+/// frame runs over. Two consequences:
+///
+/// * a host with a **fixed** window never writes the global and still sees it correct (each entry
+///   restores it), so this is behavior-neutral for every existing driver; and
+/// * a callee entered with a different window (the per-event `win` of a §14 confined child) publishes
+///   *its* window, and the caller restores its own on return via [`emit_win_reload`].
+fn emit_win_publish(code: &mut Vec<u8>) {
+    code.push(OP_LOCAL_GET);
+    uleb(code, 0); // win
+    code.push(0x24); // global.set
+    uleb(code, WIN_GLOBAL_IDX as u64);
+}
+
+/// #1312 — **reload** `win` (local 0) from [`WIN_GLOBAL_IDX`] after a call that can run guest code.
+/// The callee (or a cross-tier bounce inside it) may have `vm_map`-grown the window, and a growing
+/// backing may relocate, in which case the host publishes the fresh base into the global before
+/// returning. Two instructions, and only after calls — the address computations themselves consume
+/// local 0 immediately, so nothing else can hold a stale base.
+fn emit_win_reload(code: &mut Vec<u8>) {
+    code.push(0x23); // global.get
+    uleb(code, WIN_GLOBAL_IDX as u64);
+    code.push(OP_LOCAL_SET);
+    uleb(code, 0); // win
 }
 
 /// Debit one fuel unit from the fuel counter global and trap `TRAP_OUT_OF_FUEL` when it goes negative.
@@ -6001,12 +6087,14 @@ fn emit_block_body(
                 get(code, cx, *arg);
                 code.push(OP_CALL);
                 uleb(code, THREAD_SPAWN_IMPORT_IDX as u64);
+                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::ThreadJoin { handle } if nested_caps => {
                 get(code, cx, *handle);
                 code.push(OP_CALL);
                 uleb(code, THREAD_JOIN_IMPORT_IDX as u64);
+                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::MemoryWait {
@@ -6027,6 +6115,7 @@ fn emit_block_body(
                 sleb32(code, matches!(ty, IntTy::I64) as i32);
                 code.push(OP_CALL);
                 uleb(code, MEM_WAIT_IMPORT_IDX as u64);
+                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             Inst::MemoryNotify { addr, count } if nested_caps => {
@@ -6036,6 +6125,7 @@ fn emit_block_body(
                 get(code, cx, *count);
                 code.push(OP_CALL);
                 uleb(code, MEM_NOTIFY_IMPORT_IDX as u64);
+                emit_win_reload(code); // #1312: the servicer may have grown/relocated the window
                 set_result(cx, code, k, &mut next_val);
             }
             // §14 VM-in-VM bounce (opt-in `nested_caps`): a `call.cap` to INSTANTIATOR
@@ -6099,6 +6189,9 @@ fn emit_block_body(
                     code.push(OP_CALL);
                     uleb(code, JOIN_IMPORT_IDX as u64);
                 }
+                // #1312: every arm above bounced to the host, which may have grown (and so
+                // relocated) the window; reload before the results are popped and used.
+                emit_win_reload(code);
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
                     uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -6120,7 +6213,8 @@ fn emit_block_body(
                         }
                         code.push(OP_CALL);
                         uleb(code, widx as u64);
-                        // Results pushed in order; pop into destination locals in reverse.
+                        emit_win_reload(code); // #1312: the callee may have grown the window
+                                               // Results pushed in order; pop into destination locals in reverse.
                         for i in (0..n_results).rev() {
                             code.push(OP_LOCAL_SET);
                             uleb(code, cx.local_of[k][next_val + i] as u64);
@@ -6189,7 +6283,10 @@ fn emit_block_body(
                         code.push(0x6a); // i32.add
                         code.push(OP_CALL);
                         uleb(code, 1); // func 1 = env.call_interp
-                                       // Load results back from the scratch slots (narrow to i32 where needed).
+                                       // #1312: the bounce runs interpreted guest code that may `vm_map`-grow the
+                                       // window, relocating its backing — reload before the results are read back.
+                        emit_win_reload(code);
+                        // Load results back from the scratch slots (narrow to i32 where needed).
                         for i in 0..n_results {
                             code.push(OP_LOCAL_GET);
                             uleb(code, 1); // env
