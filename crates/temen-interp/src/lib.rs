@@ -18986,6 +18986,18 @@ impl Host {
             .get(i as usize)
             .copied()
             .filter(|b| b.bound)
+            // #1300: the durable transform models `call.import` as a **leaf** suspend point (its
+            // result reloads on thaw). A serve op must *re-issue* instead (§13.4 slice 4b), and the
+            // transform cannot see a runtime binding — so a durable domain never resolves an import
+            // to one: the call fails closed (`CapFault`), on every engine, through this one getter.
+            .filter(|b| {
+                !(self.durable
+                    && b.type_id == temen_ir::CAP_SELF_TYPE_ID
+                    && matches!(
+                        b.op,
+                        temen_ir::durable_abi::SVC_POLL_OP | temen_ir::durable_abi::SVC_WAIT_OP
+                    ))
+            })
     }
 
     pub fn set_import_bindings(&mut self, bindings: Vec<BoundImport>) {

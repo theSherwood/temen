@@ -25,7 +25,7 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use temen_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FToI, Func, FuncType, IToF, Inst, IntTy, Memory, Module,
-    Terminator, TypeEntry, ValType,
+    Terminator, TypeEntry, VShape, ValType,
 };
 
 /// The one call signature every generated durable suspend site uses: `(i32) -> (i64)` (the clock
@@ -239,6 +239,20 @@ fn emit_suspend_body(
     match *suspend {
         Suspend::Cap { npoints } => {
             for _ in 0..npoints {
+                // #1300 Phase 2 (v128 half): a third of the points keep a **vector** live across the
+                // suspend — `i64x2.splat acc` before the call, a lane extracted after it and folded
+                // in — so the shadow frame spills/reloads a 16-byte slot on every backend.
+                let vec_across = if g.below(3) == 0 {
+                    insts.push(Inst::Splat {
+                        shape: VShape::I64x2,
+                        a: acc,
+                    });
+                    let v = *next;
+                    *next += 1;
+                    Some(v)
+                } else {
+                    None
+                };
                 insts.push(Inst::ConstI32(g.u64v() as i32)); // the i32 clock arg
                 let arg = *next;
                 *next += 1;
@@ -261,6 +275,25 @@ fn emit_suspend_body(
                 acc = *next;
                 *next += 1;
                 i64_vals.push(acc);
+                if let Some(v) = vec_across {
+                    insts.push(Inst::ExtractLane {
+                        shape: VShape::I64x2,
+                        lane: g.below(2) as u8,
+                        signed: false,
+                        a: v,
+                    });
+                    let lane = *next;
+                    *next += 1;
+                    insts.push(Inst::IntBin {
+                        ty: IntTy::I64,
+                        op: BinOp::Xor,
+                        a: acc,
+                        b: lane,
+                    });
+                    acc = *next;
+                    *next += 1;
+                    i64_vals.push(acc);
+                }
                 gen_straightline(g, insts, i64_vals, next, acc);
                 acc = *i64_vals.last().unwrap();
             }
