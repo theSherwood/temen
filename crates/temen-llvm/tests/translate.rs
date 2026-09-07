@@ -12806,6 +12806,11 @@ fn demo_bash_translates_and_verifies() {
         "trap \"\" INT; kill -INT $$; echo ignored-ok",
         "trap \"echo u1\" USR1; kill -USR1 $$; kill -USR1 $$; echo twice",
         "trap \"echo bye\" EXIT; (echo sub); echo main",
+        // The shell ITSELF signaled from a subshell while it waits: bash's `wait_sigint` discard logic
+        // (the child exited normally, so the SIGINT is dropped and `$?` is the child's 0) — the slice-4
+        // README listed this as a 128-vs-0 divergence; it matches native on all three tiers, pinned.
+        "(kill -INT $$); echo rc=$?; echo after",
+        "trap 'echo trapped' INT; (kill -INT $$); echo rc=$?",
         // Rung-3 tail — here-docs/here-strings into BUILTIN readers (bash spools each one into
         // an unlinked temp file, so these came free with the #800/#801 fs surface; pinned here
         // because the slice-4 README listed them as a remaining gap).

@@ -115,9 +115,9 @@ interp's safepoint redirect runs the C handler on a dedicated stack) and bash ne
 (`llvm.global_ctors`, which the synthesized `_start` already runs). Gate: five trap scripts in
 the capstone differential (23 scripts total).
 
-Known nuance (deferred until a real script trips it): `(kill -INT $$); echo rc=$?` — `$?` after
-the shell ITSELF is signaled from a subshell while waiting differs (temen 128, native 0: bash's
-`wait_sigint` discard logic vs the personality's `128+sig` zombie status encoding).
+The once-noted nuance — `(kill -INT $$); echo rc=$?`, the shell ITSELF signaled from a subshell
+while it waits — **matches native** (`rc=0`: bash's `wait_sigint` discard logic drops the SIGINT
+because the child exited normally) on all three tiers; it is pinned in the capstone's script list.
 
 ## Interactive rung 1 (DONE) — `bash -i` on the #797 controlling terminal, foreground
 
@@ -296,10 +296,13 @@ gap was the same #1062 setjmp keying — `bytecode.rs`'s `SetJmp`/`LongJmp` were
 `bash -c 'exit'` would have busy-looped in the playground; the token-in-`jmp_buf` fix is now ported to
 the bytecode engine too (pinned by `c_longjmp_through_a_copied_jmp_buf`, which asserts on both tiers).
 
-This resolves most of the "does bash run in the browser" risk: the language + real-program surface is
-at parity on the wasm-safe tier. What remains for the *playground* is integration wiring — an AOT
-`bash.temen` module + a `temen_run_shell`-style entry, the coreutils as browser fixtures, and the
-#797 terminal for interactive `-i` — not core execution gaps.
+This resolved the "does bash run in the browser" risk: the language + real-program surface is at
+parity on the wasm-safe tier. The playground wiring then landed too — the AOT `bash.temen` asset +
+`bash -c` card (#1080/#1114), the coreutils as `bin_*.temen` fixtures (#801), the interactive
+`bash -i` session over the #797 terminal on a Worker (#1122 route (b)), and async signal delivery +
+the interruptible-park `-EINTR` on both bytecode drivers (#1146: `^C` at the prompt → `$? = 130`,
+proven in Chromium). The blocking-stdin park itself (`Stream{In}` under `set_stdin_blocking`) holds
+on every driver as well — cooperative, parallel, and the threaded debug engine (#1302).
 
 ## bash on the parallel driver (#748 — real OS threads)
 
@@ -309,17 +312,29 @@ window copy with its own powerbox, `waitpid` a real condvar block, pipes level-t
 `execve` an in-place host/table swap on the exec'ing thread. Builtin pipelines, command/process
 substitution, subshells, and the exec'd-coreutil pipelines (`seq | head`, `seq 100 | wc -l`,
 `sort | uniq`, redirections) all match the cooperative tier. The bash capstone gate
-(`demo_bash_translates_and_verifies`) pins this as the **dual-driver differential**: every script in
-the main list runs on both bytecode drivers and they must agree with each other (the kill-based trap
-scripts print less than native on BOTH, coherently — async delivery into a running C handler is an
-interp-only tier, #796 L2), and the external-command list must additionally match native on both.
+(`demo_bash_translates_and_verifies`) pins this as the **three-engine differential**: every script in
+the main list runs on the tree-walker and both bytecode drivers, and each is asserted equal to native
+(stdout + exit) — including the kill-based trap scripts, since async delivery into a running C handler
+is on the bytecode engine too (#1146); the external-command list likewise matches native on all three.
 
-## What remains (the slice ladder from the #802 sketch)
+## What remains
 
-- The `^D`-EOF nuance (the one-shot EOF is writer-count state, so the shell's next read can
-  consume an EOF meant for the job — native VEOF is a queued, one-READ event; the capstone
-  sessions don't currently trip it).
-- The `$?`-after-self-SIGINT edge above (slice 4's known nuance).
+The mechanism ladder from the #802 sketch is complete on all three engines (fork/exec/pipes, traps
+and async delivery, the terminal, job control, blocking parks with `-EINTR`, a real `/bin`). The
+`^D`-EOF nuance once listed here is closed: `VEOF` is a **one-shot** for the current read and the
+next terminal read re-arms the writer, so an EOF meant for the foreground job is never consumed by
+the shell's next prompt read. What is left is surface, not mechanism:
+
+- **readline** — bash is built `--disable-readline`, so `bash -i` has no line editing, history, or
+  arrow keys. The host side readline needs exists (raw-mode termios, `TIOCGWINSZ` + `SIGWINCH`,
+  per-keystroke terminal reads); the gaps are shim-side (`select`/`FIONREAD` typeahead probes, a
+  termcap answer) and the playground pane interpreting readline's escape sequences.
+- **#1122 route (a)** — a cooperative suspend/resume session (park-for-input across the FFI, no
+  SharedArrayBuffer) so the interactive card runs on hosts without cross-origin isolation.
+- **An interactive differential harness** — drive native `bash --norc -i` under a pty with the
+  same keystrokes and compare interleaved transcripts (today prompt (fd 2) and echo/output (fd 1)
+  land in separate captures).
+- **#797 rung 2** — a PTY pair (`openpty`); deferred until a consumer needs one (bash does not).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash
   (same-file checks distinguish paths, not hardlinks); `sigsuspend` returns `EINTR` without
