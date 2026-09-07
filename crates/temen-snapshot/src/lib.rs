@@ -41,7 +41,7 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    DurableBinding, DurableHandle, DurableJitDomain, DurableJitUnit, FrozenChildState, FrozenFiber,
+    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, FrozenChildState, FrozenFiber,
     FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use temen_ir::Module;
@@ -118,7 +118,7 @@ use temen_ir::Module;
 /// artifact holding no live-impl cap is byte-identical (only the version differs); one that does
 /// couldn't have been produced by v14 (freeze refused it), so there's no v14 mis-parse to guard.
 /// v16 (DURABILITY.md §12.5 Slice 2: durable guest-JIT): the handle-table binding codec gains
-/// `JitDomain { idx }` / `JitCode { domain, unit }` tags (`B_JIT_DOMAIN`/`B_JIT_CODE`), and a new
+/// `JitTable { idx }` / `JitCode { domain, unit }` tags (`B_JIT_TABLE`/`B_JIT_CODE`), and a new
 /// Section 5 (`TAG_JIT`, after the serve state) carries each granted §22 domain's out-of-line unit
 /// state — the memory-match precondition, compile quotas, and units (each unit's instrumented+
 /// verified IR + `install` type id), rebuilt positionally on thaw so the binding indices re-resolve.
@@ -177,7 +177,7 @@ const B_ADDRESS_SPACE: u8 = 5;
 const B_INSTANTIATOR: u8 = 6;
 const B_LIVE_IMPL: u8 = 7;
 /// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
-const B_JIT_DOMAIN: u8 = 8;
+const B_JIT_TABLE: u8 = 8;
 const B_JIT_CODE: u8 = 9;
 
 const PROT_RW: u8 = 0;
@@ -520,7 +520,7 @@ pub fn freeze_with_prots(
 
     // Section 5 — Durable guest-JIT state (DURABILITY.md §12.5 Slice 2, v16): each granted §22
     // domain's out-of-line units + compile quotas. The handle table (Section 3) carries the
-    // `JitDomain`/`JitCode` *bindings* (indices); this carries the *state* those indices name,
+    // `JitTable`/`JitCode` *bindings* (indices); this carries the *state* those indices name,
     // rebuilt positionally on thaw. Elided when no JIT is granted, so a JIT-free artifact keeps
     // the pre-JIT section layout (only the version differs).
     let jit = host.capture_durable_jit();
@@ -535,7 +535,7 @@ pub fn freeze_with_prots(
 /// Serialize the durable guest-JIT domains (Section 5, v17). Canonical: the `table_log2` header,
 /// then domains and units in index order (capture already yields them so), install occupancy in
 /// install order — all minimal LEB128.
-fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitDomain]) {
+fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitTable]) {
     b.push(table_log2); // v17: the run's call.dyn table reservation
     write_uleb(b, jit.len() as u64);
     for d in jit {
@@ -725,14 +725,14 @@ pub fn restore_with_prots(
 
     // ---- Durable guest-JIT state (§12.5 Slice 2, v16): decode Section 5, bounds-check the handle
     // table's JIT indices against it, and rebuild the domains (each unit re-verified). Do this
-    // *before* re-granting the table so a forged `JitDomain`/`JitCode` index that names no restored
+    // *before* re-granting the table so a forged `JitTable`/`JitCode` index that names no restored
     // domain/unit is rejected here — otherwise the guest's first `compile`/`invoke` would index
-    // `jit_domains` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
+    // `jit_tables` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
     // bounds check). ----
     let (jit_table_log2, jit) = decode_jit(jit_body)?;
     for h in &handles {
         let ok = match h.binding {
-            DurableBinding::JitDomain { idx } => (idx as usize) < jit.len(),
+            DurableBinding::JitTable { idx } => (idx as usize) < jit.len(),
             DurableBinding::JitCode { domain, unit } => jit
                 .get(domain as usize)
                 .is_some_and(|d| (unit as usize) < d.units.len()),
@@ -968,7 +968,7 @@ fn decode_control(
 /// ⇒ no JIT granted (`table_log2 = 0`, empty set). Enforces canonical minimal encoding via the
 /// shared [`Reader`]; a unit's IR is carried opaquely here (its decode + re-verify happens in
 /// [`Host::restore_durable_jit`]). Returns `(table_log2, domains)`.
-fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitDomain>), RestoreError> {
+fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), RestoreError> {
     let Some(body) = body else {
         return Ok((0, Vec::new()));
     };
@@ -1003,7 +1003,7 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitDomain>), Restor
             let unit = u32::try_from(jr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             installed.push((slot, unit));
         }
-        domains.push(DurableJitDomain {
+        domains.push(DurableJitTable {
             mem_log2,
             units_left,
             bytes_left,
@@ -1137,8 +1137,8 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, slot as u64);
             write_uleb(b, export as u64);
         }
-        DurableBinding::JitDomain { idx } => {
-            b.push(B_JIT_DOMAIN);
+        DurableBinding::JitTable { idx } => {
+            b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
         }
         DurableBinding::JitCode { domain, unit } => {
@@ -1174,7 +1174,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
-        B_JIT_DOMAIN => DurableBinding::JitDomain {
+        B_JIT_TABLE => DurableBinding::JitTable {
             idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
         B_JIT_CODE => DurableBinding::JitCode {

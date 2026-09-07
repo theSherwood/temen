@@ -142,10 +142,20 @@ fn drive(
 }
 
 fn run(parent_src: &str, minter_quota: u64) -> (Result<Vec<Value>, Trap>, Vec<Vec<u8>>) {
+    run_in(parent_src, minter_quota, false)
+}
+
+/// [`run`] with the parent host marked **durable** (`Host::set_durable`) or not.
+fn run_in(
+    parent_src: &str,
+    minter_quota: u64,
+    durable: bool,
+) -> (Result<Vec<Value>, Trap>, Vec<Vec<u8>>) {
     let parent = module(parent_src);
     let child = module(CHILD);
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile parent");
     let mut host = Host::new();
+    host.set_durable(durable);
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(&child);
     let minter = host.grant_window_minter(minter_quota);
@@ -195,4 +205,36 @@ fn an_exhausted_minter_refuses_probeably_without_surfacing() {
     let (r, seen) = run(&parent(true, false), (1 << 16) - 1);
     assert_eq!(r, Ok(vec![Value::I64(-22)]), "EINVAL, not a trap");
     assert!(seen.is_empty(), "a refused spawn never reaches the host");
+}
+
+/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it runs
+/// unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
+const SPAWN_ONLY_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 16
+  vq = i64.const 0
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vr = i64.extend_i32_s vs
+  return vr
+  }
+}
+"#;
+
+/// #1299 — the resumable engine's op-15 arm had **no durable gate** (the tree-walker's and the native
+/// thunk's refuse): a durable domain could mint a detached child no freeze can see. Now it lands
+/// `-EINVAL` before the quota take, exactly like the other refusals in `event_instantiate_detached`.
+#[test]
+fn a_durable_domain_refuses_a_detached_spawn_without_surfacing() {
+    let (r, seen) = run_in(SPAWN_ONLY_PARENT, 1 << 16, true);
+    assert_eq!(r, Ok(vec![Value::I64(-22)]), "EINVAL, not a trap");
+    assert!(seen.is_empty(), "a refused spawn never reaches the host");
+    // The same spawn under a non-durable host is admitted — the gate is durability, not the shape.
+    let (r, seen) = run_in(SPAWN_ONLY_PARENT, 1 << 16, false);
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "join handle 0");
+    assert_eq!(seen.len(), 1);
 }

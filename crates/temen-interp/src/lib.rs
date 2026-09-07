@@ -16250,11 +16250,11 @@ enum Binding {
     /// mock synchronous-only/blocking op the offload pool can overlap. Out-of-line (an index, not the
     /// `Arc`) so `Binding` stays `Copy`, like [`Binding::SharedRegion`]/[`Binding::Module`].
     Blocking(u32),
-    /// A guest-driven `Jit` domain handle (iface 11, DESIGN.md §22), carrying the index of its
-    /// [`JitDomainState`] in [`Host::jit_domains`]. Out-of-line so `Binding` stays `Copy`.
-    JitDomain(u32),
+    /// A guest-driven `Jit` handle (iface 11, DESIGN.md §22), carrying the index of its unit table
+    /// ([`JitTableState`]) in [`Host::jit_tables`]. Out-of-line so `Binding` stays `Copy`.
+    JitTable(u32),
     /// A `CompiledCode` handle minted by `Jit.compile` (iface 12): `(domain, unit)` indices into
-    /// [`Host::jit_domains`]. No directly callable ops (like [`Binding::Module`]) — it is only
+    /// [`Host::jit_tables`]. No directly callable ops (like [`Binding::Module`]) — it is only
     /// *named* in `Jit.invoke`/`release`.
     JitCode {
         domain: u32,
@@ -16339,7 +16339,7 @@ impl Attestation {
 /// The value-typed subset of [`Binding`] a v1 snapshot can **re-grant** on restore
 /// (DURABILITY.md §12.5). Every variant's entire state is value-typed — no out-of-line host
 /// objects (`Host::regions`/`modules`/`rings`/…) and no native pointers — so re-granting it
-/// into a fresh `Host` reconstructs the exact authority. The `JitDomain`/`JitCode` variants
+/// into a fresh `Host` reconstructs the exact authority. The `JitTable`/`JitCode` variants
 /// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
 /// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
 /// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`,
@@ -16370,14 +16370,14 @@ pub enum DurableBinding {
     /// out-of-line unit state — each unit's already-instrumented+verified funcs and the compile
     /// quotas — is *not* value-typed enough to ride this `Copy` binding, so it travels in a
     /// separate artifact section ([`Host::capture_durable_jit`]); this binding carries only the
-    /// domain's **index**, which the thaw re-pins into the positionally-rebuilt `jit_domains`. The
+    /// domain's **index**, which the thaw re-pins into the positionally-rebuilt `jit_tables`. The
     /// native/wasm code pointers are process-local and re-derived on thaw (a native re-compile is
     /// the Slice-3 follow-on; an interpreter run invokes the restored funcs directly).
-    JitDomain {
+    JitTable {
         idx: u32,
     },
     /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
-    /// `jit_domains`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
+    /// `jit_tables`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
     /// index pair is its whole authority — durable once the domain's units are captured.
     JitCode {
         domain: u32,
@@ -16413,13 +16413,13 @@ pub struct DurableJitUnit {
     pub install_type_id: u32,
 }
 
-/// One §22 guest-JIT **domain** captured for snapshot (DURABILITY.md §12.5 Slice 2): the
-/// memory-match precondition, the compile quotas, and the domain's units in index order (dead
-/// units included, so a live [`DurableBinding::JitCode`]'s `(domain, unit)` index stays valid).
+/// One §22 guest-JIT **unit table** captured for snapshot (DURABILITY.md §12.5 Slice 2): the
+/// memory-match precondition, the compile quotas, and the table's units in index order (dead
+/// units included, so a live [`DurableBinding::JitCode`]'s `(table, unit)` index stays valid).
 /// Captured as a set by [`Host::capture_durable_jit`] and rebuilt positionally by
-/// [`Host::restore_durable_jit`], so the handle-table `JitDomain`/`JitCode` indices re-resolve.
+/// [`Host::restore_durable_jit`], so the handle-table `JitTable`/`JitCode` indices re-resolve.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct DurableJitDomain {
+pub struct DurableJitTable {
     pub mem_log2: Option<u8>,
     pub units_left: u32,
     pub bytes_left: u64,
@@ -16461,8 +16461,6 @@ pub enum NonDurableKind {
     /// live loader makes the domain non-snapshottable, re-granted by the embedder after restore.
     ModuleLoader,
     Blocking,
-    JitDomain,
-    JitCode,
     HostProc,
     Budget,
     Pipe,
@@ -17774,12 +17772,13 @@ pub struct Host {
     /// (which requires a granted `Jit` capability a serving module need not hold).
     serve_native_ctx: usize,
     /// CALLS.md 5c.1a — a **JIT granted child's** serve context: the address of the child's live
-    /// `ChildCode` (its serve trampolines + fn table), registered at spawn and cleared by the
+    /// compiled module (its serve trampolines + fn table), registered at spawn and cleared by the
     /// powerbox release hook. Distinct from [`Host::serve_native_ctx`] (a top-level run's
     /// `*mut CompiledModule`) so the two interpretations can never be confused: this one is read
     /// only by the locked cap thunk's child serve arm, and only while the child executes (the
-    /// `ChildCode` outlives every in-child `call.cap` by construction; stale reads are prevented
-    /// by the clear-on-release). `0` ⇒ none.
+    /// module outlives every in-child `call.cap` by construction; stale reads are prevented by the
+    /// clear-on-release). `0` ⇒ none. #1296: the same address is registered as the native ctx of
+    /// every `Jit` table re-granted into the child (`set_jit_native_ctx`).
     child_serve_ctx: usize,
     /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
     /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
@@ -17908,11 +17907,11 @@ pub struct Host {
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
     quota: Quota,
-    /// Guest-driven `Jit` domains (iface 11), indexed by the id a [`Binding::JitDomain`] carries.
+    /// Guest-driven `Jit` unit tables (iface 11), indexed by the id a [`Binding::JitTable`] carries.
     /// Append-only for the life of the `Host` (units are never removed — `release` only revokes
     /// the *handle*; code reclaim is a DESIGN.md §22 follow-up), so unit `Arc`s and native pointers stay
     /// valid for the whole run.
-    jit_domains: Vec<JitDomainState>,
+    jit_tables: Vec<JitTableState>,
     /// The host-injected validation gate for guest-submitted `Jit` blobs ([`JitValidator`]) —
     /// injected (like [`Host::region_factory`]) rather than implemented here so this crate keeps
     /// its tiny dependency set *and* both backends run the **identical** decode+verify gate.
@@ -18130,11 +18129,28 @@ struct JitUnit {
     wasm: Option<Arc<[u8]>>,
 }
 
-/// Per-`Jit`-handle domain state.
-struct JitDomainState {
+/// Where a [`JitTableState`]'s memory-match precondition comes from.
+#[derive(Clone, Copy, Debug)]
+enum JitMem {
+    /// Fixed at grant time (a root's table, [`Host::grant_jit`]; a thawed table).
+    Fixed(Option<u8>),
+    /// Read off [`Host::self_module`] at use: a table minted into a §14 child by re-grant
+    /// ([`Host::regrant_into_child`]) exists before the child's module is bound, and a unit must
+    /// match the module it joins — the child's, not the granting parent's. The payload is the
+    /// **granting parent's** resolved precondition, the answer when no module is bound (a
+    /// same-module child of a root the embedder never `set_self_module`d runs the parent's program,
+    /// so the parent's declared memory is the child's).
+    SelfModule(Option<u8>),
+}
+
+/// Per-`Jit`-handle state: the **table of guest-compiled units** behind one `Jit` capability (§22),
+/// with its installs, compile quota and native context. Not a domain — a domain (PROCESS.md) may
+/// hold one of these; "domain" is reserved for the process abstraction (#1298).
+struct JitTableState {
     /// The memory-match precondition (DESIGN.md §22 "Security argument"): a submitted blob's declared
-    /// memory must equal the parent module's, fixed when the capability is granted.
-    mem_log2: Option<u8>,
+    /// memory must equal the owning module's — fixed when the capability is granted to a root, or
+    /// read off the child's own module for a table minted into a child (#1296).
+    mem_log2: JitMem,
     units: Vec<JitUnit>,
     /// Opaque native context the JIT embedder registered (its `*mut CompiledModule` as a
     /// `usize`); `0` in a reference run. Never dereferenced here — only stored and handed back
@@ -18316,7 +18332,7 @@ impl Host {
             cap_pages: None,
             null_guard: 0,
             quota: Quota::default(),
-            jit_domains: Vec::new(),
+            jit_tables: Vec::new(),
             jit_validator: None,
             module_validator: None,
             jit_durable_gate: None,
@@ -18371,7 +18387,7 @@ impl Host {
         // with the same remaining quota. Any *live* JIT state still fails the fork closed: units
         // and installs are per-image artifacts the core cannot faithfully duplicate.
         let jit_pristine = self
-            .jit_domains
+            .jit_tables
             .iter()
             .all(|d| d.units.is_empty() && d.installed.is_empty() && d.native_ctx == 0);
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
@@ -18406,10 +18422,10 @@ impl Host {
         // Pristine guest-JIT grants (see `jit_pristine` above): the twin gets equally-empty
         // domains at the same indices, same remaining quota — its cloned table's `Binding::Jit`
         // slots resolve, and a twin that compiles does so into its own domain.
-        twin.jit_domains = self
-            .jit_domains
+        twin.jit_tables = self
+            .jit_tables
             .iter()
-            .map(|d| JitDomainState {
+            .map(|d| JitTableState {
                 mem_log2: d.mem_log2,
                 units: Vec::new(),
                 native_ctx: 0,
@@ -19134,7 +19150,7 @@ impl Host {
         self.regions.is_empty()
             && self.blockings.is_empty()
             && self.host_procs.is_empty()
-            && self.jit_domains.is_empty()
+            && self.jit_tables.is_empty()
     }
 
     /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
@@ -19523,7 +19539,7 @@ impl Host {
                 // Slice 2 (DURABILITY.md §12.5): a guest-JIT domain/unit handle is now durable —
                 // its out-of-line unit state is captured alongside (`capture_durable_jit`) and
                 // rebuilt positionally on thaw, so the binding's index re-resolves.
-                Binding::JitDomain(idx) => DurableBinding::JitDomain { idx },
+                Binding::JitTable(idx) => DurableBinding::JitTable { idx },
                 Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
                 Binding::HostProc(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::HostProc))
@@ -19564,8 +19580,8 @@ impl Host {
     /// **Drain the live non-durable handles** so the domain becomes snapshottable (DURABILITY.md §12.5
     /// "drainable non-durable bindings" / Phase-4 handle hardening). Closes every live slot holding a
     /// binding [`Self::capture_durable_handles`] would refuse on — the ones carrying out-of-line host
-    /// state or native pointers (`SharedRegion`/`Module`/`Blocking`/`JitDomain`/`JitCode`/
-    /// `HostProc`) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
+    /// state or native pointers (`SharedRegion`/`Module`/`Blocking`/`HostProc`; the §22 `JitTable`/
+    /// `JitCode` bindings ride Section 5 since Slice 2 and stay) — and leaves the durable handles untouched. Each close frees the slot but **keeps its
     /// generation** (D37), so a guest's stale handle value becomes a dead generation and any later
     /// `call.cap` on it is an inert `CapFault`, never authority into a recycled slot. Returns the drained
     /// handles in ascending slot order (for the embedder to audit the relinquished authority). The exact
@@ -19594,7 +19610,7 @@ impl Host {
                 | Binding::Instantiator { .. }
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
-                | Binding::JitDomain(_)
+                | Binding::JitTable(_)
                 | Binding::JitCode { .. } => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
@@ -19657,7 +19673,7 @@ impl Host {
                 }
                 // Slice 2: re-pin the guest-JIT handle at its captured index. The domain's units are
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
-                DurableBinding::JitDomain { idx } => Binding::JitDomain(idx),
+                DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
@@ -19666,25 +19682,25 @@ impl Host {
 
     /// Capture the §22 guest-JIT domains' out-of-line state for a snapshot (DURABILITY.md §12.5
     /// Slice 2). Complements [`Self::capture_durable_handles`]: the handle table carries the
-    /// `JitDomain`/`JitCode` *bindings* (indices), and this carries the *state* those indices name —
+    /// `JitTable`/`JitCode` *bindings* (indices), and this carries the *state* those indices name —
     /// each domain's memory-match precondition, compile quotas, and units (in index order, dead
     /// units included so a live `JitCode`'s `unit` index stays valid). Every domain is captured
-    /// positionally (even one no live handle names, so a `JitCode` whose `JitDomain` was dropped
+    /// positionally (even one no live handle names, so a `JitCode` whose `JitTable` was dropped
     /// still resolves), which is what makes the restore's index re-pin exact. The native/wasm code
     /// pointers and `native_ctx` are process-local and dropped — an interpreter thaw invokes the
     /// restored funcs directly; a native re-compile is the Slice-3 follow-on.
-    pub fn capture_durable_jit(&self) -> Vec<DurableJitDomain> {
-        self.jit_domains
+    pub fn capture_durable_jit(&self) -> Vec<DurableJitTable> {
+        self.jit_tables
             .iter()
-            .map(|d| DurableJitDomain {
-                mem_log2: d.mem_log2,
+            .map(|d| DurableJitTable {
+                mem_log2: self.jit_mem_log2(d),
                 units_left: d.units_left,
                 bytes_left: d.bytes_left,
                 units: d
                     .units
                     .iter()
                     .map(|u| DurableJitUnit {
-                        unit_ir: encode_jit_unit(&u.funcs, &u.types, d.mem_log2),
+                        unit_ir: encode_jit_unit(&u.funcs, &u.types, self.jit_mem_log2(d)),
                         install_type_id: u.install_type_id,
                     })
                     .collect(),
@@ -19698,12 +19714,12 @@ impl Host {
     /// re-verified** — the artifact is untrusted, so its funcs must clear the verifier again before
     /// they can be invoked (the deserialization-boundary safety re-check, like the codec's
     /// window-containment gate). Domains are rebuilt positionally, so the handle table's re-pinned
-    /// `JitDomain`/`JitCode` indices resolve. Native/wasm code pointers restore to `0` (an
+    /// `JitTable`/`JitCode` indices resolve. Native/wasm code pointers restore to `0` (an
     /// interpreter run invokes the funcs directly; a native `invoke` of a not-yet-recompiled unit
     /// fails closed — the Slice-3 boundary). Fail-closed: a bad unit reconstructs no domains.
     pub fn restore_durable_jit(
         &mut self,
-        domains: &[DurableJitDomain],
+        domains: &[DurableJitTable],
     ) -> Result<(), JitRestoreError> {
         let mut rebuilt = Vec::with_capacity(domains.len());
         for d in domains {
@@ -19721,8 +19737,8 @@ impl Host {
                     wasm: None,
                 });
             }
-            rebuilt.push(JitDomainState {
-                mem_log2: d.mem_log2,
+            rebuilt.push(JitTableState {
+                mem_log2: JitMem::Fixed(d.mem_log2),
                 units,
                 native_ctx: 0,
                 units_left: d.units_left,
@@ -19730,7 +19746,7 @@ impl Host {
                 installed: d.installed.clone(),
             });
         }
-        self.jit_domains = rebuilt;
+        self.jit_tables = rebuilt;
         Ok(())
     }
 
@@ -20353,7 +20369,7 @@ impl Host {
         self.serve_native_ctx
     }
 
-    /// CALLS.md 5c.1a — register / clear this (child) domain's `ChildCode` serve context; see
+    /// CALLS.md 5c.1a — register / clear this (child) domain's compiled-module serve context; see
     /// [`Host::child_serve_ctx`].
     pub fn set_child_serve_ctx(&mut self, ctx: usize) {
         self.child_serve_ctx = ctx;
@@ -21229,9 +21245,9 @@ impl Host {
     /// slots for B2 `install` (the run's root vCPU honours it; pass the **same** value as the
     /// JIT's `table_reserve_log2`). `0` ⇒ natural size (no install room).
     pub fn grant_jit_with_table(&mut self, mem_log2: Option<u8>, table_log2: u8) -> i32 {
-        let id = self.jit_domains.len() as u32;
-        self.jit_domains.push(JitDomainState {
-            mem_log2,
+        let id = self.jit_tables.len() as u32;
+        self.jit_tables.push(JitTableState {
+            mem_log2: JitMem::Fixed(mem_log2),
             units: Vec::new(),
             native_ctx: 0,
             units_left: JIT_DEFAULT_MAX_UNITS,
@@ -21239,7 +21255,7 @@ impl Host {
             installed: Vec::new(),
         });
         self.jit_table_log2 = self.jit_table_log2.max(table_log2);
-        self.grant(cap_id::JIT, Binding::JitDomain(id))
+        self.grant(cap_id::JIT, Binding::JitTable(id))
     }
 
     /// Restore the `call.dyn` table reservation (DURABILITY.md §12.5 install-durability): the
@@ -21255,7 +21271,7 @@ impl Host {
     /// a per-run transient) and rides a snapshot. A repeat of the same slot replaces (the table slot
     /// holds one unit); push order is preserved otherwise, so a re-apply reproduces dispatch.
     pub fn jit_record_install(&mut self, domain: u32, slot: u32, unit: u32) {
-        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+        if let Some(d) = self.jit_tables.get_mut(domain as usize) {
             d.installed.retain(|&(s, _)| s != slot);
             d.installed.push((slot, unit));
         }
@@ -21263,7 +21279,7 @@ impl Host {
 
     /// Forget a B2 `uninstall`: `slot` is cleared, so drop its occupancy record (DURABILITY.md §12.5).
     pub fn jit_forget_install(&mut self, domain: u32, slot: u32) {
-        if let Some(d) = self.jit_domains.get_mut(domain as usize) {
+        if let Some(d) = self.jit_tables.get_mut(domain as usize) {
             d.installed.retain(|&(s, _)| s != slot);
         }
     }
@@ -21272,7 +21288,7 @@ impl Host {
     /// The reconstruct-on-thaw embedder re-installs each into the fresh table (interp re-applies at
     /// run start; the native tier via `temen_run::reconstruct_jit_units`).
     pub fn jit_installs(&self, domain: u32) -> Vec<(u32, u32)> {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .map_or(Vec::new(), |d| d.installed.clone())
     }
@@ -21283,7 +21299,7 @@ impl Host {
     /// installs recorded), so re-apply is a no-op there.
     fn jit_all_installs(&self) -> Vec<(u32, u32, u32)> {
         let mut out = Vec::new();
-        for (domain, d) in self.jit_domains.iter().enumerate() {
+        for (domain, d) in self.jit_tables.iter().enumerate() {
             for &(slot, unit) in &d.installed {
                 out.push((domain as u32, slot, unit));
             }
@@ -21362,7 +21378,7 @@ impl Host {
     /// in the shared [`Host::jit_compile`] gate, so a quota'd `compile` fails `-ENOMEM`
     /// identically on both backends). Set before the run, like [`Host::set_quota`].
     pub fn set_jit_quota(&mut self, max_units: u32, max_blob_bytes: u64) {
-        for d in &mut self.jit_domains {
+        for d in &mut self.jit_tables {
             d.units_left = max_units;
             d.bytes_left = max_blob_bytes;
         }
@@ -21373,14 +21389,25 @@ impl Host {
     /// Stored opaquely; only the embedder's cap thunk dereferences it. A reference
     /// (interpreter) run never calls this, leaving `0`.
     pub fn set_jit_native_ctx(&mut self, ctx: usize) {
-        for d in &mut self.jit_domains {
+        for d in &mut self.jit_tables {
             d.native_ctx = ctx;
         }
     }
 
     /// The native context registered for `domain` (`0` ⇒ reference run / none registered).
+    /// The memory-match precondition a table enforces at `compile` (see [`JitMem`]).
+    fn jit_mem_log2(&self, d: &JitTableState) -> Option<u8> {
+        match d.mem_log2 {
+            JitMem::Fixed(m) => m,
+            JitMem::SelfModule(inherited) => match &self.self_module {
+                Some(m) => m.memory.map(|mc| mc.size_log2),
+                None => inherited,
+            },
+        }
+    }
+
     pub fn jit_native_ctx(&self, domain: u32) -> usize {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .map_or(0, |d| d.native_ctx)
     }
@@ -21426,9 +21453,9 @@ impl Host {
             return Ok(Err(EINVAL));
         };
         // The wasm-JIT emitter is a `Copy` fn pointer — read it out before the `&mut` borrow of
-        // `jit_domains` so the closed-unit emit below can call it without a self-borrow conflict.
+        // `jit_tables` so the closed-unit emit below can call it without a self-borrow conflict.
         let emitter = self.jit_wasm_emitter;
-        // Read the durable install fence out before the `&mut jit_domains` borrow (disjoint fields):
+        // Read the durable install fence out before the `&mut jit_tables` borrow (disjoint fields):
         // the gate predicate (Copy) and a shared borrow of the program's tainted signatures.
         let durable_gate = if self.durable {
             self.jit_durable_gate
@@ -21436,14 +21463,15 @@ impl Host {
             None
         };
         let durable_tainted = &self.jit_durable_tainted_sigs;
-        let d = &mut self.jit_domains[domain as usize];
+        let mem_log2 = self.jit_mem_log2(&self.jit_tables[domain as usize]);
+        let d = &mut self.jit_tables[domain as usize];
         // Compile quota first: charge the *attempt's* bytes (validation is the cost a looping
         // guest imposes), the unit slot only on success; out of either budget is `-ENOMEM`.
         if d.units_left == 0 || (bytes.len() as u64) > d.bytes_left {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, d.mem_log2, symtab) {
+        let funcs = match validate(bytes, mem_log2, symtab) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
@@ -21511,7 +21539,7 @@ impl Host {
         install_type_id: u32,
     ) {
         if let Some(u) = self
-            .jit_domains
+            .jit_tables
             .get_mut(domain as usize)
             .and_then(|d| d.units.get_mut(unit as usize))
         {
@@ -21524,7 +21552,7 @@ impl Host {
     /// The natural-ABI entry pointer + interned `type_id` the JIT embedder registered for a
     /// unit (for B2 `install`); `(0, 0)` if none / a reference run.
     pub fn jit_unit_install(&self, domain: u32, unit: u32) -> (usize, u32) {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .map_or((0, 0), |u| (u.install_code, u.install_type_id))
@@ -21533,7 +21561,7 @@ impl Host {
     /// Resolve a handle as a `Jit` domain (a forged/closed/wrong-type handle is a `CapFault`).
     pub fn resolve_jit_domain(&self, handle: i32) -> Result<u32, Trap> {
         match self.resolve(handle, cap_id::JIT)? {
-            Binding::JitDomain(d) => Ok(d),
+            Binding::JitTable(d) => Ok(d),
             _ => Err(Trap::CapFault),
         }
     }
@@ -21548,7 +21576,7 @@ impl Host {
 
     /// The validated functions of a compiled unit (its entry is `funcs[0]`).
     pub fn jit_unit_funcs(&self, domain: u32, unit: u32) -> Option<Arc<[Func]>> {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .map(|u| Arc::clone(&u.funcs))
@@ -21557,7 +21585,7 @@ impl Host {
     /// The unit's type section (FuncType interning, #922) — the sibling of [`Self::jit_unit_funcs`]
     /// so an `invoke`d unit resolves its call variants' interned signatures as module INVOKE_MODULE.
     pub fn jit_unit_types(&self, domain: u32, unit: u32) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .map(|u| Arc::clone(&u.types))
@@ -21568,7 +21596,7 @@ impl Host {
     /// browser wasm-JIT tier reads this to instantiate + run the guest's runtime-compiled unit on
     /// emitted wasm; a `None` means `invoke` falls back to the interpreter (fail-closed).
     pub fn jit_unit_wasm(&self, domain: u32, unit: u32) -> Option<Arc<[u8]>> {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .and_then(|u| u.wasm.clone())
@@ -21578,7 +21606,7 @@ impl Host {
     /// handle merely revoked). The code-memory compaction driver (DESIGN.md §22) walks `0..count`
     /// deciding which to carry into the fresh module.
     pub fn jit_unit_count(&self, domain: u32) -> u32 {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .map_or(0, |d| d.units.len() as u32)
     }
@@ -21586,7 +21614,7 @@ impl Host {
     /// The number of granted `Jit` domains (append-only, indexed `0..count`). The reconstruct-on-thaw
     /// embedder (DURABILITY.md §12.5 Slice 3) walks these to re-compile each restored domain's units.
     pub fn jit_domain_count(&self) -> u32 {
-        self.jit_domains.len() as u32
+        self.jit_tables.len() as u32
     }
 
     /// The units of `domain` still reachable through a **live `CompiledCode` handle** (a
@@ -21610,7 +21638,7 @@ impl Host {
 
     /// The native trampoline registered for a unit (`0` ⇒ none).
     pub fn jit_unit_native(&self, domain: u32, unit: u32) -> usize {
-        self.jit_domains
+        self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .map_or(0, |u| u.native_code)
@@ -21789,6 +21817,7 @@ impl Host {
             || self.resolve_copyable(handle).is_ok()
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
+            || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -21896,6 +21925,31 @@ impl Host {
                     }
                     h
                 });
+        }
+        // #1296 — a §22 **`Jit`** grant: the child gets a **fresh, empty unit table** of its own, not an
+        // alias of the parent's (units, installs and the B2 dispatch slots are per-table artifacts, and
+        // sharing them across the §14 boundary would let either side's `install` alias into the
+        // other's `call.dyn`). Attenuated: the child's compile quota is at most the parent's remaining.
+        // The memory-match precondition resolves against the *child's* module at compile time
+        // ([`JitMem::SelfModule`]); the embedder's validator / emitter gates carry over so the child
+        // compiles through exactly the parent's checks. A durable child's table refuses `compile`
+        // (`jit_hosts_durable` is not inherited — #1300 is the durable-transform scope).
+        if let Ok(Binding::JitTable(idx)) = self.resolve(handle, cap_id::JIT) {
+            let parent = self.jit_tables.get(idx as usize)?;
+            let inherited = self.jit_mem_log2(parent);
+            let id = child.jit_tables.len() as u32;
+            child.jit_tables.push(JitTableState {
+                mem_log2: JitMem::SelfModule(inherited),
+                units: Vec::new(),
+                native_ctx: 0,
+                units_left: parent.units_left.min(JIT_DEFAULT_MAX_UNITS),
+                bytes_left: parent.bytes_left.min(JIT_DEFAULT_MAX_BLOB_BYTES),
+                installed: Vec::new(),
+            });
+            child.jit_table_log2 = child.jit_table_log2.max(self.jit_table_log2);
+            child.jit_validator = child.jit_validator.or(self.jit_validator);
+            child.jit_wasm_emitter = child.jit_wasm_emitter.or(self.jit_wasm_emitter);
+            return Some(child.grant(cap_id::JIT, Binding::JitTable(id)));
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
         // into the child (cloning the grant entry — its `funcs`/`data`/`module` are `Arc`s, so the copy
@@ -23255,7 +23309,7 @@ impl Host {
             // never be serviced here — it must *run guest code* (the interp eval loop intercepts
             // it before dispatch; the JIT embedder's thunk intercepts the whole iface) — so
             // reaching it is fail-closed.
-            Binding::JitDomain(_) => match op {
+            Binding::JitTable(_) => match op {
                 0 => {
                     // compile(ptr, len) -> code_handle | -errno. The blob is borrowed from guest
                     // memory; with no window there is nothing to read (-EFAULT, like Stream).

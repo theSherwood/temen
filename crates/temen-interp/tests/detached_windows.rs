@@ -461,3 +461,49 @@ fn a_detached_child_grows_past_its_declared_window() {
         "the word round-tripped through a page above the declared window"
     );
 }
+
+/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it
+/// runs unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
+const SPAWN_ONLY_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 16
+  vq = i64.const 0
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vr = i64.extend_i32_s vs
+  return vr
+  }
+}
+"#;
+
+/// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` outright — a detached window is
+/// outside the subtree snapshot, so the spawn lands `-EINVAL` probeably (never a trap) **and charges the
+/// minter nothing** (#1299 pins the tree-walker's `!durable` gate, which no test asserted before).
+#[test]
+fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
+    let a = module(SPAWN_ONLY_PARENT);
+    let b = module(ATTEST_MOD);
+    let mut host = Host::new();
+    host.set_durable(true);
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_window_minter(1 << 16); // exactly the child's window
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hw)],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("run");
+    assert_eq!(r, vec![Value::I64(-22)], "EINVAL, not a trap");
+    assert!(
+        host.window_minter_take(hw, 1 << 16),
+        "the refusal charged the minter nothing: the whole quota is still there"
+    );
+}

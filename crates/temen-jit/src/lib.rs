@@ -678,6 +678,11 @@ pub struct GrantChild {
     pub inst_handle: i32,
     pub as_handle: i32,
     pub grant_handle: i32,
+    /// #1296 — the child's `call.dyn` table reservation (`log2` slots; `0` ⇒ the natural
+    /// `next_pow2(funcs)`), read off the child powerbox: a child holding a re-granted `Jit`
+    /// capability installs units into padding slots of its **own** table, so the builder reports
+    /// the reservation its grant carried and the child compiles with that many slots.
+    pub jit_table_log2: u8,
 }
 
 /// The host callback the §14 nesting runtime uses for **`instantiate_granted`** (Instantiator op 8):
@@ -796,7 +801,7 @@ pub struct GrantChildHooks {
     /// cell), replacing the run's unsynchronized `cap_thunk` for granted children only.
     pub thunk: CapThunk,
     /// CALLS.md 5c.1b — register a spawned granted child's **serve context** on its shared
-    /// powerbox: `(child_ctx, serve_ctx)` where `serve_ctx` is the live `ChildCode` address
+    /// powerbox: `(child_ctx, serve_ctx)` where `serve_ctx` is the live child `CompiledModule` address
     /// (resolve handlers via [`child_handler_tramp`], invoke via [`child_invoke_handler`]).
     /// Called after compile, before the child thread starts; cleared by the releaser (host-side
     /// `Host::set_child_serve_ctx(0)`) so a stale pointer is never read after child exit.
@@ -1779,7 +1784,7 @@ fn run_inner(
 /// failed` → `0xc0000409`) and window commits fail (`os error 1455`) — the ISSUES.md **I3**
 /// Windows CI flake family. On unix, overcommit hid the same leak as unbounded VA growth.
 ///
-/// Freeing on drop is sound because both owners ([`CompiledModule`], [`ChildCode`]) already pin
+/// Freeing on drop is sound because the owner ([`CompiledModule`], root or §14 child) already pins
 /// the lifetime contract "nothing that points into the code may outlive this struct": the field
 /// is declared last, so runtimes/tables/trampolines drop first, and no fiber, thread, or
 /// installed table entry survives the owner (documented on the structs).
@@ -2258,6 +2263,11 @@ pub struct CompiledModule {
     /// the guarded call so a mid-run [`Self::invoke_extra`] can arm its nested recovery.
     /// `None` ⇒ no run in flight (invoke is rejected).
     live_fault_range: Option<(usize, usize)>,
+    /// #1296 — a §14 **child** module: its window is minted and owned by the nursery's spawn, never by
+    /// this module, so `live_fault_range` is never recorded (one plain child module runs in several
+    /// windows at once — the compile cache) and `invoke_extra` derives the range from the `mem_base`
+    /// the thunk was handed. `false` for a root, whose `run_code_raw` records its own window.
+    caller_window: bool,
     /// The source backtrace of the most recent [`Self::run`] that **trapped** (§5 W3 Stage 1):
     /// innermost guest frame first, symbolized from the trap site the guard handler captured.
     /// Empty after a non-trapping run (or a trap with no usable frame). Read via
@@ -3305,6 +3315,7 @@ impl CompiledModule {
             extra_bytes: 0,
             base_bytes,
             live_fault_range: None,
+            caller_window: false,
             last_trap_backtrace: Vec::new(),
             last_trap_fiber: None,
             win_mapped,
@@ -3508,16 +3519,28 @@ impl CompiledModule {
         mem_base: *mut u8,
         trap_out: *mut i64,
     ) -> Result<(), JitError> {
-        let (fn_table_ptr, live) = {
+        let (fn_table_ptr, live, caller_window, reserved) = {
             let t = &*this;
             (
                 t.fn_table.as_ptr() as *const core::ffi::c_void,
                 t.live_fault_range,
+                t.caller_window,
+                t.win_reserved,
             )
         };
-        let (lo, hi) = live.ok_or(JitError::Unsupported(
-            "invoke_extra outside an in-flight run",
-        ))?;
+        // A root run records its window at entry (`run_code_raw`); outside a run there is no live
+        // window to confine against — refuse. A §14 child's module never records one (see
+        // `caller_window`): its live window is exactly the `mem_base` its thunk was handed, whose
+        // extent (reservation + guard) is baked in `win_reserved` (#1296).
+        let (lo, hi) = match live {
+            Some(r) => r,
+            None if caller_window => mem::fault_range_of(mem_base, reserved),
+            None => {
+                return Err(JitError::Unsupported(
+                    "invoke_extra outside an in-flight run",
+                ))
+            }
+        };
         let faulted = mem::run_guarded_range(
             code,
             args.as_ptr(),
@@ -4660,9 +4683,10 @@ pub(crate) unsafe fn compile_child_and_run(
         0,          // durable path: no shared futex domain — child futex ops stay rejected
         child_inst,
         &[], // the durable/sync nested child is never an offer target — no serve trampolines
+        0,   // an empty powerbox holds no `Jit` — the natural table
     )?;
     let n_results = funcs[child_entry as usize].results.len();
-    let code = child.code;
+    let code = child.tramp_code;
     let fn_table_ptr = child.fn_table.as_ptr();
 
     // The child's own fully-mapped window (+ guard page). Seed it from the parent's sub-region so the
@@ -4817,49 +4841,15 @@ pub(crate) unsafe fn compile_child_and_run(
     Ok((results.first().copied().unwrap_or(0), trap_cell, unwound))
 }
 
-/// A compiled §14 child: the owning [`JITModule`] (executable memory lives until drop), its
-/// power-of-two-padded function table, and the entry's buffer-ABI trampoline. Produced by
-/// [`compile_child`]; the synchronous Instantiator child runs it once and drops it, a co-fiber
-/// child keeps it alive across suspends (the [`instantiator_rt`] coroutine owns it).
-#[cfg(fiber_rt)]
-pub(crate) struct ChildCode {
-    /// The padded function table `call.dyn` dispatches through; its address is baked into the
-    /// running code, so it must not move while the child can run (it is boxed and owned here).
-    pub(crate) fn_table: Box<[FnEntry]>,
-    /// The entry trampoline (buffer ABI, [`mem::run_guarded`]-compatible).
-    pub(crate) code: *const u8,
-    /// CALLS.md 5c.1a — one buffer-ABI trampoline per impl-export handler `(funcidx, code,
-    /// n_params, n_results)`, the `CompiledModule::serve_tramps` child twin. Read by the locked
-    /// thunk's child serve arm through [`Host::child_serve_ctx`]; valid exactly as long as this
-    /// `ChildCode` (the registering spawn clears the ctx at release).
-    pub(crate) serve_tramps: Vec<(u32, *const u8, usize, usize)>,
-    /// Owns the executable memory; dropped last, and the drop **releases** the code arena back to
-    /// the OS (see [`OwnedJit`] — a bare `JITModule` would leak 256 MiB of reservation per child,
-    /// eagerly commit-charged on Windows).
-    module: OwnedJit,
-}
-
-#[cfg(fiber_rt)]
-impl ChildCode {
-    /// CALLS.md 5c.1a — the serve trampoline for handler `func`, `(code, n_params, n_results)`;
-    /// the [`CompiledModule::handler_tramp`] child twin. `None` for a non-handler funcidx.
-    pub(crate) fn handler_tramp(&self, func: u32) -> Option<(*const u8, usize, usize)> {
-        self.serve_tramps
-            .iter()
-            .find(|&&(f, _, _, _)| f == func)
-            .map(|&(_, code, np, nr)| (code, np, nr))
-    }
-}
-
-/// CALLS.md 5c.1a — invoke a [`ChildCode`] serve trampoline over the child's **live** window: the
-/// [`CompiledModule::invoke_extra`] child twin, with the detect-and-kill fault range taken from the
-/// caller's own thunk parameters (`[mem_base, mem_base+mem_size)`) instead of a stored
-/// `live_fault_range` — the child serve arm runs *inside* the child's in-flight guarded entry call
-/// on the child's own thread, and the thunk was handed exactly that window. Returns `true` if the
-/// handler faulted (the caller reports `FAULT_TRAP`, the outer run's detect-and-kill shape).
+/// CALLS.md 5c.1a — invoke a §14 child's serve trampoline over the child's **live** window: the
+/// [`CompiledModule::invoke_extra`] serve twin, with the detect-and-kill fault range taken from the
+/// caller's own thunk parameters (`[mem_base, mem_base+mem_size)`) — the child serve arm runs
+/// *inside* the child's in-flight guarded entry call on the child's own thread, and the thunk was
+/// handed exactly that window. Returns `true` if the handler faulted (the caller reports
+/// `FAULT_TRAP`, the outer run's detect-and-kill shape).
 ///
 /// # Safety
-/// `cc` is the live `ChildCode` the in-flight child was compiled from (registered at spawn,
+/// `cc` is the live [`CompiledModule`] the in-flight child was compiled from (registered at spawn,
 /// cleared at release); `code` is one of its finalized serve trampolines; `args`/`results` match
 /// the trampoline's arity; `[mem_base, mem_base+mem_size)` is the child's live mapped window;
 /// `trap_out` is the run's trap cell.
@@ -4873,7 +4863,7 @@ pub unsafe fn child_invoke_handler(
     mem_size: u64,
     trap_out: *mut i64,
 ) -> bool {
-    let cc = cc as *const ChildCode;
+    let cc = cc as *const CompiledModule;
     let fn_table_ptr = (*cc).fn_table.as_ptr() as *const core::ffi::c_void;
     let lo = mem_base as usize;
     mem::run_guarded_range(
@@ -4888,41 +4878,34 @@ pub unsafe fn child_invoke_handler(
     )
 }
 
-/// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw [`ChildCode`] (the
-/// `Host::child_serve_ctx` registration, opaque outside this crate).
+/// CALLS.md 5c.1a — resolve handler `func`'s serve trampoline on a raw child [`CompiledModule`]
+/// (the `Host::child_serve_ctx` registration, opaque outside this crate).
 ///
 /// # Safety
-/// `cc` is a live registered `ChildCode` (see [`child_invoke_handler`]).
+/// `cc` is a live registered child module (see [`child_invoke_handler`]).
 #[cfg(fiber_rt)]
 pub unsafe fn child_handler_tramp(
     cc: *const core::ffi::c_void,
     func: u32,
 ) -> Option<(*const u8, usize, usize)> {
-    (*(cc as *const ChildCode)).handler_tramp(func)
+    (*(cc as *const CompiledModule)).handler_tramp(func)
 }
 
+// PROCESS.md S1c — a compiled §14 child is shareable across OS threads. `CompiledModule` is
+// `!Send`/`!Sync` only because of its raw code pointers; once `finalize_definitions` has run (before
+// a child is ever stored) the code arena and `fn_table` are read-execute memory the entry trampoline
+// reads and jumps into, never writes. So handing an `Arc<CompiledModule>` to a spawned child thread
+// and running the same **plain** child concurrently on N threads (the nursery's per-carve cache) is
+// sound: every thread only reads the same finalized bytes, and the single `OwnedJit` frees the arena
+// once when the last `Arc` drops (after `join_children`, so no thread still runs the code). The one
+// mutable path — `define_extra`/`install` behind a re-granted `Jit` capability (#1296) — is reached
+// only through a **granted** child, which is compiled per spawn (never cached) and owned by exactly
+// one thread: its module is mutated by that thread alone, inside the child's own suspended `call.cap`
+// (the `run_raw` re-entry discipline), never shared. A root module is never sent anywhere.
 #[cfg(fiber_rt)]
-impl Drop for ChildCode {
-    fn drop(&mut self) {
-        // This impl exists to document that `code`/`fn_table` die with the struct (no use may
-        // outlive it) — that contract is what makes the [`OwnedJit`] free-on-drop sound here.
-        let _ = &self.module;
-    }
-}
-
-// PROCESS.md S1c — a compiled child is shareable across OS threads. `ChildCode` is `!Send`/`!Sync`
-// only because of the raw `code: *const u8`; it holds no interior mutability and, once
-// `finalize_definitions` has run (before it is ever stored), the code arena and `fn_table` are
-// **immutable, read-execute memory** — the entry trampoline reads them, never writes. So handing
-// `&ChildCode` (or an `Arc<ChildCode>`) to a spawned child thread and running the same code
-// concurrently on N threads is sound: every thread only reads the same finalized bytes and jumps into
-// them, and the single `OwnedJit` frees the arena once when the last `Arc` drops (after `join_all`, so
-// no thread still runs the code). This is the foundation the S1c OS-thread child executor stands on
-// (the per-carve cache below becomes `Arc`-backed to match).
+unsafe impl Send for CompiledModule {}
 #[cfg(fiber_rt)]
-unsafe impl Send for ChildCode {}
-#[cfg(fiber_rt)]
-unsafe impl Sync for ChildCode {}
+unsafe impl Sync for CompiledModule {}
 
 // Compile-time proof that the child artifact stays thread-shareable — if a future field reintroduced a
 // `!Send`/`!Sync` type (e.g. an `Rc` or `Cell`) without a matching soundness review, this assertion
@@ -4930,7 +4913,7 @@ unsafe impl Sync for ChildCode {}
 #[cfg(fiber_rt)]
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<ChildCode>();
+    assert_send_sync::<CompiledModule>();
 };
 
 /// Build a fresh `JITModule` with the escape-TCB ISA configuration **every** compile path shares
@@ -5017,7 +5000,9 @@ fn compile_child(
     // a cross-domain dispatch can invoke it over the child's live window (the `serve_tramps`
     // block of `CompiledModule::compile`, child twin). Empty ⇒ a child that offers nothing.
     serve_handlers: &[u32],
-) -> Result<ChildCode, JitError> {
+    // #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
+    table_reserve_log2: u8,
+) -> Result<CompiledModule, JitError> {
     compile_child_windowed(
         funcs,
         types,
@@ -5031,6 +5016,7 @@ fn compile_child(
         futex_sched,
         inst_env,
         serve_handlers,
+        table_reserve_log2,
     )
 }
 
@@ -5039,6 +5025,13 @@ fn compile_child(
 /// the reservation, the thunks see `(mapped, reserved)` so the child's `vm_map` commits tail pages
 /// through the same path a root run's does, and an access past the committed extent faults on the
 /// inaccessible tail. `mapped_log2 == reserved_log2` is the fully-mapped carve child.
+///
+/// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
+/// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
+/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no fiber /
+/// setjmp / nursery runtime of its own (those ops are rejected below). Being the root's shape is what
+/// lets a child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
+/// submitted unit against exactly these baked constants, into the child's own table.
 #[allow(clippy::too_many_arguments)]
 fn compile_child_windowed(
     funcs: &[Func],
@@ -5053,7 +5046,8 @@ fn compile_child_windowed(
     futex_sched: usize,
     inst_env: InstEnv,
     serve_handlers: &[u32],
-) -> Result<ChildCode, JitError> {
+    table_reserve_log2: u8,
+) -> Result<CompiledModule, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
     // *validated* (which requires `child ≤ parent ≤ 2^MAX`, so this is unreachable in practice — but
@@ -5098,10 +5092,22 @@ fn compile_child_windowed(
     let mapped = 1u64 << mapped_log2; // bounded ≤ MAX by the reject above (audit #3)
     let reserved = 1u64 << reserved_log2;
     let mask = reserved - 1;
+    // The `call.dyn` table, power-of-two padded and — like a root's (`CompiledModule::compile`) —
+    // reserved larger than the module needs when the child holds a `Jit` grant, so `install` fills
+    // padding slots without moving the mask constant baked into every call site.
+    let table_len = (1usize << table_reserve_log2)
+        .max(funcs.len().next_power_of_two())
+        .max(1);
+    let fn_table_mask = (table_len as u64) - 1;
 
     let mut module = new_jit_module()?;
     let ids: Vec<FuncId> = declare_all_funcs(&mut module, funcs)?;
-    let distinct = distinct_types(funcs);
+    // Function signatures first, then every call-site signature (as the root does), so a unit a
+    // `Jit`-holding child later submits interns against stable ids — id-equality ≡ structural
+    // equality across the child's program and its units (DESIGN.md §22).
+    let mut distinct = distinct_types(funcs);
+    intern_unit_sigs(&mut distinct, funcs, types)?;
+    let distinct = distinct;
 
     let cap = CapEnv {
         thunk_addr: cap_thunk as *const () as i64,
@@ -5122,6 +5128,7 @@ fn compile_child_windowed(
         ThreadEnv::null()
     };
     let mut ctx = module.make_context();
+    let mut base_bytes = 0usize;
     for (f, id) in funcs.iter().zip(&ids) {
         build_clif(
             &mut module,
@@ -5142,7 +5149,7 @@ fn compile_child_windowed(
             guard_offset_of(reserved), // its own window's trailing guard
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
-            (ids.len().next_power_of_two() as u64) - 1, // the child's own table mask
+            fn_table_mask,    // the child's own (reserved) table mask
             None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
             None, // nested-child units carry no source-loc map (W5 JIT/DWARF)
@@ -5151,6 +5158,7 @@ fn compile_child_windowed(
         module
             .define_function(*id, &mut ctx)
             .map_err(|e| JitError::Backend(e.to_string()))?;
+        base_bytes += ctx.compiled_code().map_or(0, |c| c.code_buffer().len());
         module.clear_context(&mut ctx);
     }
     build_trampoline(
@@ -5199,7 +5207,6 @@ fn compile_child_windowed(
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
 
-    let table_len = funcs.len().next_power_of_two();
     let fn_table: Box<[FnEntry]> = (0..table_len)
         .map(|slot| match funcs.get(slot) {
             Some(f) => FnEntry::new(
@@ -5232,10 +5239,63 @@ fn compile_child_windowed(
     // PROCESS.md S1: a child module was actually JIT-compiled (as opposed to served from the
     // per-carve cache). Counting successful compiles is what lets a test prove the cache hits.
     CHILD_COMPILES.fetch_add(1, Ordering::Relaxed);
-    Ok(ChildCode {
+    Ok(CompiledModule {
         fn_table,
-        code,
+        tramp_code: code,
         serve_tramps,
+        n_params: entry.params.len(),
+        n_results: entry.results.len(),
+        n_real_funcs: funcs.len(),
+        distinct,
+        cap,
+        fiber: FiberEnv::null(),
+        thread: thread_env,
+        inst: inst_env,
+        setjmp: SetjmpEnv::null(),
+        mask,
+        cap_mapped: mapped,
+        sub_base: 0,
+        epoch_addr: epoch_addr as i64,
+        fuel_addr: fuel_addr as i64,
+        fn_table_mask,
+        next_extra: 0,
+        extra_bytes: 0,
+        base_bytes,
+        live_fault_range: None,
+        caller_window: true,
+        last_trap_backtrace: Vec::new(),
+        last_trap_fiber: None,
+        win_mapped: mapped as usize,
+        win_reserved: reserved as usize,
+        win_size: mapped as usize,
+        null_guard: temen_ir::module_null_guard(),
+        mem_size_log2: Some(mapped_log2),
+        data: Vec::new(), // a child's data segments are materialized into its window by the spawner
+        restore_prots: Vec::new(),
+        durable: false,
+        concurrent_durable: false,
+        frozen_seed: Vec::new(),
+        frozen_out: Vec::new(),
+        frozen_vcpus_out: Vec::new(),
+        frozen_nested_out: Vec::new(),
+        frozen_root_sp_out: 0,
+        frozen_vcpu_seed: Vec::new(),
+        frozen_nested_seed: Vec::new(),
+        thaw_root_sp: DURABLE_SHADOW_BASE + 8,
+        freeze_ctl: None,
+        fiber_rt: None,
+        domain: None,
+        _nursery: None,
+        #[cfg(setjmp_rt)]
+        _setjmp_rt: None,
+        call_tramp: None,
+        fiber_cfg: None,
+        fiber_table: None,
+        src_ranges: Vec::new(),
+        src_files: Vec::new(),
+        func_names: std::collections::HashMap::new(),
+        var_locs: Vec::new(),
+        debug_types: Vec::new(),
         module: OwnedJit::new(module),
     })
 }
@@ -5276,10 +5336,10 @@ pub(crate) fn compile_nondurable_child(
     child_size_log2: u8,
     epoch_addr: usize,
     // This child's own counted-fuel cell (`0` ⇒ un-metered). Baked, so a fuel-armed run must not reuse
-    // this `ChildCode` across spawns — the caller (`instantiate`) skips the cache when this is nonzero.
+    // this module across spawns — the caller (`instantiate`) skips the cache when this is nonzero.
     fuel_addr: usize,
     futex_sched: usize,
-) -> Result<ChildCode, JitError> {
+) -> Result<CompiledModule, JitError> {
     compile_child(
         funcs,
         types,
@@ -5292,12 +5352,13 @@ pub(crate) fn compile_nondurable_child(
         futex_sched,
         InstEnv::null(),
         &[], // a plain (ungranted) child is never an offer target — no serve trampolines
+        0,   // an empty powerbox holds no `Jit` — the natural table
     )
 }
 
 /// PROCESS.md S1: run an already-compiled non-durable §14 child confined to the carve
 /// `[parent_mem_base + sub_base, … + 2^size_log2)`. Because [`compile_child`] bakes only the size
-/// mask and the window **base is a runtime arg** to `run_guarded`, one [`ChildCode`] runs at *any*
+/// mask and the window **base is a runtime arg** to `run_guarded`, one compiled child runs at *any*
 /// carve offset — the property the compile cache relies on. Allocates the child's own fresh guarded
 /// window, seeds it from the carve (the §14 data plane is shared memory), runs under the re-entrant
 /// detect-and-kill guard, and copies the result window back into the carve (the parent is the
@@ -5305,12 +5366,15 @@ pub(crate) fn compile_nondurable_child(
 /// run never freezes), so this is the `compile_child_and_run` body minus all its durable branches.
 ///
 /// # Safety
-/// `code` is a live compiled child (kept alive by the cache for the call). `[parent_mem_base +
-/// sub_base, … + child_size)` is committed parent-window memory (the `Instantiator` bounded the
-/// carve to the holder's range). `args` matches the entry's arity.
+/// `code` is a live compiled child (kept alive by the cache for the call), held by raw pointer —
+/// **no `&CompiledModule` may be live across the run**: a child holding a `Jit` grant re-enters its
+/// module (`define_extra`/`install`) through the pointer its powerbox registered while its guest is
+/// suspended in the `call.cap` (the root's `run_raw` discipline). `[parent_mem_base + sub_base, …
+/// + child_size)` is committed parent-window memory (the `Instantiator` bounded the carve to the
+/// holder's range). `args` matches the entry's arity.
 #[cfg(fiber_rt)]
 pub(crate) unsafe fn run_child_code(
-    code: &ChildCode,
+    code: *const CompiledModule,
     sub_base: u64,
     child_size_log2: u8,
     parent_mem_base: *mut u8,
@@ -5339,7 +5403,7 @@ pub(crate) unsafe fn run_child_code(
 /// As [`run_child_code`].
 #[cfg(fiber_rt)]
 pub(crate) unsafe fn run_child_code_then(
-    code: &ChildCode,
+    code: *const CompiledModule,
     sub_base: u64,
     child_size_log2: u8,
     parent_mem_base: *mut u8,
@@ -5347,6 +5411,12 @@ pub(crate) unsafe fn run_child_code_then(
     n_results: usize,
     teardown: impl FnOnce(),
 ) -> (i64, i64) {
+    // Read the two raw pointers the guarded call needs up front; no reference into `*code` survives
+    // past here (see the safety contract).
+    let (entry_code, fn_table_ptr) = (
+        (*code).tramp_code,
+        (*code).fn_table.as_ptr() as *const core::ffi::c_void,
+    );
     let child_size = 1u64 << child_size_log2;
     let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
     let child_base = child_window.base();
@@ -5363,11 +5433,11 @@ pub(crate) unsafe fn run_child_code_then(
     // caught here, not propagated to the parent's frame.
     let faulted = mem::run_guarded(
         &child_window,
-        code.code,
+        entry_code,
         args.as_ptr(),
         results.as_mut_ptr(),
         child_base,
-        code.fn_table.as_ptr() as *const core::ffi::c_void,
+        fn_table_ptr,
         &mut trap_cell,
     );
     if faulted {
@@ -5400,7 +5470,7 @@ pub(crate) unsafe fn run_child_code_then(
 /// `args` matches the entry's arity.
 #[cfg(fiber_rt)]
 pub(crate) unsafe fn run_detached_child_then(
-    code: &ChildCode,
+    code: *const CompiledModule,
     mapped_log2: u8,
     reserved_log2: u8,
     init: impl FnOnce(&mut [u8]),
@@ -5408,6 +5478,10 @@ pub(crate) unsafe fn run_detached_child_then(
     n_results: usize,
     teardown: impl FnOnce(),
 ) -> (i64, i64) {
+    let (entry_code, fn_table_ptr) = (
+        (*code).tramp_code,
+        (*code).fn_table.as_ptr() as *const core::ffi::c_void,
+    );
     let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
     let base = window.base();
     init(window.rw_mut());
@@ -5417,11 +5491,11 @@ pub(crate) unsafe fn run_detached_child_then(
     // baked mask; the tail + guard fault); the guard is re-entrant so a child fault is caught here.
     let faulted = mem::run_guarded(
         &window,
-        code.code,
+        entry_code,
         args.as_ptr(),
         results.as_mut_ptr(),
         base,
-        code.fn_table.as_ptr() as *const core::ffi::c_void,
+        fn_table_ptr,
         &mut trap_cell,
     );
     if faulted {

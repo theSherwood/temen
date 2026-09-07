@@ -4141,7 +4141,15 @@ impl<'p> Vcpu<'p> {
         };
         let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
         let payload_ok = payload.len() as u64 <= args_room;
-        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok {
+        // A **durable** domain refuses op 15 outright (PROCESS.md §5): a detached window is outside
+        // the subtree snapshot, and a child no freeze can see is worse than a probeable `-EINVAL`.
+        // The tree-walker and the native thunk gate the same way; this arm must too (#1299) — and
+        // before the quota take below, so the refusal charges nothing.
+        let durable = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().is_durable(),
+            None => self.host.is_durable(),
+        };
+        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || durable {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
@@ -9295,6 +9303,27 @@ fn gc_write(
 /// half of the contract ("a unit runs its own scheduler to completion"). No durability shadowing:
 /// a freeze never lands mid-invoke (snapshot paths carry no invoke state), so unlike `step_vcpu`
 /// there is no `fiber_sp`/`shadow_switch` bookkeeping. A trap propagates to the invoker.
+/// A resolved unit's `(funcs, types)` — what [`resolve_jit_unit`] hands the driver's Jit arms.
+type JitUnitBody = (
+    std::sync::Arc<[Func]>,
+    std::sync::Arc<[temen_ir::TypeEntry]>,
+);
+
+/// Resolve a `Jit.invoke`/`install` `(handle, code)` pair against `host` — authority (a forged handle
+/// is a `CapFault`) and the cross-table check (a code handle from another table is one too) — to the
+/// unit's funcs + types. The one resolution body the cooperative driver's Jit arms share, so a §14
+/// child's units resolve against the **child's** host (#1296: a child holds its own `Jit` table).
+fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<JitUnitBody, Trap> {
+    let table = host.resolve_jit_domain(h)?;
+    let (cd, cu) = host.resolve_jit_code(code)?;
+    if cd != table {
+        return Err(Trap::CapFault);
+    }
+    let funcs = host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
+    let types = host.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
+    Ok((funcs, types))
+}
+
 fn run_invoke(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -12512,23 +12541,17 @@ impl CoopSched {
                     tasks[ti].vt.active.set(dst, Reg::from_i32(woken as i32));
                 }
                 Ok(VcpuStop::JitInstall { h, code, dst }) => {
-                    // Resolve authority + the unit's funcs from the host (a forged/cross-domain handle is
-                    // an inert CapFault → trap), compile the unit to bytecode, and install it. Compiling
-                    // the unit can fail only if it uses an op the bytecode engine doesn't lower yet — the
-                    // one place a guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
-                    let (funcs, types) = match host.resolve_jit_domain(h).and_then(|domain| {
-                        let (cd, cu) = host.resolve_jit_code(code)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        host.jit_unit_funcs(cd, cu)
-                            .ok_or(Trap::CapFault)
-                            .and_then(|f| {
-                                host.jit_unit_types(cd, cu)
-                                    .ok_or(Trap::CapFault)
-                                    .map(|t| (f, t))
-                            })
-                    }) {
+                    // Resolve authority + the unit's funcs from the TASK's host (a forged/cross-table
+                    // handle is an inert CapFault → trap), compile the unit to bytecode, and install it
+                    // into the task's own dispatch table (a §14 child's `extra_envs[k].table` — its
+                    // installs are invisible to the parent's `call.dyn`, #1296). Compiling the unit can
+                    // fail only if it uses an op the bytecode engine doesn't lower yet — the one place a
+                    // guest-provided unit can outrun coverage (no tree-walker fallback mid-run).
+                    let resolved = match tasks[ti].env {
+                        None => resolve_jit_unit(host, h, code),
+                        Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
+                    };
+                    let (funcs, types) = match resolved {
                         Ok(f) => f,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -12536,7 +12559,10 @@ impl CoopSched {
                         }
                     };
                     let res = match compile_module(&funcs, &types) {
-                        Some(unit) => match dom.install(unit) {
+                        Some(unit) => match match tasks[ti].env {
+                            None => dom.install(unit),
+                            Some(k) => jit_install_into(&dom.source, &extra_envs[k].table, unit),
+                        } {
                             Some(slot) => {
                                 // #926 slice 2f: mirror `slot → code` so the browser B2 driver can
                                 // rebuild its `WebAssembly.Table` at the next event boundary (installs
@@ -12559,12 +12585,25 @@ impl CoopSched {
                     tasks[ti].vt.active.set(dst, Reg::from_i64(res));
                 }
                 Ok(VcpuStop::JitUninstall { h, slot, dst }) => {
-                    if let Err(t) = host.resolve_jit_domain(h) {
+                    let authority = match tasks[ti].env {
+                        None => host.resolve_jit_domain(h),
+                        Some(k) => extra_envs[k].host.lock_unpoisoned().resolve_jit_domain(h),
+                    };
+                    if let Err(t) = authority {
                         complete(tasks, ti, Err(t)); // authority check
                         continue;
                     }
                     let n_real = dom.source.primary().progs.len();
-                    let res = if dom.uninstall(slot as usize, n_real) {
+                    let cleared = match tasks[ti].env {
+                        None => dom.uninstall(slot as usize, n_real),
+                        Some(k) => jit_uninstall_from(
+                            &dom.source,
+                            &extra_envs[k].table,
+                            slot as usize,
+                            n_real,
+                        ),
+                    };
+                    let res = if cleared {
                         // Keep the B2 mirror exact — a freed slot must trap in the JS table too.
                         if let Some(e) = slot_codes.get_mut(slot as usize) {
                             *e = -1;
@@ -12594,7 +12633,10 @@ impl CoopSched {
                     let scalar = |t: &ValType| {
                         matches!(t, ValType::I32 | ValType::I64 | ValType::F32 | ValType::F64)
                     };
+                    // A §14 child's invoke is serviced interpreted below, against its own window
+                    // and host (#1296); only the root's units surface to the emitted tier.
                     let emittable = eligible.is_some()
+                        && tasks[ti].env.is_none()
                         && params.iter().all(scalar)
                         && results.iter().all(scalar);
                     let surfaced = if emittable {
@@ -12625,20 +12667,13 @@ impl CoopSched {
                             mapped,
                         });
                     }
-                    // Resolve unit funcs (authority + cross-domain) and compile, as for install.
-                    let (funcs, types) = match host.resolve_jit_domain(h).and_then(|domain| {
-                        let (cd, cu) = host.resolve_jit_code(code)?;
-                        if cd != domain {
-                            return Err(Trap::CapFault);
-                        }
-                        host.jit_unit_funcs(cd, cu)
-                            .ok_or(Trap::CapFault)
-                            .and_then(|f| {
-                                host.jit_unit_types(cd, cu)
-                                    .ok_or(Trap::CapFault)
-                                    .map(|t| (f, t))
-                            })
-                    }) {
+                    // Resolve unit funcs (authority + cross-table) against the task's host, as for
+                    // install, and compile.
+                    let resolved = match tasks[ti].env {
+                        None => resolve_jit_unit(host, h, code),
+                        Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
+                    };
+                    let (funcs, types) = match resolved {
                         Ok(f) => f,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -12667,15 +12702,37 @@ impl CoopSched {
                         .map(|(ty, s)| slot_to_val(*ty, *s))
                         .collect();
                     let umod = dom.source.push(unit);
-                    match run_invoke(
-                        &dom.source,
-                        &dom.table,
-                        umod,
-                        &child_args,
-                        fuel,
-                        mem,
-                        &mut HostCell::Excl(host),
-                    ) {
+                    // The unit runs over the TASK's window, table and host: the root's, or a §14
+                    // child's own (`extra_envs[k]`) — a child's unit never sees the parent's window.
+                    let ran = match tasks[ti].env {
+                        None => run_invoke(
+                            &dom.source,
+                            &dom.table,
+                            umod,
+                            &child_args,
+                            fuel,
+                            mem,
+                            &mut HostCell::Excl(host),
+                        ),
+                        Some(k) => {
+                            let ChildEnv {
+                                mem: cmem,
+                                host: chost,
+                                table: ctable,
+                                ..
+                            } = &mut extra_envs[k];
+                            run_invoke(
+                                &dom.source,
+                                ctable,
+                                umod,
+                                &child_args,
+                                fuel,
+                                cmem,
+                                &mut HostCell::Shared(chost),
+                            )
+                        }
+                    };
+                    match ran {
                         Ok(vals) => {
                             for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
                                 let re = slot_to_val(*ty, val_to_slot(*v));
