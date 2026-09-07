@@ -1915,12 +1915,23 @@ mod growable_tests {
         let (size, page) = (3 * 4096, 4096);
         let a = Region::growable(page, page).expect("growable region");
         assert!(a.grow_to(size), "grow before the differential");
+        // Fewer ops under Miri. This arm is far more expensive there than its `Shared` twin: a
+        // `Growable` resolves its `(base, size)` through two **atomic** loads on *every* accessor
+        // (the relocation snapshot), and Miri's data-race modelling makes each of those cost orders
+        // of magnitude more than the plain field reads the other variants do. At 20k ops this test
+        // alone ran longer than the rest of the crate's Miri suite combined, on a nightly job that
+        // already carries two 20k differentials.
+        //
+        // The trade is cheap: Miri's value here is per-operation UB/provenance checking, which a few
+        // thousand ops through every accessor arm exercises just as well as twenty. The native run
+        // keeps the full 20k, so the fuzz's breadth is unchanged where it costs nothing.
+        let ops = if cfg!(miri) { 2_000 } else { 20_000 };
         differential(
             &a,
             &Region::paged(size, page),
             size,
             page,
-            20_000,
+            ops,
             0x0f1e_2d3c_4b5a_6978,
         )
         .unwrap();
