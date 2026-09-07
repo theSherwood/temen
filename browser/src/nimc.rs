@@ -391,6 +391,28 @@ pub(crate) fn drive_op13<'p>(
             bytecode::VcpuEvent::Join { handle } => {
                 vcpu.deliver_join(children[handle as usize].clone());
             }
+            // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
+            // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own
+            // window — this inline (interpreter) path has no emitted-unit servicer (that is the staged
+            // `JIT_RUN` path's bounce), correct and slower. The unit resolves on the child's host.
+            bytecode::VcpuEvent::JitInstall { handle, code } => {
+                let (funcs, types) = match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
+                {
+                    Ok((f, t, _wasm)) => (Ok(f), t),
+                    Err(t) => (Err(t), std::sync::Arc::from(Vec::new())),
+                };
+                let _ = vcpu.deliver_jit_install(funcs, types);
+            }
+            bytecode::VcpuEvent::JitUninstall { handle, .. } => {
+                let authorized = vcpu.host_mut().resolve_jit_domain(handle).map(|_| ());
+                let _ = vcpu.deliver_jit_uninstall(authorized);
+            }
+            bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
+                match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code) {
+                    Ok((funcs, types, _wasm)) => vcpu.deliver_jit_invoke(Ok(funcs), types),
+                    Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
+                }
+            }
             _ => return Err(Trap::Malformed),
         }
     }

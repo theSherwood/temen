@@ -191,7 +191,7 @@ process-local, so they restore to `0`; `temen_run::reconstruct_jit_units` re-com
 the cold-start twin of `recompact_into`. `jit_cap_run` runs it transparently after compiling the
 module and before re-entering the guest (a no-op for a fresh run, which holds no restored units), so a
 native `invoke` of a restored unit runs its **own** code, matching the interpreter thaw (the §12.6
-cross-backend contract). Pinned by
+cross-backend contract). The **wasm-JIT** twin is lazy (#1301): `Host::jit_unit_wasm_or_emit` re-emits a restored unit from its IR through the installed emitter on its first `invoke` and caches it, so the browser drivers (which read units through it) run a thawed domain's units on the emitted tier from then on; without an emitter the interpreter fallback stands. Pinned by
 `durable_guest_jit.rs::durable_jit_domain_reconstructs_and_invokes_native` (freeze → restore →
 `jit_cap_run` reconstructs + invokes natively ≡ 42). **B2 `install` table-slot durability now lands
 too:** the dispatch table is a per-run transient (§12.4), so a unit's `install` occupancy — `(slot,

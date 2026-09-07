@@ -2674,7 +2674,8 @@ fn drive_over_cell(
                 } else {
                     children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
                 };
-                let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                // #1296: a child's table reserves the slots its (re-granted) `Jit` table carries.
+                let cdt = Arc::new(DomainTable::new(&cfuncs, ch.jit_table_log2()));
                 // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
                 // can be re-linked to it once the whole subtree is rebuilt (below). Key the callee
                 // by its `(parent task, join slot)` edge and record the child as a holder under its
@@ -11606,7 +11607,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let made = sched.spawn(move |id| {
                                         // A nested child is its **own** domain (own host/window/program),
                                         // so it gets its own dispatch table, not the parent's.
-                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        // #1296: reserve the install slots the child's re-granted
+                                        // `Jit` table carries (none ⇒ the natural table).
+                                        let cdt = Arc::new(DomainTable::new(
+                                            &cfuncs,
+                                            child_host.lock_unpoisoned().jit_table_log2(),
+                                        ));
                                         let mut child = VCpu::new(
                                             cfuncs,
                                             ctypes,
@@ -12030,7 +12036,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // self-describe) and never in `nested_children` (no
                                         // carve geometry exists — and the durable refusal
                                         // above keeps it out of every freeze path).
-                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        // #1296: reserve the install slots the child's re-granted
+                                        // `Jit` table carries (none ⇒ the natural table).
+                                        let cdt = Arc::new(DomainTable::new(
+                                            &cfuncs,
+                                            child_host.lock_unpoisoned().jit_table_log2(),
+                                        ));
                                         let mut child = VCpu::new(
                                             cfuncs,
                                             ctypes,
@@ -21602,6 +21613,31 @@ impl Host {
             .and_then(|u| u.wasm.clone())
     }
 
+    /// [`Self::jit_unit_wasm`], **re-emitting on demand** a unit that has none — a unit a snapshot
+    /// restored (`restore_durable_jit` rebuilds units from their captured IR with no code, the
+    /// process-local pointers do not ride the artifact; DURABILITY.md §12.5 Slice 3, #1301) or a
+    /// fork twin's. The unit's IR is re-encoded (the same validated blob shape `compile` handed the
+    /// emitter) and run through the installed [`JitWasmEmitter`] once, then cached like a fresh
+    /// compile's; without an emitter (or outside its subset) the answer stays `None` and `invoke`
+    /// keeps its interpreter fallback. The wasm-JIT drivers read units through this so a thawed
+    /// domain's units run on the emitted tier after their first `invoke`, the native tier's
+    /// `reconstruct_jit_units` twin.
+    pub fn jit_unit_wasm_or_emit(&mut self, domain: u32, unit: u32) -> Option<Arc<[u8]>> {
+        if let Some(w) = self.jit_unit_wasm(domain, unit) {
+            return Some(w);
+        }
+        let emitter = self.jit_wasm_emitter?;
+        let mem_log2 = self.jit_mem_log2(self.jit_tables.get(domain as usize)?);
+        let u = self
+            .jit_tables
+            .get_mut(domain as usize)?
+            .units
+            .get_mut(unit as usize)?;
+        let blob = encode_jit_unit(&u.funcs, &u.types, mem_log2);
+        u.wasm = emitter(&blob).map(Arc::from);
+        u.wasm.clone()
+    }
+
     /// The number of units a `Jit` domain has compiled (append-only; released units stay, their
     /// handle merely revoked). The code-memory compaction driver (DESIGN.md §22) walks `0..count`
     /// deciding which to carry into the fresh module.
@@ -26096,6 +26132,57 @@ mod fork_powerbox_tests {
                 })
             ),
             "the stdout stream handle resolves in the twin"
+        );
+    }
+
+    /// #1301 (wasm half): a restored unit carries no emitted code; the first read through
+    /// `jit_unit_wasm_or_emit` re-emits it from its IR with the installed emitter (the same blob
+    /// `compile` would have handed it) and caches the result — the plain getter stays `None` until then.
+    #[test]
+    fn restored_unit_reemits_on_demand_with_the_installed_emitter() {
+        fn echo(blob: &[u8]) -> Option<Vec<u8>> {
+            Some(blob.to_vec())
+        }
+        let unit = temen_text::parse_module(
+            "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  v2 = i32.add v0 v1\n  return v2\n  }\n}\n",
+        )
+        .expect("parse unit");
+        temen_verify::verify_module(&unit).expect("verify unit");
+        let unit_ir = encode_jit_unit(&unit.funcs, &unit.types, Some(16));
+        let captured = DurableJitTable {
+            mem_log2: Some(16),
+            units_left: 3,
+            bytes_left: 1 << 20,
+            units: vec![DurableJitUnit {
+                unit_ir: unit_ir.clone(),
+                install_type_id: 0,
+            }],
+            installed: Vec::new(),
+        };
+        // No emitter: restored units stay code-less on every read (the interpreter fallback).
+        let mut bare = Host::new();
+        bare.restore_durable_jit(std::slice::from_ref(&captured))
+            .expect("restore");
+        assert!(bare.jit_unit_wasm(0, 0).is_none());
+        assert!(bare.jit_unit_wasm_or_emit(0, 0).is_none());
+        // With one: `None` until asked to emit, then the emitter's answer over the unit's own IR,
+        // cached (a second read hands back the same bytes without re-emitting).
+        let mut host = Host::new();
+        host.set_jit_wasm_emitter(echo);
+        host.restore_durable_jit(std::slice::from_ref(&captured))
+            .expect("restore");
+        assert!(host.jit_unit_wasm(0, 0).is_none(), "restore emits nothing");
+        let emitted = host
+            .jit_unit_wasm_or_emit(0, 0)
+            .expect("re-emitted on demand");
+        assert_eq!(
+            &emitted[..],
+            &unit_ir[..],
+            "the emitter saw the unit's own IR"
+        );
+        assert!(
+            Arc::ptr_eq(&emitted, &host.jit_unit_wasm(0, 0).expect("cached")),
+            "the re-emit is cached on the unit"
         );
     }
 

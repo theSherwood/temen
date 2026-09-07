@@ -10,7 +10,8 @@
 
 use temen_browser::{onramp_exec, STATUS_OK};
 
-const CARD_PROGRAM: &str = "\\ Forth on Temen: every word below is JIT-compiled to a verified IR unit.
+const CARD_PROGRAM: &str =
+    "\\ Forth on Temen: every word below is JIT-compiled to a verified IR unit.
 : sq ( n -- n ) dup * ;
 : fact ( n -- n ) dup 1 > if dup 1- recurse * else drop 1 then ;
 5 sq . 10 fact . cr
@@ -78,7 +79,10 @@ fn forth_card_program_runs_through_the_onramp() {
 fn forth_card_reports_errors_and_recovers() {
     let bytes = include_bytes!("../web/assets/forth.temen");
     let m = temen_encode::decode_module(bytes).expect("decode forth.temen");
-    let out = onramp_exec(&m, b"1 2 + . cr\nbogus\n: bad ( n -- n ) dup dup ;\n3 . cr\n");
+    let out = onramp_exec(
+        &m,
+        b"1 2 + . cr\nbogus\n: bad ( n -- n ) dup dup ;\n3 . cr\n",
+    );
     assert_eq!(out.status, STATUS_OK);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
