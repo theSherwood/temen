@@ -6429,6 +6429,12 @@ pub enum SchedStop {
     /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
     /// scheduler can't advance (it drives only `thread.spawn`/`join`).
     Blocked,
+    /// #1146 (deeper) — every live thread is parked and at least one of them in a **blocking-stdin
+    /// `read`** (W4): the run is live and resumable, that thread is now the stopped + focused one
+    /// (`pc` = its read), and [`provide_stdin`](ScheduledDebugRun::provide_stdin) + a resume
+    /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
+    /// input prompt instead of a dead end.
+    StdinPark { pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
     /// coroutines (step-into, with the coroutine's vCPU pinned across the body) are all handled.
@@ -6466,6 +6472,14 @@ enum DbgTaskState {
         deadline: u64,
         dst: u32,
     },
+    /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
+    /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]); the read op was rewound and the
+    /// turn did not tick (the park is not a visible op — the re-issued read is). Woken explicitly by
+    /// [`ScheduledDebugRun::provide_stdin`]; a [`restore`](ScheduledDebugRun::restore) re-admits it
+    /// (a restored run is not parked — the re-executed read is served from the cap tape, or re-parks
+    /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
+    /// and the single-vCPU `DebugRun::stdin_parked` — invariant 14's debugger axis.
+    BlockedStdin,
     /// Finished — result (or trap) retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -6701,7 +6715,8 @@ pub enum SchedTraceEvent {
 }
 
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
-/// (aux = child), 2 = blocked-wait (aux = key), 3 = done.
+/// (aux = child), 2 = blocked-wait (aux = key), 3 = done, 4 = blocked-stdin (a park/wake the differ
+/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act).
 fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
     tasks
         .iter()
@@ -6710,6 +6725,7 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
             DbgTaskState::BlockedJoin { child, .. } => (1, child as u64),
             DbgTaskState::BlockedWait { key, .. } => (2, key),
             DbgTaskState::Done(_) => (3, 0),
+            DbgTaskState::BlockedStdin => (4, 0),
         })
         .collect()
 }
@@ -7006,6 +7022,10 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
+            // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds
+            // (as in the single-vCPU `DebugRun`); `drive` reports `SchedStop::StdinPark` once nothing
+            // else can run, and `provide_stdin` re-admits the task so the read re-issues.
+            Outcome::StdinPark => tasks[ti].state = DbgTaskState::BlockedStdin,
             // coroutine / tier-up — outside this engine's slice.
             _ => return Serviced::Declined,
         },
@@ -7870,7 +7890,24 @@ impl ScheduledDebugRun {
                     Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
                     _ => match dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn) {
                         Some(i) => i,
-                        None => return SchedStop::Blocked,
+                        // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
+                        // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
+                        // lowest-index one), else a true deadlock.
+                        None => {
+                            let parked = tasks
+                                .iter()
+                                .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
+                            let pc =
+                                parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
+                            return match (parked, pc) {
+                                (Some(p), Some(pc)) => {
+                                    *stopped = Some(p);
+                                    *focus = p;
+                                    SchedStop::StdinPark { pc }
+                                }
+                                _ => SchedStop::Blocked,
+                            };
+                        }
                     },
                 }
             };
@@ -8114,6 +8151,29 @@ impl ScheduledDebugRun {
         &mut self.host
     }
 
+    /// #1146 (deeper) — whether some thread is parked in a blocking-stdin `read` (W4): the run is live,
+    /// paused at that read, and resumable once [`provide_stdin`](ScheduledDebugRun::provide_stdin)
+    /// supplies bytes. The scheduled twin of [`DebugRun::stdin_parked`].
+    pub fn stdin_parked(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| matches!(t.state, DbgTaskState::BlockedStdin))
+    }
+
+    /// #1146 (deeper) — append stdin bytes for the parked blocking `read`s ([`Host::push_stdin`]) and
+    /// re-admit every stdin-parked thread: the next advance re-issues each read against the new
+    /// bytes, and the completed read joins the recorded cap tape so a later `seek` replays it
+    /// faithfully. The scheduled twin of [`DebugRun::provide_stdin`]; the wake is explicit (no
+    /// readiness poll) so the schedule stays a pure function of the recorded inputs.
+    pub fn provide_stdin(&mut self, bytes: &[u8]) {
+        self.host.push_stdin(bytes);
+        for t in self.tasks.iter_mut() {
+            if matches!(t.state, DbgTaskState::BlockedStdin) {
+                t.state = DbgTaskState::Runnable;
+            }
+        }
+    }
+
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
     /// focused thread becomes the one about to run (lowest-index runnable), or none once the run finished.
     pub fn locate(&mut self) {
@@ -8250,7 +8310,13 @@ impl ScheduledDebugRun {
                     },
                     threads: ts.threads.clone(),
                     env: ts.env,
-                    state: ts.state.clone(),
+                    // A restored run is not parked (#1146 deeper): a captured blocking-stdin park
+                    // re-admits, and the re-executed read is served from the cap tape (or re-parks
+                    // at the frontier) — the scheduled twin of `DebugRun::restore`'s rule.
+                    state: match &ts.state {
+                        DbgTaskState::BlockedStdin => DbgTaskState::Runnable,
+                        s => s.clone(),
+                    },
                     at_bp: ts.at_bp,
                 }
             })

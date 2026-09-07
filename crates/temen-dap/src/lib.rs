@@ -341,8 +341,8 @@ impl DapServer {
         // `blockStdin: true` (INTERACTIVE_EMBEDDING.md W4): a `read` on an exhausted stdin buffer
         // parks the session (a `stopped` event, reason `"stdin"`) instead of returning EOF; the
         // custom `provideStdin` request appends bytes and a resume re-issues the read. Bytecode
-        // engine, single-vCPU, powerbox sessions only — anything else fails the launch (fail-closed)
-        // rather than silently keeping EOF semantics.
+        // engine powerbox sessions only (single-vCPU or threaded — #1146 deeper) — anything else
+        // fails the launch (fail-closed) rather than silently keeping EOF semantics.
         let block_stdin = args
             .get("blockStdin")
             .and_then(|v| v.as_bool())
