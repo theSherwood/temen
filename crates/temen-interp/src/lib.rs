@@ -25589,9 +25589,17 @@ impl Mem {
             .map(|p| p as *const u8)
     }
 
-    /// #816: the window's reserved span — the length of the flat view [`flat_win_base`] addresses.
-    pub(crate) fn win_reserved(&self) -> u64 {
-        self.window.reserved()
+    /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to
+    /// what the backing holds. This is what a codegen host mirrors or bounds its view to, and it is
+    /// *not* the reservation: a cooperative run reserves `DEFAULT_RESERVED_LOG2` (the oracle's, so a
+    /// guest `vm_map` past the declared window is admitted rather than `-EINVAL`) over a backing that
+    /// starts at the declared size and grows on demand. Reporting the reservation there would tell a
+    /// driver to mirror a terabyte. For a §14 child carve the two agree — the parent backing covers
+    /// the whole carve — so this only ever narrows where narrowing is correct.
+    pub(crate) fn win_flat_len(&self) -> u64 {
+        self.window
+            .reserved()
+            .min(self.back.len().saturating_sub(self.window.base()))
     }
 
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
@@ -25774,17 +25782,19 @@ impl GuestMem for Mem {
     /// §3e op 0 `map`: (re)commit pages with `prot`, zero-filling them (a fresh commit). Works
     /// anywhere in the reserved window `[0, reserved)` — including **growth** into the reserved
     /// tail `[mapped, reserved)`, the §1a sparse-address-space capability. Out-of-range /
-    /// misaligned → `-EINVAL`. Over a [`Region::Foreign`] (a detached child's own embedder memory,
-    /// #1286) the embedder is asked to grow it to cover the pages first; a refusal (the memory's
-    /// `maximum`) is `-ENOMEM`, probeable, before a byte of protection state changes. (A fixed
-    /// backing shorter than the reservation keeps its #1153 contract: the op succeeds and accesses
-    /// past the backing are dropped/read zero — `region_backing_bound.rs`.)
+    /// misaligned → `-EINVAL`. Over a **growable** backing ([`Region::can_grow`] — a detached
+    /// child's own embedder memory, #1286; a cooperative run's relocatable window, #1312) the
+    /// backing is asked to cover the pages first; a refusal (the foreign memory's `maximum`, or an
+    /// allocator that cannot serve the buffer) is `-ENOMEM`, probeable, before a byte of protection
+    /// state changes. (A **fixed** backing shorter than the reservation keeps its #1153 contract:
+    /// the op succeeds and accesses past the backing are dropped/read zero —
+    /// `region_backing_bound.rs`.)
     fn map(&mut self, offset: u64, len: u64, prot: i32) -> i64 {
         let pages = match self.prot_pages(offset, len) {
             Ok(p) => p,
             Err(e) => return e,
         };
-        if self.back.is_foreign()
+        if self.back.can_grow()
             && !self
                 .back
                 .grow_to(self.window.base() + (pages.end() + 1) * self.page)

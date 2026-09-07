@@ -90,6 +90,20 @@ pub enum Region {
     /// contiguous span for emitted `win + addr` code to serve it. Built via
     /// [`Region::owned_zeroed`]; eager allocation is the cost, so callers bound the size.
     Owned(Owned),
+    /// An owned flat buffer that **grows in place, relocating** (#1312): like [`Region::Owned`], but
+    /// [`Region::grow_to`] enlarges it (`realloc` + zero the new tail), so a window over it can
+    /// `vm_map`-commit past its initial size instead of `-EINVAL`ing at a pre-sized reservation. The
+    /// base address **may move** on a grow, so — unlike every other variant — a raw pointer taken
+    /// from [`Region::raw_base`] is valid only until the next `grow_to`.
+    ///
+    /// **Single-owner contract.** Grow only from the thread that owns the run, while no other thread
+    /// holds a pointer derived from this region: a relocation frees the old buffer, so a stale base
+    /// held across it is a use-after-free that no bound can catch. The cooperative browser drivers
+    /// (`temen_coop_*`, the warm session) satisfy this — one wasm thread owns the run and re-reads
+    /// the base per event and after every cross-tier bounce. The genuinely-parallel per-Worker driver
+    /// (`temen_par_*`) shares one backing address across Workers and therefore **never** builds this
+    /// variant. Built via [`Region::growable`].
+    Growable(Growable),
     /// Portable fallback: zeroed pages in a `Mutex`-guarded map (serialized, not the parallel path).
     Paged(Paged),
     /// **Proxied**: bytes in memory this process cannot address, reached through a [`ForeignOps`]
@@ -144,7 +158,10 @@ impl Foreign {
 /// Which accessor body serves a [`Region`]: the one raw-pointer body (`Shared`, which `Mapped` and
 /// `Owned` wrap), the safe `Paged` reference, or the proxied `Foreign` table.
 enum Backing<'a> {
-    Raw(&'a Shared),
+    /// A **snapshot** of the flat body, by value: `Mapped`/`Shared`/`Owned` hand out their fixed
+    /// `(base, size)`, while the relocatable `Growable` reads its current pair atomically. Taken
+    /// afresh per access, so it can never outlive a relocation.
+    Raw(Shared),
     Paged(&'a Paged),
     Foreign(&'a Foreign),
 }
@@ -198,6 +215,18 @@ impl Region {
         Owned::new(size, page).map(Region::Owned)
     }
 
+    /// #1312: an owned flat buffer of `size` zero bytes that [`grow_to`](Region::grow_to) can
+    /// **enlarge** — the backing a cooperative run's window uses so a guest allocator's `vm_map` can
+    /// commit past the declared window (the interpreter oracle reserves 2^40 and grows on demand; a
+    /// fixed backing made the same `map` `-EINVAL`). Rounded up to `page`; the whole allocation is
+    /// addressable and zeroed, so a grow inside it costs nothing.
+    ///
+    /// `None` when `size` is 0 or the allocation fails, so callers refuse rather than abort. See
+    /// [`Region::Growable`] for the single-owner contract the caller must meet — the base moves.
+    pub fn growable(size: u64, page: u64) -> Option<Region> {
+        Growable::new(size, page).map(Region::Growable)
+    }
+
     /// A proxied region over foreign backing `id` with `len` addressable bytes, reached through `ops`
     /// (#1284). `len` may later grow ([`Region::set_foreign_len`]); it never shrinks.
     pub fn foreign(id: u32, len: u64, ops: &'static ForeignOps) -> Region {
@@ -216,15 +245,25 @@ impl Region {
         }
     }
 
-    /// Whether this is a proxied [`Region::Foreign`] (the one variant whose length can grow).
+    /// Whether this is a proxied [`Region::Foreign`].
     pub fn is_foreign(&self) -> bool {
         matches!(self, Region::Foreign(_))
     }
 
+    /// Whether [`grow_to`](Region::grow_to) can actually **extend** this backing past its current
+    /// length — the two growable variants ([`Region::Foreign`]'s embedder memory, and the
+    /// relocatable [`Region::Growable`]). Every other variant is fixed-size, where `grow_to` only
+    /// reports whether the length already fits. The `map`-commit path keys on this to decide whether
+    /// a commit past the backing is a request to grow or a fail-closed refusal.
+    pub fn can_grow(&self) -> bool {
+        matches!(self, Region::Foreign(_) | Region::Growable(_))
+    }
+
     /// Make at least `len` bytes addressable. A `Foreign` region asks its embedder to grow the foreign
-    /// memory ([`ForeignOps::grow`]) and records the new length; every other variant is fixed-size, so
-    /// this is simply whether `len` already fits. `false` = the backing cannot cover `len` — the caller
-    /// fails closed rather than run over a backing shorter than its window (#1191).
+    /// memory ([`ForeignOps::grow`]) and records the new length; a `Growable` region reallocates its
+    /// own buffer (**the base may move** — see [`Region::Growable`]); every other variant is
+    /// fixed-size, so this is simply whether `len` already fits. `false` = the backing cannot cover
+    /// `len` — the caller fails closed rather than run over a backing shorter than its window (#1191).
     pub fn grow_to(&self, len: u64) -> bool {
         match self {
             Region::Foreign(f) => {
@@ -237,6 +276,7 @@ impl Region {
                 }
                 ok
             }
+            Region::Growable(g) => g.grow(len),
             _ => len <= self.len(),
         }
     }
@@ -249,17 +289,19 @@ impl Region {
     fn backing(&self) -> Backing<'_> {
         match self {
             #[cfg(unix)]
-            Region::Mapped(m) => Backing::Raw(&m.raw),
-            Region::Shared(s) => Backing::Raw(s),
-            Region::Owned(o) => Backing::Raw(&o.raw),
+            Region::Mapped(m) => Backing::Raw(m.raw),
+            Region::Shared(s) => Backing::Raw(*s),
+            Region::Owned(o) => Backing::Raw(o.raw),
+            Region::Growable(g) => Backing::Raw(g.snapshot()),
             Region::Paged(p) => Backing::Paged(p),
             Region::Foreign(f) => Backing::Foreign(f),
         }
     }
 
-    /// The flat raw body, if this region has one (`Paged`/`Foreign` do not).
+    /// The flat raw body, if this region has one (`Paged`/`Foreign` do not). By value: a `Growable`
+    /// region's `(base, size)` is read live, so there is no stable `&Shared` to lend.
     #[inline]
-    fn flat(&self) -> Option<&Shared> {
+    fn flat(&self) -> Option<Shared> {
         match self.backing() {
             Backing::Raw(s) => Some(s),
             _ => None,
@@ -282,6 +324,10 @@ impl Region {
     /// "not flat-addressable" and fail closed (the window then runs on the interpreter only).
     /// Reading or writing through the returned pointer is subject to the same safety contract as
     /// the region's construction; bounds are the caller's to keep.
+    ///
+    /// #1312: on a [`Region::Growable`] the address is only valid until the next
+    /// [`grow_to`](Region::grow_to) — re-read it after any operation that may have committed
+    /// memory (the browser drivers re-read per event and after every cross-tier bounce).
     pub fn raw_base(&self) -> Option<*mut u8> {
         self.flat().map(|s| s.base_ptr())
     }
@@ -699,6 +745,12 @@ mod shared {
 
     /// Borrowed backing over `[base, base+size)`. `base` must be 8-aligned (so a naturally-aligned
     /// 4/8-byte access is a valid atomic) and outlive every `Region::Shared` over it.
+    ///
+    /// `Copy` (two words) so a **relocatable** backing can hand out a by-value *snapshot* of its
+    /// current `(base, size)` per access ([`Region::Growable`](super::Region::Growable), whose base
+    /// moves on grow and therefore cannot lend a `&Shared`). Copying is free relative to the access
+    /// it serves, and a snapshot is only ever used within the one call that took it.
+    #[derive(Clone, Copy)]
     pub struct Shared {
         base: *mut u8,
         pub(super) size: u64,
@@ -1040,6 +1092,131 @@ mod owned {
                 std::alloc::dealloc(
                     self.raw.base_ptr(),
                     std::alloc::Layout::from_size_align_unchecked(self.alloc_len, 8),
+                );
+            }
+        }
+    }
+}
+
+// ===================== #1312: the owned buffer that grows, relocating =====================
+
+pub use growable::Growable;
+
+/// The relocatable owned backing (see [`Region::Growable`]). An [`Owned`] whose buffer `realloc`s on
+/// [`grow`](Growable::grow), so a window over it commits past its initial size instead of refusing —
+/// the coop tier's answer to "the interpreter oracle grows, the emitted tier's backing could not".
+/// Accessor bodies still live once in [`Shared`]; this module owns only the buffer's lifecycle and
+/// the atomic `(base, size)` pair each access snapshots.
+mod growable {
+    use super::Shared;
+    use core::sync::atomic::{
+        AtomicPtr, AtomicU64, AtomicUsize,
+        Ordering::{Acquire, Release},
+    };
+
+    /// A growable, **relocating** flat buffer. `size` is the addressable length (always the whole
+    /// allocation — every byte is zeroed, so a grow within it is free); `alloc_len` is the layout
+    /// size `Drop`/`realloc` must pass back to the allocator.
+    ///
+    /// `Send`/`Sync` come from the atomics, but soundness under *concurrent* use does not: the
+    /// single-owner contract on [`Region::Growable`](super::Region::Growable) is what makes a
+    /// relocation safe, since it frees the old buffer.
+    pub struct Growable {
+        base: AtomicPtr<u8>,
+        size: AtomicU64,
+        alloc_len: AtomicUsize,
+        page: usize,
+    }
+
+    impl Growable {
+        pub(super) fn new(size: u64, page: u64) -> Option<Growable> {
+            let page = (page as usize).max(1);
+            let alloc_len = usize::try_from(size)
+                .ok()
+                .filter(|&s| s > 0)?
+                .checked_next_multiple_of(page)?;
+            // 8-aligned for the widest (`U64`) atomic; `alloc_len > 0` so the layout is non-zero.
+            let layout = std::alloc::Layout::from_size_align(alloc_len, 8).ok()?;
+            // SAFETY: non-zero layout.
+            let base = unsafe { std::alloc::alloc_zeroed(layout) };
+            if base.is_null() {
+                return None;
+            }
+            Some(Growable {
+                base: AtomicPtr::new(base),
+                size: AtomicU64::new(alloc_len as u64),
+                alloc_len: AtomicUsize::new(alloc_len),
+                page,
+            })
+        }
+
+        /// The current `(base, size)` as a by-value [`Shared`] — what every accessor dispatches
+        /// through. `size` is loaded **first** so that an (contract-violating) interleaved grow can
+        /// only ever pair a *stale, smaller* size with a newer, larger buffer, never the reverse.
+        pub(super) fn snapshot(&self) -> Shared {
+            let size = self.size.load(Acquire);
+            Shared::new(self.base.load(Acquire), size)
+        }
+
+        /// Make at least `len` bytes addressable, reallocating (and possibly **moving**) the buffer.
+        /// The new tail is zeroed, so grown pages read as fresh zeroes exactly like a `map`-committed
+        /// page elsewhere. `false` = the allocator refused and **nothing changed**, so the caller
+        /// answers `-ENOMEM` (probeable) before any protection state moves.
+        pub(super) fn grow(&self, len: u64) -> bool {
+            if len <= self.size.load(Acquire) {
+                return true;
+            }
+            let old_alloc = self.alloc_len.load(Acquire);
+            let Ok(need) = usize::try_from(len) else {
+                return false; // a 64-bit request this host can never address
+            };
+            let Some(need) = need.checked_next_multiple_of(self.page) else {
+                return false;
+            };
+            // Amortize repeated allocator growth (a bump allocator commits page by page) by at least
+            // doubling — but fall back to the exact requirement if the doubled ask is refused, so a
+            // legitimate grow near the address-space limit is not lost to the overshoot.
+            let doubled = old_alloc.saturating_mul(2).max(need);
+            let base = self.base.load(Acquire);
+            // SAFETY: `base`/`old_alloc` are the live allocation and its exact layout (8-aligned,
+            // non-zero). `realloc` keeps the old block valid when it returns null.
+            let old_layout = unsafe { std::alloc::Layout::from_size_align_unchecked(old_alloc, 8) };
+            let mut new_alloc = doubled;
+            // SAFETY: as above; `new_alloc >= need > old_alloc > 0`, so the new layout is valid.
+            let mut p = unsafe { std::alloc::realloc(base, old_layout, new_alloc) };
+            if p.is_null() && doubled > need {
+                new_alloc = need;
+                // SAFETY: as above — the failed `realloc` left the block untouched.
+                p = unsafe { std::alloc::realloc(base, old_layout, new_alloc) };
+            }
+            if p.is_null() {
+                return false;
+            }
+            // `realloc` leaves the grown tail uninitialized; commit it as zeroes.
+            // SAFETY: `p` addresses `new_alloc` bytes and `new_alloc > old_alloc`.
+            unsafe { core::ptr::write_bytes(p.add(old_alloc), 0, new_alloc - old_alloc) };
+            // Publish the buffer before the length: a reader that races (contract violation) then
+            // sees at worst the old, smaller length over the new, larger buffer.
+            self.base.store(p, Release);
+            self.alloc_len.store(new_alloc, Release);
+            self.size.store(new_alloc as u64, Release);
+            true
+        }
+    }
+
+    // `Send`/`Sync` are automatic — three atomics and a `usize`, no bare pointer field. What they do
+    // *not* buy is safe concurrent growth: that rests on the single-owner contract documented on
+    // `Region::Growable`, since a relocation frees the buffer a racing reader may hold.
+
+    // The buffer outlives every snapshot taken from it (each is used within the one accessor call
+    // that took it), and this `Drop` runs once, after those end.
+    impl Drop for Growable {
+        fn drop(&mut self) {
+            // SAFETY: the exact layout currently allocated (8-aligned, `alloc_len` bytes).
+            unsafe {
+                std::alloc::dealloc(
+                    *self.base.get_mut(),
+                    std::alloc::Layout::from_size_align_unchecked(*self.alloc_len.get_mut(), 8),
                 );
             }
         }
@@ -1652,6 +1829,101 @@ mod foreign_tests {
         assert_eq!(r.read_word(5000, 4), 0xdead_beef);
         assert_eq!(r.atomic_rmw(5000, 4, RmwOp::Add, 1), 0xdead_beef);
         assert_eq!(r.atomic_load(5000, 4), 0xdead_bef0);
+    }
+}
+
+#[cfg(test)]
+mod growable_tests {
+    //! #1312 — the relocatable owned backing a cooperative run's window grows into.
+
+    use super::*;
+
+    /// The whole point: `grow_to` extends the addressable set, **preserving** what was written and
+    /// zeroing the new tail (a grown page must read as a fresh `map`-committed page). The base is
+    /// allowed to move — callers re-read it, which is the contract this variant trades for growth.
+    #[test]
+    fn growing_preserves_bytes_and_zeroes_the_new_tail() {
+        let page = 4096;
+        let r = Region::growable(page, page).expect("growable region");
+        assert!(r.can_grow(), "the map-commit path keys on this");
+        assert_eq!(r.len(), page);
+        r.write_from(0, b"before-the-grow");
+        r.write_word(64, 8, 0x0123_4567_89ab_cdef);
+
+        assert!(r.grow_to(5 * page), "the allocator serves a modest grow");
+        assert!(r.len() >= 5 * page, "the request is now addressable");
+
+        let mut got = [0u8; 15];
+        r.read_into(0, &mut got);
+        assert_eq!(&got, b"before-the-grow", "prior bytes survive relocation");
+        assert_eq!(r.read_word(64, 8), 0x0123_4567_89ab_cdef);
+        assert_eq!(r.byte(4 * page), 0, "the grown tail reads as fresh zero");
+        assert_eq!(r.read_word(4 * page + 8, 8), 0);
+
+        // Reachable only because the region grew: write high, read it back.
+        r.set_byte(4 * page + 3, 0xab);
+        assert_eq!(r.byte(4 * page + 3), 0xab);
+    }
+
+    /// A grow the allocator cannot serve leaves the region **exactly** as it was and reports
+    /// failure, so `Mem::map` answers `-ENOMEM` before it touches any page state (invariant 5:
+    /// errors are values). A grow that already fits is a no-op success.
+    #[test]
+    fn a_refused_grow_changes_nothing() {
+        let page = 4096;
+        let r = Region::growable(page, page).expect("growable region");
+        r.write_from(0, b"intact");
+        let (base, len) = (r.raw_base(), r.len());
+
+        assert!(!r.grow_to(u64::MAX), "no host serves a 2^64-byte buffer");
+        assert_eq!(r.len(), len, "length unchanged after a refusal");
+        assert_eq!(r.raw_base(), base, "buffer unchanged after a refusal");
+        let mut got = [0u8; 6];
+        r.read_into(0, &mut got);
+        assert_eq!(&got, b"intact");
+
+        assert!(r.grow_to(page), "already fits — a no-op success");
+        assert!(r.grow_to(0));
+        assert_eq!(r.len(), len);
+    }
+
+    /// The relocation contract, stated as a test: `raw_base` is a snapshot, not an identity. A
+    /// caller that caches it across a grow is the bug this variant's docs forbid — every driver
+    /// re-reads it per event and after each cross-tier bounce.
+    #[test]
+    fn the_base_is_only_valid_until_the_next_grow() {
+        let page = 4096;
+        let r = Region::growable(page, page).expect("growable region");
+        let before = r.raw_base().expect("flat-addressable");
+        // Grow far enough that an in-place extension is unlikely (but never assert that it moved —
+        // the allocator is free to extend in place, and both outcomes are correct).
+        assert!(r.grow_to(64 * page));
+        let after = r.raw_base().expect("still flat-addressable");
+        assert_eq!(
+            r.raw_base_at(32 * page),
+            Some(unsafe { after.add(32 * page as usize) }),
+            "offsets resolve against the CURRENT base"
+        );
+        let _ = before; // deliberately unused: reading through it after the grow would be UB
+    }
+
+    /// A growable region serves every accessor identically to the safe `Paged` reference — the same
+    /// differential the raw and proxied bodies are gated by, run at a size it was grown into (so the
+    /// ops land in reallocated memory, not just the original buffer).
+    #[test]
+    fn differential_growable_vs_paged_fuzz() {
+        let (size, page) = (3 * 4096, 4096);
+        let a = Region::growable(page, page).expect("growable region");
+        assert!(a.grow_to(size), "grow before the differential");
+        differential(
+            &a,
+            &Region::paged(size, page),
+            size,
+            page,
+            20_000,
+            0x0f1e_2d3c_4b5a_6978,
+        )
+        .unwrap();
     }
 }
 

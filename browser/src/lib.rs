@@ -6885,14 +6885,13 @@ struct WarmSession {
     /// Re-established (without zeroing) before every eval, so the guest restores to the same
     /// mapped geometry — and the same write protections — instead of faulting.
     prots: Vec<(u64, u8)>,
-    /// Mapped window size, `1 << WARM_MAPPED_LOG2` (also the owned backing size).
-    win: u64,
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
     entry_sp: u64,
     eval_fn: temen_ir::FuncIdx,
-    /// The owned window backing (kept alive for the session; `back` aliases it).
-    win_ptr: *mut u8,
-    win_layout: Layout,
+    /// The session's window: a **growable** owned region (#1312) opening at `1 << WARM_MAPPED_LOG2`.
+    /// An eval whose guest `vm_map`s past that (a compiler-guest whose heap outgrows 64 MiB) extends
+    /// it instead of `-EINVAL`ing, and extending it *reallocates*, so the base moves — read it through
+    /// [`WarmSession::win_ptr`] / [`WarmSession::win`] at every use, never cached.
     back: std::sync::Arc<temen_interp::Region>,
     /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
     image: Vec<u8>,
@@ -6907,12 +6906,33 @@ struct WarmSession {
     /// Runs is what keeps a warm+JIT Run off the ~one-time cdylib emit. Held here (not in a global) so
     /// [`temen_warm_close`] tears it down while its window alias is still valid, before the window is freed.
     jit: Option<Box<JitOnrampRun>>,
+    /// #1312: the window base [`jit`](Self::jit) was built against. The warm+JIT run bakes a
+    /// `win_base`, and a *warm-coop* eval on the same session can grow — and so relocate — the
+    /// window underneath it. Compared on each [`temen_warm_jit_open`]; a mismatch rebuilds rather
+    /// than driving emitted code through a stale base.
+    jit_win_base: usize,
     /// #816 item 4 — the cached **warm-coop** artifact: the coop tier-up emit (leaves + wrappers)
     /// plus the outlined module's compiled program, built once by [`temen_warm_coop_open`] and
     /// reused by every [`temen_warm_coop_prepare`]. The tier a **page-managing / InterpDriven**
     /// `eval_run` runs on — where the WasmDriven [`temen_warm_jit_open`] declines, the coop drive
     /// interprets the eval and tiers its eligible leaves up onto emitted wasm.
     coop: Option<Box<WarmCoop>>,
+}
+
+impl WarmSession {
+    /// The window's base address **right now**. A `vm_map` grow inside an eval reallocates the
+    /// backing, so this can differ from one call to the next (#1312) — never cache it across a run.
+    fn win_ptr(&self) -> *mut u8 {
+        self.back
+            .raw_base()
+            .expect("a warm session's window is always flat-addressable")
+    }
+
+    /// The window's byte length right now — `1 << WARM_MAPPED_LOG2` at open, plus whatever an eval's
+    /// guest has since `vm_map`-grown.
+    fn win(&self) -> u64 {
+        self.back.len()
+    }
 }
 
 /// The per-session warm-coop cache (see [`WarmSession::coop`]): the [`coop_emit_for`] outputs with
@@ -6985,16 +7005,17 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         set(STATUS_UNSUPPORTED);
         return -1;
     };
-    let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
-        set(STATUS_UNSUPPORTED);
-        return -1;
-    };
-    // SAFETY: non-zero 8-aligned size; the buffer is this session's window, freed in `temen_warm_close`.
-    let win_ptr = unsafe { std::alloc::alloc_zeroed(layout) };
-    if win_ptr.is_null() {
+    // #1312: a **growable** window — an eval whose guest `vm_map`s past `1 << WARM_MAPPED_LOG2`
+    // extends it rather than being refused. The session owns it through the `Arc<Region>` alone
+    // (no separate raw pointer + layout to keep in step), and it frees itself on close.
+    let Some(region) = temen_interp::Region::growable(win, temen_interp::host_page_size()) else {
         set(STATUS_TRAP);
         return -1;
-    }
+    };
+    let back = std::sync::Arc::new(region);
+    let win_ptr = back
+        .raw_base()
+        .expect("a growable region is flat-addressable");
     // Seed the on-ramp heap bump words (`_start` normally does this): brk = top = heap_base.
     // #964: a marked module's heap words sit one guard up.
     let scratch = temen_ir::module_null_guard();
@@ -7009,8 +7030,6 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         w[b..b + 8].copy_from_slice(&hb);
         w[t..t + 8].copy_from_slice(&hb);
     }
-    // SAFETY: `[win_ptr, win)` is this session's exclusive window; the engine takes the `Arc<Region>`.
-    let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, win) });
     let mut host = Host::new();
     let _ = grant_onramp_caps(&mut host, &m, None);
     let mut fuel = u64::MAX;
@@ -7031,15 +7050,16 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let prots = match (&ran, pages) {
         (Ok(_) | Err(Trap::Exit(_)), Some(entries)) => entries,
         _ => {
-            drop(back);
-            // SAFETY: no alias remains (back dropped, run returned); free the window.
-            unsafe { std::alloc::dealloc(win_ptr, layout) };
+            drop(back); // the region owns the buffer and frees it
             set(STATUS_TRAP);
             return -1;
         }
     };
     // Capture the live prefix `[0, brk)` — everything above brk is still the zero `warmup` left.
-    // SAFETY: `win_ptr` owns `win` bytes; read the post-warmup image, no run in flight.
+    // SAFETY: the region owns `win` bytes; read the post-warmup image, no run in flight. The base is
+    // re-read because the rule for this window is never to cache it (the warmup itself is clamped to
+    // `WARM_MAPPED_LOG2`, so it cannot have grown, but the rule is uniform).
+    let win_ptr = back.raw_base().expect("flat-addressable");
     let (image, live) = unsafe {
         let w = core::slice::from_raw_parts(win_ptr, win as usize);
         let live = warm_read_brk(w, scratch).min(win as usize);
@@ -7051,16 +7071,14 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
             prog,
             module: m,
             prots,
-            win,
             entry_sp,
             eval_fn,
-            win_ptr,
-            win_layout: layout,
             back,
             image,
             dirty_end: live,
             scratch,
             jit: None,
+            jit_win_base: 0,
             coop: None,
         });
     }
@@ -7090,7 +7108,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     // byte-identical warm state (fresh-per-Run isolation).
     // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
     unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
         w[..s.image.len()].copy_from_slice(&s.image);
         w[s.image.len()..s.dirty_end].fill(0);
     }
@@ -7115,7 +7133,11 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         s.back.clone(),
         &mut host,
         false, // window already carries the warm image — do not re-seed
-        WARM_MAPPED_LOG2,
+        // #1312: the oracle's reservation over a growable backing, so an eval whose guest outgrows
+        // the 64 MiB warm window commits real pages instead of `-EINVAL`. Only the *warmup* stays
+        // clamped to `WARM_MAPPED_LOG2` — it defines the image geometry, which is captured as a flat
+        // byte prefix, so growth there would have nothing to restore into.
+        temen_ir::DEFAULT_RESERVED_LOG2,
         Some(&s.prots),
     );
     let (status, value, exit_code) = match ran {
@@ -7132,7 +7154,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     // are zeroed at map time, but the guest may have written them).
     // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
     unsafe {
-        let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
+        let w = core::slice::from_raw_parts(s.win_ptr(), s.win() as usize);
         // Any page the eval left committed (`Rw`, kind 1) may carry its writes — zero to the top
         // of the highest one on the next restore (page size from the engine's map_info encoding).
         let grown = eval_pages
@@ -7143,10 +7165,10 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
             .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
             .max()
             .unwrap_or(0)
-            .min(s.win) as usize;
+            .min(s.win()) as usize;
         s.dirty_end = s
             .dirty_end
-            .max(warm_read_brk(w, s.scratch).min(s.win as usize))
+            .max(warm_read_brk(w, s.scratch).min(s.win() as usize))
             .max(grown);
     }
     set(status);
@@ -7163,20 +7185,20 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
 /// a fresh one.
 #[no_mangle]
 pub extern "C" fn temen_warm_close() {
-    // SAFETY: single-threaded wasm; take the session and free its owned window.
+    // SAFETY: single-threaded wasm; take the session and drop its owned window.
     unsafe {
         if let Some(s) = (*core::ptr::addr_of_mut!(WARM_SESSION)).take() {
-            // #816 item 4: an armed warm-coop run's `CoopRun` window also aliases this session's
-            // buffer (`_owned: None`) — drop it before the free.
+            // #816 item 4: an armed warm-coop run's `CoopRun` shares this session's window region —
+            // drop it first so the region's last reference goes with the session.
             if (*core::ptr::addr_of!(COOP_RUN))
                 .as_ref()
                 .is_some_and(|c| c.warm)
             {
                 temen_coop_close();
             }
-            let (win_ptr, layout) = (s.win_ptr, s.win_layout);
-            drop(s); // drops `back` + the cached warm+JIT run (both alias `win_ptr`) before the free
-            std::alloc::dealloc(win_ptr, layout);
+            // #1312: the window is a `Region` now, so dropping the session frees it (together with
+            // the cached warm+JIT run, which holds its own `Arc` to the same region).
+            drop(s);
         }
     }
 }
@@ -7235,15 +7257,22 @@ pub extern "C" fn temen_warm_jit_open(shared: i32) -> i32 {
         return -STATUS_UNSUPPORTED;
     };
     if s.jit.is_some() {
-        set(STATUS_OK);
-        return 0;
+        // #1312: reuse the cached run only if it still names the live window. A warm-coop eval may
+        // have `vm_map`-grown the session window since, which reallocates and can move it; the
+        // emitted run's baked `win_base` would then address freed memory. Rebuilding is correct and
+        // costs one emit, which only a session that mixes both tiers ever pays.
+        if s.jit_win_base == s.win_ptr() as usize {
+            set(STATUS_OK);
+            return 0;
+        }
+        s.jit = None;
     }
-    // SAFETY: `s.back` aliases the live session window `[s.win_ptr, s.win)`, valid for the session's life.
+    // SAFETY: `s.back` aliases the live session window `[s.win_ptr(), s.win())`, valid for the session's life.
     let built = unsafe {
         JitOnrampRun::open_warm_eval(
             &s.module,
             s.back.clone(),
-            s.win_ptr,
+            s.win_ptr(),
             WARM_MAPPED_LOG2,
             shared != 0,
             s.eval_fn,
@@ -7252,6 +7281,7 @@ pub extern "C" fn temen_warm_jit_open(shared: i32) -> i32 {
     };
     match built {
         Ok(run) => {
+            s.jit_win_base = run.win_base(); // #1312: the base this emit is bound to
             s.jit = Some(Box::new(run));
             set(STATUS_OK);
             0
@@ -7282,7 +7312,7 @@ pub extern "C" fn temen_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize)
     // warm state each Run (identical to [`temen_warm_eval`]'s restore).
     // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
     unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
         w[..s.image.len()].copy_from_slice(&s.image);
         w[s.image.len()..s.dirty_end].fill(0);
     }
@@ -7424,10 +7454,10 @@ pub extern "C" fn temen_warm_jit_finish() -> i32 {
     // [`temen_warm_eval`]).
     // SAFETY: `win_ptr` owns `win` bytes; read the post-eval brk, no run in flight.
     unsafe {
-        let w = core::slice::from_raw_parts(s.win_ptr, s.win as usize);
+        let w = core::slice::from_raw_parts(s.win_ptr(), s.win() as usize);
         s.dirty_end = s
             .dirty_end
-            .max(warm_read_brk(w, s.scratch).min(s.win as usize));
+            .max(warm_read_brk(w, s.scratch).min(s.win() as usize));
     }
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
@@ -7526,7 +7556,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     // byte-identical warm state each Run (identical to [`temen_warm_eval`]'s restore).
     // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
     unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr, s.win as usize);
+        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
         w[..s.image.len()].copy_from_slice(&s.image);
         w[s.image.len()..s.dirty_end].fill(0);
     }
@@ -7553,9 +7583,10 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         eligible: std::sync::Arc::clone(&wc.eligible),
         page_checked: wc.paged,
     };
-    // The resumable twin of the warm interp path's `run_over_grown`: the reservation clamped to
-    // the session window, the image bytes already restored (no data seed), and the captured page
-    // map re-established (`seed_pages`) so the grown heap + protected rodata are live again.
+    // The resumable twin of the warm interp path's `run_over_grown`: the image bytes already
+    // restored (no data seed), the captured page map re-established (`seed_pages`) so the grown heap
+    // + protected rodata are live again, and — #1312 — the oracle's reservation over the growable
+    // window, so a compiler-guest whose heap outgrows 64 MiB grows it rather than trapping.
     let run = match wc.prog.coop_run_over_grown(
         s.eval_fn,
         &[Value::I64(s.entry_sp as i64)],
@@ -7563,7 +7594,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         host,
         Some(tierup),
         s.back.clone(),
-        WARM_MAPPED_LOG2,
+        temen_ir::DEFAULT_RESERVED_LOG2,
         &s.prots,
     ) {
         Ok(r) => r,
@@ -7573,13 +7604,12 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         }
     };
     // SAFETY: single-threaded wasm; the session is read back only via the coop exports. The window
-    // is the warm session's (`_owned: None`) — `temen_warm_close` drops this run before freeing it.
+    // is the warm session's (shared `Region`, still fixed-size until slice 3) — `temen_warm_close`
+    // drops this run before freeing it.
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            win_ptr: s.win_ptr,
-            win_len: s.win as usize,
-            _owned: None,
+            back: s.back.clone(),
             warm: true,
             emitted_wasm: std::sync::Arc::clone(&wc.wasm),
             func: 0,
@@ -8846,8 +8876,10 @@ pub extern "C" fn temen_onramp_jit_close() {
 /// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open`]; single-threaded wasm.
 static mut JIT_RUN: Option<JitOnrampRun> = None;
 
-/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap (the emitted run can't
-/// grow it, so it must be sized up front).
+/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap. The **single-shot**
+/// tier still sizes this up front: its backing is fixed, so a `vm_map` past it is admitted by the
+/// reservation and then declined at the first emitted access (#1153, invariant 9). The cooperative
+/// tier uses this only as its window's *initial* size — there the backing grows (#1312).
 const JIT_RUN_WIN_LOG2: u8 = 25;
 
 /// Open a **single-shot wasm-JIT run** over the on-ramp module at `[mod_ptr, mod_len)` (Lua/SQLite/hello):
@@ -12261,18 +12293,22 @@ pub const COOP_RUN_TRAP: i32 = 2;
 pub const COOP_RUN_JIT_INVOKE: i32 = 3;
 
 /// The live cooperative tier-up session — the `CoopRun` plus the host-facing operand/capture state
-/// (mirrors the relevant fields of `TierupRun`). The `backing` box owns the window `CoopRun`'s `Mem`
-/// addresses through a raw-pointer `Region`; both drop together at [`temen_coop_close`].
+/// (mirrors the relevant fields of `TierupRun`). The window `Region` is shared with `CoopRun`'s
+/// `Mem`; both drop together at [`temen_coop_close`].
 struct CoopTierupRun {
     run: bytecode::CoopRun,
-    /// The run window's base/length — in this module's linear memory, so emitted leaves address it
-    /// through the one shared `env.memory`. For a [`temen_coop_open`] run the window is `_owned`
-    /// here (a boxed slice, pointer-stable across the struct's moves); for a **warm-coop** run
-    /// (#816 item 4, [`temen_warm_coop_prepare`]) it is the warm session's window — owned by
-    /// [`WARM_SESSION`], whose close tears this run down before freeing it.
-    win_ptr: *const u8,
-    win_len: usize,
-    _owned: Option<Box<[u8]>>,
+    /// The run window's backing — in this module's linear memory, so emitted leaves address it
+    /// through the one shared `env.memory`. For a [`temen_coop_open`] run this is a
+    /// **growable** region (#1312) the guest's `vm_map` can extend past the declared window, the way
+    /// the interpreter oracle's own reservation does; for a **warm-coop** run (#816 item 4,
+    /// [`temen_warm_coop_prepare`]) it is the warm session's window, whose close tears this run down
+    /// before freeing it.
+    ///
+    /// **Read the base and length per use, never cache them**: growing a `Region::Growable`
+    /// reallocates, so the base moves. That is what [`temen_coop_win_ptr`] /
+    /// [`temen_coop_tierup_win_ptr`] are for, and why the JS driver re-reads them after every
+    /// cross-tier bounce (publishing the fresh base into the emitted `"win"` global).
+    back: std::sync::Arc<temen_interp::Region>,
     /// #816 item 4: a warm-coop run — at DONE/TRAP the warm session's heap high-water advances (so
     /// the next restore zeroes what this eval dirtied), and [`temen_warm_close`] must drop this run
     /// before freeing the window it borrows.
@@ -12488,8 +12524,14 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
 
 /// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
 /// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
-/// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
-/// run). Idempotent open: closes any prior run first.
+/// on refusal (decode error, an op outside the engine subset, nothing for the emitted tier to run,
+/// or a window the host allocator refused). Idempotent open: closes any prior run first.
+///
+/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and reserved
+/// at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the declared window
+/// commits real memory instead of `-EINVAL`ing. Growing reallocates and can move the window, so the
+/// driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`] after every bounce and
+/// publish the base to each emitted instance's `"win"` global.
 #[no_mangle]
 pub extern "C" fn temen_coop_open(
     mod_ptr: *const u8,
@@ -12523,11 +12565,17 @@ pub extern "C" fn temen_coop_open(
             return -status;
         }
     };
-    let mut backing = vec![0u8; 1usize << win_log2].into_boxed_slice();
-    let win_ptr = backing.as_mut_ptr();
-    // SAFETY: `backing` is owned by the session and pointer-stable across its moves (boxed slice).
-    let back =
-        std::sync::Arc::new(unsafe { temen_interp::Region::shared(win_ptr, 1u64 << win_log2) });
+    // #1312: a **growable** window. `win_log2` is the *initial* size (and the emit-time mask domain);
+    // a guest allocator's `vm_map` grows the backing past it on demand, exactly as it grows the
+    // oracle's own reservation, instead of `-EINVAL`ing at a pre-sized ceiling (INVARIANTS.md #14).
+    // Growing relocates, so nothing may cache the base — see `CoopTierupRun::back`.
+    let Some(region) =
+        temen_interp::Region::growable(1u64 << win_log2, temen_interp::host_page_size())
+    else {
+        set(STATUS_UNSUPPORTED);
+        return -STATUS_UNSUPPORTED;
+    };
+    let back = std::sync::Arc::new(region);
     let mut host = Host::new();
     host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
@@ -12564,8 +12612,11 @@ pub extern "C" fn temen_coop_open(
         // fidelity `scalar_extent` cannot (matching the pump's `with_jit_page_checked`).
         page_checked: paged,
     };
-    // `CoopRun` owns its `Domain`; the window is built over `back` with the reservation clamped to
-    // the run window (`vm_map`-grow into `[declared, 1 << win_log2)`, an over-grow `-EINVAL`s).
+    // `CoopRun` owns its `Domain`; the window is built over `back` with the **oracle's** reservation
+    // (#1312). It used to be clamped to `win_log2`, which made a `vm_map` past the declared window
+    // `-EINVAL` here and succeed on `onramp_exec` — the divergence this issue is about. Growth into
+    // `[declared, 1 << DEFAULT_RESERVED_LOG2)` is now admitted exactly as the oracle admits it, and
+    // the growable backing commits the pages; only a map past the reservation is still `-EINVAL`.
     let run = match bytecode::CoopRun::new_over(
         &m,
         0,
@@ -12574,8 +12625,8 @@ pub extern "C" fn temen_coop_open(
         host,
         Some(tierup),
         &[],
-        win_log2,
-        back,
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        back.clone(),
     ) {
         Some(Ok(r)) => r,
         Some(Err(_)) => {
@@ -12591,9 +12642,7 @@ pub extern "C" fn temen_coop_open(
     unsafe {
         *core::ptr::addr_of_mut!(COOP_RUN) = Some(CoopTierupRun {
             run,
-            win_ptr,
-            win_len: 1usize << win_log2,
-            _owned: Some(backing),
+            back,
             warm: false,
             emitted_wasm: wasm.into(),
             func: 0,
@@ -12690,7 +12739,7 @@ pub extern "C" fn temen_coop_run() -> i32 {
         // SAFETY: single-threaded wasm; the warm session outlives its armed coop run by
         // construction (`temen_warm_close` drops the run first), and no engine run is in flight.
         if let Some(ws) = unsafe { (*core::ptr::addr_of_mut!(WARM_SESSION)).as_mut() } {
-            let w = unsafe { core::slice::from_raw_parts(ws.win_ptr, ws.win as usize) };
+            let w = unsafe { core::slice::from_raw_parts(ws.win_ptr(), ws.win() as usize) };
             let grown = s
                 .run
                 .mem_map_info()
@@ -12701,12 +12750,12 @@ pub extern "C" fn temen_coop_run() -> i32 {
                         .map(|&(off, _)| off.saturating_add(temen_interp::host_page_size()))
                         .max()
                         .unwrap_or(0)
-                        .min(ws.win)
+                        .min(ws.win())
                 })
                 .unwrap_or(0) as usize;
             ws.dirty_end = ws
                 .dirty_end
-                .max(warm_read_brk(w, ws.scratch).min(ws.win as usize))
+                .max(warm_read_brk(w, ws.scratch).min(ws.win() as usize))
                 .max(grown);
         }
     }
@@ -12802,15 +12851,24 @@ pub extern "C" fn temen_coop_wasm_len() -> usize {
 }
 
 /// The run window's base address in this module's linear memory (the emitted `f{i}`s' `win` arg).
+///
+/// #1312: read this **fresh** every time it is needed. A `vm_map` grow reallocates the growable
+/// backing, so the base can differ from one call to the next; a host that cached it would address
+/// freed memory (the emitted tier gets the fresh base through the `"win"` global).
 #[no_mangle]
 pub extern "C" fn temen_coop_win_ptr() -> *const u8 {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| s.win_ptr)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
+        s.back
+            .raw_base()
+            .map_or(core::ptr::null(), |p| p as *const u8)
+    })
 }
 
-/// The run window's byte length (`1 << win_log2`).
+/// The run window's byte length — the initial `1 << win_log2`, plus whatever the guest has
+/// `vm_map`-grown since (#1312). Like the base, re-read it rather than caching it.
 #[no_mangle]
 pub extern "C" fn temen_coop_win_len() -> usize {
-    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.win_len)
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.back.len() as usize)
 }
 
 /// #816 env-routed tier-up: the **pending event's** window base — the emitted `f{i}`s' `win` arg
@@ -12822,7 +12880,9 @@ pub extern "C" fn temen_coop_win_len() -> usize {
 #[no_mangle]
 pub extern "C" fn temen_coop_tierup_win_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
-        s.run.pending_win().map_or(s.win_ptr, |(ptr, _)| ptr)
+        s.run
+            .pending_win()
+            .map_or_else(|| temen_coop_win_ptr(), |(ptr, _)| ptr)
     })
 }
 
@@ -12833,7 +12893,7 @@ pub extern "C" fn temen_coop_tierup_win_len() -> usize {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| {
         s.run
             .pending_win()
-            .map_or(s.win_len, |(_, len)| len as usize)
+            .map_or_else(|| temen_coop_win_len(), |(_, len)| len as usize)
     })
 }
 

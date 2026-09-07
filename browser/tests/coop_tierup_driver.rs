@@ -686,7 +686,23 @@ struct DriverData {
     fuel_globals: Vec<wasmi::Global>,
     /// #1009 paged: the emitted `"pagestate"` globals (the coop twin of the pump driver's).
     pagestate_globals: Vec<wasmi::Global>,
+    /// #1312: the emitted `"win"` globals — the live window base. This harness mirrors the window at
+    /// a fixed `WIN_BASE`, so the value never changes; writing it after each bounce mirrors what the
+    /// JS driver must do over the engine's own (relocating) backing, and pins that the emitted entry
+    /// publish and the host write agree.
+    win_globals: Vec<wasmi::Global>,
     bounces: Vec<u32>,
+}
+
+/// Widen the mirrored memory so `[0, need)` is addressable — the window can now **grow** mid-run
+/// (#1312), and with it the page-state table that sits just past it.
+fn ensure_mirror(store: impl wasmi::AsContextMut, mem: Memory, need: usize) {
+    let mut store = store;
+    let want = need.div_ceil(1 << 16) as u64;
+    let have = mem.size(&store);
+    if want > have {
+        mem.grow(&mut store, want - have).expect("mirror grows");
+    }
 }
 
 struct CoopB2Driver {
@@ -699,10 +715,16 @@ struct CoopB2Driver {
     /// Bounce shims keyed by `(slot, occupant code)` (`-2` = a program-function slot) so an
     /// uninstall/reinstall regenerates against the new occupant's signature.
     shims: HashMap<(u32, i32), Func>,
-    win_len: usize,
     /// #1009: the dispatch-table generation the shared table was last synced at (mirrors the JS
     /// driver's cache so an install re-syncs and a no-install run syncs once).
     synced_gen: i64,
+}
+
+/// The live window right now — base **and** length re-read together. Never cache either across a
+/// bounce or an event: a `vm_map` grow reallocates the engine's backing, moving the base and
+/// extending the length (#1312).
+fn live_win() -> (*mut u8, usize) {
+    (temen_coop_win_ptr() as *mut u8, temen_coop_win_len())
 }
 
 impl CoopB2Driver {
@@ -711,8 +733,7 @@ impl CoopB2Driver {
     fn new() -> CoopB2Driver {
         let engine = Engine::default();
         let mut store: Store<DriverData> = Store::new(&engine, DriverData::default());
-        let win_len = temen_coop_win_len();
-        let pages = ((WIN_BASE as usize + win_len) as u32).div_ceil(1 << 16) + 1;
+        let pages = ((WIN_BASE as usize + temen_coop_win_len()) as u32).div_ceil(1 << 16) + 1;
         let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
         store.data_mut().mem = Some(memory);
         let tsize = 1u32 << temen_coop_table_log2();
@@ -733,7 +754,6 @@ impl CoopB2Driver {
             main: unsafe { std::mem::zeroed() },
             unit_insts: HashMap::new(),
             shims: HashMap::new(),
-            win_len,
             synced_gen: -1,
         };
         d.main = d.instantiate(&main_wasm);
@@ -752,7 +772,6 @@ impl CoopB2Driver {
         linker
             .func_wrap("env", "trap", |_c: Caller<'_, DriverData>, _code: i32| {})
             .unwrap();
-        let win_len = self.win_len;
         linker
             .func_wrap(
                 "env",
@@ -762,7 +781,7 @@ impl CoopB2Driver {
                       args_ptr: i32|
                       -> Result<(), wasmi::Error> {
                     let mem = c.data().mem.unwrap();
-                    let win_ptr = temen_coop_win_ptr() as *mut u8;
+                    let (win_ptr, win_len) = live_win();
                     // Make the emitted frames' window writes visible to the engine before the callback.
                     let mut w = vec![0u8; win_len];
                     mem.read(&c, WIN_BASE as usize, &mut w).unwrap();
@@ -771,9 +790,19 @@ impl CoopB2Driver {
                     let mut slots = [0u8; 512];
                     mem.read(&c, args_ptr as usize, &mut slots).unwrap();
                     let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr());
+                    // #1312: the callback may have `vm_map`-grown the window, which reallocates and
+                    // can relocate the engine's backing — re-read BOTH base and length, and widen the
+                    // mirror to match before copying back.
+                    let (win_ptr, win_len) = live_win();
+                    ensure_mirror(&mut c, mem, WIN_BASE as usize + win_len);
                     let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
                     mem.write(&mut c, WIN_BASE as usize, live).unwrap();
                     mem.write(&mut c, args_ptr as usize, &slots).unwrap();
+                    // The mirror's base never moves, so this is a no-op here — but it is the write the
+                    // JS driver must make over the engine's relocating backing, so make it anyway.
+                    for g in c.data().win_globals.clone() {
+                        g.set(&mut c, Val::I32(WIN_BASE as i32)).unwrap();
+                    }
                     // #717 fan-out: a bounced callback may have `vm_map`-grown the window. #1009
                     // paged: the grow refreshed the page-state table (`call_interp` rebuilt it) —
                     // fan the fresh coverage to `"mapped"`, re-copy the table, re-point `"pagestate"`.
@@ -788,11 +817,7 @@ impl CoopB2Driver {
                             unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }
                                 .to_vec();
                         let table_base = WIN_BASE as usize + win_len;
-                        let need = (table_base + plen).div_ceil(1 << 16) as u32;
-                        let have = mem.size(&c) as u32;
-                        if need > have {
-                            mem.grow(&mut c, (need - have) as u64).unwrap();
-                        }
+                        ensure_mirror(&mut c, mem, table_base + plen);
                         mem.write(&mut c, table_base, &table).unwrap();
                         for g in c.data().pagestate_globals.clone() {
                             g.set(&mut c, Val::I32(table_base as i32)).unwrap();
@@ -826,6 +851,9 @@ impl CoopB2Driver {
         }
         if let Some(g) = instance.get_global(&self.store, "pagestate") {
             self.store.data_mut().pagestate_globals.push(g);
+        }
+        if let Some(g) = instance.get_global(&self.store, "win") {
+            self.store.data_mut().win_globals.push(g);
         }
         instance
     }
@@ -899,9 +927,12 @@ impl CoopB2Driver {
 
     /// Sync window + globals into the shared instances before running an emitted entry.
     fn prime(&mut self, mapped: i64) {
-        let win_ptr = temen_coop_win_ptr() as *mut u8;
+        // #1312: read the window's base and length per event — a previous event's `vm_map` may have
+        // grown (and relocated) it — and widen the mirror to whatever it is now.
+        let (win_ptr, win_len) = live_win();
+        ensure_mirror(&mut self.store, self.memory, WIN_BASE as usize + win_len);
         // SAFETY: the paused task is parked on the pending event; the window is exclusive.
-        let live = unsafe { std::slice::from_raw_parts(win_ptr, self.win_len) };
+        let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
         self.memory
             .write(&mut self.store, WIN_BASE as usize, live)
             .unwrap();
@@ -914,20 +945,18 @@ impl CoopB2Driver {
         for g in self.store.data().fuel_globals.clone() {
             g.set(&mut self.store, Val::I64(1 << 61)).unwrap();
         }
+        // #1312: the emitted entry publishes `win` itself, so this only pins that the two agree.
+        for g in self.store.data().win_globals.clone() {
+            g.set(&mut self.store, Val::I32(WIN_BASE as i32)).unwrap();
+        }
         // #1009 paged: copy the page-state table in after the window and point `"pagestate"` at it
         // (the browser shares memory, zero-copy; here the emitted module has its own).
         if temen_coop_paged() != 0 {
             let plen = temen_coop_pagestate_len();
             // SAFETY: pending-event page-state table, stable until the deliver.
             let table = unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) };
-            let table_base = WIN_BASE as usize + self.win_len;
-            let need = (table_base + plen).div_ceil(1 << 16) as u32;
-            let have = self.memory.size(&self.store) as u32;
-            if need > have {
-                self.memory
-                    .grow(&mut self.store, (need - have) as u64)
-                    .unwrap();
-            }
+            let table_base = WIN_BASE as usize + win_len;
+            ensure_mirror(&mut self.store, self.memory, table_base + plen);
             self.memory
                 .write(&mut self.store, table_base, table)
                 .unwrap();
@@ -939,13 +968,15 @@ impl CoopB2Driver {
 
     /// Mirror the emitted writes back into the live window before the vCPU resumes.
     fn writeback(&mut self) {
-        let win_ptr = temen_coop_win_ptr() as *mut u8;
-        let mut buf = vec![0u8; self.win_len];
+        // #1312: re-read — the emitted region's bounces may have grown and relocated the window.
+        let (win_ptr, win_len) = live_win();
+        ensure_mirror(&mut self.store, self.memory, WIN_BASE as usize + win_len);
+        let mut buf = vec![0u8; win_len];
         self.memory
             .read(&self.store, WIN_BASE as usize, &mut buf)
             .unwrap();
         // SAFETY: see above.
-        unsafe { std::slice::from_raw_parts_mut(win_ptr, self.win_len) }.copy_from_slice(&buf);
+        unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&buf);
     }
 
     /// Service the pending TIERUP through the shared table (#880): sync window/table/globals, run the
@@ -1095,6 +1126,200 @@ fn drive_coop_b2_session_allow_trap(m: &temen_ir::Module) -> (CoopB2Driver, u32)
         }
     }
     (d, tierups)
+}
+
+// ---- #1312: a guest whose allocator grows the window past the declared size ---------------------
+
+/// The `__temen_malloc` shape, reduced: a tier-up-eligible leaf calls a helper that `vm_map`s
+/// `[off, off+len)` RW and returns `off`, then stores through the freshly mapped address and reads
+/// it back. `declared` sets the module's `memory N`; `ro` adds a `readonly` segment, which is what
+/// flips `temen_coop_open` into **paged** mode (every real on-ramp card lays its `.rodata` out that
+/// way, so both modes must carry the grow).
+///
+/// The interpreter oracle reserves `DEFAULT_RESERVED_LOG2` and grows on demand, so every case below
+/// succeeds there. The cooperative tier used to clamp its reservation to the run window, making any
+/// map past it `-EINVAL` — which this guest, like the real allocator, does not check, so the store
+/// then faulted (#1312).
+fn grow_guest_src(mem_h: i32, off: u64, len: u64, declared: u8, ro: bool) -> String {
+    let data = if ro {
+        "data ro 32768 \"temen-coop-grow-rodata!!\"\n"
+    } else {
+        ""
+    };
+    format!(
+        r#"memory {declared}
+{data}func () -> (i64) {{
+block 0 () {{
+  vx = i64.const 7
+  vr = call 1 (vx)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vp = call 2 (v0)
+  i64.store vp v0
+  vl = i64.load vp
+  vs = i64.add vl v0
+  return vs
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const {off}
+  vlen = i64.const {len}
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  return voff
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+/// Run one grow case through the real coop FFI and assert full parity with `onramp_exec`.
+/// `want_grown` says the run must end with a window larger than it opened with — the proof that the
+/// map actually committed rather than being refused and papered over.
+fn assert_grow_case(name: &str, off: u64, len: u64, declared: u8, ro: bool, want_grown: bool) {
+    let (_out_h, mem_h) = onramp_out_mem_handles();
+    let src = grow_guest_src(mem_h, off, len, declared, ro);
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "[{name}] coop open (status {})", temen_status());
+    assert_eq!(
+        temen_coop_paged() != 0,
+        ro,
+        "[{name}] a readonly segment opens the run paged"
+    );
+    let opened_len = temen_coop_win_len();
+    let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+    assert_eq!(
+        temen_status(),
+        want.status,
+        "[{name}] status parity with the oracle"
+    );
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "[{name}] value parity with the oracle"
+    );
+    assert!(tierups >= 1, "[{name}] the leaf must actually tier up");
+    if want_grown {
+        assert!(
+            temen_coop_win_len() > opened_len,
+            "[{name}] the window must have grown past the {opened_len}-byte run window, got {}",
+            temen_coop_win_len()
+        );
+    }
+    temen_coop_close();
+}
+
+/// #1312 — the gap this issue is about: a `vm_map` whose end lands **past the coop run window**.
+/// The run window opens at `max(JIT_RUN_WIN_LOG2, declared)` = 32 MiB; the oracle reserves 2^40 and
+/// grows, so all three shapes below succeed there. Before the growable backing they all trapped on
+/// the cooperative tier, with zero tier-ups (the fault landed in interpreted code, inside the
+/// allocator, before the hot leaf was ever reached).
+#[test]
+fn coop_grow_past_the_run_window_matches_the_oracle() {
+    let _g = ffi_guard();
+    const WIN: u64 = 1 << 25; // JIT_RUN_WIN_LOG2 — the run window `temen_coop_open` opens with
+    for &ro in &[false, true] {
+        let tag = if ro { "paged" } else { "scalar" };
+        // A grow that starts inside the window and runs past its end.
+        assert_grow_case(
+            &format!("{tag}/crosses-the-window"),
+            65536,
+            WIN - 65536 + 16384,
+            16,
+            ro,
+            true,
+        );
+        // A first map placed entirely past the window (a heap based above it).
+        assert_grow_case(
+            &format!("{tag}/starts-past-the-window"),
+            WIN,
+            16384,
+            16,
+            ro,
+            true,
+        );
+        // The worst shape: `memory 25` puts the synthesized heap base *at* the run window, so the
+        // very first `malloc` grow lands past it — such a guest could not grow at all.
+        assert_grow_case(
+            &format!("{tag}/declared-at-the-window"),
+            WIN,
+            16384,
+            25,
+            ro,
+            true,
+        );
+    }
+    // A grow that stays inside the window keeps working, and does not grow the backing.
+    assert_grow_case("scalar/inside-the-window", 65536, 16384, 16, false, false);
+}
+
+/// Growth is bounded by the **reservation**, not by "whatever the allocator will give us": a map
+/// past `1 << DEFAULT_RESERVED_LOG2` is `-EINVAL` on the cooperative tier exactly as on the oracle,
+/// and the guest sees it as a value it can probe (invariant 5), not a trap. Without this the
+/// growable backing would have turned a refusal into an unbounded allocation attempt.
+#[test]
+fn coop_grow_past_the_reservation_is_einval_on_both_tiers() {
+    let _g = ffi_guard();
+    let (_out_h, mem_h) = onramp_out_mem_handles();
+    // `_start` returns the raw `vm_map` result, so the errno itself is the compared value.
+    let src = format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vas = i32.const {mem_h}
+  voff = i64.const {off}
+  vlen = i64.const 16384
+  vprot = i32.const 3
+  vr = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vprot)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 3
+  vm = i64.mul v0 vk
+  vs = i64.add vm vk
+  return vs
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        off = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2
+    );
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "the oracle probes the refusal");
+    assert!(want.value < 0, "the oracle refuses with a negative errno");
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "coop open (status {})", temen_status());
+    let opened_len = temen_coop_win_len();
+    let (_d, _tierups) = drive_coop_b2_session_allow_trap(&m);
+    assert_eq!(temen_status(), want.status, "status parity");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "the same errno on both tiers — a refusal, never a trap"
+    );
+    assert_eq!(
+        temen_coop_win_len(),
+        opened_len,
+        "a refused map leaves the backing untouched"
+    );
+    temen_coop_close();
 }
 
 /// #1009 paged, on the cooperative path: a rodata guest whose eligible leaf accesses its `Ro` page
@@ -3060,6 +3285,149 @@ export 0 func "warmup" 0
 export 1 func "eval_run" 1
 "#
     )
+}
+
+/// #1312 — a **warm** guest whose eval `vm_map`s past the 64 MiB warm window (`WARM_MAPPED_LOG2`).
+/// `warmup` seeds nothing unusual; `eval_run` grows a page at the window's end, stores a marker
+/// through it, reads it back and streams it. This is the JACL playground's shape: a compiler-guest
+/// whose heap outgrows the warm image's window while compiling.
+fn warm_grow_guest_text(mem_h: i32, out_h: i32) -> String {
+    const WARM_WIN: u64 = 1 << 26; // WARM_MAPPED_LOG2 — the session's opening window
+    const PROBE: u64 = WARM_WIN + 16;
+    // The on-ramp brk word sits one guard up on the #1094 marked layout (see `warm_coop_guest_text`).
+    let brk = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK;
+    // A `readonly` segment arms the **paged** coop tier — the mode every real on-ramp card runs in
+    // (they all lay `.rodata` out this way, and the JACL compiler-guest reports `PAGED=true`). Paged
+    // mode is also what keeps the leaf tiering up here: the per-access page check replaces the #717
+    // one-bound `scalar_extent`, which a restored warm window's explicit page entries make
+    // unrepresentable, so a non-paged warm guest declines every tier-up.
+    format!(
+        r#"memory 16
+data ro 24576 "temen-warm-grow-rodata!!"
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vbrkaddr = i64.const {brk}
+  vbrk = i64.const 40960
+  i64.store vbrkaddr vbrk
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vas = i32.const {mem_h}
+  voff = i64.const {WARM_WIN}
+  vlen = i64.const 16384
+  vrw = i32.const 3
+  vm = call.cap 5 0 (i64, i64, i32) -> (i64) vas (voff, vlen, vrw)
+  vprobe = i64.const {PROBE}
+  vmark = i64.const 424242
+  i64.store vprobe vmark
+  vld = i64.load vprobe
+  v3 = i64.const 3
+  vleaf = call 2 (v3)
+  vsum = i64.add vld vleaf
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vx: i64) {{
+  v3 = i64.const 3
+  vm = i64.mul vx v3
+  v7 = i64.const 7
+  va = i64.add vm v7
+  return va
+  }}
+}}
+export 0 func "warmup" 0
+export 1 func "eval_run" 1
+"#
+    )
+}
+
+/// #1312 on the **warm** tier — the path the JACL playground runs, and the one whose fixed-arena
+/// `malloc` shim exists to dodge this gap. The warm session's window opens at 64 MiB and the eval
+/// maps past it: before the growable backing that map was `-EINVAL` (the reservation was clamped to
+/// the window), the store through it faulted, and the eval trapped. Both warm tiers — the plain
+/// interpreter eval and the coop tier-up eval — must now agree with each other and grow the window.
+#[test]
+fn warm_eval_grows_past_the_warm_window_on_both_tiers() {
+    let _g = ffi_guard();
+
+    let (out_h, mem_h) = onramp_out_mem_handles();
+    let m = temen_text::parse_module(&warm_grow_guest_text(mem_h, out_h)).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let live = temen_warm_open(bytes.as_ptr(), bytes.len());
+    assert!(live > 0, "warm open (status {})", temen_status());
+
+    // The interpreter warm eval is the oracle here: it grows the window and reads its marker back.
+    let want = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "interp warm eval status");
+    assert_eq!(
+        want,
+        424242 + 16,
+        "marker through the grown page, plus the leaf"
+    );
+    // SAFETY: capture slots staged by the eval; sole accessor (FFI_LOCK).
+    let want_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+
+    assert_eq!(
+        temen_warm_coop_open(0),
+        0,
+        "warm-coop open (status {})",
+        temen_status()
+    );
+    // Two rounds: the second proves the restore still works over a window a prior eval grew (the
+    // image is copied back and `[image, dirty_end)` re-zeroed across the larger backing).
+    for round in 0..2 {
+        assert_eq!(
+            temen_warm_coop_prepare(core::ptr::null(), 0),
+            0,
+            "warm-coop prepare (round {round}, status {})",
+            temen_status()
+        );
+        let win_before = temen_coop_win_len();
+        let (_d, tierups) = drive_coop_b2_session_allow_trap(&m);
+        assert_eq!(
+            temen_status(),
+            STATUS_OK,
+            "warm-coop status (round {round}) — a trap here is the #1312 symptom"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            want,
+            "warm-coop value parity with the interpreter warm eval (round {round})"
+        );
+        assert!(tierups >= 1, "the leaf must tier up (round {round})");
+        // SAFETY: capture slots staged by the DONE arm; sole accessor (FFI_LOCK).
+        let out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(out, want_out, "warm-coop stdout parity (round {round})");
+        assert!(
+            temen_coop_win_len() >= win_before,
+            "the window never shrinks (round {round})"
+        );
+    }
+    assert!(
+        temen_coop_win_len() > (1usize << 26),
+        "the eval grew the session window past its 64 MiB opening size, got {}",
+        temen_coop_win_len()
+    );
+
+    // The interpreter warm path still agrees after the coop Runs — the grown window is shared state
+    // the coop tier must leave restorable.
+    let again = temen_warm_eval(core::ptr::null(), 0);
+    assert_eq!(temen_status(), STATUS_OK, "post-coop interp eval status");
+    assert_eq!(again, want, "post-coop interp eval parity");
+    temen_warm_close();
 }
 
 /// #816 item 4 — the warm-coop differential: value/stdout parity with the interpreter warm path
