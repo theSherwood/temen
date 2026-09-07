@@ -202,3 +202,107 @@ fn codec_refuses_a_tampered_unit() {
         other => panic!("expected a fail-closed refusal, got {other:?}"),
     }
 }
+
+/// #1296 item 4 — a **frozen §14 child** that holds a `Jit` cap carries its unit tables inline in its
+/// `FrozenChildState` (the v19 block), so a subtree snapshot round-trips the child's compiled units.
+/// Before this the child's units were dropped (only the root's rode Section 5), dangling its
+/// `JitTable` handle on thaw. We build a root host carrying one nested child whose recorded host
+/// state holds a captured JIT table, freeze → restore, and confirm the child's units survive
+/// byte-identically (the §12.6 canonical re-serialize also holds over the new inline block).
+#[test]
+fn a_frozen_childs_jit_tables_round_trip_through_the_codec() {
+    use temen_interp::{FrozenChildState, FrozenNested};
+
+    // A "child" host that compiled two units — capture its durable JIT state as the residue would.
+    let mut child = Host::new();
+    child.set_jit_validator(validator);
+    let dom = child.grant_jit_with_table(Some(SIZE_LOG2), 4);
+    child.jit_compile(dom, &unit_blob(7)).unwrap().unwrap();
+    let c1 = child.jit_compile(dom, &unit_blob(11)).unwrap().unwrap();
+    child.jit_record_install(c1.domain, 3, c1.unit); // an install lands in the reserved padding
+    let child_jit = child.capture_durable_jit();
+    let child_log2 = child.jit_table_log2();
+    assert_eq!(child_jit.len(), 1, "one JIT table captured");
+    assert_eq!(child_jit[0].units.len(), 2, "two units captured");
+
+    // A root host carrying that child as depth-1 residue (a same-module child at slot 0).
+    let module = gate_module();
+    let mut host = Host::new();
+    host.set_frozen_nested(vec![FrozenNested {
+        parent_task: 0,
+        slot: 0,
+        carve_off: 0,
+        size_log2: 12,
+        entry: 0,
+        module_digest: None,
+        completed_result: None,
+    }]);
+    host.set_frozen_child_state(vec![FrozenChildState {
+        parent_task: 0,
+        slot: 0,
+        svc_queue: Vec::new(),
+        svc_results: Vec::new(),
+        svc_next_ticket: 0,
+        handles: Vec::new(),
+        jit_tables: child_jit.clone(),
+        jit_table_log2: child_log2,
+    }]);
+
+    let window = vec![0u8; WINDOW];
+    let artifact = freeze(&module, &window, &host).expect("freeze admits the child's JIT residue");
+
+    let mut thost = Host::new();
+    let restored = restore(&artifact, &module, &mut thost).expect("restore");
+
+    // §12.6 canonical: re-serializing the restored residue is byte-identical (the new inline block
+    // encodes deterministically).
+    assert_eq!(
+        freeze(&module, &restored, &thost).expect("re-freeze"),
+        artifact,
+        "re-serialize of a restored child JIT block is byte-identical"
+    );
+
+    // The child's JIT state round-tripped: same table, same unit count, same install occupancy + log2.
+    let cs = thost.frozen_child_state();
+    assert_eq!(cs.len(), 1, "the child state came back");
+    assert_eq!(cs[0].jit_tables.len(), 1);
+    assert_eq!(cs[0].jit_tables[0].units.len(), 2, "both units survived");
+    assert_eq!(
+        cs[0].jit_tables[0].installed,
+        vec![(3, 1)],
+        "install occupancy survived"
+    );
+    assert_eq!(
+        cs[0].jit_table_log2, child_log2,
+        "the table reservation survived"
+    );
+
+    // A child with NO Jit cap writes the presence byte 0 (elided): its state still round-trips.
+    let mut host2 = Host::new();
+    host2.set_frozen_nested(vec![FrozenNested {
+        parent_task: 0,
+        slot: 0,
+        carve_off: 0,
+        size_log2: 12,
+        entry: 0,
+        module_digest: None,
+        completed_result: None,
+    }]);
+    host2.set_frozen_child_state(vec![FrozenChildState {
+        parent_task: 0,
+        slot: 0,
+        svc_queue: Vec::new(),
+        svc_results: Vec::new(),
+        svc_next_ticket: 0,
+        handles: Vec::new(),
+        jit_tables: Vec::new(),
+        jit_table_log2: 0,
+    }]);
+    let art2 = freeze(&module, &vec![0u8; WINDOW], &host2).expect("freeze plain child");
+    let mut thost2 = Host::new();
+    restore(&art2, &module, &mut thost2).expect("restore plain child");
+    assert!(
+        thost2.frozen_child_state()[0].jit_tables.is_empty(),
+        "a JIT-free child restores an empty table"
+    );
+}
