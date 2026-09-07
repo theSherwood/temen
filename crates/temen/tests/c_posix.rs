@@ -1161,6 +1161,138 @@ int main(void) {{
     }
 }
 
+/// #1146 (deeper) — **the same interactive-stdin `^C` on both scheduler drivers** (invariant 14: the
+/// tree-walker's `Blocked::CapRead` stdin park, carried to the cooperative pump and `drive_parallel`).
+/// A blocking `Stream{In}` read was `unreachable!` on both scheduler drivers. Now the coop pump parks
+/// it as `BlockedStdin` — blocking on the #1122 doorbell while all-parked, re-admitted by the signal
+/// sweep — and the parallel driver polls it, breaking on the interrupt; on both, the rewound read then
+/// completes `-EINTR` at the stdin park site in `resume` (the leg the pump alone could not provide —
+/// without it the re-run would silently re-park). Same guest + embedder "terminal" as the tree-walker
+/// witness above; `rc=42` on each driver.
+#[test]
+fn c_a_ctrl_c_interrupts_a_blocked_interactive_stdin_read_on_the_scheduler_drivers() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    // The granted stdin handle is deterministic (the first grant on a fresh Host), so one source
+    // serves every leg; each leg asserts its own grant matches.
+    let stdin_h = Host::new().grant_stream(temen_interp::StreamRole::In);
+    let src = format!(
+        r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_sigaltstack(int cap, long sp, long size);
+long __px_write(int cap, long fd, long buf, long len);
+long __vm_read(int fd, void *buf, long len);
+static char sigstk[16384];
+static volatile long fired;
+static void handler(int sig) {{ fired = sig; }}
+int main(void) {{
+  __px_signal(0, 2, (long)handler);
+  __px_sigaltstack(0, (long)sigstk, 16384);
+  __px_write(0, 1, (long)sigstk, 1);   /* readiness byte: the terminal may open fire */
+  char b[8];
+  long n = __vm_read({stdin_h}, b, 8); /* the PROMPT: interactive stdin, no data -> PARKS */
+  long i = 0;
+  while (!fired) {{ i = i + 1; if (i > 100000000) return -1; }}  /* handler landing window */
+  if (n == -4) return 40 + fired;      /* 42: -EINTR and the SIGINT handler ran */
+  return (int)n;
+}}
+"#
+    );
+    let ir = c_to_ir(&src);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    // A fresh host per leg: interactive stdin granted FIRST (same handle every time), the
+    // personality after, the doorbell armed so the all-parked coop run BLOCKS for the `^C` instead
+    // of faulting as a deadlock, then the shim bound.
+    let build = |ih: &mut Host| -> Posix {
+        let h = ih.grant_stream(temen_interp::StreamRole::In);
+        assert_eq!(h, stdin_h, "deterministic stdin grant");
+        ih.stdin_block = true;
+        let (posix, px) = setup(ih, win);
+        ih.arm_external_wake();
+        bind_shim(&raw, ih, px);
+        posix
+    };
+    // The embedder "terminal": hold fire until the guest's readiness byte, then raise SIGINT until
+    // the run ends (#796 — a pre-handler ^C is fatal).
+    let spawn_terminal = |posix: Posix, done: std::sync::Arc<AtomicBool>| {
+        std::thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) && posix.stdout().is_empty() {
+                std::thread::yield_now();
+            }
+            while !done.load(Ordering::Relaxed) {
+                posix.raise_signal(2);
+                std::thread::yield_now();
+            }
+        })
+    };
+
+    // ▶ Cooperative driver: park (`BlockedStdin`) → bell-block → sweep-interrupt → `-EINTR` re-run.
+    {
+        let mut ih = Host::new();
+        let posix = build(&mut ih);
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let terminal = spawn_terminal(posix.clone(), std::sync::Arc::clone(&done));
+        let mut fuel = 200_000_000u64;
+        let ran =
+            temen_interp::bytecode::compile_and_run_with_host(&raw, 0, &[], &mut fuel, &mut ih)
+                .expect("the bytecode engine compiles this module (no declining op)");
+        done.store(true, Ordering::Relaxed);
+        terminal.join().expect("terminal thread");
+        match ran {
+            Ok(v) => assert_eq!(
+                v,
+                vec![Value::I32(42)],
+                "coop: the ^C completed the parked interactive stdin read with -EINTR and ran the handler"
+            ),
+            Err(e) => panic!("coop bytecode trapped: {e:?}\n{ir}"),
+        }
+    }
+
+    // ▶ Parallel driver: the stdin poll loop breaks on the interrupt; the re-run `-EINTR`s.
+    {
+        let mut ih = Host::new();
+        let posix = build(&mut ih);
+        let done = std::sync::Arc::new(AtomicBool::new(false));
+        let terminal = spawn_terminal(posix.clone(), std::sync::Arc::clone(&done));
+        let layout = std::alloc::Layout::from_size_align(win as usize, 8).unwrap();
+        // SAFETY: non-zero layout; the buffer is `win` valid 8-aligned bytes owned here, used only
+        // as this run's window until freed below, after the region (and every vCPU borrow) is dropped.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!base.is_null());
+        // SAFETY: `base` is `win` valid 8-aligned bytes, exclusively this window's, freed only after.
+        let back = std::sync::Arc::new(unsafe { temen_interp::Region::shared(base, win) });
+        let mut fuel = 200_000_000u64;
+        let ran = temen_interp::bytecode::compile_and_run_capture_over_parallel_with_host(
+            &raw,
+            0,
+            &[],
+            &mut fuel,
+            &[],
+            std::sync::Arc::clone(&back),
+            &mut ih,
+        )
+        .expect("the bytecode engine compiles this module (no declining op)");
+        drop(back);
+        // SAFETY: same layout; the region and all borrows of `base` are gone (the scope joined all vCPUs).
+        unsafe { std::alloc::dealloc(base, layout) };
+        done.store(true, Ordering::Relaxed);
+        terminal.join().expect("terminal thread");
+        match ran.0 {
+            Ok(v) => assert_eq!(
+                v,
+                vec![Value::I32(42)],
+                "parallel: the ^C completed the parked interactive stdin read with -EINTR and ran the handler"
+            ),
+            Err(e) => panic!("bytecode-parallel trapped: {e:?}\n{ir}"),
+        }
+    }
+}
+
 /// #799 — **the two-world merge, witnessed in one program**: a PERSONALITY-ONLY guest (no
 /// manager, no offers, no powerbox topology — the exact link shape bash gets) runs return-twice
 /// `fork()` and a blocking `waitpid()` through nothing but named personality imports. The fork

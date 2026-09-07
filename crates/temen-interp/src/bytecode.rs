@@ -10271,6 +10271,15 @@ enum TaskState {
     BlockedPipeWrite {
         pipe: u32,
     },
+    /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
+    /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]). The read op was rewound; the
+    /// settle scan re-admits when the (root-host) stdin buffer has bytes (`stdin_ready`), and the
+    /// all-parked signal sweep interrupts it like a pipe park (the rewound read completes `-EINTR`).
+    /// The cooperative analogue of the tree-walker's `Blocked::CapRead` stdin park. Note: `push_stdin`
+    /// takes `&mut Host`, which the run exclusively borrows, so no *concurrent* data feed can reach a
+    /// coop stdin park today — the only live wake is the signal interrupt; the readiness re-admit is
+    /// the correct contract kept for symmetry (and a future shared-Host feed), not a reachable path.
+    BlockedStdin,
     /// I48 — parked in a blocking `cont.resume.block` on fiber `fiber` (event-parked, not yet woken).
     /// The resumer's cursor was rewound to the resume op; when `fiber` is woken (idle-timer, notify,
     /// or the cap-completion drain) this task is marked `Runnable` and re-executes the resume, which
@@ -10824,6 +10833,12 @@ impl CoopSched {
                             Some(k) => extra_envs[k].host.lock_unpoisoned().pipe_write_ready(*pipe),
                             None => host.pipe_write_ready(*pipe),
                         },
+                        // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
+                        // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
+                        TaskState::BlockedStdin => match t.env {
+                            Some(k) => extra_envs[k].host.lock_unpoisoned().stdin_ready(),
+                            None => host.stdin_ready(),
+                        },
                         _ => return None,
                     };
                     ready.then_some(ci)
@@ -10971,10 +10986,13 @@ impl CoopSched {
                         // waiters). The caught handler itself is delivered at that task's next safepoint.
                         let mut woke = false;
                         for t in tasks.iter_mut() {
+                            // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
+                            // blocking-I/O parks whose rewound op completes `-EINTR` on a signal.
                             let is_pipe = matches!(
                                 t.state,
                                 TaskState::BlockedPipeRead { .. }
                                     | TaskState::BlockedPipeWrite { .. }
+                                    | TaskState::BlockedStdin
                             );
                             let is_reap =
                                 matches!(t.state, TaskState::BlockedReapPersonality { .. });
@@ -11041,6 +11059,11 @@ impl CoopSched {
                                 t.state,
                                 TaskState::BlockedPipeRead { .. }
                                     | TaskState::BlockedPipeWrite { .. }
+                                    // #1146 (deeper) — a blocking stdin park is externally wakeable
+                                    // too (an embedder signal rings the bell); without this an
+                                    // all-parked stdin run would fault as a deadlock instead of
+                                    // blocking for the `^C`.
+                                    | TaskState::BlockedStdin
                             )
                         });
                         match host.external_wake().filter(|_| external) {
@@ -11143,10 +11166,12 @@ impl CoopSched {
                     *pending_tierup = Some((ti, dst, results));
                     return Ok(CoopStep::TierUp { func, argv, mapped });
                 }
-                // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
-                // a scheduler task — same rationale as tier-up above.
+                // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
+                // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
+                // interrupts it (the re-run completes `-EINTR`), exactly like a pipe park. Invariant 14:
+                // the tree-walker's stdin park, carried to the cooperative driver.
                 Ok(VcpuStop::StdinPark) => {
-                    unreachable!("blocking stdin not enabled on the scheduler driver")
+                    tasks[ti].state = TaskState::BlockedStdin;
                 }
                 // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
                 // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
@@ -13439,9 +13464,24 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
             Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
-            // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session).
+            // #1146 (deeper) — blocking `Stream{In}` read on an exhausted stdin (the op was rewound):
+            // block this OS thread until bytes arrive, a default-action TERMINATE flips `term_flag`
+            // (the re-run then dies at its per-op safepoint — invariant 14's terminate axis), or a
+            // deliverable non-`SA_RESTART` signal interrupts it (latch `set_sig_interrupt` and break so
+            // the re-run completes `-EINTR` at the stdin park site in `resume`). The stdin twin of the
+            // pipe poll below — each blocked OS thread observes its own interrupt, no central sweep.
             Ok(VcpuStop::StdinPark) => {
-                unreachable!("blocking stdin not enabled on the native driver")
+                let term_flag = host.lock_unpoisoned().term_flag.clone();
+                while !host.lock_unpoisoned().stdin_ready() {
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    if host.lock_unpoisoned().park_interrupted() {
+                        host.lock_unpoisoned().set_sig_interrupt();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
             }
             Ok(VcpuStop::Spawn {
                 func,
@@ -15283,6 +15323,26 @@ impl Vm {
                         && eff_op == 0
                         && host.with(|p| p.take_stdin_parked())
                     {
+                        // #1146 (deeper) — the stdin park's EINTR leg. The scheduler drivers' interrupt
+                        // paths (the cooperative all-parked sweep / the parallel poll break) latch
+                        // `set_sig_interrupt` and re-admit this task; the rewound read re-executes and
+                        // lands HERE. Without this leg the re-run would re-park unconditionally and the
+                        // latched interrupt would be silently dropped (a livelock, not a visible hang) —
+                        // the EINTR completion for a stdin park lives in `resume`, not only in the pump.
+                        // Mirror the pipe park site below: drain the transient flag unconditionally (so a
+                        // stale interrupt can never leak into a later read), and on a deliverable
+                        // non-`SA_RESTART` signal — the latched flag, or one already pending at the park
+                        // insert (the pre-park race) — complete `-EINTR` in `dst` and advance instead of
+                        // parking; the caught handler is delivered at the next safepoint. `SA_RESTART`
+                        // leaves it to re-park (data resumes it).
+                        let sig_flag = host.with(|p| p.take_sig_interrupt());
+                        let interrupted = (sig_flag && !host.with(|p| p.signal_restart()))
+                            || host.with(|p| p.park_interrupted());
+                        if interrupted {
+                            self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
