@@ -734,7 +734,7 @@ unsafe fn serve_native(
 
 /// The native (Cranelift) half of the guest-driven `Jit` capability (DESIGN.md §22), reached
 /// from [`cap_thunk`]'s iface-11 intercept. Op semantics — including every fail-closed path —
-/// mirror the interpreter reference (`temen-interp`'s `Binding::JitDomain` dispatch arm + its
+/// mirror the interpreter reference (`temen-interp`'s `Binding::JitTable` dispatch arm + its
 /// eval-loop `invoke`) exactly, so the two backends agree on results, errnos, and traps:
 /// - op 0 `compile(ptr, len)`: borrow the blob, run the shared `Host::jit_compile` (the
 ///   injected validator gate), then **additionally** compile the unit into the live

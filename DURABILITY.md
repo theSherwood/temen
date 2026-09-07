@@ -173,11 +173,11 @@ so a durable domain **admits** the (instrumented) unit instead of refusing (`tem
 runs no pass; the embedder-injected validator does, keeping `temen-durable` out of the TCB). A
 unit outside the strict transform's scope (a guest-memory suspend point) fails closed. Pinned by
 `crates/temen/tests/durable_guest_jit.rs` (admit-vs-refuse gate; end-to-end NORMAL compile+invoke ≡
-non-durable). **Persisting the `JitCode`/`JitDomain` handles across a snapshot now lands (Slice 2).**
+non-durable). **Persisting the `JitCode`/`JitTable` handles across a snapshot now lands (Slice 2).**
 A `Jit` domain's out-of-line unit state — each unit's already-instrumented+verified IR and the
 compile quotas — rides a new snapshot **Section 5** (`TAG_JIT`, temen-snapshot format v16;
-`Host::capture_durable_jit`), and the handle table's `JitDomain { idx }` / `JitCode { domain, unit }`
-bindings become durable (`DurableBinding`), re-pinned into the positionally-rebuilt `jit_domains` on
+`Host::capture_durable_jit`), and the handle table's `JitTable { idx }` / `JitCode { domain, unit }`
+bindings become durable (`DurableBinding`), re-pinned into the positionally-rebuilt `jit_tables` on
 thaw. Restore **re-decodes and re-verifies** each unit (the artifact is untrusted, so its funcs must
 clear the verifier again — the deserialization-boundary re-check, and a forged handle index is
 bounds-rejected fail-closed), then an interpreter run invokes the reconstructed unit directly. So a
@@ -859,7 +859,7 @@ construction. What's stored:
   bit-identically on thaw from the same module, and only the runtime mutation needs capturing.
   That mutation is B2 `install` of guest-JIT units. **Install-durability (§12.5) now captures it:**
   the occupancy — `(slot, unit)` per installed unit, plus the table reservation `table_log2` — is
-  recorded on the domain (`JitDomainState.installed`, not the per-run table), rides Section 5 beside
+  recorded on the domain (`JitTableState.installed`, not the per-run table), rides Section 5 beside
   the units, and is **re-applied** when a run builds its table (`DomainTable::install_at` at run
   entry; the native tier via `temen_run::reconstruct_jit_units` → `CompiledModule::install_at`), so a
   `call.dyn` through an installed slot resolves after a freeze/thaw. The identity slots stay a
@@ -879,7 +879,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Exit` / `Clock` / `Memory` / `Yielder` | — | `grant_exit`/`grant_clock`/`grant_memory`/`grant_yielder` |
 | `AddressSpace { base, size }` | base, size | `grant_address_space` |
 | `Instantiator { base, size }` | base, size | `grant_instantiator` |
-| `JitDomain { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
+| `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
@@ -887,7 +887,7 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`SharedRegion(u32)` (R4), `Module(u32)`, `Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitDomain`/`JitCode` handles were here until
+`SharedRegion(u32)` (R4), `Module(u32)`, `Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is

@@ -11,7 +11,10 @@
 
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
-use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
+use temen_jit::{
+    compile_and_run_capture_reserved_with_host_durable,
+    compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome,
+};
 
 fn grant_hooks() -> GrantChildHooks {
     GrantChildHooks {
@@ -200,17 +203,21 @@ fn a_durable_domain_refuses_a_detached_spawn_on_both_backends() {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
         let r = if jit {
+            // The native tier learns durability from the run entry (`cm.durable` → the nursery's
+            // flag), not from the host, so the durable run entry is the one to use. It installs no
+            // grant hooks: a thunk that reached the hook lookup would trap `CapFault`, so a `-22`
+            // here can only come from the durable gate that precedes it.
             let args = [h[0] as i64, h[1] as i64, h[2] as i64];
-            let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
+            let (jo, _, _) = compile_and_run_capture_reserved_with_host_durable(
                 &p,
                 0,
                 &args,
                 &[],
+                &[],
+                &[],
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 temen_run::cap_thunk,
                 &mut host as *mut Host as *mut c_void,
-                Some(temen_run::module_resolver),
-                Some(grant_hooks()),
             )
             .expect("jit run");
             match jo {
