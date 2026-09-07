@@ -8845,8 +8845,10 @@ pub extern "C" fn temen_onramp_jit_close() {
 /// The live single-shot JIT run. `None` until [`temen_onramp_jit_run_open`]; single-threaded wasm.
 static mut JIT_RUN: Option<JitOnrampRun> = None;
 
-/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap (the emitted run can't
-/// grow it, so it must be sized up front).
+/// The single-shot run's fixed window log2 — 32 MiB, holding Lua/SQLite's heap. The **single-shot**
+/// tier still sizes this up front: its backing is fixed, so a `vm_map` past it is admitted by the
+/// reservation and then declined at the first emitted access (#1153, invariant 9). The cooperative
+/// tier uses this only as its window's *initial* size — there the backing grows (#1312).
 const JIT_RUN_WIN_LOG2: u8 = 25;
 
 /// Open a **single-shot wasm-JIT run** over the on-ramp module at `[mod_ptr, mod_len)` (Lua/SQLite/hello):
@@ -12491,8 +12493,14 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
 
 /// Open a cooperative tier-up run over the guest module `[mod_ptr, mod_len)` (stdin optional,
 /// `shared` = SharedArrayBuffer memory). Returns `0`/`STATUS_OK` on success, a negative `STATUS_*`
-/// on refusal (decode error, an op outside the engine subset, or nothing for the emitted tier to
-/// run). Idempotent open: closes any prior run first.
+/// on refusal (decode error, an op outside the engine subset, nothing for the emitted tier to run,
+/// or a window the host allocator refused). Idempotent open: closes any prior run first.
+///
+/// #1312: the run window opens at `max(JIT_RUN_WIN_LOG2, declared)` but is **growable** and reserved
+/// at the oracle's `DEFAULT_RESERVED_LOG2`, so a guest allocator's `vm_map` past the declared window
+/// commits real memory instead of `-EINVAL`ing. Growing reallocates and can move the window, so the
+/// driver must re-read [`temen_coop_win_ptr`] / [`temen_coop_tierup_win_ptr`] after every bounce and
+/// publish the base to each emitted instance's `"win"` global.
 #[no_mangle]
 pub extern "C" fn temen_coop_open(
     mod_ptr: *const u8,

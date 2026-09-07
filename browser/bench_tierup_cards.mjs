@@ -88,6 +88,10 @@ const cards = [
     'WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt LIMIT 50000) SELECT sum(x%7) FROM cnt;\n'],
   ['tcl', 'web/assets/tcl_repl.temen',
     'set s 0\nfor {set i 1} {$i <= 20000} {incr i} { set s [expr {$s + $i % 7}] }\nputs $s\n'],
+  // #1312: a guest whose allocator `vm_map`s past the 32 MiB coop run window. Before the growable
+  // backing this card could not run on the emitted tier at all — the map was refused and the store
+  // through it faulted, so the row read MISMATCH with 0 tier-ups. Here to keep that visible.
+  ['coop-grow', 'tests/fixtures/coop_grow_past_window.temen', ''],
 ];
 
 console.log(`cdylib: ${wasmPath}`);

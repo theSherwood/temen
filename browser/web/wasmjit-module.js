@@ -286,7 +286,13 @@ const tierupJitRes = (ret, tc) => tc === 0 || tc === 1 ? BigInt(ret)
 // single-vCPU or genuinely threaded alike. It wraps the `temen_coop_*` cdylib (`CoopRun`), whose
 // scheduler multiplexes every vCPU of the run — the root and its `thread.spawn` descendants — on
 // this one wasm thread and services concurrency, fibers, and §22 install/invoke **internally**, so
-// only tier-up, a §22 `Jit.invoke` of an emitted unit, and the run's end reach here. The per-event
+// only tier-up, a §22 `Jit.invoke` of an emitted unit, and the run's end reach here.
+//
+// #1312: this run's window **grows** — a guest allocator's `vm_map` past the declared window commits
+// real memory rather than being refused — and growing it reallocates, so the window's base can move
+// mid-run. Nothing here may cache the base or the length: `eventWin()` reads the base per event, and
+// the `call_interp` bounce below republishes it to every live instance's `"win"` global (the emitted
+// code reloads its `win` from that global after each call). The per-event
 // contract (worker.js's PAR_TIERUP shape): sync the B2 shared driver table (`call_indirect` tiers
 // up, #880) when its generation advances, re-arm `"fuel"`, write the event's `"mapped"` sync (#717;
 // a paged run also points `"pagestate"` at the live table, #1009), call `f{func}(win, env, ...args)`
@@ -304,10 +310,17 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   const mappedGlobals = []; // every live instance's "mapped" — the post-bounce fan-out set (#717)
   const fuelGlobals = [];
   const pagestateGlobals = []; // #1009 paged: the "pagestate" base globals (only a paged main module has one)
+  // #1312: every live instance's "win" — the live window BASE. The coop run's window backing grows
+  // on a guest `vm_map`, and growing it reallocates, so the base can move mid-run. The emitted entry
+  // publishes its own `win` argument here, so this set only has to be written when the base actually
+  // changed: after a bounce that may have grown the window (below). Every emitted function reloads
+  // its `win` local from this global after each call, so the write takes effect immediately.
+  const winGlobals = [];
   const registerGlobals = (exports) => {
     if (exports.mapped) mappedGlobals.push(exports.mapped);
     if (exports.fuel) fuelGlobals.push(exports.fuel);
     if (exports.pagestate) pagestateGlobals.push(exports.pagestate);
+    if (exports.win) winGlobals.push(exports.win);
   };
   // #846/#880 on the cooperative path — the shared driver table (Model B2): the main module and every
   // §22 unit `call_indirect` through it, and the driver populates its slots from the engine's mirror at
@@ -335,6 +348,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         const now = ex.temen_coop_mapped_now();
         for (const g of mappedGlobals) g.value = now;
       }
+      // #1312: the bounce ran interpreted guest code, which may have `vm_map`-grown the window. A
+      // grow reallocates the backing and can MOVE it, so publish the current base to every live
+      // instance — the emitted frame reloads its `win` from this global on return from the bounce.
+      // Read it fresh here (never cached): this is the one point in the run where it can change.
+      const base = Number(ex.temen_coop_tierup_win_ptr());
+      for (const g of winGlobals) g.value = base;
       if (rc !== 0) throw new Error('bounce trap'); // unwind to the deliver below
     },
   } });
