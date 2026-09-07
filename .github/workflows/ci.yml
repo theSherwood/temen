@@ -906,6 +906,11 @@ jobs:
           # A detached child on the wasm-JIT tier (#1285): its own WebAssembly.Memory, argv payload, attest,
           # vm_map growth of the child memory — byte-identical to the interpreter oracle.
           node browser-detached-jit-test.mjs
+          # #1312 the cooperative window grows: a guest whose allocator `vm_map`s past the 32 MiB coop
+          # run window runs on the emitted tier through the REAL JS driver (the native wasmi
+          # differential plays the driver's role; this is the shipped `driveCoopTierupRun`, the only
+          # place the post-bounce `"win"` fan-out over a relocating backing is exercised).
+          node browser-coop-grow-test.mjs
           # A guest-issued op 15 on the op-13 loop (#1286): the driver's child is minted its own Memory by
           # the servicer and driven emitted; args payload, attest, growth.
           node browser-op13jit-detached-test.mjs
