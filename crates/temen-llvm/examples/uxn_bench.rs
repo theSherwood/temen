@@ -101,8 +101,8 @@ fn main() {
     };
     println!("uxn bench — bench.tal, {frames} frames, 512 sprites at 320x240 (frames/s; ratio = native/this)");
     println!(
-        "{:<20} {:>10} {:>9} {:>8}   {}",
-        "engine", "seconds", "fps", "ratio", "last-frame hash"
+        "{:<20} {:>10} {:>9} {:>8}   last-frame hash",
+        "engine", "seconds", "fps", "ratio"
     );
     let native_fps = frames as f64 / native_secs;
     println!(
