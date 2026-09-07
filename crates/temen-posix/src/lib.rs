@@ -734,6 +734,13 @@ impl Terminal {
 /// Open-file descriptions ([`OpenFile`]) nest innermost: World → Proc → description.
 struct World {
     stdout: Vec<u8>,
+    /// The **interleaved terminal transcript** (the interactive differential harness, #802 rung 3):
+    /// when armed ([`Posix::enable_transcript`]) every byte that would reach a real terminal — fd-1
+    /// writes, fd-2 writes (bash's prompt), and the line discipline's echo — is ALSO appended here,
+    /// in arrival order, so a `bash -i` session can be compared byte-for-byte with native bash
+    /// driven under a pty (whose master stream is exactly this interleaving). `None` = off (the
+    /// separate `stdout`/`stderr` captures are unchanged either way).
+    transcript: Option<Vec<u8>>,
     /// When set, fd-1 writes go **here** instead of [`World::stdout`], and [`Posix::stdout`] reads it
     /// back. This unifies the shell's own output with a spawned child's: the embedder points it at the
     /// `Host`'s shared stdout sink (`Host::shared_stdout`), the same buffer a re-granted `Stream` writes
@@ -1083,6 +1090,27 @@ impl Posix {
             .clone()
     }
 
+    /// Arm the **interleaved terminal transcript** ([`World::transcript`]): from now on fd-1 writes,
+    /// fd-2 writes, and the terminal's echo are appended to one buffer in arrival order — what a pty
+    /// master would carry. Read it back with [`Posix::transcript`]. Idempotent; the separate
+    /// `stdout`/`stderr` captures keep working unchanged.
+    pub fn enable_transcript(&self) {
+        let mut w = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        if w.transcript.is_none() {
+            w.transcript = Some(Vec::new());
+        }
+    }
+    /// The interleaved terminal transcript so far (empty when [`Posix::enable_transcript`] was never
+    /// called).
+    pub fn transcript(&self) -> Vec<u8> {
+        self.world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transcript
+            .clone()
+            .unwrap_or_default()
+    }
+
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
         self.world
@@ -1275,6 +1303,9 @@ impl Posix {
                         .unwrap_or_else(|e| e.into_inner())
                         .extend_from_slice(&out),
                     None => w.stdout.extend_from_slice(&out),
+                }
+                if let Some(t) = w.transcript.as_mut() {
+                    t.extend_from_slice(&out);
                 }
             }
             let pipe = term.input_pipe;
@@ -2149,6 +2180,7 @@ fn net_handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
 fn new_world(stdin: Vec<u8>) -> World {
     World {
         stdout: Vec::new(),
+        transcript: None,
         stdout_sink: None,
         stderr: Vec::new(),
         stdin,
@@ -2706,6 +2738,12 @@ impl Ctx<'_> {
         // proceeds until slice 2's stop). Unconditional pending TOSTOP: termios lands with #797.
         if matches!(sink, Sink::Stdout | Sink::Stderr) {
             self.tty_background_check(SIGTTOU);
+        }
+        // The interleaved transcript (when armed) sees terminal-bound bytes in arrival order.
+        if matches!(sink, Sink::Stdout | Sink::Stderr) {
+            if let Some(t) = self.w.transcript.as_mut() {
+                t.extend_from_slice(data);
+            }
         }
         match sink {
             Sink::Stdout => match &self.w.stdout_sink {
