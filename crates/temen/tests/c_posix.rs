@@ -6278,3 +6278,73 @@ fn c_a_sigkill_terminates_a_stopped_child_and_waitpid_reports_the_signal() {
          reaps WIFSIGNALED — matching the oracle"
     );
 }
+
+/// #1122 route (a) — the **cooperative suspend/resume session**: with `set_suspend_on_idle` the pump
+/// hands an all-parked, externally-wakeable settle back to the embedder as `CoopEvent::Idle` — no
+/// doorbell armed, no second thread, the whole scheduler state retained inside the `CoopRun` — and a
+/// terminal feed between pumps re-admits the parked reader on the next pump's settle. A canonical
+/// partial line (no newline) deposits nothing, so the run idles again; the completed line wakes the
+/// read; `^D` gives the second read its EOF and the guest finishes. The `bash -i` session shape for a
+/// host without threads or SharedArrayBuffer.
+#[test]
+fn c_terminal_coop_session_suspends_on_idle_and_resumes_on_feed() {
+    use temen_interp::bytecode::{CoopEvent, CoopRun};
+    let src = format!(
+        "{PIPE_SHIM}\n\
+static char b[8];\n\
+int main(void) {{\n\
+  long n = read(0, b, 8);             /* parks: the session goes Idle */\n\
+  if (n != 3) return (int)(100 + n);  /* \"hi\\n\" */\n\
+  long m = read(0, b, 8);             /* parks again: Idle */\n\
+  if (m != 0) return (int)(200 + m);  /* ^D: EOF */\n\
+  return 42;\n\
+}}\n"
+    );
+    let ir = c_to_ir(&src);
+    let raw = parse_module_raw(&ir).unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n{ir}"));
+    let mut ih = Host::new();
+    let (posix, px) = setup(&mut ih, win);
+    posix.enable_terminal(&mut ih);
+    // Deliberately NO `arm_external_wake`: the session shape needs no doorbell.
+    bind_shim(&raw, &mut ih, px);
+    let mut run = CoopRun::new(&raw, 0, &[], 200_000_000, ih, None)
+        .expect("the bytecode engine compiles this module")
+        .expect("the run schedules");
+    run.set_suspend_on_idle(true);
+    assert!(
+        matches!(run.run(), CoopEvent::Idle),
+        "the first terminal read parks and the pump yields Idle"
+    );
+    posix.feed_terminal(b"h"); // canonical mode: buffered, nothing deposited
+    assert!(
+        matches!(run.run(), CoopEvent::Idle),
+        "a partial line deposits nothing — the re-settle finds the reader still parked, Idle again"
+    );
+    posix.feed_terminal(b"i\n"); // the completed line is deposited (and echoed)
+    assert!(
+        matches!(run.run(), CoopEvent::Idle),
+        "the line was read (3 bytes); the second read parks — Idle"
+    );
+    posix.feed_terminal(b"\x04"); // ^D on an empty line: one-shot EOF
+    match run.run() {
+        CoopEvent::Done(v) => assert_eq!(
+            v,
+            vec![Value::I32(42)],
+            "both reads completed across the suspensions"
+        ),
+        CoopEvent::Idle => panic!("still idle after ^D"),
+        CoopEvent::Trapped(t) => panic!("trapped: {t:?}"),
+        _ => panic!("unexpected tier-up/invoke event on a plain run"),
+    }
+    assert_eq!(
+        posix.stdout(),
+        b"hi\n",
+        "the line discipline echoed the typed line into the stdout sink at feed time"
+    );
+}

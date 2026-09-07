@@ -7982,6 +7982,184 @@ pub extern "C" fn temen_bash_exited() -> i32 {
         .unwrap_or(-1)
 }
 
+// === #1122 route (a) — the cooperative SUSPEND/RESUME bash session =============================
+// The interactive card's other driver: no session Worker blocked on a doorbell, no cross-Worker
+// wake — the run is a resumable [`bytecode::CoopRun`] this thread PUMPS. Whenever every task is
+// parked on the terminal read, `temen_bash_coop_pump` returns IDLE (the scheduler state stays inside
+// the run), the embedder feeds keystrokes (`temen_bash_coop_feed` → the #797 feed-time line
+// discipline) and pumps again; the loop-top settle re-admits the reader. Nothing here needs threads
+// or a SharedArrayBuffer — the playground hosts it on a Worker only to keep the page responsive
+// during a long-running command (the owner's route-(a) note), which is a robustness layer, not a
+// dependency. The deterministic cooperative schedule is unchanged.
+
+struct BashCoopSession {
+    run: bytecode::CoopRun,
+    posix: temen_posix::Posix,
+    /// How much of the interleaved terminal transcript the embedder has drained.
+    tx_off: usize,
+    /// `None` while the session runs; the exit code once it finished (`-2` = engine trap).
+    exit: Option<i32>,
+}
+static mut BASH_COOP: Option<BashCoopSession> = None;
+
+/// `temen_bash_coop_pump` results.
+pub const BASH_COOP_IDLE: i32 = 0;
+pub const BASH_COOP_DONE: i32 = 1;
+pub const BASH_COOP_TRAP: i32 = 2;
+
+/// Open an interactive `bash -i` session on the suspend/resume driver over `[mod_ptr, mod_len)` (the
+/// same cached decode+compile as `temen_bash_session`) with the `/bin` registry blob
+/// `[bins_ptr, bins_len)`. Returns `0`, or `-1` for a module that doesn't decode / isn't bash-shaped,
+/// `-2` if scheduling trapped. Idempotent: closes any prior session. Nothing runs yet — call
+/// `temen_bash_coop_pump` to reach the first prompt.
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_open(
+    mod_ptr: *const u8,
+    mod_len: usize,
+    bins_ptr: *const u8,
+    bins_len: usize,
+) -> i32 {
+    par_install_panic_capture();
+    temen_bash_coop_close();
+    let slice = |p: *const u8, n: usize| -> &'static [u8] {
+        if p.is_null() || n == 0 {
+            &[]
+        } else {
+            // SAFETY: the host guarantees the range is a live `temen_alloc`ation it just filled.
+            unsafe { core::slice::from_raw_parts(p, n) }
+        }
+    };
+    let Some((m, compiled)) = cached_bash_program(slice(mod_ptr, mod_len)) else {
+        return -1;
+    };
+    let owned = parse_shell_cmds(slice(bins_ptr, bins_len));
+    let bins: Vec<(&str, &temen_ir::Module, u8)> = owned
+        .iter()
+        .map(|(n, cm)| (n.as_str(), cm, cm.memory.map_or(0, |mc| mc.size_log2)))
+        .collect();
+    // `interactive`: the #797 terminal (and the doorbell, unused by this driver — the pump yields
+    // IDLE before it would ever sleep on the bell).
+    let Some((host, posix, init_mem)) = bash_host_build(m, &[b"bash", b"-i"], &[], &bins, true)
+    else {
+        return -1;
+    };
+    posix.enable_transcript();
+    let mut run = match bytecode::CoopRun::new_reserved_over_compiled(
+        m,
+        compiled,
+        0,
+        &[],
+        u64::MAX,
+        host,
+        None,
+        &init_mem,
+        BASH_RESERVED_LOG2,
+    ) {
+        Ok(r) => r,
+        Err(_) => return -2,
+    };
+    run.set_suspend_on_idle(true);
+    // SAFETY: single-threaded access to the session statics (one Worker owns this driver).
+    unsafe {
+        *core::ptr::addr_of_mut!(BASH_COOP) = Some(BashCoopSession {
+            run,
+            posix,
+            tx_off: 0,
+            exit: None,
+        });
+    }
+    0
+}
+
+/// Pump the session: run until every task is parked on terminal input (`BASH_COOP_IDLE` — feed and
+/// pump again), the shell exited (`BASH_COOP_DONE` — read the code with `temen_bash_coop_exit`), or
+/// the engine trapped (`BASH_COOP_TRAP`). `-1` with no live session.
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_pump() -> i32 {
+    // SAFETY: single-threaded access to the session statics.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(BASH_COOP)).as_mut() }) else {
+        return -1;
+    };
+    if s.exit.is_some() {
+        return BASH_COOP_DONE;
+    }
+    match s.run.run() {
+        bytecode::CoopEvent::Idle => BASH_COOP_IDLE,
+        bytecode::CoopEvent::Done(_) => {
+            s.exit = Some(0);
+            BASH_COOP_DONE
+        }
+        bytecode::CoopEvent::Trapped(Trap::Exit(code)) => {
+            s.exit = Some(code);
+            BASH_COOP_DONE
+        }
+        bytecode::CoopEvent::Trapped(_) => {
+            s.exit = Some(-2);
+            BASH_COOP_TRAP
+        }
+        // Tier-up / invoke surfacing is never enabled on a session (no eligibility set).
+        _ => {
+            s.exit = Some(-2);
+            BASH_COOP_TRAP
+        }
+    }
+}
+
+/// Deliver keystrokes into the session's terminal (the #797 feed-time line discipline: canonical
+/// editing, echo, `^C`/`^D`/`^Z`). Does not pump — call `temen_bash_coop_pump` after. A call with no
+/// live session is a no-op.
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_feed(ptr: *const u8, len: usize) {
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: the host guarantees the range is a live allocation it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) };
+    // SAFETY: single-threaded access to the session statics.
+    if let Some(s) = unsafe { (*core::ptr::addr_of_mut!(BASH_COOP)).as_ref() } {
+        s.posix.feed_terminal(bytes);
+    }
+}
+
+/// Drain the session's NEW interleaved terminal transcript bytes (prompt, echo, output in arrival
+/// order) into `[buf, cap)`; returns how many were copied. `0` = nothing new (or no live session).
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_drain(buf: *mut u8, cap: usize) -> usize {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    // SAFETY: single-threaded access to the session statics.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(BASH_COOP)).as_mut() }) else {
+        return 0;
+    };
+    let bytes = s.posix.transcript();
+    let fresh = &bytes[s.tx_off.min(bytes.len())..];
+    let n = fresh.len().min(cap);
+    // SAFETY: the host guarantees `[buf, cap)` is a live allocation owned by the caller.
+    unsafe { core::ptr::copy_nonoverlapping(fresh.as_ptr(), buf, n) };
+    s.tx_off += n;
+    n
+}
+
+/// The session's exit code once `temen_bash_coop_pump` returned `BASH_COOP_DONE`; `-1` while it runs
+/// (or with no session).
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_exit() -> i32 {
+    // SAFETY: single-threaded access to the session statics.
+    unsafe { (*core::ptr::addr_of_mut!(BASH_COOP)).as_ref() }
+        .and_then(|s| s.exit)
+        .unwrap_or(-1)
+}
+
+/// Tear the session down (idempotent).
+#[no_mangle]
+pub extern "C" fn temen_bash_coop_close() {
+    // SAFETY: single-threaded access to the session statics.
+    unsafe {
+        *core::ptr::addr_of_mut!(BASH_COOP) = None;
+    }
+}
+
 /// **In-browser link + run of a frontend-emitted program** (docs/TEMEN_BROWSER_PLAN.md option (b)):
 /// the live-editing path, language-agnostic. Given a **program** unit and a **library** unit —
 /// each either TEMEN-IR **text** or a **binary object** (`.temeno` bytes, the v9 object dialect;
@@ -12499,6 +12677,9 @@ pub extern "C" fn temen_coop_run() -> i32 {
         },
         bytecode::CoopEvent::Trapped(Trap::Exit(code)) => (STATUS_EXIT, 0, code, COOP_RUN_DONE),
         bytecode::CoopEvent::Trapped(_) => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
+        // Never surfaced here: the tier-up driver does not arm `set_suspend_on_idle` (#1122 route (a)
+        // is the bash coop session's driver, below). Fail closed rather than spin.
+        bytecode::CoopEvent::Idle => (STATUS_TRAP, 0, 0, COOP_RUN_TRAP),
     };
     s.value = value;
     // #816 item 4: a warm-coop eval ended — advance the warm session's heap high-water so the next

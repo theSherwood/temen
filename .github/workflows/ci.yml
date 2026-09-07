@@ -1059,6 +1059,11 @@ jobs:
           # pane is a terminal model — Backspace edits the composed line (`\b \b` rendered as an
           # erase), ArrowUp recalls the previous command, ^D exits. SKIPs when bash.temen is absent.
           node browser-bash-readline-test.mjs
+          # The cooperative SUSPEND/RESUME session card (#1122 route (a)): one Worker owns a resumable
+          # run, `temen_bash_coop_pump` returns idle at the prompt instead of blocking on a doorbell, keys
+          # are fed and the run pumped again — the interactive E2E's whole script (builtin, ^C, exec'd
+          # seq, ^Z/fg, ^D) on that driver. SKIPs when bash.temen is absent.
+          node browser-bash-coop-session-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs

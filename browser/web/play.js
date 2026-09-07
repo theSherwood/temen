@@ -1418,6 +1418,33 @@ type seq
       'Ctrl+D (or typing `exit`) ends the session. bash is GPLv3 and never committed — this ' +
       'card’s module is built at deploy (node build-bash-assets.mjs).',
   },
+  'bash -i (cooperative session)': {
+    kind: 'bash-i-coop',
+    jit: false,
+    url: './assets/bash.temen',
+    cmds: [
+      { name: '/bin/true', url: './assets/bin_true.temen' },
+      { name: '/bin/false', url: './assets/bin_false.temen' },
+      { name: '/bin/echo', url: './assets/bin_echo.temen' },
+      { name: '/bin/cat', url: './assets/bin_cat.temen' },
+      { name: '/bin/seq', url: './assets/bin_seq.temen' },
+      { name: '/bin/head', url: './assets/bin_head.temen' },
+      { name: '/bin/wc', url: './assets/bin_wc.temen' },
+      { name: '/bin/sort', url: './assets/bin_sort.temen' },
+      { name: '/bin/uniq', url: './assets/bin_uniq.temen' },
+      { name: '/bin/ls', url: './assets/bin_ls.temen' },
+      { name: '/bin/pwd', url: './assets/bin_pwd.temen' },
+      { name: '/bin/grep', url: './assets/bin_grep.temen' },
+      { name: '/bin/tr', url: './assets/bin_tr.temen' },
+    ],
+    mode: 'io',
+    desc: 'The same live `bash -i` session on the SUSPEND/RESUME driver (#1122 route (a)): instead of a ' +
+      'Worker blocked in the engine and woken across threads, one Worker owns a resumable run and ' +
+      'pumps it — whenever bash waits at the prompt the engine hands control back (idle), your ' +
+      'keystrokes are fed into the terminal, and the run resumes. No doorbell, no blocking, no ' +
+      'SharedArrayBuffer needed by the driver itself; the deterministic cooperative schedule is ' +
+      'unchanged. Same readline line editing, job control, and /bin as the card above.',
+  },
   'SQLite (:memory: — write & run SQL)': {
     kind: 'module',
     jit: true, // _start is wasm-JIT-emittable (proven byte-identical by browser-jit-module-test)
@@ -2057,9 +2084,13 @@ async function runBashInteractive(c) {
     });
     return w;
   };
-  const session = mk('session');
-  const control = mk('control');
-  c.bashWorkers = [session, control];
+  // #1122 route (a): the cooperative-session card runs ONE Worker in the `coop` role (it owns the
+  // resumable run: open, pump-to-idle, feed, pump…) and it doubles as the control side (keys in,
+  // transcript out). The threads card keeps its blocking session Worker + control Worker pair.
+  const coop = ex.kind === 'bash-i-coop';
+  const session = mk(coop ? 'coop' : 'session');
+  const control = coop ? session : mk('control');
+  c.bashWorkers = coop ? [session] : [session, control];
   // A minimal TERMINAL model for the output pane (readline rung): the session's bytes are a
   // terminal stream, not plain text — readline (running as `TERM=dumb`) erases with `\b \b`,
   // returns to column 0 with `\r`, and may emit CSI sequences a real terminal would consume.
@@ -3900,7 +3931,7 @@ async function runDemo(c) {
   if (ex.kind === 'nimc') return runNimc(c);
   if (ex.kind === 'shell') return runShell(c);
   if (ex.kind === 'bash') return runBash(c);
-  if (ex.kind === 'bash-i') return runBashInteractive(c);
+  if (ex.kind === 'bash-i' || ex.kind === 'bash-i-coop') return runBashInteractive(c);
   if (ex.kind === 'module') return runModule(c);
   return runText(c);
 }
@@ -4047,8 +4078,8 @@ function buildCard(name, ex) {
     }
   } else {
     section.appendChild(el('pre', 'note',
-      ex.kind === 'bash-i'
-        ? `Real GNU bash, interactive (${ex.url}). Click Run to start the session, then type at the prompt in the input below — Enter sends the line, Ctrl+C / Ctrl+D send the control keys. Stop tears the session down.`
+      ex.kind === 'bash-i' || ex.kind === 'bash-i-coop'
+        ? `Real GNU bash, interactive (${ex.url}). Click Run to start the session, then type at the prompt in the input below — every key goes to the terminal (readline line editing, arrows, Ctrl+C / Ctrl+D / Ctrl+Z). Stop tears the session down.`
         : ex.kind === 'reactor'
         ? `Pre-built on-ramp reactor module (${ex.url}). Click Run — the page calls tick() once per animation frame; the arrow keys steer it through the keyboard capability.`
         : ex.kind === 'selfhost'
@@ -4161,7 +4192,7 @@ function buildCard(name, ex) {
   // the session's line discipline; Ctrl+C / Ctrl+D send the raw control bytes. Wired by
   // `runBashInteractive` (disabled until a session is live).
   let term = null;
-  if (ex.kind === 'bash-i') {
+  if (ex.kind === 'bash-i' || ex.kind === 'bash-i-coop') {
     term = el('input', 'term-input');
     term.type = 'text';
     term.placeholder = 'type a command and press Enter (Ctrl+C / Ctrl+D work) — Run starts the session';

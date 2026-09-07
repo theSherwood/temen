@@ -3509,6 +3509,40 @@ pub enum Outcome {
 
 /// The result of running a program through the powerbox: how it ended, plus the bytes it wrote
 /// to stdout/stderr via the `Stream` capabilities.
+/// #1122 route (a) — one pump step of a [`CoopSession`].
+#[derive(Debug)]
+pub enum SessionStep {
+    /// Every task is parked on input only the embedder can supply (a terminal read): feed the
+    /// terminal and pump again. The run is live and its whole state retained in the session.
+    Idle,
+    /// The run finished — the guest's exit code or returned values.
+    Done(Outcome),
+}
+
+/// #1122 route (a) — a resumable cooperative bytecode run ([`Instance::open_coop_session`]): the
+/// embedder owns it and drives it with [`pump`](Self::pump) between input feeds.
+pub struct CoopSession {
+    run: temen_interp::bytecode::CoopRun,
+}
+
+impl CoopSession {
+    /// Run until the session idles on external input ([`SessionStep::Idle`]) or finishes
+    /// ([`SessionStep::Done`]); a fatal trap is the `Err` (§5 detect-and-kill).
+    pub fn pump(&mut self) -> Result<SessionStep, String> {
+        match self.run.run() {
+            temen_interp::bytecode::CoopEvent::Idle => Ok(SessionStep::Idle),
+            temen_interp::bytecode::CoopEvent::Done(v) => {
+                outcome_from_interp(Ok(v)).map(SessionStep::Done)
+            }
+            temen_interp::bytecode::CoopEvent::Trapped(t) => {
+                outcome_from_interp(Err(t)).map(SessionStep::Done)
+            }
+            // Tier-up / `Jit.invoke` surfacing is never enabled on a session (no eligibility set).
+            _ => Err("unexpected tier-up event on a cooperative session".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Run {
     pub outcome: Outcome,
@@ -5554,6 +5588,52 @@ impl Instance {
     /// §7 capability-name directory (F7); the guest reaches it at runtime via
     /// `self.resolve(name)` (`__vm_cap_resolve` from C) + `call.cap` (`__vm_host_call`) — no
     /// stash slot, no ABI change, no authority unless the embedder injects it.
+    /// #1122 route (a) — open a **cooperative suspend/resume session** on the bytecode engine: the
+    /// same host build as [`run_with_caps`](Self::run_with_caps) (powerbox, `extra_caps` by name,
+    /// stdin/quota/handoff), but the run is returned as a [`CoopSession`] the caller pumps. Whenever
+    /// every task is parked on something only the embedder can satisfy (a terminal read), `pump`
+    /// returns [`SessionStep::Idle`] instead of blocking a thread on the doorbell; the caller feeds
+    /// the terminal (`Posix::feed_terminal`) and pumps again. No second thread, no doorbell, the
+    /// deterministic cooperative schedule — the interactive-shell shape for a host without threads
+    /// or SharedArrayBuffer. `Err` if the module is outside the bytecode engine's subset (this
+    /// entry does not fall back to the tree-walker: a session needs the resumable driver).
+    pub fn open_coop_session(
+        &self,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+    ) -> Result<CoopSession, String> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let init_mem = config.init_mem()?;
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        host.set_handoff(config.handoff);
+        self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
+        let fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
+        let mut run = temen_interp::bytecode::CoopRun::new_reserved(
+            m,
+            0,
+            &[],
+            fuel,
+            host,
+            None,
+            init_mem.as_deref().unwrap_or(&[]),
+            temen_ir::DEFAULT_RESERVED_LOG2,
+        )
+        .ok_or_else(|| {
+            "module outside the bytecode engine's subset (no session driver)".to_string()
+        })?
+        .map_err(|t| format!("guest trapped while scheduling ({t:?})"))?;
+        run.set_suspend_on_idle(true);
+        Ok(CoopSession { run })
+    }
+
     pub fn run_with_caps(
         &self,
         backend: Backend,

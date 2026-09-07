@@ -87,6 +87,9 @@ fn coop_tierup_run(
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
             bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+            bytecode::CoopEvent::Idle => {
+                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
             bytecode::CoopEvent::JitInvoke { .. } => {
                 panic!("unexpected JitInvoke (no vm_jit guest here)")
             }
@@ -269,6 +272,9 @@ fn coop_tierup_bounce_matches_pure_interp() {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
             bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::Idle => {
+                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
             bytecode::CoopEvent::JitInvoke { .. } => {
                 panic!("unexpected JitInvoke (no vm_jit guest here)")
             }
@@ -516,6 +522,9 @@ fn coop_tierup_child_env_tasks_tier_up() {
             match run.run() {
                 bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
                 bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::Idle => {
+                    panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                }
                 bytecode::CoopEvent::JitInvoke { .. } => {
                     panic!("unexpected JitInvoke (no vm_jit guest here)")
                 }
@@ -660,6 +669,9 @@ block 0 (vx: i64) {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => break Ok(vals),
             bytecode::CoopEvent::Trapped(t) => break Err(t),
+            bytecode::CoopEvent::Idle => {
+                panic!("unexpected Idle (suspend_on_idle is never armed here)")
+            }
             bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
             bytecode::CoopEvent::TierUp { func, argv, .. } => {
                 assert_eq!(func, 2, "only the leaf is eligible");
@@ -902,6 +914,9 @@ fn coop_tierup_fork_twin_tiers_up_over_its_private_flat_window() {
                 match run.run() {
                     bytecode::CoopEvent::Done(vals) => break Ok(vals),
                     bytecode::CoopEvent::Trapped(t) => break Err(t),
+                    bytecode::CoopEvent::Idle => {
+                        panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                    }
                     bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
                     bytecode::CoopEvent::TierUp { func, argv, .. } => {
                         assert_eq!(func, 5, "only the leaf is eligible");
@@ -1022,6 +1037,9 @@ block 0 (vx: i64) {
             match run.run() {
                 bytecode::CoopEvent::Done(vals) => return (Ok(vals), tierups),
                 bytecode::CoopEvent::Trapped(t) => return (Err(t), tierups),
+                bytecode::CoopEvent::Idle => {
+                    panic!("unexpected Idle (suspend_on_idle is never armed here)")
+                }
                 bytecode::CoopEvent::JitInvoke { .. } => panic!("unexpected JitInvoke"),
                 bytecode::CoopEvent::TierUp { func, argv, .. } => {
                     tierups += 1;

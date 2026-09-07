@@ -5,6 +5,11 @@
 //              parked on the external-wake doorbell whenever bash waits at the prompt. A browser
 //              permits that block only off the main thread — this Worker IS the terminal's
 //              "process".
+//   coop     — #1122 route (a), the SUSPEND/RESUME driver: one Worker owns a resumable
+//              `CoopRun` and pumps it; `temen_bash_coop_pump` returns IDLE whenever bash waits at
+//              the prompt (no doorbell, no blocking, no Atomics.wait), keystrokes are fed and the
+//              run pumped again. Needs no threads or SharedArrayBuffer of its own — it lives on a
+//              Worker only so a long-running command never freezes the page.
 //   control  — the non-blocking side: it delivers keystrokes into the live session
 //              (`temen_bash_feed` → the #797 feed-time line discipline in shared memory) and
 //              polls `temen_bash_drain` for the new terminal transcript, posting each chunk to the page.
@@ -23,6 +28,14 @@ let memory = null;
 let drainBuf = 0;
 const DRAIN_CAP = 1 << 16;
 const pending = []; // keystroke batches that arrived before the instantiate finished
+let coopPump = null; // #1122 route (a): set once the coop session is open
+const feedCoop = (bytes) => {
+  const p = ex.temen_alloc(bytes.length);
+  u8().set(bytes, p);
+  ex.temen_bash_coop_feed(p, bytes.length);
+  ex.temen_dealloc(p, bytes.length);
+  coopPump();
+};
 const dec = new TextDecoder();
 const u8 = () => new Uint8Array(memory.buffer); // re-taken per use: the shared memory can grow
 
@@ -61,6 +74,44 @@ async function init(cfg) {
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);
   } catch (err) {
     postMessage({ kind: 'fail', why: String(err) });
+    return;
+  }
+
+  if (role === 'coop') {
+    // #1122 route (a) — the suspend/resume session: ONE Worker owns the run and pumps it. Nothing
+    // blocks: `temen_bash_coop_pump` returns IDLE whenever bash waits at the prompt, keystrokes are
+    // fed and the run pumped again. (No doorbell, no Atomics.wait — this driver would run on the
+    // main thread too; the Worker only keeps the page responsive during a long-running command.)
+    ex = exports;
+    drainBuf = ex.temen_alloc(DRAIN_CAP);
+    const rc = ex.temen_bash_coop_open(modPtr, modLen, binsPtr, binsLen);
+    if (rc !== 0) {
+      postMessage({ kind: 'fail', why: `temen_bash_coop_open: ${rc}` });
+      return;
+    }
+    const drainCoop = () => {
+      for (;;) {
+        const n = ex.temen_bash_coop_drain(drainBuf, DRAIN_CAP);
+        if (n === 0) break;
+        postMessage({ kind: 'out', text: dec.decode(u8().slice(drainBuf, drainBuf + n), { stream: true }) });
+        if (n < DRAIN_CAP) break;
+      }
+    };
+    // Pump to the next idle point (or the end), draining the transcript after it.
+    coopPump = () => {
+      let st;
+      try {
+        st = ex.temen_bash_coop_pump();
+      } catch (err) {
+        postMessage({ kind: 'fail', why: String(err) });
+        return;
+      }
+      drainCoop();
+      if (st === 1) postMessage({ kind: 'done', rc: ex.temen_bash_coop_exit() });
+      else if (st === 2) postMessage({ kind: 'fail', why: 'engine trap in the coop session' });
+    };
+    coopPump(); // reach the first prompt
+    for (const b of pending.splice(0)) { feedCoop(b); }
     return;
   }
 
@@ -108,7 +159,8 @@ self.onmessage = (e) => {
   if (m.role) {
     init(m); // async; keystrokes arriving meanwhile buffer below
   } else if (m.kind === 'keys' && m.bytes && m.bytes.length) {
-    if (ex) feed(m.bytes);
-    else pending.push(m.bytes);
+    if (!ex) pending.push(m.bytes);
+    else if (coopPump) feedCoop(m.bytes); // #1122 route (a): feed, then pump to the next idle
+    else feed(m.bytes);
   }
 };
