@@ -2674,7 +2674,8 @@ fn drive_over_cell(
                 } else {
                     children.get(&parent).map(|p| p.depth + 1).unwrap_or(1)
                 };
-                let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                // #1296: a child's table reserves the slots its (re-granted) `Jit` table carries.
+                let cdt = Arc::new(DomainTable::new(&cfuncs, ch.jit_table_log2()));
                 // §13.4 slice 4d: keep the child's host Arc so a holder's restored `LiveImpl`
                 // can be re-linked to it once the whole subtree is rebuilt (below). Key the callee
                 // by its `(parent task, join slot)` edge and record the child as a holder under its
@@ -11606,7 +11607,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let made = sched.spawn(move |id| {
                                         // A nested child is its **own** domain (own host/window/program),
                                         // so it gets its own dispatch table, not the parent's.
-                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        // #1296: reserve the install slots the child's re-granted
+                                        // `Jit` table carries (none ⇒ the natural table).
+                                        let cdt = Arc::new(DomainTable::new(
+                                            &cfuncs,
+                                            child_host.lock_unpoisoned().jit_table_log2(),
+                                        ));
                                         let mut child = VCpu::new(
                                             cfuncs,
                                             ctypes,
@@ -12030,7 +12036,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // self-describe) and never in `nested_children` (no
                                         // carve geometry exists — and the durable refusal
                                         // above keeps it out of every freeze path).
-                                        let cdt = Arc::new(DomainTable::new(&cfuncs, 0));
+                                        // #1296: reserve the install slots the child's re-granted
+                                        // `Jit` table carries (none ⇒ the natural table).
+                                        let cdt = Arc::new(DomainTable::new(
+                                            &cfuncs,
+                                            child_host.lock_unpoisoned().jit_table_log2(),
+                                        ));
                                         let mut child = VCpu::new(
                                             cfuncs,
                                             ctypes,

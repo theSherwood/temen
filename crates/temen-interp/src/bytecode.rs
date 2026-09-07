@@ -700,7 +700,7 @@ impl Compiled {
 /// one `Acquire` load; `install` does a `Release` store, so a vCPU that observes a filled slot also
 /// observes the unit pushed into the [`ModuleSource`] before it (the install serializes under the
 /// source lock). Built once per domain (root / §14 child / coroutine); only the root's is installed into.
-struct SharedSlots {
+pub struct SharedSlots {
     slots: Box<[std::sync::atomic::AtomicU64]>,
 }
 
@@ -816,12 +816,24 @@ fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
 /// `source` (its table's module indices resolve there) but carries its own `table`.
 struct Domain {
     source: std::sync::Arc<ModuleSource>,
-    table: SharedSlots,
+    /// Shared (`Arc`) so a persistent reactor can keep one table across the frames it runs — a §22
+    /// `install` must outlive the frame that made it (#1296, the cross-tier bounce).
+    table: std::sync::Arc<SharedSlots>,
 }
 
 impl Domain {
     fn new(primary: Compiled, table_log2: u8) -> Domain {
         Domain::over_primary(std::sync::Arc::new(primary), table_log2)
+    }
+
+    /// A domain over an existing shared table — the persistent cross-tier reactor's frames
+    /// (`SharedProgram::run_over_grown_info`) all dispatch through one table, so a unit installed in
+    /// one bounce is reachable from the next.
+    fn child_shared(
+        source: std::sync::Arc<ModuleSource>,
+        table: std::sync::Arc<SharedSlots>,
+    ) -> Domain {
+        Domain { source, table }
     }
 
     /// Like [`Domain::new`], but over an **already-`Arc`'d** primary `Compiled` — so a caller that
@@ -833,7 +845,7 @@ impl Domain {
         let table = SharedSlots::new(primary.progs.len(), table_log2, 0);
         Domain {
             source: std::sync::Arc::new(ModuleSource::over(primary)),
-            table,
+            table: std::sync::Arc::new(table),
         }
     }
 
@@ -843,7 +855,10 @@ impl Domain {
     /// it carries only the child's own natural entries, never the parent's installed §22 unit slots
     /// (matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
     fn child(source: std::sync::Arc<ModuleSource>, table: SharedSlots) -> Domain {
-        Domain { source, table }
+        Domain {
+            source,
+            table: std::sync::Arc::new(table),
+        }
     }
 
     /// `Jit.install`: append `unit` to the shared source and fill the first padding slot with
@@ -2389,8 +2404,16 @@ impl SharedProgram {
             seed_data,
             reserved_log2,
             prots,
+            None, // no persistent table — the install-less legacy bounce
         );
         (out, info.map(|i| i.3), mapped)
+    }
+
+    /// A dispatch table for a **persistent** reactor over this program: `2^table_log2` slots (at least
+    /// the natural size), the first `n_funcs` the program's own functions, the rest install padding
+    /// (#1296). Pass it to every [`Self::run_over_grown_info`] frame so installs persist across them.
+    pub fn dispatch_table(&self, table_log2: u8) -> std::sync::Arc<SharedSlots> {
+        std::sync::Arc::new(SharedSlots::new(self.n_funcs, table_log2, 0))
     }
 
     /// [`run_over_grown`](Self::run_over_grown), but returning the post-run window's whole
@@ -2399,6 +2422,11 @@ impl SharedProgram {
     /// bounce (#1201: the single-shot wasm-JIT tier carrying `unmap`/`protect`). `None` under the same
     /// §13 `Backed`-alias condition; `Some((1, 0, 0, vec![]))` for a memory-less module. The trailing
     /// `u64` is the scalar extent, as for `run_over_grown`.
+    ///
+    /// `table` is the reactor's **persistent** dispatch table ([`Self::dispatch_table`]): a §22
+    /// `install` made in one bounce stays reachable from the next (#1296 — a child holding a
+    /// re-granted `Jit` installs into its own table across its emitted run's bounces). `None` builds a
+    /// natural, throwaway table for the call (no install state carried).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     pub fn run_over_grown_info(
         &self,
@@ -2410,13 +2438,17 @@ impl SharedProgram {
         seed_data: bool,
         reserved_log2: u8,
         prots: Option<&[(u64, u8)]>,
+        table: Option<&std::sync::Arc<SharedSlots>>,
     ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
             return (Err(Trap::Malformed), None, 0);
         }
-        // A fresh natural dispatch table over the shared compiled source (cheap: an `Arc` clone + the
-        // slot vector) — the cross-tier reactor carries no §22 install state between calls.
-        let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
+        // The domain over the shared compiled source (cheap: an `Arc` clone) — the reactor's persistent
+        // table when it keeps one, else a fresh natural table for this call.
+        let dom = match table {
+            Some(t) => Domain::child_shared(self.source.clone(), std::sync::Arc::clone(t)),
+            None => Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0)),
+        };
         let mut mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
             if seed_data {
@@ -3468,7 +3500,7 @@ impl<'p> Vcpu<'p> {
         vt.active.home = module as usize;
         let own_dom = Domain::child(
             std::sync::Arc::clone(&prog.dom.source),
-            build_table_for(cunit.progs.len(), 0, module),
+            build_table_for(cunit.progs.len(), host.jit_table_log2(), module), // #1296
         );
         Ok(Vcpu {
             vt,
@@ -5016,10 +5048,11 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
     host.grant_instantiator(0, child_size);
     host.grant_address_space(0, child_size);
     host.restore_replay_substate(&es.host);
+    let table_log2 = host.jit_table_log2(); // #1296: the child's reserved install slots
     DbgEnv {
         mem,
         host,
-        table: build_table_for(progs_len, 0, es.module as u32),
+        table: build_table_for(progs_len, table_log2, es.module as u32),
         fuel: es.fuel,
     }
 }
@@ -5793,11 +5826,12 @@ impl DebugRun {
             ..
         } = ModuleDebug::build(m, 0);
         let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
-        let dom = Domain::new(c, host.jit_table_log2());
+                                                             // The debug engines hold `source`/`table` as separate fields (a `Domain` shares its table).
+        let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
+        let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
         let mem = build_mem(m);
-        let mut vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
+        let mut vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         vt.invoke_step_into = true; // single-vCPU engine steps *into* §22 Jit.invoke (scheduled = leaf)
-        let Domain { source, table } = dom;
         Some(DebugRun {
             source,
             table,
@@ -7113,7 +7147,7 @@ fn dbg_instantiate(
         (quota as u64).min(pfuel)
     };
     // The child is its own domain: a fresh natural table over module 0 (no installed §22 units).
-    let child_table = build_table(c0.progs.len(), 0);
+    let child_table = build_table(c0.progs.len(), child_host.jit_table_log2()); // #1296
     let child_vt = VTask::new(&c0, entry as u64 as usize, &child_args)?;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
@@ -7255,7 +7289,7 @@ fn dbg_instantiate_module(
     // mapping into *its* pushed module index (the mutable-Domain step, like a separate-module coroutine).
     let progs_len = child_compiled.progs.len();
     let cm = source.push(child_compiled);
-    let child_table = build_table_for(progs_len, 0, cm as u32);
+    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
     let cunit = source.get(cm).ok_or(Trap::Malformed)?;
     let mut child_vt = VTask::new(&cunit, entry as u64 as usize, &child_args)?;
     child_vt.active.module = cm;
@@ -7698,10 +7732,10 @@ impl ScheduledDebugRun {
             ..
         } = ModuleDebug::build(m, 0);
         let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
-        let dom = Domain::new(c, host.jit_table_log2());
+        let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
+        let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
         let mem = build_mem(m);
-        let vt = VTask::new(&dom.source.primary(), func as usize, args).ok()?;
-        let Domain { source, table } = dom;
+        let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         Some(ScheduledDebugRun {
             source,
             table,
@@ -8557,7 +8591,7 @@ fn exec_image_build(
     // Push the command as a new domain unit + build its natural table + activation.
     let progs_len = child_compiled.progs.len();
     let cm = dom.source.push(child_compiled);
-    let child_table = build_table_for(progs_len, 0, cm as u32);
+    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
     let cunit = dom.source.get(cm).ok_or(())?;
     let mut new_vt = VTask::new(&cunit, entry as usize, &child_args).map_err(|_| ())?;
     new_vt.active.module = cm;
@@ -12005,7 +12039,8 @@ impl CoopSched {
                     // A nested child is its **own** domain: a fresh natural table over module 0 (no access
                     // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
                     let c0 = dom.source.primary();
-                    let child_table = build_table(c0.progs.len(), 0);
+                    // (#1296: reserving the install slots the child's re-granted `Jit` carries).
+                    let child_table = build_table(c0.progs.len(), child_host.jit_table_log2());
                     let mut child_vt = VTask::new(&c0, entry as usize, &child_args)?;
                     // #816 env-routed tier-up: a same-module confined child runs module 0, so the
                     // run's bitmap applies to it too — inherit it when the child's window is
@@ -12256,7 +12291,10 @@ impl CoopSched {
                     // natural table mapping into *its* module index (no installed §22 units).
                     let progs_len = child_compiled.progs.len();
                     let cm = dom.source.push(child_compiled);
-                    let child_table = build_table_for(progs_len, 0, cm as u32);
+                    // #1296: the child's own table reserves the install slots its re-granted `Jit`
+                    // table carries (none ⇒ natural).
+                    let child_table =
+                        build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
                     let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
                     let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
                     child_vt.active.module = cm;
@@ -12478,10 +12516,15 @@ impl CoopSched {
                                 // only ever happen between host events — a unit with a `call.cap` never
                                 // emits, so the install itself always runs interpreted). Twin of the
                                 // single-shot pump's `slot_codes` recording; inert on the native drive.
-                                if let Some(e) = slot_codes.get_mut(slot) {
-                                    *e = code;
+                                // The mirror is the ROOT's emitted dispatch table: a §14 child's
+                                // install stays in the child's own table (#1296) — mirroring it here
+                                // would publish the child's unit into the parent's `call.dyn` slots.
+                                if tasks[ti].env.is_none() {
+                                    if let Some(e) = slot_codes.get_mut(slot) {
+                                        *e = code;
+                                    }
+                                    *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                                 }
-                                *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                                 slot as i64
                             }
                             None => super::ENOSPC,
@@ -13989,7 +14032,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     (quota as u64).min(fuel)
                 };
                 // Own table over the **shared** source (module 0 = the same primary the child runs).
-                let child_table = build_table(c0.progs.len(), 0);
+                let child_table = build_table(c0.progs.len(), child_host.jit_table_log2()); // #1296
                 let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
                 let child_vt = match VTask::new(&c0, entry as usize, &child_args) {
                     Ok(v) => v,
@@ -14142,7 +14185,8 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // table mapping into *its* module index (no parent install slots).
                 let progs_len = child_compiled.progs.len();
                 let cm = dom.source.push(child_compiled);
-                let child_table = build_table_for(progs_len, 0, cm as u32);
+                let child_table =
+                    build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
                 let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
                 let cunit = match child_dom.source.get(cm) {
                     Some(u) => u,

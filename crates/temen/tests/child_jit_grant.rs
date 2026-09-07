@@ -50,7 +50,9 @@ fn blob(zero_arg: bool) -> Vec<u8> {
 /// func 1 (child, `(Instantiator)`): resolve `"jit"` by name (written into its own window), compile
 /// the blob at `BLOB_OFF` `times` times (the last compile's code handle is what it invokes), invoke
 /// `(3, 4)`, return the sum. `times == 2` is the quota probe: it returns the **second compile's**
-/// result instead (`-ENOMEM` when the child's table has one unit).
+/// result instead (`-ENOMEM` when the child's table has one unit). Modes 5/6: the child `install`s
+/// its unit and returns the slot; in mode 5 the parent `call.dyn`s that slot (in its own table), in
+/// mode 6 it returns the slot as is.
 fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     let blob_len = blob.len();
     // The parent stages the blob into the (future) carve as little-endian i64 stores.
@@ -70,7 +72,7 @@ fn src(grants_n: u32, blob: &[u8], mode: u32) -> String {
     );
     let child_tail = match mode {
         2 => "  vc2 = call.cap 11 0 (i64, i64) -> (i64) hj (vb, vl)\n  return vc2\n".to_string(),
-        5 => "  vslot = call.cap 11 3 (i64) -> (i64) hj (vc)\n  return vslot\n".to_string(),
+        5 | 6 => "  vslot = call.cap 11 3 (i64) -> (i64) hj (vc)\n  return vslot\n".to_string(),
         _ => "  va = i32.const 3\n  vb4 = i32.const 4\n  vr = call.cap 11 1 (i64, i32, i32) -> (i32) hj (vc, va, vb4)\n  vr64 = i64.extend_i32_s vr\n  return vr64\n".to_string(),
     };
     // Mode 5: the parent `call.dyn`s the slot the child installed — in the PARENT's table, which the
@@ -159,13 +161,13 @@ block 0 (vci: i64) {{
 fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, i32, i32) {
     let mut host = Host::new();
     let ih = host.grant_instantiator(0, 128 << 10);
-    let jh = grant_jit(&mut host, m, if mode == 5 { 4 } else { 0 });
+    let jh = grant_jit(&mut host, m, if mode >= 5 { 4 } else { 0 });
     host.set_jit_quota(units, 1 << 20);
     (host, ih, jh)
 }
 
 fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 2] {
-    let b = blob(mode == 5);
+    let b = blob(mode >= 5);
     let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
     verify_module(&m).expect("verify");
     let mut out = Vec::new();
@@ -192,7 +194,7 @@ fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 
 /// The same program on the native JIT, with temen-run's production child hooks (the child is built
 /// host-side by `grant_named_child_build`, which reports the `Jit` grant's table reservation).
 fn run_jit(grants_n: u32, mode: u32, units: u32) -> JitOutcome {
-    let b = blob(mode == 5);
+    let b = blob(mode >= 5);
     let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
     verify_module(&m).expect("verify");
     let (mut host, ih, jh) = setup(&m, mode, units);
@@ -289,4 +291,19 @@ fn a_childs_install_is_invisible_to_the_parents_dispatch_table() {
         matches!(jo, JitOutcome::Trapped(_)),
         "native JIT: the parent's call.dyn must trap, got {jo:?}"
     );
+}
+
+#[test]
+fn a_child_installs_into_its_own_reserved_table() {
+    // The `Jit` grant carries the parent's table reservation (16 slots) into the child, so the
+    // child's `install` lands in a padding slot of the CHILD's dispatch table: a non-negative slot
+    // (never `-ENOSPC` from a natural, padding-free table), identical on every engine.
+    let [tw, bc] = run_both(1, 6, 4096);
+    assert!(
+        matches!(tw.as_deref(), Ok([Value::I64(s)]) if *s >= 0),
+        "tree-walker: the child's install must return a slot, got {tw:?}"
+    );
+    assert_eq!(bc, tw, "bytecode engine agrees on the slot");
+    let jo = run_jit(1, 6, 4096);
+    assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
 }

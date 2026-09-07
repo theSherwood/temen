@@ -256,7 +256,12 @@ fn jit_run_module(m: &temen_ir::Module) -> (Vec<u8>, bool) {
     let pages = ((WIN_BASE as u64 + WIN_SIZE) / (64 * 1024)) as u32;
     let mut store: Store<Option<JitOnrampRun>> = Store::new(&engine, None);
     let memory = Memory::new(&mut store, MemoryType::new(pages, Some(pages))).unwrap();
-    let win_ptr = unsafe { memory.data_mut(&mut store).as_mut_ptr().add(WIN_BASE as usize) };
+    let win_ptr = unsafe {
+        memory
+            .data_mut(&mut store)
+            .as_mut_ptr()
+            .add(WIN_BASE as usize)
+    };
     let run =
         unsafe { JitOnrampRun::open_shared_run(m, win_ptr, WIN_SIZE, WIN_LOG2, false, Vec::new()) }
             .expect("emittable");
@@ -386,7 +391,10 @@ fn chibicc_compiled_malloc_program_matches_or_declines() {
         .expect("parse produced IR");
 
     let interp_out = String::from_utf8_lossy(&onramp_exec(&m, b"").stdout).to_string();
-    assert_eq!(interp_out, "libc\n", "interp oracle prints the strdup'd string");
+    assert_eq!(
+        interp_out, "libc\n",
+        "interp oracle prints the strdup'd string"
+    );
     let (jit_bytes, declined) = jit_run_module(&m);
     let jit_out = String::from_utf8_lossy(&jit_bytes).to_string();
     assert!(
