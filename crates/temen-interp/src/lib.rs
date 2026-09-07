@@ -18128,13 +18128,28 @@ struct JitUnit {
     wasm: Option<Arc<[u8]>>,
 }
 
+/// Where a [`JitTableState`]'s memory-match precondition comes from.
+#[derive(Clone, Copy, Debug)]
+enum JitMem {
+    /// Fixed at grant time (a root's table, [`Host::grant_jit`]; a thawed table).
+    Fixed(Option<u8>),
+    /// Read off [`Host::self_module`] at use: a table minted into a §14 child by re-grant
+    /// ([`Host::regrant_into_child`]) exists before the child's module is bound, and a unit must
+    /// match the module it joins — the child's, not the granting parent's. The payload is the
+    /// **granting parent's** resolved precondition, the answer when no module is bound (a
+    /// same-module child of a root the embedder never `set_self_module`d runs the parent's program,
+    /// so the parent's declared memory is the child's).
+    SelfModule(Option<u8>),
+}
+
 /// Per-`Jit`-handle state: the **table of guest-compiled units** behind one `Jit` capability (§22),
 /// with its installs, compile quota and native context. Not a domain — a domain (PROCESS.md) may
 /// hold one of these; "domain" is reserved for the process abstraction (#1298).
 struct JitTableState {
     /// The memory-match precondition (DESIGN.md §22 "Security argument"): a submitted blob's declared
-    /// memory must equal the parent module's, fixed when the capability is granted.
-    mem_log2: Option<u8>,
+    /// memory must equal the owning module's — fixed when the capability is granted to a root, or
+    /// read off the child's own module for a table minted into a child (#1296).
+    mem_log2: JitMem,
     units: Vec<JitUnit>,
     /// Opaque native context the JIT embedder registered (its `*mut CompiledModule` as a
     /// `usize`); `0` in a reference run. Never dereferenced here — only stored and handed back
@@ -19669,14 +19684,14 @@ impl Host {
         self.jit_tables
             .iter()
             .map(|d| DurableJitTable {
-                mem_log2: d.mem_log2,
+                mem_log2: self.jit_mem_log2(d),
                 units_left: d.units_left,
                 bytes_left: d.bytes_left,
                 units: d
                     .units
                     .iter()
                     .map(|u| DurableJitUnit {
-                        unit_ir: encode_jit_unit(&u.funcs, &u.types, d.mem_log2),
+                        unit_ir: encode_jit_unit(&u.funcs, &u.types, self.jit_mem_log2(d)),
                         install_type_id: u.install_type_id,
                     })
                     .collect(),
@@ -19714,7 +19729,7 @@ impl Host {
                 });
             }
             rebuilt.push(JitTableState {
-                mem_log2: d.mem_log2,
+                mem_log2: JitMem::Fixed(d.mem_log2),
                 units,
                 native_ctx: 0,
                 units_left: d.units_left,
@@ -21223,7 +21238,7 @@ impl Host {
     pub fn grant_jit_with_table(&mut self, mem_log2: Option<u8>, table_log2: u8) -> i32 {
         let id = self.jit_tables.len() as u32;
         self.jit_tables.push(JitTableState {
-            mem_log2,
+            mem_log2: JitMem::Fixed(mem_log2),
             units: Vec::new(),
             native_ctx: 0,
             units_left: JIT_DEFAULT_MAX_UNITS,
@@ -21371,6 +21386,17 @@ impl Host {
     }
 
     /// The native context registered for `domain` (`0` ⇒ reference run / none registered).
+    /// The memory-match precondition a table enforces at `compile` (see [`JitMem`]).
+    fn jit_mem_log2(&self, d: &JitTableState) -> Option<u8> {
+        match d.mem_log2 {
+            JitMem::Fixed(m) => m,
+            JitMem::SelfModule(inherited) => match &self.self_module {
+                Some(m) => m.memory.map(|mc| mc.size_log2),
+                None => inherited,
+            },
+        }
+    }
+
     pub fn jit_native_ctx(&self, domain: u32) -> usize {
         self.jit_tables
             .get(domain as usize)
@@ -21428,6 +21454,7 @@ impl Host {
             None
         };
         let durable_tainted = &self.jit_durable_tainted_sigs;
+        let mem_log2 = self.jit_mem_log2(&self.jit_tables[domain as usize]);
         let d = &mut self.jit_tables[domain as usize];
         // Compile quota first: charge the *attempt's* bytes (validation is the cost a looping
         // guest imposes), the unit slot only on success; out of either budget is `-ENOMEM`.
@@ -21435,7 +21462,7 @@ impl Host {
             return Ok(Err(ENOMEM));
         }
         d.bytes_left -= bytes.len() as u64;
-        let funcs = match validate(bytes, d.mem_log2, symtab) {
+        let funcs = match validate(bytes, mem_log2, symtab) {
             Ok(f) if !f.is_empty() => f,
             Ok(_) => return Ok(Err(EINVAL)), // an empty unit has no entry to invoke
             Err(e) => return Ok(Err(e)),
@@ -21781,6 +21808,7 @@ impl Host {
             || self.resolve_copyable(handle).is_ok()
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
+            || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
     }
 
     /// FORK.md §8.5 slice 3 — whether `handle` is a **forkable** host proc (carries a fork factory),
@@ -21888,6 +21916,31 @@ impl Host {
                     }
                     h
                 });
+        }
+        // #1296 — a §22 **`Jit`** grant: the child gets a **fresh, empty unit table** of its own, not an
+        // alias of the parent's (units, installs and the B2 dispatch slots are per-table artifacts, and
+        // sharing them across the §14 boundary would let either side's `install` alias into the
+        // other's `call.dyn`). Attenuated: the child's compile quota is at most the parent's remaining.
+        // The memory-match precondition resolves against the *child's* module at compile time
+        // ([`JitMem::SelfModule`]); the embedder's validator / emitter gates carry over so the child
+        // compiles through exactly the parent's checks. A durable child's table refuses `compile`
+        // (`jit_hosts_durable` is not inherited — #1300 is the durable-transform scope).
+        if let Ok(Binding::JitTable(idx)) = self.resolve(handle, cap_id::JIT) {
+            let parent = self.jit_tables.get(idx as usize)?;
+            let inherited = self.jit_mem_log2(parent);
+            let id = child.jit_tables.len() as u32;
+            child.jit_tables.push(JitTableState {
+                mem_log2: JitMem::SelfModule(inherited),
+                units: Vec::new(),
+                native_ctx: 0,
+                units_left: parent.units_left.min(JIT_DEFAULT_MAX_UNITS),
+                bytes_left: parent.bytes_left.min(JIT_DEFAULT_MAX_BLOB_BYTES),
+                installed: Vec::new(),
+            });
+            child.jit_table_log2 = child.jit_table_log2.max(self.jit_table_log2);
+            child.jit_validator = child.jit_validator.or(self.jit_validator);
+            child.jit_wasm_emitter = child.jit_wasm_emitter.or(self.jit_wasm_emitter);
+            return Some(child.grant(cap_id::JIT, Binding::JitTable(id)));
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
         // into the child (cloning the grant entry — its `funcs`/`data`/`module` are `Arc`s, so the copy
