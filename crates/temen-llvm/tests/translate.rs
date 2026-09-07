@@ -13777,7 +13777,9 @@ fn demo_bash_readline_transcript_matches_native() {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok || !linked.exists() {
-        eprintln!("note: skipping bash readline (build_bitcode.sh failed — offline or no clang/make?)");
+        eprintln!(
+            "note: skipping bash readline (build_bitcode.sh failed — offline or no clang/make?)"
+        );
         return;
     }
     let opts = temen_llvm::TranslateOptions {
