@@ -6395,6 +6395,9 @@ impl DebugRun {
             access_sink,
             scheduled_writes,
             write_cursor,
+            watchpoints,
+            value_watches,
+            last_watch,
             ..
         } = self;
         *at_bp = false; // a step leaves the breakpoint-paused state
@@ -6441,6 +6444,41 @@ impl DebugRun {
             // parent depth) runs the child to completion, and step-out of the child body lands back in
             // the parent — while stepping *within* the child compares child-local frames as usual.
             let cur_vm = vt.debug_active();
+            // A watchpoint fires *during* a step too — parity with `continue` (`run_to`) and with the
+            // tree-walker, whose per-op seam checks watches ahead of the step target. Checked before
+            // the step-boundary return and independent of the step's depth (a watch is not
+            // depth-scoped): a window-range access, or a value watch (#1229) whose SSA-held variable
+            // just changed, stops the step here with the watch reason.
+            if let Some(pc) = cur_vm.cur_ir_pc(source) {
+                if pc.module == 0 && (!watchpoints.is_empty() || !value_watches.is_empty()) {
+                    let w = watch_hit_before(
+                        cur_vm,
+                        mem,
+                        funcs,
+                        fn_block_base,
+                        watchpoints,
+                        pc.func,
+                        pc.block,
+                        pc.inst,
+                    )
+                    .or_else(|| {
+                        value_watch_hit_before(
+                            cur_vm,
+                            fn_block_base,
+                            value_watches,
+                            pc.func,
+                            pc.block,
+                            pc.inst,
+                        )
+                        .map(|()| (0, true))
+                    });
+                    if let Some(w) = w {
+                        *last_watch = Some(w);
+                        *at_bp = true;
+                        return Some(pc);
+                    }
+                }
+            }
             // Cumulative across a coroutine *or* §22-invoke boundary: the child's frames sit above the
             // parent's resume/invoke frame (`parent_depth + child stack`).
             let depth = match &vt.active_invoke {

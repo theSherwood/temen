@@ -965,10 +965,16 @@ impl Debuggee for BytecodeBackend {
         let mut fuel = self.fuel;
         let stop = match &mut self.engine {
             Engine::Single(run) => match run.step(&mut fuel) {
-                Some(pc) => Stop::Break {
-                    reason: StopReason::Step,
-                    pc,
-                },
+                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
+                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
+                // watch hit and report it, else a plain step.
+                Some(pc) => {
+                    let reason = match run.take_watch_hit() {
+                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
+                        None => StopReason::Step,
+                    };
+                    Stop::Break { reason, pc }
+                }
                 None => self.finish_stop(),
             },
             Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel)),
@@ -980,10 +986,16 @@ impl Debuggee for BytecodeBackend {
         let mut fuel = self.fuel;
         let stop = match &mut self.engine {
             Engine::Single(run) => match run.step_over(&mut fuel) {
-                Some(pc) => Stop::Break {
-                    reason: StopReason::Step,
-                    pc,
-                },
+                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
+                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
+                // watch hit and report it, else a plain step.
+                Some(pc) => {
+                    let reason = match run.take_watch_hit() {
+                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
+                        None => StopReason::Step,
+                    };
+                    Stop::Break { reason, pc }
+                }
                 None => self.finish_stop(),
             },
             Engine::Threaded(run) => Self::sched_stop(run.step_over(&mut fuel)),
@@ -995,10 +1007,16 @@ impl Debuggee for BytecodeBackend {
         let mut fuel = self.fuel;
         let stop = match &mut self.engine {
             Engine::Single(run) => match run.step_out(&mut fuel) {
-                Some(pc) => Stop::Break {
-                    reason: StopReason::Step,
-                    pc,
-                },
+                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
+                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
+                // watch hit and report it, else a plain step.
+                Some(pc) => {
+                    let reason = match run.take_watch_hit() {
+                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
+                        None => StopReason::Step,
+                    };
+                    Stop::Break { reason, pc }
+                }
                 None => self.finish_stop(),
             },
             Engine::Threaded(run) => Self::sched_stop(run.step_out(&mut fuel)),
