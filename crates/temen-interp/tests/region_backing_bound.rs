@@ -140,6 +140,50 @@ fn protect_straddling_the_backing_end_never_reads_host_memory() {
     assert_eq!(canary, 0x5A);
 }
 
+/// #1312, the other side of the same seam: over a **growable** backing the identical `map` past the
+/// initial backing does not merely get admitted-then-dropped — the backing *grows to cover it*, so
+/// the store lands and the load reads it back, exactly as the engine-`mmap`ed oracle window behaves.
+/// This is what lets a cooperative run's window carry a guest allocator that `vm_map`s past its
+/// declared size (the fixed backing above is why it could not).
+#[test]
+fn map_past_a_growable_backing_grows_it_and_the_access_lands() {
+    let page = temen_interp::host_page_size();
+    let m = temen_text::parse_module(&src(0)).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let prog = bytecode::VcpuProgram::compile(&m).expect("compile");
+    let back = Arc::new(Region::growable(WIN, page).expect("growable backing"));
+    assert_eq!(back.len(), WIN, "starts at the declared window");
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    // func 1: map [WIN, WIN+page) RW, store a marker in the last word, load it back.
+    let args = [
+        Value::I32(asl),
+        Value::I64(WIN as i64),
+        Value::I64(page as i64),
+    ];
+    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 1, &args, back.clone(), &[], host)
+        .expect("root vcpu");
+    let res = match vcpu.run() {
+        bytecode::VcpuEvent::Done(v) => Ok(v),
+        bytecode::VcpuEvent::Trapped(t) => Err(t),
+        _ => panic!("unexpected event"),
+    };
+    assert_eq!(
+        errno_of(&res),
+        424242,
+        "the grown page is real memory: the marker round-trips"
+    );
+    assert!(
+        back.len() >= WIN + page,
+        "the map grew the backing to cover the committed page, got {}",
+        back.len()
+    );
+    // The reservation still bounds growth: a map past `1 << DEFAULT_RESERVED_LOG2` is -EINVAL on
+    // this window exactly as on a fixed one — growth extends the backing, never the mask domain.
+    let reserved = vcpu.mem_map_info().expect("window").2;
+    assert_eq!(reserved, 1u64 << temen_ir::DEFAULT_RESERVED_LOG2);
+}
+
 #[test]
 fn page_ops_inside_the_backing_still_work() {
     let page = temen_interp::host_page_size();
