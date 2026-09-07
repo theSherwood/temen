@@ -1813,3 +1813,148 @@ fn threaded_without_block_stdin_exhausted_reads_stay_eof() {
         "two zero-length echoes"
     );
 }
+
+/// A promoted-scalar local `x` (an `ssalist` var — no window address) whose value changes: `x = 10`
+/// (value 0) until the add at inst 3, then `x = 11` (value 2). Watching it needs a **value** watch
+/// (#1229) — the window-range data breakpoint can't reach an address-less SSA local.
+const VALUE_WATCH_DBG: &str = r#"func () -> (i64) {
+block 0 () {
+  va = i64.const 10
+  vb = i64.const 1
+  vc = i64.add va vb
+  vd = i64.add vc vb
+  return vd
+  }
+}
+debug.file 0 "vw.temt"
+debug.fname 0 "main"
+debug.loc 0 0 0 0 2 3
+debug.loc 0 0 1 0 3 3
+debug.loc 0 0 2 0 4 3
+debug.loc 0 0 3 0 5 3
+debug.loc 0 0 4 0 6 3
+debug.var 0 "x" ssalist 2 0 1 0 0 3 2 "int"
+"#;
+
+/// **#1229 — value watchpoint by name over DAP, engine parity.** Arm a data breakpoint on the
+/// address-less SSA local `x` (the panel's watch-a-variable flow: `dataBreakpointInfo` mints a value
+/// `dataId`, `setDataBreakpoints` arms it), then Continue: the debugger stops with reason
+/// "data breakpoint" when `x`'s value changes — identically on the bytecode engine and the
+/// tree-walker. The window-range watch path can't serve this variable, so this exercises the value
+/// watch specifically (the minted `dataId` is the `val:…` form).
+#[test]
+fn dap_over_bytecode_value_watchpoint_matches_the_tree_walker() {
+    fn script(engine: Option<&str>) -> (String, bool, String) {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(VALUE_WATCH_DBG)),
+            ("function", Json::i(0)),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        // Break on line 3 (inst 1) so we pause with `x` (= 10) live to arm the watch.
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("vw.temt"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(3))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        let st = s.handle(&req(
+            5,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let frame_id = response(&st)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("id")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let sc = s.handle(&req(
+            6,
+            "scopes",
+            Json::obj(vec![("frameId", Json::i(frame_id))]),
+        ));
+        let var_ref = response(&sc)
+            .get("body")
+            .unwrap()
+            .get("scopes")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("variablesReference")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let info = s.handle(&req(
+            7,
+            "dataBreakpointInfo",
+            Json::obj(vec![
+                ("variablesReference", Json::i(var_ref)),
+                ("name", Json::s("x")),
+            ]),
+        ));
+        let data_id = response(&info)
+            .get("body")
+            .and_then(|b| b.get("dataId"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        let arm = s.handle(&req(
+            8,
+            "setDataBreakpoints",
+            Json::obj(vec![(
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("dataId", Json::s(&data_id)),
+                    ("accessType", Json::s("write")),
+                ])]),
+            )]),
+        ));
+        let verified = response(&arm)
+            .get("body")
+            .and_then(|b| b.get("breakpoints"))
+            .and_then(|b| b.as_array())
+            .and_then(|a| a.first())
+            .and_then(|b| b.get("verified"))
+            .cloned()
+            == Some(Json::Bool(true));
+        // Continue → stop when `x`'s value changes.
+        let cont = s.handle(&req(9, "continue", Json::obj(vec![])));
+        let reason = event(&cont, "stopped")
+            .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        (data_id, verified, reason)
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert!(
+        bytecode.0.starts_with("val:"),
+        "`x` resolves to a value dataId (no window address): {:?}",
+        bytecode.0
+    );
+    assert!(
+        bytecode.1,
+        "the value data breakpoint verifies on the bytecode engine"
+    );
+    assert_eq!(bytecode.2, "data breakpoint", "stops for the value watch");
+    assert_eq!(
+        bytecode,
+        script(None),
+        "bytecode value watchpoint ≡ tree-walker value watchpoint"
+    );
+}

@@ -552,9 +552,9 @@ impl DapServer {
             .and_then(|n| n.as_str())
             .unwrap_or("")
             .to_string();
-        let body = match self.data_watch_target(args, &name) {
-            Some((addr, len)) => Json::obj(vec![
-                ("dataId", Json::s(format!("{addr}:{len}"))),
+        let body = match self.watch_data_id(args, &name) {
+            Some(data_id) => Json::obj(vec![
+                ("dataId", Json::s(data_id)),
                 ("description", Json::s(name)),
                 (
                     "accessTypes",
@@ -564,24 +564,26 @@ impl DapServer {
                         Json::s("readWrite"),
                     ]),
                 ),
-                // The id is range-not-handle, valid only at the current stop, so don't persist it.
+                // The id is range/value-not-handle, valid only at the current stop, so don't persist.
                 ("canPersist", Json::Bool(false)),
             ]),
             None => Json::obj(vec![
                 ("dataId", Json::Null),
                 (
                     "description",
-                    Json::s(format!("`{name}` has no watchable address here")),
+                    Json::s(format!("`{name}` is not watchable here")),
                 ),
             ]),
         };
         (true, body, vec![])
     }
 
-    /// Resolve the `(addr, len)` a `dataBreakpointInfo` request names: the variable `name` scoped to
-    /// the request's container (a scope's `variablesReference` == `frameId + 1`), else the stopped
-    /// thread's top frame. `None` if there is no such in-scope memory-located variable.
-    fn data_watch_target(&mut self, args: Option<&Json>, name: &str) -> Option<(u64, u64)> {
+    /// Mint the `dataId` a `dataBreakpointInfo` request names, scoped to the request's container (a
+    /// scope's `variablesReference` == `frameId + 1`), else the stopped thread's top frame. Two forms:
+    /// a **window-range** watch `"addr:len"` for a memory-located variable, or — when the variable has
+    /// no address but is a live SSA-held scalar (#1229) — a **value** watch `"val:<frame_idx>:<name>"`.
+    /// `None` if the variable is neither (unknown, or not live here).
+    fn watch_data_id(&mut self, args: Option<&Json>, name: &str) -> Option<String> {
         let session = self.session.as_ref()?;
         let (tid, frame_idx) = args
             .and_then(|a| a.get("variablesReference"))
@@ -592,7 +594,18 @@ impl DapServer {
         let session = self.session.as_mut()?;
         session.inspector.select_task(tid);
         let func = session.inspector.backtrace().get(frame_idx)?.pc.func;
-        self.session.as_ref()?.resolve_watch(frame_idx, func, name)
+        // Prefer a window-range watch (an addressable var).
+        if let Some((addr, len)) = self.session.as_ref()?.resolve_watch(frame_idx, func, name) {
+            return Some(format!("{addr}:{len}"));
+        }
+        // Otherwise, an SSA-held scalar is readable but has no address — value-watch it (#1229).
+        // `read_var` returns `Some` only when the var is live at this frame's pc; width is
+        // irrelevant for the SSA case (it reads the value slot, not window bytes).
+        let session = self.session.as_ref()?;
+        if session.inspector.read_var(frame_idx, name, 8).is_some() {
+            return Some(format!("val:{frame_idx}:{name}"));
+        }
+        None
     }
 
     /// `setDataBreakpoints`: replace the armed data watchpoints with the requested set (the protocol
@@ -619,26 +632,28 @@ impl DapServer {
                 Some("readWrite") => WatchKind::ReadWrite,
                 _ => WatchKind::Write,
             };
-            match bp
-                .get("dataId")
-                .and_then(|d| d.as_str())
-                .and_then(parse_data_id)
-            {
-                // `set_watchpoint` returns `None` on a backend without watchpoints (bytecode) — report
-                // the data breakpoint unverified rather than silently dropping it.
-                Some((addr, len)) => match session.inspector.set_watchpoint(addr, len, kind) {
-                    Some(id) => {
-                        session.data_watch_ids.push(id);
-                        out.push(Json::obj(vec![("verified", Json::Bool(true))]));
-                    }
-                    None => out.push(Json::obj(vec![
-                        ("verified", Json::Bool(false)),
-                        ("message", Json::s("watchpoints unsupported on this engine")),
-                    ])),
-                },
+            let data_id = bp.get("dataId").and_then(|d| d.as_str());
+            // A `"val:<frame>:<name>"` dataId arms a value watch (#1229); an `"addr:len"` one arms a
+            // window-range watch. Either returns `None` on a backend that can't serve it (report the
+            // data breakpoint unverified rather than silently dropping it).
+            let armed = match data_id {
+                Some(id) if id.starts_with("val:") => {
+                    parse_value_data_id(id).and_then(|(frame, name)| {
+                        session.inspector.set_value_watchpoint(frame, name, kind)
+                    })
+                }
+                Some(id) => parse_data_id(id)
+                    .and_then(|(addr, len)| session.inspector.set_watchpoint(addr, len, kind)),
+                None => None,
+            };
+            match armed {
+                Some(id) => {
+                    session.data_watch_ids.push(id);
+                    out.push(Json::obj(vec![("verified", Json::Bool(true))]));
+                }
                 None => out.push(Json::obj(vec![
                     ("verified", Json::Bool(false)),
-                    ("message", Json::s("unresolved dataId")),
+                    ("message", Json::s("unresolved or unsupported dataId")),
                 ])),
             }
         }
@@ -1677,6 +1692,14 @@ fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
 fn parse_data_id(s: &str) -> Option<(u64, u64)> {
     let (addr, len) = s.split_once(':')?;
     Some((addr.parse().ok()?, len.parse().ok()?))
+}
+
+/// Parse a **value**-watch `dataId` (`"val:<frame_idx>:<name>"`, #1229) into the frame level and
+/// variable name to arm via `set_value_watchpoint`. `None` on any malformed id (a C identifier never
+/// contains `:`, so the name is the whole remainder).
+fn parse_value_data_id(s: &str) -> Option<(usize, &str)> {
+    let (frame, name) = s.strip_prefix("val:")?.split_once(':')?;
+    Some((frame.parse().ok()?, name))
 }
 
 /// Parse a decimal or `0x`-hex integer (the `setVariable` value / `writeMemory` address forms).

@@ -27,7 +27,7 @@
 
 use temen_interp::bytecode::{
     self, AccessSinkFn, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
-    ScheduledSnapshot, ScheduledWrite,
+    ScheduledSnapshot, ScheduledWrite, ValueWatchTarget,
 };
 use temen_interp::MemEvent;
 
@@ -206,6 +206,20 @@ pub trait Debuggee {
     /// unverified.
     fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId>;
     fn clear_watchpoint(&mut self, id: WatchId) -> bool;
+    /// Arm a **value watchpoint** on an SSA-held (address-less) source variable `name` in the frame
+    /// `frame_from_top` levels up — stop when its value changes (#1229). `None` when the variable has
+    /// no SSA location there (it's memory-located — watch it with [`set_watchpoint`] via
+    /// [`var_addr`](Debuggee::var_addr) — or isn't live/known), or the backend doesn't serve value
+    /// watches (the scheduled bytecode engine this slice). Default `None`.
+    fn set_value_watchpoint(
+        &mut self,
+        frame_from_top: usize,
+        name: &str,
+        kind: WatchKind,
+    ) -> Option<WatchId> {
+        let _ = (frame_from_top, name, kind);
+        None
+    }
 
     // --- inspection ------------------------------------------------------------------------------
     fn backtrace(&self) -> Vec<FrameInfo>;
@@ -348,6 +362,14 @@ impl Debuggee for Inspector {
     fn clear_watchpoint(&mut self, id: WatchId) -> bool {
         Inspector::clear_watchpoint(self, id)
     }
+    fn set_value_watchpoint(
+        &mut self,
+        frame_from_top: usize,
+        name: &str,
+        kind: WatchKind,
+    ) -> Option<WatchId> {
+        Inspector::set_value_watchpoint(self, frame_from_top, name, kind)
+    }
     fn backtrace(&self) -> Vec<FrameInfo> {
         Inspector::backtrace(self)
     }
@@ -427,6 +449,10 @@ pub struct BytecodeBackend {
     /// Armed watchpoints with backend-owned stable ids (re-applied to the run after a `seek` rebuild).
     /// Single-vCPU only — the scheduled engine reports `supports_watch = false` this slice.
     watch_specs: Vec<(WatchId, u64, u64, WatchKind)>,
+    /// Armed **value** watchpoints on SSA-held source variables (#1229), backend-owned stable ids,
+    /// re-applied after a `seek` rebuild like `watch_specs`. Single-vCPU only this slice; the target
+    /// is frame-independent so re-application is verbatim.
+    value_specs: Vec<(WatchId, ValueWatchTarget, WatchKind)>,
     next_watch: u32,
     fuel: u64,
     /// This session runs its guest under the **on-ramp I/O powerbox** ([`grant_io_powerbox`]) instead of
@@ -569,6 +595,7 @@ impl BytecodeBackend {
             args: args.to_vec(),
             breakpoints: Vec::new(),
             watch_specs: Vec::new(),
+            value_specs: Vec::new(),
             next_watch: 0,
             fuel,
             powerbox,
@@ -765,7 +792,12 @@ impl BytecodeBackend {
             .map(|(_, a, l, k)| (*a, *l, *k))
             .collect();
         match &mut self.engine {
-            Engine::Single(run) => run.set_watchpoints(ranges),
+            Engine::Single(run) => {
+                run.set_watchpoints(ranges);
+                // Value watches (#1229) ride the single-vCPU engine this slice; the target is
+                // frame-independent so re-application after a `seek` rebuild is verbatim.
+                run.set_value_watches(self.value_specs.clone());
+            }
             Engine::Threaded(run) => run.set_watchpoints(ranges),
         }
     }
@@ -1107,13 +1139,33 @@ impl Debuggee for BytecodeBackend {
         Some(id)
     }
     fn clear_watchpoint(&mut self, id: WatchId) -> bool {
-        let before = self.watch_specs.len();
+        let before = self.watch_specs.len() + self.value_specs.len();
         self.watch_specs.retain(|(w, ..)| *w != id);
-        let removed = self.watch_specs.len() != before;
+        self.value_specs.retain(|(w, ..)| *w != id);
+        let removed = self.watch_specs.len() + self.value_specs.len() != before;
         if removed {
             self.apply_watches();
         }
         removed
+    }
+    // Value watches (#1229): stop when an SSA-held source variable's value changes. Single-vCPU only
+    // this slice — `resolve_value_watch` yields `None` on the scheduled engine, so the arm fails
+    // cleanly (the DAP reports the data breakpoint unverified).
+    fn set_value_watchpoint(
+        &mut self,
+        frame_from_top: usize,
+        name: &str,
+        kind: WatchKind,
+    ) -> Option<WatchId> {
+        let target = match &self.engine {
+            Engine::Single(run) => run.resolve_value_watch(frame_from_top, name)?,
+            Engine::Threaded(_) => return None,
+        };
+        let id = WatchId::from_raw(self.next_watch);
+        self.next_watch += 1;
+        self.value_specs.push((id, target, kind));
+        self.apply_watches();
+        Some(id)
     }
     fn backtrace(&self) -> Vec<FrameInfo> {
         let mut out = Vec::new();
