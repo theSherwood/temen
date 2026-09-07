@@ -1699,7 +1699,7 @@ fn par_jit_rt() -> Option<&'static ParJitCfg> {
 /// [`par_resolve_unit`]) and hand back the unit's funcs + its emitted wasm.
 #[allow(clippy::type_complexity)]
 fn par_resolve_unit_rt(
-    h: &Host,
+    h: &mut Host,
     handle: i32,
     code: i32,
 ) -> Result<
@@ -1718,7 +1718,7 @@ fn par_resolve_unit_rt(
     // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
     let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
     let types = h.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, types, h.jit_unit_wasm(cd, cu)))
+    Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu))) // #1301: a thawed unit re-emits here
 }
 
 /// §22 **Model B2 cross-Worker** mirror registry: `slot → the code handle installed there` (or `-1`
@@ -1787,10 +1787,10 @@ pub extern "C" fn temen_par_jit_slot_code(slot: u32) -> i32 {
 pub extern "C" fn temen_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
     par_jit_rt()
         .and_then(|cfg| {
-            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
             g.resolve_jit_code(handle)
                 .ok()
-                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .and_then(|(cd, cu)| g.jit_unit_wasm_or_emit(cd, cu))
                 .map(|w| w.len())
         })
         .unwrap_or(0)
@@ -1801,10 +1801,10 @@ pub extern "C" fn temen_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
 pub extern "C" fn temen_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 {
     par_jit_rt()
         .and_then(|cfg| {
-            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
             g.resolve_jit_code(handle)
                 .ok()
-                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .and_then(|(cd, cu)| g.jit_unit_wasm_or_emit(cd, cu))
                 .map(|w| w.as_ptr())
         })
         .unwrap_or(core::ptr::null())
@@ -2279,8 +2279,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 let resolved = if let Some(pb) = par_pb() {
                     par_resolve_unit(pb, handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
-                    let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                    par_resolve_unit_rt(&g, handle, code).map(|(f, t, _)| (f, t))
+                    let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                    par_resolve_unit_rt(&mut g, handle, code).map(|(f, t, _)| (f, t))
                 } else {
                     return PAR_TRAP;
                 };
@@ -2336,8 +2336,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     // resolves through the same host — a forged / cross-domain handle traps identically.
                     // Codegen off / v128 / a unit outside the emitter subset ⇒ the interpreter services it.
                     let resolved = {
-                        let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                        par_resolve_unit_rt(&g, handle, code)
+                        let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                        par_resolve_unit_rt(&mut g, handle, code)
                     };
                     match resolved {
                         Err(t) => v
@@ -12818,7 +12818,7 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     s.jit_wasm_by_handle = h
         .resolve_jit_code(code)
         .ok()
-        .and_then(|(cd, cu)| h.jit_unit_wasm(cd, cu));
+        .and_then(|(cd, cu)| h.jit_unit_wasm_or_emit(cd, cu)); // #1301
     s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }
 

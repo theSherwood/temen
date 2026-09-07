@@ -12597,7 +12597,8 @@ impl CoopSched {
                         // (a `Jit.invoke` runs against the shared root powerbox/window).
                         let wasm = host.resolve_jit_domain(h).ok().and_then(|domain| {
                             let (cd, cu) = host.resolve_jit_code(code).ok()?;
-                            (cd == domain).then(|| host.jit_unit_wasm(cd, cu))?
+                            (cd == domain).then(|| host.jit_unit_wasm_or_emit(cd, cu))?
+                            // #1301
                         });
                         let mapped = match mem.as_ref() {
                             None => Some(0),
