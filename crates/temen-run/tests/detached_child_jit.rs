@@ -171,3 +171,71 @@ fn an_exhausted_minter_refuses_probeably_on_both_backends() {
     assert_eq!(run_interp(&p, &c, (1 << 16) - 1), -22);
     assert_eq!(run_jit(&p, &c, (1 << 16) - 1), -22);
 }
+
+/// A parent that only issues the 7-arg op 15 and returns its result — no window stores, so it runs
+/// unchanged under a **durable** host (whose shadow reserve spans `[0, 64 KiB)`).
+const SPAWN_ONLY_PARENT: &str = r#"memory 17
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vmh = i64.extend_i32_u v1
+  vmin = i64.extend_i32_u v2
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 16
+  vq = i64.const 0
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
+  vr = i64.extend_i32_s vs
+  return vr
+  }
+}
+"#;
+
+/// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` on both backends, probeably, and
+/// the minter keeps its whole quota (#1299 pins the native thunk's gate alongside the tree-walker's).
+#[test]
+fn a_durable_domain_refuses_a_detached_spawn_on_both_backends() {
+    let p = module(SPAWN_ONLY_PARENT);
+    let c = module(CHILD);
+    for jit in [false, true] {
+        let (mut host, h) = host(&c, 1 << 16);
+        host.set_durable(true);
+        let r = if jit {
+            let args = [h[0] as i64, h[1] as i64, h[2] as i64];
+            let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
+                &p,
+                0,
+                &args,
+                &[],
+                temen_ir::DEFAULT_RESERVED_LOG2,
+                temen_run::cap_thunk,
+                &mut host as *mut Host as *mut c_void,
+                Some(temen_run::module_resolver),
+                Some(grant_hooks()),
+            )
+            .expect("jit run");
+            match jo {
+                JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+                ref o => panic!("jit ended abnormally: {o:?}"),
+            }
+        } else {
+            let mut fuel = 50_000_000u64;
+            let r = run_with_host(
+                &p,
+                0,
+                &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
+                &mut fuel,
+                &mut host,
+            )
+            .expect("interp run");
+            match r.first() {
+                Some(Value::I64(x)) => *x,
+                other => panic!("unexpected interp result {other:?}"),
+            }
+        };
+        assert_eq!(r, -22, "jit={jit}: EINVAL, not a trap");
+        assert!(
+            host.window_minter_take(h[2], 1 << 16),
+            "jit={jit}: the refusal charged the minter nothing"
+        );
+    }
+}

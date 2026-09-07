@@ -4141,7 +4141,15 @@ impl<'p> Vcpu<'p> {
         };
         let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
         let payload_ok = payload.len() as u64 <= args_room;
-        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok {
+        // A **durable** domain refuses op 15 outright (PROCESS.md §5): a detached window is outside
+        // the subtree snapshot, and a child no freeze can see is worse than a probeable `-EINVAL`.
+        // The tree-walker and the native thunk gate the same way; this arm must too (#1299) — and
+        // before the quota take below, so the refusal charges nothing.
+        let durable = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().is_durable(),
+            None => self.host.is_durable(),
+        };
+        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || durable {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
