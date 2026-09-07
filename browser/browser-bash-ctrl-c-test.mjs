@@ -80,6 +80,14 @@ try {
     `${CARD} pre.stdout`, { timeout: 60000 });
 
   // The prompt is fully usable: a second command runs cleanly with a fresh $? = 0.
+  // #1309 — the `BACK=130` wait resolves the instant that line drains, which can beat bash
+  // reprinting PS1 and re-parking its prompt read; feeding `echo AGAIN=$?` into that window loses
+  // it. Wait for the reprinted prompt (the pane ends with `$ `) and let its read park first — the
+  // same settle the test does before feeding `cat` above.
+  await page.waitForFunction(
+    (sel) => document.querySelector(sel).textContent.trimEnd().endsWith('$'),
+    `${CARD} pre.stdout`, { timeout: 60000 });
+  await page.waitForTimeout(500); // let the reprinted prompt's read park before the follow-up
   await term.fill('echo AGAIN=$?');
   await term.press('Enter');
   await page.waitForFunction(
