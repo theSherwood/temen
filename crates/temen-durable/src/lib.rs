@@ -291,6 +291,9 @@ fn is_guest_mem_op(inst: &Inst) -> bool {
             | Inst::AtomicCmpxchg { .. }
             | Inst::V128Load { .. }
             | Inst::V128Store { .. }
+            | Inst::MemCopy { .. }
+            | Inst::MemMove { .. }
+            | Inst::MemFill { .. }
             | Inst::MemoryWait { .. } // reads the window value at `addr`
     )
 }
@@ -308,7 +311,51 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
         IntBin { a, b, .. } | IntCmp { a, b, .. } | FBin { a, b, .. } | FCmp { a, b, .. } => {
             vec![*a, *b]
         }
-        IntUn { a, .. } | FUn { a, .. } | Eqz { a, .. } => vec![*a],
+        IntUn { a, .. }
+        | FUn { a, .. }
+        | Eqz { a, .. }
+        | Convert { a, .. }
+        | FToISat { a, .. }
+        | FToITrap { a, .. }
+        | IToFConv { a, .. }
+        | Cast { a, .. }
+        | Splat { a, .. }
+        | ExtractLane { a, .. }
+        | VIntUn { a, .. }
+        | VFloatUn { a, .. }
+        | VPopcnt { a, .. }
+        | VWiden { a, .. }
+        | VConvert { a, .. }
+        | VExtAddPairwise { a, .. }
+        | VAnyTrue { a, .. }
+        | VAllTrue { a, .. }
+        | VBitmask { a, .. }
+        | VNot { a, .. } => vec![*a],
+        Fma { a, b, c, .. } | VFma { a, b, c, .. } => vec![*a, *b, *c],
+        ReplaceLane { a, b, .. }
+        | VIntBin { a, b, .. }
+        | VIntCmp { a, b, .. }
+        | VFloatBin { a, b, .. }
+        | VFloatCmp { a, b, .. }
+        | VPMinMax { a, b, .. }
+        | VSatBin { a, b, .. }
+        | VAvgr { a, b, .. }
+        | VDot { a, b, .. }
+        | VDotI8 { a, b, .. }
+        | VExtMul { a, b, .. }
+        | VQ15MulrSat { a, b, .. }
+        | VNarrow { a, b, .. }
+        | VBitBin { a, b, .. }
+        | Shuffle { a, b, .. }
+        | Swizzle { a, b, .. } => vec![*a, *b],
+        VShift { a, amt, .. } => vec![*a, *amt],
+        Bitselect { a, b, mask } => vec![*a, *b, *mask],
+        DataSym { .. } | DataSelf { .. } | DataTop | CapSelfTypeId { .. } | ExportHandle { .. } => {
+            vec![]
+        }
+        CapSelfCovers { handle, .. } => vec![*handle],
+        MemCopy { dst, src, len } | MemMove { dst, src, len } => vec![*dst, *src, *len],
+        MemFill { dst, val, len } => vec![*dst, *val, *len],
         Select { cond, a, b } => vec![*cond, *a, *b],
         Load { addr, .. } | AtomicLoad { addr, .. } | V128Load { addr, .. } => vec![*addr],
         Store { addr, value, .. }
@@ -330,12 +377,15 @@ fn inst_operands(i: &Inst) -> Option<Vec<ValIdx>> {
         } => vec![*addr, *expected, *timeout],
         MemoryNotify { addr, count } => vec![*addr, *count],
         Call { args, .. } => args.clone(),
-        CapCall { handle, args, .. } => {
+        CapCall { handle, args, .. }
+        | CallImportDyn { handle, args, .. }
+        | CallSym { handle, args, .. } => {
             let mut v = Vec::with_capacity(args.len() + 1);
             v.push(*handle);
             v.extend_from_slice(args);
             v
         }
+        CallImport { args, .. } => args.clone(),
         CallIndirect { idx, args, .. } => {
             let mut v = Vec::with_capacity(args.len() + 1);
             v.push(*idx);
@@ -430,9 +480,14 @@ fn compute_may_suspend(funcs: &[Func], types: &[TypeEntry]) -> Vec<bool> {
             b.insts.iter().any(|x| {
                 // `call.cap` suspends to the host; a fiber `cont.resume`/`suspend` switches
                 // stacks and is a freeze safepoint too (`cont.new` alone merely allocates).
+                // `call.import` / `call.import.dyn` / `call.sym` are capability calls bound at
+                // run time (IMPORTS.md) — the same host suspend as `call.cap` (#1300 Phase 2).
                 matches!(
                     x,
                     Inst::CapCall { .. }
+                        | Inst::CallImport { .. }
+                        | Inst::CallImportDyn { .. }
+                        | Inst::CallSym { .. }
                         | Inst::ContResume { .. }
                         | Inst::Suspend { .. }
                         | Inst::ThreadJoin { .. }
@@ -748,6 +803,9 @@ fn transform_func(
             .enumerate()
             .filter(|(_, inst)| match inst {
                 Inst::CapCall { .. }
+                | Inst::CallImport { .. }
+                | Inst::CallImportDyn { .. }
+                | Inst::CallSym { .. }
                 | Inst::ContResume { .. }
                 | Inst::Suspend { .. }
                 | Inst::ThreadJoin { .. }
@@ -880,9 +938,6 @@ fn transform_func(
         if is_header[b] {
             let plen = bi.plen;
             let slot_types = bi.types[0..plen].to_vec();
-            if slot_types.contains(&ValType::V128) {
-                return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
-            }
             let spilled: Vec<usize> = (0..plen).collect(); // all params (loop-carried, live)
             let mut frame_offsets = Vec::with_capacity(plen);
             let mut off = 0u64;
@@ -960,7 +1015,14 @@ fn transform_func(
                         handle: *handle,
                         args: args.clone(),
                     },
-                    Inst::CapCall { .. } => SuspendKind::Leaf,
+                    // A runtime-bound capability call is a leaf exactly like `call.cap`: the host
+                    // effect happened before the freeze, so the thaw reloads its result. (A
+                    // durable domain never resolves an import to a serve op — `Host::import_binding`
+                    // fails those closed — so the `SvcServe` re-issue case cannot hide behind one.)
+                    Inst::CapCall { .. }
+                    | Inst::CallImport { .. }
+                    | Inst::CallImportDyn { .. }
+                    | Inst::CallSym { .. } => SuspendKind::Leaf,
                     Inst::Call { func, args } => SuspendKind::Propagated {
                         callee: *func,
                         args: args.clone(),
@@ -987,13 +1049,17 @@ fn transform_func(
                         timeout: *timeout,
                     },
                     _ => unreachable!(
-                        "suspend position is a call.cap / call / fiber / thread.join / atomic.wait op"
+                        "suspend position is a call.cap / call.import / call / fiber / thread.join / atomic.wait op"
                     ),
                 };
                 let nres = match (&kind, &blk.insts[pos]) {
-                    (SuspendKind::Leaf, Inst::CapCall { sig, .. }) => {
-                        sig_of(type_section, *sig).results.len()
-                    }
+                    (
+                        SuspendKind::Leaf,
+                        Inst::CapCall { sig, .. }
+                        | Inst::CallImport { sig, .. }
+                        | Inst::CallImportDyn { sig, .. }
+                        | Inst::CallSym { sig, .. },
+                    ) => sig_of(type_section, *sig).results.len(),
                     (SuspendKind::SvcServe { .. }, Inst::CapCall { sig, .. }) => {
                         sig_of(type_section, *sig).results.len()
                     }
@@ -1063,9 +1129,6 @@ fn transform_func(
                 } else {
                     (0..save_end).filter(|&i| used[i]).collect()
                 };
-                if spilled.iter().any(|&i| slot_types[i] == ValType::V128) {
-                    return Err(TransformError::UnsupportedInst); // v128 spill/reload: future work
-                }
                 // Frame layout (DURABILITY.md §12.7): packed spilled values, resume id on top.
                 let mut frame_offsets = Vec::with_capacity(spilled.len());
                 let mut off = 0u64;
@@ -1150,12 +1213,7 @@ fn transform_func(
         let sp_a = ub.one(Inst::DurableShadowBase);
         let sp = ub.one(load(LoadOp::I64, sp_a, 0)); // this activation's frame base
         for (j, &i) in pt.spilled.iter().enumerate() {
-            ub.zero(store(
-                store_op(pt.slot_types[i]),
-                sp,
-                i as u32,
-                pt.frame_offsets[j],
-            ));
+            ub.zero(spill(pt.slot_types[i], sp, i as u32, pt.frame_offsets[j]));
         }
         let rid = ub.one(Inst::ConstI32(gid as i32 + 1));
         ub.zero(store(StoreOp::I32, sp, rid, pt.rid_off));
@@ -1175,7 +1233,7 @@ fn transform_func(
             .spilled
             .iter()
             .enumerate()
-            .map(|(j, &i)| ab.one(load(load_op(pt.slot_types[i]), base, pt.frame_offsets[j])))
+            .map(|(j, &i)| ab.one(reload(pt.slot_types[i], base, pt.frame_offsets[j])))
             .collect();
         ab.zero(store(StoreOp::I64, sp_a, base, 0)); // pop: SP = frame base
 
@@ -1571,30 +1629,43 @@ fn align_up(x: u64, a: u64) -> u64 {
     (x + a - 1) & !(a - 1)
 }
 
-fn store_op(t: ValType) -> StoreOp {
-    match t {
+/// Spill one frame slot of type `t` at `addr + offset` (#1300 Phase 2: a `v128` slot spills
+/// through `v128.store`, 16-byte aligned by the frame layout; every scalar through `store`).
+fn spill(t: ValType, addr: ValIdx, value: ValIdx, offset: u64) -> Inst {
+    let op = match t {
         ValType::I32 | ValType::Cap => StoreOp::I32,
         ValType::I64 | ValType::Ref => StoreOp::I64, // `ref` spills as its opaque i64 word
         ValType::F32 => StoreOp::F32,
         ValType::F64 => StoreOp::F64,
-        ValType::V128 => unreachable!("v128 spill rejected earlier"),
-    }
+        ValType::V128 => {
+            return Inst::V128Store {
+                addr,
+                value,
+                offset,
+            }
+        }
+    };
+    store(op, addr, value, offset)
 }
 
-fn load_op(t: ValType) -> LoadOp {
-    match t {
+/// Reload one frame slot of type `t` from `addr + offset` — the twin of [`spill`].
+fn reload(t: ValType, addr: ValIdx, offset: u64) -> Inst {
+    let op = match t {
         ValType::I32 | ValType::Cap => LoadOp::I32,
         ValType::I64 | ValType::Ref => LoadOp::I64, // `ref` reloads as its opaque i64 word
         ValType::F32 => LoadOp::F32,
         ValType::F64 => LoadOp::F64,
-        ValType::V128 => unreachable!("v128 reload rejected earlier"),
-    }
+        ValType::V128 => return Inst::V128Load { addr, offset },
+    };
+    load(op, addr, offset)
 }
 
 /// Result types of an instruction, given the types of all earlier values in the block
 /// and each function's result types. Covers the scalar/memory/call subset a Phase-1
-/// prefix can use; returns `UnsupportedInst` for anything else (SIMD, the remaining
-/// concurrency ops), so the transform fails closed rather than mis-typing a frame.
+/// prefix can use; returns `UnsupportedInst` for anything else — the ops whose state does not
+/// live in values the shadow frame can carry: `setjmp`/`longjmp` (an interpreter-frame jump
+/// buffer), `gc.roots`, `import.attach` (host binding-table mutation) and vCPU TLS — so the
+/// transform fails closed rather than mis-typing a frame.
 ///
 /// Deliberately **not** `temen_verify::func_value_types` (#913): that one is whole-function and
 /// **total** — it types every op and degrades gracefully (an underivable value is simply absent)
@@ -1625,6 +1696,46 @@ fn result_types(
         FToISat { op, .. } | FToITrap { op, .. } => vec![op.parts().1.val()],
         IToFConv { op, .. } => vec![op.parts().1.val()],
         Cast { op, .. } => vec![op.sig().2],
+        Fma { ty, .. } => vec![ty.val()],
+        // Address constants and §3.5 reflection: pure, one scalar each.
+        DataSym { .. } | DataSelf { .. } | DataTop => vec![ValType::I64],
+        CapSelfTypeId { .. } | CapSelfCovers { .. } | ExportHandle { .. } => vec![ValType::I32],
+        // Bulk memory ops: no results (guest-memory ops — the strict gate refuses them, the
+        // confined path admits them, like `load`/`store`).
+        MemCopy { .. } | MemMove { .. } | MemFill { .. } => vec![],
+        // §17 SIMD (#1300 Phase 2): a `v128` spills/reloads through its own load/store ops, so
+        // every vector op types like any scalar — one `v128`, a lane scalar, or an `i32` mask.
+        V128Load { .. }
+        | Splat { .. }
+        | ReplaceLane { .. }
+        | VIntBin { .. }
+        | VIntCmp { .. }
+        | VShift { .. }
+        | VFloatBin { .. }
+        | VFloatCmp { .. }
+        | VPMinMax { .. }
+        | VFma { .. }
+        | VFloatUn { .. }
+        | VIntUn { .. }
+        | VPopcnt { .. }
+        | VSatBin { .. }
+        | VAvgr { .. }
+        | VDot { .. }
+        | VDotI8 { .. }
+        | VExtMul { .. }
+        | VExtAddPairwise { .. }
+        | VQ15MulrSat { .. }
+        | VWiden { .. }
+        | VNarrow { .. }
+        | VConvert { .. }
+        | VBitBin { .. }
+        | VNot { .. }
+        | Bitselect { .. }
+        | Shuffle { .. }
+        | Swizzle { .. } => vec![ValType::V128],
+        ExtractLane { shape, .. } => vec![shape.lane_val()],
+        VAnyTrue { .. } | VAllTrue { .. } | VBitmask { .. } => vec![ValType::I32],
+        V128Store { .. } => vec![],
         AtomicLoad { ty, .. } | AtomicRmw { ty, .. } | AtomicCmpxchg { ty, .. } => vec![ty.val()],
         Store { .. } | AtomicStore { .. } | AtomicFence { .. } => vec![],
         Select { a, .. } => vec![types[*a as usize]],
@@ -1633,7 +1744,10 @@ fn result_types(
             .get(*func as usize)
             .cloned()
             .ok_or(TransformError::UnsupportedShape)?,
-        CapCall { sig, .. } => sig_of(type_section, *sig).results.clone(),
+        CapCall { sig, .. }
+        | CallImport { sig, .. }
+        | CallImportDyn { sig, .. }
+        | CallSym { sig, .. } => sig_of(type_section, *sig).results.clone(),
         CallIndirect { ty, .. } => sig_of(type_section, *ty).results.clone(),
         RefFunc { .. } => vec![ValType::I32],
         // Fiber control ops (§12 / Phase 3): an i64 handle, a `(status, value)` pair, a resume arg.
@@ -1732,6 +1846,59 @@ mod tests {
             18,
         );
         let out = transform_module(&m).expect("conversions are in the Phase-2 prefix model");
+        temen_verify::verify_module(&out).expect("instrumented IR must verify");
+        assert_eq!(
+            out.funcs[0].blocks.len(),
+            8,
+            "one point: 4n+4 blocks with n=1"
+        );
+    }
+
+    /// #1300 Phase 2 (item 3, v128 half): a `v128` live across the suspend point spills through
+    /// `v128.store` into a 16-byte-aligned frame slot and reloads through `v128.load`; the
+    /// instrumented function verifies.
+    #[test]
+    fn a_v128_live_across_the_suspend_point_instruments_and_verifies() {
+        let m = parse_with_mem(
+            "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+             v1 = i64.const 7\n  v2 = i64x2.splat v1\n  v3 = i32.const 0\n  \
+             v4 = call.cap 2 0 (i32) -> (i64) v0 (v3)\n  \
+             v5 = i64x2.extract_lane 1 v2\n  v6 = i64.add v4 v5\n  return v6\n  }\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("a v128 in the live set is in scope");
+        temen_verify::verify_module(&out).expect("instrumented IR must verify");
+        let spills = out.funcs[0]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i, Inst::V128Store { .. }))
+            .count();
+        let reloads = out.funcs[0]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter(|i| matches!(i, Inst::V128Load { .. }))
+            .count();
+        assert_eq!(
+            (spills, reloads),
+            (1, 1),
+            "the v128 spills once and reloads once"
+        );
+    }
+
+    /// #1300 Phase 2: a `call.import` (a capability call bound at run time) is a suspend point
+    /// exactly like `call.cap` — the function is may-suspend, the site gets a poll + resume arm,
+    /// and the instrumented IR verifies.
+    #[test]
+    fn a_call_import_is_a_leaf_suspend_point() {
+        let m = parse_with_mem(
+            "import 0 \"clock\" (i32) -> (i64)\n\
+             func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  \
+             v2 = call.import 0 (v1)\n  v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
+            18,
+        );
+        let out = transform_module(&m).expect("call.import is a modeled suspend point");
         temen_verify::verify_module(&out).expect("instrumented IR must verify");
         assert_eq!(
             out.funcs[0].blocks.len(),
