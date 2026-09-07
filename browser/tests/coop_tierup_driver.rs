@@ -3297,10 +3297,21 @@ fn warm_grow_guest_text(mem_h: i32, out_h: i32) -> String {
     // The on-ramp brk word sits one guard up on the #1094 marked layout (see `warm_coop_guest_text`).
     let brk = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_HEAP_BRK;
     // A `readonly` segment arms the **paged** coop tier — the mode every real on-ramp card runs in
-    // (they all lay `.rodata` out this way, and the JACL compiler-guest reports `PAGED=true`). Paged
-    // mode is also what keeps the leaf tiering up here: the per-access page check replaces the #717
-    // one-bound `scalar_extent`, which a restored warm window's explicit page entries make
-    // unrepresentable, so a non-paged warm guest declines every tier-up.
+    // (they all lay `.rodata` out this way, and the JACL compiler-guest reports `PAGED=true`).
+    //
+    // Paged mode is also what keeps the leaf tiering up *in this test*, for a reason particular to
+    // the guest below rather than to warm sessions: a warm module is **not** re-declared to the
+    // session window (#816 — the heap `vm_map`-grows into `[declared, backing)` instead), so `mapped`
+    // here is `1 << 16`, and mapping at `WARM_MAPPED_LOG2` leaves a hole between the two. That is a
+    // **sparse** map, which the #717 one-bound `scalar_extent` cannot represent, so a non-paged run
+    // would decline the tier-up and interpret the leaf — the documented fail-closed behavior
+    // `tierup_grow_window.rs::sparse_map_declines_tierup_and_stays_correct` pins. The paged tier's
+    // per-access page check carries it instead.
+    //
+    // A real allocator is not sparse: the synthesized `__temen_malloc` bases its heap at
+    // `1 << declared_log2` — exactly `mapped` — and grows contiguously upward, so it stays
+    // one-bound representable and tiers up non-paged too. Verified directly: the same guest with the
+    // rodata dropped and the map moved to `65536` reports `tierups=1`.
     format!(
         r#"memory 16
 data ro 24576 "temen-warm-grow-rodata!!"
