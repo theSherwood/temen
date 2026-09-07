@@ -12831,9 +12831,7 @@ fn bash_temen_transcript(
     };
     let run = match backend {
         None => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)]),
-        Some(false) => {
-            inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)])
-        }
+        Some(false) => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)]),
         Some(true) => inst.run_with_caps_parallel(&config, &[("posix", cap)]),
     }
     .unwrap_or_else(|e| panic!("bash -i transcript session ({backend:?}): {e}"));
@@ -13480,7 +13478,9 @@ fn demo_bash_translates_and_verifies() {
             "\x04",
         ];
         match bash_pty_oracle_transcript(&oracle, chunks) {
-            None => eprintln!("note: skipping the interactive transcript differential (no python3/pty)"),
+            None => {
+                eprintln!("note: skipping the interactive transcript differential (no python3/pty)")
+            }
             Some(native) => {
                 let native = String::from_utf8_lossy(&native).into_owned();
                 assert!(
