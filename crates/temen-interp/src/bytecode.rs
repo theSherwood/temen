@@ -5117,6 +5117,33 @@ pub struct DebugRun {
     /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
     /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
     last_watch: Option<(u64, bool)>,
+    /// Value watchpoints on SSA-held (address-less) source variables (#1229): stop when a watched
+    /// variable's holding value **changes**. The window-range `watchpoints` can't reach these — a
+    /// promoted scalar has no address. Empty in the common case; the DAP backend re-applies the set
+    /// after a `seek` rebuild, preserving each id's running `last` across an in-place re-apply.
+    value_watches: Vec<ValueWatchRun>,
+}
+
+/// A resolved value-watch target for the bytecode engine — frame-independent so the DAP backend can
+/// re-apply it verbatim after a `seek` rebuild: the owning function, how to find the variable's
+/// holding value at any pc ([`ValueSite`]), and the arm-time baseline value. Opaque to the DAP layer
+/// (it only stores and hands these back).
+#[derive(Clone)]
+pub struct ValueWatchTarget {
+    func: u32,
+    site: super::ValueSite,
+    last: super::Reg,
+}
+
+/// A value watch live in a [`DebugRun`] — a [`ValueWatchTarget`] plus the caller-owned [`WatchId`]
+/// and the running `last` value (updated on each fire so the next change re-fires). Kind gates
+/// firing (change is a write; a `Read`-only value watch never fires — an SSA value has no read).
+struct ValueWatchRun {
+    id: super::WatchId,
+    func: u32,
+    site: super::ValueSite,
+    last: super::Reg,
+    kind: super::WatchKind,
 }
 
 /// The watched range the op at module-0 `(func, block, inst)` would hit, from the live block-local
@@ -5156,6 +5183,44 @@ fn watch_hit_before(
                 (base < w_end && *addr < end && kind.fires_on(write)).then_some((base, write))
             })
         })
+}
+
+/// The first value watch whose variable's holding SSA value **changed** since it was last seen, for
+/// the top frame at module-0 `(func, block, inst)` — the bytecode counterpart of the tree-walker's
+/// `DebugShared::value_watch_hit` (#1229). Reads the holding slot from the top frame's window
+/// (`vm.base + block-base + value-index`) and updates the watch's `last` in passing, so the next
+/// change re-fires. `Some(())` ⇒ pause; a `Read`-only kind never fires (an SSA value has no read).
+/// A free fn so it borrows only the pieces `run_to` has split out of `&mut self`.
+fn value_watch_hit_before(
+    vm: &Vm,
+    fn_block_base: &[Vec<u32>],
+    value_watches: &mut [ValueWatchRun],
+    func: FuncIdx,
+    block: usize,
+    inst: usize,
+) -> Option<()> {
+    let base_off = *fn_block_base.get(func as usize)?.get(block)? as usize;
+    for w in value_watches.iter_mut() {
+        if w.func != func || !w.kind.fires_on(true) {
+            continue;
+        }
+        let idx = match &w.site {
+            super::ValueSite::Single(s) => *s as usize,
+            // Not live at this pc (no covering loclist entry) ⇒ don't compare.
+            super::ValueSite::List(locs) => match super::loclist_value(locs, block, inst) {
+                Some(s) => s as usize,
+                None => continue,
+            },
+        };
+        let Some(&cur) = vm.regs.get(vm.base + base_off + idx) else {
+            continue;
+        };
+        if w.last != cur {
+            w.last = cur;
+            return Some(());
+        }
+    }
+    None
 }
 
 /// A debug-session **access sink** (INTERACTIVE_EMBEDDING.md slice 3): observes every module-0
@@ -5780,6 +5845,28 @@ impl<'a> FrameReader<'a> {
             VarLoc::Fixed { addr } => Some(*addr),
         }
     }
+
+    /// Resolve a source variable held in an **SSA value** (no window address) to a value-watch
+    /// target (#1229): its owning function, how to find its holding value at any pc, and the current
+    /// (arm-time) holding value as the change baseline. `None` for a memory-located var (watch it by
+    /// address instead), an unknown name, or a var not live at this frame's pc.
+    fn value_watch_target(&self, depth: usize, name: &str) -> Option<(u32, super::ValueSite, Reg)> {
+        let (module, func, block, inst, base) = self.frame_at(depth)?;
+        let di = self.md_for(module)?.0?;
+        let var = super::pick_var(di, func as FuncIdx, name, block, inst)?;
+        let (site, idx) = match &var.loc {
+            VarLoc::Ssa { value } => (super::ValueSite::Single(*value), *value as usize),
+            VarLoc::SsaList(locs) => (
+                super::ValueSite::List(locs.clone()),
+                super::loclist_value(locs, block, inst)? as usize,
+            ),
+            // Memory-located: watchable by address (the window-range watch), not by value.
+            VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => return None,
+        };
+        let off = *self.md_for(module)?.1.get(func)?.get(block)? as usize;
+        let last = *self.vm.regs.get(base + off + idx)?;
+        Some((func as u32, site, last))
+    }
 }
 
 impl DebugRun {
@@ -5852,6 +5939,7 @@ impl DebugRun {
             scheduled_writes: Vec::new(),
             write_cursor: 0,
             last_watch: None,
+            value_watches: Vec::new(),
         })
     }
 
@@ -5864,9 +5952,47 @@ impl DebugRun {
 
     /// Take the `(addr, write)` of the watchpoint the last `run_to` stopped before (cleared by the
     /// read), so the caller can report `StopReason::Watchpoint`. `None` if the last stop was a plain
-    /// breakpoint / step.
+    /// breakpoint / step. A **value** watch (#1229) reports `(0, true)` — it has no window address.
     pub fn take_watch_hit(&mut self) -> Option<(u64, bool)> {
         self.last_watch.take()
+    }
+
+    /// Resolve a source variable held in an SSA value (no window address) to a value-watch target
+    /// (#1229), for the frame `depth` levels from the top. `None` for a memory-located var (watch it
+    /// by address via [`var_addr`](DebugRun::var_addr)/[`set_watchpoints`](DebugRun::set_watchpoints)),
+    /// an unknown name, or one not live at the stopped pc. The target is frame-independent, so the DAP
+    /// backend can re-apply it verbatim after a `seek` rebuild.
+    pub fn resolve_value_watch(&self, depth: usize, name: &str) -> Option<ValueWatchTarget> {
+        let (func, site, last) = self.reader().value_watch_target(depth, name)?;
+        Some(ValueWatchTarget { func, site, last })
+    }
+
+    /// Replace the armed **value watchpoints** (#1229) — each `(id, target, kind)` makes `run_to`
+    /// stop when the target variable's holding value changes. Re-applied by the DAP backend after a
+    /// `seek` rebuild; an id already armed keeps its running `last` (so re-applying to arm *another*
+    /// watch doesn't reset a live one's baseline), while an id new to this run seeds from the target's
+    /// arm-time baseline (a fresh `seek`-rebuilt run starts them all from the target baseline).
+    pub fn set_value_watches(
+        &mut self,
+        watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
+    ) {
+        self.value_watches = watches
+            .into_iter()
+            .map(|(id, target, kind)| {
+                let last = self
+                    .value_watches
+                    .iter()
+                    .find(|w| w.id == id)
+                    .map_or(target.last, |w| w.last);
+                ValueWatchRun {
+                    id,
+                    func: target.func,
+                    site: target.site,
+                    last,
+                    kind,
+                }
+            })
+            .collect();
     }
 
     /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
@@ -6088,6 +6214,7 @@ impl DebugRun {
             scheduled_writes,
             write_cursor,
             last_watch,
+            value_watches,
             ..
         } = self;
         // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
@@ -6140,17 +6267,40 @@ impl DebugRun {
                 let cur_mem = &*mem;
                 match cur_vm.cur_ir_pc(source) {
                     Some(pc) if bps.contains(&pc) => Some((pc, None)),
-                    Some(pc) if !watchpoints.is_empty() && pc.module == 0 => watch_hit_before(
-                        cur_vm,
-                        cur_mem,
-                        funcs,
-                        fn_block_base,
-                        watchpoints,
-                        pc.func,
-                        pc.block,
-                        pc.inst,
-                    )
-                    .map(|w| (pc, Some(w))),
+                    Some(pc)
+                        if pc.module == 0
+                            && (!watchpoints.is_empty() || !value_watches.is_empty()) =>
+                    {
+                        // A window-range watch stops *before* the access; a value watch (#1229)
+                        // stops when a watched SSA-held variable's value changed. A value watch has
+                        // no window address, so it reports addr 0 (the DAP maps the variant, not the
+                        // address).
+                        if let Some(w) = watch_hit_before(
+                            cur_vm,
+                            cur_mem,
+                            funcs,
+                            fn_block_base,
+                            watchpoints,
+                            pc.func,
+                            pc.block,
+                            pc.inst,
+                        ) {
+                            Some((pc, Some(w)))
+                        } else if value_watch_hit_before(
+                            cur_vm,
+                            fn_block_base,
+                            value_watches,
+                            pc.func,
+                            pc.block,
+                            pc.inst,
+                        )
+                        .is_some()
+                        {
+                            Some((pc, Some((0, true))))
+                        } else {
+                            None
+                        }
+                    }
                     _ => None,
                 }
             };

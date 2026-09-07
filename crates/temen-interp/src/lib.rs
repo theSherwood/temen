@@ -418,6 +418,38 @@ struct Watch {
     kind: WatchKind,
 }
 
+/// How to find a promoted scalar's holding SSA value at a given pc — mirrors the SSA cases of
+/// [`temen_ir::VarLoc`]. Resolved from the var's debug location at arm time so the per-op seam
+/// needs no debug info (only the loclist we captured). `pub(crate)` so the bytecode engine shares it.
+#[derive(Clone)]
+pub(crate) enum ValueSite {
+    /// A single function-wide value index ([`VarLoc::Ssa`]).
+    Single(u32),
+    /// A per-block location list ([`VarLoc::SsaList`]): the holding value index varies through the
+    /// function; resolve it at the stopped pc with [`loclist_value`].
+    List(Vec<SsaLoc>),
+}
+
+/// A **value watchpoint** — a source variable held in an SSA value with **no window address**
+/// (`VarLoc::Ssa`/`SsaList`, the chibicc-promoted-scalar case), watched by value: the run pauses
+/// when the variable's holding value *changes* (#1229). This is the register-file analogue of the
+/// window-range [`Watch`]; the range watch can't reach these because there is no address to watch.
+///
+/// **Function-scoped, change-detection only.** The watch fires whenever the named variable in
+/// function `func` changes value, in whichever activation of that function is executing — so under
+/// recursion it fires across activations, not only the one it was armed in (acceptable for the
+/// teaching/debugger case; frame-precise scoping is a follow-up). Only value *change* is
+/// observable for an SSA value (there is no distinct "read"), so `Read`-only never fires.
+struct ValueWatch {
+    id: WatchId,
+    func: u32,
+    site: ValueSite,
+    /// The last-seen holding value; seeded at arm time so a change on the very next op is caught.
+    /// `None` when the variable was not live at the arming pc — seeded lazily on first sighting.
+    last: Option<Reg>,
+    kind: WatchKind,
+}
+
 /// Debug state **shared by every vCPU** of a debugged run (DEBUGGING.md W2/Milestone B):
 /// breakpoints and watchpoints are global — a breakpoint fires in whichever thread reaches it, a
 /// watchpoint on whichever thread touches the range. (Logical time and the pending single-step are
@@ -429,6 +461,10 @@ struct DebugShared {
     /// Window-range watchpoints. Empty in the common case, so the hot loop skips the (confining)
     /// `access_of` computation entirely when none are armed (S4 cost gating).
     watchpoints: Vec<Watch>,
+    /// Value watchpoints on SSA-held (address-less) source variables (#1229). Empty in the common
+    /// case, so the per-op seam skips them entirely. Shares the [`next_watch`](DebugShared::next_watch)
+    /// id space with `watchpoints`, so a single `WatchId` names either kind.
+    value_watches: Vec<ValueWatch>,
     next_watch: u32,
     /// Pause before every `call.cap` (the host boundary, DEBUGGING.md S5).
     cap_stops: bool,
@@ -443,6 +479,7 @@ impl DebugShared {
         DebugShared {
             breakpoints: BTreeSet::new(),
             watchpoints: Vec::new(),
+            value_watches: Vec::new(),
             next_watch: 0,
             cap_stops: false,
             suppress_stops: false,
@@ -480,6 +517,45 @@ impl DebugShared {
             let overlaps = base < w_end && w.addr < end;
             (overlaps && w.kind.fires_on(write)).then_some((base, write))
         })
+    }
+
+    /// First value watchpoint whose variable's holding SSA value **changed** since it was last seen,
+    /// evaluated for the frame at `(func, block, inst)` with live values `vals` (#1229). Updates the
+    /// watch's stored `last` in passing, so the next change re-fires. `None` when nothing changed (or
+    /// no value watch covers this frame/pc). A value watch is change-detection only — a `Read`-only
+    /// kind never fires.
+    fn value_watch_hit(
+        &mut self,
+        func: u32,
+        vals: &[Reg],
+        block: usize,
+        inst: usize,
+    ) -> Option<WatchId> {
+        for w in self.value_watches.iter_mut() {
+            if w.func != func || !w.kind.fires_on(true) {
+                continue;
+            }
+            let slot = match &w.site {
+                ValueSite::Single(s) => *s as usize,
+                // Not live at this pc (no covering loclist entry) ⇒ don't compare.
+                ValueSite::List(locs) => match loclist_value(locs, block, inst) {
+                    Some(s) => s as usize,
+                    None => continue,
+                },
+            };
+            let Some(&cur) = vals.get(slot) else {
+                continue;
+            };
+            match w.last {
+                None => w.last = Some(cur), // first sighting: seed, don't fire
+                Some(prev) if prev != cur => {
+                    w.last = Some(cur);
+                    return Some(w.id);
+                }
+                Some(_) => {}
+            }
+        }
+        None
     }
 }
 
@@ -540,6 +616,7 @@ impl DebugCtx {
         pc: IrPc,
         inst: &Inst,
         accesses: [MemAccess; 2],
+        frame_vals: &[Reg],
         depth: usize,
     ) -> Option<StopReason> {
         // Time-travel seek (W1): replay straight to logical time `t`, past any breakpoints.
@@ -556,13 +633,24 @@ impl DebugCtx {
         let reason = if just_resumed {
             None
         } else {
-            let sh = self.shared();
+            let mut sh = self.shared();
             if sh.suppress_stops {
                 None // scheduled-seek fast-forward: run past stops (clock still ticks below)
             } else if sh.breakpoints.contains(&pc) {
                 Some(StopReason::Breakpoint)
             } else if let Some((addr, write)) = accesses.iter().find_map(|a| sh.watch_hit(*a)) {
                 Some(StopReason::Watchpoint { addr, write })
+            } else if sh
+                .value_watch_hit(pc.func, frame_vals, pc.block, pc.inst)
+                .is_some()
+            {
+                // A value watch (#1229) has no window address; report addr 0 (the DAP maps the
+                // `Watchpoint` variant, not the address, and c_interpret attributes the hit by its
+                // own watch tracking).
+                Some(StopReason::Watchpoint {
+                    addr: 0,
+                    write: true,
+                })
             } else if let Some(r) = sh.cap_stop(inst) {
                 Some(r)
             } else if self.step_target == Some(self.clock) {
@@ -1536,12 +1624,65 @@ impl Inspector {
         id
     }
 
-    /// Remove a watchpoint; returns whether one was present.
+    /// Watch a promoted-scalar source variable held in an **SSA value** (no window address —
+    /// `VarLoc::Ssa`/`SsaList`, the chibicc-promoted-scalar case), in the focused frame
+    /// `frame_from_top` levels up: the run pauses when the variable's value **changes** (#1229).
+    /// This is the value-watch complement to [`set_watchpoint`](Inspector::set_watchpoint) (window
+    /// ranges) — a range watch can't reach these because there is no address. Resolves the variable's
+    /// holding value site from debug info and snapshots its current value, so a change on the very
+    /// next op is caught. Returns `None` when `name` has no SSA location in that frame — it lives in
+    /// memory (use `set_watchpoint` via [`var_addr`](Inspector::var_addr)), isn't live here, or the
+    /// module carries no debug info. A `Read`-only kind never fires (an SSA value has no distinct
+    /// read); pass [`WatchKind::Write`].
+    pub fn set_value_watchpoint(
+        &mut self,
+        frame_from_top: usize,
+        name: &str,
+        kind: WatchKind,
+    ) -> Option<WatchId> {
+        let di = self.debug_info.as_ref()?;
+        let (func, site, last) = self
+            .with_focused(|v| {
+                let n = v.frames.len();
+                let frame = v.frames.get(n.checked_sub(1 + frame_from_top)?)?;
+                if frame.module != 0 {
+                    return None;
+                }
+                let var = pick_var(di, frame.func, name, frame.block, frame.inst)?;
+                let (site, slot) = match &var.loc {
+                    VarLoc::Ssa { value } => (ValueSite::Single(*value), *value as usize),
+                    VarLoc::SsaList(locs) => {
+                        let slot = loclist_value(locs, frame.block, frame.inst)? as usize;
+                        (ValueSite::List(locs.clone()), slot)
+                    }
+                    // Memory-located (or a fixed global): watchable by address, not by value.
+                    VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => {
+                        return None
+                    }
+                };
+                Some((frame.func, site, frame.vals.get(slot).copied()))
+            })
+            .flatten()?;
+        let mut d = self.shared();
+        let id = WatchId(d.next_watch);
+        d.next_watch += 1;
+        d.value_watches.push(ValueWatch {
+            id,
+            func,
+            site,
+            last,
+            kind,
+        });
+        Some(id)
+    }
+
+    /// Remove a watchpoint (window-range or value); returns whether one was present.
     pub fn clear_watchpoint(&mut self, id: WatchId) -> bool {
         let mut d = self.shared();
-        let before = d.watchpoints.len();
+        let before = d.watchpoints.len() + d.value_watches.len();
         d.watchpoints.retain(|x| x.id != id);
-        d.watchpoints.len() != before
+        d.value_watches.retain(|x| x.id != id);
+        d.watchpoints.len() + d.value_watches.len() != before
     }
 
     /// Enable/disable pausing before every `call.cap` ([`StopReason::CapCall`]) — the host-boundary
@@ -10629,7 +10770,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 } else {
                     [MemAccess::None; 2]
                 };
-                if let Some(reason) = dbg.before_op(pc, inst, accesses, frames.len()) {
+                if let Some(reason) =
+                    dbg.before_op(pc, inst, accesses, &frames[top].vals, frames.len())
+                {
                     return Ok(Inner::Pause(reason, pc));
                 }
             }
