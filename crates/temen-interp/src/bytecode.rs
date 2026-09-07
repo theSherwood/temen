@@ -728,6 +728,20 @@ impl SharedSlots {
         self.slots.len()
     }
 
+    /// #1297 — a fork twin's table: a **snapshot** of this one (same size, same slot words). The
+    /// units the words name live in the domain's shared, append-only [`ModuleSource`], so the copy
+    /// resolves every install made before the fork; installs after it diverge per domain.
+    fn fork(&self) -> SharedSlots {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        SharedSlots {
+            slots: self
+                .slots
+                .iter()
+                .map(|s| AtomicU64::new(s.load(Ordering::Acquire)))
+                .collect(),
+        }
+    }
+
     /// Dispatch-path read: one `Acquire` load, paired with [`Domain::install`]'s `Release` store.
     #[inline]
     fn slot(&self, i: usize) -> super::TableSlot {
@@ -11542,8 +11556,9 @@ impl CoopSched {
                             invoke_step_into: false,
                         };
                         // The twin is its own domain: a fresh env over the private window + duplicated
-                        // powerbox, a natural table over the caller's (same-)module, the caller's env fuel.
-                        let twin_table = build_table(dom.source.primary().progs.len(), 0);
+                        // powerbox, its own dispatch table seeded with the caller's installs (#1297),
+                        // the caller's env fuel.
+                        let twin_table = extra_envs[ck].table.fork();
                         let twin_eidx = extra_envs.len();
                         extra_envs.push(ChildEnv {
                             mem: twin_mem,
@@ -11831,7 +11846,11 @@ impl CoopSched {
                                 active_invoke: None,
                                 invoke_step_into: false,
                             };
-                            let twin_table = build_table(dom.source.primary().progs.len(), 0);
+                            // #1297: the twin's own dispatch table, seeded with the caller's installs.
+                            let twin_table = match tasks[ti].env {
+                                Some(k) => extra_envs[k].table.fork(),
+                                None => dom.table.fork(),
+                            };
                             let twin_eidx = extra_envs.len();
                             extra_envs.push(ChildEnv {
                                 mem: twin_mem,

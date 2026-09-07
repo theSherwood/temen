@@ -3957,6 +3957,21 @@ impl DomainTable {
     /// Dispatch-path read: one `Acquire` load. Ordered after the matching `install` `Release` store,
     /// so a reader that observes a filled slot also observes the pushed unit (the `units` `Mutex` in
     /// `install` releases before the slot store, and `units_snapshot` re-acquires it).
+    /// #1297 — a fork twin's table: a **snapshot** of this one (same size, same slot words, the
+    /// installed units `Arc`-shared), owned by the twin. Installs after the fork diverge — each
+    /// domain fills its own padding — while every slot filled before it resolves in both.
+    fn fork(&self) -> DomainTable {
+        DomainTable {
+            slots: self
+                .slots
+                .iter()
+                .map(|s| AtomicU64::new(s.load(Ordering::Acquire)))
+                .collect(),
+            units: Mutex::new(self.units.lock_unpoisoned().clone()),
+            unit_types: Mutex::new(self.unit_types.lock_unpoisoned().clone()),
+        }
+    }
+
     #[inline]
     fn slot(&self, i: usize) -> TableSlot {
         unpack_slot(self.slots[i].load(Ordering::Acquire))
@@ -9463,7 +9478,7 @@ impl VCpu {
             memop: false,
             acc: None,
             quota: self.quota,
-            dt: Arc::clone(&self.dt),
+            dt: Arc::new(self.dt.fork()), // #1297: its own table, seeded with the parent's installs
             units: Vec::new(),
             invoked: None,
             invoked_ref_slots: None,
@@ -18391,21 +18406,19 @@ impl Host {
         // closure itself, and a partial carry would silently drop capabilities, so one factory-less
         // entry fails the whole fork closed (the pre-PR-5 behavior).
         let procs_forkable = self.host_procs.iter().all(|e| e.fork.is_some());
-        // #802 slice 4 — a **pristine** guest-JIT grant (the fixed powerbox prefix mints one on
-        // every `temen-run` host, whether or not the guest ever JITs) duplicates as a fresh grant:
-        // no units, no installs, no registered native context — nothing to carry, so the twin gets
-        // an equally-empty domain at the same index (its cloned table's `Binding::Jit` resolves)
-        // with the same remaining quota. Any *live* JIT state still fails the fork closed: units
-        // and installs are per-image artifacts the core cannot faithfully duplicate.
-        let jit_pristine = self
-            .jit_tables
-            .iter()
-            .all(|d| d.units.is_empty() && d.installed.is_empty() && d.native_ctx == 0);
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
+        // #1297 audit — one classification, not two: every refusal below coincides with snapshot's
+        // (`NonDurableKind` / `drain_non_durable`) or with its quiescence precondition, so a domain
+        // fork refuses is a domain a snapshot refuses too, for the same reason: live offers, pending
+        // live impls, blockings and window minters ARE `NonDurableKind`s; the serve queue/results,
+        // the offload pool, §13.4 replay recording and freeze residue are in-flight run state a
+        // freeze also requires drained; `self_instance` is the run's own §3.5 surface (re-registered
+        // by the embedder, never carried). Host procs are the one place fork is *more* capable
+        // (a provider fork factory carries them; snapshot cannot). Guest-JIT tables, the former
+        // odd one out (fork refused what snapshot carries), now fork below.
         let simple = procs_forkable
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
-            && jit_pristine
             && self.blockings.is_empty()
             && self.window_minters.is_empty()
             && self.svc_queue.is_empty()
@@ -18430,19 +18443,36 @@ impl Host {
         let mut twin = Host::new(); // fresh `domain_id`
                                     // Own handle namespace, same bindings (indices into the shared backings below).
         twin.table = self.table.clone();
-        // Pristine guest-JIT grants (see `jit_pristine` above): the twin gets equally-empty
-        // domains at the same indices, same remaining quota — its cloned table's `Binding::Jit`
-        // slots resolve, and a twin that compiles does so into its own domain.
+        // #1297 — §22 guest-JIT tables fork **with their live state**, exactly what a snapshot
+        // carries (DURABILITY.md §12.5: units as immutable verified IR + quotas + the install
+        // occupancy): each unit's IR / types / emitted wasm is `Arc`-shared (a refcount bump), the
+        // install list is plain data, and only the process-local code pointers are dropped — the
+        // twin's `native_ctx`/`native_code` start at `0`, so an interpreter twin invokes the IR
+        // directly and a native/wasm tier recompiles from it on demand (`jit_unit_wasm_or_emit`,
+        // `reconstruct_jit_units`), the thaw answer. Same indices, same remaining quota, so the
+        // cloned table's `Binding::JitTable` slots resolve; the twin's later compiles and installs
+        // land in ITS tables (the engines fork the dispatch table alongside), never the original's.
         twin.jit_tables = self
             .jit_tables
             .iter()
             .map(|d| JitTableState {
                 mem_log2: d.mem_log2,
-                units: Vec::new(),
+                units: d
+                    .units
+                    .iter()
+                    .map(|u| JitUnit {
+                        funcs: Arc::clone(&u.funcs),
+                        types: Arc::clone(&u.types),
+                        native_code: 0,
+                        install_code: 0,
+                        install_type_id: u.install_type_id,
+                        wasm: u.wasm.clone(),
+                    })
+                    .collect(),
                 native_ctx: 0,
                 units_left: d.units_left,
                 bytes_left: d.bytes_left,
-                installed: Vec::new(),
+                installed: d.installed.clone(),
             })
             .collect();
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
