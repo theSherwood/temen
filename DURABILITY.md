@@ -204,6 +204,22 @@ freeze/thaw. Pinned by `durable_guest_jit.rs::durable_jit_install_slot_survives_
 (install → freeze → restore → `call.dyn` ≡ 42, both backends) and
 `jit_roundtrip.rs::jit_install_occupancy_round_trips` (byte-identical re-serialize).
 
+**A §14 child's guest-JIT units ride its `FrozenChildState`, not Section 5 (#1296).** Section 5 is
+captured on the **root** host (`capture_durable_jit` once per artifact), so a nested child that holds a
+`Jit` cap of its own — `regrant_into_child` mints it a fresh, attenuated table — would restore a
+`JitTable` handle pointing at a table nothing captured. So each frozen child carries its own tables
+inline in the v19 child block (a presence byte + the same `table_log2`/domains shape Section 5 uses),
+and the interp thaw rebuilds them (`restore_durable_jit`) on the re-created child before its handle
+resolves; the thaw also re-injects the durable-JIT admission fns from the root so a thawed child can
+compile *new* units too. A durable child compiles at all only because the `jit` re-grant now confers
+the hosting authority (`jit_hosts_durable` + the install-fence predicate + the taint fn) — the fence's
+tainted set is resolved lazily from the child's *own* module (like `JitMem::SelfModule`), since its
+table is minted before that module is bound. Pinned by
+`jit_roundtrip.rs::a_frozen_childs_jit_tables_round_trip_through_the_codec` (subtree freeze → restore
+carries the child's units + install occupancy, byte-identical re-serialize) and
+`temen-interp::a_durable_child_inherits_jit_hosting_and_resolves_its_own_taint` (a durable hosting
+child compiles + resolves its own taint; a non-hosting one still refuses).
+
 **In-flight guest-JIT continuations freeze via `install` + `call.dyn` (the design's freezable
 path).** `Jit.invoke` is a **seam-free atomic leaf** by design (DESIGN.md §22 / CONSOLIDATION.md §11 —
 the nested run refuses anything but a plain return, the fuzzed hinge), so it is *never interrupted

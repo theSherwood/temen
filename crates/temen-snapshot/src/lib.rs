@@ -144,7 +144,14 @@ use temen_ir::Module;
 /// regardless of host page (portability); cross-host host-page-size representation is #737's concern,
 /// not widened here. Restore now also returns `reserved_log2` so a cross-host thaw sizes its Mem
 /// reservation to the guest's original mask domain (its future growth bound), not just the extent.
-const FORMAT_VERSION: u16 = 18;
+/// v19 (#1296, invariant 14 nesting axis): a **frozen child's** inline host state (the v14 block in a
+/// nested record) gains its §22 guest-JIT unit tables — a presence byte, then the same `table_log2`
+/// header + domains shape Section 5 uses (`write_jit`), rebuilt by `Host::restore_durable_jit` on the
+/// re-created child at thaw. A child holding a `Jit` cap previously froze fine but its unit table was
+/// dropped, dangling its `JitTable` handle on thaw; now the subtree snapshot round-trips it. A child
+/// with no `Jit` cap writes the presence byte `0`, so a JIT-free subtree's child block grows by one
+/// byte per recorded child (a v18 child block had no such byte, so it mis-parses under v19).
+const FORMAT_VERSION: u16 = 19;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -496,6 +503,16 @@ pub fn freeze_with_prots(
                             write_uleb(b, 1);
                             write_serve_trio(b, &c.svc_queue, &c.svc_results, c.svc_next_ticket);
                             write_handle_recs(b, &c.handles);
+                            // v19 (#1296): the child's §22 unit tables, when it holds a `Jit` cap —
+                            // the same `table_log2` + domains shape Section 5 uses. Elided (presence
+                            // byte 0) for a child with no JIT, so a plain child block grows by one byte.
+                            match c.jit_tables.is_empty() {
+                                true => write_uleb(b, 0),
+                                false => {
+                                    write_uleb(b, 1);
+                                    write_jit(b, c.jit_table_log2, &c.jit_tables);
+                                }
+                            }
                         }
                     }
                 }
@@ -936,6 +953,17 @@ fn decode_control(
                         binding,
                     });
                 }
+                // v19 (#1296): the child's optional §22 unit tables (presence byte, then the
+                // Section-5 body shape). Canonical: presence 1 ⇒ a non-empty set (an empty one elides).
+                let (jit_tables, jit_table_log2) = if cr.uleb()? != 0 {
+                    let (tl, ds) = read_jit_body(&mut cr)?;
+                    if ds.is_empty() {
+                        return Err(RestoreError::Malformed);
+                    }
+                    (ds, tl)
+                } else {
+                    (Vec::new(), 0)
+                };
                 child_state.push(FrozenChildState {
                     parent_task,
                     slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
@@ -943,6 +971,8 @@ fn decode_control(
                     svc_results,
                     svc_next_ticket,
                     handles,
+                    jit_tables,
+                    jit_table_log2,
                 });
             }
             nested.push(FrozenNested {
@@ -973,6 +1003,21 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), Restore
         return Ok((0, Vec::new()));
     };
     let mut jr = Reader::new(body);
+    let (table_log2, domains) = read_jit_body(&mut jr)?;
+    if !jr.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    // Canonical: an empty JIT set elides the section (freeze only emits it when non-empty).
+    if domains.is_empty() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok((table_log2, domains))
+}
+
+/// Read the `table_log2` header + durable-JIT domains from the current reader position — the body
+/// shape [`write_jit`] emits (v17). Shared by [`decode_jit`] (Section 5) and the inline per-child JIT
+/// block (v19, #1296); the caller enforces the section-level canonical checks (`at_end`, non-empty).
+fn read_jit_body(jr: &mut Reader) -> Result<(u8, Vec<DurableJitTable>), RestoreError> {
     let table_log2 = jr.u8()?;
     let nd = jr.uleb()?;
     let mut domains = Vec::with_capacity(nd as usize);
@@ -1010,13 +1055,6 @@ fn decode_jit(body: Option<&[u8]>) -> Result<(u8, Vec<DurableJitTable>), Restore
             units,
             installed,
         });
-    }
-    if !jr.at_end() {
-        return Err(RestoreError::Malformed);
-    }
-    // Canonical: an empty JIT set elides the section (freeze only emits it when non-empty).
-    if domains.is_empty() {
-        return Err(RestoreError::Malformed);
     }
     Ok((table_log2, domains))
 }

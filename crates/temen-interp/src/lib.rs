@@ -2779,6 +2779,36 @@ fn drive_over_cell(
                     .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
                 let child_args = if let Some(cs) = cstate {
                     ch.restore_durable_handles(&cs.handles);
+                    // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
+                    // and its dispatch-table reservation *before* the run resolves its `JitTable`
+                    // handle — so a thawed child invokes its restored units exactly as the root does
+                    // (native/wasm code pointers restore to 0; an interpreter invoke runs the funcs
+                    // directly, a JIT-tier invoke lazily re-emits from IR, #1301). A corrupt captured
+                    // unit fails the subtree thaw closed, like the root's `JitReconstruct`.
+                    if !cs.jit_tables.is_empty() {
+                        if ch.restore_durable_jit(&cs.jit_tables).is_err() {
+                            // Leave the table empty; the child's re-resolved `JitTable` handle then
+                            // faults probeably rather than aliasing a stale table.
+                        }
+                        ch.set_jit_table_log2(cs.jit_table_log2);
+                        // Re-inject the durable-JIT admission fns from the root (the embedder set them
+                        // on the root at restore) so a thawed child can also compile *new* units, not
+                        // only invoke restored ones. Its own tainted set re-resolves from its module.
+                        let rg = host_shared.lock_unpoisoned();
+                        if let Some(vf) = rg.jit_validator() {
+                            ch.set_jit_validator(vf);
+                        }
+                        if let Some(g) = rg.jit_durable_gate() {
+                            ch.set_jit_durable_gate(g, Vec::new());
+                        }
+                        if let Some(tf) = rg.jit_durable_taint_fn() {
+                            ch.set_jit_durable_taint_fn(tf);
+                        }
+                        if let Some(em) = rg.jit_wasm_emitter() {
+                            ch.set_jit_wasm_emitter(em);
+                        }
+                        ch.set_jit_hosts_durable(rg.jit_hosts_durable());
+                    }
                     ch.set_svc_state(
                         cs.svc_queue.clone(),
                         cs.svc_results.clone(),
@@ -6816,11 +6846,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     match hg.capture_durable_handles() {
                         Err(_) => true, // a non-durable child handle: fail the freeze closed
                         Ok(handles) => {
+                            // #1296: a child holding a `Jit` cap carries its unit tables here (the
+                            // root's ride Section 5; a child's would otherwise be dropped, dangling
+                            // its `JitTable` handle on thaw). Captured beside the handles + serve trio.
+                            let jit_tables = hg.capture_durable_jit();
+                            let jit_table_log2 = hg.jit_table_log2();
                             // Record whenever the child holds ANY state a fresh-host thaw would
                             // drop — handles included (every child holds at least its
                             // instantiator grant; restoring the captured table verbatim
                             // preserves guest-held handle values exactly).
-                            if !q.is_empty() || !r.is_empty() || t != 0 || !handles.is_empty() {
+                            if !q.is_empty()
+                                || !r.is_empty()
+                                || t != 0
+                                || !handles.is_empty()
+                                || !jit_tables.is_empty()
+                            {
                                 drop(hg);
                                 let sink =
                                     v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
@@ -6833,6 +6873,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                         svc_results: r,
                                         svc_next_ticket: t,
                                         handles,
+                                        jit_tables,
+                                        jit_table_log2,
                                     });
                             }
                             false
@@ -8637,6 +8679,16 @@ pub struct FrozenChildState {
     /// The child's durable handle table (its `capture_durable_handles` output — a child holding a
     /// non-durable handle refuses the subtree freeze exactly like a root).
     pub handles: Vec<DurableHandle>,
+    /// The child's §22 guest-JIT unit tables (its `capture_durable_jit` output), when it holds a
+    /// `Jit` cap (#1296). The root's units ride artifact Section 5 (`capture_durable_jit` on the root
+    /// host); a *child's* `JitTable` handle in `handles` would otherwise point at a table that was
+    /// never captured, so its state rides here and is rebuilt (`restore_durable_jit`) on thaw before
+    /// the handle resolves. Empty for a child without a `Jit` cap.
+    pub jit_tables: Vec<DurableJitTable>,
+    /// The child's call.dyn dispatch-table reservation (`Host::jit_table_log2`), restored on thaw so a
+    /// re-applied install lands in the same padded slot the child chose. `0` for a child with no `Jit`
+    /// cap (the default).
+    pub jit_table_log2: u8,
 }
 
 /// A **spawned vCPU** (a `thread.spawn` child) flattened for freeze (DURABILITY.md §12.8 slice 3.2.1).
@@ -18101,7 +18153,19 @@ pub struct Host {
     /// The program's tainted signatures (`temen_durable::tainted_signatures_of`), stashed by a durable
     /// grant so [`Host::jit_durable_gate`] can check a submitted unit's entry signature against them.
     /// Plain data — the analysis ran in the injecting tier, never here. Empty otherwise.
+    ///
+    /// A **root** grant stashes these eagerly from the program module. A §14 **child's** table is
+    /// minted by [`Host::regrant_into_child`] *before* its module is bound (like
+    /// [`JitMem::SelfModule`]), so its tainted set cannot be computed at grant time; it is left empty
+    /// and resolved lazily at the first `Jit.compile` from the child's own [`Host::self_module`] via
+    /// [`Host::jit_durable_taint_fn`] — the child runs its own program, so its own module is the
+    /// authority (#1296).
     jit_durable_tainted_sigs: Vec<FuncType>,
+    /// The injected `temen_durable::tainted_signatures_of` (a bare `fn`, like [`Host::jit_validator`],
+    /// so this TCB crate holds no `temen-durable` dependency). A durable grant sets it so a §14 child
+    /// whose table was re-granted before its module was bound can resolve *its own* tainted set from
+    /// [`Host::self_module`] at compile time. `None` ⇒ no lazy resolution (the root's eager set stands).
+    jit_durable_taint_fn: Option<JitDurableTaintFn>,
     /// The host-injected wasm-JIT emitter ([`JitWasmEmitter`], the browser tier). When set, each
     /// closed-blob `compile` also emits the unit's wasm and stashes it on the [`JitUnit`], so a later
     /// `invoke` can run the guest's *own* runtime-compiled unit on emitted wasm instead of the
@@ -18256,6 +18320,13 @@ pub type ModuleValidator = fn(&[u8]) -> Result<Module, i64>;
 /// (suspendable at an untainted signature — DURABILITY.md §12.5). Injected as a bare `fn` so this TCB
 /// crate keeps no `temen-durable` dependency (the analysis lives in the injecting tier).
 pub type JitDurableGate = fn(&[Func], &[temen_ir::TypeEntry], &[FuncType]) -> bool;
+
+/// The injected `temen_durable::tainted_signatures_of` ([`Host::set_jit_durable_taint_fn`]): given a
+/// program's functions + type section, return the distinct signatures it instruments for suspension —
+/// the set [`JitDurableGate`] checks a submitted unit's entry against. Injected as a bare `fn` (like
+/// [`JitDurableGate`]) so this TCB crate runs no analysis; a §14 child uses it to resolve *its own*
+/// tainted set from [`Host::self_module`] when its table was re-granted before its module was bound.
+pub type JitDurableTaintFn = fn(&[Func], &[temen_ir::TypeEntry]) -> Vec<FuncType>;
 
 /// A wasm-JIT **emitter** the browser tier installs (DESIGN.md §22, the "guest-compiled units on the
 /// wasm tier" slice): given a *validated closed-unit* blob (the exact bytes `compile` accepted), it
@@ -18506,6 +18577,7 @@ impl Host {
             module_validator: None,
             jit_durable_gate: None,
             jit_durable_tainted_sigs: Vec::new(),
+            jit_durable_taint_fn: None,
             jit_wasm_emitter: None,
             jit_table_log2: 0,
             jit_hosts_fibers: false,
@@ -18724,6 +18796,13 @@ impl Host {
         twin.jit_hosts_fibers = self.jit_hosts_fibers;
         twin.jit_hosts_threads = self.jit_hosts_threads;
         twin.jit_hosts_durable = self.jit_hosts_durable;
+        // The durable-JIT admission injections ride the twin (same program surface), so a forked
+        // twin can compile durable units exactly as the original did (#1296/#1297).
+        twin.jit_validator = self.jit_validator;
+        twin.jit_durable_gate = self.jit_durable_gate;
+        twin.jit_durable_tainted_sigs = self.jit_durable_tainted_sigs.clone();
+        twin.jit_durable_taint_fn = self.jit_durable_taint_fn;
+        twin.jit_wasm_emitter = self.jit_wasm_emitter;
         Some(twin)
     }
 
@@ -21377,6 +21456,28 @@ impl Host {
         self.jit_validator = Some(v);
     }
 
+    /// The installed [`JitValidator`], if any — read on thaw to re-inject a restored child's durable
+    /// compile gate from the root (#1296).
+    pub fn jit_validator(&self) -> Option<JitValidator> {
+        self.jit_validator
+    }
+
+    /// The installed durable-JIT install-fence predicate ([`JitDurableGate`]), if any (#1296 thaw).
+    pub fn jit_durable_gate(&self) -> Option<JitDurableGate> {
+        self.jit_durable_gate
+    }
+
+    /// The installed durable-JIT taint fn ([`JitDurableTaintFn`]), if any (#1296 thaw).
+    pub fn jit_durable_taint_fn(&self) -> Option<JitDurableTaintFn> {
+        self.jit_durable_taint_fn
+    }
+
+    /// The installed [`JitWasmEmitter`], if any — read on thaw to re-inject a restored child's wasm
+    /// emitter from the root (#1296/#1301).
+    pub fn jit_wasm_emitter(&self) -> Option<JitWasmEmitter> {
+        self.jit_wasm_emitter
+    }
+
     /// Install the [`ModuleValidator`] — the decode+verify gate `ModuleLoader.from_bytes` runs.
     /// Without one, every `from_bytes` is `-EINVAL` (fail closed). Installed by the tier that grants a
     /// module loader ([`temen_run::grant_module_loader`]).
@@ -21420,6 +21521,13 @@ impl Host {
     ) {
         self.jit_durable_gate = Some(gate);
         self.jit_durable_tainted_sigs = program_tainted_sigs;
+    }
+
+    /// Install the taint-signature function ([`JitDurableTaintFn`]) a durable grant injects so a §14
+    /// child whose `Jit` table was re-granted before its module was bound can resolve *its own*
+    /// tainted set from [`Host::self_module`] at compile time ([`Host::jit_compile_linked`], #1296).
+    pub fn set_jit_durable_taint_fn(&mut self, f: JitDurableTaintFn) {
+        self.jit_durable_taint_fn = Some(f);
     }
 
     /// Install the [`JitWasmEmitter`] — the browser wasm-JIT tier's compile→wasm step. With one set,
@@ -21651,6 +21759,22 @@ impl Host {
         // The wasm-JIT emitter is a `Copy` fn pointer — read it out before the `&mut` borrow of
         // `jit_tables` so the closed-unit emit below can call it without a self-borrow conflict.
         let emitter = self.jit_wasm_emitter;
+        // A §14 child's `Jit` table was re-granted before its module was bound, so its tainted-signature
+        // set was left empty at grant (#1296). Resolve it lazily from the child's *own* module here —
+        // mirroring [`JitMem::SelfModule`] — the first time it is needed: the child runs its own
+        // program, so its own module is the authority for the install fence, not the granting parent's.
+        // A taint-free program recomputes an (empty) set each compile — negligible; a program that
+        // taints anything caches after the first. The root's eager set is never empty-and-injected
+        // together, so this no-ops for it.
+        if self.durable
+            && self.jit_hosts_durable
+            && self.jit_durable_tainted_sigs.is_empty()
+            && self.jit_durable_taint_fn.is_some()
+        {
+            if let (Some(tf), Some(sm)) = (self.jit_durable_taint_fn, self.self_module.clone()) {
+                self.jit_durable_tainted_sigs = tf(&sm.funcs, &sm.types);
+            }
+        }
         // Read the durable install fence out before the `&mut jit_tables` borrow (disjoint fields):
         // the gate predicate (Copy) and a shared borrow of the program's tainted signatures.
         let durable_gate = if self.durable {
@@ -22153,8 +22277,12 @@ impl Host {
         // other's `call.dyn`). Attenuated: the child's compile quota is at most the parent's remaining.
         // The memory-match precondition resolves against the *child's* module at compile time
         // ([`JitMem::SelfModule`]); the embedder's validator / emitter gates carry over so the child
-        // compiles through exactly the parent's checks. A durable child's table refuses `compile`
-        // (`jit_hosts_durable` is not inherited — #1300 is the durable-transform scope).
+        // compiles through exactly the parent's checks. A **durable** parent's grant also hosts
+        // durability in the child (`jit_hosts_durable` + the install-fence predicate + the taint fn),
+        // so a durable child compiles the same freeze-instrumented shapes the parent does (#1296,
+        // #1300). The child does *not* inherit the parent's tainted-signature set: its table is minted
+        // before its module is bound, so — like [`JitMem::SelfModule`] — it resolves its own set lazily
+        // from [`Host::self_module`] at the first compile.
         if let Ok(Binding::JitTable(idx)) = self.resolve(handle, cap_id::JIT) {
             let parent = self.jit_tables.get(idx as usize)?;
             let inherited = self.jit_mem_log2(parent);
@@ -22170,6 +22298,9 @@ impl Host {
             child.jit_table_log2 = child.jit_table_log2.max(self.jit_table_log2);
             child.jit_validator = child.jit_validator.or(self.jit_validator);
             child.jit_wasm_emitter = child.jit_wasm_emitter.or(self.jit_wasm_emitter);
+            child.jit_hosts_durable |= self.jit_hosts_durable;
+            child.jit_durable_gate = child.jit_durable_gate.or(self.jit_durable_gate);
+            child.jit_durable_taint_fn = child.jit_durable_taint_fn.or(self.jit_durable_taint_fn);
             return Some(child.grant(cap_id::JIT, Binding::JitTable(id)));
         }
         // FORK.md §8.6 — a **module** grant: an immutable instantiable artifact. Re-granting shares it
@@ -26368,6 +26499,106 @@ mod fork_powerbox_tests {
         assert!(
             Arc::ptr_eq(&emitted, &host.jit_unit_wasm(0, 0).expect("cached")),
             "the re-emit is cached on the unit"
+        );
+    }
+
+    /// #1296 item 5 — a **durable** parent's `jit` re-grant hosts durability in the child, so the
+    /// child compiles the same freeze-instrumented shapes the parent does (before this it fell to the
+    /// `durable && !jit_hosts_durable` refusal, #1300 territory). The install-fence taint set is *not*
+    /// inherited (the child's table is minted before its module is bound): it resolves lazily from the
+    /// child's own `self_module` at the first compile. A durable child whose parent does **not** host
+    /// durable JIT still refuses — the gate only lifts when the hosting authority is conferred.
+    #[test]
+    fn a_durable_child_inherits_jit_hosting_and_resolves_its_own_taint() {
+        // A validator that decodes+verifies and hands back the funcs (the real durable validator's
+        // instrumentation is exercised by temen-durable's own tests; here we only need the hosting +
+        // fence plumbing on the `Host`).
+        fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func]>, i64> {
+            let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
+            temen_verify::verify_module(&m).map_err(|_| -22i64)?;
+            Ok(Arc::from(m.funcs))
+        }
+        // The fence rejects a unit whose entry signature the program does not taint — so with an empty
+        // tainted set every unit is refused, and admission proves the taint was resolved.
+        fn gate(funcs: &[Func], _t: &[temen_ir::TypeEntry], tainted: &[FuncType]) -> bool {
+            let entry = FuncType {
+                params: funcs[0].params.clone(),
+                results: funcs[0].results.clone(),
+            };
+            !tainted.contains(&entry)
+        }
+        // The taint fn taints every signature of the program module it is handed (here, the child's
+        // own `self_module`) — so the child taints exactly the sig of the unit it compiles.
+        fn taint(funcs: &[Func], _t: &[temen_ir::TypeEntry]) -> Vec<FuncType> {
+            funcs
+                .iter()
+                .map(|f| FuncType {
+                    params: f.params.clone(),
+                    results: f.results.clone(),
+                })
+                .collect()
+        }
+
+        let unit = temen_text::parse_module(
+            "memory 16\nfunc (i32) -> (i32) {\nblock 0 (v0: i32) {\n  return v0\n  }\n}\n",
+        )
+        .expect("parse unit");
+        temen_verify::verify_module(&unit).expect("verify unit");
+        let unit_ir = temen_encode::encode_module(&unit);
+
+        // A durable parent that HOSTS durable JIT.
+        let mut parent = Host::new();
+        parent.set_durable(true);
+        parent.set_jit_validator(validator);
+        parent.set_jit_durable_gate(gate, Vec::new()); // the parent's own eager set (taints nothing)
+        parent.set_jit_durable_taint_fn(taint);
+        parent.set_jit_hosts_durable(true);
+        let pjit = parent.grant_jit(Some(16));
+
+        // Re-grant into a durable child; give it a module of its own so its taint resolves.
+        let mut child = Host::new();
+        child.set_durable(true);
+        let cjit = parent
+            .regrant_into_child(pjit, &mut child)
+            .expect("jit re-grants into the child");
+        child.self_module = Some(Arc::new(unit.clone()));
+        assert!(
+            child.jit_hosts_durable,
+            "the durable hosting authority was inherited"
+        );
+        assert!(
+            child.jit_durable_tainted_sigs.is_empty(),
+            "the child does NOT inherit the parent's tainted set — it resolves its own"
+        );
+
+        // The child compiles the unit: the hosting gate is lifted AND the fence admits it because the
+        // taint was resolved from the child's own module.
+        match child.jit_compile(cjit, &unit_ir) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("a durable hosting child should compile its unit, got errno {e}"),
+            Err(t) => panic!("a durable hosting child should compile its unit, got trap {t:?}"),
+        }
+        assert_eq!(
+            child.jit_durable_tainted_sigs.len(),
+            1,
+            "the child resolved its own tainted set from self_module at compile time"
+        );
+
+        // Control: a durable child whose parent does NOT host durable JIT still refuses (the gate
+        // only lifts when the authority is conferred).
+        let mut plain = Host::new();
+        plain.set_durable(true);
+        plain.set_jit_validator(validator);
+        let pjit2 = plain.grant_jit(Some(16));
+        let mut child2 = Host::new();
+        child2.set_durable(true);
+        let cjit2 = plain
+            .regrant_into_child(pjit2, &mut child2)
+            .expect("jit re-grants");
+        child2.self_module = Some(Arc::new(unit.clone()));
+        assert!(
+            matches!(child2.jit_compile(cjit2, &unit_ir), Ok(Err(e)) if e == EINVAL),
+            "a durable child of a non-hosting parent refuses compile fail-closed"
         );
     }
 

@@ -1318,6 +1318,10 @@ pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
         temen_durable::unit_suspends_untainted,
         temen_durable::tainted_signatures_of(&m.funcs, &m.types),
     );
+    // #1296: also inject the taint fn so a §14 child that inherits this grant (its table minted by
+    // `regrant_into_child` before its module is bound) can resolve its *own* tainted set from its
+    // module at compile time — the parent's eager set above is for the parent's program only.
+    host.set_jit_durable_taint_fn(temen_durable::tainted_signatures_of);
     host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
