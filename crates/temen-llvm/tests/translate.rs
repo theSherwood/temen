@@ -5916,6 +5916,38 @@ fn stub_trap_names_the_extern() {
 }
 
 #[test]
+fn stub_extern_called_with_two_arities() {
+    // Regression (the `demo_tcl_repl_stdin` nightly capstone, `CallArgCountMismatch`): an undefined
+    // external stubbed via `stub_unresolved_externs` and *called with two different arities* — the
+    // old-C empty-prototype drift that is pervasive in Tcl's C, where each call site invents its own
+    // function type (see the §varargs / old-C note at the `def_sig` call lowering). The stub table used
+    // to mint ONE stub keyed by name from the *first* call's signature, so the second, mismatched call
+    // emitted a `call <stub>` whose arg count didn't match the stub's params — an unverifiable module.
+    // Each distinct call shape now gets its own trap stub (all still trap identically), so it verifies.
+    use temen_llvm::TranslateOptions;
+    let ll = "\
+declare i32 @mystery()\n\
+define i32 @a(i32 %x) {\n\
+entry:\n\
+  %r = call i32 @mystery(i32 %x)\n\
+  ret i32 %r\n\
+}\n\
+define i32 @b(i32 %x) {\n\
+entry:\n\
+  %r = call i32 @mystery(i32 %x, i32 %x)\n\
+  ret i32 %r\n\
+}\n";
+    let opts = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    let t =
+        temen_llvm::translate_ll_str_with_options(ll, opts).expect("translate two-arity stub .ll");
+    temen_verify::verify_module(&t.module)
+        .expect("a stubbed extern called with two arities must still verify");
+}
+
+#[test]
 fn vector_mask_bitwise_any_match() {
     // The SIMD "**any lane matches**" idiom (Postgres' `simd.h`): several `<N x i1>` comparison masks
     // combined with `or`/`and`, then `sext` to a full-width vector. clang `-O2` folds

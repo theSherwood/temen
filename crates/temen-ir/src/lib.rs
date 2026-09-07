@@ -3027,7 +3027,7 @@ impl Inst {
 
 /// A function signature — the immediate carried by `call.dyn` and (later) the
 /// function-table type ids. Equality is structural (the runtime "type_id" check).
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct FuncType {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,

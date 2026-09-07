@@ -283,13 +283,18 @@ impl Default for TranslateOptions {
 }
 
 /// Lazily-assigned trap stubs for undefined externals ([`TranslateOptions::stub_unresolved_externs`]).
-/// Shared across all function translations via a `RefCell`; each distinct name gets one stub, assigned
-/// index `base + ordinal` (the stubs are appended to `funcs` last, after `_start` + defined + helpers,
+/// Shared across all function translations via a `RefCell`; each distinct `(name, signature)` gets one
+/// stub, assigned index `base + ordinal` (the stubs are appended to `funcs` last, after `_start` + defined + helpers,
 /// so `base` = that total count and the assigned indices match the final vector positions).
 struct StubTable {
     base: u32,
     order: Vec<(String, temen_ir::FuncType)>,
-    idx: HashMap<String, u32>,
+    /// One stub per **(name, signature)**. Old-C empty-prototype drift lets a single undefined extern
+    /// be called with several incompatible shapes (each call site invents its own type — pervasive in
+    /// Tcl's C); keying by name alone minted one stub from the first shape, so a later mismatched call
+    /// emitted a `call` whose arity/types didn't match the stub's params — an unverifiable module. Each
+    /// distinct shape now gets its own trap stub (all trap identically), so the module always verifies.
+    idx: HashMap<(String, temen_ir::FuncType), u32>,
     /// Declared-external signatures (from `m.func_declarations`), for **address-taken** undefined
     /// externals: a function *pointer* to an undefined extern (e.g. `@memcmp` in a comparator table)
     /// has no call site to derive a signature from, so its stub uses the declared prototype's type.
@@ -305,28 +310,28 @@ impl StubTable {
             extern_sigs,
         }
     }
-    /// The stub index for `name`, minting a new one (keyed by name, using the *first* signature seen)
-    /// on the first reference. A later call to the same name with a mismatched signature keeps this
-    /// index; the shape mismatch then surfaces as a clean `temen-verify` type-id error, not an escape.
+    /// The stub index for `(name, sig)`, minting a new one on the first reference of that exact shape.
+    /// Two call sites that name the same undefined extern with *different* signatures (old-C prototype
+    /// drift) each get their own trap stub, so the emitted `call` always matches its callee's params.
+    /// Address-taken funcrefs stay stable: they all resolve through the one declared prototype sig
+    /// (`get_or_insert_extern`), so `&foo == &foo` across sites.
     fn get_or_insert(&mut self, name: &str, sig: temen_ir::FuncType) -> u32 {
-        if let Some(&i) = self.idx.get(name) {
+        let key = (name.to_string(), sig);
+        if let Some(&i) = self.idx.get(&key) {
             return i;
         }
         let i = self.base + self.order.len() as u32;
         if std::env::var_os("TEMEN_STUB_DEBUG").is_some() {
             eprintln!("[stub] {name}");
         }
-        self.order.push((name.to_string(), sig));
-        self.idx.insert(name.to_string(), i);
+        self.order.push(key.clone());
+        self.idx.insert(key, i);
         i
     }
     /// The stub index for an **address-taken** undefined external — using its declared prototype's
     /// signature. `None` if `name` is not a declared function (e.g. an undefined *data* global, which
     /// has no funcref and stays fail-closed).
     fn get_or_insert_extern(&mut self, name: &str) -> Option<u32> {
-        if let Some(&i) = self.idx.get(name) {
-            return Some(i);
-        }
         let sig = self.extern_sigs.get(name)?.clone();
         Some(self.get_or_insert(name, sig))
     }
