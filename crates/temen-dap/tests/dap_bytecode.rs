@@ -1958,3 +1958,121 @@ fn dap_over_bytecode_value_watchpoint_matches_the_tree_walker() {
         "bytecode value watchpoint ≡ tree-walker value watchpoint"
     );
 }
+
+/// **#1229 — a value watch fires during single-stepping too** (not only `continue`), matching the
+/// tree-walker's per-op seam. Arm the watch on `x`, then `stepIn` repeatedly: one step stops with
+/// reason "data breakpoint" when `x`'s value changes, on the bytecode engine and the tree-walker
+/// alike. Regression guard for the bytecode step path, which previously advanced to the source-line
+/// boundary without consulting watchpoints.
+#[test]
+fn dap_over_bytecode_value_watchpoint_fires_during_step() {
+    fn script(engine: Option<&str>) -> String {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let mut la = vec![
+            ("programText", Json::s(VALUE_WATCH_DBG)),
+            ("function", Json::i(0)),
+        ];
+        if let Some(e) = engine {
+            la.push(("engine", Json::s(e)));
+        }
+        s.handle(&req(2, "launch", Json::obj(la)));
+        s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("vw.temt"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(3))])]),
+                ),
+            ]),
+        ));
+        s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+        let st = s.handle(&req(
+            5,
+            "stackTrace",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        let frame_id = response(&st)
+            .get("body")
+            .unwrap()
+            .get("stackFrames")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("id")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let sc = s.handle(&req(
+            6,
+            "scopes",
+            Json::obj(vec![("frameId", Json::i(frame_id))]),
+        ));
+        let var_ref = response(&sc)
+            .get("body")
+            .unwrap()
+            .get("scopes")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("variablesReference")
+            .unwrap()
+            .as_i64()
+            .unwrap();
+        let info = s.handle(&req(
+            7,
+            "dataBreakpointInfo",
+            Json::obj(vec![
+                ("variablesReference", Json::i(var_ref)),
+                ("name", Json::s("x")),
+            ]),
+        ));
+        let data_id = response(&info)
+            .get("body")
+            .and_then(|b| b.get("dataId"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned)
+            .unwrap_or_default();
+        s.handle(&req(
+            8,
+            "setDataBreakpoints",
+            Json::obj(vec![(
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![
+                    ("dataId", Json::s(&data_id)),
+                    ("accessType", Json::s("write")),
+                ])]),
+            )]),
+        ));
+        let mut reasons = Vec::new();
+        for seq in 9..14 {
+            let out = s.handle(&req(
+                seq,
+                "stepIn",
+                Json::obj(vec![("threadId", Json::i(1))]),
+            ));
+            if let Some(r) = event(&out, "stopped")
+                .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
+            {
+                reasons.push(r);
+            }
+            if event(&out, "terminated").is_some() {
+                break;
+            }
+        }
+        reasons.join(",")
+    }
+
+    let bytecode = script(Some("bytecode"));
+    assert!(
+        bytecode.contains("data breakpoint"),
+        "a step stops for the value watch on the bytecode engine: {bytecode:?}"
+    );
+    assert_eq!(
+        bytecode,
+        script(None),
+        "the step-fires-watch sequence matches the tree-walker"
+    );
+}
