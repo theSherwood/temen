@@ -438,7 +438,8 @@ in session discussion; collected here so the next slice has a home to be picked 
   `temen_alloc`/`temen_dealloc` ABI conversion skipped.
 - [x] **A real-language playground tab.** Landed, well past the original ask — the "pre-compiled
   modules first" half: the playground's demo sidebar now runs C reactor guests (bounce / life /
-  mandelzoom / the **Uxn** virtual machine over its Varvara devices), **DOOM**, an editable **Lua** evaluator, a **SQLite** REPL, a **QuickJS** REPL
+  mandelzoom / the **Uxn** virtual machine over its Varvara devices, plus an editable **Uxntal**
+  card whose source is assembled inside the sandbox), **DOOM**, an editable **Lua** evaluator, a **SQLite** REPL, a **QuickJS** REPL
   (editor JS piped as stdin, JS syntax highlighting), and a persistent **PostgreSQL** session
   (boot once, query many; survives page reloads via a data-dir snapshot) — all compiled through
   the `temen-llvm` on-ramp and tracked in `LLVM.md` / `crates/temen-run/demos/*`, not here. The

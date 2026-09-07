@@ -64,8 +64,11 @@ fn committed_rom_is_fresh() {
     );
 }
 
-#[test]
-fn guest_frame_hashes_match_native() {
+/// Build both sides once (native `cc` oracle + the translated guest) and return
+/// `(native frame-hash stream, the instantiated guest, the demo ROM, the demo source)`. `None` when
+/// `clang`/`cc` are unavailable, so every tier variant skips cleanly.
+#[allow(clippy::type_complexity)]
+fn build() -> Option<(String, temen_run::Instance, Vec<u8>, Vec<u8>)> {
     let dir = std::env::temp_dir();
     let src = demo_dir().join("uxn_diff.c");
     let frames = format!("-DUXN_DIFF_FRAMES={FRAMES}");
@@ -86,11 +89,11 @@ fn guest_frame_hashes_match_native() {
         .status();
     if !matches!(clang, Ok(s) if s.success()) {
         eprintln!("note: skipping uxn_diff (clang unavailable)");
-        return;
+        return None;
     }
     if cc(&["-O2", &frames, src.to_str().unwrap()], &exe).is_none() {
         eprintln!("note: skipping uxn_diff (cc unavailable)");
-        return;
+        return None;
     }
     let rom = rom();
 
@@ -116,39 +119,73 @@ fn guest_frame_hashes_match_native() {
         "the swarm animates (frames differ)"
     );
 
-    // Guest: translate, then run `_start` on each backend with the ROM on stdin.
     let t = temen_llvm::translate_ll_path(&ll).expect("translate uxn_diff.c");
     let inst = temen_run::instantiate(t.module).expect("instantiate");
-    let config = RunConfig {
-        limits: Limits {
-            fuel: None,
-            deadline: None,
-            max_fibers: 0,
-            max_vcpus: 0,
-        },
-        stdin: rom,
-        memory_size_log2: None,
-        args: vec![],
-        env: vec![],
-        ..RunConfig::default()
+    let tal = std::fs::read(demo_dir().join("demo.tal")).expect("demo.tal");
+    Some((native, inst, rom, tal))
+}
+
+/// Run the guest on `backend` twice — the committed ROM on stdin, then the demo's Uxntal SOURCE, which
+/// the guest assembles itself (uxnasm_core.c) — and assert both frame-hash streams equal native's.
+fn assert_matches_native(backend: Backend) {
+    let Some((native, inst, rom, tal)) = build() else {
+        return;
     };
-    for backend in [Backend::TreeWalk, Backend::Bytecode, Backend::Jit] {
+    for (label, stdin) in [("rom", rom), ("tal", tal)] {
+        let config = RunConfig {
+            limits: Limits {
+                fuel: None,
+                deadline: None,
+                max_fibers: 0,
+                max_vcpus: 0,
+            },
+            stdin,
+            memory_size_log2: None,
+            args: vec![],
+            env: vec![],
+            ..RunConfig::default()
+        };
+        let started = std::time::Instant::now();
         let run = inst
             .run(backend, &config)
-            .unwrap_or_else(|e| panic!("{backend:?} run failed: {e}"));
+            .unwrap_or_else(|e| panic!("{backend:?}/{label} run failed: {e}"));
         match run.outcome {
             Outcome::Returned(_) | Outcome::Exited(0) => {}
-            other => panic!("{backend:?}: unexpected outcome {other:?}"),
+            other => panic!("{backend:?}/{label}: unexpected outcome {other:?}"),
         }
         let guest = String::from_utf8(run.stdout).unwrap();
         assert_eq!(
             guest, native,
-            "{backend:?}: frame hashes differ from native"
+            "{backend:?}/{label}: frame hashes differ from native"
+        );
+        eprintln!(
+            "uxn_diff: {FRAMES} frames byte-identical to native on {backend:?} from the {label} ({:.1}s)",
+            started.elapsed().as_secs_f64()
         );
     }
-    eprintln!("uxn_diff: {FRAMES} frames byte-identical to native on TreeWalk/Bytecode/Jit");
 }
 
+/// The default-lane tier (the `*_jit` convention): the Cranelift JIT, fast enough for every PR.
+#[test]
+fn guest_frame_hashes_match_native_jit() {
+    assert_matches_native(Backend::Jit);
+}
+
+/// The interpreter tiers are minutes each — a whole VM interpreted by an interpreter — so they are
+/// `#[ignore]`d full-depth gates (the `full-depth-gates` matrix runs them on the daily/manual
+/// schedule), exactly like the Lua suites. Run one locally with:
+///   cargo test --test uxn_diff -- --ignored bytecode
+#[test]
+#[ignore = "a whole VM on the bytecode engine is long; scheduled/manual full-depth gate"]
+fn guest_frame_hashes_match_native_bytecode() {
+    assert_matches_native(Backend::Bytecode);
+}
+
+#[test]
+#[ignore = "a whole VM on the tree-walker is long; scheduled/manual full-depth gate"]
+fn guest_frame_hashes_match_native_tree_walker() {
+    assert_matches_native(Backend::TreeWalk);
+}
 /// The CPU against the **golden opcode corpus** (`demos/uxn/corpus/opcodes.corpus`): 303 programs
 /// whose end states were recorded from uxn5's spec-compliant core — every non-control-flow opcode in
 /// every mode over random operands (stack and memory wrap-around included), every jump form, lambdas,
