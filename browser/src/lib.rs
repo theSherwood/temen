@@ -1699,7 +1699,7 @@ fn par_jit_rt() -> Option<&'static ParJitCfg> {
 /// [`par_resolve_unit`]) and hand back the unit's funcs + its emitted wasm.
 #[allow(clippy::type_complexity)]
 fn par_resolve_unit_rt(
-    h: &Host,
+    h: &mut Host,
     handle: i32,
     code: i32,
 ) -> Result<
@@ -1718,7 +1718,7 @@ fn par_resolve_unit_rt(
     // FuncType interning (#922): carry the unit's type section beside its funcs and emitted wasm.
     let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
     let types = h.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, types, h.jit_unit_wasm(cd, cu)))
+    Ok((funcs, types, h.jit_unit_wasm_or_emit(cd, cu))) // #1301: a thawed unit re-emits here
 }
 
 /// §22 **Model B2 cross-Worker** mirror registry: `slot → the code handle installed there` (or `-1`
@@ -1787,10 +1787,10 @@ pub extern "C" fn temen_par_jit_slot_code(slot: u32) -> i32 {
 pub extern "C" fn temen_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
     par_jit_rt()
         .and_then(|cfg| {
-            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
             g.resolve_jit_code(handle)
                 .ok()
-                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .and_then(|(cd, cu)| g.jit_unit_wasm_or_emit(cd, cu))
                 .map(|w| w.len())
         })
         .unwrap_or(0)
@@ -1801,10 +1801,10 @@ pub extern "C" fn temen_par_jit_code_wasm_by_handle_len(handle: i32) -> usize {
 pub extern "C" fn temen_par_jit_code_wasm_by_handle_ptr(handle: i32) -> *const u8 {
     par_jit_rt()
         .and_then(|cfg| {
-            let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+            let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
             g.resolve_jit_code(handle)
                 .ok()
-                .and_then(|(cd, cu)| g.jit_unit_wasm(cd, cu))
+                .and_then(|(cd, cu)| g.jit_unit_wasm_or_emit(cd, cu))
                 .map(|w| w.as_ptr())
         })
         .unwrap_or(core::ptr::null())
@@ -2279,8 +2279,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 let resolved = if let Some(pb) = par_pb() {
                     par_resolve_unit(pb, handle, code)
                 } else if let Some(cfg) = par_jit_rt() {
-                    let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                    par_resolve_unit_rt(&g, handle, code).map(|(f, t, _)| (f, t))
+                    let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                    par_resolve_unit_rt(&mut g, handle, code).map(|(f, t, _)| (f, t))
                 } else {
                     return PAR_TRAP;
                 };
@@ -2336,8 +2336,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                     // resolves through the same host — a forged / cross-domain handle traps identically.
                     // Codegen off / v128 / a unit outside the emitter subset ⇒ the interpreter services it.
                     let resolved = {
-                        let g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
-                        par_resolve_unit_rt(&g, handle, code)
+                        let mut g = cfg.host.lock().unwrap_or_else(|e| e.into_inner());
+                        par_resolve_unit_rt(&mut g, handle, code)
                     };
                     match resolved {
                         Err(t) => v
@@ -5631,6 +5631,10 @@ pub struct JitOnrampRun {
     /// before `f0` and after each bounce — the single-shot twin of the coop tier's `sync_pagestate`.
     paged: bool,
     pagestate: Vec<u8>,
+    /// #1296 — the run's **persistent** `call.dyn` dispatch table, shared by every cross-tier bounce
+    /// frame, so a `Jit.install` a child makes in one bounce is reachable from the next. Sized by the
+    /// host's `jit_table_log2` (the reservation a re-granted `Jit` carried in; `0` ⇒ natural).
+    table: std::sync::Arc<bytecode::SharedSlots>,
 }
 
 /// How a single-shot JIT run feeds its guest — the twin of [`onramp_exec`] (stdin) vs
@@ -6218,6 +6222,7 @@ impl JitOnrampRun {
         } else {
             (Vec::new(), declared_extent)
         };
+        let table = program.dispatch_table(host.jit_table_log2());
         Ok(JitOnrampRun {
             module,
             program,
@@ -6240,6 +6245,7 @@ impl JitOnrampRun {
             mapped,
             paged,
             pagestate,
+            table,
         })
     }
 
@@ -6310,6 +6316,7 @@ impl JitOnrampRun {
                 emitted_wasm = split_wasm;
             }
         }
+        let table = program.dispatch_table(host.jit_table_log2());
         Ok(JitOnrampRun {
             module: std::sync::Arc::new(module),
             program,
@@ -6334,6 +6341,7 @@ impl JitOnrampRun {
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
+            table,
         })
     }
 
@@ -6412,6 +6420,7 @@ impl JitOnrampRun {
                 false,
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 self.prots.as_deref(),
+                Some(&self.table), // #1296: installs persist across this run's bounces
             );
             match info {
                 Some(info) => {
@@ -9164,6 +9173,34 @@ pub unsafe extern "C" fn temen_op13jit_open_detached(
 /// The op-13 loop's common open: verify, compile the driver, grant the powerbox (`Instantiator` over the
 /// driver's `memory 16` window, the child `Module`, the forkable `"fs"` counter, and — `minter` — a
 /// `WindowMinter`), allocate the window, stand up the resumable root with `(inst, modh, fs | minter)`.
+/// The op-13 driver's `Jit` table reservation (`2^4` slots): what a child re-granted the driver's `jit`
+/// installs into (its own table, sized from this at spawn).
+const OP13_JIT_TABLE_LOG2: u8 = 4;
+
+/// [`temen_op13jit_open_child`] over a **caller-provided driver too** (both encoded): a nested (op-13,
+/// carve) loop whose driver program is the test's own — e.g. one that re-grants the driver's `"jit"`
+/// into the child by name (#1296). The detached twin is [`temen_op13jit_open_detached`].
+///
+/// # Safety
+/// `[driver_ptr, driver_len)` and `[child_ptr, child_len)` are live byte slices for the call.
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_open_named(
+    driver_ptr: *const u8,
+    driver_len: usize,
+    child_ptr: *const u8,
+    child_len: usize,
+) -> i32 {
+    let driver = std::slice::from_raw_parts(driver_ptr, driver_len);
+    let child = std::slice::from_raw_parts(child_ptr, child_len);
+    let (Ok(driver), Ok(child)) = (
+        temen_encode::decode_module(driver),
+        temen_encode::decode_module(child),
+    ) else {
+        return -STATUS_DECODE_ERR;
+    };
+    op13jit_open_driver(driver, child, false)
+}
+
 fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter: bool) -> i32 {
     temen_op13jit_close();
     if temen_verify::verify_module(&driver).is_err() || temen_verify::verify_module(&child).is_err()
@@ -9199,6 +9236,15 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     let modh = host.grant_module(&child);
     let fs_h = host.grant_host_proc_forkable(handler, fork);
     host.register_cap_name("fs", fs_h);
+    // #1296 — the driver holds a §22 `Jit` (validator + wasm emitter armed, the browser's) under the
+    // name `"jit"`, so a driver program may re-grant it into an op-13 child by name; the child then
+    // compiles / installs / invokes units on its own fresh table (see `op13jit_child_jit.rs`). The
+    // built-in mini driver never names it — nothing changes for it.
+    host.set_jit_validator(browser_jit_validator);
+    host.set_jit_wasm_emitter(browser_jit_wasm_emitter);
+    let jit_h =
+        host.grant_jit_with_table(driver.memory.map(|mc| mc.size_log2), OP13_JIT_TABLE_LOG2);
+    host.register_cap_name("jit", jit_h);
     // #1286: the detached driver's third entry arg is a `WindowMinter` (byte quota = the default
     // per-child memory ceiling) rather than the `"fs"` handle.
     let third = if minter {
@@ -9661,6 +9707,10 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 let Some(mut host) = d.root.take_granted_host() else {
                     return OP13JIT_TRAP; // the driver always marshals; a grant-less child is off-contract
                 };
+                // §3.5 / #1296: the child's self-referential surface is ITS module — a re-granted `Jit`
+                // table's memory-match precondition resolves against the child's declared memory (the
+                // tree-walker's op-13 arm and the coop pump register it the same way).
+                host.set_self_module(&d.child);
                 let child_size = 1u64 << size_log2;
                 // SAFETY: the engine validated the carve within the driver's window; the child window
                 // aliases that sub-window (the §14 data plane), and `mem_base` outlives the child run.
@@ -9776,6 +9826,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             } => {
                 // A grant-less spawn (`grants_n == 0`) stashes no powerbox: the child gets a fresh one.
                 let mut host = d.root.take_granted_host().unwrap_or_default();
+                host.set_self_module(&d.child); // #1296: as the nested arm — the child's own module
                 let child_size = 1u64 << size_log2;
                 host.set_attestation(temen_interp::Attestation {
                     tier: 1,
@@ -12777,7 +12828,7 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     s.jit_wasm_by_handle = h
         .resolve_jit_code(code)
         .ok()
-        .and_then(|(cd, cu)| h.jit_unit_wasm(cd, cu));
+        .and_then(|(cd, cu)| h.jit_unit_wasm_or_emit(cd, cu)); // #1301
     s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }
 

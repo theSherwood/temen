@@ -7,7 +7,7 @@
 //!
 //! Slice 1 covers *compile-side* composition + a NORMAL-state end-to-end run.
 //!
-//! **Slice 2 — persist `JitCode`/`JitDomain` across a snapshot**
+//! **Slice 2 — persist `JitCode`/`JitTable` across a snapshot**
 //! (`durable_jit_domain_survives_freeze_and_invokes`): a durable domain's compiled units ride the
 //! artifact (temen-snapshot Section 5), and after restore the re-pinned handles invoke the
 //! reconstructed (re-verified) unit on the interpreter.
@@ -225,7 +225,7 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
     };
 
     // Freeze the domain (NORMAL state — no continuation) and serialize the real artifact. Before
-    // Slice 2 this refused (`JitCode`/`JitDomain` were non-durable); now the units ride Section 5.
+    // Slice 2 this refused (`JitCode`/`JitTable` were non-durable); now the units ride Section 5.
     let win = {
         let mut w = init_durable_window(WINDOW);
         write_state(&mut w, STATE_NORMAL);

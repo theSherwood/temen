@@ -1,12 +1,12 @@
 //! §22 guest-JIT × the snapshot codec (DURABILITY.md §12.5 **Slice 2**): a durable domain's
-//! compiled units survive freeze → serialize → restore, and the re-pinned `JitDomain`/`JitCode`
-//! handles resolve against the rebuilt `jit_domains`. Proves the two §12.6 invariants for the new
+//! compiled units survive freeze → serialize → restore, and the re-pinned `JitTable`/`JitCode`
+//! handles resolve against the rebuilt `jit_tables`. Proves the two §12.6 invariants for the new
 //! Section 5 (canonical byte-identical re-serialize; fail-closed on a tampered unit) plus the
 //! handle-index bounds gate.
 
 use std::sync::Arc;
 
-use temen_interp::{DurableJitDomain, DurableJitUnit, Host, JitRestoreError};
+use temen_interp::{DurableJitTable, DurableJitUnit, Host, JitRestoreError};
 use temen_ir::{Func, Module};
 use temen_snapshot::{freeze, restore, RestoreError};
 
@@ -154,13 +154,13 @@ fn no_jit_domain_elides_section_5() {
     );
 }
 
-/// Fail-closed at the reconstruction boundary: a `DurableJitDomain` whose unit IR is garbage is
+/// Fail-closed at the reconstruction boundary: a `DurableJitTable` whose unit IR is garbage is
 /// rejected (`Decode`) rather than admitting unverified funcs. The codec's `JitReconstruct` maps
 /// this failure; here we exercise the `Host` primitive directly (deterministic, no byte-fiddling).
 #[test]
 fn restore_rejects_a_corrupt_unit() {
     let mut host = Host::new();
-    let bad = vec![DurableJitDomain {
+    let bad = vec![DurableJitTable {
         mem_log2: Some(SIZE_LOG2),
         units_left: 10,
         bytes_left: 1 << 20,

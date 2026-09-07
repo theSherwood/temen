@@ -196,6 +196,17 @@ impl GuestWindow {
     }
 }
 
+/// The fault range a window of `reserved` bytes at `base` has — `[base, base + reserved + guard)`,
+/// exactly what [`GuestWindow::fault_range`] reports for a live window built with that reservation —
+/// recomputed from the base alone. A §14 child's module never records its live window (one compiled
+/// child may run in several windows at once — the plain-child cache), so its `Jit.invoke` derives the
+/// range from the window the thunk was handed.
+pub(crate) fn fault_range_of(base: *mut u8, reserved: usize) -> (usize, usize) {
+    let page = pal::page_size();
+    let lo = base as usize;
+    (lo, lo + round_up(reserved, page) + page)
+}
+
 impl Drop for GuestWindow {
     fn drop(&mut self) {
         if !self.base.is_null() {
