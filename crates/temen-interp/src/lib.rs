@@ -17772,12 +17772,13 @@ pub struct Host {
     /// (which requires a granted `Jit` capability a serving module need not hold).
     serve_native_ctx: usize,
     /// CALLS.md 5c.1a — a **JIT granted child's** serve context: the address of the child's live
-    /// `ChildCode` (its serve trampolines + fn table), registered at spawn and cleared by the
+    /// compiled module (its serve trampolines + fn table), registered at spawn and cleared by the
     /// powerbox release hook. Distinct from [`Host::serve_native_ctx`] (a top-level run's
     /// `*mut CompiledModule`) so the two interpretations can never be confused: this one is read
     /// only by the locked cap thunk's child serve arm, and only while the child executes (the
-    /// `ChildCode` outlives every in-child `call.cap` by construction; stale reads are prevented
-    /// by the clear-on-release). `0` ⇒ none.
+    /// module outlives every in-child `call.cap` by construction; stale reads are prevented by the
+    /// clear-on-release). `0` ⇒ none. #1296: the same address is registered as the native ctx of
+    /// every `Jit` table re-granted into the child (`set_jit_native_ctx`).
     child_serve_ctx: usize,
     /// CALLS.md 5c.1b — the run's **kill-path epoch cell** address (`*const AtomicU64`-compatible;
     /// `0` ⇒ none armed), mirrored here from the JIT run so a thread **blocked inside the cap
@@ -20360,7 +20361,7 @@ impl Host {
         self.serve_native_ctx
     }
 
-    /// CALLS.md 5c.1a — register / clear this (child) domain's `ChildCode` serve context; see
+    /// CALLS.md 5c.1a — register / clear this (child) domain's compiled-module serve context; see
     /// [`Host::child_serve_ctx`].
     pub fn set_child_serve_ctx(&mut self, ctx: usize) {
         self.child_serve_ctx = ctx;

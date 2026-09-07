@@ -2012,6 +2012,8 @@ pub unsafe extern "C" fn grant_child_build(
             // and inherit the run's kill-path cell so thunk-blocked waits stay boundable.
             child.arm_svc_cv();
             child.set_epoch_cell(parent.epoch_cell());
+            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
+            let jit_table_log2 = child.jit_table_log2();
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -2020,6 +2022,7 @@ pub unsafe extern "C" fn grant_child_build(
                 inst_handle,
                 as_handle,
                 grant_handle: cg,
+                jit_table_log2,
             };
             1
         }
@@ -2036,12 +2039,13 @@ pub unsafe extern "C" fn grant_child_build(
 pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
     if !ctx.is_null() {
         // CALLS.md 5c.1b — clear the serve context first (idempotent across the two releases): the
-        // child's `ChildCode` dies with the child thread, so no reader may see the pointer after
+        // child's module dies with the child thread, so no reader may see the pointer after
         // either ref is released. A caller mid-wait observes ctx==0 as the dead-callee signal.
         {
             let cell = &*(ctx as *const Mutex<Host>);
             let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
             g.set_child_serve_ctx(0);
+            g.set_jit_native_ctx(0); // #1296 — the child's module dies with its thread too
             if let Some(cv) = g.svc_cv() {
                 cv.notify_all();
             }
@@ -2053,18 +2057,22 @@ pub unsafe extern "C" fn grant_child_release(ctx: *mut c_void) {
 }
 
 /// CALLS.md 5c.1b — the [`temen_jit::ChildServeRegistrar`]: record a spawned granted child's live
-/// `ChildCode` address on its shared powerbox, so the locked thunk's serve arm can resolve and
+/// `CompiledModule` address on its shared powerbox, so the locked thunk's serve arm can resolve and
 /// invoke its handlers. Cleared by [`grant_child_release`].
 ///
 /// # Safety
 /// `child_ctx` is a live shared-cell ref a builder returned; `serve_ctx` is the child's
-/// `ChildCode` address, valid until the releaser clears it.
+/// `CompiledModule` address, valid until the releaser clears it.
 pub unsafe extern "C" fn child_register_serve(child_ctx: *mut c_void, serve_ctx: usize) {
     if !child_ctx.is_null() {
         let cell = &*(child_ctx as *const Mutex<Host>);
-        cell.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_child_serve_ctx(serve_ctx);
+        let mut g = cell.lock().unwrap_or_else(|e| e.into_inner());
+        g.set_child_serve_ctx(serve_ctx);
+        // #1296 — the registered address is the child's own `CompiledModule` (a §14 child compiles
+        // to the root's shape), so it is also the native ctx of every `Jit` table re-granted into
+        // the child: `jit_native_op` compiles / installs / invokes the child's units in *its*
+        // module and *its* dispatch table — never the parent's. Cleared with the serve ctx.
+        g.set_jit_native_ctx(serve_ctx);
     }
 }
 
@@ -2160,7 +2168,7 @@ unsafe fn serve_locked_child(
             let mut res = vec![0i64; n_res];
             // Run the handler with the cell UNLOCKED (its own call.cap calls relock; an enqueuer
             // never blocks behind a running handler). SAFETY: `serve_ctx` is the live
-            // `ChildCode` (cleared only at release, which runs after the child's guest code —
+            // module (cleared only at release, which runs after the child's guest code —
             // including this serve — has returned); `[mem_base, +mem_size)` is this child's
             // live window, handed to this very thunk call.
             drop(guard);
@@ -2536,6 +2544,8 @@ unsafe fn finish_child_build(
             // CALLS.md 5c.1b — as `grant_child_build`: arm the wake signal, inherit the kill cell.
             child.arm_svc_cv();
             child.set_epoch_cell(parent.epoch_cell());
+            // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
+            let jit_table_log2 = child.jit_table_log2();
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -2543,6 +2553,7 @@ unsafe fn finish_child_build(
                 retained_ctx: std::sync::Arc::into_raw(retained) as *mut c_void,
                 inst_handle,
                 as_handle,
+                jit_table_log2,
                 grant_handle: 0,
             };
             1

@@ -8,9 +8,19 @@
 //! Also pinned: the quota attenuates (a parent with one unit left hands the child one unit; the
 //! child's second `compile` is `-ENOMEM`), and a child spawned **without** the grant has no `jit`
 //! name to resolve (the resolve returns a negative errno, never a handle into the parent's table).
+//!
+//! #1296 slice 2 — the **native JIT** runs the same program (`run_jit`): a §14 child compiles to the
+//! root's shape (`CompiledModule`), so its re-granted `Jit` table compiles units into the child's own
+//! module and installs into the child's own dispatch table; the four outcomes must match the
+//! interpreter's byte-for-byte.
+
+#[path = "support/grant_hooks.rs"]
+mod grant_hooks_mod;
+use grant_hooks_mod::grant_hooks;
 
 use temen_encode::encode_module;
 use temen_interp::{bytecode, run_with_host, Host, Trap, Value};
+use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use temen_run::grant_jit;
 use temen_text::parse_module;
 use temen_verify::verify_module;
@@ -144,16 +154,23 @@ block 0 (vci: i64) {{
 
 /// Run on the tree-walker and on the bytecode engine with the same host setup (a root `Jit` grant of
 /// `units` units); return both outcomes for the caller's assertions.
+/// The parent's host for one run: an `Instantiator` over the low 128 KiB and a `Jit` table (16
+/// install slots for the install probe) with a `units` compile quota.
+fn setup(m: &temen_ir::Module, mode: u32, units: u32) -> (Host, i32, i32) {
+    let mut host = Host::new();
+    let ih = host.grant_instantiator(0, 128 << 10);
+    let jh = grant_jit(&mut host, m, if mode == 5 { 4 } else { 0 });
+    host.set_jit_quota(units, 1 << 20);
+    (host, ih, jh)
+}
+
 fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 2] {
     let b = blob(mode == 5);
     let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
     verify_module(&m).expect("verify");
     let mut out = Vec::new();
     for engine in 0..2 {
-        let mut host = Host::new();
-        let ih = host.grant_instantiator(0, 128 << 10);
-        let jh = grant_jit(&mut host, &m, if mode == 5 { 4 } else { 0 }); // 16 install slots for the probe
-        host.set_jit_quota(units, 1 << 20);
+        let (mut host, ih, jh) = setup(&m, mode, units);
         let args = [Value::I32(ih), Value::I32(jh)];
         let mut fuel = 5_000_000u64;
         let r = if engine == 0 {
@@ -172,6 +189,40 @@ fn run_both(grants_n: u32, mode: u32, units: u32) -> [Result<Vec<Value>, Trap>; 
     [out.remove(0), out.remove(0)]
 }
 
+/// The same program on the native JIT, with temen-run's production child hooks (the child is built
+/// host-side by `grant_named_child_build`, which reports the `Jit` grant's table reservation).
+fn run_jit(grants_n: u32, mode: u32, units: u32) -> JitOutcome {
+    let b = blob(mode == 5);
+    let m = parse_module(&src(grants_n, &b, mode)).expect("parse");
+    verify_module(&m).expect("verify");
+    let (mut host, ih, jh) = setup(&m, mode, units);
+    let (jo, _mem) = compile_and_run_capture_reserved_with_host_ex(
+        &m,
+        0,
+        &[ih as i64, jh as i64],
+        &[0u8; 128 << 10],
+        0,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut core::ffi::c_void,
+        None,
+        Some(grant_hooks()),
+    )
+    .expect("jit");
+    jo
+}
+
+/// Interp `Ok([I64(x)])` ≡ JIT `Returned([x])`; any interp trap ≡ any JIT trap (the kind is not part
+/// of the pinned contract here — the interp's `IndirectCallType` vs the JIT's `Trapped(..)`).
+fn agrees(interp: &Result<Vec<Value>, Trap>, jit: &JitOutcome) -> bool {
+    match (interp, jit) {
+        (Ok(v), JitOutcome::Returned(r)) => {
+            matches!((v.first(), r.first()), (Some(Value::I64(a)), Some(b)) if a == b)
+        }
+        (Err(_), JitOutcome::Trapped(_)) => true,
+        _ => false,
+    }
+}
+
 #[test]
 fn a_child_compiles_and_invokes_a_unit_on_its_own_jit_table() {
     let [tw, bc] = run_both(1, 1, 4096);
@@ -181,6 +232,8 @@ fn a_child_compiles_and_invokes_a_unit_on_its_own_jit_table() {
         "tree-walker: child invoked 3 + 4"
     );
     assert_eq!(bc, tw, "bytecode engine agrees");
+    let jo = run_jit(1, 1, 4096);
+    assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
 }
 
 #[test]
@@ -193,6 +246,8 @@ fn the_child_table_quota_is_at_most_the_parents_remaining() {
         "tree-walker: ENOMEM on the second compile"
     );
     assert_eq!(bc, tw, "bytecode engine agrees");
+    let jo = run_jit(1, 2, 1);
+    assert!(agrees(&tw, &jo), "native JIT agrees: {jo:?}");
 }
 
 #[test]
@@ -208,6 +263,12 @@ fn a_child_without_the_grant_cannot_reach_the_parents_table() {
         }
     }
     assert_eq!(tw, bc, "both engines refuse the same way");
+    let jo = run_jit(0, 1, 4096);
+    assert!(
+        matches!(&jo, JitOutcome::Returned(r) if r.first().is_some_and(|x| *x < 0))
+            || matches!(jo, JitOutcome::Trapped(_)),
+        "native JIT: no `jit` name resolves, got {jo:?}"
+    );
 }
 
 #[test]
@@ -222,5 +283,10 @@ fn a_childs_install_is_invisible_to_the_parents_dispatch_table() {
     assert!(
         bc.is_err(),
         "bytecode: the parent's call.dyn must trap, got {bc:?}"
+    );
+    let jo = run_jit(1, 5, 4096);
+    assert!(
+        matches!(jo, JitOutcome::Trapped(_)),
+        "native JIT: the parent's call.dyn must trap, got {jo:?}"
     );
 }

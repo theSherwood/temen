@@ -20,7 +20,7 @@ use std::sync::{Condvar, Mutex};
 use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry, ValType};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
-/// [`crate::ChildCode`] depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
+/// a compiled child ([`crate::CompiledModule`]) depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
 /// for the whole run per the [`crate::ModuleResolver`] contract — a held grant's storage outlives the
 /// run and distinct live modules have distinct storage, so a stale-pointer collision cannot happen
 /// within a run; the worst case of any mismatch is a miss, never wrong code). `entry` picks the
@@ -87,7 +87,7 @@ impl Child {
 /// immediately, so a parent can spawn a second child (or its own work) while this one runs.
 #[allow(clippy::too_many_arguments)] // a child spawn threads its full carve/completion/futex context
 fn spawn_child_on_thread(
-    code: std::sync::Arc<crate::ChildCode>,
+    code: std::sync::Arc<crate::CompiledModule>,
     sub_base: u64,
     child_size_log2: u8,
     parent_mem_base: *mut u8,
@@ -100,7 +100,7 @@ fn spawn_child_on_thread(
     // SAFETY: `parent_mem_base` is the parent window, which outlives every child (`join_children` runs
     // before it frees). The child thread touches only its **own** carve `[sub_base, +size)` for copy-in
     // / copy-back — disjoint from siblings and from the parent's live data — so crossing the pointer to
-    // the thread races nothing (`ChildCode` is `Send + Sync`; the carve model is the disjointness the
+    // the thread races nothing (a compiled child is `Send + Sync`; the carve model is the disjointness the
     // guest owns, exactly like sibling `thread.spawn` accesses to one window).
     unsafe impl Send for SendPtr {}
     let base = SendPtr(parent_mem_base);
@@ -116,10 +116,18 @@ fn spawn_child_on_thread(
         .spawn(move || {
             let base = base; // move the wrapper into the thread
             mem::install_guard();
-            // SAFETY: `code` is a live `Arc<ChildCode>` held by this closure; the carve is committed
-            // parent memory the Instantiator bounded; `args` matches the entry arity (caller-checked).
+            // SAFETY: `code` is a live `Arc<CompiledModule>` held by this closure (passed by raw
+            // pointer — see `run_child_code`); the carve is committed parent memory the Instantiator
+            // bounded; `args` matches the entry arity (caller-checked).
             let (r, t) = unsafe {
-                crate::run_child_code(&code, sub_base, child_size_log2, base.0, &args, n_results)
+                crate::run_child_code(
+                    std::sync::Arc::as_ptr(&code),
+                    sub_base,
+                    child_size_log2,
+                    base.0,
+                    &args,
+                    n_results,
+                )
             };
             let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
             *st = Some((r, t));
@@ -149,7 +157,7 @@ fn spawn_child_on_thread(
 #[allow(clippy::too_many_arguments)]
 unsafe fn spawn_granted_child(
     rt: &Nursery,
-    code: crate::ChildCode,
+    code: crate::CompiledModule,
     sub_base: u64,
     child_size_log2: u8,
     parent_mem_base: *mut u8,
@@ -169,9 +177,10 @@ unsafe fn spawn_granted_child(
     let ctx = SendRaw(gc_ctx);
     let code = std::sync::Arc::new(code);
     // CALLS.md 5c.1b — register the child's serve context on its shared powerbox before the child
-    // thread starts (so a dispatch enqueued at any point of the child's life finds it). The
-    // `ChildCode` Arc lives until the child thread ends, and the releaser clears the ctx before
-    // that Arc drops (the teardown hook runs `release` first) — no stale read window.
+    // thread starts (so a dispatch enqueued at any point of the child's life finds it). The module's
+    // Arc lives until the child thread ends, and the releaser clears the ctx before that Arc drops
+    // (the teardown hook runs `release` first) — no stale read window. The same registration is the
+    // child's `Jit` native ctx (#1296): a re-granted `Jit` table compiles units into this module.
     {
         let rs = rt.grant_register_serve.load(Ordering::Acquire);
         if rs != 0 {
@@ -200,7 +209,7 @@ unsafe fn spawn_granted_child(
             // once, from the only thread still holding it.
             let (r, t) = unsafe {
                 crate::run_child_code_then(
-                    &code,
+                    std::sync::Arc::as_ptr(&code),
                     sub_base,
                     child_size_log2,
                     base.0,
@@ -311,16 +320,16 @@ pub(crate) struct Nursery {
     /// (`take_frozen_nested`). The JIT analog of the interpreter's `VCpu::freeze_sink`.
     frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
     /// PROCESS.md S1: **per-carve compile cache** for non-durable children. Keyed by
-    /// [`ChildCodeKey`], each entry is a compiled [`crate::ChildCode`] reused across spawns — so a
+    /// [`ChildCodeKey`], each entry is a compiled [`crate::CompiledModule`] reused across spawns — so a
     /// shell respawning the same applet (any offset, same size) recompiles nothing. Held behind the
     /// nursery, alive for the run; the durable / nesting child bypasses it (its baked per-child
     /// nursery makes its code un-shareable). **`Arc`** (S1c): a cached child can be handed to an
-    /// OS-thread child executor and run concurrently on several threads — sound because `ChildCode` is
+    /// OS-thread child executor and run concurrently on several threads — sound because a compiled child is
     /// `Send + Sync` (its code arena + `fn_table` are immutable read-execute memory after
     /// `finalize_definitions`; the `unsafe impl` + compile-time assertion live in `lib.rs`). A lookup
     /// still drops the lock before the run. (Children run synchronously on the calling thread **today**;
     /// this makes the artifact ready for the async spawn slice that follows.)
-    child_code: Mutex<HashMap<ChildCodeKey, std::sync::Arc<crate::ChildCode>>>,
+    child_code: Mutex<HashMap<ChildCodeKey, std::sync::Arc<crate::CompiledModule>>>,
     /// PROCESS.md S2 (JIT parity): the host callbacks for `instantiate_granted` (op 8) — build a
     /// granted child's powerbox `Host` and free it after the run — stored as raw fn-pointer addresses
     /// (`0` ⇒ none, an inert `CapFault`, like a run that re-grants nothing). Set once at run entry via
@@ -345,7 +354,7 @@ pub(crate) struct Nursery {
     /// only correct for a builder that does not share the child `Host`).
     grant_thunk: std::sync::atomic::AtomicUsize,
     /// CALLS.md 5c.1b — the [`crate::ChildServeRegistrar`] hook (0 ⇒ none): registers a spawned
-    /// granted child's `ChildCode` address on its shared powerbox so the locked thunk's serve arm
+    /// granted child's module address on its shared powerbox so the locked thunk's serve arm
     /// can resolve + invoke handlers.
     grant_register_serve: std::sync::atomic::AtomicUsize,
     /// #964: the run's NULL guard (`0` = unguarded), set once at run entry via
@@ -1020,6 +1029,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
+        jit_table_log2: 0,
     };
     if build(
         rt.cap_ctx,
@@ -1048,6 +1058,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
         &rt.serve_handlers,
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1332,6 +1343,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
+        jit_table_log2: 0,
     };
     if build(
         rt.cap_ctx,
@@ -1378,6 +1390,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
         &rt.serve_handlers,
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1428,7 +1441,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
 #[allow(clippy::too_many_arguments)]
 unsafe fn spawn_detached_child(
     rt: &Nursery,
-    code: crate::ChildCode,
+    code: crate::CompiledModule,
     mapped_log2: u8,
     reserved_log2: u8,
     seeds: Vec<(u64, Vec<u8>)>,
@@ -1470,7 +1483,7 @@ unsafe fn spawn_detached_child(
             // once, from the only thread still holding it.
             let (r, t) = unsafe {
                 crate::run_detached_child_then(
-                    &code,
+                    std::sync::Arc::as_ptr(&code),
                     mapped_log2,
                     reserved_log2,
                     |rw| {
@@ -1624,6 +1637,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         inst_handle: 0,
         as_handle: 0,
         grant_handle: 0,
+        jit_table_log2: 0,
     };
     if build(
         rt.cap_ctx,
@@ -1661,6 +1675,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         rt.futex_sched,
         crate::InstEnv::null(),
         &rt.serve_handlers,
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
     );
     let code = match compiled {
         Ok(code) => code,
