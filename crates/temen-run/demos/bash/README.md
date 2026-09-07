@@ -317,6 +317,19 @@ the main list runs on the tree-walker and both bytecode drivers, and each is ass
 (stdout + exit) — including the kill-based trap scripts, since async delivery into a running C handler
 is on the bytecode engine too (#1146); the external-command list likewise matches native on all three.
 
+## Interactive rung 3 (DONE) — the transcript differential vs native under a pty
+
+The native oracle is driven under a **real pty** by `pty_oracle.py` (`bash --norc --noprofile -i`,
+`ONLCR`/`ECHOCTL` off so the byte streams line up) with the **prompt-wait protocol**: each keystroke
+chunk is typed only once a fresh prompt has arrived. The temen half types the same chunks into the
+#797 terminal with the same protocol, and the personality's new **interleaved transcript sink**
+(`Posix::enable_transcript`/`transcript` — fd-1 writes, fd-2 writes, and the discipline's echo in
+arrival order, exactly a pty master's view) is compared **byte-for-byte** with the oracle's master
+stream, on the tree-walker and both bytecode drivers (the capstone's rung-3 block). Builtins only for
+now (the plain terminal grant stages no `/bin`); `^C` is left out of this comparison because whether
+it lands before or after bash re-parks its prompt read is a genuine race on the native feed path
+(#1252) — the Chromium E2E is its deterministic proof.
+
 ## What remains
 
 The mechanism ladder from the #802 sketch is complete on all three engines (fork/exec/pipes, traps
@@ -331,9 +344,6 @@ the shell's next prompt read. What is left is surface, not mechanism:
   termcap answer) and the playground pane interpreting readline's escape sequences.
 - **#1122 route (a)** — a cooperative suspend/resume session (park-for-input across the FFI, no
   SharedArrayBuffer) so the interactive card runs on hosts without cross-origin isolation.
-- **An interactive differential harness** — drive native `bash --norc -i` under a pty with the
-  same keystrokes and compare interleaved transcripts (today prompt (fd 2) and echo/output (fd 1)
-  land in separate captures).
 - **#797 rung 2** — a PTY pair (`openpty`); deferred until a consumer needs one (bash does not).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash

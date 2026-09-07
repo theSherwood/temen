@@ -12745,6 +12745,100 @@ fn bash_exit_code(o: &temen_run::Outcome) -> i32 {
     }
 }
 
+/// Python-escape `bytes` for `pty_oracle.py`'s argv (it `unicode_escape`-decodes each chunk).
+fn py_escape(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for &b in bytes {
+        match b {
+            b'\\' => s.push_str("\\\\"),
+            0x20..=0x7e => s.push(b as char),
+            _ => s.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    s
+}
+
+/// **The interactive oracle** (#802 rung 3): native `bash --norc --noprofile -i` under a real pty,
+/// driven by `demos/bash/pty_oracle.py` with the prompt-wait protocol (type the next chunk only once a
+/// fresh prompt arrived), returning the pty master's byte stream — prompt, echo, and output
+/// interleaved in arrival order. `None` when `python3` is unavailable or the oracle fails; the caller
+/// skips loudly.
+fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Option<Vec<u8>> {
+    let mut cmd = Command::new("python3");
+    cmd.arg(bash_demo_dir().join("pty_oracle.py")).arg(oracle);
+    for c in chunks {
+        cmd.arg(py_escape(c.as_bytes()));
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "note: pty_oracle.py failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return None;
+    }
+    Some(out.stdout)
+}
+
+/// **The temen half** of the interactive differential: `bash -i` on the #797 controlling terminal
+/// with the personality's interleaved transcript armed ([`temen_posix::Posix::enable_transcript`]);
+/// a feeder thread types each chunk with the oracle's protocol — wait until the transcript has grown
+/// past the last keystroke AND ends with the prompt, then feed. `backend`: `None` = the tree-walker,
+/// `Some(false)` = the cooperative bytecode driver, `Some(true)` = `drive_parallel`. Returns the run's
+/// outcome and the transcript.
+fn bash_temen_transcript(
+    inst: &temen_run::Instance,
+    backend: Option<bool>,
+    chunks: &[&str],
+) -> (temen_run::Outcome, Vec<u8>) {
+    let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
+    posix.enable_transcript();
+    let feeder = {
+        let px = posix.clone();
+        let chunks: Vec<Vec<u8>> = chunks.iter().map(|c| c.as_bytes().to_vec()).collect();
+        std::thread::spawn(move || {
+            let mut typed_at = 0usize;
+            for c in chunks {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    let t = px.transcript();
+                    if t.len() > typed_at && t.ends_with(b"$ ") {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        eprintln!("feeder: no prompt within 60s; abandoning the session");
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                typed_at = px.transcript().len();
+                px.feed_terminal(&c);
+            }
+        })
+    };
+    // The same environment the oracle exports (PATH differs only in what it resolves; nothing
+    // in the transcript prints it).
+    let config = temen_run::RunConfig {
+        args: vec![b"bash".to_vec(), b"-i".to_vec()],
+        env: vec![
+            b"PATH=/bin".to_vec(),
+            b"HOME=/".to_vec(),
+            b"PS1=$ ".to_vec(),
+            b"TERM=dumb".to_vec(),
+            b"HISTFILE=".to_vec(),
+        ],
+        ..Default::default()
+    };
+    let run = match backend {
+        None => inst.run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)]),
+        Some(false) => inst.run_with_caps(temen_run::Backend::Bytecode, &config, &[("posix", cap)]),
+        Some(true) => inst.run_with_caps_parallel(&config, &[("posix", cap)]),
+    }
+    .unwrap_or_else(|e| panic!("bash -i transcript session ({backend:?}): {e}"));
+    feeder.join().expect("feeder thread");
+    (run.outcome, posix.transcript())
+}
+
 /// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
 /// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
 /// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
@@ -13313,6 +13407,55 @@ fn demo_bash_translates_and_verifies() {
             err.contains("exit"),
             "bash -i ({label}): ^D printed bash's `exit` farewell (stderr: {err:?})"
         );
+    }
+
+    // ▶ Interactive rung 3 (#802) — **the interactive differential**: the SAME keystrokes typed at
+    // native `bash -i` under a real pty (`pty_oracle.py`) and at temen's #797 terminal, both with the
+    // prompt-wait protocol, and the two INTERLEAVED transcripts (prompt on fd 2, the terminal's
+    // echo, output on fd 1, in arrival order — the personality's new `transcript` sink is exactly a
+    // pty master's view) compared byte-for-byte, on all three engines. Builtins only (the plain
+    // terminal grant stages no /bin); `^C` is deliberately absent — whether it lands before or after
+    // bash re-parks its prompt read is a real race on this feed path (#1252); the Chromium E2E is
+    // its deterministic proof. Skips loudly without `python3`.
+    {
+        let chunks: &[&str] = &[
+            "echo hi\n",
+            "x=5; echo $((x*2))\n",
+            "for i in 1 2; do echo i=$i; done\n",
+            "false; echo rc=$?\n",
+            "printf '%s-%s\\n' a b\n",
+            "read -r v <<< hello; echo got=$v\n",
+            "\x04",
+        ];
+        match bash_pty_oracle_transcript(&oracle, chunks) {
+            None => {
+                eprintln!("note: skipping the interactive transcript differential (no python3/pty)")
+            }
+            Some(native) => {
+                let native = String::from_utf8_lossy(&native).into_owned();
+                assert!(
+                    native.ends_with("$ exit\n") && native.contains("$ echo hi\nhi\n$ "),
+                    "the pty oracle produced a sane transcript: {native:?}"
+                );
+                for (label, backend) in [
+                    ("tree-walker", None),
+                    ("coop bytecode", Some(false)),
+                    ("parallel", Some(true)),
+                ] {
+                    let (outcome, ours) = bash_temen_transcript(&inst, backend, chunks);
+                    assert_eq!(
+                        outcome,
+                        temen_run::Outcome::Exited(0),
+                        "bash -i transcript ({label}): ^D exit"
+                    );
+                    assert_eq!(
+                        String::from_utf8_lossy(&ours),
+                        native,
+                        "bash -i ({label}): the interleaved terminal transcript differs from native"
+                    );
+                }
+            }
+        }
     }
 
     // ▶ Interactive rung 2 (#802): **job control** — `^Z` stops the foreground external command,
