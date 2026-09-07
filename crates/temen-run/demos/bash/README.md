@@ -356,6 +356,26 @@ and a `bash -i` session typing a backspace-edited line and an arrow-up history r
 **same interleaved transcript as native readline under a pty** on the tree-walker and both bytecode
 drivers (the rung-3 harness doubles as readline's acceptance).
 
+## #1122 route (a) (DONE) — the cooperative suspend/resume session
+
+The interactive card's second driver. `CoopRun::set_suspend_on_idle` makes the cooperative pump hand
+an all-parked, externally-wakeable settle back to the embedder as `CoopEvent::Idle` instead of
+sleeping the thread on the #1122 doorbell — the whole scheduler state stays inside the `CoopRun`; the
+embedder feeds the terminal (`Posix::feed_terminal`, the line discipline running at feed time) and
+pumps again, and the loop-top settle re-admits the parked reader. No second thread, no doorbell, no
+SharedArrayBuffer needed by the driver, and the deterministic cooperative schedule is unchanged.
+`temen_run::Instance::open_coop_session` is the native entry (`CoopSession::pump` →
+`SessionStep::{Idle, Done}`); `temen_bash_coop_open/pump/feed/drain/exit/close` the wasm one; the
+playground's "bash -i (cooperative session)" card runs it on one Worker (only so a long command never
+freezes the page — the owner's robustness note, not a dependency).
+
+Gates: `c_terminal_coop_session_suspends_on_idle_and_resumes_on_feed` (a partial canonical line idles
+again, the completed line wakes the read, `^D` finishes); both bash capstones drive the same
+`bash -i` transcripts on the session driver — **every idle is asserted to be a fresh prompt**, and the
+transcripts match native byte-for-byte, readline's `^C`/editing/history included (the schedule is
+deterministic, so this driver has no feed-timing race at all); `browser-bash-coop-session-test.mjs`
+runs the interactive E2E's full script (builtin, `^C`, fork+exec'd `seq`, `^Z`/`fg`, `^D`) on the card.
+
 ## What remains
 
 The mechanism ladder from the #802 sketch is complete on all three engines (fork/exec/pipes, traps
@@ -368,8 +388,6 @@ the shell's next prompt read. What is left is surface, not mechanism:
   `/etc/termcap`) plus a pane that interprets cursor motion would unlock readline's full redisplay
   (the rung below runs it as a dumb terminal: backspace-based editing, no cursor addressing), and a
   real readiness op behind `select`'s finite-timeout probe would let readline batch typeahead.
-- **#1122 route (a)** — a cooperative suspend/resume session (park-for-input across the FFI, no
-  SharedArrayBuffer) so the interactive card runs on hosts without cross-origin isolation.
 - **#797 rung 2** — a PTY pair (`openpty`); deferred until a consumer needs one (bash does not).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash

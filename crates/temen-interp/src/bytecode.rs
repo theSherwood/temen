@@ -10379,6 +10379,7 @@ fn drive(
     let mut sched = CoopSched::new(&dom, entry, args, fuel, mem, host, None)?;
     match sched.pump(&dom, mem, host, fuel, budget)? {
         CoopStep::Done(vals) => Ok(vals),
+        CoopStep::Idle => unreachable!("idle suspension not enabled on the native driver"),
         CoopStep::TierUp { .. } => unreachable!("tier-up not enabled on the native driver"),
         CoopStep::JitInvoke { .. } => {
             unreachable!("Jit.invoke surfacing not enabled on the native driver")
@@ -10393,6 +10394,13 @@ fn drive(
 enum CoopStep {
     /// The root task returned; these are the run's results.
     Done(Vec<Value>),
+    /// #1122 route (a) — every task is parked, nothing internal can wake one, and at least one park is
+    /// externally wakeable (a terminal/pipe read or a blocking stdin read): with
+    /// [`CoopSched::suspend_on_idle`] set the pump RETURNS here instead of blocking on the doorbell,
+    /// so an embedder that owns the run (a [`CoopRun`]) can feed input and pump again — the whole
+    /// scheduler state stays inside the `CoopSched`. Without the flag this state blocks on the bell
+    /// (or is the deadlock it always was).
+    Idle,
     /// A task paused on an eligible module-0 `Call` to `func` with raw i64 arg slots `argv`; `mapped`
     /// is the window's committed scalar extent for the emitted `"mapped"` global (#717 host sync).
     TierUp {
@@ -10487,6 +10495,10 @@ struct CoopSched {
     /// does. A tier-up region's bounces use the run-level `fibers` instead (a parked fiber persists for
     /// the run to resume). Empty except during an outstanding invoke; always empty on the native `drive`.
     invoke_fibers: Vec<FiberState>,
+    /// #1122 route (a) — when set, an all-parked, externally-wakeable settle yields
+    /// [`CoopStep::Idle`] to the driver instead of blocking on the #1122 doorbell (see
+    /// [`CoopRun::set_suspend_on_idle`]). Off on the native `drive` and the blocking browser session.
+    suspend_on_idle: bool,
 }
 
 /// #1262 — wire a domain's personality signal doors to the cooperative pump's `#1122` external-wake
@@ -10655,6 +10667,7 @@ impl CoopSched {
             table_gen: 0,
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
             invoke_fibers: Vec::new(),
+            suspend_on_idle: false,
         })
     }
 
@@ -10691,6 +10704,7 @@ impl CoopSched {
             // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
             // callbacks), never touched by the scheduler loop itself.
             invoke_fibers: _,
+            suspend_on_idle,
         } = self;
         // #1157 — the round-robin pick cursor (the last task index run). Scanning from `last_pick + 1`
         // (rather than always lowest-index) is what lets the preemption quantum actually rotate: a
@@ -11132,6 +11146,12 @@ impl CoopSched {
                                     | TaskState::BlockedStdin
                             )
                         });
+                        // #1122 route (a) — a suspend/resume session: hand the idle state back to the
+                        // driver (it feeds the terminal and pumps again; the loop-top settle then sees
+                        // the deposit / the signal) instead of sleeping this thread on the bell.
+                        if *suspend_on_idle && external {
+                            return Ok(CoopStep::Idle);
+                        }
                         match host.external_wake().filter(|_| external) {
                             Some(bell) => {
                                 let (gen, cv) = &*bell;
@@ -12777,6 +12797,12 @@ pub struct TierUpConfig {
 /// wait/notify) **internally** — multiplexing every vCPU on the one host thread — so, unlike the
 /// per-Worker parallel driver, those never surface; only the run's end and tier-up round-trips do.
 pub enum CoopEvent {
+    /// #1122 route (a) — the run is **idle**: every task is parked on something only the embedder can
+    /// satisfy (a terminal/pipe read, a blocking stdin read) and [`CoopRun::set_suspend_on_idle`] is
+    /// on. The run is live and resumable: feed input (e.g. `Posix::feed_terminal`, or a signal) and
+    /// call [`run`](CoopRun::run) again. Never surfaced with the flag off (the pump blocks on the
+    /// doorbell instead, or faults as a deadlock).
+    Idle,
     /// The run finished; these are the root task's results.
     Done(Vec<Value>),
     /// The run trapped (the root task, or a fatal driver fault).
@@ -12865,6 +12891,75 @@ impl CoopRun {
     /// Shared constructor tail: compile `m`, range-check `entry`, and build the `CoopSched` over the
     /// caller-chosen `mem`. `None` if `m` is outside the bytecode engine's subset (fall back to the
     /// tree-walker); `Some(Err)` if `entry` is out of range or seeding traps.
+    /// #1122 route (a) — the **suspend/resume session** constructor: like [`new_over`](Self::new_over)
+    /// but over an engine-backed reservation (`Mem::with_reservation` — the shape every temen-run
+    /// bytecode run uses, the `vm_map`-grown heap living in the reserved tail), seeded with the
+    /// embedder's window image (`init_mem`: the powerbox argv/env blob) and the module's data, with
+    /// the personality fork/`waitpid` park-request door wired (as the one-shot entries do) so a
+    /// `bash -i` session forks and waits. Pair with [`set_suspend_on_idle`](Self::set_suspend_on_idle).
+    /// `None` if `m` is outside the engine's subset.
+    #[allow(clippy::too_many_arguments)] // the window-seeding seam inherently threads more inputs
+    pub fn new_reserved(
+        m: &Module,
+        entry: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        host: Host,
+        tierup: Option<TierUpConfig>,
+        init_mem: &[u8],
+        reserved_log2: u8,
+    ) -> Option<Result<CoopRun, Trap>> {
+        let compiled = compile_reserved(m)?;
+        Some(Self::new_reserved_over_compiled(
+            m,
+            compiled,
+            entry,
+            args,
+            fuel,
+            host,
+            tierup,
+            init_mem,
+            reserved_log2,
+        ))
+    }
+
+    /// [`new_reserved`](Self::new_reserved) over an already-compiled program (the browser's cached
+    /// `bash.temen` compile, #1144): the `Domain` is `over_primary` on the shared `compiled`, so a
+    /// session open costs a window build + schedule, not a recompile of the whole shell.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_reserved_over_compiled(
+        m: &Module,
+        compiled: std::sync::Arc<Compiled>,
+        entry: FuncIdx,
+        args: &[Value],
+        mut fuel: u64,
+        mut host: Host,
+        tierup: Option<TierUpConfig>,
+        init_mem: &[u8],
+        reserved_log2: u8,
+    ) -> Result<CoopRun, Trap> {
+        if entry as usize >= compiled.progs.len() {
+            return Err(Trap::Malformed);
+        }
+        host.wire_park_door();
+        let dom = Domain::over_primary(compiled, host.jit_table_log2());
+        let mut mem = m.memory.map(|mc| {
+            let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+            mm.seed(init_mem);
+            mm.init_data(&m.data);
+            mm.seed_null_guard(temen_ir::module_null_guard()); // #964
+            mm
+        });
+        let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
+        Ok(CoopRun {
+            dom,
+            mem,
+            host,
+            fuel,
+            sched,
+        })
+    }
+
     fn assemble(
         m: &Module,
         entry: FuncIdx,
@@ -12995,6 +13090,16 @@ impl CoopRun {
         self.pending_mem().map_or(0, |m| m.map_version())
     }
 
+    /// #1122 route (a) — make an all-parked, externally-wakeable settle surface as
+    /// [`CoopEvent::Idle`] instead of blocking the calling thread on the #1122 doorbell. The
+    /// suspend/resume session shape: the embedder owns this `CoopRun`, pumps until `Idle`, feeds the
+    /// terminal (`Posix::feed_terminal` — the line discipline runs at feed time, host-side), and pumps
+    /// again; the loop-top settle re-admits the reader on the deposit. Works on any host (no threads,
+    /// no SharedArrayBuffer), keeps the deterministic cooperative schedule.
+    pub fn set_suspend_on_idle(&mut self, on: bool) {
+        self.sched.suspend_on_idle = on;
+    }
+
     /// Pump the schedule to its next pause: [`CoopEvent::Done`]/[`CoopEvent::Trapped`] end the run,
     /// [`CoopEvent::TierUp`] hands an emitted region to the host (resume with `deliver_tierup*`).
     pub fn run(&mut self) -> CoopEvent {
@@ -13010,6 +13115,7 @@ impl CoopRun {
             u64::MAX,
         ) {
             Ok(CoopStep::Done(vals)) => CoopEvent::Done(vals),
+            Ok(CoopStep::Idle) => CoopEvent::Idle,
             Ok(CoopStep::TierUp { func, argv, mapped }) => CoopEvent::TierUp { func, argv, mapped },
             Ok(CoopStep::JitInvoke {
                 code,

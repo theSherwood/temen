@@ -12841,6 +12841,56 @@ fn bash_temen_transcript(
     (run.outcome, posix.transcript())
 }
 
+/// **The temen half on the #1122 route-(a) session driver**: `bash -i` as an
+/// [`temen_run::CoopSession`] — pumped on THIS thread, no feeder thread, no doorbell. Every `Idle`
+/// is asserted to be a prompt (the transcript ends with `$ `), then the next chunk is fed and the
+/// session pumped again; `Done` ends it. The schedule is deterministic, so unlike the threaded
+/// harness there is no feed-timing race at all — which is also why this driver can include `^C`.
+fn bash_temen_transcript_session(
+    inst: &temen_run::Instance,
+    chunks: &[&str],
+) -> (temen_run::Outcome, Vec<u8>) {
+    let (cap, posix) = temen_run::posix::posix_cap_terminal(0, 0);
+    posix.enable_transcript();
+    let config = temen_run::RunConfig {
+        args: vec![b"bash".to_vec(), b"-i".to_vec()],
+        env: vec![
+            b"PATH=/bin".to_vec(),
+            b"HOME=/".to_vec(),
+            b"PS1=$ ".to_vec(),
+            b"TERM=dumb".to_vec(),
+            b"HISTFILE=".to_vec(),
+        ],
+        ..Default::default()
+    };
+    let mut session = inst
+        .open_coop_session(&config, &[("posix", cap)])
+        .expect("open the bash -i coop session");
+    let mut typed_at = 0usize;
+    let mut next = 0usize;
+    loop {
+        match session.pump().expect("session pump") {
+            temen_run::SessionStep::Done(outcome) => return (outcome, posix.transcript()),
+            temen_run::SessionStep::Idle => {
+                let t = posix.transcript();
+                assert!(
+                    t.len() > typed_at && t.ends_with(b"$ "),
+                    "the session idles only at a fresh prompt: {:?}",
+                    String::from_utf8_lossy(&t)
+                );
+                assert!(
+                    next < chunks.len(),
+                    "the session idled with no keys left to type: {:?}",
+                    String::from_utf8_lossy(&t)
+                );
+                typed_at = t.len();
+                posix.feed_terminal(chunks[next].as_bytes());
+                next += 1;
+            }
+        }
+    }
+}
+
 /// **▶ GNU bash translates + verifies** (#802 slice 2 — the whole-shell gate). Runs the faithful
 /// `demos/bash/build_bitcode.sh` (fetch bash 5.2.21 → configure the bring-up config → native
 /// oracle → 152 per-TU bitcodes with each Makefile's own flags → llvm-link + shim + waist) and
@@ -13454,6 +13504,19 @@ fn demo_bash_translates_and_verifies() {
                         "bash -i ({label}): the interleaved terminal transcript differs from native"
                     );
                 }
+                // #1122 route (a) — the same session on the suspend/resume driver (no thread, no
+                // doorbell): every idle is a prompt, and the transcript still matches native.
+                let (outcome, ours) = bash_temen_transcript_session(&inst, chunks);
+                assert_eq!(
+                    outcome,
+                    temen_run::Outcome::Exited(0),
+                    "bash -i transcript (coop session): ^D exit"
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&ours),
+                    native,
+                    "bash -i (coop session): the interleaved terminal transcript differs from native"
+                );
             }
         }
     }
@@ -13807,4 +13870,17 @@ fn demo_bash_readline_transcript_matches_native() {
             "readline bash -i ({label}): the terminal transcript differs from native readline"
         );
     }
+    // #1122 route (a) — readline on the suspend/resume session driver: `^C`, editing, and history
+    // recall across idle/feed/pump cycles, byte-identical to native readline.
+    let (outcome, ours) = bash_temen_transcript_session(&inst, chunks);
+    assert_eq!(
+        outcome,
+        temen_run::Outcome::Exited(0),
+        "readline bash -i (coop session): ^D exit"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ours),
+        native,
+        "readline bash -i (coop session): the terminal transcript differs from native readline"
+    );
 }
