@@ -342,6 +342,13 @@ int tcsetattr(int fd, int actions, const void *t) {
   buf[3] = (unsigned char)b[17 + 5]; /* VTIME */
   return (int)px_ret_(px_call_(PX_TCSETATTR, fd, (long)buf, 0, 0));
 }
+/* Flow control / queue flushing (readline rung): readline's SIGINT cleanup runs `rl_restart_output`
+ * → `tcflow(fd, TCOON)` (a trap stub before this — `^C` at a readline prompt died in the handler),
+ * and `rl_deprep_terminal` may `tcflush`/`tcdrain`. The #797 terminal has no XON/XOFF state and no
+ * output queue to drain (writes land in the sink synchronously), so all three succeed as no-ops. */
+int tcflow(int fd, int action) { (void)fd; (void)action; return 0; }
+int tcflush(int fd, int queue) { (void)fd; (void)queue; return 0; }
+int tcdrain(int fd) { (void)fd; return 0; }
 int tcgetwinsize(int fd, void *ws) {
   return (int)px_ret_(px_call_(PX_TCGETWINSIZE, fd, (long)ws, 0, 0));
 }

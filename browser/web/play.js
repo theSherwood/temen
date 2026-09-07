@@ -1987,8 +1987,42 @@ async function runBashInteractive(c) {
   const session = mk('session');
   const control = mk('control');
   c.bashWorkers = [session, control];
+  // A minimal TERMINAL model for the output pane (readline rung): the session's bytes are a
+  // terminal stream, not plain text — readline (running as `TERM=dumb`) erases with `\b \b`,
+  // returns to column 0 with `\r`, and may emit CSI sequences a real terminal would consume.
+  // Completed lines are kept verbatim; only the current line is edited: `\b` moves the cursor left,
+  // `\r` to column 0, printable bytes overwrite at the cursor, `\n` commits the line. `ESC [ … F` is
+  // parsed and dropped except `K` (clear to end of line) and `C`/`D` (cursor right/left). Without
+  // this the pane showed raw control characters after every Backspace.
+  const term = { lines: [], cur: '', col: 0, esc: '' };
+  const render = () => {
+    c.el.stdout.textContent = term.lines.join('\n') + (term.lines.length ? '\n' : '') + term.cur;
+  };
   const append = (text) => {
-    c.el.stdout.textContent += text;
+    for (const ch of text) {
+      if (term.esc) {
+        term.esc += ch;
+        if (term.esc.length === 2 && ch !== '[') term.esc = ''; // ESC x — a 2-byte sequence, dropped
+        else if (term.esc.length > 2 && /[@-~]/.test(ch)) {
+          const n = parseInt(term.esc.slice(2, -1), 10) || 1;
+          if (ch === 'K') term.cur = term.cur.slice(0, term.col);
+          else if (ch === 'C') term.col = Math.min(term.cur.length, term.col + n);
+          else if (ch === 'D') term.col = Math.max(0, term.col - n);
+          term.esc = '';
+        }
+        continue;
+      }
+      if (ch === '\x1b') term.esc = ch;
+      else if (ch === '\n') { term.lines.push(term.cur); term.cur = ''; term.col = 0; }
+      else if (ch === '\r') term.col = 0;
+      else if (ch === '\b') term.col = Math.max(0, term.col - 1);
+      else if (ch >= ' ' || ch === '\t') {
+        term.cur = term.cur.slice(0, term.col) + ch + term.cur.slice(term.col + 1);
+        term.col += 1;
+      }
+      // other control bytes (BEL, …) are dropped
+    }
+    render();
   };
   const finish = (why) => {
     if (!c.bashWorkers) return;
@@ -2021,30 +2055,40 @@ async function runBashInteractive(c) {
       finish(m.why);
     }
   };
-  // The input line: Enter sends the line + '\n'; Ctrl+C / Ctrl+D send the raw control byte (the
-  // #797 line discipline handles echo, editing, and the VEOF one-shot).
+  // Keystrokes reach the terminal ONE KEY AT A TIME, as bytes — what a terminal emulator does and
+  // what readline needs (it reads the tty in raw mode and does its own echo and editing): printable
+  // keys as themselves, Enter `\n`, Backspace DEL (readline's rubout / the discipline's VERASE in
+  // canonical mode), Tab, arrows/Home/End/Delete as their ANSI sequences, Ctrl+<letter> as the
+  // control byte (so ^C/^D/^Z reach the #797 line discipline's ISIG/VEOF handling exactly as
+  // before — #798: ^Z is VSUSP, SIGTSTP at the foreground pgid). The visible text is the TERMINAL's
+  // echo in the pane above, so the input box stays empty; anything placed in it without key events
+  // (a test's `fill`) is flushed ahead of the next key.
   const send = (arr) => control.postMessage({ kind: 'keys', bytes: Uint8Array.from(arr) });
+  const enc = new TextEncoder();
+  const SEQ = {
+    ArrowUp: '\x1b[A', ArrowDown: '\x1b[B', ArrowRight: '\x1b[C', ArrowLeft: '\x1b[D',
+    Home: '\x1b[H', End: '\x1b[F', Delete: '\x1b[3~',
+  };
   c.el.term.disabled = false;
   c.el.term.value = '';
   c.el.term.focus();
   c.el.term.onkeydown = (ev) => {
-    if (ev.key === 'Enter') {
-      const line = c.el.term.value;
-      c.el.term.value = '';
-      send([...new TextEncoder().encode(line), 10]);
-      ev.preventDefault();
-    } else if (ev.ctrlKey && (ev.key === 'c' || ev.key === 'C')) {
-      send([3]);
-      ev.preventDefault();
-    } else if (ev.ctrlKey && (ev.key === 'd' || ev.key === 'D')) {
-      send([4]);
-      ev.preventDefault();
-    } else if (ev.ctrlKey && (ev.key === 'z' || ev.key === 'Z')) {
-      // #798 job control — ^Z (VSUSP, 0x1a): the feed-time line discipline raises SIGTSTP at the
-      // foreground pgid. Stopping a job that is PARKED (a foreground `cat` on `read`) so bash's
-      // `waitpid(WUNTRACED)` wakes and returns to the prompt is tracked in #1171; the byte delivery
-      // is the correct foundation for it (and matches the ^C/^D wiring above).
-      send([26]);
+    const flush = () => {
+      if (c.el.term.value) { send([...enc.encode(c.el.term.value)]); c.el.term.value = ''; }
+    };
+    const plain = !ev.ctrlKey && !ev.altKey && !ev.metaKey;
+    let bytes = null;
+    if (ev.key === 'Enter') bytes = [10];
+    else if (ev.key === 'Backspace') bytes = [127];
+    else if (ev.key === 'Tab') bytes = [9];
+    else if (ev.key === 'Escape') bytes = [27];
+    else if (SEQ[ev.key]) bytes = [...enc.encode(SEQ[ev.key])];
+    else if (ev.ctrlKey && !ev.altKey && !ev.metaKey && /^[a-zA-Z]$/.test(ev.key)) {
+      bytes = [ev.key.toLowerCase().charCodeAt(0) & 0x1f];
+    } else if (plain && ev.key.length === 1) bytes = [...enc.encode(ev.key)];
+    if (bytes) {
+      flush();
+      send(bytes);
       ev.preventDefault();
     }
   };

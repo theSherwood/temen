@@ -13762,10 +13762,17 @@ fn demo_bash_readline_transcript_matches_native() {
         );
     }
 
-    // The interactive transcript, WITH editing: a backspace (`\x7f` = readline's rubout → `\b \b`),
-    // arrow-up (`ESC [ A` — previous-history recalls and re-runs the `x=5` line), and `^D`.
+    // The interactive transcript, WITH editing: `^C` at the prompt (readline's own SIGINT handler
+    // cleans up — `rl_restart_output` → `tcflow`, a trap stub before the shim grew it — re-raises
+    // into bash's handler, and bash reprints the prompt with `$? = 130`), a backspace (`\x7f` =
+    // readline's rubout → `\b \b`), arrow-up (`ESC [ A` — previous-history recalls and re-runs the
+    // `x=5` line), and `^D`. Readline's handler makes the `^C` outcome deterministic on this feed
+    // path (unlike the canonical-mode race, #1252): parked or not, the pending SIGINT lands in
+    // `rl_getc`'s `RL_CHECK_SIGNALS`.
     let chunks: &[&str] = &[
         "echo hi\n",
+        "\x03",
+        "echo rc=$?\n",
         "echo abX\x7fc\n",
         "x=5; echo $((x*2))\n",
         "\x1b[A\n",
@@ -13778,8 +13785,10 @@ fn demo_bash_readline_transcript_matches_native() {
     };
     let native = String::from_utf8_lossy(&native).into_owned();
     assert!(
-        native.contains("abX\x08 \x08c\nabc\n") && native.matches("\n10\n").count() == 2,
-        "the readline oracle edited and recalled as expected: {native:?}"
+        native.contains("$ \n$ echo rc=$?\nrc=130\n")
+            && native.contains("abX\x08 \x08c\nabc\n")
+            && native.matches("\n10\n").count() == 2,
+        "the readline oracle handled ^C, edited, and recalled as expected: {native:?}"
     );
     for (label, backend) in [
         ("tree-walker", None),

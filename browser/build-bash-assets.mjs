@@ -25,7 +25,11 @@
 //     crates/temen/tests/c_shell.rs). No toolchain needed for this half.
 //
 // Usage:  node build-bash-assets.mjs
-//   env:  TEMEN_BASH_CACHE (default /tmp/temen_bash_cache) — the input cache (bash source + bitcode)
+//   env:  TEMEN_BASH_READLINE (default 1) — the READLINE variant (#802 readline rung): bundled readline
+//                                           + termcap linked in, so the interactive card has line
+//                                           editing, history, and arrow keys. `0` = the plain build.
+//         TEMEN_BASH_CACHE (default /tmp/temen_bash_cache_rl, or /tmp/temen_bash_cache for the plain
+//                           build) — the input cache (bash source + bitcode)
 //         TEMEN_BASH_VER   (default 5.2.21)                — bash version (passed to build_bitcode.sh)
 // Needs (only on a cold input cache): clang/llvm-link, make, curl, tar. The regenerate half
 // needs only cargo + the workspace.
@@ -37,11 +41,12 @@ import { existsSync, mkdirSync, copyFileSync, statSync, readdirSync } from 'node
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = dirname(HERE);
 const ASSETS = join(HERE, 'web', 'assets');
-const CACHE = process.env.TEMEN_BASH_CACHE ?? '/tmp/temen_bash_cache';
+const READLINE = (process.env.TEMEN_BASH_READLINE ?? '1') !== '0';
+const CACHE = process.env.TEMEN_BASH_CACHE ?? (READLINE ? '/tmp/temen_bash_cache_rl' : '/tmp/temen_bash_cache');
 const BASHDIR = join(REPO, 'crates', 'temen-run', 'demos', 'bash');
 mkdirSync(ASSETS, { recursive: true });
 
-const env = { ...process.env, TEMEN_BASH_CACHE: CACHE };
+const env = { ...process.env, TEMEN_BASH_CACHE: CACHE, TEMEN_BASH_READLINE: READLINE ? '1' : '0' };
 const sh = (cmd, args, opts = {}) =>
   execFileSync(cmd, args, { stdio: 'inherit', env, cwd: REPO, ...opts });
 const mb = (p) => (statSync(p).size / 1e6).toFixed(1);
@@ -49,9 +54,9 @@ const mb = (p) => (statSync(p).size / 1e6).toFixed(1);
 // ---- 1) code-independent input: the whole-program bash bitcode (cached) ------------------------
 const linkedLl = join(CACHE, 'bash_linked.ll');
 if (existsSync(linkedLl)) {
-  console.log(`✓ cached bitcode: bash_linked.ll (${mb(linkedLl)} MB)`);
+  console.log(`✓ cached bitcode: bash_linked.ll (${mb(linkedLl)} MB${READLINE ? ', readline' : ''})`);
 } else {
-  console.log('building bash bitcode from source (cold — fetches ftp.gnu.org, ~2-3 min)…');
+  console.log(`building bash bitcode from source (cold — fetches ftp.gnu.org, ~2-3 min${READLINE ? ', readline variant' : ''})…`);
   sh('bash', [join(BASHDIR, 'build_bitcode.sh')]);
   console.log(`✓ built bitcode: bash_linked.ll (${mb(linkedLl)} MB)`);
 }
