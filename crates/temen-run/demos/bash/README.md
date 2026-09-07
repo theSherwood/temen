@@ -330,6 +330,32 @@ now (the plain terminal grant stages no `/bin`); `^C` is left out of this compar
 it lands before or after bash re-parks its prompt read is a genuine race on the native feed path
 (#1252) — the Chromium E2E is its deterministic proof.
 
+## Readline rung (DONE) — line editing on the terminal, byte-identical to native readline
+
+`TEMEN_BASH_READLINE=1 build_bitcode.sh` builds the **readline variant** into its own cache
+(`/tmp/temen_bash_cache_rl`): `--disable-readline` dropped, bash's bundled `lib/readline` and
+`lib/termcap` linked in (`bash_cv_termcap_lib=gnutermcap` — a host ncurses/tinfo cannot be linked
+into the bitcode, and pinning the oracle to the same bundled library keeps the differential honest;
+the K&R-era `tparam.c` gets `-include unistd.h`). With no termcap database in-guest readline runs
+in its `TERM=dumb` fallback on both sides: echo and editing are readline's own (`rl_outstream` =
+fd 2), erase is `\b \b`, no cursor addressing, bracketed paste off.
+
+One shim gap closed the whole rung: readline's `rl_getc` waits in `pselect(fd, NULL timeout)`
+BEFORE every `read` and treats a negative result as EOF, so the old `-1` stub ended a readline
+session at its first keystroke. There is no readiness op; a NULL timeout means "block until input"
+and our terminal `read` already blocks (parking, `-EINTR` on a signal), so `select`/`pselect` now
+report the read set ready and let `read` wait — observationally identical for a blocking reader. A
+finite timeout (the typeahead probes) answers "nothing pending", so readline processes keystrokes
+one at a time. Everything else readline touches — raw-mode `tcsetattr` (`~(ICANON|ECHO)`, ISIG
+kept), `TIOCGWINSZ`, `SIGWINCH`/`SIGINT` re-raise via `kill(getpid())`, `fileno`/`putc` on the shim
+`FILE`s — already existed.
+
+Gate: `demo_bash_readline_transcript_matches_native` (`#[ignore]`d — a second configure + native
+build) — the variant translates + verifies, `bash -c` still matches its oracle (traps included),
+and a `bash -i` session typing a backspace-edited line and an arrow-up history recall produces the
+**same interleaved transcript as native readline under a pty** on the tree-walker and both bytecode
+drivers (the rung-3 harness doubles as readline's acceptance).
+
 ## What remains
 
 The mechanism ladder from the #802 sketch is complete on all three engines (fork/exec/pipes, traps
@@ -338,10 +364,10 @@ and async delivery, the terminal, job control, blocking parks with `-EINTR`, a r
 next terminal read re-arms the writer, so an EOF meant for the foreground job is never consumed by
 the shell's next prompt read. What is left is surface, not mechanism:
 
-- **readline** — bash is built `--disable-readline`, so `bash -i` has no line editing, history, or
-  arrow keys. The host side readline needs exists (raw-mode termios, `TIOCGWINSZ` + `SIGWINCH`,
-  per-keystroke terminal reads); the gaps are shim-side (`select`/`FIONREAD` typeahead probes, a
-  termcap answer) and the playground pane interpreting readline's escape sequences.
+- **readline beyond the `dumb` fallback** — a termcap entry in-guest (`TERMCAP` env or a memfs
+  `/etc/termcap`) plus a pane that interprets cursor motion would unlock readline's full redisplay
+  (the rung below runs it as a dumb terminal: backspace-based editing, no cursor addressing), and a
+  real readiness op behind `select`'s finite-timeout probe would let readline batch typeahead.
 - **#1122 route (a)** — a cooperative suspend/resume session (park-for-input across the FFI, no
   SharedArrayBuffer) so the interactive card runs on hosts without cross-origin isolation.
 - **#797 rung 2** — a PTY pair (`openpty`); deferred until a consumer needs one (bash does not).

@@ -9,13 +9,21 @@
 # entry the on-ramp's synthesized `_start` calls, argv parsed from the powerbox args buffer.
 #
 #   needs: clang, llvm-link, cc, make, curl, tar
-#   env:   TEMEN_BASH_CACHE (default /tmp/temen_bash_cache), TEMEN_BASH_VER (default 5.2.21)
+#   env:   TEMEN_BASH_CACHE (default /tmp/temen_bash_cache), TEMEN_BASH_VER (default 5.2.21),
+#          TEMEN_BASH_READLINE=1 — the READLINE variant (#802 readline rung): bundled readline +
+#          bundled termcap linked in, `--disable-readline` dropped; its own cache dir
+#          (default /tmp/temen_bash_cache_rl) since the configure differs.
 #
 #   ./build_bitcode.sh            # → $CACHE/bash_linked.ll  (+ a native oracle at $SRC/bash)
 set -uo pipefail
 
 VER="${TEMEN_BASH_VER:-5.2.21}"
-CACHE="${TEMEN_BASH_CACHE:-/tmp/temen_bash_cache}"
+RL="${TEMEN_BASH_READLINE:-0}"
+if [ "$RL" = 1 ]; then
+  CACHE="${TEMEN_BASH_CACHE:-/tmp/temen_bash_cache_rl}"
+else
+  CACHE="${TEMEN_BASH_CACHE:-/tmp/temen_bash_cache}"
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$CACHE/bash-$VER"
 OUT="$CACHE/bc"
@@ -39,8 +47,17 @@ cd "$SRC"
 # ac_cv_type_long_double=no: the printf builtin's `%Lf` path uses x86_fp80, which the on-ramp
 # does not lower (Milestone 1+); autoconf-denying the type keeps floatmax_t = double in BOTH the
 # guest bitcode and the native oracle, so the differential stays honest.
+# READLINE variant: bundled readline (no --disable-readline) over the BUNDLED termcap
+# (bash_cv_termcap_lib=gnutermcap — a host ncurses/tinfo cannot be linked into the bitcode, and
+# pinning the oracle to the same library keeps the differential honest; with no termcap database
+# in-guest readline runs in its `dumb`-terminal fallback, which is the point of the first rung).
+if [ "$RL" = 1 ]; then
+  RLCONF=(); export bash_cv_termcap_lib=gnutermcap
+else
+  RLCONF=(--disable-readline)
+fi
 [ -f config.h ] || ac_cv_type_long_double=no ./configure --without-bash-malloc \
-  --disable-readline --disable-nls --disable-net-redirections >"$CACHE/configure.log" 2>&1 \
+  "${RLCONF[@]}" --disable-nls --disable-net-redirections >"$CACHE/configure.log" 2>&1 \
   || { echo "CONFIGURE FAILED"; tail -5 "$CACHE/configure.log"; exit 12; }
 
 echo "=== [3/6] native oracle build (bash + the generated sources) ==="
@@ -55,7 +72,7 @@ echo "=== [4/6] per-TU bitcode (reusing each Makefile's exact flags) ==="
 # common flag set — capture it per directory from a representative TU (the Tcl-recipe trick),
 # swap gcc→clang -emit-llvm, compile every member uniformly FROM THAT DIRECTORY (several sources
 # use `../`-relative includes).
-rm -f "$OUT"/*.ll
+rm -f "$OUT"/*.ll "$OUT/.fail"
 
 # capture_flags <dir> <representative.o> <source.c> — sets FLAGS[] from the make -n line.
 capture_flags() {
@@ -75,11 +92,15 @@ capture_flags() {
 }
 
 # emit <dir> <base> — compile $dir/$base.c → $OUT/<tag>_<base>.ll with the captured FLAGS.
+# The bundled termcap is K&R-era C (`tparam.c` calls `write` undeclared — a hard error in C99+ on
+# modern clang); pre-include unistd.h for that directory so the TU compiles unchanged.
 emit() {
   local dir="$1" base="$2" tag="$3"
-  clang -emit-llvm -S -O2 -fno-vectorize -fno-slp-vectorize "${FLAGS[@]}" \
+  local extra=()
+  [ "$tag" = termcap ] && extra=(-include unistd.h)
+  clang -emit-llvm -S -O2 -fno-vectorize -fno-slp-vectorize "${FLAGS[@]}" "${extra[@]}" \
     "$dir/$base.c" -o "$OUT/${tag}_$base.ll" 2>"$OUT/${tag}_$base.err" \
-    || { echo "  CLANG FAIL: $tag/$base"; head -2 "$OUT/${tag}_$base.err"; fail=1; }
+    || { echo "  CLANG FAIL: $tag/$base"; head -2 "$OUT/${tag}_$base.err"; echo 1 >"$OUT/.fail"; }
 }
 
 fail=0
@@ -103,18 +124,29 @@ done)
 # readline's STANDALONE support shims (shell/xmalloc/xfree/savestring/mbutil) that duplicate
 # bash's own definitions — the native static link never pulls them (archive member semantics),
 # so the whole-program link must skip them: take only the four hist* members.
-for spec in "builtins:libbuiltins.a" "lib/glob:libglob.a" "lib/sh:libsh.a" \
-            "lib/readline:libhistory.a" "lib/tilde:libtilde.a"; do
+# READLINE variant: libreadline.a's members too — minus the same standalone shims (shell/xmalloc/
+# xfree/savestring duplicate bash's own) and the hist* members libhistory already contributes —
+# plus the bundled libtermcap.a (termcap + tparam).
+ARCHIVES=("builtins:libbuiltins.a" "lib/glob:libglob.a" "lib/sh:libsh.a"
+          "lib/readline:libhistory.a" "lib/tilde:libtilde.a")
+[ "$RL" = 1 ] && ARCHIVES+=("lib/readline:libreadline.a" "lib/termcap:libtermcap.a")
+for spec in "${ARCHIVES[@]}"; do
   dir="$SRC/${spec%%:*}" lib="${spec##*:}"
   first=$(ar t "$dir/$lib" | head -1)
   capture_flags "$dir" "$first" "${first%.o}.c"
   for obj in $(ar t "$dir/$lib"); do
     base=${obj%.o}
-    case "$lib:$base" in libhistory.a:hist* | libhistory.a:history) ;; libhistory.a:*) continue ;; esac
+    case "$lib:$base" in
+      libhistory.a:hist* | libhistory.a:history) ;;
+      libhistory.a:*) continue ;;
+      libreadline.a:shell | libreadline.a:xmalloc | libreadline.a:xfree | libreadline.a:savestring) continue ;;
+      libreadline.a:hist* | libreadline.a:history | libreadline.a:tilde) continue ;;
+    esac
     [ -f "$dir/$base.c" ] || { echo "  NO SRC: ${spec%%:*}/$base"; fail=1; continue; }
     (cd "$dir" && emit . "$base" "$(basename "${spec%%:*}")")
   done
 done
+[ -f "$OUT/.fail" ] && fail=1
 echo "compiled $(ls "$OUT"/*.ll 2>/dev/null | wc -l) TUs (fail=$fail)"
 
 echo "=== [5/6] shim + reused waist → bitcode ==="

@@ -1041,7 +1041,7 @@ int sigdelset(unsigned long *set, int sig) { *set &= ~(1ul << sig); return 0; }
 int sigismember(const unsigned long *set, int sig) { return (*set >> sig) & 1; }
 int __libc_current_sigrtmin(void) { return 34; }
 int __libc_current_sigrtmax(void) { return 63; }
-/* Sockets / dlopen / select: no surface yet — clean failures, never escapes. */
+/* Sockets / dlopen: no surface yet — clean failures, never escapes. */
 int socket(int d, int t, int p) { (void)d; (void)t; (void)p; return -1; }
 int connect(int fd, const void *sa, unsigned int len) { (void)fd; (void)sa; (void)len; return -1; }
 int getaddrinfo(const char *n, const char *s, const void *h, void **res) {
@@ -1055,13 +1055,21 @@ void *dlopen(const char *f, int flags) { (void)f; (void)flags; return 0; }
 void *dlsym(void *h, const char *s) { (void)h; (void)s; return 0; }
 int dlclose(void *h) { (void)h; return 0; }
 char *dlerror(void) { return "dynamic loading unavailable"; }
+/* select/pselect (readline rung): readline's `rl_getc` waits in `pselect(fd, NULL timeout)` BEFORE
+ * every `read` and treats a negative result as EOF (`handle_error`: errno != EINTR → EOF), so the
+ * old `-1` stub would end an interactive readline session at its first keystroke. There is no
+ * readiness op; a NULL timeout means "block until input", and our terminal `read` already blocks
+ * (parking with `-EINTR` on a signal), so report the read set ready as-is and let `read` do the
+ * waiting — observationally identical for a blocking reader. A finite timeout is a typeahead probe
+ * (readline's `_rl_input_available`, bash's `input_avail`): answer "nothing pending", so readline
+ * processes keystrokes one at a time (correct, just un-batched). */
 int select(int n, void *r, void *w, void *e, void *tv) {
-  (void)n; (void)r; (void)w; (void)e; (void)tv;
-  return -1;
+  (void)w; (void)e;
+  return (tv == 0 && r && n > 0) ? 1 : 0;
 }
 int pselect(int n, void *r, void *w, void *e, const void *ts, const void *mask) {
-  (void)n; (void)r; (void)w; (void)e; (void)ts; (void)mask;
-  return -1;
+  (void)w; (void)e; (void)mask;
+  return (ts == 0 && r && n > 0) ? 1 : 0;
 }
 int chown(const char *p, unsigned int u, unsigned int g) { (void)p; (void)u; (void)g; return 0; }
 int fchmod(int fd, unsigned int m) { (void)fd; (void)m; return 0; }
