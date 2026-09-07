@@ -18622,15 +18622,22 @@ impl Host {
         // entry fails the whole fork closed (the pre-PR-5 behavior).
         let procs_forkable = self.host_procs.iter().all(|e| e.fork.is_some());
         // The core can duplicate only a simple domain; anything else the personality must re-wire.
-        // #1297 audit — one classification, not two: every refusal below coincides with snapshot's
-        // (`NonDurableKind` / `drain_non_durable`) or with its quiescence precondition, so a domain
-        // fork refuses is a domain a snapshot refuses too, for the same reason: live offers, pending
-        // live impls, blockings and window minters ARE `NonDurableKind`s; the serve queue/results,
-        // the offload pool, §13.4 replay recording and freeze residue are in-flight run state a
-        // freeze also requires drained; `self_instance` is the run's own §3.5 surface (re-registered
-        // by the embedder, never carried). Host procs are the one place fork is *more* capable
-        // (a provider fork factory carries them; snapshot cannot). Guest-JIT tables, the former
-        // odd one out (fork refused what snapshot carries), now fork below.
+        // #1297 audit — the two classifications agree, and where they differ fork is the *more*
+        // capable one (`snapshot ⊆ fork`), never the reverse (a domain a snapshot carries, fork
+        // carries too). Grouped by why each refusal here holds:
+        //   * ARE `NonDurableKind`s (snapshot refuses the binding; fork gates on its backing being
+        //     empty): live offers, pending live impls, blockings, window minters.
+        //   * In-flight run state, not a capability — cloning it into a *second* live domain would
+        //     double-drive it, so fork refuses even though a snapshot (which resumes the SAME domain,
+        //     not a duplicate) serializes some of it: the serve queue/results (a twin re-serving the
+        //     same dispatches would double-execute — snapshot carries them to resume one domain), the
+        //     offload pool, §13.4 replay recording, and freeze residue (a freeze in progress).
+        //   * `self_instance` is the run's own §3.5 reflection surface, re-registered by the embedder.
+        // Fork is MORE capable than snapshot for: forkable host procs (a provider fork factory carries
+        // them; snapshot cannot), and — carried in the twin below, not gated — shared regions, module
+        // grants + the `ModuleLoader` gate, pipes, budgets, and the §22 guest-JIT tables. snapshot
+        // refuses each of those (native pointers / live `Arc` backings it cannot serialize); fork, an
+        // in-process clone, shares or duplicates the backing, so the twin's handle stays live.
         let simple = procs_forkable
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
@@ -18803,6 +18810,15 @@ impl Host {
         twin.jit_durable_tainted_sigs = self.jit_durable_tainted_sigs.clone();
         twin.jit_durable_taint_fn = self.jit_durable_taint_fn;
         twin.jit_wasm_emitter = self.jit_wasm_emitter;
+        // #1297 — the `ModuleLoader` decode+verify gate rides the twin (a `Copy` fn pointer, like
+        // `jit_validator`). A `Binding::ModuleLoader` is Copy and rode the cloned table above, so
+        // without its backing the twin's `from_bytes` would fail closed — the silent capability drop
+        // fork refuses to make (host procs fail the whole fork rather than carry half). snapshot
+        // *refuses* a live loader (it cannot serialize the fn pointer or the non-durable `Module`
+        // grants it mints — `NonDurableKind::ModuleLoader`, re-granted by the embedder on thaw); fork,
+        // an in-process clone, carries it whole — the "fork is more capable than snapshot" case, like
+        // shared regions / modules / pipes / budgets / forkable host procs.
+        twin.module_validator = self.module_validator;
         Some(twin)
     }
 
@@ -26609,6 +26625,54 @@ mod fork_powerbox_tests {
         assert!(
             matches!(child2.jit_compile(cjit2, &unit_ir), Ok(Err(e)) if e == EINVAL),
             "a durable child of a non-hosting parent refuses compile fail-closed"
+        );
+    }
+
+    /// #1297 audit — fork is the *more capable* classification: a live `ModuleLoader` is a
+    /// `NonDurableKind` a snapshot refuses (it can serialize neither the validator fn pointer nor the
+    /// non-durable `Module` grants it mints), yet fork, an in-process clone, carries it **whole** — the
+    /// binding rode the cloned table, and its `module_validator` backing now rides too, so the twin's
+    /// `from_bytes` still mints a module. Without carrying the backing the twin would hold a live handle
+    /// that fails closed — the silent capability drop fork refuses to make.
+    #[test]
+    fn fork_carries_a_module_loader_and_its_validator() {
+        fn validator(bytes: &[u8]) -> Result<Module, i64> {
+            let m = temen_encode::decode_module(bytes).map_err(|_| -22i64)?;
+            temen_verify::verify_module(&m).map_err(|_| -22i64)?;
+            Ok(m)
+        }
+        let m = temen_text::parse_module(
+            "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  v0 = i32.const 5\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let blob = temen_encode::encode_module(&m);
+
+        let mut host = Host::new();
+        host.set_module_validator(validator);
+        let lh = host.grant_module_loader();
+        assert!(
+            host.module_from_bytes(&blob) >= 0,
+            "the parent's loader mints a module"
+        );
+
+        // snapshot refuses a live loader (the asymmetry this audit records).
+        assert!(
+            matches!(host.capture_durable_handles(), Err(h) if h.kind == NonDurableKind::ModuleLoader),
+            "a snapshot refuses a live ModuleLoader"
+        );
+
+        // fork carries it whole: the handle resolves AND its validator backing rode along.
+        let mut twin = host
+            .fork_powerbox(7)
+            .expect("forks with a live module loader");
+        assert!(
+            twin.resolve(lh, cap_id::MODULE_LOADER).is_ok(),
+            "the twin resolves the loader handle"
+        );
+        assert!(
+            twin.module_from_bytes(&blob) >= 0,
+            "the twin's loader mints a module — the validator backing was carried, not dropped"
         );
     }
 

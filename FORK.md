@@ -362,6 +362,17 @@ structure. Split into sub-slices by risk:
   ride into the twin exactly as a snapshot carries them; the process-local code pointers reset (an
   interpreter twin invokes the IR, the JIT tiers recompile on demand), and each engine gives the twin
   its own dispatch table seeded with the parent's installs, so later installs diverge per domain.
+  **#1297 classification audit (the #13 half):** fork's refusal set and snapshot's
+  (`NonDurableKind` / `capture_durable_handles`) are now reconciled as **one relation, not two lists** —
+  `snapshot ⊆ fork`. Where they differ, fork is the *more* capable in-process clone: it carries shared
+  regions, module grants, the `ModuleLoader` decode gate (validator fn pointer now rides the twin, so a
+  forked loader still mints modules — it was silently dead before), pipes, budgets, and forkable host
+  procs, all of which a snapshot refuses (native pointers / live `Arc` backings it cannot serialize,
+  re-granted by the embedder on thaw). Fork's own refusals are either the shared `NonDurableKind`s
+  (live offers, pending live impls, blockings, window minters) or in-flight run state whose duplication
+  into a *second live domain* would double-drive it (the serve queue/results — a snapshot carries these
+  to resume the SAME domain, but a twin re-serving them would double-execute — the offload pool, replay
+  recording, freeze residue). Pinned by `fork_carries_a_module_loader_and_its_validator`.
 - **Increment 3b — wire the twin into `clone_caller`. NEXT.** The remaining sub-steps, each with a real
   primitive gap to fill:
   1. **Window deep-copy — a NEW `Mem` primitive is needed.** Both existing builders *share* the backing
