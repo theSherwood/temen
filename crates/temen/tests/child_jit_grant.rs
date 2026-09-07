@@ -199,12 +199,12 @@ fn the_child_table_quota_is_at_most_the_parents_remaining() {
 fn a_child_without_the_grant_cannot_reach_the_parents_table() {
     let [tw, bc] = run_both(0, 1, 4096);
     for (r, name) in [(&tw, "tree-walker"), (&bc, "bytecode")] {
-        match r {
-            Ok(v) => assert!(
+        // A trap is an equally closed outcome; a value must be a negative errno.
+        if let Ok(v) = r {
+            assert!(
                 matches!(v.first(), Some(Value::I64(x)) if *x < 0),
                 "{name}: no `jit` name resolves, got {v:?}"
-            ),
-            Err(_) => {} // a trap is an equally closed outcome
+            );
         }
     }
     assert_eq!(tw, bc, "both engines refuse the same way");
