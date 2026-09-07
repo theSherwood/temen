@@ -13689,3 +13689,124 @@ fn demo_bash_translates_and_verifies() {
         );
     }
 }
+
+/// **▶ bash with READLINE** (#802 readline rung — the interactive line editor the playground was
+/// missing): the `TEMEN_BASH_READLINE=1` build variant (bundled readline + bundled termcap linked in,
+/// `--disable-readline` dropped) translates, verifies, still runs `bash -c` byte-identical to its own
+/// native oracle, and — the point — an interactive `bash -i` session with LINE EDITING (backspace,
+/// arrow-up history recall) produces the same interleaved terminal transcript as native readline
+/// under a real pty, on the tree-walker and both bytecode drivers. Readline runs in its
+/// `TERM=dumb` fallback on both sides (no termcap database in-guest; `bash_cv_termcap_lib=gnutermcap`
+/// pins the oracle to the same bundled library), so the editing output is backspace-based, no cursor
+/// motion. `#[ignore]`d for wall-clock (a second configure + native build of bash); skips loudly
+/// without the toolchain or `python3`.
+#[test]
+#[ignore = "capstone: builds the readline variant of bash (minutes); run with --ignored"]
+fn demo_bash_readline_transcript_matches_native() {
+    let cache = std::env::temp_dir().join("temen_bash_cache_rl");
+    let script = bash_demo_dir().join("build_bitcode.sh");
+    let linked = cache.join("bash_linked.ll");
+    let ok = Command::new("bash")
+        .arg(&script)
+        .env("TEMEN_BASH_READLINE", "1")
+        .env("TEMEN_BASH_CACHE", &cache)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok || !linked.exists() {
+        eprintln!(
+            "note: skipping bash readline (build_bitcode.sh failed — offline or no clang/make?)"
+        );
+        return;
+    }
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t = temen_llvm::translate_ll_path_with_options(linked.to_str().unwrap(), opts)
+        .expect("readline bash translates");
+    temen_verify::verify_module(&t.module).expect("readline bash verifies");
+    let oracle = cache.join("bash-5.2.21/bash");
+    let inst = temen_run::instantiate(t.module.clone()).expect("instantiate readline bash");
+
+    // `-c` is untouched by readline (it only runs interactively) — pin that the variant's
+    // non-interactive surface still matches ITS oracle, traps included.
+    for script in [
+        "echo hi; x=$(echo sub); echo \"$x\"",
+        "trap \"echo INT-caught\" INT; kill -INT $$; echo after",
+    ] {
+        let config = temen_run::RunConfig {
+            args: vec![b"bash".to_vec(), b"-c".to_vec(), script.as_bytes().to_vec()],
+            env: vec![b"PATH=/bin".to_vec(), b"HOME=/".to_vec()],
+            ..Default::default()
+        };
+        let (cap, posix) = temen_run::posix::posix_cap(0, 0, Vec::new());
+        let run = inst
+            .run_with_caps(temen_run::Backend::TreeWalk, &config, &[("posix", cap)])
+            .expect("readline bash -c");
+        let native = Command::new(&oracle)
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", "/bin")
+            .env("HOME", "/")
+            .output()
+            .expect("native oracle");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            String::from_utf8_lossy(&native.stdout),
+            "readline bash -c {script:?}: stdout differs from its oracle"
+        );
+        assert_eq!(
+            bash_exit_code(&run.outcome),
+            native.status.code().unwrap_or(-1),
+            "readline bash -c {script:?}: exit status"
+        );
+    }
+
+    // The interactive transcript, WITH editing: `^C` at the prompt (readline's own SIGINT handler
+    // cleans up — `rl_restart_output` → `tcflow`, a trap stub before the shim grew it — re-raises
+    // into bash's handler, and bash reprints the prompt with `$? = 130`), a backspace (`\x7f` =
+    // readline's rubout → `\b \b`), arrow-up (`ESC [ A` — previous-history recalls and re-runs the
+    // `x=5` line), and `^D`. Readline's handler makes the `^C` outcome deterministic on this feed
+    // path (unlike the canonical-mode race, #1252): parked or not, the pending SIGINT lands in
+    // `rl_getc`'s `RL_CHECK_SIGNALS`.
+    let chunks: &[&str] = &[
+        "echo hi\n",
+        "\x03",
+        "echo rc=$?\n",
+        "echo abX\x7fc\n",
+        "x=5; echo $((x*2))\n",
+        "\x1b[A\n",
+        "false; echo rc=$?\n",
+        "\x04",
+    ];
+    let Some(native) = bash_pty_oracle_transcript(&oracle, chunks) else {
+        eprintln!("note: skipping the readline transcript differential (no python3/pty)");
+        return;
+    };
+    let native = String::from_utf8_lossy(&native).into_owned();
+    assert!(
+        native.contains("$ \n$ echo rc=$?\nrc=130\n")
+            && native.contains("abX\x08 \x08c\nabc\n")
+            && native.matches("\n10\n").count() == 2,
+        "the readline oracle handled ^C, edited, and recalled as expected: {native:?}"
+    );
+    for (label, backend) in [
+        ("tree-walker", None),
+        ("coop bytecode", Some(false)),
+        ("parallel", Some(true)),
+    ] {
+        let (outcome, ours) = bash_temen_transcript(&inst, backend, chunks);
+        assert_eq!(
+            outcome,
+            temen_run::Outcome::Exited(0),
+            "readline bash -i ({label}): ^D exit"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&ours),
+            native,
+            "readline bash -i ({label}): the terminal transcript differs from native readline"
+        );
+    }
+}

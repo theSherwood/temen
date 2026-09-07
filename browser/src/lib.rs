@@ -7820,6 +7820,10 @@ struct BashSession {
     /// How much of the personality's accumulated stdout/stderr the control Worker has drained.
     out_off: usize,
     err_off: usize,
+    /// How much of the **interleaved terminal transcript** (`kind` 2 — prompt, echo, and output in
+    /// arrival order, what a terminal shows; readline's echo rides fd 2, so the two-stream view
+    /// reorders it against command output) has been drained.
+    tx_off: usize,
     /// `None` while the session runs; the exit code once it finished.
     exit: Option<i32>,
 }
@@ -7866,12 +7870,16 @@ pub extern "C" fn temen_bash_session(
     else {
         return -1;
     };
+    // The card's pane is a TERMINAL: arm the interleaved transcript so `temen_bash_drain(2)` hands it
+    // prompt, echo, and output in arrival order (the #802 rung-3 sink).
+    posix.enable_transcript();
     // Publish the session BEFORE entering the run: from here the control Worker's feed/drain reach
     // the live personality. (The session lock is never held while the engine runs or feeds.)
     *BASH_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(BashSession {
         posix: posix.clone(),
         out_off: 0,
         err_off: 0,
+        tx_off: 0,
         exit: None,
     });
     // Flush the type-ahead: keystrokes that raced this Worker's startup queued in
@@ -7939,8 +7947,10 @@ pub extern "C" fn temen_bash_feed(ptr: *const u8, len: usize) {
 }
 
 /// #1122 — drain the session's NEW output bytes (`kind` 0 = the personality's stdout, 1 = stderr
-/// — bash's prompt lands on stderr) into `[buf, cap)`; returns how many bytes were copied and
-/// advances the drain offset. `0` = nothing new (or no live session).
+/// — bash's prompt lands on stderr, 2 = the **interleaved terminal transcript**: fd 1 + fd 2 + the
+/// line discipline's echo in arrival order, the stream a terminal pane should render) into
+/// `[buf, cap)`; returns how many bytes were copied and advances that kind's drain offset. `0` =
+/// nothing new (or no live session).
 #[no_mangle]
 pub extern "C" fn temen_bash_drain(kind: i32, buf: *mut u8, cap: usize) -> usize {
     if buf.is_null() || cap == 0 {
@@ -7948,10 +7958,10 @@ pub extern "C" fn temen_bash_drain(kind: i32, buf: *mut u8, cap: usize) -> usize
     }
     let mut g = BASH_SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let Some(s) = g.as_mut() else { return 0 };
-    let (bytes, off) = if kind == 0 {
-        (s.posix.stdout(), &mut s.out_off)
-    } else {
-        (s.posix.stderr(), &mut s.err_off)
+    let (bytes, off) = match kind {
+        0 => (s.posix.stdout(), &mut s.out_off),
+        1 => (s.posix.stderr(), &mut s.err_off),
+        _ => (s.posix.transcript(), &mut s.tx_off),
     };
     let fresh = &bytes[(*off).min(bytes.len())..];
     let n = fresh.len().min(cap);

@@ -7,7 +7,7 @@
 //              "process".
 //   control  — the non-blocking side: it delivers keystrokes into the live session
 //              (`temen_bash_feed` → the #797 feed-time line discipline in shared memory) and
-//              polls `temen_bash_drain` for new stdout/stderr, posting each chunk to the page.
+//              polls `temen_bash_drain` for the new terminal transcript, posting each chunk to the page.
 //              A separate Worker (not the page) because these calls take real Mutexes — under
 //              contention they `Atomics.wait`, which the main thread bans.
 //
@@ -34,15 +34,16 @@ const feed = (bytes) => {
 };
 
 const drainOnce = () => {
-  for (const kind of [0, 1]) {
-    // Loop each stream dry (a burst larger than the buffer spans several drains). `slice` (not
-    // `subarray`): TextDecoder rejects views over a SharedArrayBuffer.
-    for (;;) {
-      const n = ex.temen_bash_drain(kind, drainBuf, DRAIN_CAP);
-      if (n === 0) break;
-      postMessage({ kind: kind === 0 ? 'out' : 'err', text: dec.decode(u8().slice(drainBuf, drainBuf + n)) });
-      if (n < DRAIN_CAP) break;
-    }
+  // ONE stream: the interleaved terminal transcript (`kind` 2 — prompt, echo, and output in arrival
+  // order). Draining stdout and stderr separately reordered them against each other (readline's echo
+  // and its newline ride fd 2, command output fd 1), which is what a terminal pane must never show.
+  // Loop it dry (a burst larger than the buffer spans several drains). `slice` (not `subarray`):
+  // TextDecoder rejects views over a SharedArrayBuffer.
+  for (;;) {
+    const n = ex.temen_bash_drain(2, drainBuf, DRAIN_CAP);
+    if (n === 0) break;
+    postMessage({ kind: 'out', text: dec.decode(u8().slice(drainBuf, drainBuf + n), { stream: true }) });
+    if (n < DRAIN_CAP) break;
   }
 };
 

@@ -1054,6 +1054,11 @@ jobs:
           # pump slept through the terminate of a parked twin (no `set_kill` bell ring) and deadlocked.
           # SKIPs with the batch when bash.temen/bin_cat.temen is absent.
           node browser-bash-ctrl-c-test.mjs
+          # Readline line editing (#802 readline rung): the staged bash.temen is the READLINE variant
+          # (build-bash-assets.mjs default), keystrokes reach the terminal one key at a time, and the
+          # pane is a terminal model — Backspace edits the composed line (`\b \b` rendered as an
+          # erase), ArrowUp recalls the previous command, ^D exits. SKIPs when bash.temen is absent.
+          node browser-bash-readline-test.mjs
           # DAP-over-bytecode debugger through the wasm FFI: drive a full initialize→launch→breakpoint→
           # variables→terminate conversation in Chromium on the bytecode engine (DEBUGGING.md).
           node browser-dap-test.mjs
