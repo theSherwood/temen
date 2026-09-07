@@ -18888,6 +18888,14 @@ impl Host {
         }
     }
 
+    /// #1146 (deeper) — blocking-stdin readiness for the bytecode scheduler drivers: a task parked in a
+    /// `Stream{In}` read under [`Self::set_stdin_blocking`] ([`TaskState::BlockedStdin`]) re-admits once
+    /// the stdin buffer has unconsumed bytes. The stdin twin of [`Self::pipe_read_ready`]; a root-host
+    /// resource (never per-`env`).
+    pub(crate) fn stdin_ready(&self) -> bool {
+        self.stdin_pos < self.stdin.len()
+    }
+
     /// #1080 rung 4 — pipe-write readiness (backpressure) for the bytecode cooperative driver: ready
     /// when the FIFO has room under `PIPE_CAP`, OR every reader closed (the re-run writes / `-EPIPE`s).
     /// The write twin of [`Self::pipe_read_ready`].

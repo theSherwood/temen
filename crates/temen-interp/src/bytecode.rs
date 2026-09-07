@@ -6429,6 +6429,12 @@ pub enum SchedStop {
     /// No thread is runnable and the root hasn't finished: a `memory.wait`/deadlock the debug
     /// scheduler can't advance (it drives only `thread.spawn`/`join`).
     Blocked,
+    /// #1146 (deeper) — every live thread is parked and at least one of them in a **blocking-stdin
+    /// `read`** (W4): the run is live and resumable, that thread is now the stopped + focused one
+    /// (`pc` = its read), and [`provide_stdin`](ScheduledDebugRun::provide_stdin) + a resume
+    /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
+    /// input prompt instead of a dead end.
+    StdinPark { pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
     /// coroutines (step-into, with the coroutine's vCPU pinned across the body) are all handled.
@@ -6466,6 +6472,14 @@ enum DbgTaskState {
         deadline: u64,
         dst: u32,
     },
+    /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
+    /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]); the read op was rewound and the
+    /// turn did not tick (the park is not a visible op — the re-issued read is). Woken explicitly by
+    /// [`ScheduledDebugRun::provide_stdin`]; a [`restore`](ScheduledDebugRun::restore) re-admits it
+    /// (a restored run is not parked — the re-executed read is served from the cap tape, or re-parks
+    /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
+    /// and the single-vCPU `DebugRun::stdin_parked` — invariant 14's debugger axis.
+    BlockedStdin,
     /// Finished — result (or trap) retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -6701,7 +6715,8 @@ pub enum SchedTraceEvent {
 }
 
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
-/// (aux = child), 2 = blocked-wait (aux = key), 3 = done.
+/// (aux = child), 2 = blocked-wait (aux = key), 3 = done, 4 = blocked-stdin (a park/wake the differ
+/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act).
 fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
     tasks
         .iter()
@@ -6710,6 +6725,7 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
             DbgTaskState::BlockedJoin { child, .. } => (1, child as u64),
             DbgTaskState::BlockedWait { key, .. } => (2, key),
             DbgTaskState::Done(_) => (3, 0),
+            DbgTaskState::BlockedStdin => (4, 0),
         })
         .collect()
 }
@@ -7006,6 +7022,10 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
+            // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds
+            // (as in the single-vCPU `DebugRun`); `drive` reports `SchedStop::StdinPark` once nothing
+            // else can run, and `provide_stdin` re-admits the task so the read re-issues.
+            Outcome::StdinPark => tasks[ti].state = DbgTaskState::BlockedStdin,
             // coroutine / tier-up — outside this engine's slice.
             _ => return Serviced::Declined,
         },
@@ -7870,7 +7890,24 @@ impl ScheduledDebugRun {
                     Some((st, _)) if matches!(tasks[st].state, DbgTaskState::Runnable) => st,
                     _ => match dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn) {
                         Some(i) => i,
-                        None => return SchedStop::Blocked,
+                        // Nothing runnable and no timed waiter: a thread parked in a blocking-stdin
+                        // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
+                        // lowest-index one), else a true deadlock.
+                        None => {
+                            let parked = tasks
+                                .iter()
+                                .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
+                            let pc =
+                                parked.and_then(|p| tasks[p].vt.debug_active().cur_ir_pc(source));
+                            return match (parked, pc) {
+                                (Some(p), Some(pc)) => {
+                                    *stopped = Some(p);
+                                    *focus = p;
+                                    SchedStop::StdinPark { pc }
+                                }
+                                _ => SchedStop::Blocked,
+                            };
+                        }
                     },
                 }
             };
@@ -8114,6 +8151,29 @@ impl ScheduledDebugRun {
         &mut self.host
     }
 
+    /// #1146 (deeper) — whether some thread is parked in a blocking-stdin `read` (W4): the run is live,
+    /// paused at that read, and resumable once [`provide_stdin`](ScheduledDebugRun::provide_stdin)
+    /// supplies bytes. The scheduled twin of [`DebugRun::stdin_parked`].
+    pub fn stdin_parked(&self) -> bool {
+        self.tasks
+            .iter()
+            .any(|t| matches!(t.state, DbgTaskState::BlockedStdin))
+    }
+
+    /// #1146 (deeper) — append stdin bytes for the parked blocking `read`s ([`Host::push_stdin`]) and
+    /// re-admit every stdin-parked thread: the next advance re-issues each read against the new
+    /// bytes, and the completed read joins the recorded cap tape so a later `seek` replays it
+    /// faithfully. The scheduled twin of [`DebugRun::provide_stdin`]; the wake is explicit (no
+    /// readiness poll) so the schedule stays a pure function of the recorded inputs.
+    pub fn provide_stdin(&mut self, bytes: &[u8]) {
+        self.host.push_stdin(bytes);
+        for t in self.tasks.iter_mut() {
+            if matches!(t.state, DbgTaskState::BlockedStdin) {
+                t.state = DbgTaskState::Runnable;
+            }
+        }
+    }
+
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
     /// focused thread becomes the one about to run (lowest-index runnable), or none once the run finished.
     pub fn locate(&mut self) {
@@ -8250,7 +8310,13 @@ impl ScheduledDebugRun {
                     },
                     threads: ts.threads.clone(),
                     env: ts.env,
-                    state: ts.state.clone(),
+                    // A restored run is not parked (#1146 deeper): a captured blocking-stdin park
+                    // re-admits, and the re-executed read is served from the cap tape (or re-parks
+                    // at the frontier) — the scheduled twin of `DebugRun::restore`'s rule.
+                    state: match &ts.state {
+                        DbgTaskState::BlockedStdin => DbgTaskState::Runnable,
+                        s => s.clone(),
+                    },
                     at_bp: ts.at_bp,
                 }
             })
@@ -10271,6 +10337,15 @@ enum TaskState {
     BlockedPipeWrite {
         pipe: u32,
     },
+    /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
+    /// [`super::Host::set_stdin_blocking`] ([`Outcome::StdinPark`]). The read op was rewound; the
+    /// settle scan re-admits when the (root-host) stdin buffer has bytes (`stdin_ready`), and the
+    /// all-parked signal sweep interrupts it like a pipe park (the rewound read completes `-EINTR`).
+    /// The cooperative analogue of the tree-walker's `Blocked::CapRead` stdin park. Note: `push_stdin`
+    /// takes `&mut Host`, which the run exclusively borrows, so no *concurrent* data feed can reach a
+    /// coop stdin park today — the only live wake is the signal interrupt; the readiness re-admit is
+    /// the correct contract kept for symmetry (and a future shared-Host feed), not a reachable path.
+    BlockedStdin,
     /// I48 — parked in a blocking `cont.resume.block` on fiber `fiber` (event-parked, not yet woken).
     /// The resumer's cursor was rewound to the resume op; when `fiber` is woken (idle-timer, notify,
     /// or the cap-completion drain) this task is marked `Runnable` and re-executes the resume, which
@@ -10824,6 +10899,12 @@ impl CoopSched {
                             Some(k) => extra_envs[k].host.lock_unpoisoned().pipe_write_ready(*pipe),
                             None => host.pipe_write_ready(*pipe),
                         },
+                        // #1146 (deeper) — a blocking stdin park re-admits once its own host's stdin
+                        // buffer has bytes (the stdin twin of the pipe poll; domain-scoped like the rest).
+                        TaskState::BlockedStdin => match t.env {
+                            Some(k) => extra_envs[k].host.lock_unpoisoned().stdin_ready(),
+                            None => host.stdin_ready(),
+                        },
                         _ => return None,
                     };
                     ready.then_some(ci)
@@ -10971,10 +11052,13 @@ impl CoopSched {
                         // waiters). The caught handler itself is delivered at that task's next safepoint.
                         let mut woke = false;
                         for t in tasks.iter_mut() {
+                            // A pipe read/write OR a blocking stdin read (#1146 deeper) — the interruptible
+                            // blocking-I/O parks whose rewound op completes `-EINTR` on a signal.
                             let is_pipe = matches!(
                                 t.state,
                                 TaskState::BlockedPipeRead { .. }
                                     | TaskState::BlockedPipeWrite { .. }
+                                    | TaskState::BlockedStdin
                             );
                             let is_reap =
                                 matches!(t.state, TaskState::BlockedReapPersonality { .. });
@@ -11041,6 +11125,11 @@ impl CoopSched {
                                 t.state,
                                 TaskState::BlockedPipeRead { .. }
                                     | TaskState::BlockedPipeWrite { .. }
+                                    // #1146 (deeper) — a blocking stdin park is externally wakeable
+                                    // too (an embedder signal rings the bell); without this an
+                                    // all-parked stdin run would fault as a deadlock instead of
+                                    // blocking for the `^C`.
+                                    | TaskState::BlockedStdin
                             )
                         });
                         match host.external_wake().filter(|_| external) {
@@ -11143,10 +11232,12 @@ impl CoopSched {
                     *pending_tierup = Some((ti, dst, results));
                     return Ok(CoopStep::TierUp { func, argv, mapped });
                 }
-                // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session), never
-                // a scheduler task — same rationale as tier-up above.
+                // #1146 (deeper) — park this task on a blocking `Stream{In}` read (the op was rewound);
+                // the settle scan re-admits it on `stdin_ready` and the all-parked signal sweep
+                // interrupts it (the re-run completes `-EINTR`), exactly like a pipe park. Invariant 14:
+                // the tree-walker's stdin park, carried to the cooperative driver.
                 Ok(VcpuStop::StdinPark) => {
-                    unreachable!("blocking stdin not enabled on the scheduler driver")
+                    tasks[ti].state = TaskState::BlockedStdin;
                 }
                 // I48 — a blocking `cont.resume.block` of a still-parked fiber: idle this task on the
                 // fiber (`step_vcpu` already rewound the resumer's cursor to the resume op). The
@@ -13439,9 +13530,24 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
             Ok(VcpuStop::TierUp { .. }) => unreachable!("tier-up not enabled on the native driver"),
-            // Blocking stdin is only ever set on an owned-host `Vcpu` (the interactive session).
+            // #1146 (deeper) — blocking `Stream{In}` read on an exhausted stdin (the op was rewound):
+            // block this OS thread until bytes arrive, a default-action TERMINATE flips `term_flag`
+            // (the re-run then dies at its per-op safepoint — invariant 14's terminate axis), or a
+            // deliverable non-`SA_RESTART` signal interrupts it (latch `set_sig_interrupt` and break so
+            // the re-run completes `-EINTR` at the stdin park site in `resume`). The stdin twin of the
+            // pipe poll below — each blocked OS thread observes its own interrupt, no central sweep.
             Ok(VcpuStop::StdinPark) => {
-                unreachable!("blocking stdin not enabled on the native driver")
+                let term_flag = host.lock_unpoisoned().term_flag.clone();
+                while !host.lock_unpoisoned().stdin_ready() {
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    if host.lock_unpoisoned().park_interrupted() {
+                        host.lock_unpoisoned().set_sig_interrupt();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
             }
             Ok(VcpuStop::Spawn {
                 func,
@@ -15283,6 +15389,26 @@ impl Vm {
                         && eff_op == 0
                         && host.with(|p| p.take_stdin_parked())
                     {
+                        // #1146 (deeper) — the stdin park's EINTR leg. The scheduler drivers' interrupt
+                        // paths (the cooperative all-parked sweep / the parallel poll break) latch
+                        // `set_sig_interrupt` and re-admit this task; the rewound read re-executes and
+                        // lands HERE. Without this leg the re-run would re-park unconditionally and the
+                        // latched interrupt would be silently dropped (a livelock, not a visible hang) —
+                        // the EINTR completion for a stdin park lives in `resume`, not only in the pump.
+                        // Mirror the pipe park site below: drain the transient flag unconditionally (so a
+                        // stale interrupt can never leak into a later read), and on a deliverable
+                        // non-`SA_RESTART` signal — the latched flag, or one already pending at the park
+                        // insert (the pre-park race) — complete `-EINTR` in `dst` and advance instead of
+                        // parking; the caught handler is delivered at the next safepoint. `SA_RESTART`
+                        // leaves it to re-park (data resumes it).
+                        let sig_flag = host.with(|p| p.take_sig_interrupt());
+                        let interrupted = (sig_flag && !host.with(|p| p.signal_restart()))
+                            || host.with(|p| p.park_interrupted());
+                        if interrupted {
+                            self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
+                            pc += 1;
+                            continue;
+                        }
                         self.module = module;
                         self.cur = cur;
                         self.base = base;

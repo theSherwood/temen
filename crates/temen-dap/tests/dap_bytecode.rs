@@ -1515,8 +1515,9 @@ fn dap_over_bytecode_fiber_on_a_spawned_thread() {
 
 // ---- W4 blocking stdin: the launch gate is fail-closed --------------------------------------------
 // `blockStdin: true` parks a `read` on exhausted stdin instead of returning EOF — a session mode only
-// the single-vCPU bytecode powerbox path supports. Every unsupported combination must *fail the
-// launch* rather than silently keep EOF semantics (invariant 9: decline, never diverge).
+// the bytecode powerbox path supports (single-vCPU or threaded — #1146 deeper). Every unsupported
+// combination must *fail the launch* rather than silently keep EOF semantics (invariant 9: decline,
+// never diverge).
 
 /// Launch `text` with the given extra args; returns the launch response's `success`.
 fn launch_succeeds(text: &str, extra: Vec<(&str, Json)>) -> bool {
@@ -1571,10 +1572,12 @@ fn block_stdin_launch_gate_is_fail_closed() {
             ("blockStdin", Json::Bool(true)),
         ]),
     ));
+    // #1146 (deeper): the threaded engine carries the park too (invariant 14) — a thread.spawn
+    // module under the powerbox + blockStdin LAUNCHES (the full round trip is pinned below).
     assert_eq!(
         response(&out).get("success"),
-        Some(&Json::Bool(false)),
-        "a thread.spawn module + blockStdin must fail the launch"
+        Some(&Json::Bool(true)),
+        "a thread.spawn powerbox module + blockStdin launches on the threaded engine"
     );
     // And the same launches *without* blockStdin still succeed — the gate rejects only the mode.
     assert!(
@@ -1610,5 +1613,203 @@ fn provide_stdin_fails_cleanly_on_a_non_blocking_session() {
         response(&out).get("success"),
         Some(&Json::Bool(false)),
         "provideStdin on a non-blocking session fails cleanly"
+    );
+}
+
+// ---- W4 on the threaded engine (#1146 deeper): park, provideStdin, resume, faithful replay -------
+
+/// A threaded echo guest under the powerbox: the root spawns a worker (which just returns), joins it,
+/// then twice `read`s stdin into the window and `write`s back exactly the bytes read, and `exit`s 0.
+/// Each `read` finds the buffer exhausted, so under `blockStdin` it parks the session (twice).
+const THREADED_ECHO: &str = r#"memory 16
+import 0 "read" (i64, i64) -> (i64)
+import 1 "write" (i64, i64) -> (i64)
+import 2 "exit" (i32) -> ()
+export 0 func "_start" 0
+
+func () -> () {
+block 0 () {
+  vsp = i64.const 0
+  va = i64.const 0
+  vh = thread.spawn 1 vsp va
+  vj = thread.join vh
+  vptr = i64.const 16384
+  vlen = i64.const 16
+  vn = call.import 0 (vptr, vlen)
+  vw = call.import 1 (vptr, vn)
+  vn2 = call.import 0 (vptr, vlen)
+  vw2 = call.import 1 (vptr, vn2)
+  vcode = i32.const 0
+  call.import 2 (vcode)
+  unreachable
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+
+/// The reason of the batch's `stopped` event, if any.
+fn stopped_reason(msgs: &[Json]) -> Option<String> {
+    event(msgs, "stopped")
+        .and_then(|m| m.get("body"))
+        .and_then(|b| b.get("reason"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
+/// The text of the last `output` event in a batch — the guest's captured stdout at this stop (full,
+/// not a delta: it rewinds on a reverse `seek`). `None` if the batch carried none.
+fn output_text(msgs: &[Json]) -> Option<String> {
+    msgs.iter()
+        .rev()
+        .find(|m| m.get("event").and_then(|e| e.as_str()) == Some("output"))
+        .and_then(|m| m.get("body"))
+        .and_then(|b| b.get("output"))
+        .and_then(|o| o.as_str())
+        .map(|s| s.to_string())
+}
+
+/// **#1146 (deeper) — the blocking-stdin park on the threaded debug engine (invariant 14's debugger
+/// axis)**: a `thread.spawn` guest under `blockStdin` parks at each exhausted `read` (`stopped`
+/// reason `"stdin"`, not a dead-end `Blocked`), resumes on `provideStdin`, echoes the provided
+/// bytes, and its reverse replay reproduces both inputs from the cap tape with **no new park** —
+/// the same W4 acceptance the single-vCPU engine meets (`browser/tests/chibicc_debug.rs`).
+#[test]
+fn threaded_blocking_stdin_parks_provides_and_replays() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(THREADED_ECHO)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            ("blockStdin", Json::Bool(true)),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "threaded blockStdin launch ok"
+    );
+
+    // No breakpoints: the run spawns + joins the worker, then parks at the first read (reason
+    // "stdin") instead of EOF-completing — and instead of reporting a deadlock.
+    let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    assert_eq!(
+        stopped_reason(&out).as_deref(),
+        Some("stdin"),
+        "parked awaiting input at the first read (not terminated/blocked: {out:?})"
+    );
+
+    // Provide the first input and resume: it echoes, then parks at the second read.
+    let out = s.handle(&req(
+        4,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("A\n"))]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "provideStdin accepted on the threaded engine"
+    );
+    let out = s.handle(&req(5, "continue", Json::obj(vec![])));
+    assert_eq!(
+        stopped_reason(&out).as_deref(),
+        Some("stdin"),
+        "parked at the second read: {out:?}"
+    );
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\n"),
+        "the first provided input was echoed"
+    );
+
+    // Provide the second input and resume to completion.
+    s.handle(&req(
+        6,
+        "provideStdin",
+        Json::obj(vec![("data", Json::s("B!"))]),
+    ));
+    let out = s.handle(&req(7, "continue", Json::obj(vec![])));
+    assert!(
+        event(&out, "terminated").is_some(),
+        "ran to completion: {out:?}"
+    );
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\nB!"),
+        "both provided inputs were echoed"
+    );
+
+    // Rewind to the start: the captured output rewinds with the program. The rebuilt run replays
+    // from the cap tape (and any checkpoint that captured the park re-admits the parked thread).
+    let out = s.handle(&req(8, "reverseContinue", Json::obj(vec![])));
+    assert!(
+        event(&out, "stopped").is_some(),
+        "rewound to the start: {out:?}"
+    );
+    assert_eq!(
+        output_text(&out).as_deref().unwrap_or(""),
+        "",
+        "output rewound to empty at the start"
+    );
+
+    // Forward again: the tape serves both provided reads byte-identically — the run completes with
+    // the same output and **no new stdin park** (the W4 replay acceptance, threaded).
+    let out = s.handle(&req(9, "continue", Json::obj(vec![])));
+    assert!(
+        stopped_reason(&out).is_none(),
+        "replay served the provided inputs from the tape — no re-park: {out:?}"
+    );
+    assert!(
+        event(&out, "terminated").is_some(),
+        "replay ran to completion"
+    );
+    assert_eq!(
+        output_text(&out).as_deref(),
+        Some("A\nB!"),
+        "replay reproduced the provided inputs byte-identically"
+    );
+}
+
+/// **Inertness pin** (invariant 9b), threaded: without `blockStdin` the same guest keeps plain EOF
+/// semantics on the threaded engine — exhausted reads return 0 and the run completes with no stop.
+#[test]
+fn threaded_without_block_stdin_exhausted_reads_stay_eof() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(THREADED_ECHO)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+        ]),
+    ));
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    let out = s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+    assert!(
+        stopped_reason(&out).is_none(),
+        "no park without blockStdin: {out:?}"
+    );
+    assert!(
+        event(&out, "terminated").is_some(),
+        "EOF reads completed the run: {out:?}"
+    );
+    assert_eq!(
+        output_text(&out).as_deref().unwrap_or(""),
+        "",
+        "two zero-length echoes"
     );
 }
