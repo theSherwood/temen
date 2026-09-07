@@ -13292,16 +13292,21 @@ impl CoopRun {
             .map_or(-1, |k| k as i64)
     }
 
-    /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, reserved
+    /// #816: the pending task's **flat window view** for the emitted call — `(base ptr, addressable
     /// len)`. For the root this is the run backing itself; for a §14 child it is the backing plus
     /// the carve offset, so the emitted `win + addr` accesses land exactly where the interpreter's
     /// confined accesses do. `None` when the pending window has no flat address (a `Paged`-backed
     /// window, e.g. a fork twin's private copy on wasm) — such tasks never carry the tier-up bitmap
     /// (the eligibility gates check [`Mem::flat_win_base`] at task creation), so a pending tier-up
     /// always resolves `Some`; the `None` arm is the fail-closed default for defensive callers.
+    ///
+    /// #1312: the length is the backing-clamped [`Mem::win_flat_len`], not the reservation — a
+    /// cooperative run now reserves the oracle's `DEFAULT_RESERVED_LOG2` over a growable backing, and
+    /// a driver must mirror what exists, not the mask domain. **Re-read both per event and after any
+    /// bounce**: a `vm_map` grow can extend *and relocate* the backing.
     pub fn pending_win(&self) -> Option<(*const u8, u64)> {
         let m = self.pending_mem()?;
-        Some((m.flat_win_base()?, m.win_reserved()))
+        Some((m.flat_win_base()?, m.win_flat_len()))
     }
 
     /// The pending task's window committed **scalar extent** right now — the #717 value the cdylib

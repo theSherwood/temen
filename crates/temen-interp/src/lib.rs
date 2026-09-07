@@ -25458,9 +25458,17 @@ impl Mem {
             .map(|p| p as *const u8)
     }
 
-    /// #816: the window's reserved span — the length of the flat view [`flat_win_base`] addresses.
-    pub(crate) fn win_reserved(&self) -> u64 {
-        self.window.reserved()
+    /// #816/#1312 — the **flat span** this window's base actually addresses: its reservation, clamped to
+    /// what the backing holds. This is what a codegen host mirrors or bounds its view to, and it is
+    /// *not* the reservation: a cooperative run reserves `DEFAULT_RESERVED_LOG2` (the oracle's, so a
+    /// guest `vm_map` past the declared window is admitted rather than `-EINVAL`) over a backing that
+    /// starts at the declared size and grows on demand. Reporting the reservation there would tell a
+    /// driver to mirror a terabyte. For a §14 child carve the two agree — the parent backing covers
+    /// the whole carve — so this only ever narrows where narrowing is correct.
+    pub(crate) fn win_flat_len(&self) -> u64 {
+        self.window
+            .reserved()
+            .min(self.back.len().saturating_sub(self.window.base()))
     }
 
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
