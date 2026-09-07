@@ -58,7 +58,17 @@ against uxn5's assembler on this dialect.
 ```sh
 sh crates/temen-run/demos/uxn/build.sh            # → /tmp/temen_uxn_cache/{uxn.temen,uxn_demo.rom}
 cargo test -p temen-browser --test uxn_reactor    # the reactor wiring over the committed assets
-cargo test -p temen-llvm --test uxn_diff          # native vs guest frame hashes (needs clang + cc)
+cargo test -p temen-llvm --test uxn_diff          # the corpus + the JIT-tier frame hashes (clang + cc)
+```
+
+The differential's interpreter tiers are `#[ignore]`d, like the Lua suites and for the same reason —
+a whole VM interpreted by an interpreter is minutes per tier (locally: ~58 s on the bytecode engine,
+~113 s on the tree-walker, per input, against ~4 s on the JIT). The per-PR lane runs the JIT tier at
+full depth; run a slow tier explicitly:
+
+```sh
+cd crates/temen-llvm && cargo test --test uxn_diff -- --ignored --nocapture            # both tiers
+cd crates/temen-llvm && cargo test --test uxn_diff -- --ignored --nocapture tree_walker # just one
 ```
 
 To run your own ROM in the playground, pick it in the card's ROM picker or drop it on the canvas (the
