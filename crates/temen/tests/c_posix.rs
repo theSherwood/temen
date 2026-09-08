@@ -39,9 +39,9 @@ use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Trap, Value};
-use temen_jit::{compile_and_run_with_host, JitOutcome};
+use temen_jit::{compile_and_run_with_host, compile_and_run_with_host_signals, JitOutcome, SignalArm};
 use temen_posix::Posix;
-use temen_run::cap_thunk;
+use temen_run::{cap_thunk, jit_sig_delivery, jit_sig_return, jit_sig_take};
 use temen_text::parse_module as parse_module_raw;
 use temen_verify::verify_module;
 
@@ -331,11 +331,57 @@ fn run_bytecode_parallel_setup(src: &str, extra: impl Fn(&mut Host, &Posix)) -> 
     }
 }
 
+/// #932 — the **JIT** twin of [`run_interp_only`] for async signal delivery: run the guest on the
+/// Cranelift JIT with safepoint signal delivery **armed**, so a compute-bound loop that relies on an
+/// async handler (which would spin forever on the un-armed JIT) delivers it mid-loop, exactly as the
+/// interpreter does. The delivery context is built from the SAME host after the personality grant
+/// (which installs the `SignalSource`) and before the run; it holds `Arc` clones of the armed flag +
+/// source, so it does not borrow the host — the cap thunk still gets `&mut jh`. Results map to `I64`
+/// (the JIT's untyped register ABI), so callers assert `Value::I64`.
+fn run_jit_signals(src: &str) -> Effects {
+    let ir = c_to_ir(src);
+    let raw = parse_module_raw(&ir)
+        .unwrap_or_else(|e| panic!("parse IR failed: {e:?}\n--- IR ---\n{ir}"));
+    let win = 1u64
+        << raw
+            .memory
+            .expect("the frontend declares a window")
+            .size_log2;
+    let mut jh = Host::new();
+    let (jposix, jpx) = setup(&mut jh, win);
+    verify_module(&raw).unwrap_or_else(|e| panic!("verify failed: {e:?}\n--- IR ---\n{ir}"));
+    bind_shim(&raw, &mut jh, jpx);
+    // #932 — build the delivery context AFTER the grant installed the source, before the run. Kept
+    // alive (its address is baked into the compiled code) for the whole call.
+    let deliv = jit_sig_delivery(&jh).expect("the posix grant installs a SignalSource");
+    let arm = SignalArm {
+        armed: deliv.armed_ptr(),
+        take: jit_sig_take,
+        ret: jit_sig_return,
+        ctx: &*deliv as *const _ as *mut c_void,
+    };
+    let jout =
+        compile_and_run_with_host_signals(&raw, 0, &[], cap_thunk, &mut jh as *mut Host as *mut c_void, arm)
+            .expect("jit compiles");
+    let (result, exited) = match jout {
+        JitOutcome::Returned(s) => (s.iter().map(|&x| Value::I64(x)).collect(), None),
+        JitOutcome::Exited(c) => (Vec::new(), Some(c)),
+        other => panic!("jit ended abnormally: {other:?}\n--- IR ---\n{ir}"),
+    };
+    drop(deliv); // keep the delivery ctx alive across the run above
+    Effects {
+        result,
+        exited,
+        stdout: jposix.stdout(),
+        file_f: jposix.read_file("f"),
+    }
+}
+
 /// #796 L2 — **async delivery to a running loop**: a signal raised while the guest is compute-bound is
 /// delivered to its handler at a safepoint, with **no `sigcheck` poll** in the loop. The handler sets a
 /// global; the loop (which never polls) observes it and exits. This is the headline "async" win — the
 /// interpreter redirects a running fiber into the handler `void(int)` on its registered signal stack and
-/// resumes. Interpreter-only (the JIT has no safepoint injection yet).
+/// resumes. #932 — the JIT now injects the same safepoint redirect, so all three tiers deliver.
 #[test]
 fn c_async_signal_interrupts_a_compute_loop() {
     let src = r#"
@@ -377,6 +423,15 @@ int main(void) {
         p.result,
         vec![Value::I32(2)],
         "#1146: the parallel bytecode driver delivers the async handler mid-loop too"
+    );
+    // #932 — the JIT now injects the same safepoint redirect: the armed poll at function entries +
+    // back-edges dispatches `handler` mid-compute-loop (which never polls) and resumes, returning 2 —
+    // byte-identical to the interpreter oracle. (Results are the JIT's untyped `I64`.)
+    let j = run_jit_signals(src);
+    assert_eq!(
+        j.result,
+        vec![Value::I64(2)],
+        "#932: the JIT delivers the async handler mid-loop at a safepoint"
     );
 }
 
@@ -422,13 +477,20 @@ int main(void) {
         vec![Value::I32(2)],
         "#1146: the bytecode engine honors the block mask for async delivery too"
     );
+    // #932 — the JIT's safepoint delivery calls the same `take_deliverable`, so the block mask is
+    // honored identically: held while blocked, delivered on unblock.
+    assert_eq!(
+        run_jit_signals(src).result,
+        vec![Value::I64(2)],
+        "#932: the JIT honors the block mask for async delivery too"
+    );
 }
 
 /// #796 block-during-handler — **a handler is never reentered by its own signal**: the handler
 /// re-raises SIGINT at itself and spins a window; the delivery mask (the delivered signal is
 /// blocked for the handler's duration, POSIX) holds it — a leak would re-enter and bump `count`
 /// inside the window. On return the mask restores and the held raise delivers (a second, NON-nested
-/// handler run): `count` reaches 2 with `leaked` still 0. Interpreter-only (no JIT safepoints).
+/// handler run): `count` reaches 2 with `leaked` still 0. #932 — delivered on all three tiers.
 #[test]
 fn c_a_handler_is_never_reentered_by_its_own_signal() {
     let src = r#"
@@ -472,6 +534,14 @@ int main(void) {
         run_bytecode_only(src, |_| {}).result,
         vec![Value::I32(2)],
         "#1146: the bytecode engine never reenters a handler by its own signal"
+    );
+    // #932 — block-during-handler on the JIT: the redirect's take-thunk pushes the delivery mask and
+    // the return-thunk fires `handler_returned` to restore it, so the in-handler re-raise is held and
+    // delivered exactly once after return — never reentrant.
+    assert_eq!(
+        run_jit_signals(src).result,
+        vec![Value::I64(2)],
+        "#932: the JIT never reenters a handler by its own signal"
     );
 }
 
@@ -524,6 +594,14 @@ int main(void) {
         run_bytecode_only(src, |_| {}).result,
         vec![Value::I32(11)],
         "#1146: a different signal nests into a running handler on the bytecode engine too"
+    );
+    // #932 — nested delivery on the JIT: the guest handler runs as a native call with its OWN
+    // safepoints, so USR1 delivers at a back-edge *inside* SIGINT's live handler (the take-thunk's
+    // depth gate admits it, up to `MAX_SIG_HANDLER_NEST`) — nested, exactly as on the interpreter.
+    assert_eq!(
+        run_jit_signals(src).result,
+        vec![Value::I64(11)],
+        "#932: a different signal nests into a running handler on the JIT too"
     );
 }
 
@@ -578,6 +656,14 @@ int main(void) {
         run_bytecode_only(src, |_| {}).result,
         vec![Value::I32(101)],
         "#1146: the bytecode engine honors sa_mask for the handler's duration too"
+    );
+    // #932 — `sa_mask` on the JIT: `take_deliverable` folds the action mask into the handler mask, so
+    // even though the nested handler has live safepoints, USR1 stays held through h2 and delivers
+    // non-nested after return — the complement of the nesting case, identical to the interpreter.
+    assert_eq!(
+        run_jit_signals(src).result,
+        vec![Value::I64(101)],
+        "#932: the JIT honors sa_mask for the handler's duration too"
     );
 }
 

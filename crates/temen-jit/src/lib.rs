@@ -1046,6 +1046,41 @@ pub fn compile_and_run_with_host_interruptible(
     .0)
 }
 
+/// #932 — [`compile_and_run_with_host`] with **async signal delivery armed**: the lowering polls the
+/// host `armed` flag (`Host::sig_armed`) at its safepoints (function entries + taken back-edges) and,
+/// when a signal is deliverable, redirects into the guest handler `void(int)` on the guest-registered
+/// signal stack — the JIT tier of the interpreters' per-op redirect (`#796`/`#1146`), so a
+/// compute-bound guest on the JIT delivers its handler mid-loop. The `SignalArm`'s decision/return
+/// thunks carry the shared `SignalSource` logic (nesting bound, `take_deliverable`, `handler_returned`),
+/// so delivery is byte-identical to the interpreter under the differential oracle. Build the arm from
+/// the granted host with `temen_run::jit_sig_delivery` + `jit_sig_take`/`jit_sig_return`.
+///
+/// # Safety
+/// As [`compile_and_run_with_host`], plus every address in `signal` (the `armed` flag, the two thunks,
+/// and the delivery ctx) must stay valid and honour its ABI for the whole call (they are baked into
+/// the compiled code).
+pub fn compile_and_run_with_host_signals(
+    m: &IrModule,
+    func: FuncIdx,
+    args: &[i64],
+    cap_thunk: CapThunk,
+    cap_ctx: *mut core::ffi::c_void,
+    signal: SignalArm,
+) -> Result<JitOutcome, JitError> {
+    Ok(run_inner(
+        m,
+        func,
+        args,
+        cap_thunk,
+        cap_ctx,
+        RunOpts {
+            signal: Some(signal),
+            ..RunOpts::default()
+        },
+    )?
+    .0)
+}
+
 /// [`compile_and_run_with_host_interruptible`] + the §9/D45 [`FastCapResolver`]: the production run
 /// path — a guest-undisableable kill-path **and** hot `call.cap`s devirtualized. The resolver's
 /// unclaimed ops fall back to `cap_thunk` unchanged.
@@ -1700,6 +1735,9 @@ struct RunOpts<'a> {
     fast_resolver: Option<FastCapResolver>,
     /// §15 spawn quota.
     quota: Quota,
+    /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) baked into
+    /// safepoints; `None` ⇒ no signal check emitted.
+    signal: Option<SignalArm>,
 }
 
 impl Default for RunOpts<'_> {
@@ -1716,6 +1754,7 @@ impl Default for RunOpts<'_> {
             fuel: None,
             fast_resolver: None,
             quota: Quota::default(),
+            signal: None,
         }
     }
 }
@@ -1739,13 +1778,14 @@ fn run_inner(
         fuel,
         fast_resolver,
         quota,
+        signal,
     } = opts;
     // The historical one-shot lifecycle, now compile → run over the long-lived split
     // (DESIGN.md §22): `CompiledModule` owns the `JITModule` for the whole run and the
     // executable memory is freed when it drops, after `run` returns — behavior-identical
     // to the old inline compile→run→drop.
     #[cfg_attr(not(fiber_rt), allow(unused_mut))]
-    let mut cm = CompiledModule::compile(
+    let mut cm = CompiledModule::compile_with_signal(
         m,
         func,
         cap_thunk,
@@ -1757,7 +1797,8 @@ fn run_inner(
         fuel,
         fast_resolver,
         quota,
-        0, // one-shot path: natural table size (no B2 reservation)
+        0,      // one-shot path: natural table size (no B2 reservation)
+        signal, // #932 — the one-shot signal-delivery arm (None on every non-signal entry)
     )?;
     // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
     // §14 nursery before the guest runs (the nursery only exists when the module holds an
@@ -2605,7 +2646,6 @@ impl CompiledModule {
     /// run) and honour their respective ABIs — the same contract the one-shot entry points
     /// documented per call, stretched over the module's life.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn compile(
         m: &IrModule,
         func: FuncIdx,
@@ -2619,6 +2659,45 @@ impl CompiledModule {
         fast_resolver: Option<FastCapResolver>,
         quota: Quota,
         table_reserve_log2: u8,
+    ) -> Result<CompiledModule, JitError> {
+        // #932 — the stable public signature: no async signal delivery armed (the common case). The
+        // signal-arming variant is [`Self::compile_with_signal`], reached only by the one-shot
+        // `compile_and_run_with_host_signals` entry, so every existing caller is unchanged.
+        Self::compile_with_signal(
+            m,
+            func,
+            cap_thunk,
+            cap_ctx,
+            reserved_log2,
+            sub,
+            resolve_module,
+            interrupt,
+            fuel,
+            fast_resolver,
+            quota,
+            table_reserve_log2,
+            None,
+        )
+    }
+
+    /// [`Self::compile`] with an optional #932 async-signal delivery arm (`signal`) baked into the
+    /// module's safepoints. `None` ⇒ byte-identical to [`Self::compile`]. Crate-internal — the stable
+    /// public surface is [`Self::compile`] + the named `compile_and_run_with_host_signals` entry.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn compile_with_signal(
+        m: &IrModule,
+        func: FuncIdx,
+        cap_thunk: CapThunk,
+        cap_ctx: *mut core::ffi::c_void,
+        reserved_log2: u8,
+        sub: Option<SubWindow>,
+        resolve_module: Option<ModuleResolver>,
+        interrupt: Option<*const AtomicU64>,
+        fuel: Option<*mut u64>,
+        fast_resolver: Option<FastCapResolver>,
+        quota: Quota,
+        table_reserve_log2: u8,
+        signal: Option<SignalArm>,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
         // The `call.dyn` function table is power-of-two padded; `table_reserve_log2`
@@ -2640,6 +2719,17 @@ impl CompiledModule {
         // module, since its address is baked into the code) and reads the remaining budget back after
         // the run.
         let fuel_addr = fuel.map_or(0, |p| p as i64);
+        // #932 — the async-signal delivery arm baked into `emit_signal_check` at safepoints. `null`
+        // (no checks emitted) unless the caller supplied a `SignalArm`. Its three addresses (the
+        // `Host::sig_armed` flag + the take/return thunks + the delivery ctx) are baked into the code,
+        // so the caller must keep them valid for the module's life (the one-shot signal entry holds
+        // the delivery ctx for the whole run).
+        let sig = signal.map_or(SigEnv::null(), |s| SigEnv {
+            armed_addr: s.armed as i64,
+            take_thunk: s.take as usize as i64,
+            return_thunk: s.ret as usize as i64,
+            ctx_addr: s.ctx as i64,
+        });
         // Calls can reach any function, so every function must be lowerable.
         for f in &m.funcs {
             ensure_supported(f, &m.types)?;
@@ -3019,6 +3109,7 @@ impl CompiledModule {
                 thread,
                 inst,
                 setjmp,
+                sig, // #932 async signal delivery arm (null unless a `SignalArm` was supplied)
                 &mut ctx.func,
                 f,
                 mask,
@@ -4165,6 +4256,7 @@ impl CompiledModule {
                 self.thread,
                 self.inst,
                 self.setjmp,
+                SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
                 &mut ctx.func,
                 f,
                 self.mask,
@@ -5141,6 +5233,7 @@ fn compile_child_windowed(
             thread_env,
             inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
+            SigEnv::null(), // #932 — a §14 child is not signal-delivery armed (slice 1b)
             &mut ctx.func,
             f,
             mask,
@@ -5742,6 +5835,60 @@ fn ensure_supported(f: &Func, type_section: &[temen_ir::TypeEntry]) -> Result<()
     Ok(())
 }
 
+/// #932 — the JIT-side ABI of the async-signal delivery **decision** thunk a host supplies to
+/// [`compile_and_run_with_host_signals`]: given the delivery ctx and a 3-slot `out` buffer, gate on
+/// the nesting bound + consume one deliverable signal, writing `(handler_funcref, signum, handler_sp)`
+/// into `out[0..3]` and returning `1` (delivered) or `0` (nothing / bound reached). Mirrors the
+/// interpreter's per-op redirect — the host wires it to `temen_interp::SignalSource::take_deliverable`.
+pub type SigTakeThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, out: *mut i64) -> i32;
+/// #932 — the JIT-side ABI of the async-signal **handler-return** thunk: fire after the guest handler
+/// the redirect dispatched returns, so the host restores the block-during-handler mask
+/// (`SignalSource::handler_returned`) and pops the nesting count.
+pub type SigReturnThunk = unsafe extern "C" fn(ctx: *mut core::ffi::c_void);
+
+/// #932 — the host's async-signal delivery **arm** for a JIT run: the `Host::sig_armed` flag the
+/// lowering polls at its safepoints (function entries + taken back-edges), plus the two call-out
+/// thunks and their ctx. Passed to [`compile_and_run_with_host_signals`]. All three addresses are
+/// baked into the compiled code, so the flag, the thunks, and the ctx must stay valid for the whole
+/// run. See `temen_run::JitSigDelivery` for the host side.
+pub struct SignalArm {
+    /// The `AtomicBool` "a signal is armed" flag (`Host::sig_armed`) the lowering polls inline.
+    pub armed: *const core::sync::atomic::AtomicBool,
+    /// The delivery-decision thunk (gate + consume). See [`SigTakeThunk`].
+    pub take: SigTakeThunk,
+    /// The handler-return thunk (restore mask + pop nesting). See [`SigReturnThunk`].
+    pub ret: SigReturnThunk,
+    /// The opaque host delivery context passed to both thunks (a `*mut temen_run::JitSigDelivery`).
+    pub ctx: *mut core::ffi::c_void,
+}
+
+/// #932 — the async-signal delivery environment baked into [`emit_signal_check`]: the host `armed`
+/// flag address, the two call-out thunk addresses, and the ctx address. All `0` ⇒ no delivery is
+/// armed for this compile (the check is not emitted — guest code is byte-identical to the un-armed
+/// build), exactly like [`Lower::epoch_addr`]/[`Lower::fuel_addr`].
+#[derive(Clone, Copy)]
+struct SigEnv {
+    armed_addr: i64,
+    take_thunk: i64,
+    return_thunk: i64,
+    ctx_addr: i64,
+}
+
+impl SigEnv {
+    fn null() -> SigEnv {
+        SigEnv {
+            armed_addr: 0,
+            take_thunk: 0,
+            return_thunk: 0,
+            ctx_addr: 0,
+        }
+    }
+    /// True when this compile arms safepoint signal delivery (the host supplied a [`SignalArm`]).
+    fn is_armed(&self) -> bool {
+        self.armed_addr != 0
+    }
+}
+
 /// The host `call.cap` thunk + ctx addresses, baked into each `call.cap` as constants.
 #[derive(Clone, Copy)]
 struct CapEnv {
@@ -5956,6 +6103,10 @@ struct Lower<'a> {
     /// (`null` ⇒ the module has no `setjmp`, or the target lacks the runtime and `ensure_supported`
     /// already rejected the ops).
     setjmp: SetjmpEnv,
+    /// #932 — the async-signal delivery arm (host `armed` flag + take/return thunks + ctx) baked into
+    /// [`emit_signal_check`] at safepoints (`SigEnv::null()` ⇒ no signal delivery armed — the check is
+    /// not emitted, guest code byte-identical to the un-armed build).
+    sig: SigEnv,
     /// Address of the host-owned **interrupt cell** (`AtomicU64`) for the §5 fuel/epoch kill-path.
     /// `0` ⇒ no kill-path is armed for this compile (the checks are not emitted — guest code is
     /// byte-identical to the un-armed build). When non-zero, the lowering polls `*epoch_addr` at
@@ -6047,6 +6198,7 @@ fn build_clif(
     thread: ThreadEnv,
     inst: InstEnv,
     setjmp: SetjmpEnv,
+    sig: SigEnv,
     clif: &mut Function,
     f: &Func,
     mask: u64,
@@ -6150,6 +6302,7 @@ fn build_clif(
         thread,
         inst,
         setjmp,
+        sig,
         epoch_addr,
         fuel_addr,
         ids,
@@ -6172,6 +6325,7 @@ fn build_clif(
         .map(|v| BlockArg::from(*v))
         .collect();
     emit_epoch_check(&mut b, &lower);
+    emit_signal_check(module, &mut b, &lower); // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
     b.ins().jump(blocks[0], &entry_args);
@@ -7804,9 +7958,10 @@ fn lower_block(
             // §5 kill-path: poll the interrupt cell before taking any branch — every loop body ends
             // in one of these terminators, so this bounds a non-terminating intra-function loop.
             emit_epoch_check(b, lower);
-            // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
-            // target block index is at-or-before this block's, matching the interpreters' `backedge!`
-            // (`$t <= pc`). Back-edge-ness is fully static here (one target).
+            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
+                                                 // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
+                                                 // target block index is at-or-before this block's, matching the interpreters' `backedge!`
+                                                 // (`$t <= pc`). Back-edge-ness is fully static here (one target).
             if *target as usize <= block_idx {
                 emit_fuel_check(b, lower);
             }
@@ -7825,11 +7980,12 @@ fn lower_block(
             let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
             let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
-                                        // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
-                                        // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
-                                        // static per edge, but which edge is taken is a runtime value — so an edge that is a
-                                        // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
-                                        // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
+            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
+                                                 // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
+                                                 // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
+                                                 // static per edge, but which edge is taken is a runtime value — so an edge that is a
+                                                 // back-edge *alone* is charged via a trampoline block entered only when that edge is taken.
+                                                 // Gated on `fuel_addr != 0` so an un-armed compile emits the identical plain `brif`.
             let then_be = lower.fuel_addr != 0 && *then_blk as usize <= block_idx;
             let else_be = lower.fuel_addr != 0 && *else_blk as usize <= block_idx;
             match (then_be, else_be) {
@@ -7869,12 +8025,13 @@ fn lower_block(
         } => {
             let index = get(&vals, *idx)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
-                                        // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
-                                        // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
-                                        // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
-                                        // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
-                                        // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
-                                        // `fuel_addr != 0` so an un-armed compile builds the identical table.
+            emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
+                                                 // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
+                                                 // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
+                                                 // Back-edge-ness is static per arm; which arm is selected is runtime. So: no arm a back-edge
+                                                 // ⇒ no charge; every arm a back-edge ⇒ charge once up front; mixed ⇒ route each back-edge arm
+                                                 // through a trampoline that charges then jumps, leaving forward arms direct. Gated on
+                                                 // `fuel_addr != 0` so an un-armed compile builds the identical table.
             let is_be = |t: u32| lower.fuel_addr != 0 && t as usize <= block_idx;
             let all_be = is_be(default.0) && targets.iter().all(|(t, _)| is_be(*t));
             let any_be = is_be(default.0) || targets.iter().any(|(t, _)| is_be(*t));
@@ -8125,6 +8282,93 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     emit_trap(b, lower, TrapKind::OutOfFuel);
     b.switch_to_block(cont);
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
+}
+
+/// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag (`Host::sig_armed`)
+/// and, when set, call out to the host's decision thunk; if it returns a deliverable signal, redirect
+/// into the guest handler `void(int)` (dispatched through the §3c function table like a `call.dyn`) on
+/// the guest-registered signal stack, then notify handler-return and **re-poll** (so a signal that
+/// arrived during the handler, or a queued one exposed by unblocking, is delivered before continuing).
+/// A no-op when no signal delivery is armed (`SigEnv::null()`) — then the guest code is byte-identical
+/// to the un-armed build. Placed at the same safepoints as [`emit_epoch_check`] (function entry +
+/// every branch), so a compute-bound guest polls within a bounded number of steps and delivers its
+/// handler mid-loop — the JIT twin of the interpreters' per-op redirect (`#796` / `#1146`). The
+/// **decision** (nesting bound + consume) and **return** bookkeeping (mask restore) live in the shared
+/// `SignalSource` behind the thunks, so delivery is byte-identical to the interpreter under the
+/// differential oracle (DESIGN.md §18); only the redirect codegen is here.
+///
+/// On return the builder is positioned at a fresh continuation block (the not-delivered path); the
+/// caller emits the real terminator / next check there. The armed flag is loaded **atomically** (as
+/// [`emit_epoch_check`] does) so Cranelift's alias analysis cannot hoist the poll out of a loop — the
+/// host sets it from another thread and the guest never stores it.
+fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lower) {
+    if !lower.sig.is_armed() {
+        return; // no signal delivery armed for this compile — emit nothing
+    }
+    let poll = b.create_block(); // re-poll head (revisited after a handler returns)
+    let cont = b.create_block(); // the not-delivered continuation
+    b.ins().jump(poll, &[]);
+    b.switch_to_block(poll);
+    // Poll the host `AtomicBool` armed flag. Atomic load (like the epoch cell) so it is re-read every
+    // iteration — a plain load would be hoisted out of the loop and the poll would fire only once.
+    let armed_addr = b.ins().iconst(I64, lower.sig.armed_addr);
+    let armed = b.ins().atomic_load(I8, atomic_flags(), armed_addr);
+    let maybe = b.create_block();
+    b.ins().brif(armed, maybe, &[], cont, &[]);
+
+    // Armed: ask the host decision thunk `fn(ctx, *mut [i64;3]) -> i32` for a deliverable signal.
+    b.switch_to_block(maybe);
+    let out_ss = b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 24, 3)); // [fref,signum,sp]
+    let out = b.ins().stack_addr(I64, out_ss, 0);
+    let ctx = b.ins().iconst(I64, lower.sig.ctx_addr);
+    let take_sig = {
+        let mut s = module.make_signature(); // host C ABI (matches the `extern "C"` thunk)
+        s.params.push(AbiParam::new(I64)); // ctx
+        s.params.push(AbiParam::new(I64)); // out ptr
+        s.returns.push(AbiParam::new(I32)); // 1 = deliverable, 0 = not
+        b.import_signature(s)
+    };
+    let take = b.ins().iconst(I64, lower.sig.take_thunk);
+    let got = b.ins().call_indirect(take_sig, take, &[ctx, out]);
+    let got = b.inst_results(got)[0];
+    let deliver = b.create_block();
+    b.ins().brif(got, deliver, &[], cont, &[]);
+
+    // Deliver: read `(handler_funcref, signum, handler_sp)` and dispatch the guest handler
+    // `void(int)` — IR type `(i64 sp, i32 signum) -> ()` — through the §3c table (the `call.dyn`
+    // machinery), on the guest's registered signal stack `sp` (the handler's v0). The interrupted
+    // safepoint is NOT retired, so control resumes here (and re-polls) after the handler returns.
+    b.switch_to_block(deliver);
+    let fref64 = b.ins().load(I64, MemFlags::trusted(), out, 0);
+    let fref = b.ins().ireduce(I32, fref64);
+    let signum64 = b.ins().load(I64, MemFlags::trusted(), out, 8);
+    let signum = b.ins().ireduce(I32, signum64);
+    let sp = b.ins().load(I64, MemFlags::trusted(), out, 16);
+    let handler_ty = FuncType {
+        params: vec![ValType::I64, ValType::I32],
+        results: vec![],
+    };
+    let code = indirect_dispatch(b, lower, fref, &handler_ty);
+    let hsig = b.import_signature(sig_from(module, &handler_ty.params, &handler_ty.results));
+    let mut cargs = ctx_args(b, lower);
+    cargs.push(sp);
+    cargs.push(signum);
+    b.ins().call_indirect(hsig, code, &cargs);
+    // The handler may `exit`/trap or `longjmp`; propagate a set trap cell now (unwinds this function),
+    // exactly as after a `call.dyn`. Leaves the builder in a fresh continuation block.
+    emit_trap_propagate(b, lower);
+    // Handler returned normally: notify the host (restore the block-during-handler mask, pop nesting).
+    let ret_sig = {
+        let mut s = module.make_signature();
+        s.params.push(AbiParam::new(I64)); // ctx
+        b.import_signature(s)
+    };
+    let retf = b.ins().iconst(I64, lower.sig.return_thunk);
+    let ctx2 = b.ins().iconst(I64, lower.sig.ctx_addr);
+    b.ins().call_indirect(ret_sig, retf, &[ctx2]);
+    b.ins().jump(poll, &[]); // re-poll: deliver a nested/queued signal before resuming
+    b.switch_to_block(cont);
+    // `poll`/`maybe`/`deliver`/`cont` are sealed by the caller's `seal_all_blocks`.
 }
 
 /// Emit the safepoint-anchored **counted-fuel** decrement (INTERP_PERF.md "Fuel unification"): charge

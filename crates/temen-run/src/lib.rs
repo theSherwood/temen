@@ -271,6 +271,88 @@ unsafe fn fiber_cap_wait(
     }
 }
 
+// ---- #932: JIT async signal delivery bridge ---------------------------------------------------
+//
+// The JIT (`temen-jit`) polls a host `armed` flag at its safepoints and, when set, calls out here to
+// decide + finish a delivery. The DECISION (nesting bound + `take_deliverable`) and the RETURN
+// bookkeeping (`handler_returned`) live in the shared `temen_interp::SignalSource`, so JIT delivery is
+// byte-identical to the interpreter's per-op redirect under the differential oracle (DESIGN.md §18);
+// the JIT supplies only the redirect *codegen*. This lives in `temen-run` (not the
+// `#![forbid(unsafe_code)]` interp crate) because the thunks dereference the raw `ctx` the JIT hands
+// back — the same reason `cap_thunk` lives here.
+
+/// #932 — the host-side **delivery context** for a JIT run's async signals: the `Host::sig_armed`
+/// flag the JIT polls, the installed personality it consults, and the live injected-handler `depth`
+/// (the JIT's analogue of the tree-walker's `VCpu::sig_handler_stack.len()`). Build it from a granted
+/// host with [`jit_sig_delivery`], hand its address + [`jit_sig_take`]/[`jit_sig_return`] to the JIT
+/// as a [`temen_jit::SignalArm`], and keep it alive for the whole run (its address is baked into the
+/// compiled code). Single-threaded per run — the thunks fire synchronously from the running vCPU's
+/// safepoint — so a `Cell` depth needs no atomics.
+pub struct JitSigDelivery {
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    source: Arc<dyn temen_interp::SignalSource + Send + Sync>,
+    depth: std::cell::Cell<usize>,
+}
+
+impl JitSigDelivery {
+    /// The address of the `AtomicBool` "a signal is armed" flag ([`Host::sig_armed`]) the JIT polls at
+    /// each safepoint. Stable for the delivery's life (the `Arc` keeps the cell pinned).
+    pub fn armed_ptr(&self) -> *const std::sync::atomic::AtomicBool {
+        Arc::as_ptr(&self.armed)
+    }
+}
+
+/// #932 — build the JIT async-signal delivery context for `host`, or `None` when no `SignalSource` is
+/// installed (a poll-only run — the JIT emits no signal check). Call **after** the personality is
+/// granted (which installs the source) and before the run.
+pub fn jit_sig_delivery(host: &Host) -> Option<Box<JitSigDelivery>> {
+    host.signal_arm_pair().map(|(armed, source)| {
+        Box::new(JitSigDelivery {
+            armed,
+            source,
+            depth: std::cell::Cell::new(0),
+        })
+    })
+}
+
+/// #932 — the JIT **delivery-decision** thunk (the analogue of the interpreter's per-op redirect):
+/// gate on the nesting bound, then consume one deliverable signal via `take_deliverable`. On success
+/// write `(handler_funcref, signum, handler_sp)` into `out[0..3]` and return `1`; otherwise `0`. The
+/// consume + mask handling live in the shared `SignalSource`, so block-during-handler / `sa_mask` /
+/// `SA_RESTART` come out identical to the interpreter.
+///
+/// # Safety
+/// `ctx` must be a live `*mut JitSigDelivery` for the call; `out` must point at 3 writable `i64` slots.
+pub unsafe extern "C" fn jit_sig_take(ctx: *mut c_void, out: *mut i64) -> i32 {
+    let d = &*(ctx as *const JitSigDelivery);
+    if d.depth.get() >= temen_interp::MAX_SIG_HANDLER_NEST {
+        return 0; // nesting bound reached — hold (interp: `sig_handler_stack.len() < MAX_SIG_HANDLER_NEST`)
+    }
+    match d.source.take_deliverable() {
+        Some((fref, signum, sp)) => {
+            *out.add(0) = fref as i64;
+            *out.add(1) = signum as i64;
+            *out.add(2) = sp as i64;
+            d.depth.set(d.depth.get() + 1);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// #932 — the JIT **handler-return** thunk (the analogue of the interpreter's handler-frame pop): pop
+/// the nesting count and fire `handler_returned` so the source restores the block-during-handler mask
+/// (and re-arms any signal that unblocking exposes). Called right after the guest handler's dispatched
+/// call returns on the JIT.
+///
+/// # Safety
+/// `ctx` must be a live `*mut JitSigDelivery` for the call.
+pub unsafe extern "C" fn jit_sig_return(ctx: *mut c_void) {
+    let d = &*(ctx as *const JitSigDelivery);
+    d.depth.set(d.depth.get().saturating_sub(1));
+    d.source.handler_returned();
+}
+
 /// The shared [`cap_thunk`] body. `pending` is the §12 parking out-param: `Some` only from
 /// [`cap_thunk_locked`]'s generic tail, where a punted offloadable dispatch must not run (or
 /// wait) under the domain lock — the caller takes the completion id, releases the lock, and

@@ -19787,6 +19787,17 @@ impl Host {
             .map(|src| (Arc::clone(&self.sig_armed), src))
     }
 
+    /// #932 — the public form of [`Self::signal_poll`]: the `(armed flag, source)` pair a **JIT** run
+    /// needs to arm safepoint signal delivery, or `None` when no [`SignalSource`] is installed. The JIT
+    /// delivery context (`temen_run::JitSigDelivery`) is built from this — it lives out of crate because
+    /// its call-out thunks dereference a raw `ctx` pointer, which this `#![forbid(unsafe_code)]` crate
+    /// cannot. Call after the personality is granted (which installs the source) and before the run.
+    pub fn signal_arm_pair(
+        &self,
+    ) -> Option<(Arc<AtomicBool>, Arc<dyn SignalSource + Send + Sync>)> {
+        self.signal_poll()
+    }
+
     /// Install a host binding in a free slot and return the guest handle — a forgeable
     /// `i32` index encoding `(generation, slot)`. This is how the powerbox (and, later,
     /// attenuation) hands authority to the guest (§3c). Panics only if the table is
