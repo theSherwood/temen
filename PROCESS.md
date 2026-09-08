@@ -481,7 +481,9 @@ object, and *who holds authority over its backing* is the whole visibility story
   live coordination compose. JIT/bytecode answer the probeable `-EINVAL` refusal (the
   op-14 precedent). Pinned by `temen-interp/tests/detached_windows.rs`: detached
   serve/park/reply round-trip (142), the side-by-side attest report (nested 257 vs
-  detached 1), quota exhaustion, forged-minter refusal.
+  detached 1), quota exhaustion, forged-minter refusal. **Superseded by R2 (below):** the
+  standalone `WindowMinter` quota folds into `Budget.mem`, so the mint spends the budget and
+  grows by top-up rather than reading a separate minter side-table.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
@@ -498,6 +500,8 @@ is already a capability with a quota" — promoted to a passable, splittable obj
 
 ```
 split(budget, fuel, mem, spawn)  -> sub_budget | -errno    (attenuation: sub ≤ remaining)
+transfer(dst, fuel, mem, spawn)  -> ok | -errno            (top-up: move quota DOWN into an
+                                                            existing sub-budget; conservation)
 read(budget)                     -> remaining/spent          (§15 monitoring readout)
 ```
 
@@ -508,6 +512,21 @@ charged to the parent" is either (a) the parent pre-split a budget to the child,
 the child calls a **spawn endpoint the parent serves**, and the parent creates the domain
 against its own budget — its consent is that it services the call. Genode's quota-transfer
 model, reached via two primitives we need anyway.
+
+**Window-minting folds into `Budget.mem`, and grows by top-up (INVARIANTS #3 ruling
+2026-09-08, #1289 R2).** Minting or growing a **detached** window is not a separate authority
+— it spends `Budget.mem`, so an `Instantiator` holder mints/grows independent VA only against
+the budget its ancestors granted, never ambient-under-`Instantiator`; the standalone
+`WindowMinter` cap retires once every mint site takes a budget. Growth beyond a domain's
+current `mem` is the top-up path: a domain requests more from its parent (a message *up* — the
+served spawn/mem endpoint, data plane), and the parent grants by `transfer`ring bytes *down*
+from its own `Budget.mem` (control plane, #3-preserving — the parent's remaining falls by
+exactly what the child's rises). A parent short on slack requests from *its* parent first, so a
+deep child's request **cascades up the ancestry** to the first ancestor with slack (or the
+platform root), each hop a `transfer`. Transactional: no ancestor can cover the shortfall ⇒
+nothing moves and the request is `-ENOMEM`, like an over-asking `split`. So `split` is the
+eager push at spawn and `transfer` the lazy push on demand — the two primitives §15/Genode
+already call for.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 

@@ -31,6 +31,26 @@ no ambient names. The one sanctioned residue: a domain offering its *own* export
 own grant graph. *Violated by:* any path where a domain reaches a capability its ancestors
 never granted. (Owner decision 2026-07-23; IMPORTS.md §3.3/§3.6, PROCESS.md §4.)
 
+**Ruling — window-minting authority is the memory budget, and it tops up down the graph
+(2026-09-08, #1289 R2):** minting or growing an independent (detached) window is not a separate
+authority — it **spends `Budget.mem`** (PROCESS.md §5), which attenuates down the grant graph like
+every other authority, so a domain can never hold more VA than its ancestors granted. The standalone
+`WindowMinter` capability retires once every mint site takes a budget. Because authority moves only
+down, a domain that needs *more* memory than its budget holds cannot pull it: it **requests** from its
+parent (a message *up* — a served endpoint / fault upcall, the data plane), and the parent **grants**
+by **transferring** bytes from its own `Budget.mem` *down* into the child's (the control plane) — the
+parent's remaining drops by exactly what the child's rises (conservation). If the parent lacks the
+slack, it requests from *its* parent first, so a deep child's top-up **cascades recursively up the
+ancestry** to the first ancestor with slack (or the platform's root budget), each hop updating two
+budgets. The cascade is **transactional**: if no ancestor can cover the shortfall, nothing transfers
+anywhere and the request fails closed (`-ENOMEM`), exactly as an over-asking `split` deducts nothing.
+This is Genode's quota-transfer applied to VA — `split` pushes budget down eagerly at spawn,
+`transfer` pushes it down lazily on demand — so every byte a descendant holds stays traceable to a
+grant from above (the invariant), and nothing becomes ambient-under-`Instantiator`. *Caveat recorded:*
+`Budget` is a `NonDurableKind` today, so minting authority does not survive a freeze — under R1
+(freeze authority) that is harmless for a platform-driven freeze (the platform re-grants on thaw) and
+a prerequisite to lift for an ancestor-driven one.
+
 ## 4. Host = mechanism, guest = policy
 
 The host's inter-domain layer is a waiter table, wake plumbing, and lifecycle cleanup —
