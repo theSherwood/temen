@@ -63,7 +63,12 @@ fn io_cap(name: &str) -> Option<(u32, u32)> {
 /// This is the powerbox a chibicc `_start` expects (minus the browser's graphical caps), so a debugged C
 /// program that `printf`s (→ a `write` cap) runs instead of `CapFault`ing; its output lands in
 /// `host.stdout`. The browser's `grant_onramp_caps` is the twin used for the non-debug Run path.
-fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
+fn grant_io_powerbox(
+    host: &mut Host,
+    m: &Module,
+    stdin: &[u8],
+    fs_seed: Option<&temen_fs::FsSeed>,
+) {
     host.stdin = stdin.to_vec();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let handles = [
@@ -86,7 +91,14 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
     // op, and bind the `vm_fs` slot to it below. Granted only when the module imports it (a plain
     // stdout-only program is unaffected); guest-private, no host disk, dropped at session end.
     let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
-        let mut inner = temen_fs::mem_fs_handler(false)();
+        // #1323 slice 3: seed the memfs with the launch's fs-image when one was supplied (a lesson's
+        // pre-seeded input files, e.g. a `colors.txt` the guest `fopen`s for read), else an empty
+        // scratch store. Each build clones the seed fresh, so a reverse-`seek` rebuild re-seeds
+        // identically (deterministic replay).
+        let mut inner = match fs_seed {
+            Some((files, dirs)) => temen_fs::mem_fs_seeded_handler(files.clone(), dirs.clone())(),
+            None => temen_fs::mem_fs_handler(false)(),
+        };
         let h = host.grant_host_proc(Box::new(
             move |_slot_op: u32,
                   args: &[i64],
@@ -150,13 +162,14 @@ fn build_single_run(
     stdin: &[u8],
     block_stdin: bool,
     mem_limit: Option<u64>,
+    fs_seed: Option<&temen_fs::FsSeed>,
     tape: &CapTape,
 ) -> Option<DebugRun> {
     if !powerbox {
         return DebugRun::new(module, func, args);
     }
     let mut host = Host::new();
-    grant_io_powerbox(&mut host, module, stdin);
+    grant_io_powerbox(&mut host, module, stdin, fs_seed);
     // Slice 5: the Memory-capability growth cap — a `vm_map` past the limit returns -ENOMEM, so a
     // guest malloc observes NULL (the OOM-teaching knob). Re-armed on every seek rebuild.
     host.set_mem_map_limit(mem_limit);
@@ -191,11 +204,12 @@ fn build_scheduled_run(
     block_stdin: bool,
     mem_limit: Option<u64>,
     seed: Option<u64>,
+    fs_seed: Option<&temen_fs::FsSeed>,
     tape: &CapTape,
 ) -> Option<ScheduledDebugRun> {
     let mut run = if powerbox {
         let mut host = Host::new();
-        grant_io_powerbox(&mut host, module, stdin);
+        grant_io_powerbox(&mut host, module, stdin, fs_seed);
         host.set_mem_map_limit(mem_limit);
         if block_stdin {
             host.set_stdin_blocking(true);
@@ -495,6 +509,10 @@ pub struct BytecodeBackend {
     powerbox: bool,
     /// Preloaded stdin for the powerbox (`read(0, …)`); empty for a pure-output program.
     stdin: Vec<u8>,
+    /// #1323 slice 3: the launch's fs-image seed (a lesson's pre-seeded files + dirs) mounted on the
+    /// `vm_fs` memfs; cloned fresh on every (re)build so a reverse-`seek` re-seeds identically.
+    /// `None` = an empty scratch store.
+    fs_seed: Option<temen_fs::FsSeed>,
     /// W4 blocking stdin: a `read` on an exhausted buffer parks the session
     /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Powerbox
     /// sessions on either bytecode engine (the threaded one since #1146 deeper — invariant 14).
@@ -588,6 +606,36 @@ impl BytecodeBackend {
         mem_limit: Option<u64>,
         seed: Option<u64>,
     ) -> Option<BytecodeBackend> {
+        Self::new_with_fs_seed(
+            module,
+            func,
+            args,
+            fuel,
+            powerbox,
+            stdin,
+            block_stdin,
+            mem_limit,
+            seed,
+            None,
+        )
+    }
+
+    /// #1323 slice 3: [`new`](Self::new) plus a `vm_fs` **memfs seed** — the launch's fs-image
+    /// (a lesson's pre-seeded input files) mounted so the guest can `fopen` them for read. `new`
+    /// is the unseeded (empty scratch store) shorthand.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_fs_seed(
+        module: Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        powerbox: bool,
+        stdin: Vec<u8>,
+        block_stdin: bool,
+        mem_limit: Option<u64>,
+        seed: Option<u64>,
+        fs_seed: Option<temen_fs::FsSeed>,
+    ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let engine = if bytecode::module_spawns_threads(&module) {
             // The powerbox rides the scheduled engine too now, so a threaded C guest's
@@ -602,6 +650,7 @@ impl BytecodeBackend {
                 block_stdin,
                 mem_limit,
                 seed,
+                fs_seed.as_ref(),
                 &tape,
             )?;
             Engine::Threaded(Box::new(run))
@@ -618,6 +667,7 @@ impl BytecodeBackend {
                 &stdin,
                 block_stdin,
                 mem_limit,
+                fs_seed.as_ref(),
                 &tape,
             )?))
         };
@@ -633,6 +683,7 @@ impl BytecodeBackend {
             fuel,
             powerbox,
             stdin,
+            fs_seed,
             block_stdin,
             mem_limit,
             tape,
@@ -680,6 +731,7 @@ impl BytecodeBackend {
             &self.stdin,
             self.block_stdin,
             self.mem_limit,
+            self.fs_seed.as_ref(),
             &self.tape,
         )
     }
@@ -696,6 +748,7 @@ impl BytecodeBackend {
             self.block_stdin,
             self.mem_limit,
             self.seed,
+            self.fs_seed.as_ref(),
             &self.tape,
         )
     }
