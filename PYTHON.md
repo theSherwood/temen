@@ -215,6 +215,17 @@ executes only the user's code.
 
 ### Phase D — CPython (stretch, tracked separately)
 
+**Spike run (#1328) — `crates/temen-run/demos/cpython/`.** The front half already works at scale:
+CPython 3.13.1 configures + builds native (`CC=clang --disable-shared --without-mimalloc`), **278/278
+TUs** compile to bitcode, and the exact `python` link set (**175 modules → one 40 MB module**) enters
+the on-ramp. Two gaps found so far, both ordinary (not architectural): (1) mimalloc's `_mi_heap_default`
+is an **initialized thread-local** the TLS block layout can't resolve — sidestepped by
+`--without-mimalloc` (and the *next* gap was not TLS, so initialized-TLS is not pervasive across
+CPython's own thread-state here); (2) **`constexpr reference to @malloc`** — address-taken libc in a
+const table (`Python/hashtable.c`), the QuickJS `&sin` class, fixed by linking a real guest allocator.
+The go/no-go: **feasible, but a multi-step bring-up** — the dominant remaining cost is the libc/OS
+waist + frozen stdlib + the long gap tail. Full inventory in `demos/cpython/README.md`.
+
 CPython is the "real Python" prize and a **separate, substantially larger bring-up** — not an
 increment on MicroPython. Whole-program `llvm-link` of CPython (Postgres-scale link), stdlib
 frozen in, threads/GIL single-threaded, signals stubbed or wired to `temen-posix`, its own gap
