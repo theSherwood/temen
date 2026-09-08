@@ -62,7 +62,7 @@ for t in jit bytecode tree-walker guest-jit cranelift llvm wasm simd gpu peval; 
   label "topic:$t" "D4C5F9" "Topic: $t"
 done
 # languages / frontends
-for t in c nim go rust typescript lua tcl quickjs; do
+for t in c nim go rust typescript lua tcl quickjs python; do
   label "topic:$t" "D4C5F9" "Topic: $t"
 done
 # runtime themes
