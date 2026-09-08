@@ -471,7 +471,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
   vmin = i64.extend_i32_u v2
   vz = i64.const 0
   ve = i64.const 0
-  vlog = i64.const 16
+  vlog = i64.const 12
   vq = i64.const 0
   vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vz, vz, ve, vlog, vq)
   vr = i64.extend_i32_s vs
@@ -480,18 +480,22 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` outright — a detached window is
-/// outside the subtree snapshot, so the spawn lands `-EINVAL` probeably (never a trap) **and charges the
-/// budget nothing** (#1299 pins the tree-walker's `!durable` gate, which no test asserted before).
+/// PROCESS.md §5 / #1289 R1: a **durable** domain may now **spawn** a detached child (the tree-walker's
+/// `!durable` op-15 gate is lifted — freeze authority is a per-grant capability, not a placement rule).
+/// The spawn succeeds (returns a non-negative slot) and charges `Budget.mem` the child's window, exactly
+/// as a non-durable spawn does; the durability constraint moves to the *freeze* (a freeze while the
+/// detached child is live fails closed — `a_durable_freeze_with_a_live_detached_child_fails_closed` in
+/// `durable_nesting.rs`), never a silent drop. (The bytecode servicer + native thunk still decline a
+/// durable detached spawn — a tracked in-flight decline until their freeze path is wired.)
 #[test]
-fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
+fn a_durable_domain_spawns_a_detached_child_and_charges_the_budget() {
     let a = module(SPAWN_ONLY_PARENT);
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
     host.set_durable(true);
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_budget(0, (1 << 16) as i64, 0); // exactly the child's window
+    let hw = host.grant_budget(0, (1 << 12) as i64, 0); // exactly the child's 2^12 window
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -501,9 +505,12 @@ fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
         &mut host,
     )
     .expect("run");
-    assert_eq!(r, vec![Value::I64(-22)], "EINVAL, not a trap");
     assert!(
-        host.budget_mem_take(hw, 1 << 16),
-        "the refusal charged the budget nothing: the whole quota is still there"
+        matches!(r.as_slice(), [Value::I64(s)] if *s >= 0),
+        "the durable domain now spawns the detached child, returning its slot: {r:?}"
+    );
+    assert!(
+        !host.budget_mem_take(hw, 1 << 12),
+        "the spawn charged the child's window to Budget.mem — the quota is now exhausted"
     );
 }

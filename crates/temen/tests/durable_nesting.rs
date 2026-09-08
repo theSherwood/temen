@@ -1326,3 +1326,53 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+/// #1289 R1 — a durable domain may now **spawn** a detached child (op 15), but **freezing** while that
+/// child is live **fails closed** (`ThreadFault`), never silently dropping the child's separate window.
+/// A detached child holds a `child_hosts` entry but has no carve in `nested_children` (unlike a nested
+/// child) and its own window never sees the subtree `UNWINDING` broadcast — so it cannot yet ride the
+/// parent's artifact. The parent is frozen from the start; it spawns the detached child at its op-15
+/// cap call, then the trailing poll observes `UNWINDING` with the child live → refuse.
+const PARENT_DETACHED: &str = "memory 18
+func (i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32) {
+  vb = i64.extend_i32_u v2
+  vm = i64.extend_i32_u v1
+  vz = i64.const 0
+  ve = i64.const 0
+  vlog = i64.const 17
+  vs = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vm, vz, vz, ve, vlog, vz)
+  vr = i64.extend_i32_s vs
+  return vr
+  }
+}
+";
+
+#[test]
+fn a_durable_freeze_with_a_live_detached_child_fails_closed() {
+    let parent = instrument(PARENT_DETACHED);
+    let child_mod = child(); // memory 17 = the op-15 size_log2
+
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mh = host.grant_module(&child_mod);
+    let bh = host.grant_budget(0, (1u64 << 17) as i64, 0); // one detached window
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING); // freeze from the start
+    let mut fuel = 50_000_000u64;
+    let (r, _snap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih), Value::I32(mh), Value::I32(bh)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        r,
+        Err(Trap::ThreadFault),
+        "a freeze with a live detached child fails closed, not a silent drop: {r:?}"
+    );
+}
