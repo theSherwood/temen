@@ -3486,6 +3486,14 @@ async function proveModuleParity(c) {
       await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
       jitOut = readModuleStdout();
     } catch (e) {
+      // A **declared** decline (#1233: e.g. the Forth kernel's thread words reached from its emitted
+      // outer loop) is the documented fallback, not a failure — the interpreter carries the program;
+      // report the single-tier result, as the warm path does above.
+      if (/declined to the interpreter/.test(e.message)) {
+        setState(c, 'done', `✓ interpreter only — wasm-JIT declined this program (${interp.stdout.length}B stdout)`);
+        logTo(c, `parity: wasm-JIT declined (${e.message}); the interpreter carries this program`);
+        return;
+      }
       setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
       logTo(c, `parity: JIT emit failed: ${e.message}`);
       return;
