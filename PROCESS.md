@@ -481,7 +481,9 @@ object, and *who holds authority over its backing* is the whole visibility story
   live coordination compose. JIT/bytecode answer the probeable `-EINVAL` refusal (the
   op-14 precedent). Pinned by `temen-interp/tests/detached_windows.rs`: detached
   serve/park/reply round-trip (142), the side-by-side attest report (nested 257 vs
-  detached 1), quota exhaustion, forged-minter refusal.
+  detached 1), quota exhaustion, forged-minter refusal. **Superseded by R2 (below):** the
+  standalone `WindowMinter` quota folds into `Budget.mem`, so the mint spends the budget and
+  grows by top-up rather than reading a separate minter side-table.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
@@ -498,6 +500,8 @@ is already a capability with a quota" — promoted to a passable, splittable obj
 
 ```
 split(budget, fuel, mem, spawn)  -> sub_budget | -errno    (attenuation: sub ≤ remaining)
+transfer(dst, fuel, mem, spawn)  -> ok | -errno            (top-up: move quota DOWN into an
+                                                            existing sub-budget; conservation)
 read(budget)                     -> remaining/spent          (§15 monitoring readout)
 ```
 
@@ -508,6 +512,21 @@ charged to the parent" is either (a) the parent pre-split a budget to the child,
 the child calls a **spawn endpoint the parent serves**, and the parent creates the domain
 against its own budget — its consent is that it services the call. Genode's quota-transfer
 model, reached via two primitives we need anyway.
+
+**Window-minting folds into `Budget.mem`, and grows by top-up (INVARIANTS #3 ruling
+2026-09-08, #1289 R2).** Minting or growing a **detached** window is not a separate authority
+— it spends `Budget.mem`, so an `Instantiator` holder mints/grows independent VA only against
+the budget its ancestors granted, never ambient-under-`Instantiator`; the standalone
+`WindowMinter` cap retires once every mint site takes a budget. Growth beyond a domain's
+current `mem` is the top-up path: a domain requests more from its parent (a message *up* — the
+served spawn/mem endpoint, data plane), and the parent grants by `transfer`ring bytes *down*
+from its own `Budget.mem` (control plane, #3-preserving — the parent's remaining falls by
+exactly what the child's rises). A parent short on slack requests from *its* parent first, so a
+deep child's request **cascades up the ancestry** to the first ancestor with slack (or the
+platform root), each hop a `transfer`. Transactional: no ancestor can cover the shortfall ⇒
+nothing moves and the request is `-ENOMEM`, like an over-asking `split`. So `split` is the
+eager push at spawn and `transfer` the lazy push on demand — the two primitives §15/Genode
+already call for.
 
 ### Faults — the security trap is terminal; the memory fault is a capability event
 
@@ -570,9 +589,14 @@ self.attest() -> { isolation_tier,                      (§2: 0 / 1 / 3)
   Transparent freeze means a domain *cannot observe* being snapshotted, and the artifact
   is a complete read of its window. So "no ancestor can read my memory" is false for any
   domain an ancestor can freeze — which is every nested durable child today. Hence
-  `freeze_authority` in the report, and the rule: a domain may be **confidential**
-  (freezable by nobody below the platform) or **ancestor-durable**, not both. Pick per
-  domain.
+  `freeze_authority` in the report, and the rule (INVARIANTS #14 ruling 2026-09-08,
+  #1289 R1): freeze authority is an explicit, attenuating **capability**, not a consequence
+  of placement. A domain is **confidential** (freezable by nobody below the platform) **or**
+  **ancestor-freezable**, per *grant*, not per placement — pick per domain. For a **nested
+  carve** child the grant is implied by the aliasing (the parent reads its carve, so it can
+  always freeze it — every nested durable child today); a **detached** child owns its window,
+  so an ancestor freezes it only if granted, and may thus be platform-durable **and**
+  ancestor-confidential at once.
 - **Attest covers computation, not provisioning.** Every capability a domain holds came
   through its (possibly hostile) creator, so "fetch my secret over my secure channel" is
   MITM-able regardless of a clean report — the classic TEE lesson. v1 deliberately claims
@@ -870,7 +894,7 @@ Unchanged in substance from v1, restated against the substrate:
 | O11 | `clone` captures all vCPUs (forkall) vs POSIX calling-thread-only fork — benign for shells (POSIX post-fork threaded code is async-signal-safe-only anyway); pin the divergence in the personality doc | §7 | open |
 | O12 | No stop/continue (SIGSTOP / Ctrl-Z): the L2 safepoint redirect is the natural carrier (stop = park at the next poll instead of running a handler) — fold into the signals ladder rather than mint a bespoke op? | §9 | open |
 | O13 | Signals L1/L2 are designed, not built: until they land, parked calls are uninterruptible short of kill and compute-bound code sees no delivery — scope the POSIX personality's claims to L0 meanwhile | §9 | **mostly addressed (#796/#799)** — L2 safepoint delivery built; L1 built disposition-gated for the capability path's blocking pipe parks (a *deliverable* signal → parked read/write returns `-EINTR`; ignored/masked → none). Remaining: `join`/endpoint/completion parks, the embedder-async ^C hook, JIT/bytecode parity |
-| O14 | Attest's `freeze_authority` field requires freeze authority to be *explicit* — today subtree-freeze authority is implicit in nesting; plumbing needed before the report can be truthful | §6 | **partly addressed** — `attest` reports `freeze_exposed = durable` (the conservative truth: a durable nested child *is* ancestor-freezable). Remaining: a durable **freeze/thaw** must capture + restore a child's `Attestation` (the thaw re-attach path currently defaults it) — a `DURABILITY.md` follow-up |
+| O14 | Attest's `freeze_authority` field requires freeze authority to be *explicit* — today subtree-freeze authority is implicit in nesting; plumbing needed before the report can be truthful | §6 | **conceptual half closed** (INVARIANTS #14 ruling 2026-09-08, #1289 R1: freeze authority is an explicit, attenuating capability, per grant not per placement; `attest` reports `freeze_exposed = durable`, the conservative truth for a nested child whose parent's aliasing implies the grant). **Remaining plumbing (in flight):** a durable **freeze/thaw** must capture + restore a child's `Attestation` (the thaw re-attach path currently defaults it) so a detached child's placement/exposure survives — the prerequisite for the op-15 refusal to become "refuse unless a freeze-authority holder is registered" — a `DURABILITY.md` follow-up |
 
 ---
 
