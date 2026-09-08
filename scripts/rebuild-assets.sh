@@ -217,6 +217,24 @@ if want nim_driver_guest; then
   else
     note "nim_link SKIP/✗ (rustc +1.81.0 + rust-src + llvm-18 — see build_nim_link.sh)"
   fi
+  # The nimc card's whole-card tier-up (#1025 3e) op-13-spawns the CHILD-ENTRY phase guests; the
+  # playground fetches them from web/assets, so mirror the committed `_ce` fixtures there (they're the
+  # same wire-coupled modules the browser op-13 tests use — nifler_ce from the nifler demo, nimsem_ce +
+  # hexer_ce from the frontend fixtures). A plain copy (the fixtures are the toolchain-built source of
+  # truth), re-validated after; a stale copy only degrades the card to the interpreter, never crashes.
+  ceok=1
+  for pair in "crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz:nifler_ce" \
+              "$FX/nimsem_ce.temen.gz:nimsem_ce" "$FX/hexer_ce.temen.gz:hexer_ce"; do
+    srcgz="${pair%%:*}"; base="${pair##*:}"
+    if [ -f "$srcgz" ] && gunzip -c "$srcgz" > "/tmp/rebuild_$base.temen" 2>/dev/null \
+       && validate "/tmp/rebuild_$base.temen"; then
+      cp "$srcgz" "browser/web/assets/$base.temen.gz"
+    else
+      ceok=0
+    fi
+  done
+  [ "$ceok" = 1 ] && note "nim_card_ce ✓ (nifler_ce + nimsem_ce + hexer_ce → web/assets)" \
+                  || note "nim_card_ce ✗ (a child-entry fixture missing/failed re-validate)"
 fi
 
 # --- 7) lua_snapshot.temen (Lua 5.4.7 core+libs + the two-phase snapshot harness → translate) -------

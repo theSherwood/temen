@@ -1012,6 +1012,13 @@ jobs:
           # op-13 emitted children — the whole-card realization of `nimc::compile_nim` on the wasm-JIT tier.
           # Uses the committed nim assets + nifler_ce/nimsem_ce/hexer_ce; reuses the threads module.
           node browser-nim-wholecard-op13-test.mjs
+          # #1025 3e (SHIPPED card wiring): drive the playground's own `snapshotClient.nimCompile` — the exact
+          # path the nim card uses — with the committed web/assets guests (now incl. the child-entry `_ce`).
+          # The snapshot WORKER runs `jitNimWholeCardOp13` (whole card tiered) then link+run and reports what
+          # it pre-seeded; asserts the compile finished (status 0) and the worker actually tiered up
+          # (tier.semmed/hexed > 0 — not a silent interpreter fallback), proving the asset plumbing +
+          # foreign-memory-in-a-Worker end-to-end. Reuses the threads module + committed assets.
+          node browser-nim-card-tierup-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
