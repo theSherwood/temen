@@ -652,6 +652,13 @@ pub fn compile_nim_ce(
 
     // ---- phase 2: nimsem (dependency-ordered), driving nifler via exec ----------------------------
     for stem in &order {
+        // #1025 3e (route A, extended): if the JS whole-card orchestrator already ran nimsem on the
+        // wasm-JIT tier for this module and seeded its `.s.nif` (byte-identical to the interpreter run —
+        // `browser-nim-wholecard-op13-test`), skip the interpreter nimsem run. Best-effort: a module the
+        // orchestrator missed has no `.s.nif` and runs nimsem inline as before.
+        if read(&handle, &format!("nimcache/{stem}.s.nif")).is_some() {
+            continue;
+        }
         let m = &mods[stem];
         let pnif = format!("nimcache/{stem}.p.nif");
         let mut argv = vec![
@@ -681,33 +688,41 @@ pub fn compile_nim_ce(
     let mut leng: Vec<(String, String)> = Vec::new();
     for stem in &order {
         let is_main = stem == &main_stem;
-        let s_nif = format!("nimcache/{stem}.s.nif");
-        let outdir_arg = format!("--outdir:{outdir}");
-        let argv: Vec<&str> = if is_main {
-            vec![
-                "hexer",
-                "c",
-                "--bits:64",
-                "--cpu:le",
-                "--flags:br",
-                "--isMain",
-                "--app:console",
-                &outdir_arg,
-                &s_nif,
-            ]
-        } else {
-            vec!["hexer", "c", &s_nif]
-        };
-        let (_o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
-        if code != 0 && code != 5 {
-            return Err(format!("hexer failed on {stem} (code {code})"));
-        }
         let key = if is_main {
             format!("{outdir}/{stem}.x.nif")
         } else {
             format!("nimcache/{stem}.x.nif")
         };
-        let x = read(&handle, &key).ok_or(format!("hexer produced no {key}"))?;
+        // #1025 3e (route A, extended): a `.x.nif` the JS whole-card orchestrator produced on the
+        // wasm-JIT tier (byte-identical to the interpreter hexer run) skips the interpreter run here;
+        // otherwise run hexer inline as before.
+        let x = match read(&handle, &key) {
+            Some(x) => x,
+            None => {
+                let s_nif = format!("nimcache/{stem}.s.nif");
+                let outdir_arg = format!("--outdir:{outdir}");
+                let argv: Vec<&str> = if is_main {
+                    vec![
+                        "hexer",
+                        "c",
+                        "--bits:64",
+                        "--cpu:le",
+                        "--flags:br",
+                        "--isMain",
+                        "--app:console",
+                        &outdir_arg,
+                        &s_nif,
+                    ]
+                } else {
+                    vec!["hexer", "c", &s_nif]
+                };
+                let (_o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
+                if code != 0 && code != 5 {
+                    return Err(format!("hexer failed on {stem} (code {code})"));
+                }
+                read(&handle, &key).ok_or(format!("hexer produced no {key}"))?
+            }
+        };
         leng.push((stem.clone(), String::from_utf8_lossy(&x).into_owned()));
     }
 

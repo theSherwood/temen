@@ -4589,6 +4589,33 @@ pub unsafe extern "C" fn temen_nim_stdlib_read(path_ptr: *const u8, path_len: us
     len
 }
 
+/// Pack **every** cached stdlib source file (opened by [`temen_nim_stdlib_open`]) as
+/// `[count: u32][per file: name_len: u32, name, data_len: u32, data]` (LE) onto [`OUT`]; returns its
+/// length (`0` if unopened). The JS whole-card orchestrator (#1025 3e) seeds this whole blob into each
+/// tiered nimsem call's memfs — nimsem's `exec`→nifler reads the stdlib **sources** at the image's exact
+/// keys (`lib/…`, plus the flattened `lib/std/…`→`lib/…` view), so seeding all of it guarantees the
+/// tiered nimsem finds any source at the same key `compile_nim`'s inline nimsem would. The format is
+/// the one [`parse_packed_files`] decodes (the phase-open `seeds` ABI).
+#[no_mangle]
+pub extern "C" fn temen_nim_stdlib_files() -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the cache + the OUT stash.
+    let mut blob = Vec::new();
+    let files = unsafe { (*core::ptr::addr_of!(NIM_STDLIB)).as_ref() };
+    let n = files.map_or(0, |f| f.len()) as u32;
+    blob.extend_from_slice(&n.to_le_bytes());
+    if let Some(files) = files {
+        for (k, v) in files {
+            blob.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            blob.extend_from_slice(k.as_bytes());
+            blob.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            blob.extend_from_slice(v);
+        }
+    }
+    let len = blob.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), blob) };
+    len
+}
+
 /// nimony's module-stem hash for `path` ([`nimc::module_suffix`]) onto [`OUT`]; returns its length. The
 /// JS crawl uses it to name `.p.nif` cache files exactly as the Rust driver does.
 ///
@@ -9941,6 +9968,19 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // Reuse the cached child emit across a crawl's many `phase_open`s (nifler_ce emits once);
                 // on a miss, emit now — BEFORE the powerbox is committed to a run — so a decline still has
                 // the powerbox to run the child on the interpreter with.
+                // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
+                // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
+                // child's hundreds-of-MB `SharedProgram` + wasm doesn't co-reside with the new emit and
+                // blow the engine's linear-memory budget. Within a crawl (same child) the key matches, so
+                // the cache is kept and nifler_ce still emits once.
+                unsafe {
+                    if (*core::ptr::addr_of!(OP13_CHILD_EMIT))
+                        .as_ref()
+                        .is_some_and(|c| c.key != d.child_key)
+                    {
+                        *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = None;
+                    }
+                }
                 let cached = if d.child_key != 0 {
                     unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
                         .filter(|c| c.key == d.child_key)
@@ -10070,6 +10110,19 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     return OP13JIT_TRAP;
                 }
                 let init_mem = args_init_mem_raw(&args);
+                // On a key change (a different phase child — nifler_ce → nimsem_ce → hexer_ce across the
+                // whole card, #1025 3e), drop the stale emit BEFORE emitting the new child, so the old
+                // child's hundreds-of-MB `SharedProgram` + wasm doesn't co-reside with the new emit and
+                // blow the engine's linear-memory budget. Within a crawl (same child) the key matches, so
+                // the cache is kept and nifler_ce still emits once.
+                unsafe {
+                    if (*core::ptr::addr_of!(OP13_CHILD_EMIT))
+                        .as_ref()
+                        .is_some_and(|c| c.key != d.child_key)
+                    {
+                        *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = None;
+                    }
+                }
                 let cached = if d.child_key != 0 {
                     unsafe { (*core::ptr::addr_of!(OP13_CHILD_EMIT)).as_ref() }
                         .filter(|c| c.key == d.child_key)
