@@ -220,14 +220,14 @@ type ResolvedUnit = (Arc<[Func]>, Option<Arc<[u8]>>);
 
 /// Resolve a `JitInvoke` event's authority against the vCPU's own host (compile minted the handle
 /// there) — mirroring the browser's `par_resolve_unit` — and hand back the unit's funcs + emitted wasm.
-fn resolve(h: &Host, handle: i32, code: i32) -> Result<ResolvedUnit, Trap> {
+fn resolve(h: &mut Host, handle: i32, code: i32) -> Result<ResolvedUnit, Trap> {
     let domain = h.resolve_jit_domain(handle)?;
     let (cd, cu) = h.resolve_jit_code(code)?;
     if cd != domain {
         return Err(Trap::CapFault);
     }
     let funcs = h.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, h.jit_unit_wasm(cd, cu)))
+    Ok((funcs, h.jit_unit_wasm_or_emit(cd, cu))) // the one (lazy) emit site, #1346
 }
 
 /// How a `JitInvoke` is serviced.
@@ -398,7 +398,7 @@ fn compile_stashes_wasm_matching_the_interpreter() {
             .expect("no trap")
             .expect("compile ok");
         let wasm = host
-            .jit_unit_wasm(c.domain, c.unit)
+            .jit_unit_wasm_or_emit(c.domain, c.unit)
             .unwrap_or_else(|| panic!("{name}: emitter hook produced no wasm"));
 
         let want = oracle_unit(&unit_m, &argv);
@@ -521,8 +521,8 @@ fn run_guest_shared(unit_src: &str, mode: Mode) -> Result<Vec<Value>, Trap> {
                 // Resolve against the shared host (browser `par_resolve_unit_rt`); drop the lock before
                 // delivering — the interpreter path re-locks it to run the unit.
                 let resolved = {
-                    let g = shared.lock().unwrap();
-                    resolve(&g, handle, code)
+                    let mut g = shared.lock().unwrap();
+                    resolve(&mut g, handle, code)
                 };
                 match mode {
                     Mode::Interp => vcpu.deliver_jit_invoke(

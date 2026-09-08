@@ -18352,15 +18352,16 @@ pub type JitDurableGate = fn(&[Func], &[temen_ir::TypeEntry], &[FuncType]) -> bo
 pub type JitDurableTaintFn = fn(&[Func], &[temen_ir::TypeEntry]) -> Vec<FuncType>;
 
 /// A wasm-JIT **emitter** the browser tier installs (DESIGN.md §22, the "guest-compiled units on the
-/// wasm tier" slice): given a *validated closed-unit* blob (the exact bytes `compile` accepted), it
-/// returns the emitted wasm that runs the unit's entry as `f0(win, env, args…)`, or `None` when the
-/// unit is outside the emitter subset — then `invoke` falls back to the interpreter, fail-closed.
+/// wasm tier" slice): given a validated unit's IR — the unit's **post-link** funcs re-encoded by
+/// [`Host::jit_unit_wasm_or_emit`], the one emit site — it returns the emitted wasm that runs the
+/// unit's entry as `f0(win, env, args…)`, or `None` when the unit is outside the emitter subset — then
+/// `invoke` falls back to the interpreter, fail-closed.
 ///
 /// Injected as a bare `fn` like [`JitValidator`] so the `temen-wasm-jit` dependency stays in the
-/// embedder: the core only stores the opaque bytes it produces and hands them back
-/// ([`Host::jit_unit_wasm`]); it never decodes or executes them. Only the closed-blob `compile` path
-/// emits (an empty symbol table); `compile_linked` units are not emitted yet (they `invoke` on the
-/// interpreter). Zero cost when unset — every non-browser run leaves it `None`.
+/// embedder: the core only stores the opaque bytes it produces and hands them back; it never decodes
+/// or executes them. It runs **lazily, at a unit's first read** by a wasm-JIT driver — never at
+/// `compile` — so a `compile` and a `compile_linked` unit, a thawed unit and a fork twin's all take
+/// the same path (#1346). Zero cost when unset — every non-browser run leaves it `None`.
 pub type JitWasmEmitter = fn(&[u8]) -> Option<Vec<u8>>;
 
 /// A successful [`Host::jit_compile`]: the minted `CompiledCode` handle and the `(domain,
@@ -18385,10 +18386,12 @@ struct JitUnit {
     native_code: usize,
     install_code: usize,
     install_type_id: u32,
-    /// The emitted wasm for this unit's entry (`f0(win, env, args…)`), produced at `compile` time by
-    /// the host-injected [`JitWasmEmitter`] (the browser wasm-JIT tier). `None` in every non-browser
-    /// run and for any unit outside the emitter subset — then `invoke` runs on the interpreter. The
-    /// bytes are opaque here: the core stores and returns them, never decoding or executing them.
+    /// The emitted wasm for this unit's entry (`f0(win, env, args…)`) — the host-injected
+    /// [`JitWasmEmitter`]'s output, produced and cached on the unit's first read through
+    /// [`Host::jit_unit_wasm_or_emit`] (the browser wasm-JIT tier). `None` until then, in every
+    /// non-browser run, and for any unit outside the emitter subset — then `invoke` runs on the
+    /// interpreter. The bytes are opaque here: the core stores and returns them, never decoding or
+    /// executing them.
     wasm: Option<Arc<[u8]>>,
 }
 
@@ -21892,9 +21895,6 @@ impl Host {
         let Some(validate) = self.jit_validator else {
             return Ok(Err(EINVAL));
         };
-        // The wasm-JIT emitter is a `Copy` fn pointer — read it out before the `&mut` borrow of
-        // `jit_tables` so the closed-unit emit below can call it without a self-borrow conflict.
-        let emitter = self.jit_wasm_emitter;
         // A §14 child's `Jit` table was re-granted before its module was bound, so its tainted-signature
         // set was left empty at grant (#1296). Resolve it lazily from the child's *own* module here —
         // mirroring [`JitMem::SelfModule`] — the first time it is needed: the child runs its own
@@ -21951,23 +21951,16 @@ impl Host {
         }
         d.units_left -= 1;
         let unit = d.units.len() as u32;
-        // Emit wasm for a **closed** unit (`compile`, empty symbol table) when the browser tier has
-        // installed an emitter (DESIGN.md §22): a later `invoke` then runs the guest's own
-        // runtime-compiled unit on emitted wasm. `compile_linked` units are not emitted yet
-        // (interpreter-only invoke). Fail-closed: an out-of-subset unit gets `None` and stays on the
-        // interpreter. The emitter re-decodes the *already-validated* `bytes`, so no unverified module
-        // ever reaches it.
-        let wasm = match emitter {
-            Some(emit) if symtab.is_empty() => emit(bytes).map(Arc::from),
-            _ => None,
-        };
+        // No wasm yet: the browser tier emits a unit **lazily**, on its first read through
+        // [`Self::jit_unit_wasm_or_emit`] — the one emit path for a `compile`d, a `compile_linked`,
+        // a thawed, and a forked unit alike (#1346), always from the validated post-link IR.
         d.units.push(JitUnit {
             funcs,
             types,
             native_code: 0,
             install_code: 0,
             install_type_id: 0,
-            wasm,
+            wasm: None,
         });
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
         // stored unit stays (append-only storage; harmless without a handle).
@@ -22047,26 +22040,23 @@ impl Host {
             .map(|u| Arc::clone(&u.types))
     }
 
-    /// The emitted wasm the [`JitWasmEmitter`] produced for a unit at `compile` time (`f0(win, env,
-    /// args…)`), or `None` if no emitter is installed or the unit is outside the emitter subset. The
-    /// browser wasm-JIT tier reads this to instantiate + run the guest's runtime-compiled unit on
-    /// emitted wasm; a `None` means `invoke` falls back to the interpreter (fail-closed).
-    pub fn jit_unit_wasm(&self, domain: u32, unit: u32) -> Option<Arc<[u8]>> {
+    /// The cached emitted wasm of a unit (`f0(win, env, args…)`), `None` until its first
+    /// [`Self::jit_unit_wasm_or_emit`] — the read every wasm-JIT driver goes through.
+    fn jit_unit_wasm(&self, domain: u32, unit: u32) -> Option<Arc<[u8]>> {
         self.jit_tables
             .get(domain as usize)
             .and_then(|d| d.units.get(unit as usize))
             .and_then(|u| u.wasm.clone())
     }
 
-    /// [`Self::jit_unit_wasm`], **re-emitting on demand** a unit that has none — a unit a snapshot
-    /// restored (`restore_durable_jit` rebuilds units from their captured IR with no code, the
-    /// process-local pointers do not ride the artifact; DURABILITY.md §12.5 Slice 3, #1301) or a
-    /// fork twin's. The unit's IR is re-encoded (the same validated blob shape `compile` handed the
-    /// emitter) and run through the installed [`JitWasmEmitter`] once, then cached like a fresh
-    /// compile's; without an emitter (or outside its subset) the answer stays `None` and `invoke`
-    /// keeps its interpreter fallback. The wasm-JIT drivers read units through this so a thawed
-    /// domain's units run on the emitted tier after their first `invoke`, the native tier's
-    /// `reconstruct_jit_units` twin.
+    /// A unit's emitted wasm (`f0(win, env, args…)`), **emitting it on first read** — the one emit
+    /// site (#1346): every wasm-JIT driver resolves a unit through this, whether the unit was just
+    /// `compile`d or `compile_linked`, restored by a snapshot (`restore_durable_jit` rebuilds units
+    /// from their captured IR with no code, the process-local pointers do not ride the artifact;
+    /// DURABILITY.md §12.5 Slice 3, #1301), or cloned into a fork twin. The unit's validated
+    /// post-link IR is re-encoded and run through the installed [`JitWasmEmitter`] once, then cached
+    /// on the unit; without an emitter (or outside its subset) the answer stays `None` and `invoke`
+    /// keeps its interpreter fallback. The native tier's `reconstruct_jit_units` twin.
     pub fn jit_unit_wasm_or_emit(&mut self, domain: u32, unit: u32) -> Option<Arc<[u8]>> {
         if let Some(w) = self.jit_unit_wasm(domain, unit) {
             return Some(w);
