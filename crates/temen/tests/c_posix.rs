@@ -39,7 +39,9 @@ use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Trap, Value};
-use temen_jit::{compile_and_run_with_host, compile_and_run_with_host_signals, JitOutcome, SignalArm};
+use temen_jit::{
+    compile_and_run_with_host, compile_and_run_with_host_signals, JitOutcome, SignalArm,
+};
 use temen_posix::Posix;
 use temen_run::{cap_thunk, jit_sig_delivery, jit_sig_return, jit_sig_take};
 use temen_text::parse_module as parse_module_raw;
@@ -360,9 +362,15 @@ fn run_jit_signals(src: &str) -> Effects {
         ret: jit_sig_return,
         ctx: &*deliv as *const _ as *mut c_void,
     };
-    let jout =
-        compile_and_run_with_host_signals(&raw, 0, &[], cap_thunk, &mut jh as *mut Host as *mut c_void, arm)
-            .expect("jit compiles");
+    let jout = compile_and_run_with_host_signals(
+        &raw,
+        0,
+        &[],
+        cap_thunk,
+        &mut jh as *mut Host as *mut c_void,
+        arm,
+    )
+    .expect("jit compiles");
     let (result, exited) = match jout {
         JitOutcome::Returned(s) => (s.iter().map(|&x| Value::I64(x)).collect(), None),
         JitOutcome::Exited(c) => (Vec::new(), Some(c)),
