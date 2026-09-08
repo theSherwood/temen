@@ -848,6 +848,140 @@ fn budget_plus_raw_quota_fails_closed() {
     );
 }
 
+// ===== #989 slice 1b — the record's Budget `channel` bounds a spawned child ======================
+
+/// The worst-case per-pipe host-served channel charge (`PIPE_CAP`, a full 64 KiB FIFO). Mirror of
+/// `temen_interp`'s internal constant; kept in sync by the `channel_budget_bounds_...` assertions.
+const PIPE_CAP: i64 = 64 << 10;
+
+/// Host-level harness for the §14 channel bound: a parent `(Instantiator, Budget-with-channel)`
+/// spawns func 1 through an op-17 record; the child loops minting host-served pipes
+/// (`self.pipe`, op 16) into its OWN powerbox and returns how many it minted before the mint was
+/// refused. When the funding budget's `channel` field bounded the child (slice 1b stamps it onto the
+/// child's `channel_cap`), the mint fails closed at exactly `channel / PIPE_CAP` pipes; an unbounded
+/// channel only stops when the handle table fills (many more). fuel/mem/spawn are all unbounded
+/// (`-1`) so the ONLY thing constraining the child is its channel ceiling. The parent joins and
+/// returns the child's count (post-spawn budget reads are 0 — consumed at commit — so the
+/// `run_budgeted`-shaped `join*1000 + fuel + mem` collapses to `count*1000`).
+fn run_channel_bounded_child(channel: i64) -> Result<Vec<Value>, temen_interp::Trap> {
+    let src = format!(
+        r#"memory 17
+func (i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32) {{
+  vf0 = i64.const {f0}
+  vf8 = i64.const 65536
+  vf16 = i64.const {f16}
+  vmask = i64.const 4294967295
+  vb64 = i64.extend_i32_s vbud
+  vbm = i64.and vb64 vmask
+  vsh = i64.const 32
+  vbs = i64.shl vbm vsh
+  vmod = i64.const 4294967295
+  vf24 = i64.or vmod vbs
+  vf32 = i64.const 0
+  vf40 = i64.const 0
+  vf48 = i64.const 0
+{stores}
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vzero = i32.const 0
+  visneg = i32.lt_s vch vzero
+  br_if visneg 2(vbud) 1(vinst, vbud, vch)
+}}
+block 1 (vinst1: i32, vbud1: i32, vch1: i32) {{
+  vj = call.cap 6 1 (i32) -> (i64) vinst1 (vch1)
+  fld0 = i64.const 0
+  fld1 = i64.const 1
+  vfr = call.cap 14 1 (i64) -> (i64) vbud1 (fld0)
+  vmr = call.cap 14 1 (i64) -> (i64) vbud1 (fld1)
+  k = i64.const 1000
+  t0 = i64.mul vj k
+  t1 = i64.add t0 vfr
+  t2 = i64.add t1 vmr
+  return t2
+}}
+block 2 (vbud2: i32) {{
+  vneg = i64.const -1
+  return vneg
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vn0 = i64.const 0
+  br 1(vn0)
+}}
+block 1 (vn: i64) {{
+  vz = i32.const 0
+  vfds = i64.const 20480
+  vr = call.cap 4294967295 16 (i64) -> (i32) vz (vfds)
+  vrz = i32.const 0
+  vfail = i32.lt_s vr vrz
+  br_if vfail 2(vn) 3(vn)
+}}
+block 2 (vnf: i64) {{
+  return vnf
+}}
+block 3 (vnok: i64) {{
+  vone = i64.const 1
+  vn2 = i64.add vnok vone
+  br 1(vn2)
+  }}
+}}
+"#,
+        f0 = (1u64 << 32) as i64,
+        f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
+        stores = store_record(17408),
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let ih = host.grant_instantiator(0, 128 << 10);
+    // fuel/mem/spawn unbounded — only `channel` constrains the child.
+    let bh = host.grant_budget_channel(-1, -1, -1, channel);
+    let mut fuel = 50_000_000u64;
+    let (res, _) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(bh)],
+        &mut fuel,
+        &[],
+        0,
+        &mut host,
+    );
+    res
+}
+
+/// #989 slice 1b — a `Budget` split's `channel` field bounds a §14 child's host-served pipe memory:
+/// a channel of exactly 2×`PIPE_CAP` lets the child mint exactly two pipes before the third fails
+/// closed (`-EMFILE`), so the parent's join reports `2` (× 1000). An **unbounded** channel (`-1`,
+/// the default) mints far more (until the handle table fills), so the exact `2` is proof the
+/// funding budget's ceiling propagated onto the child's `channel_cap` at spawn.
+#[test]
+fn channel_budget_bounds_a_spawned_childs_pipe_mints() {
+    assert_eq!(
+        run_channel_bounded_child(2 * PIPE_CAP),
+        Ok(vec![Value::I64(2_000)]),
+        "a 2×PIPE_CAP channel budget bounds the child to exactly two pipe mints"
+    );
+    // A one-pipe ceiling bounds it to a single mint — the ceiling scales with the budget.
+    assert_eq!(
+        run_channel_bounded_child(PIPE_CAP),
+        Ok(vec![Value::I64(1_000)]),
+        "a 1×PIPE_CAP channel budget bounds the child to exactly one pipe mint"
+    );
+    // Unbounded channel: the child mints well past two (handle-table bound, not channel) — so the
+    // bounded cases above are enforcing the cap, not hitting some incidental limit at two.
+    let unbounded = run_channel_bounded_child(-1).expect("unbounded spawn runs");
+    let n = match unbounded.as_slice() {
+        [Value::I64(v)] => v / 1000,
+        other => panic!("unexpected unbounded result: {other:?}"),
+    };
+    assert!(
+        n > 2,
+        "an unbounded channel mints more than two pipes (got {n}) — the bound above is real"
+    );
+}
+
 /// §3c.2 — the budget-record program: a Budget-funded record spawn that the
 /// §3c.2 hook funds on every tier (the pre-3c.2 form of this test asserted the `-EINVAL`
 /// gap). The shared program: resolve "vm" + "bgt", build a record carrying the budget handle,

@@ -1151,7 +1151,8 @@ fn take_spawn_budget(
     }
     // Commit: drain to zero. `take_budget` returns the pre-drain state, so the fuel it reports
     // equals the `fuel` peeked above — fund from that. Bounded fuel is `min(budget, parent)`,
-    // unbounded inherits the parent's remaining.
+    // unbounded inherits the parent's remaining. (#989 slice 1b — the child's `channel` cap is
+    // peeked separately by the inline-building spawn arms before this drain; see `set_channel_cap`.)
     host.take_budget(budget).ok_or(Trap::CapFault)?;
     Ok(Some(if fuel >= 0 {
         (fuel as u64).min(parent_fuel)
@@ -12334,6 +12335,11 @@ impl CoopSched {
                     };
                     // §3d: a record's budget funds the child here — the commit site, after every
                     // other refusal (geometry, grants), so a refused spawn leaves it intact.
+                    // #989 slice 1b — peek the budget's `channel` cap BEFORE `take_spawn_budget`
+                    // drains it, so a funded spawn can stamp the child's host-served channel ceiling.
+                    let chan_cap = (budget != 0)
+                        .then(|| host.peek_budget(budget).map(|b| b.channel))
+                        .flatten();
                     let child_fuel = if budget != 0 {
                         match take_spawn_budget(host, budget, child_size, pfuel) {
                             Err(t) => {
@@ -12347,7 +12353,14 @@ impl CoopSched {
                                     .set(dst, Reg::from_i32(super::EINVAL as i32));
                                 continue;
                             }
-                            Ok(Some(f)) => f,
+                            Ok(Some(f)) => {
+                                // Funded spawn committed — bound the child's channel memory (`-1` =
+                                // unbounded, a no-op vs. the default).
+                                if let Some(cap) = chan_cap {
+                                    child_host.set_channel_cap(cap);
+                                }
+                                f
+                            }
                         }
                     } else if quota <= 0 {
                         pfuel
@@ -12585,6 +12598,10 @@ impl CoopSched {
                     };
                     // §3d: a record's budget funds the child here — the commit site, after every
                     // other refusal (module resolve, geometry, grants, manifest binding).
+                    // #989 slice 1b — peek the channel cap before `take_spawn_budget` drains it.
+                    let chan_cap = (budget != 0)
+                        .then(|| host.peek_budget(budget).map(|b| b.channel))
+                        .flatten();
                     let child_fuel = if budget != 0 {
                         match take_spawn_budget(host, budget, child_size, pfuel) {
                             Err(t) => {
@@ -12598,7 +12615,14 @@ impl CoopSched {
                                     .set(dst, Reg::from_i32(super::EINVAL as i32));
                                 continue;
                             }
-                            Ok(Some(f)) => f,
+                            Ok(Some(f)) => {
+                                // Funded spawn committed — bound the child's channel memory from the
+                                // funding budget's `channel` (see the same-module arm; `-1` = unbounded).
+                                if let Some(cap) = chan_cap {
+                                    child_host.set_channel_cap(cap);
+                                }
+                                f
+                            }
                         }
                     } else if quota <= 0 {
                         pfuel
