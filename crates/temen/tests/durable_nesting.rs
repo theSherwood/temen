@@ -1210,3 +1210,119 @@ fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+/// #1289 R1 / O14 — a thawed nested child's `self.attest` reports the correct exposure. The child
+/// (a same-module loop, caught live at a freeze-from-start) calls `self.attest` **after** its loop
+/// and returns it, so the read runs on the *thawed* host. A durable nested child is `window_exposed`
+/// (its parent reads its carve) + `freeze_exposed` (it froze) at tier 1 — packed `1 | 1<<8 | 1<<9 =
+/// 769`. Before the thaw re-stamped the child's attestation it defaulted (`1`), so the thawed read
+/// lied; now the uninterrupted and thawed runs agree.
+const PARENT_ATTEST_LOOP: &str = "memory 18
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 0
+  v3 = i64.const 0
+  br 1(v2, v3)
+}
+block 1 (v4: i64, v5: i64) {
+  v6 = i64.const 100
+  v7 = i64.lt_s v4 v6
+  br_if v7 2(v4, v5) 3(v5)
+}
+block 2 (v8: i64, v9: i64) {
+  v10 = i64.add v9 v8
+  v11 = i64.const 1
+  v12 = i64.add v8 v11
+  br 1(v12, v10)
+}
+block 3 (v13: i64) {
+  va = self.attest
+  vr = i64.extend_i32_u va
+  return vr
+  }
+}
+";
+
+/// tier 1 (in-process) | window_exposed (1<<8) | freeze_exposed (1<<9) = 769.
+const NESTED_DURABLE_ATTEST: i64 = 1 | (1 << 8) | (1 << 9);
+
+#[test]
+fn a_thawed_nested_childs_attestation_reports_exposed() {
+    let parent = instrument(PARENT_ATTEST_LOOP);
+
+    // Control: an uninterrupted run — the child attests at spawn-time exposure (nested + durable).
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (base, _) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(ih)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        base,
+        Ok(vec![Value::I64(NESTED_DURABLE_ATTEST)]),
+        "uninterrupted: the nested durable child attests window+freeze exposed"
+    );
+
+    // Freeze-from-start: the child is caught at its entry poll and rides as residue.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 50_000_000u64;
+    let (fr, fsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(fih)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert!(fr.is_ok(), "subtree freeze returns a placeholder: {fr:?}");
+    assert_eq!(fhost.frozen_nested().len(), 1, "one nested child rode");
+    let residue = fhost.frozen_nested().to_vec();
+
+    // Thaw: the reconstructed child runs its body (loop + attest) on the thawed host. Its attest must
+    // equal the control — the thaw re-derived its exposure, rather than defaulting it to unexposed.
+    let mut twin = fsnap.clone();
+    begin_thaw(&mut twin, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_nested(residue);
+    let tih = thost.grant_instantiator(0, WINDOW as u64);
+    let mut fuel = 50_000_000u64;
+    let (tr, tsnap) = run_capture_reserved_with_host(
+        &parent,
+        0,
+        &[Value::I32(tih)],
+        &mut fuel,
+        &twin,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(NESTED_DURABLE_ATTEST)]),
+        "thawed child attests the same exposure as the uninterrupted run (not the defaulted value)"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
