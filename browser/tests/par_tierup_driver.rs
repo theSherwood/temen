@@ -475,15 +475,22 @@ const LK_K: i64 = 90909;
 /// Where the emitted `F` stores + reloads its result (above the NULL guard, below the staged blob).
 const LK_MARK: i64 = 0x5000;
 
-/// `unit(x) = F(x) + LK_K`, `F` an unresolved `call.sym` the guest binds to Slot 1 at link time.
-fn lk_unit_module() -> temen_ir::Module {
+/// `unit(x) = F(x) + LK_K`. `linked == false`: `F` is an unresolved `call.sym` the guest binds to
+/// Slot 1 at link time (the blob it `compile_linked`s). `linked == true`: the same unit in its
+/// post-link shape — the linker rewrites that `call.sym` into a `call.dyn` through the patched
+/// placeholder (`Resolved::Slot`, IMPORTS.md §2.5) — the harness's source for the non-shared wasmi
+/// twin of the FFI's emit (the linker itself is off limits outside the linker, `imports_gate.rs`).
+fn lk_unit_module(linked: bool) -> temen_ir::Module {
+    let call = if linked {
+        "  v1 = i32.const 1\n  v2 = call.dyn (i64) -> (i64) v1 (v0)\n"
+    } else {
+        "  v1 = i32.const 0\n  v2 = call.sym \"F\" (i64) -> (i64) v1 (v0)\n"
+    };
     let src = format!(
         r#"memory 16
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  v1 = i32.const 0
-  v2 = call.sym "F" (i64) -> (i64) v1 (v0)
-  vk = i64.const {LK_K}
+{call}  vk = i64.const {LK_K}
   v3 = i64.add v2 vk
   return v3
   }}
@@ -611,8 +618,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
         temen_par_powerbox_jit_runtime, temen_par_shim_wasm_len, temen_wasmjit_len,
         temen_wasmjit_ptr, PAR_JIT_INVOKE,
     };
-    let unit_m = lk_unit_module();
-    let blob = temen_encode::encode_module(&unit_m); // imports unresolved — the guest links it
+    let blob = temen_encode::encode_module(&lk_unit_module(false)); // unresolved — the guest links it
     let symtab: Vec<u8> = vec![1, 1, b'F', 0, 1]; // `"F"` → Slot(1) (canonical wire form)
     let guest = lk_guest_module(blob.len(), symtab.len(), emitted_callee);
     let guest_bytes = temen_encode::encode_module(&guest);
@@ -691,8 +697,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
         );
         lk_instantiate(&mut store, &engine, memory, table, &art.wasm)
     };
-    let linked = temen_ir::resolve_imports_with(&unit_m, |_| Some(temen_ir::Resolved::Slot(1)))
-        .expect("link");
+    let linked = lk_unit_module(true);
     temen_verify::verify_module(&linked).expect("linked unit verifies");
     let unit_wasm = temen_wasm_jit::compile_module_b2(&linked, false, temen_par_jit_table_log2())
         .expect("B2 unit emit");
@@ -750,8 +755,15 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
                         .set(&mut store, slot as u64, Val::FuncRef(fr))
                         .unwrap();
                 }
-                // The invoked unit (cached per code handle): the FFI emitted it (shared) on demand.
-                assert!(temen_par_jit_code_wasm_len(v) > 0, "the linked unit emits");
+                // The invoked unit (cached per code handle): the FFI emitted it (shared) on demand
+                // from the guest-linked IR — the same code as the twin but for the shared-memory
+                // import's max limit (a few LEB bytes), the `inst_codegen_paged.rs` pin.
+                let ffi_len = temen_par_jit_code_wasm_len(v);
+                assert!(
+                    ffi_len > unit_wasm.len() && ffi_len - unit_wasm.len() <= 8,
+                    "FFI linked-unit emit {ffi_len} vs unshared twin {}",
+                    unit_wasm.len()
+                );
                 let _code = temen_par_jit_code(v);
                 let inst = *unit_inst.get_or_insert_with(|| {
                     lk_instantiate(&mut store, &engine, memory, table, &unit_wasm)
