@@ -1977,7 +1977,7 @@ pub fn production_grant_hooks() -> temen_jit::GrantChildHooks {
         build: grant_child_build,
         build_named: grant_named_child_build,
         build_detached: grant_detached_child_build,
-        minter_take,
+        budget_mem_take,
         release: grant_child_release,
         bind_imports: child_bind_imports,
         mint: child_offer_mint,
@@ -2467,16 +2467,16 @@ pub unsafe extern "C" fn grant_detached_child_build(
     finish_child_build(parent, built, out, trap_out)
 }
 
-/// PROCESS.md §5 / #1287 — the `WindowMinter` admission for a detached spawn on the JIT
-/// ([`temen_jit::MinterTaker`]): deduct `bytes` from the minter behind `minter` on the parent `Host`.
+/// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn on the JIT
+/// ([`temen_jit::BudgetMemTaker`]): deduct `bytes` from the minter behind `minter` on the parent `Host`.
 /// `1` = admitted; `0` = forged/wrong-type handle or exhausted quota (nothing deducted) — the spawn
-/// refuses probeably, exactly the interpreter's `window_minter_take`.
+/// refuses probeably, exactly the interpreter's `budget_mem_take`.
 ///
 /// # Safety
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
-pub unsafe extern "C" fn minter_take(ctx: *mut c_void, minter: i32, bytes: u64) -> i32 {
+pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
     let parent = &mut *(ctx as *mut Host);
-    i32::from(parent.window_minter_take(minter, bytes))
+    i32::from(parent.budget_mem_take(budget, bytes))
 }
 
 /// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative
@@ -4976,16 +4976,18 @@ impl HostCap {
         }
     }
 
-    /// PROCESS.md §5 — a **window minter** with a byte `quota`: the authority to spawn
-    /// **detached** children (`Instantiator.instantiate_detached`, op 15) whose fresh platform
-    /// windows no ancestor below the platform can read (the child attests
-    /// `window_exposed = false` — the distrust-spawner trust anchor). Embedder-granted like
-    /// `exec`/`fs`; each mint deducts the child's window size from the quota.
-    pub fn window_minter(quota: u64) -> HostCap {
+    /// PROCESS.md §5 — a **detached-spawn `Budget`** with a `mem` byte quota (#1289 R2: minting a
+    /// detached window is not a separate authority — it spends `Budget.mem`; the standalone
+    /// `WindowMinter` retired). The authority to spawn **detached** children
+    /// (`Instantiator.instantiate_detached`, op 15) whose fresh platform windows no ancestor below
+    /// the platform can read (the child attests `window_exposed = false` — the distrust-spawner trust
+    /// anchor). Embedder-granted like `exec`/`fs`; each mint deducts the child's window size from
+    /// `mem` (fuel/spawn are `0` — this cap is a pure VA authority).
+    pub fn detached_budget(mem: u64) -> HostCap {
         HostCap {
-            type_id: cap_id::WINDOW_MINTER,
+            type_id: cap_id::BUDGET,
             op: 0,
-            grant: Arc::new(move |h, _| h.grant_window_minter(quota)),
+            grant: Arc::new(move |h, _| h.grant_budget(0, mem as i64, 0)),
             unbound: false,
             offer: None,
             iface: None,

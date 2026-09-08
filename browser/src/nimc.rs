@@ -447,7 +447,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(child);
     // The minter's quota is the mint (the declared window); growth is bounded by the reservation.
-    let minter = host.grant_window_minter(1u64 << decl);
+    let minter = host.grant_budget(0, (1u64 << decl) as i64, 0);
 
     let size = win as usize;
     let Ok(layout) = std::alloc::Layout::from_size_align(size, 8) else {

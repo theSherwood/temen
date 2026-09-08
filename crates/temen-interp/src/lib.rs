@@ -11995,17 +11995,17 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 .vals
                                 .push(Reg::from_i32(cap.unwrap_or(EINVAL as i32)));
                         }
-                        // PROCESS.md §5 — `instantiate_detached(minter, module, grants_ptr,
+                        // PROCESS.md §5 — `instantiate_detached(budget, module, grants_ptr,
                         // grants_n, entry, size_log2, quota) -> child | -EINVAL`: spawn a
                         // child from a granted module into a **fresh platform window**, minted
-                        // through a `WindowMinter` capability — outside this domain's window,
+                        // by spending arg-0's `Budget.mem` (#1289 R2) — outside this domain's window,
                         // so no ancestor below the platform holds read authority and the child
                         // attests `window_exposed = false` (the distrust-spawner trust model).
                         // The §14 free data plane is gone BY DESIGN: data flows through the
                         // module's own segments and the named grants (streams / pipe ends /
                         // regions — the op-11 record format), the separate-process discipline.
                         // The spawner keeps kill/join/fuel authority — detachment severs
-                        // *read*, not lifecycle. A quota miss / forged minter / bad entry or
+                        // *read*, not lifecycle. A quota miss / non-`Budget` arg / bad entry or
                         // size refuses probeably (and a refused spawn charges nothing); a
                         // **durable** domain refuses outright (a detached window is outside
                         // the subtree snapshot — fail closed; multi-window freeze is the
@@ -12018,7 +12018,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         .i64(),
                                 )
                             };
-                            let minter = argn(0)? as i32;
+                            let budget = argn(0)? as i32;
                             let mh = argn(1)? as i32;
                             let grants_ptr = argn(2)? as u64;
                             let grants_n = argn(3)? as u64;
@@ -12098,9 +12098,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && child_size != 0
                                 && mod_ok
                                 && payload_ok
-                                && host
-                                    .lock_unpoisoned()
-                                    .window_minter_take(minter, child_size);
+                                && host.lock_unpoisoned().budget_mem_take(budget, child_size);
                             if !admitted {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
@@ -16431,11 +16429,6 @@ enum Binding {
         pipe: u32,
         write: bool,
     },
-    /// PROCESS.md §5 — a **window minter** (detached-window authority), carrying the index of
-    /// its remaining byte quota in [`Host::window_minters`]. Index-carrying (mutable quota
-    /// state), so non-copyable and non-durable like [`Binding::SharedRegion`]; serviced by the
-    /// eval loop's `instantiate_detached` arm, inert under the generic dispatch.
-    WindowMinter(u32),
     Exit,
     Clock,
     /// A §13 `SharedRegion` handle, carrying the index of its backing in [`Host::regions`]. The
@@ -16700,9 +16693,6 @@ pub enum NonDurableKind {
     /// §3.6 a live-callee offer — points at a *running* domain's powerbox, which no snapshot
     /// can carry; re-wired after restore like a Offer.
     LiveImpl,
-    /// PROCESS.md §5 a window minter — mutable quota state (and the detached children it
-    /// minted are outside the snapshot anyway); re-granted by the embedder after restore.
-    WindowMinter,
 }
 
 /// One handle-table slot (§3c): host-owned, guest-unwritable. `generation` is
@@ -18055,10 +18045,6 @@ pub struct Host {
     /// by the thaw's nested re-creation, which patches each entry's `callee`/`sigs` once the
     /// child at `callee_slot` is built. Empty on any run that restored no durable live impls.
     pending_live_impls: Vec<(u32, usize, u32)>,
-    /// PROCESS.md §5 — the side table a [`Binding::WindowMinter`] indexes: each entry the
-    /// minter's **remaining byte quota**, deducted at every detached mint (numeric,
-    /// host-enforced; no refund on child completion — the quota bounds lifetime total, v1).
-    window_minters: Vec<u64>,
     /// The §12 bounded blocking-offload pool, created lazily on the first batched `submit` that has a
     /// blocking SQE (so a `Host` that never offloads spawns no threads). Dropping it joins the
     /// workers ([`OffloadPool`]'s `Drop`).
@@ -18566,7 +18552,6 @@ impl Host {
             handoff_trap: 0,
             live_impls: Vec::new(),
             pending_live_impls: Vec::new(),
-            window_minters: Vec::new(),
             pool: None,
             completions: Arc::new(Completions::new()),
             completion_notify: None,
@@ -18635,7 +18620,7 @@ impl Host {
         // capable one (`snapshot ⊆ fork`), never the reverse (a domain a snapshot carries, fork
         // carries too). Grouped by why each refusal here holds:
         //   * ARE `NonDurableKind`s (snapshot refuses the binding; fork gates on its backing being
-        //     empty): live offers, pending live impls, blockings, window minters.
+        //     empty): live offers, pending live impls, blockings.
         //   * In-flight run state, not a capability — cloning it into a *second* live domain would
         //     double-drive it, so fork refuses even though a snapshot (which resumes the SAME domain,
         //     not a duplicate) serializes some of it: the serve queue/results (a twin re-serving the
@@ -18651,7 +18636,6 @@ impl Host {
             && self.offers.is_empty()
             && self.pending_live_impls.is_empty()
             && self.blockings.is_empty()
-            && self.window_minters.is_empty()
             && self.svc_queue.is_empty()
             && self.svc_results.is_empty()
             && self.self_instance.is_none()
@@ -19863,9 +19847,6 @@ impl Host {
                 }
                 Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
-                Binding::WindowMinter(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::WindowMinter))
-                }
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -19921,7 +19902,6 @@ impl Host {
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
                 Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
-                Binding::WindowMinter(_) => NonDurableKind::WindowMinter,
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -21219,27 +21199,21 @@ impl Host {
         self.grant_module_inner(m, true)
     }
 
-    /// Grant a PROCESS.md §5 **window-minter** capability with a byte `quota`: the authority to
-    /// spawn **detached** children (`Instantiator.instantiate_detached`, op 15) whose windows no
-    /// ancestor below the platform can read. Embedder-granted (like `exec`/`fs` — nothing
-    /// ambient); each mint deducts the child's window size from the remaining quota.
-    pub fn grant_window_minter(&mut self, quota: u64) -> i32 {
-        let idx = self.window_minters.len() as u32;
-        self.window_minters.push(quota);
-        self.grant(cap_id::WINDOW_MINTER, Binding::WindowMinter(idx))
-    }
-
-    /// Deduct `bytes` from the minter behind `handle` — the detached-spawn admission check.
-    /// `false` (nothing deducted) for a forged/wrong-type handle or an exhausted quota: the
-    /// spawn refuses probeably, never a trap.
-    pub fn window_minter_take(&mut self, handle: i32, bytes: u64) -> bool {
-        let idx = match self.resolve(handle, cap_id::WINDOW_MINTER) {
-            Ok(Binding::WindowMinter(i)) => i as usize,
+    /// Deduct `bytes` from the `mem` field of the `Budget` behind `handle` — the detached-spawn
+    /// admission (#1289 R2: minting a detached window is not a separate authority, it **spends
+    /// `Budget.mem`**; the standalone `WindowMinter` retired). `false` (nothing deducted) for a
+    /// forged / wrong-type handle or an insufficient bounded quota: the spawn refuses probeably,
+    /// never a trap. An **unbounded** (`-1`) mem field admits any size and stays unbounded (an
+    /// embedder that does not meter detached VA passes an unbounded-`mem` budget).
+    pub fn budget_mem_take(&mut self, handle: i32, bytes: u64) -> bool {
+        let idx = match self.resolve(handle, cap_id::BUDGET) {
+            Ok(Binding::Budget(i)) => i as usize,
             _ => return false,
         };
-        match self.window_minters.get_mut(idx) {
-            Some(rem) if *rem >= bytes => {
-                *rem -= bytes;
+        match self.budgets.get_mut(idx) {
+            Some(b) if b.mem < 0 => true, // unbounded: admit, undrained
+            Some(b) if b.mem as u64 >= bytes => {
+                b.mem -= bytes as i64;
                 true
             }
             _ => false,
@@ -23073,7 +23047,6 @@ impl Host {
             Binding::LiveImpl(_) => Ok(vec![EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
             // argument), not a dispatch target — inert probeable refusal.
-            Binding::WindowMinter(_) => Ok(vec![EINVAL]),
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
             // turned inward: the holder hangs up). Null the slot entry so every later use of the
             // handle is the clean use-after-close answer (I41: the probeable `-EBADF`, matching

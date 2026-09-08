@@ -505,14 +505,14 @@ enum Op {
         /// inherited `stdout` by name — the shell "exec" primitive.
         grants: Option<(u32, u32)>,
     },
-    /// PROCESS.md §5 `Instantiator.instantiate_detached(minter, module, grants_ptr, grants_n, entry,
+    /// PROCESS.md §5 `Instantiator.instantiate_detached(budget, module, grants_ptr, grants_n, entry,
     /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
-    /// window** minted through a `WindowMinter` — no carve, no alias; the host owns the window. The
+    /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
     /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
     /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve").
     InstantiateDetached {
         handle: u32,
-        minter: u32,
+        budget: u32,
         module: u32,
         grants: Option<(u32, u32)>,
         entry: u32,
@@ -1740,12 +1740,12 @@ fn compile_inst(
                     dst,
                     grants: Some((g(args[1]), g(args[2]))),
                 },
-                // op 15 = instantiate_detached (#1286): (minter, module, grants_ptr, grants_n, entry,
+                // op 15 = instantiate_detached (#1286): (budget, module, grants_ptr, grants_n, entry,
                 // size_log2, quota[, args_ptr, args_len]) — the fresh-window spawn; the driver mints the
                 // window and seeds the payload. A `grants_n` of 0 is the grant-less form.
                 (cap_id::INSTANTIATOR, 15) if args.len() >= 7 => Op::InstantiateDetached {
                     handle: g(*handle),
-                    minter: g(args[0]),
+                    budget: g(args[0]),
                     module: g(args[1]),
                     grants: Some((g(args[2]), g(args[3]))),
                     entry: g(args[4]),
@@ -2967,7 +2967,7 @@ pub enum VcpuEvent {
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286): start a child vCPU in a **fresh window
     /// the host mints** — no carve, nothing of it in the parent's window. Admission (child entry,
-    /// window = declared memory, `WindowMinter` quota) and the module compile + push already happened;
+    /// window = declared memory, `Budget` quota) and the module compile + push already happened;
     /// the re-granted child powerbox is stashed for [`Vcpu::take_granted_host`]. The host allocates a
     /// window of `1 << size_log2` (grown by the child's `vm_map`s), seeds the module's data segments
     /// and `args` at `module_args_base()`, runs the child with
@@ -3875,12 +3875,12 @@ impl<'p> Vcpu<'p> {
                     }
                 }
                 // op 15 (`instantiate_detached`, #1286): the fresh-window twin of the op-13 arm above —
-                // parse + gate the grant list first, commit (minter quota take, module compile + push,
+                // parse + gate the grant list first, commit (budget quota take, module compile + push,
                 // payload read) in `event_instantiate_detached`, then re-grant and stash the child
                 // powerbox for the driver. The window itself is the host's to mint: the event carries
                 // no carve.
                 Ok(VcpuStop::InstantiateDetached {
-                    minter,
+                    budget,
                     mh,
                     entry,
                     size_log2,
@@ -3897,7 +3897,7 @@ impl<'p> Vcpu<'p> {
                         None => None,
                     };
                     match self.event_instantiate_detached(
-                        minter, mh, entry, size_log2, quota, args, dst,
+                        budget, mh, entry, size_log2, quota, args, dst,
                     ) {
                         Ok(Some(ev)) => {
                             if let Some(list) = glist {
@@ -4125,13 +4125,13 @@ impl<'p> Vcpu<'p> {
     /// [`VcpuEvent::InstantiateDetached`], or land `-EINVAL` in place (`Ok(None)`). The tree-walker's
     /// admission, exactly: the entry is a child entry, the window equals the module's declared memory
     /// (§14 transparency: a detached window has no superset room — it grows into its own reservation),
-    /// the payload fits the args region, and the `WindowMinter` quota covers the window (a forged /
-    /// exhausted minter refuses, charging nothing). The child's data segments are **not** seeded here:
+    /// the payload fits the args region, and the `Budget` quota covers the window (a forged /
+    /// exhausted budget refuses, charging nothing). The child's data segments are **not** seeded here:
     /// the host owns the fresh window and seeds `module.data` + the payload before start.
     #[allow(clippy::too_many_arguments)]
     fn event_instantiate_detached(
         &mut self,
-        minter: i32,
+        budget: i32,
         mh: i32,
         entry: i64,
         size_log2: i64,
@@ -4199,10 +4199,10 @@ impl<'p> Vcpu<'p> {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
-        // Admission = the minter's quota take (the commit; every refusal above charged nothing).
+        // Admission = the budget's quota take (the commit; every refusal above charged nothing).
         let admitted = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().window_minter_take(minter, child_size),
-            None => self.host.window_minter_take(minter, child_size),
+            Some(m) => m.lock_unpoisoned().budget_mem_take(budget, child_size),
+            None => self.host.budget_mem_take(budget, child_size),
         };
         if !admitted {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -9062,10 +9062,10 @@ enum Outcome {
         budget: i32,
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
-    /// host-minted window. `minter` is the `WindowMinter` handle (admission = quota take), `grants`
+    /// host-minted window. `budget` is the `Budget` handle (admission = quota take), `grants`
     /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window.
     InstantiateDetached {
-        minter: i32,
+        budget: i32,
         mh: i32,
         entry: i64,
         size_log2: i64,
@@ -9866,7 +9866,7 @@ enum VcpuStop {
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286) — see [`Outcome::InstantiateDetached`].
     InstantiateDetached {
-        minter: i32,
+        budget: i32,
         mh: i32,
         entry: i64,
         size_log2: i64,
@@ -10375,7 +10375,7 @@ fn step_vcpu(
                 })
             }
             Outcome::InstantiateDetached {
-                minter,
+                budget,
                 mh,
                 entry,
                 size_log2,
@@ -10385,7 +10385,7 @@ fn step_vcpu(
                 args,
             } => {
                 return Ok(VcpuStop::InstantiateDetached {
-                    minter,
+                    budget,
                     mh,
                     entry,
                     size_log2,
@@ -16283,11 +16283,11 @@ impl Vm {
                     });
                 }
                 // §5 detached spawn (op 15, #1286): the Instantiator is the authority (a forged one is a
-                // CapFault, as every op above); the minter's quota take and the module resolve happen at
+                // CapFault, as every op above); the budget's quota take and the module resolve happen at
                 // the driver's commit site (`event_instantiate_detached`), peek-then-drain like op 13.
                 Op::InstantiateDetached {
                     handle,
-                    minter,
+                    budget,
                     module: module_reg,
                     grants,
                     entry,
@@ -16298,7 +16298,7 @@ impl Vm {
                 } => {
                     let ih = r!(*handle).i32();
                     host.with(|p| p.resolve_instantiator(ih))?;
-                    let minter = r!(*minter).i64() as i32;
+                    let budget = r!(*budget).i64() as i32;
                     let mh = r!(*module_reg).i64() as i32;
                     let entry = r!(*entry).i64();
                     let size_log2 = r!(*size_log2).i64();
@@ -16313,7 +16313,7 @@ impl Vm {
                     self.base = base;
                     self.pc = pc + 1;
                     return Ok(Outcome::InstantiateDetached {
-                        minter,
+                        budget,
                         mh,
                         entry,
                         size_log2,

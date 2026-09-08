@@ -1881,7 +1881,7 @@ pub extern "C" fn temen_par_root(
             args.push(Value::I32(host.grant_module(m)));
         }
         if cfg.minter_quota > 0 {
-            args.push(Value::I32(host.grant_window_minter(cfg.minter_quota)));
+            args.push(Value::I32(host.grant_budget(0, (cfg.minter_quota) as i64, 0)));
         }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
@@ -9471,7 +9471,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     // #1286: the detached driver's third entry arg is a `WindowMinter` (byte quota = the default
     // per-child memory ceiling) rather than the `"fs"` handle.
     let third = if minter {
-        host.grant_window_minter(DETACHED_DEFAULT_MAX_BYTES)
+        host.grant_budget(0, (DETACHED_DEFAULT_MAX_BYTES) as i64, 0)
     } else {
         fs_h
     };
@@ -9777,7 +9777,7 @@ unsafe fn op13_phase_open_impl(
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
     // The minter's quota is the mint (the declared window); the minted memory's `maximum` bounds growth.
-    let minter = host.grant_window_minter(1u64 << decl);
+    let minter = host.grant_budget(0, (1u64 << decl) as i64, 0);
     // Grant args in the order the parent's params expect: inst, module, minter, then the caps. The exec
     // (when present) is granted forkable so op-15's `regrant_into_child` can carry it (`can_regrant`).
     let mut grant_args = vec![

@@ -766,15 +766,15 @@ pub struct BudgetTaken {
     pub spawn: i64,
 }
 
-/// PROCESS.md §5 / #1287 — the `WindowMinter` admission for a detached spawn: deduct `bytes` (the
-/// child's declared window) from the minter behind `minter` on the parent `Host`. Returns nonzero when
+/// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn: deduct `bytes` (the
+/// child's declared window) from the budget behind `budget` on the parent `Host`. Returns nonzero when
 /// admitted; `0` for a forged/wrong-type handle or an exhausted quota — the spawn refuses probeably
-/// (`-EINVAL`), charging nothing, exactly the interpreter's `window_minter_take`.
+/// (`-EINVAL`), charging nothing, exactly the interpreter's `budget_mem_take`.
 ///
 /// # Safety
 /// `ctx` is the run's `cap_ctx` (the parent `Host`).
-pub type MinterTaker =
-    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, minter: i32, bytes: u64) -> i32;
+pub type BudgetMemTaker =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i32;
 
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
@@ -784,8 +784,8 @@ pub struct GrantChildHooks {
     /// `build_named`, but the child attests `window_exposed = false` and its starter caps span
     /// `child_size` = the window **reservation** (a root's shape — no carve bounds it).
     pub build_detached: GrantNamedChildBuilder,
-    /// #1287 — the `WindowMinter` quota take (see [`MinterTaker`]).
-    pub minter_take: MinterTaker,
+    /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
+    pub budget_mem_take: BudgetMemTaker,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
@@ -5844,7 +5844,7 @@ struct InstEnv {
     child_offer_thunk: i64,
     // PROCESS.md §5 / #1287 — op 15 (`instantiate_detached`): a separate-module child in its **own**
     // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
-    // `WindowMinter`; argv rides as the optional spawn-time payload.
+    // `Budget`; argv rides as the optional spawn-time payload.
     instantiate_detached_thunk: i64,
 }
 
@@ -8522,7 +8522,7 @@ fn lower_instantiator(
         13 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
         // CALLS.md 5c.0 child_offer: (child, export) -> live-impl handle (probeable -EINVAL).
         14 => Some((&[VI32, VI64], &[VI32])),
-        // PROCESS.md §5 / #1287 instantiate_detached: (minter, module, grants_ptr, grants_n, entry,
+        // PROCESS.md §5 / #1287 instantiate_detached: (budget, module, grants_ptr, grants_n, entry,
         // size_log2, quota[, args_ptr, args_len]) -> child handle — the fresh-window spawn; the two
         // optional trailing args are the spawn-time argv payload (absent ⇒ none, as the interpreter).
         15 => Some((&[VI64, VI64, VI64, VI64, VI64, VI64, VI64], &[VI32])),
@@ -8736,7 +8736,7 @@ fn lower_instantiator(
         }
         15 => {
             // PROCESS.md §5 / #1287 instantiate_detached(nursery, mem_base, mem_size, handle:i32,
-            //   minter:i64, module:i64, grants_ptr:i64, grants_n:i64, entry:i64, size_log2:i64,
+            //   budget:i64, module:i64, grants_ptr:i64, grants_n:i64, entry:i64, size_log2:i64,
             //   fuel:i64, args_ptr:i64, args_len:i64, trap_out:i64) -> handle:i32. The fresh-window
             // spawn: no carve — the thunk mints a root-shaped window (declared size committed, a
             // lazy reservation above it), seeds the module's data + the argv payload, and runs the
@@ -8751,7 +8751,7 @@ fn lower_instantiator(
                     get(vals, *args.get(i).ok_or(JitError::Malformed)?)?,
                 ))
             };
-            let minter = a(b, 0)?;
+            let budget = a(b, 0)?;
             let modh = a(b, 1)?;
             let grants_ptr = a(b, 2)?;
             let grants_n = a(b, 3)?;
@@ -8776,7 +8776,7 @@ fn lower_instantiator(
                 tref,
                 thunk,
                 &[
-                    nursery, mem_base, mem_size, h, minter, modh, grants_ptr, grants_n, entry,
+                    nursery, mem_base, mem_size, h, budget, modh, grants_ptr, grants_n, entry,
                     size_log2, fuel, args_ptr, args_len, trap_out,
                 ],
             );

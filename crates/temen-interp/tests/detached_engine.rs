@@ -2,7 +2,7 @@
 //! detached windows itself (`detached_windows.rs`); the resumable engine instead **surfaces** the spawn
 //! as [`bytecode::VcpuEvent::InstantiateDetached`] — no carve, the host mints the window — after doing
 //! the authority-bearing work in-engine: the `Instantiator` resolved, the module compiled + pushed to the
-//! shared source, the `WindowMinter` quota taken (a miss lands `-EINVAL` probeably), the grant list
+//! shared source, the detached-spawn `Budget` quota taken (a miss lands `-EINVAL` probeably), the grant list
 //! re-granted and stashed, and the optional spawn-time **args payload** read out of the parent's window.
 //! The host here seeds the fresh window (data segments + payload at `module_args_base()`) and runs the
 //! child with `new_confined_child_grow_over_host` — exactly what the browser's op-13 servicer does over a
@@ -36,7 +36,7 @@ block 0 (v0: i64) {
 /// "hello-de" as a little-endian i64 — the word the child reads at `args_base + 8`.
 const ARGV_WORD: i64 = i64::from_le_bytes(*b"hello-de");
 
-/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the `WindowMinter`. Stores the args
+/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores the args
 /// blob (`argc = 1`, `"hello-detached\0"`) as three words at 18432, issues op 15 with the 9-arg form
 /// (payload `(18432, 24)`) or the 7-arg form, then `join`s the child (or, in the refusal probe, returns
 /// the spawn's own result).
@@ -158,12 +158,12 @@ fn run_in(
     host.set_durable(durable);
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(&child);
-    let minter = host.grant_window_minter(minter_quota);
+    let budget = host.grant_budget(0, (minter_quota) as i64, 0);
     let back = Arc::new(Region::new(1u64 << 17, 4096));
     let root = bytecode::Vcpu::new_root_with_powerbox(
         &prog,
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(minter)],
+        &[Value::I32(inst), Value::I32(modh), Value::I32(budget)],
         Arc::clone(&back),
         &[],
         host,

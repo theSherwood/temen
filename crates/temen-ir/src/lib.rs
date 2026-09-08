@@ -185,9 +185,9 @@ pub mod cap_id {
     /// window *outside* the parent's — no ancestor below the minter holds read authority, and
     /// the child attests `window_exposed = false` (the jacl distrust-spawner trust anchor).
     /// The capability carries a **byte quota**, deducted at each mint (host-enforced); an
-    /// ordinary granted authority (D46 `Resolver`-shaped: you can mint detached windows only
-    /// if someone granted you that), embedder-granted at the root.
-    pub const WINDOW_MINTER: u32 = 15;
+    /// `15` (`WINDOW_MINTER`) is **retired** (#1289 R2): minting a detached window is not a
+    /// separate authority — it spends `Budget.mem` (iface 14). The id stays reserved (not reused)
+    /// so old wire never collides.
     /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
     /// are interned per-`Host` from this base upward (`intern_interface` — the id ≡
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
