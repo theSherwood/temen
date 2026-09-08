@@ -1660,11 +1660,15 @@ mod tests {
         unsafe { std::alloc::dealloc(base, layout) };
     }
 
-    /// The in-tree differential ([`differential`]) with the test seed and op count (miri runs every op
-    /// through its interpreter + provenance/race checkers, so far fewer there).
-    fn fuzz_against(a: &Region, b: &Region, size: u64, page: u64) {
+    /// The in-tree differential ([`differential`]) at the standard op count (miri runs every op
+    /// through its interpreter + provenance/race checkers, so far fewer there). **Every** backing's
+    /// differential goes through here so the miri budget lives in exactly one place — a test that
+    /// hardcodes `20_000` instead silently costs the nightly miri job orders of magnitude more than
+    /// the rest of the crate's suite combined. `seed` stays per-caller so each backing still fuzzes
+    /// its own op stream.
+    pub(super) fn fuzz_against(a: &Region, b: &Region, size: u64, page: u64, seed: u64) {
         let ops = if cfg!(miri) { 400 } else { 20_000 };
-        differential(a, b, size, page, ops, 0x9e37_79b9_7f4a_7c15).unwrap();
+        differential(a, b, size, page, ops, seed).unwrap();
     }
 
     /// The **one** raw-pointer accessor body (`Shared`, which `Mapped` now merely `mmap`-owns and
@@ -1682,7 +1686,13 @@ mod tests {
         assert!(!base.is_null());
         // SAFETY: `base` is `size` valid 8-aligned bytes used only through `a` within this scope.
         let a = unsafe { Region::shared(base, size) };
-        fuzz_against(&a, &Region::Paged(Paged::new(size, page)), size, page);
+        fuzz_against(
+            &a,
+            &Region::Paged(Paged::new(size, page)),
+            size,
+            page,
+            0x9e37_79b9_7f4a_7c15,
+        );
         drop(a);
         // SAFETY: same layout; `a` dropped above.
         unsafe { std::alloc::dealloc(base, layout) };
@@ -1791,15 +1801,13 @@ mod foreign_tests {
         let (size, page) = (3 * 4096, 4096);
         let id = mock_foreign::new_mem(size);
         let a = Region::foreign(id, size, &mock_foreign::OPS);
-        differential(
+        super::tests::fuzz_against(
             &a,
             &Region::paged(size, page),
             size,
             page,
-            20_000,
             0x1234_5678_9abc_def1,
-        )
-        .unwrap();
+        );
     }
 
     /// A `Foreign` is not flat-addressable, its length follows the foreign memory's growth (never
@@ -1915,15 +1923,13 @@ mod growable_tests {
         let (size, page) = (3 * 4096, 4096);
         let a = Region::growable(page, page).expect("growable region");
         assert!(a.grow_to(size), "grow before the differential");
-        differential(
+        super::tests::fuzz_against(
             &a,
             &Region::paged(size, page),
             size,
             page,
-            20_000,
             0x0f1e_2d3c_4b5a_6978,
-        )
-        .unwrap();
+        );
     }
 }
 
