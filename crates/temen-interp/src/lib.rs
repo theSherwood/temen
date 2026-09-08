@@ -2763,6 +2763,15 @@ fn drive_over_cell(
                     .map(|m| m.nested_view(m.window.base() + abs_carve, fnr.size_log2));
                 let mut ch = Host::new();
                 ch.set_durable(true);
+                // #1289 R1 / O14: re-stamp the child's §6 attestation, which the thaw otherwise
+                // defaults (`window_exposed = false` — a lie: the parent reads this child's carve).
+                // A §14 child reconstructed here is **nested** (it lives in the parent's window image)
+                // and **durable** (it froze), so it is `window_exposed` + `freeze_exposed`, tier
+                // inherited from the root — `child_attestation(true)`, the same the spawn path stamps.
+                // (A *detached* durable child — not reconstructible on this carve path yet — will carry
+                // its own captured attestation instead, since `window_exposed = false` cannot be
+                // re-derived from "nested"; that lands with the detached-durable freeze plumbing.)
+                ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true));
                 // §13.4 slice 4c: a child with recorded host state restores it **verbatim** —
                 // the captured handle table (slots/generations preserved, so guest handle
                 // values reloaded from its spilled frames still resolve) and its serve trio —
@@ -23506,6 +23515,66 @@ impl Host {
                         2 => spawn,
                         _ => EINVAL,
                     }]),
+                    2 => {
+                        // transfer(dst, fuel, mem, spawn) -> 0 | -errno (#1289 R2, the top-up
+                        // primitive — `split`'s lazy inverse). Move quota **from this budget (the
+                        // holder) into an existing budget `dst` the caller also holds** — a parent
+                        // tops up a child's create-budget from its own. Conservation: the holder falls
+                        // by exactly what `dst` rises. Attenuation: a bounded holder field can only move
+                        // what it has; `-1` in a field = "all remaining". Transactional: over-asking any
+                        // bounded field is `-EINVAL` and **nothing moves** (like an over-asking `split`).
+                        let dst_h = *args.first().unwrap_or(&-1) as i32;
+                        let Ok(Binding::Budget(dst)) = self.resolve(dst_h, cap_id::BUDGET) else {
+                            return Ok(vec![EINVAL]);
+                        };
+                        let dst = dst as usize;
+                        if dst == idx || dst >= self.budgets.len() {
+                            // A self-transfer would clobber its own credit; a stale index is closed.
+                            return Ok(vec![EINVAL]);
+                        }
+                        // Per field, from the holder's remaining: `(moved, holder_after)`. `-1` = move
+                        // all (bounded holder → moves it all, holder 0; unbounded holder → dst becomes
+                        // unbounded, holder stays unbounded). An unbounded holder hands out any bounded
+                        // amount and stays unbounded. Over-asking a bounded field ⇒ `None` (fail closed).
+                        let move_field = |arg: i64, rem: i64| -> Option<(i64, i64)> {
+                            if arg < 0 {
+                                Some(if rem < 0 { (-1, -1) } else { (rem, 0) })
+                            } else if rem < 0 {
+                                Some((arg, -1))
+                            } else if arg <= rem {
+                                Some((arg, rem - arg))
+                            } else {
+                                None
+                            }
+                        };
+                        let (Some((mf, hf)), Some((mm, hm)), Some((ms, hs))) = (
+                            move_field(*args.get(1).unwrap_or(&0), fuel),
+                            move_field(*args.get(2).unwrap_or(&0), mem),
+                            move_field(*args.get(3).unwrap_or(&0), spawn),
+                        ) else {
+                            return Ok(vec![EINVAL]);
+                        };
+                        // Credit `dst` (a `-1` move, or an already-unbounded field, stays unbounded),
+                        // then debit the holder. Both writes are disjoint cells (`dst != idx`).
+                        let credit = |cur: i64, moved: i64| -> i64 {
+                            if moved < 0 || cur < 0 {
+                                -1
+                            } else {
+                                cur + moved
+                            }
+                        };
+                        let d = self.budgets[dst];
+                        self.budgets[dst] = BudgetState {
+                            fuel: credit(d.fuel, mf),
+                            mem: credit(d.mem, mm),
+                            spawn: credit(d.spawn, ms),
+                        };
+                        let h = &mut self.budgets[idx];
+                        h.fuel = hf;
+                        h.mem = hm;
+                        h.spawn = hs;
+                        Ok(vec![0])
+                    }
                     _ => Ok(vec![EINVAL]),
                 }
             }
