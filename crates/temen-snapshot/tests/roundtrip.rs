@@ -6,7 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -244,6 +244,75 @@ fn restore_refuses_a_mismatched_module() {
     let mut thost = Host::new();
     let err = restore(&artifact, &other, &mut thost).expect_err("digest mismatch must refuse");
     assert_eq!(err, RestoreError::ModuleMismatch, "R5 identity gate");
+}
+
+/// #1289 R1 / O14 (v20): a **non-default** `Attestation` rides the artifact (Section 6) and the
+/// restore host is re-stamped with it, instead of the boundary defaulting the domain's
+/// placement/exposure. The case that matters for R1 is an ancestor-freezable detached-shaped child
+/// (`freeze_exposed = true`, `window_exposed = false`) — non-default, so it must survive the cut.
+#[test]
+fn a_non_default_attestation_round_trips_through_the_codec() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock(); // slot 0 — SRC calls Clock.now
+    let attest = Attestation {
+        tier: 1,
+        window_exposed: false,
+        freeze_exposed: true,
+    };
+    host.set_attestation(attest);
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    // A fresh restore host defaults to the root attestation; restore must overwrite it from the artifact.
+    let mut thost = Host::new();
+    assert_eq!(
+        thost.attestation(),
+        Attestation::default(),
+        "a fresh host starts at the root default"
+    );
+    restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.attestation(),
+        attest,
+        "the artifact carried the domain's attestation across the freeze→thaw boundary"
+    );
+}
+
+/// A **default** (root) attestation elides Section 6 — the artifact is byte-identical regardless of
+/// how the default was reached, and an absent section leaves the restore host as the embedder
+/// configured it (the canonical/minimal-artifact discipline the rest of the codec follows).
+#[test]
+fn a_default_attestation_elides_the_attest_section() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    let win = init_durable_window(WINDOW);
+    let artifact_default = freeze(&inst, &win, &host).expect("freeze default");
+
+    let mut host2 = Host::new();
+    host2.grant_clock();
+    host2.set_attestation(Attestation::default());
+    let artifact_set = freeze(&inst, &win, &host2).expect("freeze default-set");
+    assert_eq!(
+        artifact_default, artifact_set,
+        "a default attestation elides the section regardless of how it was set"
+    );
+
+    // An absent section leaves whatever the embedder pre-stamped on the restore host (v19 behavior).
+    let mut thost = Host::new();
+    let preset = Attestation {
+        tier: 3,
+        window_exposed: false,
+        freeze_exposed: false,
+    };
+    thost.set_attestation(preset);
+    restore(&artifact_default, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.attestation(),
+        preset,
+        "an absent attest section leaves the host as the embedder configured it"
+    );
 }
 
 #[test]
