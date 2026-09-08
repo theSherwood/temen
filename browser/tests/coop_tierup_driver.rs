@@ -2855,11 +2855,16 @@ export 0 func "_start" 0
 #[test]
 fn coop_jacl_compiler_runs_through_the_driver() {
     let _g = ffi_guard();
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../codegen/selfhost/build/jacl_compiler.temen"
-    );
-    let Ok(bytes) = std::fs::read(path) else {
+    // The sibling-repo layout, or `JACL_COMPILER_TEMEN` (#1334: built from jacl_impl against this
+    // tree's `temen-llvm-translate`).
+    let path = std::env::var("JACL_COMPILER_TEMEN").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../codegen/selfhost/build/jacl_compiler.temen"
+        )
+        .to_string()
+    });
+    let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
             "SKIP: jacl_compiler.temen absent (run codegen/selfhost/build_compiler_temen.sh)"
         );
@@ -2886,17 +2891,26 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     // Uncapped drive (the compiler fires many events — the session driver's runaway caps are for
     // the small synthetic guests).
     let mut d = CoopB2Driver::new();
+    let mut tierups = 0u32;
     loop {
         match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
             COOP_RUN_TIERUP => {
+                tierups += 1;
                 let f = temen_coop_func() as usize;
                 d.service_tierup(compiler.funcs[f].results.len());
             }
-            COOP_RUN_DONE => break,
+            // #1334: the macro program used to end here — the staging's `Jit.invoke` fired inside a
+            // cross-tier bounce, which the nested drive `CapFault`ed. Drive to the end and compare.
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
+    eprintln!(
+        "jacl coop: status={} tierups={tierups} bounces={}",
+        temen_status(),
+        d.bounces().len()
+    );
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
         temen_coop_value(),
@@ -2907,6 +2921,17 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     let got_out =
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    // #1334's acceptance: the macro expanded in-guest (`unless` → `if` → `br_if`) on a run that
+    // really tiered up and bounced (the staging runs interpreted inside a bounce), never declined.
+    assert!(
+        String::from_utf8_lossy(&got_out).contains("br_if"),
+        "the macro expanded in-guest"
+    );
+    assert!(tierups > 0, "the compiler-guest tiered up");
+    assert!(
+        !d.bounces().is_empty(),
+        "the staging ran through a cross-tier bounce"
+    );
     temen_coop_close();
 }
 
@@ -3731,86 +3756,6 @@ fn drive_coop_b2_session_allow_trap_counting(m: &temen_ir::Module) -> (CoopB2Dri
         }
     }
     (d, tierups, invokes)
-}
-
-// ---- #1334 (JACL half): the self-hosted compiler-guest stages a macro on the cooperative tier ------
-
-/// The JACL compiler-guest (`jacl_compiler.temen`, built by the sibling jacl_impl repo — see
-/// `tests/jacl_selfhost_jit.rs`), via `JACL_COMPILER_TEMEN` or the sibling-repo layout. `None` ⇒ SKIP.
-fn jacl_compiler_module() -> Option<temen_ir::Module> {
-    let p = std::env::var("JACL_COMPILER_TEMEN").unwrap_or_else(|_| {
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../../codegen/selfhost/build/jacl_compiler.temen"
-        )
-        .to_string()
-    });
-    let bytes = std::fs::read(p).ok()?;
-    Some(temen_encode::decode_module(&bytes).expect("decode jacl_compiler.temen"))
-}
-
-/// A macro-using JACL program (the tour's `unless`): the compiler expands it IN-GUEST through
-/// `vm_jit_compile_linked` + `vm_jit_invoke2` — the #1334 shape, on a paged rodata card.
-const JACL_MACRO_SRC: &str = "defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
-                              mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
-
-#[test]
-fn jacl_compiler_guest_stages_a_macro_on_the_coop_tier() {
-    let Some(m) = jacl_compiler_module() else {
-        eprintln!("SKIP: jacl_compiler.temen absent (set JACL_COMPILER_TEMEN)");
-        return;
-    };
-    // The production tier-up floor (the bench's setting), not the mechanism tests' floor 0.
-    let _g = FFI_LOCK.lock().unwrap();
-    temen_coop_set_tierup_floor(temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES);
-    let want = onramp_exec(&m, JACL_MACRO_SRC.as_bytes());
-    assert!(
-        want.status == STATUS_OK || want.status == temen_browser::STATUS_EXIT,
-        "oracle status {} exit={}",
-        want.status,
-        want.exit_code
-    );
-    let ir = String::from_utf8(want.stdout.clone()).expect("IR is utf8");
-    assert!(
-        ir.contains("br_if"),
-        "oracle: the macro expanded in-guest:\n{ir:.400}"
-    );
-
-    let bytes = temen_encode::encode_module(&m);
-    let opened = temen_coop_open(
-        bytes.as_ptr(),
-        bytes.len(),
-        JACL_MACRO_SRC.as_ptr(),
-        JACL_MACRO_SRC.len(),
-        0,
-    );
-    assert_eq!(
-        opened,
-        0,
-        "coop admits the compiler-guest (status {})",
-        temen_status()
-    );
-    let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
-    eprintln!(
-        "jacl coop: status={} paged={} tierups={tierups} invokes={invokes} bounces={}",
-        temen_status(),
-        temen_coop_paged(),
-        d.bounces().len()
-    );
-    assert_eq!(temen_status(), want.status, "status parity with the oracle");
-    let got_out =
-        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
-    assert_eq!(got_out, want.stdout, "IR parity with the oracle");
-    // The issue's acceptance: parity with `tierups > 0`. The staging itself runs interpreted INSIDE a
-    // cross-tier bounce out of the tiered-up region (`invokes` stays 0 — it never surfaces as an event),
-    // so the bounce log is the witness that the emitted tier, not a decline, carried the run.
-    assert!(tierups > 0, "the compiler-guest tiered up");
-    assert!(
-        !d.bounces().is_empty(),
-        "the staging ran through a cross-tier bounce"
-    );
-    let _ = invokes;
-    temen_coop_close();
 }
 
 // ---- #1334 (asset-free pin): a `Jit.invoke` reached INSIDE a cross-tier bounce -------------------
