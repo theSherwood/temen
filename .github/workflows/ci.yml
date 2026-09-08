@@ -995,6 +995,13 @@ jobs:
           # byte-identical whether phase-1 ran on the interpreter or as nested op-13 emitted children. Uses
           # the committed nim assets + nifler_ce.temen.gz; reuses the threads module.
           node browser-nim-op13-crawl-e2e-test.mjs
+          # #1025 3e (whole card, all phases tiered): the step past crawl-only — nifler AND nimsem AND hexer
+          # each run as §14 op-13 detached emitted children via `jitNimWholeCardOp13` (crawl → toposort →
+          # nimsem → hexer, one growing memfs, every `.p/.s/.x` pre-seeded), so the final compile only
+          # links+runs. The card's stdout is byte-identical whether the phases ran on the interpreter or as
+          # op-13 emitted children — the whole-card realization of `nimc::compile_nim` on the wasm-JIT tier.
+          # Uses the committed nim assets + nifler_ce/nimsem_ce/hexer_ce; reuses the threads module.
+          node browser-nim-wholecard-op13-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
