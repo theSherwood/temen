@@ -7280,7 +7280,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (ready, gid) = {
                     let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
-                        Some((fifo, writers, _, gid)) => (
+                        Some((fifo, writers, _, gid, _)) => (
                             !fifo.lock_unpoisoned().is_empty()
                                 || writers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
@@ -7311,7 +7311,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 let (ready, gid) = {
                     let hg = v.host.lock_unpoisoned();
                     match hg.pipes.get(pipe as usize) {
-                        Some((fifo, _, readers, gid)) => (
+                        Some((fifo, _, readers, gid, _)) => (
                             fifo.lock_unpoisoned().len() < PIPE_CAP
                                 || readers.load(std::sync::atomic::Ordering::SeqCst) == 0,
                             *gid,
@@ -16230,11 +16230,26 @@ pub type RegionBacking = Arc<dyn SharedBacking>;
 /// filling the FIFO forever. Paired with the FIFO bound ([`PIPE_CAP`]) this makes the pipe a true
 /// bounded buffer: a `write` that would overflow **parks** the writer (backpressure) until the reader
 /// drains room or every reader closes (→ `-EPIPE`).
+/// #989 — the **channel-memory charge** riding a host-served pipe backing: a clone of the *minting*
+/// domain's [`Host::channel_used`] counter plus a fire-once refund guard. The charge is on the
+/// `Arc`-shared backing (not a per-`Host` side table) so a §14 child that closes the last end
+/// refunds the domain that *minted* it — the credit follows the backing across the re-grant, not the
+/// closing `Host`. `PIPE_CAP` (the worst-case full FIFO) is charged at mint and refunded once, when
+/// the backing's last handle (both counts → 0) closes. `None` = an embedder-owned, uncharged backing
+/// (a terminal/stdin feed).
+struct ChannelCharge {
+    /// The minting domain's `channel_used` running total (bytes).
+    used: Arc<std::sync::atomic::AtomicI64>,
+    /// Set exactly once at last-close so the refund can never double-fire (fork shares the backing).
+    refunded: std::sync::atomic::AtomicBool,
+}
+
 type PipeBacking = (
     Arc<Mutex<VecDeque<u8>>>,
     Arc<std::sync::atomic::AtomicUsize>, // open write-end handles (EOF contract)
     Arc<std::sync::atomic::AtomicUsize>, // open read-end handles (EPIPE contract)
-    u32, // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
+    u32,                        // global pipe id — THE park/wake key (`Sched::pipe_waiters`)
+    Option<Arc<ChannelCharge>>, // #989 — channel-memory charge (minter's counter + refund guard)
 );
 
 /// FORK.md §8.6 — mint the **global pipe id** a new FIFO carries (`PipeBacking.3`). The park/wake
@@ -16522,6 +16537,9 @@ struct BudgetState {
     fuel: i64,
     mem: i64,
     spawn: i64,
+    /// #989 — remaining host-served **channel memory** (bytes), the 4th splittable dimension. `-1` =
+    /// unbounded. Stamped onto a §14 child's [`Host::channel_cap`] at spawn.
+    channel: i64,
 }
 
 /// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `self.attest`. The
@@ -17919,6 +17937,16 @@ pub struct Host {
     /// `Host` clones the `Arc`, so both domains see the same queue — the cross-domain `cmd1 | cmd2`
     /// wiring). Append-only vector (a pipe's index stays valid for the run), like `regions`/`budgets`.
     pipes: Vec<PipeBacking>,
+    /// #989 — this domain's running total of **host-served channel backing bytes** (pipe FIFOs),
+    /// charged `PIPE_CAP` per guest-minted pipe and refunded at last-close. Shared (`Arc`) so a pipe
+    /// backing can hold a clone and refund the minter across a §14 re-grant. Fork gives the twin a
+    /// fresh counter (its inherited backings still refund the parent, via their own clone).
+    channel_used: Arc<std::sync::atomic::AtomicI64>,
+    /// #989 — this domain's ceiling on `channel_used` (bytes); `-1` = unbounded (the root/embedder
+    /// default, so every existing host is unchanged). A §14 spawn stamps it from the funding
+    /// `Budget`'s `channel` field, so a parent's `Budget` split bounds a child's channel memory the
+    /// same way it bounds fuel/mem/spawn.
+    channel_cap: i64,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -18539,6 +18567,8 @@ impl Host {
             region_hook: None,
             budgets: Vec::new(),
             pipes: Vec::new(),
+            channel_used: Arc::new(std::sync::atomic::AtomicI64::new(0)), // #989
+            channel_cap: -1, // #989 — unbounded by default
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -18706,6 +18736,12 @@ impl Host {
                 installed: d.installed.clone(),
             })
             .collect();
+        // #989 — the twin gets a FRESH channel counter (a new domain), but inherits the parent's cap
+        // (POSIX fork inherits rlimits); the inherited pipe backings still carry the PARENT's counter
+        // (cloned in the `twin.pipes = self.pipes.clone()` below), so their last-close refunds the
+        // parent, not the twin — no double-charge on fork.
+        twin.channel_used = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        twin.channel_cap = self.channel_cap;
         // Shared `Arc` backings — fork shares these (shared memory, pipe fds, module code).
         twin.regions = self.regions.clone();
         twin.pipes = self.pipes.clone();
@@ -18717,7 +18753,7 @@ impl Host {
         // forking a stage and that stage installing its own ends.
         for s in &twin.table {
             if let Some(Binding::PipeEnd { pipe, write }) = s.entry {
-                if let Some((_, writers, readers, _)) = twin.pipes.get(pipe as usize) {
+                if let Some((_, writers, readers, _, _)) = twin.pipes.get(pipe as usize) {
                     let counter = if write { writers } else { readers };
                     counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
@@ -19196,7 +19232,7 @@ impl Host {
     /// the read park flag reports. Byte-identical to the tree-walker's `Step::Park(PipeRead)` re-check.
     pub(crate) fn pipe_read_ready(&self, pipe: u32) -> bool {
         match self.pipes.get(pipe as usize) {
-            Some((fifo, writers, _, _)) => {
+            Some((fifo, writers, _, _, _)) => {
                 !fifo.lock_unpoisoned().is_empty()
                     || writers.load(std::sync::atomic::Ordering::SeqCst) == 0
             }
@@ -19217,7 +19253,7 @@ impl Host {
     /// The write twin of [`Self::pipe_read_ready`].
     pub(crate) fn pipe_write_ready(&self, pipe: u32) -> bool {
         match self.pipes.get(pipe as usize) {
-            Some((fifo, _, readers, _)) => {
+            Some((fifo, _, readers, _, _)) => {
                 fifo.lock_unpoisoned().len() < PIPE_CAP
                     || readers.load(std::sync::atomic::Ordering::SeqCst) == 0
             }
@@ -19265,10 +19301,33 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
             // `fetch_sub` returns the *previous* value; it hits 0 exactly when the previous was 1.
-            Some((_, writers, _, _)) if writers.load(SeqCst) > 0 => {
-                writers.fetch_sub(1, SeqCst) == 1
+            Some((_, writers, _, _, _)) if writers.load(SeqCst) > 0 => {
+                let zeroed = writers.fetch_sub(1, SeqCst) == 1;
+                if zeroed {
+                    self.refund_if_dead(pipe); // #989 — last writer gone; refund iff readers already 0
+                }
+                zeroed
             }
             _ => false,
+        }
+    }
+
+    /// #989 — refund a pipe's channel charge **once**, when its last handle closes (both the writer
+    /// and reader counts are `0`). Called from the two close primitives after their decrement; the
+    /// fire-once `refunded` guard makes concurrent last-writer/last-reader closes (and fork-shared
+    /// backings) idempotent. `&self`: the counter and guard are atomics, so no `&mut` is needed.
+    fn refund_if_dead(&self, pipe: u32) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if let Some((_, writers, readers, _, Some(charge))) = self.pipes.get(pipe as usize) {
+            if writers.load(SeqCst) == 0
+                && readers.load(SeqCst) == 0
+                && charge
+                    .refunded
+                    .compare_exchange(false, true, SeqCst, SeqCst)
+                    .is_ok()
+            {
+                charge.used.fetch_sub(PIPE_CAP as i64, SeqCst);
+            }
         }
     }
 
@@ -19278,8 +19337,12 @@ impl Host {
     fn drop_pipe_reader(&self, pipe: u32) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         match self.pipes.get(pipe as usize) {
-            Some((_, _, readers, _)) if readers.load(SeqCst) > 0 => {
-                readers.fetch_sub(1, SeqCst) == 1
+            Some((_, _, readers, _, _)) if readers.load(SeqCst) > 0 => {
+                let zeroed = readers.fetch_sub(1, SeqCst) == 1;
+                if zeroed {
+                    self.refund_if_dead(pipe); // #989 — last reader gone; refund iff writers already 0
+                }
+                zeroed
             }
             _ => false,
         }
@@ -19724,6 +19787,17 @@ impl Host {
             .map(|src| (Arc::clone(&self.sig_armed), src))
     }
 
+    /// #932 — the public form of [`Self::signal_poll`]: the `(armed flag, source)` pair a **JIT** run
+    /// needs to arm safepoint signal delivery, or `None` when no [`SignalSource`] is installed. The JIT
+    /// delivery context (`temen_run::JitSigDelivery`) is built from this — it lives out of crate because
+    /// its call-out thunks dereference a raw `ctx` pointer, which this `#![forbid(unsafe_code)]` crate
+    /// cannot. Call after the personality is granted (which installs the source) and before the run.
+    pub fn signal_arm_pair(
+        &self,
+    ) -> Option<(Arc<AtomicBool>, Arc<dyn SignalSource + Send + Sync>)> {
+        self.signal_poll()
+    }
+
     /// Install a host binding in a free slot and return the guest handle — a forgeable
     /// `i32` index encoding `(generation, slot)`. This is how the powerbox (and, later,
     /// attenuation) hands authority to the guest (§3c). Panics only if the table is
@@ -20092,6 +20166,42 @@ impl Host {
         self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
     }
 
+    /// #989 — set this domain's channel-memory ceiling (bytes); `-1` = unbounded. A §14 spawn calls
+    /// this on the child `Host` with the funding `Budget`'s `channel` field, so a parent's `Budget`
+    /// split bounds a child's host-served pipe memory. Embedders leave it `-1` (unchanged behaviour).
+    pub fn set_channel_cap(&mut self, cap: i64) {
+        self.channel_cap = cap;
+    }
+
+    /// #989 — the domain's live channel-memory total (bytes), for the §15 monitoring readout and tests.
+    pub fn channel_used(&self) -> i64 {
+        self.channel_used.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// #989 — charge one `PIPE_CAP` unconditionally (trusted embedder mint), returning the charge to
+    /// stash in the backing so its last-close refunds this domain.
+    fn charge_channel(&self) -> Option<Arc<ChannelCharge>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.channel_used.fetch_add(PIPE_CAP as i64, SeqCst);
+        Some(Arc::new(ChannelCharge {
+            used: Arc::clone(&self.channel_used),
+            refunded: std::sync::atomic::AtomicBool::new(false),
+        }))
+    }
+
+    /// #989 — charge one `PIPE_CAP` **iff** it fits under `channel_cap` (the guest-reachable mint):
+    /// `None` when a bounded cap would be exceeded (the caller fails the mint closed, nothing charged),
+    /// else the charge to stash in the backing. An unbounded cap (`-1`) always succeeds.
+    fn try_charge_channel(&self) -> Option<Arc<ChannelCharge>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.channel_cap >= 0
+            && self.channel_used.load(SeqCst) + PIPE_CAP as i64 > self.channel_cap
+        {
+            return None;
+        }
+        Some(self.charge_channel().expect("charge_channel is infallible"))
+    }
+
     /// §4 / S4 — mint a **host-served pipe** and grant both ends, returning `(write_handle,
     /// read_handle)`. Both are `Stream`-typed (a pipe end is a stream: read/write/close), backed by one
     /// FIFO in [`Host::pipes`]: bytes written to the write end are drained by the read end in FIFO order,
@@ -20103,12 +20213,16 @@ impl Host {
     /// own fibers.)
     pub fn grant_pipe(&mut self) -> (i32, i32) {
         let pipe = self.pipes.len() as u32;
+        // #989 — an embedder mint is trusted (no cap enforcement), but still charges the domain's
+        // channel total so the accounting is honest and a later close refunds it.
+        let charge = self.charge_channel();
         // One write end + one read end minted here, so both shared counts start at 1 (§8.6 EOF/EPIPE).
         self.pipes.push((
             Arc::new(Mutex::new(VecDeque::new())),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
+            charge,
         ));
         let w = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true });
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
@@ -20124,6 +20238,10 @@ impl Host {
         if self.table.iter().filter(|s| s.entry.is_none()).count() < 2 {
             return None;
         }
+        // #989 — the guest-reachable mint: refuse before allocating when it would push the domain's
+        // channel total past its cap (fail-closed, like the handle-table `-EMFILE` above), and charge
+        // the worst-case `PIPE_CAP`. `None` here surfaces as a probeable errno at the `pipe()` op.
+        let charge = self.try_charge_channel()?;
         let pipe = self.pipes.len() as u32;
         // One write end + one read end minted → both counts start at 1 (§8.6 EOF/EPIPE contract).
         self.pipes.push((
@@ -20131,6 +20249,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
+            Some(charge),
         ));
         let w = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: true })?;
         let r = self.try_grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false })?;
@@ -20167,6 +20286,7 @@ impl Host {
             Arc::clone(&writers),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             gid,
+            None, // #989 — embedder-owned terminal input, not guest-minted channel memory
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing, writers, gid)
@@ -20183,6 +20303,7 @@ impl Host {
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             next_pipe_gid(),
+            None, // #989 — embedder-owned filter input, not guest-minted channel memory
         ));
         let r = self.grant(cap_id::STREAM, Binding::PipeEnd { pipe, write: false });
         (r, backing)
@@ -20207,6 +20328,9 @@ impl Host {
     /// count (§8.6); a **read** end bumps the read count (§8.6 EPIPE): the child is a new writer/reader,
     /// so the pipe stays open (no false EOF / no premature EPIPE) until it too closes/exits.
     fn install_pipe_end(&mut self, write: bool, backing: PipeBacking) -> i32 {
+        // #989 — a re-granted end pushes the SAME backing (its 5th-element charge is cloned along),
+        // so the minting domain stays charged and a child's last-close still refunds the minter. No
+        // new charge here.
         let counter = if write { &backing.1 } else { &backing.2 };
         counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let pipe = self.pipes.len() as u32;
@@ -21400,6 +21524,7 @@ impl Host {
                     fuel: 0,
                     mem: 0,
                     spawn: 0,
+                    channel: 0,
                 };
                 Some(t)
             }
@@ -21431,8 +21556,20 @@ impl Host {
     }
 
     pub fn grant_budget(&mut self, fuel: i64, mem: i64, spawn: i64) -> i32 {
+        // #989 — the 3-arg form defaults `channel` unbounded (`-1`), so every existing caller is
+        // unchanged; use `grant_budget_channel` to bound a child's channel memory.
+        self.grant_budget_channel(fuel, mem, spawn, -1)
+    }
+
+    /// #989 — [`grant_budget`] with an explicit `channel` (host-served channel-memory) dimension.
+    pub fn grant_budget_channel(&mut self, fuel: i64, mem: i64, spawn: i64, channel: i64) -> i32 {
         let id = self.budgets.len() as u32;
-        self.budgets.push(BudgetState { fuel, mem, spawn });
+        self.budgets.push(BudgetState {
+            fuel,
+            mem,
+            spawn,
+            channel,
+        });
         self.grant(cap_id::BUDGET, Binding::Budget(id))
     }
 
@@ -23452,7 +23589,13 @@ impl Host {
             Binding::Budget(idx) => {
                 // §15 / PROCESS.md §5: a passable, splittable resource-quota vector.
                 let idx = idx as usize;
-                let Some(&BudgetState { fuel, mem, spawn }) = self.budgets.get(idx) else {
+                let Some(&BudgetState {
+                    fuel,
+                    mem,
+                    spawn,
+                    channel,
+                }) = self.budgets.get(idx)
+                else {
                     return Ok(vec![EINVAL]);
                 };
                 match op {
@@ -23476,10 +23619,11 @@ impl Host {
                                 None // over-attenuation of a bounded field
                             }
                         };
-                        let (Some((cf, pf)), Some((cm, pm)), Some((cs, ps))) = (
+                        let (Some((cf, pf)), Some((cm, pm)), Some((cs, ps)), Some((cc, pc))) = (
                             split_field(*args.first().unwrap_or(&0), fuel),
                             split_field(*args.get(1).unwrap_or(&0), mem),
                             split_field(*args.get(2).unwrap_or(&0), spawn),
+                            split_field(*args.get(3).unwrap_or(&-1), channel), // #989 — omitted ⇒ inherit (unbounded)
                         ) else {
                             return Ok(vec![EINVAL]);
                         };
@@ -23490,6 +23634,7 @@ impl Host {
                             fuel: cf,
                             mem: cm,
                             spawn: cs,
+                            channel: cc,
                         });
                         Ok(vec![
                             match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
@@ -23498,6 +23643,7 @@ impl Host {
                                     b.fuel = pf;
                                     b.mem = pm;
                                     b.spawn = ps;
+                                    b.channel = pc;
                                     h as i64
                                 }
                                 None => {
@@ -23513,6 +23659,7 @@ impl Host {
                         0 => fuel,
                         1 => mem,
                         2 => spawn,
+                        3 => channel, // #989
                         _ => EINVAL,
                     }]),
                     2 => {
@@ -23568,6 +23715,7 @@ impl Host {
                             fuel: credit(d.fuel, mf),
                             mem: credit(d.mem, mm),
                             spawn: credit(d.spawn, ms),
+                            channel: d.channel, // #989 — transfer (op 2) moves only fuel/mem/spawn; channel passes through
                         };
                         let h = &mut self.budgets[idx];
                         h.fuel = hf;
@@ -23942,7 +24090,7 @@ impl Host {
         use std::sync::atomic::Ordering::SeqCst;
         let ret = |v: i64| Ok(vec![v]);
         // Clone the shared Arcs out so the `&mut self` flag writes below don't alias `self.pipes`.
-        let Some((fifo_arc, writers_arc, readers_arc, gid)) =
+        let Some((fifo_arc, writers_arc, readers_arc, gid, _)) =
             self.pipes.get(pipe as usize).cloned()
         else {
             return ret(EINVAL);
@@ -27967,5 +28115,107 @@ block 0 (v0: i64) {
             Ok(vec![Value::I64(2)]),
             "the owner survives its child's trap and polls status 2"
         );
+    }
+}
+
+#[cfg(test)]
+mod channel_budget_tests {
+    //! #989 — host-served **channel-memory** accounting: a guest-minted pipe charges `PIPE_CAP`
+    //! against the domain's `channel_used`, is refused past `channel_cap`, and is refunded when the
+    //! backing's last handle closes. The charge rides the `Arc`-shared backing, so a fork twin shares
+    //! it without a double-charge and the refund always credits the minter exactly once.
+    use super::*;
+
+    #[test]
+    fn cap_bounds_guest_pipe_mints_and_refunds_at_last_close() {
+        let mut h = Host::new();
+        h.set_channel_cap(2 * PIPE_CAP as i64); // room for exactly two pipes
+
+        // Two guest mints fit; the third is refused (fail-closed, nothing charged past the cap).
+        assert!(h.try_grant_pipe().is_some());
+        assert_eq!(h.channel_used(), PIPE_CAP as i64);
+        assert!(h.try_grant_pipe().is_some());
+        assert_eq!(h.channel_used(), 2 * PIPE_CAP as i64);
+        assert!(
+            h.try_grant_pipe().is_none(),
+            "a third pipe exceeds the 2×PIPE_CAP ceiling"
+        );
+        assert_eq!(
+            h.channel_used(),
+            2 * PIPE_CAP as i64,
+            "refused mint charged nothing"
+        );
+
+        // Close BOTH ends of the first pipe (index 0): the last close refunds one PIPE_CAP.
+        assert!(h.drop_pipe_writer(0)); // writers 1→0 (readers still 1: no refund yet)
+        assert_eq!(h.channel_used(), 2 * PIPE_CAP as i64);
+        assert!(h.drop_pipe_reader(0)); // readers 1→0: last handle gone → refund
+        assert_eq!(
+            h.channel_used(),
+            PIPE_CAP as i64,
+            "last-close refunded one pipe"
+        );
+
+        // With room freed, a new mint succeeds again.
+        assert!(h.try_grant_pipe().is_some());
+        assert_eq!(h.channel_used(), 2 * PIPE_CAP as i64);
+    }
+
+    #[test]
+    fn an_uncapped_host_charges_but_never_refuses() {
+        let mut h = Host::new(); // default channel_cap == -1 (unbounded)
+        for i in 1..=8 {
+            assert!(h.try_grant_pipe().is_some(), "unbounded host never refuses");
+            assert_eq!(h.channel_used(), i * PIPE_CAP as i64);
+        }
+    }
+
+    #[test]
+    fn fork_shares_a_backing_without_double_charging_and_refunds_the_minter_once() {
+        let mut parent = Host::new();
+        parent.set_channel_cap(4 * PIPE_CAP as i64);
+        assert!(parent.try_grant_pipe().is_some()); // pipe 0, charged to the parent
+        assert_eq!(parent.channel_used(), PIPE_CAP as i64);
+
+        // Fork: the twin shares the backing (counts bumped to 2/2) with a FRESH counter of its own.
+        let twin = parent.fork_powerbox(42).expect("fork");
+        assert_eq!(
+            twin.channel_used(),
+            0,
+            "fork does not re-charge the shared backing"
+        );
+
+        // Both domains close their ends; the refund fires exactly once, crediting the parent (minter).
+        assert!(!twin.drop_pipe_writer(0)); // 2→1
+        assert!(!twin.drop_pipe_reader(0)); // 2→1
+        assert_eq!(
+            parent.channel_used(),
+            PIPE_CAP as i64,
+            "no refund while ends remain open"
+        );
+        assert!(parent.drop_pipe_writer(0)); // 1→0 (readers still 1)
+        assert!(parent.drop_pipe_reader(0)); // 1→0: last handle → refund the parent, once
+        assert_eq!(
+            parent.channel_used(),
+            0,
+            "the minter is refunded exactly once"
+        );
+        assert_eq!(twin.channel_used(), 0, "the twin was never charged");
+    }
+
+    #[test]
+    fn embedder_and_terminal_mints_are_uncharged() {
+        let mut h = Host::new();
+        h.set_channel_cap(0); // a guest mint would be refused at this cap
+                              // Embedder-owned inputs are not guest-minted channel memory — uncharged, unaffected by the cap.
+        let _ = h.grant_terminal_input();
+        let _ = h.grant_input_pipe();
+        assert_eq!(
+            h.channel_used(),
+            0,
+            "embedder terminal/input mints charge nothing"
+        );
+        // And the guest path is still refused at the zero cap.
+        assert!(h.try_grant_pipe().is_none());
     }
 }

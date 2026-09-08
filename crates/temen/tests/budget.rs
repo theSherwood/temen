@@ -260,3 +260,89 @@ fn transfer_from_an_unbounded_holder_on_both() {
         "jit: must match interp, got {jo:?}"
     );
 }
+
+// ---- #989: the channel (4th) dimension ---------------------------------------------------------
+
+/// `split(300, 200, 3, 500)` out of a `(1000, 500, 10, channel=800)` budget, then read the parent's
+/// and child's `channel` (field 3). Encode `child_channel*1000 + parent_channel` = `500*1000 + 300`
+/// = `500300` (split_field(500, 800) → child 500, parent 300).
+const SPLIT_CHANNEL: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vb: i32) {\n\
+  f300 = i64.const 300\n\
+  m200 = i64.const 200\n\
+  s3 = i64.const 3\n\
+  c500 = i64.const 500\n\
+  vsub = call.cap 14 0 (i64, i64, i64, i64) -> (i32) vb (f300, m200, s3, c500)\n\
+  fld3 = i64.const 3\n\
+  vcc = call.cap 14 1 (i64) -> (i64) vsub (fld3)\n\
+  vpc = call.cap 14 1 (i64) -> (i64) vb (fld3)\n\
+  k1000 = i64.const 1000\n\
+  t0 = i64.mul vcc k1000\n\
+  t1 = i64.add t0 vpc\n\
+  return t1\n\
+  }\n\
+}\n";
+
+/// A LEGACY 3-arg `split(300, 200, 3)` (no channel arg) of a `channel=800` budget: the omitted
+/// channel means "inherit / all remaining", so the child takes all 800 and the parent is left 0 —
+/// the backward-compatible default that keeps a §14 child's channel UNBOUNDED when the parent was
+/// unbounded. Encode `child_channel*1000 + parent_channel` = `800*1000 + 0` = `800000`.
+const SPLIT_CHANNEL_LEGACY_3ARG: &str = "memory 17\n\
+func (i32) -> (i64) {\n\
+block 0 (vb: i32) {\n\
+  f300 = i64.const 300\n\
+  m200 = i64.const 200\n\
+  s3 = i64.const 3\n\
+  vsub = call.cap 14 0 (i64, i64, i64) -> (i32) vb (f300, m200, s3)\n\
+  fld3 = i64.const 3\n\
+  vcc = call.cap 14 1 (i64) -> (i64) vsub (fld3)\n\
+  vpc = call.cap 14 1 (i64) -> (i64) vb (fld3)\n\
+  k1000 = i64.const 1000\n\
+  t0 = i64.mul vcc k1000\n\
+  t1 = i64.add t0 vpc\n\
+  return t1\n\
+  }\n\
+}\n";
+
+/// [`both`] with an explicit `channel` (4th) dimension on the granted budget.
+fn both_channel(
+    src: &str,
+    budget: (i64, i64, i64, i64),
+) -> (Result<Vec<Value>, temen_interp::Trap>, JitOutcome) {
+    let mut ih = Host::new();
+    let ibh = ih.grant_budget_channel(budget.0, budget.1, budget.2, budget.3);
+    let ir = run_interp(src, &mut ih, ibh);
+    let mut jh = Host::new();
+    let jbh = jh.grant_budget_channel(budget.0, budget.1, budget.2, budget.3);
+    let jo = run_jit(src, &mut jh, jbh);
+    (ir, jo)
+}
+
+#[test]
+fn channel_split_and_read_matches_across_backends() {
+    let (ir, jo) = both_channel(SPLIT_CHANNEL, (1000, 500, 10, 800));
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(500_300)]),
+        "interp: channel split(500) → child 500, parent 300"
+    );
+    assert!(
+        matches!(&jo, JitOutcome::Returned(s) if s == &[500_300]),
+        "jit ≡ interp on the channel dimension: {jo:?}"
+    );
+}
+
+#[test]
+fn channel_omitted_arg_inherits_all_remaining() {
+    let (ir, jo) = both_channel(SPLIT_CHANNEL_LEGACY_3ARG, (1000, 500, 10, 800));
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(800_000)]),
+        "interp: a 3-arg split takes all remaining channel (child 800, parent 0)"
+    );
+    assert!(
+        matches!(&jo, JitOutcome::Returned(s) if s == &[800_000]),
+        "jit ≡ interp: {jo:?}"
+    );
+}
