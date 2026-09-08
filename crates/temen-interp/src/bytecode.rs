@@ -9720,6 +9720,42 @@ fn drive_nested(
                 active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
                 active.set(rdst + 1, Reg::from_i64(value));
             }
+            // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
+            // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
+            // region bounced into), or a unit invoking a unit. Service it interpreted, recursively,
+            // over the same window/host/fuel: the task-level interpreted service (`CoopSched::pump`'s
+            // fall-through, `Vcpu::deliver_jit_invoke`) verbatim, so the nested unit computes exactly
+            // what the oracle does; it gets its own invoke-confined fiber registry (`run_invoke`).
+            // It used to fall to the `CapFault` arm below, trapping the bounce and declining the run.
+            Outcome::JitInvoke {
+                h,
+                code,
+                argv,
+                dst,
+                params,
+                results,
+            } => {
+                let (funcs, types) = host.with(|p| resolve_jit_unit(p, h, code))?;
+                let unit = compile_module(&funcs, &types).ok_or(Trap::Malformed)?;
+                let arity_ok = unit
+                    .sigs
+                    .first()
+                    .is_some_and(|(ep, er)| ep.len() == params.len() && er.len() == results.len());
+                if !arity_ok {
+                    return Err(Trap::CapFault);
+                }
+                let child_args: Vec<Value> = params
+                    .iter()
+                    .zip(argv.iter())
+                    .map(|(ty, s)| slot_to_val(*ty, *s))
+                    .collect();
+                let umod = source.push(unit);
+                let vals = run_invoke(source, table, umod, &child_args, fuel, mem, host)?;
+                for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
+                    let re = slot_to_val(*ty, val_to_slot(*v));
+                    active.set(dst + i as u32, Reg::from_value(re));
+                }
+            }
             _ => return Err(Trap::CapFault),
         }
     }

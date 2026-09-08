@@ -12805,7 +12805,15 @@ pub extern "C" fn temen_coop_run() -> i32 {
                     .collect::<Vec<u8>>()
             };
             s.jit_code = code;
-            s.mapped = mapped;
+            // #1334: a paged run refreshes its page-state table here exactly as at a TIERUP — the
+            // invoked unit's `call.dyn` can reach an emitted program `f{i}`, whose page check reads
+            // the table this session stages (a stale or never-built table faulted the invoke and
+            // declined the run). `mapped` is then the table's coverage, as for a TIERUP.
+            if s.paged {
+                s.sync_pagestate();
+            } else {
+                s.mapped = mapped;
+            }
             s.argv = argv.into_vec();
             s.jit_param_types = codes(&params);
             s.jit_result_types = codes(&results);

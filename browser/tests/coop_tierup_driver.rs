@@ -2855,11 +2855,16 @@ export 0 func "_start" 0
 #[test]
 fn coop_jacl_compiler_runs_through_the_driver() {
     let _g = ffi_guard();
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../../codegen/selfhost/build/jacl_compiler.temen"
-    );
-    let Ok(bytes) = std::fs::read(path) else {
+    // The sibling-repo layout, or `JACL_COMPILER_TEMEN` (#1334: built from jacl_impl against this
+    // tree's `temen-llvm-translate`).
+    let path = std::env::var("JACL_COMPILER_TEMEN").unwrap_or_else(|_| {
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../codegen/selfhost/build/jacl_compiler.temen"
+        )
+        .to_string()
+    });
+    let Ok(bytes) = std::fs::read(&path) else {
         eprintln!(
             "SKIP: jacl_compiler.temen absent (run codegen/selfhost/build_compiler_temen.sh)"
         );
@@ -2886,17 +2891,26 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     // Uncapped drive (the compiler fires many events — the session driver's runaway caps are for
     // the small synthetic guests).
     let mut d = CoopB2Driver::new();
+    let mut tierups = 0u32;
     loop {
         match temen_coop_run() {
             COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
             COOP_RUN_TIERUP => {
+                tierups += 1;
                 let f = temen_coop_func() as usize;
                 d.service_tierup(compiler.funcs[f].results.len());
             }
-            COOP_RUN_DONE => break,
+            // #1334: the macro program used to end here — the staging's `Jit.invoke` fired inside a
+            // cross-tier bounce, which the nested drive `CapFault`ed. Drive to the end and compare.
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
             ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
         }
     }
+    eprintln!(
+        "jacl coop: status={} tierups={tierups} bounces={}",
+        temen_status(),
+        d.bounces().len()
+    );
     assert_eq!(temen_status(), want.status, "status parity with the oracle");
     assert_eq!(
         temen_coop_value(),
@@ -2907,6 +2921,17 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     let got_out =
         unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
     assert_eq!(got_out, want.stdout, "stdout parity with the oracle");
+    // #1334's acceptance: the macro expanded in-guest (`unless` → `if` → `br_if`) on a run that
+    // really tiered up and bounced (the staging runs interpreted inside a bounce), never declined.
+    assert!(
+        String::from_utf8_lossy(&got_out).contains("br_if"),
+        "the macro expanded in-guest"
+    );
+    assert!(tierups > 0, "the compiler-guest tiered up");
+    assert!(
+        !d.bounces().is_empty(),
+        "the staging ran through a cross-tier bounce"
+    );
     temen_coop_close();
 }
 
@@ -3526,4 +3551,336 @@ fn warm_coop_evals_a_page_managing_guest_with_leaf_tierup() {
         0,
         "prepare after close must refuse"
     );
+}
+
+// ---- #1334: a `compile_linked` unit invoked mid-run on the cooperative tier ---------------------
+//
+// A `compile_linked` unit (the JACL macro-staging shape: `vm_jit_compile_linked` against a symbol table
+// binding its `call.sym` imports to program-function slots, then `vm_jit_invoke2`) has no wasm at compile
+// time, but the pump re-emits it on demand (`Host::jit_unit_wasm_or_emit`, #1301) in B2 shape and
+// surfaces it as a JIT_INVOKE whose `call.dyn` dispatches through the shared table — natively to an
+// emitted program `f{i}`, or through a bounce shim to an interpreter-resident one. On a **paged** run
+// (a rodata guest — every real on-ramp card) the session used to refresh its page-state table only at
+// a TIERUP, so an emitted callee's page check read a stale or empty table, faulted, and declined the
+// whole run to the interpreter. Pinned here over all four (callee tier × paged) shapes.
+
+const LINK_SYMTAB_BASE: i64 = BLOB_BASE + 2048;
+const LINK_PROBE: i64 = 21;
+
+/// Store `bytes` into the guest window at `base` as i64 words (text-form seeding, as
+/// [`coop_jit_guest_text`]). `prefix` keeps the value names unique per call site.
+fn word_stores(prefix: &str, base: i64, bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for (i, chunk) in bytes.chunks(8).enumerate() {
+        let mut word = [0u8; 8];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let val = i64::from_le_bytes(word);
+        let addr = base + (i as i64) * 8;
+        s.push_str(&format!(
+            "  {prefix}a{i} = i64.const {addr}\n  {prefix}v{i} = i64.const {val}\n  i64.store {prefix}a{i} {prefix}v{i}\n"
+        ));
+    }
+    s
+}
+
+/// A unit with an **unresolved** import `F` (`unit(x) = F(x) + UNIT_K`) — the `.so` the guest links
+/// against its own function table. Declares the guest's memory (the Jit memory-match precondition).
+fn linked_unit_blob() -> Vec<u8> {
+    let src = format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  v1 = i32.const 0
+  v2 = call.sym "F" (i64) -> (i64) v1 (v0)
+  vk = i64.const {UNIT_K}
+  v3 = i64.add v2 vk
+  return v3
+  }}
+}}
+"#
+    );
+    temen_encode::encode_module(&temen_text::parse_module(&src).expect("unit parse"))
+}
+
+/// The threaded `vm_jit_compile_linked` + `vm_jit_invoke2` guest: `_start` spawns a worker, stages
+/// the unit and a symbol table binding `"F"` to **slot 2** (its own `F(x) = 2x`, function 2, which
+/// stores and reloads its result so an emitted `F` runs a page check), links, invokes
+/// `unit(LINK_PROBE)`, joins, streams the sum. `interp_callee` makes `F` also write to stdout through
+/// a cap — a `call.cap` keeps it off the emitted tier, so the unit's `call.dyn` must bounce. `paged`
+/// adds a read-only segment, which flips the run into paged mode (the rodata-card shape).
+fn coop_linked_guest_text(blob: &[u8], interp_callee: bool, paged: bool) -> String {
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    let data = if paged {
+        "data ro 65536 \"temen-coop-link-rodata!!\"\n"
+    } else {
+        ""
+    };
+    // Canonical symbol-table wire form: `[count=1][namelen=1]['F'][kind=0 (Slot)][slot=2]`.
+    let symtab: Vec<u8> = vec![1, 1, b'F', 0, 2];
+    let blob_stores = word_stores("b", BLOB_BASE, blob);
+    let st_stores = word_stores("s", LINK_SYMTAB_BASE, &symtab);
+    let callee_side = if interp_callee {
+        format!(
+            "  vsl = i64.const {SLOT}\n  i64.store vsl v2\n  vout = i32.const {out_h}\n  vlen8 = i64.const 8\n  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)\n"
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        r#"memory 17
+{data}import 0 "vm_jit_compile_linked" (i64, i64, i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+{blob_stores}{st_stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vsp = i64.const {LINK_SYMTAB_BASE}
+  vsn = i64.const {st_len}
+  vcode = call.import 0 (vbp, vbl, vsp, vsn)
+  vprobe = i64.const {LINK_PROBE}
+  vres = call.import 1 (vcode, vprobe)
+  vj = thread.join vt
+  vsum = i64.add vres vj
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  v1 = i64.const 2
+  vm = i64.mul v0 v1
+  vs2 = i64.const {SLOT2}
+  i64.store vs2 vm
+  v2 = i64.load vs2
+{callee_side}  return v2
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len(),
+        st_len = symtab.len(),
+    )
+}
+
+#[test]
+fn coop_compile_linked_invoke_matches_the_oracle() {
+    for (interp_callee, paged) in [(false, false), (true, false), (false, true), (true, true)] {
+        let _g = ffi_guard();
+        let m = temen_text::parse_module(&coop_linked_guest_text(
+            &linked_unit_blob(),
+            interp_callee,
+            paged,
+        ))
+        .expect("parse");
+        temen_verify::verify_module(&m).expect("verify");
+        let bytes = temen_encode::encode_module(&m);
+
+        let want = onramp_exec(&m, b"");
+        assert_eq!(
+            want.status, STATUS_OK,
+            "oracle sanity (interp_callee={interp_callee} paged={paged})"
+        );
+        assert_eq!(want.value, LINK_PROBE * 2 + UNIT_K, "oracle value");
+
+        let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+        assert_eq!(opened, 0, "open (status {})", temen_status());
+        assert_eq!(
+            temen_coop_paged() != 0,
+            paged,
+            "the rodata segment flips the run paged"
+        );
+        let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
+        eprintln!(
+            "interp_callee={interp_callee} paged={paged}: status={} value={} tierups={tierups} invokes={invokes} bounces={:?}",
+            temen_status(),
+            temen_coop_value(),
+            d.bounces()
+        );
+        assert_eq!(
+            temen_status(),
+            want.status,
+            "status parity (interp_callee={interp_callee} paged={paged})"
+        );
+        assert_eq!(
+            temen_coop_value(),
+            want.value,
+            "value parity (interp_callee={interp_callee} paged={paged})"
+        );
+        // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+        let got_out =
+            unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+        assert_eq!(got_out, want.stdout, "stdout parity");
+        // Non-vacuity: the linked unit ran on its (on-demand) emitted wasm, and an interpreter-resident
+        // callee was reached through the bounce, not by declining the invoke.
+        assert_eq!(invokes, 1, "exactly one emitted Jit.invoke");
+        assert_eq!(
+            !d.bounces().is_empty(),
+            interp_callee,
+            "bounce iff the callee is interp-resident"
+        );
+        temen_coop_close();
+    }
+}
+
+/// [`drive_coop_b2_session_allow_trap`] that also counts the JIT_INVOKE events it serviced.
+fn drive_coop_b2_session_allow_trap_counting(m: &temen_ir::Module) -> (CoopB2Driver, u32, u32) {
+    let mut d = CoopB2Driver::new();
+    let (mut tierups, mut invokes) = (0u32, 0u32);
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_JIT_INVOKE => {
+                invokes += 1;
+                assert!(invokes < 50, "runaway invokes");
+                d.service_jit_invoke();
+            }
+            COOP_RUN_TIERUP => {
+                tierups += 1;
+                assert!(tierups < 100, "runaway tier-ups");
+                let f = temen_coop_func() as usize;
+                d.service_tierup(m.funcs[f].results.len());
+            }
+            COOP_RUN_DONE | COOP_RUN_TRAP => break,
+            ev => panic!("unexpected pump event {ev} (status {})", temen_status()),
+        }
+    }
+    (d, tierups, invokes)
+}
+
+// ---- #1334 (asset-free pin): a `Jit.invoke` reached INSIDE a cross-tier bounce -------------------
+
+const NEST_PROBE: i64 = 4321;
+
+/// A closed unit `u(x) = x + UNIT_K` (declares the guest's memory).
+fn plain_unit_blob() -> Vec<u8> {
+    let src = format!(
+        r#"memory 16
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const {UNIT_K}
+  vr = i64.add v0 vk
+  return vr
+  }}
+}}
+"#
+    );
+    let m = temen_text::parse_module(&src).expect("unit parse");
+    temen_verify::verify_module(&m).expect("unit verify");
+    temen_encode::encode_module(&m)
+}
+
+/// The JACL macro-staging shape reduced to its mechanism: `_start` compiles the unit and calls the
+/// tier-up-eligible leaf `f2`, which `call.dyn`s slot 3 → `f3`, an interpreter-resident helper (it
+/// `call.import`s `vm_jit_invoke2`), so the emitted region **bounces** into it — and the `Jit.invoke`
+/// then fires on the nested interpretation the bounce runs, not at the task level. The nested drive
+/// used to have no arm for it (`CapFault` → the bounce trapped → the run declined).
+fn coop_nested_invoke_guest_text(blob: &[u8]) -> String {
+    let (out_h, _mem_h) = onramp_out_mem_handles();
+    let stores = word_stores("b", BLOB_BASE, blob);
+    format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+import 1 "vm_jit_invoke2" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {NEST_PROBE}
+  vres = call 2 (vcode, vprobe)
+  vj = thread.join vt
+  vsum = i64.add vres vj
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vs3 = i32.const 3
+  vh = call.dyn (i64, i64) -> (i64) vs3 (v0, v1)
+  vone = i64.const 1
+  vr = i64.add vh vone
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (v0: i64, v1: i64) {{
+  vr = call.import 1 (v0, v1)
+  return vr
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len(),
+    )
+}
+
+#[test]
+fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&coop_nested_invoke_guest_text(&plain_unit_blob()))
+        .expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
+    eprintln!(
+        "nested invoke: status={} value={} tierups={tierups} invokes={invokes} bounces={:?}",
+        temen_status(),
+        temen_coop_value(),
+        d.bounces()
+    );
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity");
+    // Non-vacuity: the leaf tiered up and bounced into the helper; the invoke was serviced on that
+    // nested interpretation (never surfaced as a JIT_INVOKE event).
+    assert_eq!(tierups, 1, "the leaf tiered up");
+    // (The target is the outlined `call.import` wrapper's slot, not `f3`'s own index — #889 outlining
+    // appends the wrapper — so pin the count, not the slot.)
+    assert_eq!(
+        d.bounces().len(),
+        1,
+        "the region bounced once, into the invoking helper"
+    );
+    assert_eq!(
+        invokes, 0,
+        "the nested invoke is serviced inside the bounce"
+    );
+    temen_coop_close();
 }

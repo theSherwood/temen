@@ -452,6 +452,12 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         const mapped = ex.temen_coop_mapped();
         for (const g of mappedGlobals) g.value = mapped;
         for (const g of fuelGlobals) g.value = 1n << 61n;
+        // #1334 paged: the unit's `call_indirect` can reach a paged program `f{i}` — point its page
+        // check at the table the engine refreshed for this event (as the TIERUP arm does below).
+        if (ex.temen_coop_paged()) {
+          const ps = Number(ex.temen_coop_pagestate_ptr());
+          for (const g of pagestateGlobals) g.value = ps;
+        }
         new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
         try {
           const ret = unit['f0'](eventWin(), envCell, ...args);
