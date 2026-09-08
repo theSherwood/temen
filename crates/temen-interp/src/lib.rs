@@ -11753,6 +11753,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
+                                    // #989 slice 1b — bound the child's host-served channel memory
+                                    // from the funding budget's `channel` (see the module-child branch
+                                    // below; `-1` = unbounded, a no-op vs. the default).
+                                    if let Some(b) = rec_b.as_ref() {
+                                        child_host.lock_unpoisoned().set_channel_cap(b.channel);
+                                    }
                                     let child_fuel = match rec_b.as_ref() {
                                         Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
                                         Some(_) => *fuel,
@@ -12223,6 +12229,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
+                                    // #989 slice 1b — a budget-funded spawn bounds the child's
+                                    // host-served channel memory too: stamp the funding budget's
+                                    // `channel` onto the child's `channel_cap`, the same way `spawn`
+                                    // tightens its vCPU ceiling below (`-1` = unbounded, a no-op vs.
+                                    // the default — so an unbudgeted / channel-unbounded spawn is
+                                    // unchanged). D48 containment: a parent's Budget split now bounds
+                                    // a child's pipe-FIFO bytes as it already bounds fuel/mem/spawn.
+                                    if let Some(b) = rec_b.as_ref() {
+                                        child_host.lock_unpoisoned().set_channel_cap(b.channel);
+                                    }
                                     let child_fuel = match rec_b.as_ref() {
                                         Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
                                         Some(_) => *fuel,
