@@ -364,7 +364,16 @@ impl DapServer {
             // Slice 7: the seeded pick is honored on the threaded bytecode engine (a seed with a
             // single-vCPU module fails the launch inside `new` — fail-closed).
             let seed = args.get("seed").and_then(|v| v.as_i64()).map(|v| v as u64);
-            match BytecodeBackend::new(
+            // #1323 slice 3: an optional `fsImage` launch arg (base64 of a Temen fs-image blob — the
+            // same `encode_image` format the compile-time `extraFiles` use) pre-seeds the `vm_fs`
+            // memfs, so a debugged program can `fopen` a file the lesson provided (e.g. reading a
+            // seeded `colors.txt`). Absent/undecodable ⇒ an empty scratch store (unchanged).
+            let fs_seed = args
+                .get("fsImage")
+                .and_then(|v| v.as_str())
+                .and_then(base64_decode)
+                .and_then(|bytes| temen_fs::decode_image(&bytes).ok());
+            match BytecodeBackend::new_with_fs_seed(
                 module,
                 func,
                 &call_args,
@@ -374,6 +383,7 @@ impl DapServer {
                 block_stdin,
                 mem_limit,
                 seed,
+                fs_seed,
             ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
