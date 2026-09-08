@@ -17,7 +17,7 @@ import { dirname, join } from 'node:path';
 // when the Lua asset is actually built — otherwise it's SKIPped, not failed.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_snapshot.temen'));
-const micropythonBuilt = existsSync(join(HERE, 'web', 'assets', 'micropython_repl.temen'));
+const micropythonBuilt = existsSync(join(HERE, 'web', 'assets', 'micropython_snapshot.temen'));
 const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.temen'));
 // The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
 // check additionally needs the native `chibicc` (built by that same script) as the reference oracle.

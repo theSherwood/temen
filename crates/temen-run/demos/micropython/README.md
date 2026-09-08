@@ -89,7 +89,11 @@ Artifacts land in `$TEMEN_MICROPYTHON_CACHE` (default `/tmp/temen_micropython_ca
 
 ## Where this is going (PYTHON.md)
 
-- **Slice B (#1327):** freeze the MicroPython stdlib in + the warm-snapshot driver (`micropython_snapshot.c`).
+- **Slice B (#1327) — DONE (warm snapshot):** the two-phase `micropython_snapshot.c` driver
+  (`warmup` = `mp_embed_init`, `eval_run` = exec-only) drives the `warm: true` playground card off the
+  snapshot worker. `browser/micropython-warm-snapshot-test.mjs` asserts warm `eval_run` matches the
+  cold `_start` byte-for-byte + fresh-per-Run isolation. Freezing the stdlib pairs with raising the ROM
+  level (continuing #1327).
 - **Slice C (#1329) — the capstone:** a MicroPython REPL card in the browser playground
   (`browser/build-onramp-assets.mjs` + a `play.js` card, `--host-page 65536`).
 - **Config breadth:** this build is `MICROPY_CONFIG_ROM_LEVEL_MINIMUM` + compiler + float. Raising the

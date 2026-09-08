@@ -944,6 +944,11 @@ jobs:
           # warm+JIT declines, so interpreter-only). The tcl_snapshot.temen is deploy-built (Tcl fetch +
           # toolchain isn't in this job), so this SKIPs cleanly when it's absent.
           node tcl-warm-snapshot-test.mjs
+          # MicroPython warm snapshot (PYTHON.md slice B, #1327): the two-phase micropython_snapshot driver —
+          # warm eval_run over the restored snapshot must match the cold _start byte-for-byte, and isolation
+          # must hold (MicroPython's eval_run reaches mp_embed_exec_str's nlr setjmp, so warm+JIT declines to
+          # warm-interp, like Tcl). The micropython_snapshot.temen is committed, so this runs in this job.
+          node micropython-warm-snapshot-test.mjs
           # snapshot worker (WASM_AOT.md warm+JIT · issues #804/#805): each warm card (QuickJS, Lua) runs its
           # warm session on a dedicated Worker (own engine + memory), pre-warmed off the main thread — one
           # worker per module so both stay warm. Chromium-drives play.html and asserts both cards run on both

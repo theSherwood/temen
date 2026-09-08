@@ -1550,16 +1550,22 @@ puts [string toupper "tcl on temen"]
   },
   'MicroPython (1.24.1 — write & run)': {
     kind: 'module',
+    warm: true, // slice B (#1327): the two-phase `micropython_snapshot` driver (warmup = mp_embed_init,
+    // eval_run = exec-only). Runs on the snapshot worker (pre-warmed off the main thread), so the
+    // interpreter bring-up is paid once, not per Run. warm+JIT declines (eval_run reaches
+    // mp_embed_exec_str's nlr setjmp ⇒ InterpDriven, like Tcl), so this is warm-interpreter only.
     editable: true,
     lang: 'python',
-    url: './assets/micropython_repl.temen',
+    url: './assets/micropython_snapshot.temen',
     mode: 'io',
     desc: 'MicroPython 1.24.1 — its compiler (lexer, parser, bytecode emitter), VM, object model, GC, ' +
       'and int/float/str/list/dict/comprehensions/closures/exceptions, compiled through the LLVM ' +
       'on-ramp. Edit the Python on the left and click Run: your code is piped to the guest as stdin, ' +
       'compiled and executed, and its output appears below. Real Python, running client-side in the ' +
       'sandbox — byte-identical to a native MicroPython build (crates/temen-run/demos/micropython). ' +
-      'Each Run is a fresh interpreter.',
+      'It uses a warm-runtime snapshot (pre-warmed on a worker at page load): the interpreter is ' +
+      'initialized once, then every Run restores that warm image and executes only your code (each ' +
+      'Run starts clean).',
     src: `# Write Python here, then click Run.
 print('hello, temen!')
 
