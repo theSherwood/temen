@@ -61,22 +61,22 @@ const res = await page.evaluate(async () => {
   const td = new TextDecoder();
   let streamed = '';
   const r = await client.nimCompile(getAssets, source, 'prog.nim', (b) => { try { streamed += td.decode(b, { stream: true }); } catch {} });
-  const dec = (b) => { try { return b && b.length ? td.decode(b instanceof Uint8Array ? b : new Uint8Array(b)) : ''; } catch { return ''; } };
-  const out = dec(r.stdout) || streamed;
-  return { ok: r.ok, status: r.status, stdout: out, tier: r.tier, error: r.error };
+  const replyStdout = typeof r.stdout === 'string' ? r.stdout
+    : (r.stdout && r.stdout.length ? td.decode(r.stdout instanceof Uint8Array ? r.stdout : new Uint8Array(r.stdout)) : '');
+  return { ok: r.ok, status: r.status, replyStdout, replyType: typeof r.stdout, streamedStdout: streamed, tier: r.tier, error: r.error };
 });
 
 await browser.close(); server.close();
 console.log('RESULT', JSON.stringify({ ...res, stdout: res.stdout }, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const t = res.tier || {};
-// The wiring gate: the worker ran the whole-card orchestrator (all modules semmed + hexed, no error) and
-// the compile+run finished cleanly. Output byte-identity is covered by `browser-nim-wholecard-op13-test`;
-// here the streamed stdout is best-effort (a bonus check when present).
 const tieredUp = !t.error && t.semmed > 0 && t.hexed > 0;
-const outOk = !(res.stdout || '') || res.stdout.includes('hello, Nim');
+// The reply's stdout must be populated (not just the live stream) — that's what play.js renders on the
+// page; a blank reply.stdout is the "no output on screen" bug (#1352 follow-up).
+const outOk = (res.replyStdout || '').includes('hello, Nim');
 const ok = res.ok && res.status === 0 && tieredUp && outOk;
 console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed}${t.error ? ` · tier ERR ${t.error}` : ''}`);
-console.log(`  program stdout: ${JSON.stringify((res.stdout || '').slice(0, 80))}`);
+console.log(`  reply.stdout:    ${JSON.stringify((res.replyStdout || '').slice(0, 80))}`);
+console.log(`  streamed stdout: ${JSON.stringify((res.streamedStdout || '').slice(0, 80))}`);
 console.log(ok ? 'PASS — the shipped nim card compiled on the worker with the whole card tiered up' : 'FAIL');
 process.exit(ok ? 0 : 1);
