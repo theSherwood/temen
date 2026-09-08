@@ -584,6 +584,21 @@ pub fn compile_nim_ce(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<String, String> {
+    let m = compile_nim_ce_impl(nifler, nifler_ce, nimsem, hexer, files, main_nim)?;
+    run_linked(&m)
+}
+
+/// The shared compile body — phases 1–4 through the nim→powerbox link — returning the linked, verified
+/// `Module`. [`compile_nim_ce`] runs it on the tree-walker; [`compile_nim_ce_to_module`] hands it back so
+/// the browser can run it on the wasm-JIT tier (#1357).
+fn compile_nim_ce_impl(
+    nifler: &[u8],
+    nifler_ce: Option<&[u8]>,
+    nimsem: &[u8],
+    hexer: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    main_nim: &str,
+) -> Result<Module, String> {
     let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
     let nifler_ce_m: Option<Arc<Module>> = match nifler_ce {
         Some(bytes) => {
@@ -736,9 +751,28 @@ pub fn compile_nim_ce(
 
     let m = temen_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
     temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
-    // Stream the compiled program's stdout live (#1143): the tee fires the `stdout_chunk` host import,
-    // relayed to the page only while a streaming Run is active (a no-op otherwise).
-    let out = crate::onramp_exec_with_tee(&m, &[], crate::stream_tee());
+    Ok(m)
+}
+
+/// [`compile_nim_ce`] through **link** only — returns the linked nim→powerbox `Module` without running it
+/// (#1025 #1357). The browser card uses this so the final program can run on the **wasm-JIT tier**
+/// (`runJitModule`) instead of the tree-walker: the JS worker links here, then emits + runs the returned
+/// module. `compile_nim_ce` is the run-inline wrapper for the native oracle / headless callers.
+pub fn compile_nim_ce_to_module(
+    nifler: &[u8],
+    nifler_ce: Option<&[u8]>,
+    nimsem: &[u8],
+    hexer: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    main_nim: &str,
+) -> Result<Module, String> {
+    compile_nim_ce_impl(nifler, nifler_ce, nimsem, hexer, files, main_nim)
+}
+
+/// Run the linked module under the on-ramp powerbox (tree-walker), streaming its stdout live (#1143):
+/// the tee fires the `stdout_chunk` host import, relayed to the page only while a streaming Run is active.
+fn run_linked(m: &Module) -> Result<String, String> {
+    let out = crate::onramp_exec_with_tee(m, &[], crate::stream_tee());
     if out.status != crate::STATUS_OK && out.status != crate::STATUS_EXIT {
         return Err(format!("run failed (status {})", out.status));
     }

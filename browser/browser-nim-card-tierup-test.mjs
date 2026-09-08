@@ -63,7 +63,7 @@ const res = await page.evaluate(async () => {
   const r = await client.nimCompile(getAssets, source, 'prog.nim', (b) => { try { streamed += td.decode(b, { stream: true }); } catch {} });
   const replyStdout = typeof r.stdout === 'string' ? r.stdout
     : (r.stdout && r.stdout.length ? td.decode(r.stdout instanceof Uint8Array ? r.stdout : new Uint8Array(r.stdout)) : '');
-  return { ok: r.ok, status: r.status, replyStdout, replyType: typeof r.stdout, streamedStdout: streamed, tier: r.tier, error: r.error };
+  return { ok: r.ok, status: r.status, replyStdout, streamedStdout: streamed, tier: r.tier, runTier: r.runTier, error: r.error };
 });
 
 await browser.close(); server.close();
@@ -74,8 +74,9 @@ const tieredUp = !t.error && t.semmed > 0 && t.hexed > 0;
 // The reply's stdout must be populated (not just the live stream) — that's what play.js renders on the
 // page; a blank reply.stdout is the "no output on screen" bug (#1352 follow-up).
 const outOk = (res.replyStdout || '').includes('hello, Nim');
-const ok = res.ok && res.status === 0 && tieredUp && outOk;
-console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed}${t.error ? ` · tier ERR ${t.error}` : ''}`);
+const runEmitted = res.runTier === 'wasm-jit'; // #1357: the compiled program ran on the wasm-JIT tier
+const ok = res.ok && res.status === 0 && tieredUp && outOk && runEmitted;
+console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed} · runTier=${res.runTier}${t.error ? ` · tier ERR ${t.error}` : ''}`);
 console.log(`  reply.stdout:    ${JSON.stringify((res.replyStdout || '').slice(0, 80))}`);
 console.log(`  streamed stdout: ${JSON.stringify((res.streamedStdout || '').slice(0, 80))}`);
 console.log(ok ? 'PASS — the shipped nim card compiled on the worker with the whole card tiered up' : 'FAIL');

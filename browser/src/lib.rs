@@ -4879,6 +4879,78 @@ pub unsafe extern "C" fn temen_compile_nim_fs(
     }
 }
 
+/// **Compile a whole Nim program to its linked module, WITHOUT running it** (#1025 #1357). Same inputs
+/// and pre-crawl seeding as [`temen_compile_nim_fs`], but stops after the nim→powerbox link and stashes
+/// the **encoded linked module** on [`OUT`] (read via `temen_stdout_ptr`/`_len`), returning its length.
+/// The JS worker then runs that module on the **wasm-JIT tier** (`runJitModule`) — so the user's compiled
+/// program tiers up too, not just the compiler phases — with the tree-walker (`temen_compile_nim_fs`) as
+/// the fallback when the emit declines. `0` with a non-OK [`temen_status`] (diagnostic on
+/// `temen_stderr_*`) on a compile/link failure.
+///
+/// # Safety
+/// Each pointer/len names a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn temen_compile_nim_link_fs(
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    nimsem_ptr: *const u8,
+    nimsem_len: usize,
+    hexer_ptr: *const u8,
+    hexer_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+    main_ptr: *const u8,
+    main_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let nifler = sl(nifler_ptr, nifler_len);
+    let nimsem = sl(nimsem_ptr, nimsem_len);
+    let hexer = sl(hexer_ptr, hexer_len);
+    let image = sl(img_ptr, img_len);
+    let src = sl(src_ptr, src_len).to_vec();
+    let main = String::from_utf8_lossy(sl(main_ptr, main_len)).into_owned();
+
+    let (mut files, _dirs) = match temen_fs::decode_image(image) {
+        Ok(x) => x,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    files.push((main.clone(), src));
+    // SAFETY: single-threaded wasm; exclusive access — same pre-crawl seeding as `temen_compile_nim_fs`.
+    for (path, bytes) in unsafe { &*core::ptr::addr_of!(NIM_PRECRAWL) } {
+        files.push((path.clone(), bytes.clone()));
+    }
+
+    match nimc::compile_nim_ce_to_module(nifler, None, nimsem, hexer, files, &main) {
+        Ok(m) => {
+            let bytes = temen_encode::encode_module(&m);
+            let len = bytes.len() as i64;
+            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), bytes);
+                stash(&mut *core::ptr::addr_of_mut!(ERR), Vec::new());
+                EXIT_CODE = 0;
+            }
+            len
+        }
+        Err(diag) => {
+            set(STATUS_TRAP);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), Vec::new());
+                stash(&mut *core::ptr::addr_of_mut!(ERR), diag.into_bytes());
+                EXIT_CODE = 1;
+            }
+            0
+        }
+    }
+}
+
 /// **Self-host card — bytecode tier** (SELFHOST_C.md §7 step 5, the capstone). Run `chibicc.temen` in
 /// `--emit-object` mode over one of chibicc's *own* cc1 TUs, seeded from `[img_ptr, img_len)` — the
 /// committed closure image (`chibicc_selfhost.img`: the TU sources + their glibc header closure +
