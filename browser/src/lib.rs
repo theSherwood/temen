@@ -1652,6 +1652,10 @@ struct ParJitCfg {
     host: std::sync::Mutex<Host>,
     /// The `Jit` domain handle (the root's single entry arg).
     jit: i32,
+    /// #1347: the run program's function signatures — the dispatch table's **natural prefix**
+    /// (`slot i` = program function `i`), the source for [`temen_par_nfuncs`] and the per-slot
+    /// bounce shims ([`temen_par_shim_wasm_len`]) a Worker fills its B2 table mirror with.
+    sigs: Vec<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)>,
 }
 
 /// The leaked [`ParJitCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1679,7 +1683,13 @@ pub extern "C" fn temen_par_powerbox_jit_runtime(guest_ptr: *const u8, guest_len
     let cfg = Box::into_raw(Box::new(ParJitCfg {
         host: std::sync::Mutex::new(host),
         jit,
+        sigs: m
+            .funcs
+            .iter()
+            .map(|f| (f.params.clone(), f.results.clone()))
+            .collect(),
     }));
+    PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner()).clear(); // a new program: new prefix shims
     PAR_JIT.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
@@ -1777,6 +1787,62 @@ pub extern "C" fn temen_par_jit_table_log2() -> u32 {
 pub extern "C" fn temen_par_jit_slot_code(slot: u32) -> i32 {
     let v = PAR_JIT_SLOT_CODE.lock().unwrap_or_else(|e| e.into_inner());
     v.get(slot as usize).copied().unwrap_or(-1)
+}
+
+/// #1347: the run program's function count — the dispatch table's **natural prefix** (`slot i <
+/// nfuncs` dispatches program function `i`; the coop driver's `temen_coop_nfuncs` twin). A Worker
+/// fills those slots of its B2 table mirror with the tier-up module's emitted `f{i}` or a bounce shim
+/// ([`temen_par_shim_wasm_len`]), so a runtime unit's `call.dyn` — a `compile_linked` unit's Slot
+/// import — reaches program code exactly as it does on the interpreter. `0` until
+/// [`temen_par_powerbox_jit_runtime`].
+#[no_mangle]
+pub extern "C" fn temen_par_nfuncs() -> usize {
+    par_jit_rt().map_or(0, |cfg| cfg.sigs.len())
+}
+
+/// #1347: the natural-prefix bounce shims, built once per run and held for the process so every
+/// Worker reads stable bytes through [`temen_par_shim_wasm_ptr`] (a `Box` never moves while stored);
+/// cleared by the next [`temen_par_powerbox_jit_runtime`].
+static PAR_SHIMS: std::sync::Mutex<Vec<Option<Box<[u8]>>>> = std::sync::Mutex::new(Vec::new());
+
+/// #1347: the bounce-shim module for natural-prefix `slot` — one function (`export "t"`,
+/// [`temen_wasm_jit::emit_slot_trampoline`]) with program function `slot`'s env-prepended signature,
+/// whose body bounces to `env.call_interp(slot, …)`. The Worker binds that import to
+/// [`temen_par_inst_call_interp`] on ITS vCPU, so an emitted `call.dyn` to an interpreter-resident
+/// program function runs over the live window and powerbox (`Vcpu::bounce_call`) — the
+/// `temen_coop_shim_wasm` twin. Returns the byte length; `0` for a slot outside the prefix or a
+/// signature the i64-slot transport can't carry (the slot then stays a null funcref, as before).
+#[no_mangle]
+pub extern "C" fn temen_par_shim_wasm_len(slot: u32) -> usize {
+    let Some(cfg) = par_jit_rt() else {
+        return 0;
+    };
+    let Some((params, results)) = cfg.sigs.get(slot as usize) else {
+        return 0;
+    };
+    let mut shims = PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner());
+    let i = slot as usize;
+    if shims.len() <= i {
+        shims.resize_with(i + 1, || None);
+    }
+    if shims[i].is_none() {
+        // The browser threads build: every emitted module imports the ONE shared linear memory.
+        let Ok(w) = temen_wasm_jit::emit_slot_trampoline(params, results, slot, true) else {
+            return 0;
+        };
+        shims[i] = Some(w.into_boxed_slice());
+    }
+    shims[i].as_ref().map_or(0, |w| w.len())
+}
+
+/// Pointer to the shim module [`temen_par_shim_wasm_len`] built for `slot` (null if none).
+#[no_mangle]
+pub extern "C" fn temen_par_shim_wasm_ptr(slot: u32) -> *const u8 {
+    let shims = PAR_SHIMS.lock().unwrap_or_else(|e| e.into_inner());
+    shims
+        .get(slot as usize)
+        .and_then(|w| w.as_ref())
+        .map_or(core::ptr::null(), |w| w.as_ptr())
 }
 
 /// Emitted-wasm length for **any** code handle in the runtime domain (not just the pending invoke's),
@@ -1881,7 +1947,11 @@ pub extern "C" fn temen_par_root(
             args.push(Value::I32(host.grant_module(m)));
         }
         if cfg.minter_quota > 0 {
-            args.push(Value::I32(host.grant_budget(0, (cfg.minter_quota) as i64, 0)));
+            args.push(Value::I32(host.grant_budget(
+                0,
+                (cfg.minter_quota) as i64,
+                0,
+            )));
         }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
@@ -2326,8 +2396,18 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 // to the emitted unit's `"mapped"` global before `f0`. An unrepresentable window
                 // state (`None`) declines codegen below — the interpreted delivery honors the full
                 // page map (fail-closed, same contract as PAR_TIERUP).
+                // #1347: with the natural prefix mirrored, the unit's `call.dyn` can reach an emitted
+                // program `f{i}`, whose page check reads this vCPU's table on a paged run — rebuild it
+                // here exactly as the TierUp arm does (`b` = the table's coverage; the #1334 coop twin).
                 if let Some(h) = mapped {
-                    v.b = h as i64;
+                    if par_jit_paged() {
+                        let info = v.inner.mem_map_info().unwrap_or((1, 0, 0, Vec::new()));
+                        let (table, cover) = bytecode::build_pagestate_table(&info);
+                        v.pagestate = table;
+                        v.b = cover as i64;
+                    } else {
+                        v.b = h as i64;
+                    }
                 }
                 if let Some(cfg) = par_jit_rt() {
                     // §22 **runtime-compile** path: the guest compiled its *own* unit into the shared

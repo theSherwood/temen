@@ -154,11 +154,41 @@ self.onmessage = async (e) => {
     jitInstCache.set(code, inst);
     return inst;
   };
-  // Mirror the shared `Domain` slot→unit map into this Worker's table: `f0` of the installed unit, or
-  // null for an empty/uninstalled slot (so a stale `call_indirect` traps). Called before each invoke.
+  // #1347: a natural-prefix slot (a program function) that the tier-up module did not emit gets a
+  // bounce shim — a one-function module whose `"t"` bounces to `env.call_interp(slot, …)` on THIS
+  // Worker's vCPU (`temen_par_inst_call_interp` → `bounce_call`, the live window + powerbox), the
+  // coop driver's `shimFor`. Instantiated once per slot (the program never changes within a run).
+  const jitShims = new Map();
+  const jitShimFor = (slot) => {
+    let f = jitShims.get(slot);
+    if (f !== undefined) return f;
+    const len = ex.temen_par_shim_wasm_len(slot);
+    if (len === 0) { jitShims.set(slot, null); return null; }
+    const ptr = Number(ex.temen_par_shim_wasm_ptr(slot));
+    const bytes = new Uint8Array(memory.buffer).slice(ptr, ptr + len);
+    f = new WebAssembly.Instance(new WebAssembly.Module(bytes), {
+      env: {
+        memory,
+        trap: () => {},
+        call_interp: (t, a) => { if (ex.temen_par_inst_call_interp(v, t, a) !== 0) throw new Error('cross-tier trap'); },
+      },
+    }).exports['t'];
+    jitShims.set(slot, f);
+    return f;
+  };
+  // Mirror the shared `Domain` dispatch table into this Worker's table, exactly as the coop driver's
+  // `syncTable`: a slot in the **natural prefix** (`slot < nfuncs`) holds program function `slot` —
+  // the tier-up module's emitted `f{slot}` if it emitted, else a bounce shim (#1347); a slot past it
+  // holds an installed unit's `f0`, or null when empty/uninstalled (so a stale `call_indirect`
+  // traps). Called before each invoke.
   const jitSyncTable = () => {
     const size = 1 << ex.temen_par_jit_table_log2();
+    const nfuncs = ex.temen_par_nfuncs();
     for (let slot = 0; slot < size; slot++) {
+      if (slot < nfuncs) {
+        jitTable.set(slot, (emitted && emitted['f' + slot]) || jitShimFor(slot));
+        continue;
+      }
       const code = ex.temen_par_jit_slot_code(slot);
       if (code < 0) { jitTable.set(slot, null); continue; }
       const inst = jitUnitFor(code);
@@ -541,6 +571,15 @@ self.onmessage = async (e) => {
       // global (same contract as TIERUP above; an invoke the scalar can't describe never surfaces
       // here — the engine services it on the interpreter instead).
       unit.mapped.value = ex.temen_par_ev_b(v);
+      // #1347: the unit's `call_indirect` may land in the tier-up module's emitted `f{i}` through
+      // the natural prefix — prime its globals as the TIERUP arm does (on a paged run the engine
+      // rebuilt the page-state table for this event, and `ev_b` is its coverage).
+      if (emitted) {
+        emitted.mapped.value = ex.temen_par_ev_b(v);
+        if (Number(ex.temen_par_tierup_pagestate_len(v)) > 0)
+          emitted.pagestate.value = Number(ex.temen_par_tierup_pagestate_ptr(v));
+        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+      }
       try {
         const ret = unit['f0'](win, jitEnvCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
