@@ -177,15 +177,24 @@ on-ramp-synthesized, and only a handful of string helpers needed a shim. **Still
 Cranelift-JIT-tier differential assertion (the current test runs via `run_powerbox`), and raising the
 `MICROPY_CONFIG_ROM_LEVEL` for more stdlib breadth.
 
-### Phase B — REPL driver + frozen stdlib
-- Freeze the MicroPython standard modules **into the binary** (MicroPython's native frozen-
-  module mechanism) so `import` needs no filesystem — the Tcl-VFS trick, but built in. If any
-  real-file `import` is wanted later, the SQLite/Postgres `fs`-capability bridge is the model.
-- Two-phase **warm-snapshot driver** (`warmup()` inits the interpreter into static globals,
-  no stdin; `eval_run()` reads stdin, evaluates over the restored warm image, prints) — the
-  QuickJS/Tcl/Lua `*_snapshot.c` contract, so per-Run isolation is preserved by restoring the
-  same post-warmup snapshot and startup cost is paid once.
-- **Gate:** warm driver differential-clean; frozen `import` works with no fs cap granted.
+### Phase B — warm-snapshot driver ✅ DONE (frozen stdlib: follow-on)
+**Landed (#1327).** The two-phase **warm-snapshot driver** (`micropython_snapshot.c`: `warmup()` =
+`mp_embed_init` into the static GC heap, no stdin; `eval_run()` = read stdin + `mp_embed_exec_str`
+over the restored warm image) — the QuickJS/Tcl/Lua `*_snapshot.c` contract. The interpreter
+bring-up is paid **once** on the snapshot worker; each Run restores the same post-warmup snapshot and
+executes only the user's code.
+- **`micropython_snapshot.temen`** (442 KB, 731 funcs) is committed and drives the playground card
+  (now `warm: true`).
+- **Gate met ✅:** `micropython-warm-snapshot-test.mjs` (Node/V8, in the real-browser CI job) asserts
+  warm `eval_run` matches the cold `_start` **byte-for-byte** across a breadth of programs (print,
+  comprehension, dict, recursion, float, exception, a 200k loop), and **fresh-per-Run isolation
+  holds** (a global bound in one Run raises `NameError` in the next). Confirmed in headless Chromium
+  through the snapshot worker (`browser-play-editor-test.mjs`). warm+JIT declines cleanly to
+  warm-interp — `eval_run` reaches `mp_embed_exec_str`'s nlr setjmp ⇒ `InterpDriven`, exactly like
+  Tcl (`#1081`).
+- **Frozen stdlib (follow-on):** at `MICROPY_CONFIG_ROM_LEVEL_MINIMUM` there is little importable
+  stdlib to freeze; freezing modules in (MicroPython's native frozen-module mechanism, no filesystem)
+  pairs naturally with raising the ROM level and is tracked as continuing #1327 work.
 
 ### Phase C — CAPSTONE: the playground card
 **Wired (#1329):** the card is live and the asset is validated on the bytecode engine.
