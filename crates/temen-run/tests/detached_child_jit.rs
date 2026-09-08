@@ -193,56 +193,72 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` on both backends, probeably, and
-/// the budget keeps its whole quota (#1299 pins the native thunk's gate alongside the tree-walker's).
+/// PROCESS.md §5 / #1289 R1 — the tree-walker's `!durable` op-15 gate is lifted (freeze authority is a
+/// per-grant capability, not a placement rule), so the two backends now **diverge** on a durable detached
+/// spawn: the interpreter admits it and charges the window to `Budget.mem`, while the native thunk still
+/// declines `-EINVAL` with the budget intact — a tracked in-flight decline until the native freeze path is
+/// wired (the later detached-durable freeze slices). This pins that transition state.
 #[test]
-fn a_durable_domain_refuses_a_detached_spawn_on_both_backends() {
+fn a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_native_jit() {
     let p = module(SPAWN_ONLY_PARENT);
     let c = module(CHILD);
-    for jit in [false, true] {
+
+    // Native JIT tier: still declines. It learns durability from the run entry (`cm.durable` → the
+    // nursery's flag), not from the host, so the durable run entry is the one to use. It installs no
+    // grant hooks: a thunk that reached the hook lookup would trap `CapFault`, so a `-22` here can only
+    // come from the durable gate that precedes it.
+    {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
-        let r = if jit {
-            // The native tier learns durability from the run entry (`cm.durable` → the nursery's
-            // flag), not from the host, so the durable run entry is the one to use. It installs no
-            // grant hooks: a thunk that reached the hook lookup would trap `CapFault`, so a `-22`
-            // here can only come from the durable gate that precedes it.
-            let args = [h[0] as i64, h[1] as i64, h[2] as i64];
-            let (jo, _, _) = compile_and_run_capture_reserved_with_host_durable(
-                &p,
-                0,
-                &args,
-                &[],
-                &[],
-                &[],
-                temen_ir::DEFAULT_RESERVED_LOG2,
-                temen_run::cap_thunk,
-                &mut host as *mut Host as *mut c_void,
-            )
-            .expect("jit run");
-            match jo {
-                JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
-                ref o => panic!("jit ended abnormally: {o:?}"),
-            }
-        } else {
-            let mut fuel = 50_000_000u64;
-            let r = run_with_host(
-                &p,
-                0,
-                &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
-                &mut fuel,
-                &mut host,
-            )
-            .expect("interp run");
-            match r.first() {
-                Some(Value::I64(x)) => *x,
-                other => panic!("unexpected interp result {other:?}"),
-            }
+        let args = [h[0] as i64, h[1] as i64, h[2] as i64];
+        let (jo, _, _) = compile_and_run_capture_reserved_with_host_durable(
+            &p,
+            0,
+            &args,
+            &[],
+            &[],
+            &[],
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_run::cap_thunk,
+            &mut host as *mut Host as *mut c_void,
+        )
+        .expect("jit run");
+        let r = match jo {
+            JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+            ref o => panic!("jit ended abnormally: {o:?}"),
         };
-        assert_eq!(r, -22, "jit={jit}: EINVAL, not a trap");
+        assert_eq!(r, -22, "native jit: EINVAL, not a trap");
         assert!(
             host.budget_mem_take(h[2], 1 << 16),
-            "jit={jit}: the refusal charged the budget nothing"
+            "native jit: the refusal charged the budget nothing"
+        );
+    }
+
+    // Interpreter tier: R1 admits the durable detached spawn (returns a non-negative slot) and charges
+    // the child's 2^16 window to `Budget.mem`, exactly as a non-durable spawn does.
+    {
+        let (mut host, h) = host(&c, 1 << 16);
+        host.set_durable(true);
+        let mut fuel = 50_000_000u64;
+        let r = run_with_host(
+            &p,
+            0,
+            &[Value::I32(h[0]), Value::I32(h[1]), Value::I32(h[2])],
+            &mut fuel,
+            &mut host,
+        )
+        .expect("interp run");
+        let slot = match r.first() {
+            Some(Value::I64(x)) => *x,
+            other => panic!("unexpected interp result {other:?}"),
+        };
+        assert!(
+            slot >= 0,
+            "interp: durable detached spawn admits, slot {slot}"
+        );
+        assert!(
+            !host.budget_mem_take(h[2], 1 << 16),
+            "interp: the admitted spawn charged the child's window — the quota is now exhausted"
         );
     }
 }

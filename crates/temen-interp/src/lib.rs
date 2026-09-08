@@ -6890,7 +6890,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         }
                     }
                 };
-                let result = if nested_refused || child_state_refused {
+                // #1289 R1 — a live **detached** §14 child (its own separate window, so it holds a
+                // `child_hosts` entry but has NO carve in `nested_children` — distinct from a
+                // `thread.spawn` sibling, which is in neither) cannot yet ride the parent's artifact:
+                // the subtree STW broadcasts `UNWINDING` only into carves within *this* window image,
+                // never reaching a detached child's separate window, so it would not self-unwind and
+                // its window would be silently dropped. Fail closed until the per-child-artifact
+                // capture lands (the detached-durable freeze slices). Unlike `nested_refused` this
+                // fires even with no live nested child. A completed-and-reaped child (its `threads`
+                // slot cleared) left nothing to capture and does not refuse.
+                let detached_live_refused = froze
+                    && v.child_hosts.keys().any(|slot| {
+                        !v.nested_children.iter().any(|c| c.slot == *slot)
+                            && v.threads.get(*slot).and_then(|t| *t).is_some()
+                    });
+                let result = if nested_refused || child_state_refused || detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
                     // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
@@ -12099,8 +12113,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §14 transparency: the detached window equals the module's
                             // declared memory (a module with no memory can't spawn).
                             let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
-                            let admitted = !durable
-                                && ok_entry
+                            // #1289 R1 — a **durable** domain may now spawn a detached child (the
+                            // spawn gate no longer refuses on `durable`): freeze authority is a
+                            // per-grant capability, not a placement rule, so a durable parent and a
+                            // detached child coexist. Safety moves to the *freeze*: a parent that
+                            // freezes while a detached child is live fails closed (`detached_live_refused`
+                            // below) rather than silently dropping the child's separate window — until
+                            // the per-child-artifact capture (the detached-durable freeze slices) lands.
+                            let admitted = ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && payload_ok
