@@ -2899,6 +2899,33 @@ fn grant_onramp_caps(
     } else {
         None
     };
+    // #1323 (c_interpret #16, file I/O): a guest that imports `vm_fs` (the chibicc `__vm_fs` builtin →
+    // `call.sym "vm_fs"`) gets a private, in-memory **read-write** scratch filesystem — the existing
+    // `temen-fs` memfs, the same backend Postgres/chibicc use. `__vm_fs` is "a flat call.sym (base op
+    // 0) with the fs op in arg0", so wrap the memfs to forward `args[0]` as the op and `args[1..]` as
+    // its arguments (the op-in-arg0 seam, mirroring `temen/tests/c_link.rs::cc1_imports`). Bound below
+    // to the `vm_fs` slot; stdout/stdin stay on the Stream cap. Guest-private, no host disk, dropped at
+    // session end (least authority; see temen#1323). Granted only when imported, so bounce/life/Doom
+    // cards are unperturbed.
+    let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
+        let mut inner = temen_fs::mem_fs_handler(false)();
+        let h = host.grant_host_proc(Box::new(
+            move |_slot_op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn temen_interp::GuestMem>,
+                  minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                let (op, rest) = args
+                    .split_first()
+                    .map(|(o, r)| (*o as u32, r))
+                    .unwrap_or((0, &[][..]));
+                inner(op, rest, mem, minter)
+            },
+        ));
+        host.register_cap_name("vm_fs", h);
+        Some(h)
+    } else {
+        None
+    };
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
@@ -2909,6 +2936,14 @@ fn grant_onramp_caps(
             .imports
             .iter()
             .map(|im| {
+                // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
+                // HostProc granted above; the guest's fs op rides in arg0.
+                if im.name == "vm_fs" {
+                    return match vm_fs_h {
+                        Some(h) => temen_interp::BoundImport::required(cap_id::HOST_PROC, 0, h),
+                        None => temen_interp::BoundImport::rebindable(0, 0, None),
+                    };
+                }
                 let Some(cap) = onramp_cap_resolver(&im.name) else {
                     return temen_interp::BoundImport::rebindable(0, 0, None);
                 };

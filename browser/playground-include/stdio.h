@@ -17,6 +17,23 @@ int write(int fd, char *buf, long n);
 int read(int fd, char *buf, long n);
 void exit(int code);
 
+// #1323 (c_interpret #16, file I/O): file access over the powerbox `fs` capability. `__vm_fs(op,…)`
+// is the on-ramp fs seam recognized by the frontend (it lowers to `call.sym "vm_fs"`, with the op
+// selected by arg0), so one call carries the whole open/read/write/seek/close protocol — the same
+// `temen-fs` backend Postgres/chibicc use. The on-ramp mounts a private, in-memory read-write memfs
+// (`grant_onramp_caps`). fd 0/1/2 stay on the ambient Stream (`write`/`read` above); *file* fds
+// (>= 3, minted by FS_OPEN) reach the memfs. A plain compile-and-run card with no fs cap simply
+// never calls these (a program that only writes stdout goes through `write`).
+extern long __vm_fs(long op, long a, long b, long c, long d);
+enum { __FS_OPEN = 0, __FS_READ = 1, __FS_WRITE = 2, __FS_SEEK = 3, __FS_CLOSE = 4 };
+enum { __FS_O_READ = 1, __FS_O_WRITE = 2, __FS_O_APPEND = 4, __FS_O_TRUNC = 8, __FS_O_CREATE = 16 };
+static inline long __pg_slen(const char *s) { long n = 0; while (s[n]) n++; return n; }
+#ifndef SEEK_SET
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
+
 typedef unsigned long size_t;
 typedef long ssize_t;
 
@@ -58,7 +75,10 @@ static inline void __pg_fwrite_raw(FILE *f, const char *p, size_t n) {
     if (f->memp) *f->memp = f->mem;
     if (f->memlenp) *f->memlenp = f->memlen;
   } else if (n) {
-    write(f->fd, (char *)p, (long)n);
+    if (f->fd > 2)
+      __vm_fs(__FS_WRITE, f->fd, (long)p, (long)n, 0); // file fd → the memfs
+    else
+      write(f->fd, (char *)p, (long)n); // 0/1/2 → the ambient Stream
   }
 }
 
@@ -447,14 +467,19 @@ static inline int fflush(FILE *stream) { (void)stream; return 0; }
 int open(const char *path, int flags, ...);
 int close(int fd);
 static inline FILE *fopen(const char *path, const char *mode) {
-  int flags = 0; // r=RDONLY(0); w=WRONLY|CREAT|TRUNC; a=WRONLY|CREAT|APPEND (octal per the fs cap)
-  if (mode[0] == 'w') flags = 01 | 0100 | 01000;
-  else if (mode[0] == 'a') flags = 01 | 0100 | 02000;
-  int fd = open(path, flags);
-  if (fd < 0) return 0;
+  // Map the C mode string to the `fs` cap's O_* bits (crates/temen-fs): r=READ; w=WRITE|CREATE|TRUNC;
+  // a=WRITE|CREATE|APPEND; a trailing '+' adds the other direction.
+  long flags = 0;
+  if (mode[0] == 'r') flags = __FS_O_READ;
+  else if (mode[0] == 'w') flags = __FS_O_WRITE | __FS_O_CREATE | __FS_O_TRUNC;
+  else if (mode[0] == 'a') flags = __FS_O_WRITE | __FS_O_CREATE | __FS_O_APPEND;
+  for (const char *m = mode; *m; m++)
+    if (*m == '+') flags |= __FS_O_READ | __FS_O_WRITE;
+  long fd = __vm_fs(__FS_OPEN, (long)path, __pg_slen(path), flags, 0);
+  if (fd < 0) return 0; // -errno (e.g. ENOENT on a missing read, EACCES on an absolute path)
   FILE *f = (FILE *)malloc(sizeof(FILE));
-  if (!f) { close(fd); return 0; }
-  f->fd = fd; f->memp = 0; f->memlenp = 0; f->mem = 0; f->memcap = 0; f->memlen = 0;
+  if (!f) { __vm_fs(__FS_CLOSE, fd, 0, 0, 0); return 0; }
+  f->fd = (int)fd; f->memp = 0; f->memlenp = 0; f->mem = 0; f->memcap = 0; f->memlen = 0;
   return f;
 }
 static inline FILE *open_memstream(char **bufp, size_t *lenp) {
@@ -471,13 +496,25 @@ static inline FILE *open_memstream(char **bufp, size_t *lenp) {
 }
 static inline size_t fread(void *ptr, size_t sz, size_t nm, FILE *stream) {
   if (!stream || stream->fd < 0) return 0;
-  long r = read(stream->fd, (char *)ptr, (long)(sz * nm));
+  long want = (long)(sz * nm);
+  long r = stream->fd > 2 ? __vm_fs(__FS_READ, stream->fd, (long)ptr, want, 0)  // file fd → memfs
+                          : read(stream->fd, (char *)ptr, want);                // 0/1/2 → Stream
   if (r <= 0) return 0;
   return sz ? (size_t)r / sz : 0;
 }
+// Reposition/report a file stream (no-op-ish on a memory stream). SEEK_SET/CUR/END == the cap's whence.
+static inline int fseek(FILE *stream, long off, int whence) {
+  if (!stream || stream->fd < 0) return -1;
+  return __vm_fs(__FS_SEEK, stream->fd, whence, off, 0) < 0 ? -1 : 0;
+}
+static inline long ftell(FILE *stream) {
+  if (!stream || stream->fd < 0) return -1;
+  return __vm_fs(__FS_SEEK, stream->fd, SEEK_CUR, 0, 0);
+}
+static inline void rewind(FILE *stream) { fseek(stream, 0, SEEK_SET); }
 static inline int fclose(FILE *stream) {
   if (!stream) return EOF;
-  if (stream->fd >= 0 && stream->fd > 2) close(stream->fd);
+  if (stream->fd > 2) __vm_fs(__FS_CLOSE, stream->fd, 0, 0, 0); // close file fds; leave 0/1/2 open
   // A memory stream's buffer belongs to the caller (handed back via memp) — don't free it here.
   return 0;
 }
@@ -490,7 +527,8 @@ static inline char *fgets(char *s, int size, FILE *stream) {
   int fd = stream ? stream->fd : 0, i = 0;
   while (i < size - 1) {
     char c;
-    if (read(fd, &c, 1) != 1) { if (i == 0) return 0; break; }
+    long r = fd > 2 ? __vm_fs(__FS_READ, fd, (long)&c, 1, 0) : read(fd, &c, 1);
+    if (r != 1) { if (i == 0) return 0; break; }
     s[i++] = c;
     if (c == '\n') break;
   }

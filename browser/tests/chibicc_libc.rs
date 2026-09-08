@@ -190,6 +190,55 @@ int main(void) {
     );
 }
 
+/// #1323 slice 1 — a scratch-file round-trip over the `fs` cap (c_interpret #16 bucket 1, file I/O):
+/// `fopen("w")` → `fwrite` → `fclose` → `fopen("r")` → `fread` must return the bytes written. Today
+/// the plain run on-ramp (`onramp_exec` → `grant_onramp_caps(_, _, None)`) mounts no memfs and the
+/// playground libc's file ops don't reach the fs cap, so this fails; slice 1 mounts an empty RW memfs
+/// and routes the playground libc's file fds (>= 2) to it, keeping stdout/stdin on the Stream cap.
+#[test]
+fn scratch_file_write_then_read_roundtrips() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let (status, out) = compile_and_run(
+        &chibicc,
+        r#"#include <stdio.h>
+int main(void) {
+  FILE *w = fopen("scratch.dat", "w");
+  if (!w) { printf("open-w failed\n"); return 1; }
+  const char *msg = "hello, memfs";
+  fwrite(msg, 1, 12, w);
+  fclose(w);
+  FILE *r = fopen("scratch.dat", "r");
+  if (!r) { printf("open-r failed\n"); return 2; }
+  char buf[32] = {0};
+  size_t n = fread(buf, 1, sizeof(buf) - 1, r);
+  fclose(r);
+  printf("n=%d buf=%s\n", (int)n, buf);
+
+  // A *second* file is isolated from the first (multi-file store).
+  FILE *w2 = fopen("other.dat", "w");
+  fwrite("XY", 1, 2, w2);
+  fclose(w2);
+
+  // O_APPEND: reopening "scratch.dat" with "a" extends rather than truncates.
+  FILE *a = fopen("scratch.dat", "a");
+  fwrite("!", 1, 1, a);
+  fclose(a);
+  FILE *r2 = fopen("scratch.dat", "r");
+  char buf2[32] = {0};
+  size_t n2 = fread(buf2, 1, sizeof(buf2) - 1, r2);
+  fclose(r2);
+  printf("n2=%d buf2=%s\n", (int)n2, buf2);
+  return 0;
+}
+"#,
+    );
+    assert_eq!(status, STATUS_OK, "run status");
+    assert_eq!(out, "n=12 buf=hello, memfs\nn2=13 buf2=hello, memfs!\n");
+}
+
 /// `<sys/mman.h>` — anonymous `mmap`/`munmap` over the Memory capability (c_interpret #16 bucket 1):
 /// map two pages, write one byte in each, sum them, unmap. The mapping must be page-aligned and
 /// writable across both pages (offset 0 and 4096), returning 141 (= 42 + 99). A file-backed mapping
