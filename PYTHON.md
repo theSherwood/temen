@@ -188,19 +188,20 @@ Cranelift-JIT-tier differential assertion (the current test runs via `run_powerb
 - **Gate:** warm driver differential-clean; frozen `import` works with no fs cap granted.
 
 ### Phase C — CAPSTONE: the playground card
-- Build recipe in `browser/build-onramp-assets.mjs` (translate with **`--host-page 65536`**);
-  new `want micropython` step in `scripts/rebuild-assets.sh` that builds and `validate`s
-  (decode → verify → bytecode-compile via `prep_temen`).
-- Add an `EXAMPLES` card to `browser/web/play.js`: `kind:'module'`, `warm:true`,
-  `url:'./assets/micropython_snapshot.temen'`, `mode:'io'`, `editable:true`, `lang:'python'`,
-  a starter snippet (model the Lua card).
-- Commit the `.temen` asset under `browser/web/assets/` (passes the `check-play-assets.mjs` PR
-  gate by being git-tracked); extend `browser/browser-play-editor-test.mjs` with a real-browser
-  play-card assertion (feed the editor text as stdin, check expected stdout).
-- **Gate (the capstone acceptance):** `browser-play-editor-test.mjs` drives the real
-  `play.html` in headless Chromium, runs the MicroPython card, and asserts byte-correct
-  Python output. Card size stays within the playground download ceiling (cf. Postgres ~20 MB,
-  nifler ~17.7 MB gz).
+**Wired (#1329):** the card is live and the asset is validated on the bytecode engine.
+- Build recipe added to `browser/build-onramp-assets.mjs` (block 2d), translating both variants with
+  **`--host-page 65536 --stub-externs`**; the `onramp` step in `scripts/rebuild-assets.sh` regenerates
+  the committed asset (like qjs/lua), so no separate step is needed.
+- `EXAMPLES` card added to `browser/web/play.js`: `kind:'module'` (non-warm — runs `main` per Run,
+  the validated cold path), `url:'./assets/micropython_repl.temen'`, `mode:'io'`, `lang:'python'`,
+  with a breadth starter snippet.
+- The `.temen` asset is **committed** under `browser/web/assets/micropython_repl.temen` (442 KB;
+  passes the `check-play-assets.mjs` PR gate). It **decodes → verifies → bytecode-compiles** cleanly
+  via `prep_temen` — i.e. it runs on the same bytecode tier the browser uses.
+- **Remaining for the gate:** run `browser-play-editor-test.mjs` against the built wasm bundle in
+  headless Chromium and add the MicroPython card to its byte-exact output assertions (needs the
+  browser wasm build, not runnable in the on-ramp CI job). The generic layout assertion (every card
+  has a nav link + editor) already covers the card's presence.
 
 ### Phase D — CPython (stretch, tracked separately)
 

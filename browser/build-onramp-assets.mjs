@@ -274,6 +274,31 @@ try {
   console.log(`  – tcl skipped (${e.message} — offline, or no clang/llvm-link)`);
 }
 
+// 2d) MicroPython (interactive) — MicroPython 1.24.1 (the `ports/embed` core), built by its demo
+//     script (`demos/micropython/build_bitcode.sh`: clone → embed package with the Temen config →
+//     per-TU bitcode + openlibm → llvm-link). The playground translates two variants to a 64 KiB-page
+//     `.temen` with `--stub-externs`:
+//       • `micropython_repl.temen` — the minimal-embedding REPL (`micropython.c`, stdin → exec → print).
+//       • `micropython_snapshot.temen` — the two-phase warm driver (`micropython_snapshot.c`: `warmup`
+//         = `mp_embed_init`, `eval_run` = exec-only), so the playground warms the interpreter once and
+//         evals per Run (slice B/C). Runs byte-identical to native (`demo_micropython_repl_stdin`).
+//     Fail-soft: skipped if the toolchain/clone is unavailable, like SQLite/Tcl offline.
+try {
+  const mpScript = join(REPO, 'crates', 'temen-run', 'demos', 'micropython', 'build_bitcode.sh');
+  execFileSync('bash', [mpScript], { stdio: 'inherit' });
+  const cache = process.env.TEMEN_MICROPYTHON_CACHE ?? '/tmp/temen_micropython_cache';
+  for (const [linkedName, temenName] of [['mp_linked.ll', 'micropython_repl.temen'], ['mp_snapshot_linked.ll', 'micropython_snapshot.temen']]) {
+    const linked = join(cache, linkedName);
+    if (!existsSync(linked)) throw new Error(`build script produced no ${linkedName}`);
+    const temen = join(ASSETS, temenName);
+    execFileSync(TR, [linked, '-o', temen, '--host-page', HOST_PAGE, '--stub-externs', '--null-guard'], { stdio: 'inherit' });
+    const size = execFileSync('wc', ['-c', temen]).toString().trim().split(/\s+/)[0];
+    console.log(`  ✓ ${temenName} (${size} B)`);
+  }
+} catch (e) {
+  console.log(`  – micropython skipped (${e.message} — offline, or no git/clang/llvm-link)`);
+}
+
 // 3) Lua (interactive) — the warm Lua card ships the committed prebuilt **`lua_snapshot.temen`** (the
 //    two-phase `main`/`warmup`/`eval_run` driver, issue #805), so nothing is built here. It's a
 //    generated binary asset like the vendored `doom1.wad`: regenerate it by hand from
