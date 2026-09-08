@@ -157,19 +157,25 @@ are the capstone; D is the stretch.
   `demos/tcl/tcl_repl.c`). Minimal embedding — no ambient OS surface.
 - **Gate:** the demo's fetch step skips cleanly offline; native oracle builds.
 
-### Phase A — MicroPython runs, byte-identical (CLI)
-- Walk the fail-closed translator chokepoint one gap at a time (the QuickJS method:
-  `cargo run --example try_translate`), closing each on-ramp gap Python surfaces. Anticipated,
-  from prior ports: computed-goto dispatch (proven by QuickJS), runtime-sized `alloca`,
-  stack-direction / `frameaddress` assumptions, `i128` (big-int paths), address-taken
-  `memcpy`/libm. Each gap is either a reused mechanism or a small translator fix (mirror the
-  QuickJS/Tcl slice write-ups).
-- Wire the reusable waist (§3) into the guest link; add a small `py_shim.c` for anything
-  Python-specific.
-- **Gate:** a breadth Python script (arithmetic, str/list/dict, comprehensions, closures,
-  recursion, exceptions, float `repr`) runs **byte-identical to native MicroPython** on the
-  tree-walk interpreter and the Cranelift JIT (differential harness in `demos/micropython/`,
-  `#[ignore]` for the slow interpreter tier per the QuickJS/SQLite convention, JIT per-PR).
+### Phase A — MicroPython runs, byte-identical (CLI) ✅ DONE
+**Landed** (`crates/temen-run/demos/micropython/`, test `demo_micropython_repl_stdin`, issue #1326).
+MicroPython 1.24.1 (via the `ports/embed` API) translates (~729 funcs), verifies, and runs
+**byte-identical to the native `cc` oracle** — arithmetic, str/list/dict, comprehensions, closures,
+recursion, floats, and exception `repr` all match. The gap-walk closed four gaps, **all by config —
+no MicroPython source patched** (the real story turned out simpler than the anticipated i128 /
+frameaddress worries):
+
+| # | Gap the translator surfaced | Fix (config only) |
+|---|---|---|
+| 1 | `printf("%.*s")` dynamic precision in the HAL | `py_shim.c` overrides the HAL to `write()` (Stream cap); drop `port/mphalport.c` |
+| 2 | `type half` (f16) in `py/binary.c` | `MICROPY_FLOAT_USE_NATIVE_FLT16 = 0` (software half codec; floats stay on) |
+| 3 | x86-64 inline asm in `nlr_push` / gc register scan | `MICROPY_NLR_SETJMP = 1` + `MICROPY_GCREGS_SETJMP = 1` → the on-ramp `SetJmp`/`LongJmp` ops |
+| 4 | runtime `Unreachable` in the exec path | `llvm-link` guest **openlibm** (float math `fmod`/`nan`/… were unresolved) |
+
+The reusable waist (§3) was mostly free: `setjmp`/`longjmp` lower natively, `memcpy`/`memset` are
+on-ramp-synthesized, and only a handful of string helpers needed a shim. **Still open on #1326:** the
+Cranelift-JIT-tier differential assertion (the current test runs via `run_powerbox`), and raising the
+`MICROPY_CONFIG_ROM_LEVEL` for more stdlib breadth.
 
 ### Phase B — REPL driver + frozen stdlib
 - Freeze the MicroPython standard modules **into the binary** (MicroPython's native frozen-

@@ -12403,6 +12403,109 @@ fn demo_tcl_init_stdin() {
     );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────────────────────────
+// MicroPython — Python on the on-ramp (PYTHON.md; slice A, #1326)
+//
+// The MicroPython 1.24.1 language core (compiler + VM + object model + GC + int/float/str/list/dict/
+// comprehensions/closures/exceptions) driven through the on-ramp, byte-identical to native. The
+// faithful build lives in `demos/micropython/build_bitcode.sh`: it clones MicroPython, generates the
+// `ports/embed` package with the Temen config, compiles every TU to `.ll`, and `llvm-link`s the
+// package + the REPL driver + `py_shim.c` + guest openlibm into one module — and builds the native
+// `cc` oracle. The gap-walk (printf `%.*s`, `half` f16, nlr/gc inline asm, float libm) is closed by
+// config alone (no MicroPython source patched); see the demo README.
+//
+// `#[ignore]`d only for wall-clock (clones + builds a whole interpreter, runs it on the powerbox),
+// like the Tcl/QuickJS capstones — run with `--ignored`. Skips loudly (never fails) when
+// git/clang/make are unavailable — grep for `skipping micropython`.
+
+/// Path to `demos/micropython`.
+fn micropython_demo_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../temen-run/demos/micropython")
+}
+
+/// Run the faithful `build_bitcode.sh` (clone + embed package + per-TU bitcode + openlibm + link +
+/// native oracle). Returns `(linked_ll, native_oracle)` or `None` (skip) when the toolchain/network is
+/// unavailable.
+fn build_micropython() -> Option<(PathBuf, PathBuf)> {
+    let cache = std::env::temp_dir().join("temen_micropython_cache");
+    let linked = cache.join("mp_linked.ll");
+    let oracle = cache.join("micropython_native");
+    let script = micropython_demo_dir().join("build_bitcode.sh");
+    let ok = Command::new("bash")
+        .arg(&script)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok && linked.exists() && oracle.exists() {
+        Some((linked, oracle))
+    } else {
+        eprintln!(
+            "note: skipping micropython (build_bitcode.sh failed — offline or no git/clang/make?)"
+        );
+        None
+    }
+}
+
+/// **▶ MicroPython REPL — run a Python program piped in on stdin, byte-identical to native** (the
+/// playground driver). The whole MicroPython 1.24.1 core compiled through the on-ramp: translate →
+/// verify → run under the powerbox with the program on `stdin`, asserting stdout byte-matches the
+/// native `cc` driver oracle. `#[ignore]`d only for wall-clock; run with `--ignored`. Skips loudly
+/// when git/clang/make are unavailable — grep for `skipping micropython`.
+#[test]
+#[ignore = "capstone: clones + builds MicroPython and runs a whole interpreter on the powerbox; run with --ignored"]
+fn demo_micropython_repl_stdin() {
+    let Some((linked, oracle)) = build_micropython() else {
+        return;
+    };
+    // Language breadth: printing, list/dict comprehensions, recursion, floats (guest openlibm via
+    // `2**0.5`), and exception `repr` — every shape that walked the gap list to a byte-identical run.
+    let stdin: &[u8] = b"print('hello, temen!')\n\
+        print([x*x for x in range(6)])\n\
+        d={'a':1,'b':2}; print(sum(d.values()))\n\
+        def fib(n):\n\
+        \x20   return n if n<2 else fib(n-1)+fib(n-2)\n\
+        print([fib(i) for i in range(10)])\n\
+        print('float:', 3.0/2, round(2**0.5, 6))\n\
+        try:\n\
+        \x20   1/0\n\
+        except Exception as e:\n\
+        \x20   print('caught', repr(e))\n";
+
+    let native = {
+        use std::io::Write;
+        let mut child = Command::new(&oracle)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn native micropython driver");
+        child.stdin.take().unwrap().write_all(stdin).ok();
+        child
+            .wait_with_output()
+            .expect("run native micropython driver")
+    };
+    assert!(
+        native.status.success() && !native.stdout.is_empty(),
+        "native micropython oracle produced no output"
+    );
+
+    let opts = temen_llvm::TranslateOptions {
+        stub_unresolved_externs: true,
+        ..Default::default()
+    };
+    let t =
+        temen_llvm::translate_ll_path_with_options(&linked, opts).expect("translate micropython");
+    let module = t.module;
+    temen_verify::verify_module(&module).expect("verify micropython module");
+    let run = temen_run::run_powerbox(&module, stdin).expect("powerbox run micropython");
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "micropython: guest {:?} vs native {:?}",
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&native.stdout)
+    );
+}
+
 /// **Constexpr `icmp` in an instruction operand** — the first on-ramp gap the Tcl port surfaced
 /// (`DeleteScriptLimitCallback`: `select i1 icmp eq (ptr inttoptr(3), ptr @g), …`). A global address
 /// is never a small integer sentinel, so the compare folds to *false* at run time; the on-ramp lowers
