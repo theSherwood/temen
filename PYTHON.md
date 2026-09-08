@@ -197,10 +197,53 @@ are the capstone; D is the stretch.
   nifler ~17.7 MB gz).
 
 ### Phase D — CPython (stretch, tracked separately)
-- Whole-program `llvm-link` of CPython (Postgres-scale link), stdlib frozen in, threads/GIL
-  disabled or single-threaded, signals stubbed or wired to `temen-posix`. Its own gap
-  inventory, its own snapshot/restore for cold-boot (Postgres precedent). Gated by MicroPython
-  proving the pipeline first. Opened as a spike issue, not committed as a deliverable here.
+
+CPython is the "real Python" prize and a **separate, substantially larger bring-up** — not an
+increment on MicroPython. Whole-program `llvm-link` of CPython (Postgres-scale link), stdlib
+frozen in, threads/GIL single-threaded, signals stubbed or wired to `temen-posix`, its own gap
+inventory and its own snapshot/restore for cold-boot (Postgres precedent). Gated by MicroPython
+proving the pipeline first. Opened as a feasibility **spike** issue; not committed as a
+deliverable here. The rest of this section is the honest difficulty read.
+
+**MicroPython is not a stepping stone to CPython — it de-risks the *shared infrastructure*,
+not the interpreter.** The two are separate codebases; almost none of MicroPython's
+interpreter work transfers. What transfers is everything *around* it:
+
+| Carries over (proven by Phases A–C) | Net-new for CPython (MicroPython never exercises it) |
+|---|---|
+| On-ramp pipeline: fetch → clang → `llvm-link` → translate → verify → diff vs native oracle | **Postgres-scale link** (hundreds of TUs, not one small lib) |
+| Reusable libc waist (§3: printf/scanf/strtod/openlibm/ctype/locale) | **Freezing the whole stdlib** in + static-linking chosen C extension modules |
+| REPL + warm-snapshot driver pattern (Phase B) | **obmalloc arenas over shimmed anon `mmap`** (Postgres proved the shim; still integration) |
+| Playground card mechanics (`--host-page`, `rebuild-assets.sh`, `EXAMPLES`, real-browser test) | **GIL machinery** — pthread mutex/cond taken/released even single-threaded |
+| setjmp/longjmp on all three engines | **Signal wiring** for `SIGINT`→`KeyboardInterrupt` (stub for batch; real work for interactive) |
+| Translator-gap muscle (computed-goto, `i128`, `alloca`) | **Giant `_PyEval_EvalFrameDefault`** runs slow on the browser tiers (§6 — perf, not correctness) |
+
+Roughly **a third of the total effort is shared** (the Temen-side scaffolding Phases A–C
+build); the CPython interpreter + stdlib integration is the other two-thirds and is genuinely
+new.
+
+**The accelerant is not MicroPython — it is CPython's own upstream static ports.** CPython
+already ships a `wasm32-wasi` target (Tier 3) and the Emscripten/**Pyodide** build, and *those
+ports already solved every hard constraint Temen imposes*: static-link everything, **no
+`dlopen`**, freeze the `.py` stdlib in, stub/limit threads and signals, and shim the OS surface
+behind a narrow waist. Retargeting to Temen's on-ramp is therefore much closer to **"port the
+CPython WASI/Emscripten build to Temen's libc waist"** than a from-scratch port: crib their
+`Modules/Setup` (static module list), their deep-freeze setup, and their stub set as the
+starting configuration instead of reinventing it. This is what turns CPython from open-ended
+research into **a big but well-mapped integration** — MicroPython proves the Temen pipeline,
+the WASI/Emscripten ports prove the CPython side.
+
+**Rough sizing:** CPython is likely **~3–5× the MicroPython effort**, dominated by the
+stdlib-freeze / static-build integration and gap-closing at scale — **not by novel VM work**
+(the substrate needs nothing new; §5's gaps are all handled by static-linking or by scoped
+cuts). The two biggest live unknowns are (1) the giant eval-loop's browser-tier speed (§6) and
+(2) cold-boot time, for which the warm snapshot is the known answer.
+
+**Permanent scope cuts** (architectural, not effort — the same cuts Pyodide ships and still
+useful): binary third-party wheels and `ctypes`/FFI are out (no dynamic loader — §5); true
+multi-core `threading` is unproven at this scale (single-threaded first); `decimal` C-level
+directed rounding and non-C locales diverge (§5). A first CPython is **single-threaded,
+frozen-stdlib, pure-Python-packages-only** — exactly Pyodide's shape, and plenty.
 
 ---
 
