@@ -75,7 +75,7 @@ const res = await page.evaluate(async () => {
     const readErr = () => u8().slice(Number(ex.temen_stderr_ptr()), Number(ex.temen_stderr_ptr()) + ex.temen_stderr_len());
     let info = { crawled: 0, semmed: 0, hexed: 0 };
     if (tierWholeCard) {
-      info = await jitNimWholeCardOp13(ex, memory, { niflerCe, nimsemCe, hexerCe, nifler }, stdlib, '/prog.nim', source, 'nim-wholecard');
+      info = await jitNimWholeCardOp13(ex, memory, { niflerCe, nimsemCe, hexerCe }, stdlib, '/prog.nim', source, 'nim-wholecard');
     } else {
       ex.temen_nim_precrawl_reset();
     }

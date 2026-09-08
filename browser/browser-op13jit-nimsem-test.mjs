@@ -1,11 +1,11 @@
 // Real-browser (V8) end-to-end for the **JS-orchestrated op-13 loop on a REAL nimsem phase child**
 // (#1025 3a.3 — the heaviest front-end phase, extending the nifler/hexer tier-up to the 4-cap `exec`
 // phase via `temen_op13jit_nimsem_open`): a resumable driver marshals {fs, stdout, exit, **exec**} to
-// nimsem_ce (the child-entry phase). The `exec` cap is `make_exec` over the SAME shared memfs, running
-// the top-level nifler on the interpreter — so nimsem-the-tiered-up-child shells out to nifler
-// grandchildren (host-side) to parse the stdlib it imports, while nimsem's own sema (the dominant cost)
-// runs on **emitted wasm** in its own detached `WebAssembly.Memory` (#1288 — no 256 MiB carve, no 2 GiB
-// engine module). It semchecks the system module (`--isSystem`) and
+// nimsem_ce (the child-entry phase). The `exec` cap is `make_exec` over the SAME shared memfs; #1025 3d:
+// nimsem-the-tiered-up-child shells out to nifler by spawning `nifler_ce` as a confined **§14 op-13
+// grandchild** (`run_phase_op13`, the confinement path) to parse the stdlib it imports, while nimsem's own
+// sema (the dominant cost) runs on **emitted wasm** in its own detached `WebAssembly.Memory` (#1288 — no
+// 256 MiB carve, no 2 GiB engine module). It semchecks the system module (`--isSystem`) and
 // writes `sysvq0asl.s.nif`, which must be byte-identical to the committed expected — the same oracle the
 // headless `rust_driver_nimsem.rs` gate uses. This is `nimc.rs`'s phase-2 nimsem, nested under an op-13
 // driver, tiered up to JIT in the browser — the dominant piece of the ~180s card.
@@ -26,7 +26,9 @@ async function loadChromium() {
 }
 const FX = `${ROOT}/../crates/temen-run/demos/nim_frontend/fixtures`;
 const CE_GZ = `${FX}/nimsem_ce.temen.gz`;
-const NIFLER_GZ = `${ROOT}/web/assets/nifler.temen.gz`;
+// #1025 3d: the exec's nifler is the **child-entry** `nifler_ce` — nimsem's exec spawns it as a confined
+// §14 op-13 grandchild (`run_phase_op13`), not an inline host run.
+const NIFLER_GZ = `${ROOT}/../crates/temen-run/demos/nifler_temen/nifler_ce.temen.gz`;
 const SYSLIB_GZ = `${FX}/syslib.tar.gz`;
 const PNIF = `${FX}/sysvq0asl.p.nif`;
 const SNIF_GZ = `${FX}/sysvq0asl.s.nif.gz`;
@@ -159,7 +161,7 @@ try {
   if (errors.length) console.log('ERRORS', errors.slice(0, 6));
   const ok = !res.err && res.snifEq && res.emittedLen > 0 && res.expectedLen > 0;
   console.log(`  op13jit-nimsem: .s.nif≡=${res.snifEq} (emitted ${res.emittedLen}B / expected ${res.expectedLen}B) driver=${res.result} childrenDriven=${res.drove}${res.err ? ` · ERR ${res.err}` : ''}`);
-  console.log(ok ? 'PASS — real nimsem_ce ran DETACHED on the EMITTED tier in its own WebAssembly.Memory under the 1 GiB engine (exec→nifler host-side); .s.nif ≡ committed expected' : 'FAIL');
+  console.log(ok ? 'PASS — real nimsem_ce ran DETACHED on the EMITTED tier in its own WebAssembly.Memory under the 1 GiB engine (exec→nifler as a confined §14 op-13 grandchild); .s.nif ≡ committed expected' : 'FAIL');
   process.exit(ok ? 0 : 1);
 } finally {
   try { rmSync(work, { recursive: true, force: true }); } catch {}
