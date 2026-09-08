@@ -9,7 +9,7 @@
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
 import { foreignImports } from './foreign-mem.js';
-import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl } from './wasmjit-module.js';
+import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl, jitNimWholeCardOp13 } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -234,7 +234,8 @@ self.onmessage = async (e) => {
     if (msg.type === 'nimAssets') {
       // Cache the nimony phase guests + stdlib image (posted once). Kept as the worker's own copies so
       // later `nimCompile` Runs need only ship the (small) source, not ~28 MB of guests each time.
-      nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib };
+      nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib,
+        niflerCe: msg.niflerCe, nimsemCe: msg.nimsemCe, hexerCe: msg.hexerCe };
       self.postMessage({ type: 'reply', id: msg.id, ok: true });
       return;
     }
@@ -246,18 +247,28 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'nim assets not loaded' });
         return;
       }
-      const { nifler, nimsem, hexer, stdlib } = nimAssets;
+      const { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe } = nimAssets;
       const mainName = msg.main || 'prog.nim';
       const src = new TextEncoder().encode(msg.source);
       const main = new TextEncoder().encode(mainName);
-      // #1025 route A: tier the phase-1 nifler import crawl up to the wasm-JIT. The JS-orchestrated crawl
-      // runs nifler on the emitted-wasm tier per module and seeds each `.p.nif` into the Rust accumulator
-      // that `temen_compile_nim_fs` mounts, so `compile_nim`'s phase-1 skips the interpreter nifler run for
-      // every module the crawl covered. Best-effort: any failure just falls back to full interpreter phase-1.
+      // #1025 3e: tier the WHOLE card up to the wasm-JIT. `jitNimWholeCardOp13` runs nifler + nimsem +
+      // hexer for every module as §14 op-13 detached emitted children and seeds every `.p/.s/.x` into the
+      // accumulator `temen_compile_nim_fs` mounts, so the final compile only links + runs — ~3.3× faster
+      // than the tree-walker, byte-identical (`browser-nim-wholecard-op13-test`). Best-effort and
+      // per-phase: any module/phase the orchestrator can't tier just isn't pre-seeded, so `compile_nim`
+      // runs it on the interpreter (needs the top-level guests, hence they ship too); a hard failure
+      // resets the accumulator and the whole compile falls back to the tree-walker. Requires the
+      // child-entry guests — if a page shipped without them (old cache), fall back to the phase-1 crawl.
+      let tier = null; // what the JS orchestrator pre-seeded (for telemetry / the wiring test)
       try {
-        await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
+        if (niflerCe && nimsemCe && hexerCe) {
+          tier = await jitNimWholeCardOp13(ex, memory, { niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard');
+        } else {
+          await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
+        }
       } catch (e) {
-        ex.temen_nim_precrawl_reset(); // discard a partial crawl; interpreter phase-1 handles everything
+        ex.temen_nim_precrawl_reset(); // discard partial pre-seeds; the interpreter compile handles everything
+        tier = { error: String(e && e.message || e) };
       }
       // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
       // fresh view and fill them — the same discipline as play.js's `runNimc`.
@@ -291,7 +302,7 @@ self.onmessage = async (e) => {
       ex.temen_dealloc(ip, stdlib.length);
       ex.temen_dealloc(sp, src.length);
       ex.temen_dealloc(mp, main.length);
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr() });
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr(), tier });
       return;
     }
     if (msg.type === 'stats') {
