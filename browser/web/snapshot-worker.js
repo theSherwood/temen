@@ -285,34 +285,52 @@ self.onmessage = async (e) => {
       view.set(stdlib, ip);
       view.set(src, sp);
       view.set(main, mp);
-      // Live-stream the compiled program's stdout to the page (#1143): the tee on the final `_start`
-      // run fires `stdout_chunk`, relayed here for the duration of the compile+run. Also ACCUMULATE a copy:
-      // the final program's stdout reaches the page through the tee, and for this card `readStdout()` (the
-      // engine's captured buffer) comes back empty afterwards — so the streamed bytes are the source of
-      // truth for the reply, else the page renders a blank result over the streamed text.
+      // Live-stream the compiled program's stdout to the page (#1143), accumulating a copy — some runs
+      // route the program's output through the streaming tee with the engine's captured buffer empty
+      // afterwards (#1360), so the streamed bytes are the reply's fallback source (PR #1356).
       const streamAcc = [];
       chunkSink = (bytes) => { streamAcc.push(bytes.slice()); self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]); };
+      let status, runTier = 'interpreter';
       try {
-        ex.temen_compile_nim_fs(
+        // #1357: tier the RUN too. Compile-to-linked-module (no run), then run the linked program on the
+        // **wasm-JIT** tier via `runJitModule` — so the user's program is emitted, not just the compiler.
+        // Fall back to the tree-walker (`temen_compile_nim_fs`) if the emit declines (a page-managing /
+        // out-of-subset `_start`) or if we can't get the linked module.
+        const linkLen = Number(ex.temen_compile_nim_link_fs(
           np, nifler.length, smp, nimsem.length, hp, hexer.length,
-          ip, stdlib.length, sp, src.length, mp, main.length);
+          ip, stdlib.length, sp, src.length, mp, main.length));
+        let ranEmitted = false;
+        if (linkLen > 0) {
+          // The encoded linked module (BINARY — not `readStdout()`, which UTF-8-decodes) on the OUT stash.
+          const linked = new Uint8Array(memory.buffer, Number(ex.temen_stdout_ptr()), linkLen).slice();
+          try {
+            const rs = await runJitModule(ex, memory, linked, null, 'nim-run');
+            status = (rs === 0 || rs === 5) ? 0 : rs;
+            ranEmitted = true; runTier = 'wasm-jit';
+          } catch (_e) { /* emit declined → tree-walker fallback below */ }
+        }
+        if (!ranEmitted) {
+          ex.temen_compile_nim_fs(
+            np, nifler.length, smp, nimsem.length, hp, hexer.length,
+            ip, stdlib.length, sp, src.length, mp, main.length);
+          status = ex.temen_status();
+        }
       } finally {
         chunkSink = null;
       }
-      const status = ex.temen_status();
       ex.temen_dealloc(np, nifler.length);
       ex.temen_dealloc(smp, nimsem.length);
       ex.temen_dealloc(hp, hexer.length);
       ex.temen_dealloc(ip, stdlib.length);
       ex.temen_dealloc(sp, src.length);
       ex.temen_dealloc(mp, main.length);
-      let stdout = readStdout(); // a decoded STRING (matches the interpreter path / play.js's `${out}`)
+      let stdout = readStdout(); // a decoded STRING (matches play.js's `${out}`)
       if (!stdout.length && streamAcc.length) {
         const total = new Uint8Array(streamAcc.reduce((n, a) => n + a.length, 0));
         let o = 0; for (const a of streamAcc) { total.set(a, o); o += a.length; }
         stdout = new TextDecoder().decode(total);
       }
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout, stderr: readStderr(), tier });
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout, stderr: readStderr(), tier, runTier });
       return;
     }
     if (msg.type === 'stats') {
