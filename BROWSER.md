@@ -734,14 +734,14 @@ alongside the existing escape-TCB targets. The §22 `browser_jit_validator` alre
    **[landed — the runtime-compile→emit mechanism, native differential]** The dynamic loop's core is
    in the TCB-side seam, not the JS host: `Host` now carries an injected wasm emitter
    (`set_jit_wasm_emitter`, a bare `fn` like the `JitValidator`), so a closed-blob `Jit.compile` — the
-   guest building IR at runtime and running the shared decode→verify→memory-match gate — also emits the
-   unit's wasm and stashes it on the `JitUnit` (`Host::jit_unit_wasm`); a later `invoke` runs that
-   guest-own unit's `f0(win, env, args…)` instead of a fixed setup unit. The mechanism is pinned by
+   guest building IR at runtime and running the shared decode→verify→memory-match gate — gets its
+   unit's wasm emitted and cached on the `JitUnit` at its first driver read (`Host::jit_unit_wasm_or_emit`,
+   the one emit path for `compile`, `compile_linked`, thawed and forked units alike, #1346); a later
+   `invoke` runs that guest-own unit's `f0(win, env, args…)` instead of a fixed setup unit. The mechanism is pinned by
    `crates/temen/tests/jit_wasm_codegen.rs`: a resumable `Vcpu` guest `compile`s a unit at runtime then
    `invoke`s it, serviced on emitted wasm under `wasmi`, **byte-identical** to the interpreter oracle
    (value + trap, i32/i64 sigs; the `emitted_ran` guard rejects a silent interp fallback). Zero cost
-   when unset — every non-browser run leaves the emitter `None`, and `compile_linked` units are not
-   emitted yet (interpreter-only invoke).
+   when unset — every non-browser run leaves the emitter `None`.
    **[landed — the browser wiring, single-Worker *and* cross-Worker]** A `Jit` grant (+ validator +
    emitter) lives in a shared `Mutex<Host>` (`ParJitCfg` / `temen_par_powerbox_jit_runtime`) that the root
    vCPU dispatches its `call.cap`s through (`Vcpu::with_shared_host`), so the guest's runtime
