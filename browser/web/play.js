@@ -606,7 +606,11 @@ block 0 (sp2: i64, arg2: i64) {
   //      `build-onramp-assets.mjs` at `--host-page 65536` (the wasm page). ------------------------
   'Forth (a JIT-compiling Forth written in Temen IR)': {
     kind: 'module',
-    jit: false, // the kernel runs on the bytecode engine; the words it defines are §22 guest-JIT units
+    // #1233: the kernel's outer interpreter tiers up onto emitted wasm and defines/dispatches its
+    // words from there (browser-forth-coop-test). Thread words (`spawn`/`join`) reached from that
+    // emitted frame decline the run to the interpreter (logged) — the card's default program uses
+    // them; delete those lines to watch it run on the wasm-JIT tier.
+    jit: true,
     editable: true,
     lang: 'forth',
     url: './assets/forth.temen',
@@ -620,7 +624,10 @@ block 0 (sp2: i64, arg2: i64) {
       '`cont.new`/`cont.resume`/`suspend` (`task`/`resume`/`yield`), threads over `thread.spawn` ' +
       '(`spawn`/`join`), atomics are one-op templates. Each line you type is itself compiled as an ' +
       'anonymous unit, installed, called, and uninstalled. Edit the Forth on the left and click Run: ' +
-      'it is fed to the kernel as stdin and the output appears below. Issue #1214.',
+      'it is fed to the kernel as stdin and the output appears below. Tick **wasm-JIT** and the ' +
+      'kernel’s outer loop itself runs on emitted wasm, defining and dispatching the words from ' +
+      'there; a program using the thread words (`spawn`/`join`) declines back to the interpreter ' +
+      '(logged). Issue #1214, #1233.',
     src: `\ Forth on Temen: every word below is JIT-compiled to a verified IR unit.
 : sq ( n -- n ) dup * ;
 : fact ( n -- n ) dup 1 > if dup 1- recurse * else drop 1 then ;
@@ -3479,6 +3486,14 @@ async function proveModuleParity(c) {
       await runJitModule(eng.ex, eng.memory, bytes, stdinBytes);
       jitOut = readModuleStdout();
     } catch (e) {
+      // A **declared** decline (#1233: e.g. the Forth kernel's thread words reached from its emitted
+      // outer loop) is the documented fallback, not a failure — the interpreter carries the program;
+      // report the single-tier result, as the warm path does above.
+      if (/declined to the interpreter/.test(e.message)) {
+        setState(c, 'done', `✓ interpreter only — wasm-JIT declined this program (${interp.stdout.length}B stdout)`);
+        logTo(c, `parity: wasm-JIT declined (${e.message}); the interpreter carries this program`);
+        return;
+      }
       setState(c, 'error', `✗ wasm-JIT unavailable: ${e.message}`);
       logTo(c, `parity: JIT emit failed: ${e.message}`);
       return;

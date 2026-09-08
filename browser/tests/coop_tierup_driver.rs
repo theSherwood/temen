@@ -17,21 +17,22 @@ use temen_browser::{
     temen_coop_close, temen_coop_deliver, temen_coop_deliver_jit, temen_coop_deliver_jit_trap,
     temen_coop_deliver_trap, temen_coop_func, temen_coop_jit_code, temen_coop_jit_param_types_ptr,
     temen_coop_jit_result_types_len, temen_coop_jit_result_types_ptr,
-    temen_coop_jit_wasm_by_handle_len, temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_len,
+    temen_coop_jit_wasm_by_handle_ptr, temen_coop_jit_wasm_by_slot_len, temen_coop_jit_wasm_len,
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_code, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
-    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
-    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator, temen_run_value,
-    temen_status, temen_stdout_len, temen_stdout_ptr, temen_warm_close, temen_warm_coop_open,
-    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
-    COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    temen_coop_slot_code, temen_coop_slot_unit, temen_coop_table_gen, temen_coop_table_log2,
+    temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len,
+    temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_onramp_set_grant_instantiator, temen_run_value, temen_status, temen_stdout_len,
+    temen_stdout_ptr, temen_warm_close, temen_warm_coop_open, temen_warm_coop_prepare,
+    temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
+    COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
-    Caller, Engine, Func, FuncRef, Instance, Linker, Memory, MemoryType, Module as WModule, Store,
-    Table, TableType, Val,
+    AsContextMut, Caller, Engine, Func, FuncRef, Instance, Linker, Memory, MemoryType,
+    Module as WModule, Store, Table, TableType, Val,
 };
 
 /// The coop session statics are process-global (single-threaded wasm by design) — serialize the tests
@@ -692,6 +693,31 @@ struct DriverData {
     /// publish and the host write agree.
     win_globals: Vec<wasmi::Global>,
     bounces: Vec<u32>,
+    /// The wasmi engine, dispatch table, main emitted module, installed-unit instances, and bounce
+    /// shims live in the store data (not on [`CoopB2Driver`]) so the `env.call_interp` host function
+    /// can rebuild the table from *inside* a bounce ([`sync_table_in`], #1233).
+    engine: Option<Engine>,
+    table: Option<Table>,
+    main: Option<Instance>,
+    unit_insts: HashMap<UnitKey, Instance>,
+    /// Bounce shims keyed by `(slot, occupant code)` (`-2` = a program-function slot) so an
+    /// uninstall/reinstall regenerates against the new occupant's signature.
+    shims: HashMap<(u32, i32), Func>,
+    /// #1009: the dispatch-table generation the shared table was last synced at (mirrors the JS
+    /// driver's cache so an install re-syncs and a no-install run syncs once). `-1` = never.
+    synced_gen: i64,
+    /// #1233: bounces that found the slot mirror moved underneath the running emitted frame (a §22
+    /// install/uninstall *during* an event) and re-synced the table before returning to it.
+    bounce_syncs: u32,
+}
+
+/// Key of an instantiated §22 unit: an **installed** slot's unit by its append-only `(domain, unit)`
+/// identity (packed, [`temen_coop_slot_unit`]) — its code handle may be `release`d while the slot
+/// lives on (#1233) — or a surfaced `Jit.invoke`'s unit by its (live) code handle.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum UnitKey {
+    Unit(i64),
+    Code(i32),
 }
 
 /// Widen the mirrored memory so `[0, need)` is addressable — the window can now **grow** mid-run
@@ -707,17 +733,7 @@ fn ensure_mirror(store: impl wasmi::AsContextMut, mem: Memory, need: usize) {
 
 struct CoopB2Driver {
     store: Store<DriverData>,
-    engine: Engine,
     memory: Memory,
-    table: Table,
-    main: Instance,
-    unit_insts: HashMap<i32, Instance>,
-    /// Bounce shims keyed by `(slot, occupant code)` (`-2` = a program-function slot) so an
-    /// uninstall/reinstall regenerates against the new occupant's signature.
-    shims: HashMap<(u32, i32), Func>,
-    /// #1009: the dispatch-table generation the shared table was last synced at (mirrors the JS
-    /// driver's cache so an install re-syncs and a no-install run syncs once).
-    synced_gen: i64,
 }
 
 /// The live window right now — base **and** length re-read together. Never cache either across a
@@ -727,15 +743,213 @@ fn live_win() -> (*mut u8, usize) {
     (temen_coop_win_ptr() as *mut u8, temen_coop_win_len())
 }
 
+/// The `env.call_interp` host function: bounce an interpreter-resident edge onto the paused vCPU
+/// over the live window, then re-sync every emitted-side mirror the callback may have moved.
+fn call_interp_host(
+    mut c: Caller<'_, DriverData>,
+    target: i32,
+    args_ptr: i32,
+) -> Result<(), wasmi::Error> {
+    let mem = c.data().mem.unwrap();
+    let (win_ptr, win_len) = live_win();
+    // Make the emitted frames' window writes visible to the engine before the callback.
+    let mut w = vec![0u8; win_len];
+    mem.read(&c, WIN_BASE as usize, &mut w).unwrap();
+    // SAFETY: the paused task is parked on the pending event; the window is exclusive.
+    unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&w);
+    let mut slots = [0u8; 512];
+    mem.read(&c, args_ptr as usize, &mut slots).unwrap();
+    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr());
+    // #1312: the callback may have `vm_map`-grown the window, which reallocates and can relocate
+    // the engine's backing — re-read BOTH base and length, and widen the mirror to match before
+    // copying back.
+    let (win_ptr, win_len) = live_win();
+    ensure_mirror(&mut c, mem, WIN_BASE as usize + win_len);
+    let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
+    mem.write(&mut c, WIN_BASE as usize, live).unwrap();
+    mem.write(&mut c, args_ptr as usize, &slots).unwrap();
+    // #1233: the callback may have been a `vm_jit_install`/`uninstall` issued from the emitted frame
+    // itself (Forth's outer interpreter defining a word) — the slot mirror moved mid-event, and the
+    // frame's next `call.dyn` must find the new occupant. Re-sync the table now, before the globals
+    // fan-out below so a unit instantiated here is primed with them too.
+    if rc == 0 && sync_table_in(&mut c) {
+        c.data_mut().bounce_syncs += 1;
+    }
+    // The mirror's base never moves, so this is a no-op here — but it is the write the JS driver
+    // must make over the engine's relocating backing, so make it anyway.
+    for g in c.data().win_globals.clone() {
+        g.set(&mut c, Val::I32(WIN_BASE as i32)).unwrap();
+    }
+    // #717 fan-out: a bounced callback may have `vm_map`-grown the window. #1009 paged: the grow
+    // refreshed the page-state table (`call_interp` rebuilt it) — fan the fresh coverage to
+    // `"mapped"`, re-copy the table, re-point `"pagestate"`.
+    if temen_coop_paged() != 0 {
+        let cover = temen_coop_mapped();
+        for g in c.data().mapped_globals.clone() {
+            g.set(&mut c, Val::I64(cover)).unwrap();
+        }
+        let plen = temen_coop_pagestate_len();
+        // SAFETY: pending-event page-state table, stable until the deliver.
+        let table =
+            unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }.to_vec();
+        let table_base = WIN_BASE as usize + win_len;
+        ensure_mirror(&mut c, mem, table_base + plen);
+        mem.write(&mut c, table_base, &table).unwrap();
+        for g in c.data().pagestate_globals.clone() {
+            g.set(&mut c, Val::I32(table_base as i32)).unwrap();
+        }
+    } else {
+        let now = temen_coop_mapped_now();
+        for g in c.data().mapped_globals.clone() {
+            g.set(&mut c, Val::I64(now)).unwrap();
+        }
+    }
+    c.data_mut().bounces.push(target as u32);
+    if rc != 0 {
+        return Err(wasmi::Error::from(
+            wasmi::core::TrapCode::UnreachableCodeReached,
+        ));
+    }
+    Ok(())
+}
+
+/// Instantiate an emitted module (main, unit, or shim) against the shared memory/table and the
+/// cooperative live-state bounce, registering its `"mapped"`/`"fuel"` globals for the fan-out set.
+/// Generic over the store context so it also runs from inside [`call_interp_host`]: a unit installed
+/// *during* an event is instantiated by the bounce that installed it (#1233).
+fn instantiate_in(mut ctx: impl AsContextMut<Data = DriverData>, wasm: &[u8]) -> Instance {
+    let engine = ctx.as_context().data().engine.clone().expect("engine set");
+    let memory = ctx.as_context().data().mem.expect("memory set");
+    let table = ctx.as_context().data().table.expect("table set");
+    let module = WModule::new(&engine, wasm).expect("emitted wasm must validate");
+    let mut linker: Linker<DriverData> = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    linker
+        .func_wrap("env", "trap", |_c: Caller<'_, DriverData>, _code: i32| {})
+        .unwrap();
+    linker
+        .func_wrap("env", "call_interp", call_interp_host)
+        .unwrap();
+    let instance = linker
+        .instantiate(&mut ctx, &module)
+        .unwrap()
+        .start(&mut ctx)
+        .unwrap();
+    if let Some(g) = instance.get_global(&ctx, "mapped") {
+        ctx.as_context_mut().data_mut().mapped_globals.push(g);
+    }
+    if let Some(g) = instance.get_global(&ctx, "fuel") {
+        // A unit instantiated mid-event (from a bounce) never passes through `prime` — give it the
+        // event's budget now; `prime` re-sets every registered global at the next event anyway.
+        g.set(&mut ctx, Val::I64(1 << 61)).unwrap();
+        ctx.as_context_mut().data_mut().fuel_globals.push(g);
+    }
+    if let Some(g) = instance.get_global(&ctx, "pagestate") {
+        ctx.as_context_mut().data_mut().pagestate_globals.push(g);
+    }
+    if let Some(g) = instance.get_global(&ctx, "win") {
+        ctx.as_context_mut().data_mut().win_globals.push(g);
+    }
+    instance
+}
+
+/// Get-or-build the bounce shim for `slot` (occupant `code`, `-2` = program function).
+fn shim_in(mut ctx: impl AsContextMut<Data = DriverData>, slot: u32, code: i32) -> Option<Func> {
+    if let Some(f) = ctx.as_context().data().shims.get(&(slot, code)) {
+        return Some(*f);
+    }
+    let len = temen_coop_shim_wasm(slot);
+    if len == 0 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(temen_coop_shim_ptr(), len) }.to_vec();
+    let inst = instantiate_in(&mut ctx, &bytes);
+    let f = inst.get_func(&ctx, "t").expect("shim exports t");
+    ctx.as_context_mut()
+        .data_mut()
+        .shims
+        .insert((slot, code), f);
+    Some(f)
+}
+
+/// Rebuild the shared table from the engine's slot mirror whenever its generation moved; returns
+/// whether it did. Called at each event boundary and — #1233 — from inside [`call_interp_host`]
+/// after every bounce: a guest that `vm_jit_install`s from an *emitted* frame (Forth's outer
+/// interpreter defining a word, then `call.dyn`ing it) bumps the generation mid-event, and the
+/// frame's next `call_indirect` must find the new occupant, not a stale or empty slot. The install
+/// itself is a host-serviced bounce, so re-syncing there makes the table exact again before emitted
+/// code resumes — the dispatch-table twin of the post-bounce page-state / `"mapped"` re-sync.
+fn sync_table_in(mut ctx: impl AsContextMut<Data = DriverData>) -> bool {
+    let gen = temen_coop_table_gen() as i64;
+    if gen == ctx.as_context().data().synced_gen {
+        return false;
+    }
+    let main = ctx.as_context().data().main.expect("main instantiated");
+    let table = ctx.as_context().data().table.expect("table set");
+    let nfuncs = temen_coop_nfuncs();
+    let tsize = 1usize << temen_coop_table_log2();
+    for slot in 0..tsize {
+        let entry: Option<Func> = if slot < nfuncs {
+            match main.get_func(&ctx, &format!("f{slot}")) {
+                Some(f) => Some(f),
+                None => shim_in(&mut ctx, slot as u32, -2),
+            }
+        } else {
+            let code = temen_coop_slot_code(slot as u32);
+            if code < 0 {
+                None
+            } else {
+                // #1233: the unit is keyed and fetched by its `(domain, unit)` identity — by the time
+                // of a later rebuild the guest has typically `release`d the code handle (compile →
+                // install → release), which would make a by-handle fetch come back empty and null
+                // the slot under a live installed unit.
+                let key = UnitKey::Unit(temen_coop_slot_unit(slot as u32));
+                let cached = ctx.as_context().data().unit_insts.get(&key).copied();
+                let inst = match cached {
+                    Some(i) => Some(i),
+                    None => {
+                        let len = temen_coop_jit_wasm_by_slot_len(slot as u32);
+                        (len > 0).then(|| {
+                            let bytes = unsafe {
+                                std::slice::from_raw_parts(temen_coop_jit_wasm_by_handle_ptr(), len)
+                            }
+                            .to_vec();
+                            let i = instantiate_in(&mut ctx, &bytes);
+                            ctx.as_context_mut().data_mut().unit_insts.insert(key, i);
+                            i
+                        })
+                    }
+                };
+                match inst {
+                    Some(i) => i.get_func(&ctx, "f0"),
+                    None => shim_in(&mut ctx, slot as u32, code),
+                }
+            }
+        };
+        let fr = entry.map_or_else(FuncRef::null, FuncRef::new);
+        table.set(&mut ctx, slot as u64, Val::FuncRef(fr)).unwrap();
+    }
+    ctx.as_context_mut().data_mut().synced_gen = gen;
+    true
+}
+
 impl CoopB2Driver {
     /// Build the driver for the freshly opened coop session: memory sized for the mirrored window, the
     /// shared table (sized to the engine's `call.dyn` mask), and the main emitted module.
     fn new() -> CoopB2Driver {
         let engine = Engine::default();
-        let mut store: Store<DriverData> = Store::new(&engine, DriverData::default());
+        let mut store: Store<DriverData> = Store::new(
+            &engine,
+            DriverData {
+                synced_gen: -1,
+                ..DriverData::default()
+            },
+        );
         let pages = ((WIN_BASE as usize + temen_coop_win_len()) as u32).div_ceil(1 << 16) + 1;
         let memory = Memory::new(&mut store, MemoryType::new(pages, None)).unwrap();
-        store.data_mut().mem = Some(memory);
         let tsize = 1u32 << temen_coop_table_log2();
         let table = Table::new(
             &mut store,
@@ -743,186 +957,23 @@ impl CoopB2Driver {
             Val::FuncRef(FuncRef::null()),
         )
         .unwrap();
+        {
+            let d = store.data_mut();
+            d.mem = Some(memory);
+            d.engine = Some(engine);
+            d.table = Some(table);
+        }
         let main_wasm =
             unsafe { std::slice::from_raw_parts(temen_coop_wasm_ptr(), temen_coop_wasm_len()) }
                 .to_vec();
-        let mut d = CoopB2Driver {
-            store,
-            engine,
-            memory,
-            table,
-            main: unsafe { std::mem::zeroed() },
-            unit_insts: HashMap::new(),
-            shims: HashMap::new(),
-            synced_gen: -1,
-        };
-        d.main = d.instantiate(&main_wasm);
-        d
+        let main = instantiate_in(&mut store, &main_wasm);
+        store.data_mut().main = Some(main);
+        CoopB2Driver { store, memory }
     }
 
-    /// Instantiate an emitted module (main, unit, or shim) against the shared memory/table and the
-    /// cooperative live-state bounce, registering its `"mapped"`/`"fuel"` globals for the fan-out set.
-    fn instantiate(&mut self, wasm: &[u8]) -> Instance {
-        let module = WModule::new(&self.engine, wasm).expect("emitted wasm must validate");
-        let mut linker: Linker<DriverData> = Linker::new(&self.engine);
-        linker.define("env", "memory", self.memory).unwrap();
-        linker
-            .define("env", "__indirect_function_table", self.table)
-            .unwrap();
-        linker
-            .func_wrap("env", "trap", |_c: Caller<'_, DriverData>, _code: i32| {})
-            .unwrap();
-        linker
-            .func_wrap(
-                "env",
-                "call_interp",
-                move |mut c: Caller<'_, DriverData>,
-                      target: i32,
-                      args_ptr: i32|
-                      -> Result<(), wasmi::Error> {
-                    let mem = c.data().mem.unwrap();
-                    let (win_ptr, win_len) = live_win();
-                    // Make the emitted frames' window writes visible to the engine before the callback.
-                    let mut w = vec![0u8; win_len];
-                    mem.read(&c, WIN_BASE as usize, &mut w).unwrap();
-                    // SAFETY: the paused task is parked on the pending event; the window is exclusive.
-                    unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&w);
-                    let mut slots = [0u8; 512];
-                    mem.read(&c, args_ptr as usize, &mut slots).unwrap();
-                    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr());
-                    // #1312: the callback may have `vm_map`-grown the window, which reallocates and
-                    // can relocate the engine's backing — re-read BOTH base and length, and widen the
-                    // mirror to match before copying back.
-                    let (win_ptr, win_len) = live_win();
-                    ensure_mirror(&mut c, mem, WIN_BASE as usize + win_len);
-                    let live = unsafe { std::slice::from_raw_parts(win_ptr, win_len) };
-                    mem.write(&mut c, WIN_BASE as usize, live).unwrap();
-                    mem.write(&mut c, args_ptr as usize, &slots).unwrap();
-                    // The mirror's base never moves, so this is a no-op here — but it is the write the
-                    // JS driver must make over the engine's relocating backing, so make it anyway.
-                    for g in c.data().win_globals.clone() {
-                        g.set(&mut c, Val::I32(WIN_BASE as i32)).unwrap();
-                    }
-                    // #717 fan-out: a bounced callback may have `vm_map`-grown the window. #1009
-                    // paged: the grow refreshed the page-state table (`call_interp` rebuilt it) —
-                    // fan the fresh coverage to `"mapped"`, re-copy the table, re-point `"pagestate"`.
-                    if temen_coop_paged() != 0 {
-                        let cover = temen_coop_mapped();
-                        for g in c.data().mapped_globals.clone() {
-                            g.set(&mut c, Val::I64(cover)).unwrap();
-                        }
-                        let plen = temen_coop_pagestate_len();
-                        // SAFETY: pending-event page-state table, stable until the deliver.
-                        let table =
-                            unsafe { std::slice::from_raw_parts(temen_coop_pagestate_ptr(), plen) }
-                                .to_vec();
-                        let table_base = WIN_BASE as usize + win_len;
-                        ensure_mirror(&mut c, mem, table_base + plen);
-                        mem.write(&mut c, table_base, &table).unwrap();
-                        for g in c.data().pagestate_globals.clone() {
-                            g.set(&mut c, Val::I32(table_base as i32)).unwrap();
-                        }
-                    } else {
-                        let now = temen_coop_mapped_now();
-                        for g in c.data().mapped_globals.clone() {
-                            g.set(&mut c, Val::I64(now)).unwrap();
-                        }
-                    }
-                    c.data_mut().bounces.push(target as u32);
-                    if rc != 0 {
-                        return Err(wasmi::Error::from(
-                            wasmi::core::TrapCode::UnreachableCodeReached,
-                        ));
-                    }
-                    Ok(())
-                },
-            )
-            .unwrap();
-        let instance = linker
-            .instantiate(&mut self.store, &module)
-            .unwrap()
-            .start(&mut self.store)
-            .unwrap();
-        if let Some(g) = instance.get_global(&self.store, "mapped") {
-            self.store.data_mut().mapped_globals.push(g);
-        }
-        if let Some(g) = instance.get_global(&self.store, "fuel") {
-            self.store.data_mut().fuel_globals.push(g);
-        }
-        if let Some(g) = instance.get_global(&self.store, "pagestate") {
-            self.store.data_mut().pagestate_globals.push(g);
-        }
-        if let Some(g) = instance.get_global(&self.store, "win") {
-            self.store.data_mut().win_globals.push(g);
-        }
-        instance
-    }
-
-    /// Get-or-build the bounce shim for `slot` (occupant `code`, `-2` = program function).
-    fn shim(&mut self, slot: u32, code: i32) -> Option<Func> {
-        if let Some(f) = self.shims.get(&(slot, code)) {
-            return Some(*f);
-        }
-        let len = temen_coop_shim_wasm(slot);
-        if len == 0 {
-            return None;
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(temen_coop_shim_ptr(), len) }.to_vec();
-        let inst = self.instantiate(&bytes);
-        let f = inst.get_func(&self.store, "t").expect("shim exports t");
-        self.shims.insert((slot, code), f);
-        Some(f)
-    }
-
-    /// Rebuild the shared table from the engine's slot mirror — the per-event sync (installs only
-    /// happen between events, so a synced table is exact for the whole event).
+    /// Per-event table sync (see [`sync_table_in`]).
     fn sync_table(&mut self) {
-        let gen = temen_coop_table_gen() as i64;
-        if gen == self.synced_gen {
-            return;
-        }
-        let nfuncs = temen_coop_nfuncs();
-        let tsize = 1usize << temen_coop_table_log2();
-        for slot in 0..tsize {
-            let entry: Option<Func> = if slot < nfuncs {
-                match self.main.get_func(&self.store, &format!("f{slot}")) {
-                    Some(f) => Some(f),
-                    None => self.shim(slot as u32, -2),
-                }
-            } else {
-                let code = temen_coop_slot_code(slot as u32);
-                if code < 0 {
-                    None
-                } else if temen_coop_jit_wasm_by_handle_len(code) > 0 {
-                    let inst = match self.unit_insts.get(&code) {
-                        Some(i) => *i,
-                        None => {
-                            let bytes = unsafe {
-                                std::slice::from_raw_parts(
-                                    temen_coop_jit_wasm_by_handle_ptr(),
-                                    temen_coop_jit_wasm_by_handle_len(code),
-                                )
-                            }
-                            .to_vec();
-                            let i = self.instantiate(&bytes);
-                            self.unit_insts.insert(code, i);
-                            i
-                        }
-                    };
-                    inst.get_func(&self.store, "f0")
-                } else {
-                    self.shim(slot as u32, code)
-                }
-            };
-            let fr = match entry {
-                Some(f) => FuncRef::new(f),
-                None => FuncRef::null(),
-            };
-            self.table
-                .set(&mut self.store, slot as u64, Val::FuncRef(fr))
-                .unwrap();
-        }
-        self.synced_gen = gen;
+        sync_table_in(&mut self.store);
     }
 
     /// Sync window + globals into the shared instances before running an emitted entry.
@@ -985,8 +1036,8 @@ impl CoopB2Driver {
         self.sync_table();
         self.prime(temen_coop_mapped());
         let func = temen_coop_func();
-        let f = self
-            .main
+        let main = self.store.data().main.expect("main instantiated");
+        let f = main
             .get_func(&self.store, &format!("f{func}"))
             .unwrap_or_else(|| panic!("f{func} not exported"));
         let n = temen_coop_argv_len();
@@ -1019,15 +1070,16 @@ impl CoopB2Driver {
         self.sync_table();
         self.prime(temen_coop_mapped());
         let code = temen_coop_jit_code();
-        let inst = match self.unit_insts.get(&code) {
-            Some(i) => *i,
+        let key = UnitKey::Code(code);
+        let inst = match self.store.data().unit_insts.get(&key).copied() {
+            Some(i) => i,
             None => {
                 let bytes = unsafe {
                     std::slice::from_raw_parts(temen_coop_jit_wasm_ptr(), temen_coop_jit_wasm_len())
                 }
                 .to_vec();
-                let i = self.instantiate(&bytes);
-                self.unit_insts.insert(code, i);
+                let i = instantiate_in(&mut self.store, &bytes);
+                self.store.data_mut().unit_insts.insert(key, i);
                 i
             }
         };
@@ -1079,6 +1131,16 @@ impl CoopB2Driver {
 
     fn bounces(&self) -> &[u32] {
         &self.store.data().bounces
+    }
+
+    /// #1233: bounces that re-synced the table because the slot mirror moved mid-event.
+    fn bounce_syncs(&self) -> u32 {
+        self.store.data().bounce_syncs
+    }
+
+    /// Installed §22 units instantiated as real emitted wasm (not shims).
+    fn unit_count(&self) -> usize {
+        self.store.data().unit_insts.len()
     }
 }
 
@@ -2931,6 +2993,136 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     assert!(
         !d.bounces().is_empty(),
         "the staging ran through a cross-tier bounce"
+    );
+    temen_coop_close();
+}
+
+/// #1233 — the **Forth kernel** on the cooperative tier (asset-gated). `process`, the outer
+/// interpreter, tiers up as an emitted frame and, from *there*, `vm_jit_install`s each colon
+/// definition and `call.dyn`s it — the install-mid-event shape the per-event table sync assumed never
+/// happens ("installs only happen between events"): the emitted `call_indirect` hit a stale empty
+/// slot and the session died `COOP_RUN_TRAP` on `process` (func 42). With the post-bounce re-sync
+/// ([`sync_table_in`] from [`call_interp_host`]) the session runs to DONE observably identical to the
+/// oracle, the words dispatched natively to their emitted units. Non-vacuity pins the exact shape:
+/// ≥1 tier-up, ≥1 bounce that re-synced the table, ≥1 word instantiated as real emitted wasm.
+#[test]
+fn coop_forth_kernel_tiers_up_and_matches_the_oracle() {
+    let _g = ffi_guard();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/forth.temen");
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("SKIP: forth.temen absent (bash scripts/rebuild-assets.sh)");
+        return;
+    };
+    let kernel = temen_encode::decode_module(&bytes).expect("decode forth.temen");
+    // Words defined then called from the same emitted `process` frame; `sumsq` is a hot loop over
+    // `sq` so the word-to-word `call.dyn` edge is exercised natively, not just once.
+    const PROGRAM: &[u8] = b": sq ( n -- n ) dup * ;\n\
+                             : fact ( n -- n ) dup 1 > if dup 1- recurse * else drop 1 then ;\n\
+                             5 sq . 10 fact . cr\n\
+                             : sumsq ( n -- s ) 0 swap 0 do i sq + loop ;\n\
+                             100 sumsq . cr\n";
+
+    let want = onramp_exec(&kernel, PROGRAM);
+    assert_eq!(want.status, STATUS_OK, "the oracle must run the program");
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        PROGRAM.as_ptr(),
+        PROGRAM.len(),
+        0,
+    );
+    assert_eq!(
+        opened,
+        0,
+        "the Forth kernel must open on the coop tier (status {})",
+        temen_status()
+    );
+    let mut d = CoopB2Driver::new();
+    let mut tierups = 0u32;
+    loop {
+        match temen_coop_run() {
+            COOP_RUN_JIT_INVOKE => d.service_jit_invoke(),
+            COOP_RUN_TIERUP => {
+                tierups += 1;
+                let f = temen_coop_func() as usize;
+                d.service_tierup(kernel.funcs[f].results.len());
+            }
+            COOP_RUN_DONE => break,
+            ev => panic!(
+                "unexpected pump event {ev} (status {}, func {})",
+                temen_status(),
+                temen_coop_func()
+            ),
+        }
+    }
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    // SAFETY: capture slots staged by the DONE arm; this thread is the only accessor (FFI_LOCK).
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(
+        String::from_utf8_lossy(&got_out),
+        String::from_utf8_lossy(&want.stdout),
+        "stdout parity with the oracle"
+    );
+    assert!(tierups >= 1, "non-vacuity: the kernel must tier up");
+    assert!(
+        d.bounce_syncs() >= 1,
+        "non-vacuity: a mid-event install must have re-synced the table from its bounce"
+    );
+    assert!(
+        d.unit_count() >= 1,
+        "non-vacuity: at least one word must run as real emitted wasm"
+    );
+    eprintln!(
+        "forth coop: tierups={tierups} bounce_syncs={} units={} bounces={}",
+        d.bounce_syncs(),
+        d.unit_count(),
+        d.bounces().len()
+    );
+    temen_coop_close();
+}
+
+/// #1233 — the declared frontier of the Forth-on-coop shape: a **thread word** (`spawn`/`join`)
+/// reached from the emitted `process` frame. The kernel's `spawn` helper is interpreter-resident, so
+/// the `thread.spawn` surfaces inside a *bounce* — where a nested drive owns no scheduler to create
+/// the task in, and a `join` would park the emitted frame that is on the wasm stack. The nested drive
+/// keeps it an inert `CapFault`, the region traps, and the session declines to the interpreter
+/// (`COOP_RUN_TRAP`, status 3 — `play.js` logs the fallback and re-runs interpreted). If servicing
+/// lands, this pin flips: move the program into the parity test above. Absent asset ⇒ SKIP.
+#[test]
+fn coop_forth_thread_words_decline_to_the_oracle() {
+    let _g = ffi_guard();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/forth.temen");
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("SKIP: forth.temen absent (bash scripts/rebuild-assets.sh)");
+        return;
+    };
+    let kernel = temen_encode::decode_module(&bytes).expect("decode forth.temen");
+    const PROGRAM: &[u8] = b": work ( x -- y ) 1000 * ;\n' work 7 spawn join . cr\n";
+    let want = onramp_exec(&kernel, PROGRAM);
+    assert_eq!(want.status, STATUS_OK, "the oracle must run the program");
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        PROGRAM.as_ptr(),
+        PROGRAM.len(),
+        0,
+    );
+    assert_eq!(opened, 0, "the kernel must open on the coop tier");
+    let (_d, tierups) = drive_coop_b2_session_allow_trap(&kernel);
+    assert!(
+        tierups >= 1,
+        "non-vacuity: `process` must have tiered up first"
+    );
+    assert_eq!(
+        temen_status(),
+        STATUS_TRAP,
+        "a spawn reached from the emitted frame must decline the run (the declared frontier)"
     );
     temen_coop_close();
 }

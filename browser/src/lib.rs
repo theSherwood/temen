@@ -1881,7 +1881,11 @@ pub extern "C" fn temen_par_root(
             args.push(Value::I32(host.grant_module(m)));
         }
         if cfg.minter_quota > 0 {
-            args.push(Value::I32(host.grant_budget(0, (cfg.minter_quota) as i64, 0)));
+            args.push(Value::I32(host.grant_budget(
+                0,
+                (cfg.minter_quota) as i64,
+                0,
+            )));
         }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
@@ -13192,7 +13196,8 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_len(code: i32) -> usize {
     s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }
 
-/// Pointer to the emitted wasm the last [`temen_coop_jit_wasm_by_handle_len`] resolved.
+/// Pointer to the emitted wasm the last [`temen_coop_jit_wasm_by_handle_len`] /
+/// [`temen_coop_jit_wasm_by_slot_len`] resolved.
 #[no_mangle]
 pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
     unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(core::ptr::null(), |s| {
@@ -13200,6 +13205,37 @@ pub extern "C" fn temen_coop_jit_wasm_by_handle_ptr() -> *const u8 {
             .as_ref()
             .map_or(core::ptr::null(), |w| w.as_ptr())
     })
+}
+
+/// #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`, packed
+/// `domain << 32 | unit` (`-1` empty/natural): the key the host caches an installed slot's emitted
+/// unit by, and fetches its wasm through ([`temen_coop_jit_wasm_by_slot_len`]). Unlike the code
+/// handle ([`temen_coop_slot_code`]) it survives the guest's `Jit.release` of that handle — the
+/// ordinary compile → install → release pattern leaves the unit installed with no live handle.
+#[no_mangle]
+pub extern "C" fn temen_coop_slot_unit(slot: u32) -> i64 {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(-1, |s| {
+        s.run
+            .slot_unit(slot)
+            .map_or(-1, |(d, u)| ((d as i64) << 32) | u as i64)
+    })
+}
+
+/// Emitted-wasm length for the unit installed at dispatch-table `slot` (`0` if the slot is empty or
+/// the unit is interpreter-only) — the table rebuild's fetch, resolved through the engine's own slot
+/// mirror rather than the guest's (revocable) code handle, so a released-after-install unit still
+/// rebuilds (#1233). Bytes via [`temen_coop_jit_wasm_by_handle_ptr`] (the shared buffer), valid
+/// until the next call of either accessor.
+#[no_mangle]
+pub extern "C" fn temen_coop_jit_wasm_by_slot_len(slot: u32) -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the session.
+    let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
+        return 0;
+    };
+    let unit = s.run.slot_unit(slot);
+    let h = s.run.host_mut();
+    s.jit_wasm_by_handle = unit.and_then(|(cd, cu)| h.jit_unit_wasm_or_emit(cd, cu)); // #1301
+    s.jit_wasm_by_handle.as_ref().map_or(0, |w| w.len())
 }
 
 /// Generate the **bounce-shim module** for dispatch-table `slot` — a standalone one-function wasm
