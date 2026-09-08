@@ -1,6 +1,6 @@
 # Detached windows on the JIT tiers, and the default-spawn question  [DRAFT — proposed as PROCESS.md §5a]
 
-**Status:** owner-accepted 2026-09-04 — Decision A in progress (#1253 tracks the slices), Decision B tracked in #1289 pending the §4a rulings. Nothing here is built; the interpreter half it
+**Status:** owner-accepted 2026-09-04 — Decision A in progress (#1253 tracks the slices), Decision B tracked in #1289. §4a rulings R1 (freeze authority as an explicit capability — supersedes "durable ⇒ nested") and R3 (placement is a parameter, not a form) **accepted 2026-09-08 and recorded in INVARIANTS.md**; R2 (window minter → `Budget.mem`) still pending. Nothing here is built; the interpreter half it
 rests on **is** built (PROCESS.md §5, 2026-07-23). Written for #1253 / epic #706 after the
 op-13 phase-child sizing work exposed that "grow the window in place" cannot be delivered by
 the sub-window model at all.
@@ -318,8 +318,8 @@ it. The pattern is served by the default; the specialized case opts in.
 | Invariant | Tension | Recommended ruling |
 |---|---|---|
 | **#3 authority moves only down the grant graph** | Today only a `WindowMinter` (embedder-granted, byte-quota'd, "spawn *evidence*") may mint an independent window. If detached becomes the default, an ordinary `Instantiator` holder mints independent VA with no minter — VA becomes ambient-under-`Instantiator`. | Fold the minter's byte quota into **`Budget.mem`** (PROCESS.md §5's budget vector already has a `mem` field; budgets attenuate down the grant graph, so a child can never mint more than its ancestors granted). The minter then stops being a separate authority and becomes the budget it always was in spirit. Alternative: an explicit owner decision that VA is not a scarce authority — **not** recommended on wasm32. |
-| **#14 one frontier (the durability cell)** | Detached windows **refuse** durable today (multi-window freeze = O6, open). Detached-by-default would make durable §14 nesting refuse *by default* — verbatim the "standing refuse workaround with no tracked plan" #14 forbids. | **Durable ⇒ nested.** A durable child must be snapshottable by its parent, and a snapshot *is* a read — so a durable child is exposed by definition. PROCESS.md §6 already states the rule: a domain may be *confidential* **or** *ancestor-durable*, **not both**. So the default is detached *unless the child is durable*, in which case the placement is nested (the alias grant is implied by durability). No O6 needed; DURABILITY.md's subtree-freeze derivation stays intact; and it is the posture the design already committed to. Evaluate this first — it is the cheapest coherent answer. |
-| **#13 one canonical form** | Detached-default + an alias placement is two live placement forms, which #13 forbids as a standing dual-mode ("a migration's own scaffolding … never a standing compatibility contract"). | **One canonical form, parameterized by a grant.** The child-side ABI is byte-identical under both placements (§4(a)); what differs is a grant the parent issues. #13 governs *forms*, not *parameters* — a `SharedRegion` mapped or not is not "two forms" either. Record this reading, dated, in INVARIANTS.md. If the owner rejects it, the alternative is a dated deadline to delete the carve path once §13 `SharedRegion` covers the Stage-1 hand-offs. |
+| **#14 one frontier (the durability cell)** | Detached windows **refuse** durable today (multi-window freeze = O6, open). Detached-by-default would make durable §14 nesting refuse *by default* — verbatim the "standing refuse workaround with no tracked plan" #14 forbids. | **Durable ⇒ nested.** A durable child must be snapshottable by its parent, and a snapshot *is* a read — so a durable child is exposed by definition. PROCESS.md §6 already states the rule: a domain may be *confidential* **or** *ancestor-durable*, **not both**. So the default is detached *unless the child is durable*, in which case the placement is nested (the alias grant is implied by durability). No O6 needed; DURABILITY.md's subtree-freeze derivation stays intact; and it is the posture the design already committed to. Evaluate this first — it is the cheapest coherent answer. **Accepted 2026-09-08, but reframed (INVARIANTS #14 ruling, #1289 R1):** the landed ruling is *not* "durable ⇒ nested" — it is **freeze authority as an explicit, attenuating capability**, per grant not per placement. That subsumes the row's answer for the nested case (a nested child's parent holds freeze authority by the aliasing) and is strictly more permissive: a **detached** child may be platform-durable *and* ancestor-confidential, so a durable child need not be nested. The current op-15 detached-durable refusal is therefore an *in-flight* un-wired-support gap (reach the detached child's `Mem`+`Host` at quiesce; restore its `Attestation`), not a placement rule. |
+| **#13 one canonical form** | Detached-default + an alias placement is two live placement forms, which #13 forbids as a standing dual-mode ("a migration's own scaffolding … never a standing compatibility contract"). | **One canonical form, parameterized by a grant.** The child-side ABI is byte-identical under both placements (§4(a)); what differs is a grant the parent issues. #13 governs *forms*, not *parameters* — a `SharedRegion` mapped or not is not "two forms" either. Record this reading, dated, in INVARIANTS.md. If the owner rejects it, the alternative is a dated deadline to delete the carve path once §13 `SharedRegion` covers the Stage-1 hand-offs. **Accepted as-is 2026-09-08 (INVARIANTS #13 ruling, #1289 R3):** placement is a parameter, not a form; the escape hatch (a dated carve-path deletion if the two host-side paths ever diverge) is retained as recorded. |
 
 **Net effect on the invariants** (full table in §6.5): **0 violated; 6 strengthened** (#1 smaller
 default TCB, **#2 the masking hinge — "no D38 contact"**, #3, #4, #8 control≠data plane, #12);
@@ -415,10 +415,15 @@ DURABILITY.md 149–151. If detached children were ever durable, the cost is:
 | D5 | `FrozenNested::carve_off` semantics | 8598; snapshot 898 | S |
 | D6 | DAP/time-travel checkpoint is an independent second copy of the assumption | 25202–25264; bytecode 4762–4816 | M |
 
-The "durable ⇒ nested" ruling makes all six moot: a durable child is snapshotted by its parent,
-a snapshot is a read, so it is exposed by definition — PROCESS.md §6 already says confidential
-XOR ancestor-durable. Unchanged either way: digest gate, handle table, `TAG_SERVE`/`TAG_JIT`,
-`freeze_sink`, `completed_result`.
+**Under the landed ruling (R1, freeze authority as an explicit capability), D1–D6 split by
+placement rather than all going moot.** For a **nested** durable child they are the *current* carve
+machinery (the parent holds freeze authority by the aliasing) — the existing subtree freeze, unchanged.
+For a **detached** durable child — which R1 permits, unlike the superseded "durable ⇒ nested" — they
+become *in-flight* plumbing: the child freezes as its own root-shaped artifact and a subtree snapshot
+is a consistent cut over the parent's and each detached child's (the run driver reaches the child's
+`Mem`+`Host` at quiesce; thaw restores its `Attestation`). So D1–D6 are not eliminated by a placement
+rule; they are the tracked work behind lifting the op-15 detached-durable refusal. Unchanged either
+way: digest gate, handle table, `TAG_SERVE`/`TAG_JIT`, `freeze_sink`, `completed_result`.
 
 **Fork (#816): unchanged under both decisions.** The `bare` gate (lib.rs:5682–5689) refuses to
 fork a parent with `nested_children` or `child_hosts`, so "twin inherits child carves" is

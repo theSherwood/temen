@@ -147,9 +147,14 @@ is a parser over attacker-controlled frames in the host.
   units (`DESIGN.md` §22): the host runs the pass on submitted IR before
   verification, so guest-driven JIT composes for free.
 - **Snapshot unit = the domain, closed over its nesting subtree (§14).** State lives
-  in the domain (window, vCPUs/fibers, handle/dispatch tables); a child's window is a
-  power-of-two sub-range of the parent's (`Window::sub`), and a fault-suspended child
-  can only be drained-then-unwound if its code is instrumented.
+  in the domain (window, vCPUs/fibers, handle/dispatch tables); a **nested** child's window
+  is a power-of-two sub-range of the parent's (`Window::sub`), and a fault-suspended child
+  can only be drained-then-unwound if its code is instrumented. A **detached** child (its own
+  window, not a sub-range — §14 / DETACHED_JIT.md) is *not* covered by this subtree freeze:
+  under the freeze-authority ruling (INVARIANTS #14, #1289 R1) it freezes as its own
+  root-shaped artifact and a subtree snapshot is a consistent cut over the parent's and each
+  detached child's — in-flight plumbing (the run driver must reach the detached child's
+  `Mem`+`Host` at quiesce), which is why a durable op-15 detached spawn refuses today.
 
 **Enforcement (one flag check at instantiate/install):** *a durable domain admits
 only freezable modules and may only spawn durable children.* STW quiesces the subtree

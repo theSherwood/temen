@@ -187,6 +187,17 @@ emitting the old layout after the new one exists; or "old artifacts still use it
 keeping a fork. (Owner decision 2026-08-25; sharpens invariant 1 — every retained fork is TCB
 surface and an assumption the tree can no longer make.)
 
+**Ruling — a §14 child's placement is a parameter, not a form (2026-09-08, #1289 R3):** whether a
+confined child sits in a **nested carve** (a sub-range of the parent's window) or a **detached
+window** (its own reservation) is a grant *parameter*, not a second form. The child-side ABI is
+byte-identical under both (base 0, its own reservation — DETACHED_JIT.md §4a), and the snapshot codec
+has one root-shaped form applied at one more scope — so there is still exactly one child ABI and one
+artifact form for the tree to assume. A `SharedRegion` mapped or unmapped is not two forms, and
+neither is this. Escape hatch retained: should the host-side carve path (STW broadcast through the
+parent's `Mem`) and the detached path ever diverge into two genuinely different mechanisms rather than
+one parameterized one, *that* is the #13 violation — closed by a dated deletion of the carve path (the
+#1289 Decision-B convergence), never by keeping both.
+
 ## 14. One frontier, consistent across every axis
 
 The set of **accepted** guest-observable capabilities is the *frontier*. New functionality may be
@@ -222,6 +233,25 @@ consumer"; a standing pre-size / over-allocate / refuse workaround with no track
 that hides un-wired support rather than proven impossibility; a spike merged as a supported feature
 without either propagation or a recorded exception. (Owner decision 2026-08-27; sharpens invariants
 1 + 9 + 13; the #816 warm-coop-grows-but-single-shot-JIT-pre-sizes gap.)
+
+**Ruling — freeze authority is an explicit, attenuating capability (2026-09-08, #1289 R1; closes
+O14's conceptual half):** who may snapshot a domain is a capability (invariant 3), not a consequence of
+its placement. The platform holds freeze authority over every domain it runs; an ancestor holds it
+over a descendant *only by grant*, attenuating down the grant graph like any other authority, and
+`attest.freeze_authority` reports the actual holders. Because a snapshot is a read of the window
+(PROCESS.md §6), freeze-ability follows window-read authority: a **nested carve** child's window is a
+sub-range of its parent's, so the parent can read — hence freeze — it by construction (the grant is
+implied by the aliasing, the current behavior); a **detached** child owns its window, so an ancestor
+can freeze it *only if granted*. Placement is therefore orthogonal to durability, and §6's rule reads:
+*confidential = freezable by nobody below the platform; a domain is confidential **or**
+ancestor-freezable per grant, not per placement* — a detached child may be platform-durable **and**
+ancestor-confidential at once. A detached child freezes as its own root-shaped artifact (the one codec
+form, R3); a subtree snapshot is a consistent cut over the parent's artifact and each detached child's,
+coordinated by the authority holder. This makes the op-15 durable refusal an **un-wired-support** gap
+(*in flight* — the run driver cannot yet reach a detached child's `Mem`+`Host` at quiesce, and a thaw
+must restore a child's `Attestation`, O14's remaining plumbing), **not** a placement-derived decline
+this invariant would forbid; it becomes "refuse unless a freeze-authority holder is registered for this
+child" once that lands.
 
 **Accepted exceptions** — a *genuine impossibility* on some axis, each carrying the owner's dated
 approval; adding one always requires owner sign-off:
