@@ -3087,6 +3087,46 @@ fn coop_forth_kernel_tiers_up_and_matches_the_oracle() {
     temen_coop_close();
 }
 
+/// #1233 — the declared frontier of the Forth-on-coop shape: a **thread word** (`spawn`/`join`)
+/// reached from the emitted `process` frame. The kernel's `spawn` helper is interpreter-resident, so
+/// the `thread.spawn` surfaces inside a *bounce* — where a nested drive owns no scheduler to create
+/// the task in, and a `join` would park the emitted frame that is on the wasm stack. The nested drive
+/// keeps it an inert `CapFault`, the region traps, and the session declines to the interpreter
+/// (`COOP_RUN_TRAP`, status 3 — `play.js` logs the fallback and re-runs interpreted). If servicing
+/// lands, this pin flips: move the program into the parity test above. Absent asset ⇒ SKIP.
+#[test]
+fn coop_forth_thread_words_decline_to_the_oracle() {
+    let _g = ffi_guard();
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/web/assets/forth.temen");
+    let Ok(bytes) = std::fs::read(path) else {
+        eprintln!("SKIP: forth.temen absent (bash scripts/rebuild-assets.sh)");
+        return;
+    };
+    let kernel = temen_encode::decode_module(&bytes).expect("decode forth.temen");
+    const PROGRAM: &[u8] = b": work ( x -- y ) 1000 * ;\n' work 7 spawn join . cr\n";
+    let want = onramp_exec(&kernel, PROGRAM);
+    assert_eq!(want.status, STATUS_OK, "the oracle must run the program");
+    let opened = temen_coop_open(
+        bytes.as_ptr(),
+        bytes.len(),
+        PROGRAM.as_ptr(),
+        PROGRAM.len(),
+        0,
+    );
+    assert_eq!(opened, 0, "the kernel must open on the coop tier");
+    let (_d, tierups) = drive_coop_b2_session_allow_trap(&kernel);
+    assert!(
+        tierups >= 1,
+        "non-vacuity: `process` must have tiered up first"
+    );
+    assert_eq!(
+        temen_status(),
+        STATUS_TRAP,
+        "a spawn reached from the emitted frame must decline the run (the declared frontier)"
+    );
+    temen_coop_close();
+}
+
 // ---- #816 env-routed tier-up: a §14 confined child served over REAL emitted wasm ----------------
 
 /// #816: opt the on-ramp powerbox into the `"instantiator"` grant for this test, resetting on drop

@@ -911,6 +911,11 @@ jobs:
           # differential plays the driver's role; this is the shipped `driveCoopTierupRun`, the only
           # place the post-bounce `"win"` fan-out over a relocating backing is exercised).
           node browser-coop-grow-test.mjs
+          # #1233: the Forth kernel on the cooperative tier through the REAL JS driver — its outer
+          # interpreter tiers up and defines/dispatches §22 words from the emitted frame (a mid-bounce
+          # install + the by-slot unit fetch), byte-identical to the interpreter; thread words pin the
+          # declared decline. The native wasmi pin is `coop_forth_kernel_tiers_up_and_matches_the_oracle`.
+          node browser-forth-coop-test.mjs
           # A guest-issued op 15 on the op-13 loop (#1286): the driver's child is minted its own Memory by
           # the servicer and driven emitted; args payload, attest, growth.
           node browser-op13jit-detached-test.mjs
