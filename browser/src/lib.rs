@@ -1881,7 +1881,11 @@ pub extern "C" fn temen_par_root(
             args.push(Value::I32(host.grant_module(m)));
         }
         if cfg.minter_quota > 0 {
-            args.push(Value::I32(host.grant_budget(0, (cfg.minter_quota) as i64, 0)));
+            args.push(Value::I32(host.grant_budget(
+                0,
+                (cfg.minter_quota) as i64,
+                0,
+            )));
         }
         // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
         return match bytecode::Vcpu::new_root_with_powerbox(
