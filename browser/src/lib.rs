@@ -9673,12 +9673,14 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 }
 
 /// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
-/// a 4th cap — **`exec`** (`make_exec` over the shared memfs, running nifler on the interpreter) — so a
-/// tiered-up nimsem can shell out to nifler for stdlib parsing it didn't get pre-crawled. `exec` is a
-/// `HOST_PROC`, so nimsem-emitted's `exec` call bounces to `call_interp` over the granted host exactly
-/// like `fs`; the nifler sub-spawns run host-side while nimsem's **sema** (the dominant cost) tiers up.
-/// `nifler` is the top-level nifler module the exec spawns. Everything else matches `phase_open_argv`
-/// (packed argv/seeds, output key); nimsem's ~256 MiB peak grows in its own detached memory (#1288).
+/// a 4th cap — **`exec`** (`make_exec` over the shared memfs) — so a tiered-up nimsem can shell out to
+/// nifler for stdlib parsing it didn't get pre-crawled. `exec` is a `HOST_PROC`, so nimsem-emitted's
+/// `exec` call bounces to `call_interp` over the granted host exactly like `fs`, while nimsem's **sema**
+/// (the dominant cost) tiers up. #1025 3d: the `nifler` blob is the **child-entry** `nifler_ce`, and the
+/// exec spawns it as a **confined §14 op-13 grandchild** ([`nimc::run_phase_op13`]) — the guest services
+/// its own `exec` through the confinement path rather than an inline host run (byte-identical `.p.nif`).
+/// Everything else matches `phase_open_argv` (packed argv/seeds, output key); nimsem's ~256 MiB peak grows
+/// in its own detached memory (#1288).
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
@@ -9698,10 +9700,11 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+    // #1025 3d: the exec's nifler is the **child-entry** `nifler_ce` (run as a §14 op-13 grandchild).
+    let Ok(nifler_ce) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
         return -STATUS_DECODE_ERR;
     };
-    if temen_verify::verify_module(&nifler).is_err() {
+    if temen_verify::verify_module(&nifler_ce).is_err() {
         return -STATUS_VERIFY_ERR;
     }
     let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
@@ -9720,7 +9723,7 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
             &argv_refs,
             seeds,
             readback,
-            Some(std::sync::Arc::new(nifler)),
+            Some(std::sync::Arc::new(nifler_ce)),
         )
     }
 }
@@ -9850,18 +9853,25 @@ unsafe fn op13_phase_open_impl(
         Value::I32(stdout_h),
         Value::I32(exit_h),
     ];
-    if let Some(nifler) = exec_nifler {
-        // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`), running nifler on the
-        // interpreter (no `nifler_ce` → no re-entrant tier-up). Forkable so op-13 can re-grant it.
-        let exec_init: temen_interp::HostProc =
-            nimc::make_exec(nifler.clone(), None, std::sync::Arc::clone(&factory));
+    if let Some(nifler_ce) = exec_nifler {
+        // #1025 3d: the `exec` cap = `make_exec` over the SAME shared memfs (`factory`), spawning nifler
+        // as a **confined §14 op-13 grandchild** (`run_phase_op13`) rather than an inline host-proc run —
+        // the guest services its own `exec` through the confinement path (matching the headless compile's
+        // Gap-2 keystone). `nifler_ce` is the child-entry nifler; it's passed as `make_exec`'s
+        // `Some(..)` arg (the first arg is then unused). The nifler grandchild's `.p.nif` is byte-identical
+        // to the inline run (`op13_nifler_crawl_matches_inline`). Forkable so op-13 can re-grant it.
+        let exec_init: temen_interp::HostProc = nimc::make_exec(
+            nifler_ce.clone(),
+            Some(nifler_ce.clone()),
+            std::sync::Arc::clone(&factory),
+        );
         let exec_fork: temen_interp::HostProcFork = {
-            let nifler = std::sync::Arc::clone(&nifler);
+            let nifler_ce = std::sync::Arc::clone(&nifler_ce);
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    nifler.clone(),
-                    None,
+                    nifler_ce.clone(),
+                    Some(nifler_ce.clone()),
                     std::sync::Arc::clone(&factory),
                 ))
             })

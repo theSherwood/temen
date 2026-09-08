@@ -989,14 +989,14 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
 // **nimsem** and **hexer** — the ~180s dominators — also run as §14 op-13 detached emitted children, not
 // just the nifler crawl. Orchestration mirrors `nimc::compile_nim`'s policy in JS: crawl the import
 // closure (tiered nifler, capturing each module's deps + role), toposort deps-first (System first), then
-// per module in order run nimsem (tiered, 4-cap `exec`→nifler host-side) and hexer (tiered, 3-cap),
-// threading one growing memfs and seeding every `.p/.s/.x` output into the accumulator
-// `temen_compile_nim_fs` mounts. The final `compile_nim` call (its nifler/nimsem/hexer skip-checks all
-// satisfied) then only links + runs. Byte-identical to the all-interpreter card
-// (`browser-nim-wholecard-op13-test`). `assets` = `{niflerCe, nimsemCe, hexerCe, nifler}` (the top-level
-// nifler is nimsem's `exec` target). Best-effort: any phase that traps is left for the interpreter card.
+// per module in order run nimsem (tiered, 4-cap `exec`→nifler as a §14 op-13 grandchild, #1025 3d) and
+// hexer (tiered, 3-cap), threading one growing memfs and seeding every `.p/.s/.x` output into the
+// accumulator `temen_compile_nim_fs` mounts. The final `compile_nim` call (its nifler/nimsem/hexer
+// skip-checks all satisfied) then only links + runs. Byte-identical to the all-interpreter card
+// (`browser-nim-wholecard-op13-test`). `assets` = `{niflerCe, nimsemCe, hexerCe}` (niflerCe is both the
+// crawl child and nimsem's `exec` target). Best-effort: any phase that traps is left for the interpreter card.
 export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey) {
-  const { niflerCe, nimsemCe, hexerCe, nifler } = assets;
+  const { niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
   const u8 = () => new Uint8Array(memory.buffer);
   const enc = new TextEncoder(), dec = new TextDecoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
@@ -1070,6 +1070,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   fs.set(mainPath.replace(/^\//, ''), mainSrc);
 
   // ---- phase 1: crawl the import closure with nifler (tiered), capturing the module graph -----------
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
+  const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
   const mods = new Map(); // stem -> { file, deps: [stem], role }
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   let crawled = 0;
@@ -1107,6 +1109,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     mods.set(stem, { file, deps: depStems, role });
   }
 
+  const tCrawl = now();
   // ---- dependency order (DFS postorder, System first) — mirrors nimc::toposort ----------------------
   const order = [], mark = new Map();
   const visit = (s) => {
@@ -1125,9 +1128,9 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const flag = role === 'System' ? ['--isSystem'] : role === 'Main' ? ['--isMain'] : [];
     const argv = packStrs(['nimsem', '--define:nimNativeAlloc', '--define:nimNativeIo', 'm', ...flag, `nimcache/${stem}.p.nif`]);
     const out = enc.encode(`nimcache/${stem}.s.nif`), seed = packFiles(fs);
-    const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
-    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
-    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
+    const cp = pushBytes(nimsemCe), np = pushBytes(niflerCe), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, niflerCe.length, ap, argv.length, sp, seed.length, op, out.length);
+    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, niflerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
     const r = await drive(`${cacheKey}-nimsem`);
     if (r === null || r !== 0) { if (r !== null) ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem ${r === null ? 'trapped (' + lastTrap + ')' : 'status ' + r} on ${stem}` }; }
@@ -1143,6 +1146,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     semmed++;
   }
 
+  const tNimsem = now();
   // ---- phase 3: hexer per module (tiered, 3-cap) — main gets the app-entry glue --------------------
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
@@ -1165,7 +1169,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     fs.set(key, xnif); putFile(key, xnif); hexed++;
   }
 
-  return { crawled, semmed, hexed };
+  const tHexer = now();
+  return { crawled, semmed, hexed, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
