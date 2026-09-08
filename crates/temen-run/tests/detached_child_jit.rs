@@ -1,13 +1,13 @@
 //! PROCESS.md §5 / #1287 — **`instantiate_detached` (op 15) on the native JIT**, differential against the
 //! tree-walker. The parent (compiled by Cranelift) spawns a separate-module child DETACHED: the JIT's
-//! op-15 thunk takes the `WindowMinter` quota, builds the child powerbox through
+//! op-15 thunk takes the detached-spawn `Budget` quota, builds the child powerbox through
 //! `Host::spawn_detached_child` (attests `window_exposed = false`, starter caps over the reservation),
 //! compiles the child over a **decoupled window** (its declared 64 KiB committed inside a root-sized lazy
 //! reservation), seeds the module's data + the spawn-time argv payload into that window, and runs it on
 //! its own OS thread — no carve, no copy-in, no copy-back. The child reads the argv word, `self.attest`s,
 //! `vm_map`s past its declared window (committing a tail page of ITS reservation through its own
 //! `AddressSpace`), stores/loads on the grown page and returns `word + attest`. Same result as the
-//! interpreter's op-15 arm; an exhausted minter refuses `-EINVAL` on both.
+//! interpreter's op-15 arm; an exhausted budget refuses `-EINVAL` on both.
 
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
@@ -21,7 +21,7 @@ fn grant_hooks() -> GrantChildHooks {
         build: temen_run::grant_child_build,
         build_named: temen_run::grant_named_child_build,
         build_detached: temen_run::grant_detached_child_build,
-        minter_take: temen_run::minter_take,
+        budget_mem_take: temen_run::budget_mem_take,
         bind_imports: temen_run::child_bind_imports,
         release: temen_run::grant_child_release,
         mint: temen_run::child_offer_mint,
@@ -62,7 +62,7 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the `WindowMinter`. Stores the args
+/// The parent: `v0` Instantiator, `v1` the child `Module`, `v2` the detached-spawn `Budget`. Stores the args
 /// blob (`argc 1`, `"hello-detached\0"`) as three words at 18432, spawns the child detached (9-arg op 15,
 /// payload `(18432, 24)`, no grants, entry 0, window 2^16), then joins it — or, in the refusal probe,
 /// returns the spawn's own result.
@@ -107,8 +107,8 @@ fn host(child: &temen_ir::Module, minter_quota: u64) -> (Host, [i32; 3]) {
     let mut host = Host::new();
     let inst = host.grant_instantiator(0, 1u64 << 17);
     let modh = host.grant_module(child);
-    let minter = host.grant_window_minter(minter_quota);
-    (host, [inst, modh, minter])
+    let budget = host.grant_budget(0, (minter_quota) as i64, 0);
+    (host, [inst, modh, budget])
 }
 
 fn run_jit(parent: &temen_ir::Module, child: &temen_ir::Module, quota: u64) -> i64 {
@@ -194,7 +194,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 "#;
 
 /// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` on both backends, probeably, and
-/// the minter keeps its whole quota (#1299 pins the native thunk's gate alongside the tree-walker's).
+/// the budget keeps its whole quota (#1299 pins the native thunk's gate alongside the tree-walker's).
 #[test]
 fn a_durable_domain_refuses_a_detached_spawn_on_both_backends() {
     let p = module(SPAWN_ONLY_PARENT);
@@ -241,8 +241,8 @@ fn a_durable_domain_refuses_a_detached_spawn_on_both_backends() {
         };
         assert_eq!(r, -22, "jit={jit}: EINVAL, not a trap");
         assert!(
-            host.window_minter_take(h[2], 1 << 16),
-            "jit={jit}: the refusal charged the minter nothing"
+            host.budget_mem_take(h[2], 1 << 16),
+            "jit={jit}: the refusal charged the budget nothing"
         );
     }
 }

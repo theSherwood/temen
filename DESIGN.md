@@ -1701,8 +1701,9 @@ requirement.
   syscall never offers); the `Jit.invoke` (Model A) vs `install` (Model B2) split (both shipped
   and pinned; invoke = signature-checked entry without table slots, and the split carries the
   unit concurrency contract — installed units join the caller's concurrency model, invoked
-  units stay seam-free leaves); `SharedRegion` vs `WindowMinter` (distinct authorities:
-  shareable backing vs detached windows — not mechanism duplication). The yardstick that
+  units stay seam-free leaves); `SharedRegion` vs the detached-window mint (distinct authorities:
+  shareable backing vs detached VA — the latter folded into `Budget.mem` per #1289 R2, not a
+  separate `WindowMinter` cap, since minting VA *is* spending the memory budget). The yardstick that
   governed the sweep: a distinct authority earns a distinct kind; a distinct *mechanism* for
   the same authority does not.
 - **Revocation** (§7 PARKED): host-mediated invalidation + generation counters

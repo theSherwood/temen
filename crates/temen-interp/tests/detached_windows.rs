@@ -1,9 +1,9 @@
-//! PROCESS.md §5 — **detached windows**: a child spawned through a `WindowMinter` capability
+//! PROCESS.md §5 — **detached windows**: a child spawned through a detached-spawn `Budget` capability
 //! (`Instantiator.instantiate_detached`, op 15) runs in a fresh platform window *outside* its
 //! spawner's — no ancestor below the platform holds read authority, and the child attests
 //! `window_exposed = false` (the jacl distrust-spawner trust anchor). Detachment severs READ,
 //! not lifecycle (the spawner keeps kill/join) and not coordination (live offers work — the
-//! linkage is the powerbox, not the window). The minter's byte quota is host-enforced at each
+//! linkage is the powerbox, not the window). The budget's byte quota is host-enforced at each
 //! mint; misses refuse probeably.
 
 use std::sync::Arc;
@@ -39,7 +39,7 @@ block 0 (va: i64, vb: i64) {
 }
 "#;
 
-/// The parent: spawns the server DETACHED (op 15 — minter, module, no grants), wires its live
+/// The parent: spawns the server DETACHED (op 15 — budget, module, no grants), wires its live
 /// offer (`child_offer` — identical to the nested form: the linkage is the powerbox Arc), calls
 /// `add(40, 2)` through it (park, serve, reply), joins. Composite: join(1)*100 + 42 = 142.
 const DETACHED_CALLER: &str = r#"
@@ -75,7 +75,7 @@ fn a_detached_child_serves_live_calls_from_a_window_its_parent_cannot_see() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 12);
+    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -140,7 +140,7 @@ fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed(
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 12);
+    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -157,7 +157,7 @@ fn a_detached_child_attests_window_unexposed_where_a_nested_one_attests_exposed(
     );
 }
 
-/// The minter's quota is the attenuation: with exactly one window's worth (4096 bytes), the
+/// The budget's quota is the attenuation: with exactly one window's worth (4096 bytes), the
 /// first detached spawn succeeds and the second refuses probeably (`-EINVAL`, nothing
 /// charged) — a numeric quota, host-enforced at mint. Composite: first_failed*10 +
 /// second_failed = 0*10 + 1 = 1.
@@ -194,7 +194,7 @@ fn the_minter_quota_bounds_detached_mints() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 12); // exactly one 2^12 window
+    let hw = host.grant_budget(0, (1 << 12) as i64, 0); // exactly one 2^12 window
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -211,8 +211,8 @@ fn the_minter_quota_bounds_detached_mints() {
     );
 }
 
-/// A forged minter handle (the Instantiator handle itself, wrong type) refuses probeably —
-/// the minter is spawn evidence, and no evidence means no detached window, never a trap.
+/// A forged budget handle (the Instantiator handle itself, wrong type) refuses probeably —
+/// the budget is spawn evidence, and no evidence means no detached window, never a trap.
 const FORGED_MINTER: &str = r#"
 memory 17
 
@@ -320,7 +320,7 @@ fn a_detached_child_does_not_rendezvous_with_its_parent_on_anonymous_memory() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 17);
+    let hw = host.grant_budget(0, (1 << 17) as i64, 0);
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &a,
@@ -392,7 +392,7 @@ fn a_detached_child_receives_the_spawn_time_args_payload() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 16);
+    let hw = host.grant_budget(0, (1 << 16) as i64, 0);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -445,7 +445,7 @@ fn a_detached_child_grows_past_its_declared_window() {
     let mut host = Host::new();
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 16);
+    let hw = host.grant_budget(0, (1 << 16) as i64, 0);
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -482,7 +482,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// PROCESS.md §5: a **durable** domain refuses `instantiate_detached` outright — a detached window is
 /// outside the subtree snapshot, so the spawn lands `-EINVAL` probeably (never a trap) **and charges the
-/// minter nothing** (#1299 pins the tree-walker's `!durable` gate, which no test asserted before).
+/// budget nothing** (#1299 pins the tree-walker's `!durable` gate, which no test asserted before).
 #[test]
 fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
     let a = module(SPAWN_ONLY_PARENT);
@@ -491,7 +491,7 @@ fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
     host.set_durable(true);
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(1 << 16); // exactly the child's window
+    let hw = host.grant_budget(0, (1 << 16) as i64, 0); // exactly the child's window
     let mut fuel = 5_000_000u64;
     let r = run_with_host(
         &a,
@@ -503,7 +503,7 @@ fn a_durable_domain_refuses_a_detached_spawn_and_charges_nothing() {
     .expect("run");
     assert_eq!(r, vec![Value::I64(-22)], "EINVAL, not a trap");
     assert!(
-        host.window_minter_take(hw, 1 << 16),
-        "the refusal charged the minter nothing: the whole quota is still there"
+        host.budget_mem_take(hw, 1 << 16),
+        "the refusal charged the budget nothing: the whole quota is still there"
     );
 }

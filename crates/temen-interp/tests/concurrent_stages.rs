@@ -228,7 +228,7 @@ block 5 (vsum: i64, vtos: i64) {
 
 /// The **detached** variant — the §5 model sentence as a test ("a shell would plausibly run
 /// coreutils detached"): the same one-slot ring, but the two stages are spawned through a
-/// `WindowMinter` (op 15) from their own module into windows the parent cannot read. The
+/// detached-spawn `Budget` (op 15) from their own module into windows the parent cannot read. The
 /// region grant rides the same op-11-format named-grant records; the module's own data
 /// segment carries the `"ring"` name into each private window. Private memory and an
 /// explicit shared channel compose — exactly the separate-process discipline, in-process.
@@ -400,7 +400,7 @@ fn two_detached_stages_pipe_through_a_shared_region_ring() {
     let hi = host.grant_instantiator(0, 1u64 << 17);
     let ha = host.grant_address_space(0, 1u64 << 17);
     let hm = host.grant_module(&b);
-    let hw = host.grant_window_minter(2 << 17); // exactly two 2^17 windows
+    let hw = host.grant_budget(0, (2 << 17) as i64, 0); // exactly two 2^17 windows
     let mut fuel = 50_000_000u64;
     let r = run_with_host(
         &a,

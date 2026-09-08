@@ -338,11 +338,11 @@ pub(crate) struct Nursery {
     /// param threads through the compile pipeline.
     grant_build: std::sync::atomic::AtomicUsize,
     grant_build_named: std::sync::atomic::AtomicUsize,
-    /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `WindowMinter` taker
-    /// ([`crate::GrantChildHooks::build_detached`] / [`crate::MinterTaker`]; 0 = none ⇒ op 15 is an
+    /// PROCESS.md §5 / #1287 — the detached-child powerbox builder + the `Budget` taker
+    /// ([`crate::GrantChildHooks::build_detached`] / [`crate::BudgetMemTaker`]; 0 = none ⇒ op 15 is an
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
-    grant_minter_take: std::sync::atomic::AtomicUsize,
+    grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
     grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
@@ -408,7 +408,7 @@ impl Nursery {
             grant_build: std::sync::atomic::AtomicUsize::new(0),
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
-            grant_minter_take: std::sync::atomic::AtomicUsize::new(0),
+            grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
@@ -446,14 +446,14 @@ impl Nursery {
                 h.thunk as usize,
                 h.register_serve as usize,
                 h.build_detached as usize,
-                h.minter_take as usize,
+                h.budget_mem_take as usize,
             ),
             None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_build_detached.store(bd, Ordering::Release);
-        self.grant_minter_take.store(mt, Ordering::Release);
+        self.grant_budget_mem_take.store(mt, Ordering::Release);
         self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
@@ -1523,13 +1523,13 @@ unsafe fn spawn_detached_child(
     slot as i32
 }
 
-/// PROCESS.md §5 / #1287 — `instantiate_detached(minter, module, grants_ptr, grants_n, entry,
+/// PROCESS.md §5 / #1287 — `instantiate_detached(budget, module, grants_ptr, grants_n, entry,
 /// size_log2, quota[, args_ptr, args_len]) -> child | -EINVAL` on the native JIT: a separate-module
 /// child in a **fresh window** — `1 << size_log2` committed inside a root-sized lazy reservation, no
-/// carve, no alias — minted through the `WindowMinter` `minter`. Admission is the interpreter's op-15
+/// carve, no alias — minted through the `Budget` `budget`. Admission is the interpreter's op-15
 /// arm errno-for-errno: child entry shape, the window **equals** the module's declared memory (§14
-/// transparency), the payload fits the args region, and the minter quota covers the window (a forged /
-/// exhausted minter refuses, charging nothing). The child powerbox is the by-name grant list plus
+/// transparency), the payload fits the args region, and the budget quota covers the window (a forged /
+/// exhausted budget refuses, charging nothing). The child powerbox is the by-name grant list plus
 /// starter caps spanning the **reservation** (a root's shape, so its `vm_map` grows the window);
 /// it attests `window_exposed = false`. Data segments + the payload are seeded into the child's own
 /// window before it starts. A durable run refuses outright (multi-window freeze is O6).
@@ -1543,7 +1543,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     mem_base: u64,
     mem_size: u64,
     handle: i32,
-    minter: i64,
+    budget: i64,
     module: i64,
     grants_ptr: i64,
     grants_n: i64,
@@ -1560,14 +1560,14 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     }
     let build_addr = rt.grant_build_detached.load(Ordering::Acquire);
     let release_addr = rt.grant_release.load(Ordering::Acquire);
-    let take_addr = rt.grant_minter_take.load(Ordering::Acquire);
+    let take_addr = rt.grant_budget_mem_take.load(Ordering::Acquire);
     if build_addr == 0 || release_addr == 0 || take_addr == 0 {
         *trap_out = TrapKind::CapFault as i64;
         return 0;
     }
     let build: crate::GrantNamedChildBuilder = core::mem::transmute(build_addr);
     let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
-    let take: crate::MinterTaker = core::mem::transmute(take_addr);
+    let take: crate::BudgetMemTaker = core::mem::transmute(take_addr);
     let thunk_addr = rt.grant_thunk.load(Ordering::Acquire);
     let child_thunk: crate::CapThunk = if thunk_addr != 0 {
         core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
@@ -1626,8 +1626,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     {
         return EINVAL as i32;
     }
-    // Admission = the minter's quota take (the commit; every refusal above charged nothing).
-    if take(rt.cap_ctx, minter as i32, child_size) == 0 {
+    // Admission = the budget's quota take (the commit; every refusal above charged nothing).
+    if take(rt.cap_ctx, budget as i32, child_size) == 0 {
         return EINVAL as i32;
     }
     let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
