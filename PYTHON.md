@@ -198,10 +198,11 @@ Cranelift-JIT-tier differential assertion (the current test runs via `run_powerb
 - The `.temen` asset is **committed** under `browser/web/assets/micropython_repl.temen` (442 KB;
   passes the `check-play-assets.mjs` PR gate). It **decodes → verifies → bytecode-compiles** cleanly
   via `prep_temen` — i.e. it runs on the same bytecode tier the browser uses.
-- **Remaining for the gate:** run `browser-play-editor-test.mjs` against the built wasm bundle in
-  headless Chromium and add the MicroPython card to its byte-exact output assertions (needs the
-  browser wasm build, not runnable in the on-ramp CI job). The generic layout assertion (every card
-  has a nav link + editor) already covers the card's presence.
+- **Gate met ✅ — validated in a real browser.** `browser-play-editor-test.mjs` carries a byte-exact
+  MicroPython assertion; driven against the wasm32 threads module in **headless Chromium**, the card
+  loads the `.temen` on the wasm bytecode engine, runs the starter snippet, and produces byte-correct
+  output (comprehensions, dict sum, recursive fib, floats, `ZeroDivisionError` repr). The capstone —
+  **real Python running client-side on the playground** — is done.
 
 ### Phase D — CPython (stretch, tracked separately)
 
