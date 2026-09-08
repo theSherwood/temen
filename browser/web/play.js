@@ -1548,6 +1548,41 @@ puts "regexp:     [regexp -inline {(\\w+)@(\\w+)} user@host]"
 puts [string toupper "tcl on temen"]
 `,
   },
+  'MicroPython (1.24.1 — write & run)': {
+    kind: 'module',
+    editable: true,
+    lang: 'python',
+    url: './assets/micropython_repl.temen',
+    mode: 'io',
+    desc: 'MicroPython 1.24.1 — its compiler (lexer, parser, bytecode emitter), VM, object model, GC, ' +
+      'and int/float/str/list/dict/comprehensions/closures/exceptions, compiled through the LLVM ' +
+      'on-ramp. Edit the Python on the left and click Run: your code is piped to the guest as stdin, ' +
+      'compiled and executed, and its output appears below. Real Python, running client-side in the ' +
+      'sandbox — byte-identical to a native MicroPython build (crates/temen-run/demos/micropython). ' +
+      'Each Run is a fresh interpreter.',
+    src: `# Write Python here, then click Run.
+print('hello, temen!')
+
+# list & dict comprehensions
+print([x * x for x in range(6)])
+d = {'a': 1, 'b': 2, 'c': 3}
+print('sum of values:', sum(d.values()))
+
+# recursion + closures
+def fib(n):
+    return n if n < 2 else fib(n - 1) + fib(n - 2)
+print('fib(0..9):', [fib(i) for i in range(10)])
+
+# floats (guest openlibm)
+print('float:', 3.0 / 2, round(2 ** 0.5, 6))
+
+# exceptions
+try:
+    1 / 0
+except Exception as e:
+    print('caught', repr(e))
+`,
+  },
   'PostgreSQL (17.5 — write & run SQL)': {
     kind: 'pg',
     editable: true,

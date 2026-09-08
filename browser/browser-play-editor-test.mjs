@@ -17,6 +17,7 @@ import { dirname, join } from 'node:path';
 // when the Lua asset is actually built — otherwise it's SKIPped, not failed.
 const HERE = dirname(fileURLToPath(import.meta.url));
 const luaBuilt = existsSync(join(HERE, 'web', 'assets', 'lua_snapshot.temen'));
+const micropythonBuilt = existsSync(join(HERE, 'web', 'assets', 'micropython_repl.temen'));
 const chibiccBuilt = existsSync(join(HERE, 'web', 'assets', 'chibicc.temen'));
 // The self-host card needs the committed closure image (`build-selfhost-assets.mjs`); the byte-identity
 // check additionally needs the native `chibicc` (built by that same script) as the reference oracle.
@@ -95,6 +96,21 @@ try {
     luaOut.includes('Hello from Lua') ? ok('editable-module stdin reads the card editor') : fail(`Lua stdout: ${luaOut.slice(0, 80)}`);
   } else {
     console.log('  SKIP: editable-module stdin (lua_snapshot.temen not built — run build-onramp-assets.mjs)');
+  }
+
+  // MicroPython card (PYTHON.md, #1329): the committed `micropython_repl.temen` runs real Python
+  // client-side — the editor text is piped to the guest as stdin, compiled + executed. Assert the
+  // starter snippet's output (byte-identical to native MicroPython — `demo_micropython_repl_stdin`).
+  if (micropythonBuilt) {
+    await runCard(page, 'MicroPython (1.24.1 — write & run)', 30_000);
+    const mpOut = await page.evaluate((sel) => document.querySelector(`${sel} .stdout`).textContent,
+      card('MicroPython (1.24.1 — write & run)'));
+    mpOut.includes('hello, temen!') && mpOut.includes('[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]') &&
+      mpOut.includes("caught ZeroDivisionError('divide by zero',)")
+      ? ok('MicroPython card runs real Python (comprehensions, recursion, floats, exceptions)')
+      : fail(`MicroPython stdout: ${mpOut.slice(0, 120)}`);
+  } else {
+    console.log('  SKIP: MicroPython card (micropython_repl.temen not built)');
   }
 
   // The "run real Nim" card: runs the committed nim_hello.temen — a real Nim program
