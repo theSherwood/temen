@@ -337,6 +337,13 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     trap: () => {},
     call_interp: (target, argsPtr) => {
       const rc = ex.temen_coop_call_interp(target, argsPtr);
+      // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
+      // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the slot mirror
+      // moved mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale
+      // or empty slot. Rebuild synchronously, before the globals fan-out below primes any instance
+      // this creates (a word unit is tiny; one over the sync compile budget gets a bounce shim now and
+      // its emitted unit at the next event-boundary sync).
+      if (rc === 0 && ex.temen_coop_table_gen() !== syncedGen) syncTableSync();
       // #1009 paged: the grow rebuilt the page-state table (in `call_interp`) — fan the fresh coverage
       // to "mapped" and re-point "pagestate"; else the #717 scalar extent (the pump's twin).
       if (ex.temen_coop_paged()) {
@@ -382,31 +389,66 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     registerGlobals(inst.exports);
     return inst.exports;
   };
+  // #1233: the synchronous twin, for a rebuild inside a bounce (no event boundary to await at). An
+  // instance created mid-event never passes the per-event fuel re-arm — budget it now.
+  const instantiateUnitSync = (bytes) => {
+    const inst = new WebAssembly.Instance(new WebAssembly.Module(bytes), unitImports());
+    registerGlobals(inst.exports);
+    if (inst.exports.fuel) inst.exports.fuel.value = 1n << 61n;
+    return inst.exports;
+  };
+  const shimBytes = (slot) => {
+    const len = ex.temen_coop_shim_wasm(slot);
+    if (len === 0) return null;
+    return u8().slice(Number(ex.temen_coop_shim_ptr()), Number(ex.temen_coop_shim_ptr()) + len);
+  };
   const shimFor = async (slot, code) => {
     const key = `${slot}#${code}`;
     let f = shims.get(key);
     if (f === undefined) {
-      const len = ex.temen_coop_shim_wasm(slot);
-      if (len === 0) return null;
-      const bytes = u8().slice(Number(ex.temen_coop_shim_ptr()), Number(ex.temen_coop_shim_ptr()) + len);
+      const bytes = shimBytes(slot);
+      if (bytes === null) return null;
       f = (await instantiateUnit(bytes))['t'];
       shims.set(key, f);
     }
     return f;
   };
-  const unitFor = async (code, bytes) => {
-    let unit = jitUnits.get(code);
+  const shimForSync = (slot, code) => {
+    const key = `${slot}#${code}`;
+    let f = shims.get(key);
+    if (f === undefined) {
+      const bytes = shimBytes(slot);
+      if (bytes === null) return null;
+      f = instantiateUnitSync(bytes)['t'];
+      shims.set(key, f);
+    }
+    return f;
+  };
+  // `key`: a surfaced JIT_INVOKE's code handle (a Number), or an installed slot's `(domain, unit)`
+  // identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one cache.
+  const unitFor = async (key, bytes) => {
+    let unit = jitUnits.get(key);
     if (unit === undefined) {
       unit = await instantiateUnit(bytes);
-      jitUnits.set(code, unit);
+      jitUnits.set(key, unit);
     }
     return unit;
   };
-  // Rebuild the shared table from the engine's slot mirror at each event boundary (installs only
-  // happen between events — a unit with a `call.cap` never emits). A slot in the natural prefix holds
-  // the emitted program `f{slot}` (or a bounce shim if that function stayed interpreted); a slot past
-  // it holds an installed unit's `f0` (via its by-handle wasm) or a shim for an interpreter-resident
-  // target. Exactly `driveTierupRun`'s `syncTable`, over the `temen_coop_*` accessors.
+  // The bytes of the unit installed at `slot` (`null` = interpreter-only), fetched **by slot** —
+  // the guest typically `release`s the code handle right after `install` (the unit stays installed,
+  // only its handle dies), so a by-handle fetch would come back empty and null the slot (#1233).
+  const slotUnitBytes = (slot) => {
+    const len = ex.temen_coop_jit_wasm_by_slot_len(slot);
+    if (len === 0) return null;
+    const p = Number(ex.temen_coop_jit_wasm_by_handle_ptr());
+    return u8().slice(p, p + len);
+  };
+  // Rebuild the shared table from the engine's slot mirror whenever its generation moved: at each
+  // event boundary (`syncTable`) and — #1233 — inside `env.call_interp` after a bounce that installed
+  // or uninstalled (`syncTableSync`). A slot in the natural prefix holds the emitted program `f{slot}`
+  // (or a bounce shim if that function stayed interpreted); a slot past it holds an installed unit's
+  // `f0` (fetched by slot, cached by unit identity) or a shim for an interpreter-resident target.
+  // Exactly `driveTierupRun`'s `syncTable`, over the `temen_coop_*` accessors.
   const nfuncs = ex.temen_coop_nfuncs();
   // #1009: rebuild the table only when the slot mirror changed (a §22 install/uninstall bumps
   // `temen_coop_table_gen`) — a card that never installs syncs the table once, not per tier-up.
@@ -421,11 +463,40 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       } else {
         const code = ex.temen_coop_slot_code(slot);
         if (code >= 0) {
-          const len = ex.temen_coop_jit_wasm_by_handle_len(code);
-          entry = len > 0
-            ? (await unitFor(code, u8().slice(Number(ex.temen_coop_jit_wasm_by_handle_ptr()),
-                                              Number(ex.temen_coop_jit_wasm_by_handle_ptr()) + len)))['f0']
-            : await shimFor(slot, code);
+          const uid = ex.temen_coop_slot_unit(slot);
+          const cached = jitUnits.get(uid);
+          if (cached !== undefined) entry = cached['f0'];
+          else {
+            const bytes = slotUnitBytes(slot);
+            entry = bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimFor(slot, code);
+          }
+        }
+      }
+      table.set(slot, entry);
+    }
+    syncedGen = gen;
+  };
+  const syncTableSync = () => {
+    const gen = ex.temen_coop_table_gen();
+    if (gen === syncedGen) return;
+    for (let slot = 0; slot < tsize; slot++) {
+      let entry = null;
+      if (slot < nfuncs) {
+        entry = emitted['f' + slot] ?? shimForSync(slot, -2);
+      } else {
+        const code = ex.temen_coop_slot_code(slot);
+        if (code >= 0) {
+          const uid = ex.temen_coop_slot_unit(slot);
+          const cached = jitUnits.get(uid);
+          if (cached !== undefined) entry = cached['f0'];
+          else {
+            const bytes = slotUnitBytes(slot);
+            if (bytes !== null) {
+              // Over the sync compile budget ⇒ a shim now; `syncTable` upgrades it at the next event.
+              try { const u = instantiateUnitSync(bytes); jitUnits.set(uid, u); entry = u['f0']; }
+              catch { entry = shimForSync(slot, code); }
+            } else entry = shimForSync(slot, code);
+          }
         }
       }
       table.set(slot, entry);

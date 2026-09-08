@@ -4572,7 +4572,11 @@ impl<'p> Vcpu<'p> {
                 &mut self.mem,
                 &mut cell,
                 &mut self.fibers,
-                Some((&mut self.fiber_sp, &mut self.fiber_meta)),
+                Some(BounceRunCtx {
+                    fiber_sp: &mut self.fiber_sp,
+                    fiber_meta: &mut self.fiber_meta,
+                    jit_mirror: None,
+                }),
             )?
         };
         for (i, v) in vals.iter().enumerate() {
@@ -9549,7 +9553,8 @@ type JitUnitBody = (
 /// is a `CapFault`) and the cross-table check (a code handle from another table is one too) — to the
 /// unit's funcs + types. The one resolution body the cooperative driver's Jit arms share, so a §14
 /// child's units resolve against the **child's** host (#1296: a child holds its own `Jit` table).
-fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<JitUnitBody, Trap> {
+/// Also hands back the unit's `(domain, unit)` identity — the install arms mirror it per slot (#1233).
+fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<(JitUnitBody, (u32, u32)), Trap> {
     let table = host.resolve_jit_domain(h)?;
     let (cd, cu) = host.resolve_jit_code(code)?;
     if cd != table {
@@ -9557,7 +9562,7 @@ fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<JitUnitBody, Trap>
     }
     let funcs = host.jit_unit_funcs(cd, cu).ok_or(Trap::CapFault)?;
     let types = host.jit_unit_types(cd, cu).ok_or(Trap::CapFault)?;
-    Ok((funcs, types))
+    Ok(((funcs, types), (cd, cu)))
 }
 
 fn run_invoke(
@@ -9592,9 +9597,29 @@ fn run_invoke(
 /// The registry is caller-owned so the bounce path can persist it across the several bounces of one
 /// emitted invoke (a fiber parked by one callback is resumable by a later one — exactly the
 /// one-registry-per-invoke scope the interpreted loop has by construction).
-/// The run-level parallel-array halves `drive_nested` mirrors in run-registry mode (#880): the
-/// fibers' durable shadow-SPs and their `(entry func, sp)` freeze metadata.
-type RunFiberMeta<'a> = (&'a mut Vec<u64>, &'a mut Vec<(i32, i64)>);
+/// The run-level context a **tier-up region** bounce threads into [`drive_nested`] (`None` for a
+/// `Jit.invoke`, whose registry is invoke-confined): the run registry's parallel-array halves (#880 —
+/// the fibers' durable shadow-SPs and their `(entry func, sp)` freeze metadata) and, on the
+/// cooperative driver, the B2 slot mirror (#1233) so a `Jit.install`/`uninstall` serviced inside the
+/// bounce keeps it exact.
+struct BounceRunCtx<'a> {
+    fiber_sp: &'a mut Vec<u64>,
+    fiber_meta: &'a mut Vec<(i32, i64)>,
+    /// The coop driver's dispatch-table mirror. `None` on the single-vCPU path (its pump records the
+    /// mirror host-side, from surfaced install events — an install serviced inside one of *its*
+    /// bounces is not yet mirrored there) and for a §14 child (#1296: a child's installs stay in its
+    /// own table, never the root's mirror).
+    jit_mirror: Option<JitMirror<'a>>,
+}
+
+/// The coop driver's dispatch-table mirror ([`CoopSched`]'s `slot_codes` / `slot_units` /
+/// `table_gen`), lent to a tier-up-region bounce so an install serviced inside it keeps the mirror
+/// exact (#1233).
+struct JitMirror<'a> {
+    codes: &'a mut Vec<i32>,
+    units: &'a mut Vec<(u32, u32)>,
+    gen: &'a mut u32,
+}
 
 #[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
 fn drive_nested(
@@ -9611,7 +9636,7 @@ fn drive_nested(
     // `step_vcpu`'s parallel-array pushes so the run's bookkeeping stays index-aligned; the
     // durability `shadow_switch` is deliberately absent — a bounce host is never a durable run
     // (the pump), and the interpreted invoke path passes `None` (invoke-confined registry).
-    mut run_meta: Option<RunFiberMeta<'_>>,
+    mut run_meta: Option<BounceRunCtx<'_>>,
 ) -> Result<Vec<Value>, Trap> {
     // The resumer chain (`(resumer's fiber id, resumer, dst)`). Invariant: `chain` is non-empty
     // iff `active` is a fiber (`active_id` then indexes `fibers`).
@@ -9650,7 +9675,12 @@ fn drive_nested(
                 // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
                 // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
                 // `run_meta` doc above).
-                if let Some((fiber_sp, fiber_meta)) = run_meta.as_mut() {
+                if let Some(BounceRunCtx {
+                    fiber_sp,
+                    fiber_meta,
+                    ..
+                }) = run_meta.as_mut()
+                {
                     fiber_sp
                         .push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN);
                     let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
@@ -9720,6 +9750,52 @@ fn drive_nested(
                 active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
                 active.set(rdst + 1, Reg::from_i64(value));
             }
+            // #1233: a §22 `Jit.install`/`uninstall` reached from a bounced **tier-up region** — the
+            // interpreted-inline-call territory (`run_meta` is `Some`) where the pump's own install arm
+            // would have serviced the very same call had the region stayed interpreted. Service it here
+            // identically (resolve authority + unit → compile → install into the caller's table, the B2
+            // mirror kept exact), so a guest whose *emitted* outer loop defines and dispatches units —
+            // Forth's `process` — runs on the cooperative tier at all. Inside an invoked unit (`run_meta`
+            // `None`) it stays the §22 contract's inert `CapFault`: a unit never re-installs. (A
+            // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
+            Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
+                let ((funcs, types), unit_id) = host.with(|p| resolve_jit_unit(p, h, code))?;
+                let res = match compile_module(&funcs, &types) {
+                    Some(unit) => match jit_install_into(source, table, unit) {
+                        Some(slot) => {
+                            if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
+                                if let Some(e) = m.codes.get_mut(slot) {
+                                    *e = code;
+                                }
+                                if let Some(e) = m.units.get_mut(slot) {
+                                    *e = unit_id;
+                                }
+                                *m.gen = m.gen.wrapping_add(1); // slot mirror changed → re-sync
+                            }
+                            slot as i64
+                        }
+                        None => super::ENOSPC,
+                    },
+                    None => return Err(Trap::Malformed), // unit op outside coverage
+                };
+                active.set(dst, Reg::from_i64(res));
+            }
+            Outcome::JitUninstall { h, slot, dst } if run_meta.is_some() => {
+                host.with(|p| p.resolve_jit_domain(h))?; // authority (forged handle → CapFault)
+                let n_real = source.primary().progs.len();
+                let res = if jit_uninstall_from(source, table, slot as usize, n_real) {
+                    if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
+                        if let Some(e) = m.codes.get_mut(slot as usize) {
+                            *e = -1; // a freed slot must trap in the driver's table too
+                        }
+                        *m.gen = m.gen.wrapping_add(1);
+                    }
+                    0
+                } else {
+                    super::EINVAL
+                };
+                active.set(dst, Reg::from_i64(res));
+            }
             // #1334: a §22 `Jit.invoke` reached on a nested interpretation — a cross-tier bounce out
             // of an emitted region (the JACL compiler stages a macro from a helper the tiered-up
             // region bounced into), or a unit invoking a unit. Service it interpreted, recursively,
@@ -9735,7 +9811,7 @@ fn drive_nested(
                 params,
                 results,
             } => {
-                let (funcs, types) = host.with(|p| resolve_jit_unit(p, h, code))?;
+                let ((funcs, types), _) = host.with(|p| resolve_jit_unit(p, h, code))?;
                 let unit = compile_module(&funcs, &types).ok_or(Trap::Malformed)?;
                 let arity_ok = unit
                     .sigs
@@ -10787,6 +10863,13 @@ struct CoopSched {
     /// changed — a dispatch-heavy card that never installs syncs the table once, not per tier-up. The
     /// single-shot pump's `table_gen` twin (read via [`CoopRun::table_gen`]).
     table_gen: u32,
+    /// #1233 — the slot → **unit identity** `(domain, unit)` mirror beside `slot_codes`: the key the
+    /// host fetches an installed slot's emitted wasm by ([`CoopRun::slot_unit`]). A code *handle* is
+    /// guest-revocable — `Jit.release` right after `install` is the ordinary pattern (the unit stays,
+    /// its handle is revoked) — so a driver that keyed the fetch on `slot_codes` lost every released
+    /// unit at its next table rebuild (`IndirectCallToNull`). The unit index is append-only, so this
+    /// key never dies while the slot is filled. Meaningful only where `slot_codes[s] >= 0`.
+    slot_units: Vec<(u32, u32)>,
     /// #926 slice 2g — the **invoke-confined** fiber registry for a surfaced emitted `Jit.invoke`'s
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
@@ -10966,6 +11049,7 @@ impl CoopSched {
             // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
             slot_codes: vec![-1i32; 1usize << host.jit_table_log2()],
             table_gen: 0,
+            slot_units: vec![(0, 0); 1usize << host.jit_table_log2()],
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
             invoke_fibers: Vec::new(),
             suspend_on_idle: false,
@@ -11001,6 +11085,7 @@ impl CoopSched {
             pending_tierup,
             pending_jit,
             slot_codes,
+            slot_units,
             table_gen,
             // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
             // callbacks), never touched by the scheduler loop itself.
@@ -12852,7 +12937,7 @@ impl CoopSched {
                         None => resolve_jit_unit(host, h, code),
                         Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
                     };
-                    let (funcs, types) = match resolved {
+                    let ((funcs, types), unit_id) = match resolved {
                         Ok(f) => f,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
@@ -12865,17 +12950,22 @@ impl CoopSched {
                             Some(k) => jit_install_into(&dom.source, &extra_envs[k].table, unit),
                         } {
                             Some(slot) => {
-                                // #926 slice 2f: mirror `slot → code` so the browser B2 driver can
-                                // rebuild its `WebAssembly.Table` at the next event boundary (installs
-                                // only ever happen between host events — a unit with a `call.cap` never
-                                // emits, so the install itself always runs interpreted). Twin of the
-                                // single-shot pump's `slot_codes` recording; inert on the native drive.
+                                // #926 slice 2f: mirror `slot → code` (+ `slot → unit`, #1233) so the
+                                // browser B2 driver can rebuild its `WebAssembly.Table` when the mirror
+                                // moves. The install itself always runs interpreted (a unit with a
+                                // `call.cap` never emits) — here between host events, or (#1233) inside
+                                // a tier-up region's bounce via `drive_nested`'s twin of this arm, after
+                                // which the driver re-syncs before the emitted frame resumes. Twin of
+                                // the single-shot pump's `slot_codes` recording; inert on the native drive.
                                 // The mirror is the ROOT's emitted dispatch table: a §14 child's
                                 // install stays in the child's own table (#1296) — mirroring it here
                                 // would publish the child's unit into the parent's `call.dyn` slots.
                                 if tasks[ti].env.is_none() {
                                     if let Some(e) = slot_codes.get_mut(slot) {
                                         *e = code;
+                                    }
+                                    if let Some(e) = slot_units.get_mut(slot) {
+                                        *e = unit_id; // #1233: the host's fetch key survives `release`
                                     }
                                     *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                                 }
@@ -12981,7 +13071,7 @@ impl CoopSched {
                         Some(k) => resolve_jit_unit(&extra_envs[k].host.lock_unpoisoned(), h, code),
                     };
                     let (funcs, types) = match resolved {
-                        Ok(f) => f,
+                        Ok((f, _)) => f,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
                             continue;
@@ -13413,6 +13503,15 @@ impl CoopRun {
             .unwrap_or(-1)
     }
 
+    /// #1233 — the `(domain, unit)` identity installed at `slot` (`None` empty/natural): the key the
+    /// host fetches the slot's emitted wasm by. Unlike [`slot_code`](Self::slot_code) it survives the
+    /// guest's `Jit.release` of the code handle (the unit stays installed; only its handle dies).
+    pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
+        (self.slot_code(slot) >= 0)
+            .then(|| self.sched.slot_units.get(slot as usize).copied())
+            .flatten()
+    }
+
     /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
     /// scheduler services. The browser B2 driver caches the generation it last synced its
     /// `WebAssembly.Table` at and rebuilds only when this advances (the single-shot pump's
@@ -13547,16 +13646,31 @@ impl CoopRun {
             fiber_sp,
             fiber_meta,
             invoke_fibers,
+            slot_codes,
+            slot_units,
+            table_gen,
             ..
         } = sched;
         // The registry `coop_bounce` threads into `drive_nested`: invoke-confined (`invoke_fibers`, no
         // shadow-SP/freeze halves — invoke fibers are transient) during an emitted `Jit.invoke`, else the
         // run-level registry with its parallel arrays. One of the two `match` arms below moves it.
-        let (bounce_fibers, bounce_meta): (&mut Vec<FiberState>, Option<RunFiberMeta<'_>>) =
+        let (bounce_fibers, bounce_meta): (&mut Vec<FiberState>, Option<BounceRunCtx<'_>>) =
             if in_invoke {
                 (invoke_fibers, None)
             } else {
-                (fibers, Some((fiber_sp, fiber_meta)))
+                (
+                    fibers,
+                    Some(BounceRunCtx {
+                        fiber_sp,
+                        fiber_meta,
+                        // #1233: an install serviced inside the bounce updates the ROOT's mirror.
+                        jit_mirror: Some(JitMirror {
+                            codes: slot_codes,
+                            units: slot_units,
+                            gen: table_gen,
+                        }),
+                    }),
+                )
             };
         match tasks[ti].env {
             // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
@@ -13585,7 +13699,11 @@ impl CoopRun {
                     &mut e.mem,
                     &mut cell,
                     bounce_fibers,
-                    bounce_meta,
+                    // The child's installs land in its own table (#1296), never the root's mirror.
+                    bounce_meta.map(|mut c| {
+                        c.jit_mirror = None;
+                        c
+                    }),
                     target,
                     io,
                 )
@@ -13636,7 +13754,7 @@ fn coop_bounce(
     mem: &mut Option<Mem>,
     host: &mut HostCell,
     fibers: &mut Vec<FiberState>,
-    fiber_meta: Option<RunFiberMeta<'_>>,
+    fiber_meta: Option<BounceRunCtx<'_>>,
     target: u32,
     io: &mut [i64],
 ) -> Result<usize, Trap> {
