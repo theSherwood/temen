@@ -286,8 +286,12 @@ self.onmessage = async (e) => {
       view.set(src, sp);
       view.set(main, mp);
       // Live-stream the compiled program's stdout to the page (#1143): the tee on the final `_start`
-      // run fires `stdout_chunk`, relayed here for the duration of the compile+run.
-      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      // run fires `stdout_chunk`, relayed here for the duration of the compile+run. Also ACCUMULATE a copy:
+      // the final program's stdout reaches the page through the tee, and for this card `readStdout()` (the
+      // engine's captured buffer) comes back empty afterwards — so the streamed bytes are the source of
+      // truth for the reply, else the page renders a blank result over the streamed text.
+      const streamAcc = [];
+      chunkSink = (bytes) => { streamAcc.push(bytes.slice()); self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]); };
       try {
         ex.temen_compile_nim_fs(
           np, nifler.length, smp, nimsem.length, hp, hexer.length,
@@ -302,7 +306,13 @@ self.onmessage = async (e) => {
       ex.temen_dealloc(ip, stdlib.length);
       ex.temen_dealloc(sp, src.length);
       ex.temen_dealloc(mp, main.length);
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr(), tier });
+      let stdout = readStdout(); // a decoded STRING (matches the interpreter path / play.js's `${out}`)
+      if (!stdout.length && streamAcc.length) {
+        const total = new Uint8Array(streamAcc.reduce((n, a) => n + a.length, 0));
+        let o = 0; for (const a of streamAcc) { total.set(a, o); o += a.length; }
+        stdout = new TextDecoder().decode(total);
+      }
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout, stderr: readStderr(), tier });
       return;
     }
     if (msg.type === 'stats') {
