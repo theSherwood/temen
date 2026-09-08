@@ -19,6 +19,7 @@ path = "src/lib.rs"
 temen-ir.workspace = true
 temen-text.workspace = true
 temen-interp.workspace = true
+temen-fs.workspace = true
 
 [[bin]]
 name = "temen-dap"

@@ -79,11 +79,44 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
     {
         host.register_cap_name(name, *h);
     }
+    // #1323 (c_interpret #16, file I/O): a debugged program that does file I/O reaches a private,
+    // in-memory **read-write** scratch filesystem through the `vm_fs` seam (chibicc `__vm_fs` builtin
+    // → `call.sym "vm_fs"`, a flat call with base op 0 and the fs op in arg0). Mirror the browser Run
+    // path (`grant_onramp_caps`): grant the same `temen-fs` memfs, wrapped to forward `args[0]` as the
+    // op, and bind the `vm_fs` slot to it below. Granted only when the module imports it (a plain
+    // stdout-only program is unaffected); guest-private, no host disk, dropped at session end.
+    let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
+        let mut inner = temen_fs::mem_fs_handler(false)();
+        let h = host.grant_host_proc(Box::new(
+            move |_slot_op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn temen_interp::GuestMem>,
+                  minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                let (op, rest) = args
+                    .split_first()
+                    .map(|(o, r)| (*o as u32, r))
+                    .unwrap_or((0, &[][..]));
+                inner(op, rest, mem, minter)
+            },
+        ));
+        host.register_cap_name("vm_fs", h);
+        Some(h)
+    } else {
+        None
+    };
     if !m.imports.is_empty() {
         let bindings = m
             .imports
             .iter()
             .map(|im| {
+                // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
+                // HostProc granted above; the guest's fs op rides in arg0.
+                if im.name == "vm_fs" {
+                    return match vm_fs_h {
+                        Some(h) => BoundImport::required(cap_id::HOST_PROC, 0, h),
+                        None => BoundImport::rebindable(0, 0, None),
+                    };
+                }
                 let Some((type_id, op)) = io_cap(&im.name) else {
                     return BoundImport::rebindable(0, 0, None);
                 };

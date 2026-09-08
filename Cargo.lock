@@ -666,6 +666,7 @@ dependencies = [
 name = "temen-dap"
 version = "0.0.0"
 dependencies = [
+ "temen-fs",
  "temen-interp",
  "temen-ir",
  "temen-text",
