@@ -1064,6 +1064,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   fs.set(mainPath.replace(/^\//, ''), mainSrc);
 
   // ---- phase 1: crawl the import closure with nifler (tiered), capturing the module graph -----------
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
+  const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
   const mods = new Map(); // stem -> { file, deps: [stem], role }
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   let crawled = 0;
@@ -1101,6 +1103,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     mods.set(stem, { file, deps: depStems, role });
   }
 
+  const tCrawl = now();
   // ---- dependency order (DFS postorder, System first) — mirrors nimc::toposort ----------------------
   const order = [], mark = new Map();
   const visit = (s) => {
@@ -1137,6 +1140,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     semmed++;
   }
 
+  const tNimsem = now();
   // ---- phase 3: hexer per module (tiered, 3-cap) — main gets the app-entry glue --------------------
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
@@ -1159,7 +1163,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     fs.set(key, xnif); putFile(key, xnif); hexed++;
   }
 
-  return { crawled, semmed, hexed };
+  const tHexer = now();
+  return { crawled, semmed, hexed, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of
