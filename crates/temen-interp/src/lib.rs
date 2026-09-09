@@ -324,6 +324,9 @@ pub enum StopReason {
     /// and the clock did not advance; push bytes (the DAP `provideStdin` request) and resume —
     /// the parked read re-issues against them.
     StdinPark,
+    /// #1366 — parked on a **host-completed cap call** with this completion id: the embedder
+    /// services the request it recorded under `id`, then `deliver_cap`/`provideCap` resumes.
+    CapPark { id: u64 },
 }
 
 /// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
@@ -16965,6 +16968,11 @@ struct CompletionState {
     /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt: completed by the embedder, never
     /// by a pool worker. An inline waiter must not block on one (nobody could wake it).
     host_owned: BTreeSet<u64>,
+    /// #1366 — for a host-owned id minted while the host is **recording** its cap tape: the call's
+    /// `(type_id, op, handle, args)`, so the *delivered* value (not the dispatch-time placeholder)
+    /// joins the tape as the call's `CapRecord` when the embedder completes it — a reverse `seek`
+    /// then serves it from the tape and never re-parks.
+    host_pending: BTreeMap<u64, (u32, u32, i32, Vec<i64>)>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
     /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
@@ -16998,6 +17006,7 @@ impl Completions {
             mx: Mutex::new(CompletionState {
                 ready: BTreeMap::new(),
                 host_owned: BTreeSet::new(),
+                host_pending: BTreeMap::new(),
                 in_flight: 0,
                 next_id: 0,
                 fiber_cells: BTreeMap::new(),
@@ -17076,12 +17085,15 @@ impl Completions {
 
     /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
     /// host-owned under the one lock.
-    fn mint_host_owned(&self) -> u64 {
+    fn mint_host_owned(&self, record: Option<(u32, u32, i32, Vec<i64>)>) -> u64 {
         let mut g = self.mx.lock_unpoisoned();
         let id = g.next_id;
         g.next_id += 1;
         g.in_flight += 1;
         g.host_owned.insert(id);
+        if let Some(prefix) = record {
+            g.host_pending.insert(id, prefix);
+        }
         id
     }
 
@@ -17094,15 +17106,19 @@ impl Completions {
 
     /// #1366 — the embedder finishes a host-completed punt: post `result` for `id` and wake
     /// waiters exactly as a pool worker's [`complete`](Completions::complete) would. The id stops
-    /// being host-owned. Unknown/foreign ids are ignored (no-op) rather than corrupting the store.
-    pub fn complete_host(&self, id: u64, result: i64) {
-        {
+    /// being host-owned. Unknown/foreign ids are ignored (no-op, `None`) rather than corrupting the
+    /// store. Returns the call's recorded `(type_id, op, handle, args)` when the host was taping
+    /// (so the caller can push the delivered value as the call's [`CapRecord`]).
+    pub fn complete_host(&self, id: u64, result: i64) -> Option<(u32, u32, i32, Vec<i64>)> {
+        let prefix = {
             let mut g = self.mx.lock_unpoisoned();
             if !g.host_owned.remove(&id) {
-                return;
+                return None;
             }
-        }
+            g.host_pending.remove(&id)
+        };
         self.complete(id, result);
+        prefix
     }
 
     /// #1366 — the inline-wait form for drivers that cannot surface a park: block for a
@@ -19846,6 +19862,12 @@ impl Host {
         job: OffloadWork,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
+        // §12 W1: under a tape (recording or replaying) a pool job runs **inline** regardless of
+        // the face, so the taped result is the real one and a replay never punts (moved here from
+        // the face selection so a #1366 host-completed punt — which has no job — can still park).
+        if self.cap_record.is_some() || self.cap_replay.is_some() {
+            return Ok(vec![job()]);
+        }
         match pending {
             Some(slot) => {
                 let id = self.completions.mint();
@@ -19876,22 +19898,41 @@ impl Host {
     /// call — decline fail-closed with `CapFault` rather than block forever.
     fn punt_host(
         &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
-        // Only a driver that surfaces the park (`Vcpu`) can ever finish this call: decline before
-        // the submit hook runs under any other, so the embedder never records a dead request.
+        // Only a driver that surfaces the park (`Vcpu`, `DebugRun`) can ever finish this call:
+        // decline before the submit hook runs under any other, so the embedder never records a
+        // dead request.
         if !self.completions.host_completed_allowed() {
             return Err(Trap::CapFault);
         }
         match pending {
             Some(slot) => {
-                let id = self.completions.mint_host_owned();
+                // While taping, remember the call so the *delivered* value can be recorded as its
+                // `CapRecord` (the dispatch-time placeholder below is never taped).
+                let record = self
+                    .cap_record
+                    .is_some()
+                    .then(|| (type_id, op, handle, args.to_vec()));
+                let id = self.completions.mint_host_owned(record);
                 submit(id);
                 *slot = Some(id);
                 Ok(Vec::new())
             }
             None => Err(Trap::CapFault),
+        }
+    }
+
+    /// #1366 — push a [`CapRecord`] onto this host's cap tape if it is recording (no-op otherwise):
+    /// the embedder's delivered value for a host-completed call, recorded by `deliver_cap`.
+    pub fn tape_cap_record(&mut self, rec: CapRecord) {
+        if let Some(r) = &mut self.cap_record {
+            r.push(rec);
         }
     }
 
@@ -22947,11 +22988,10 @@ impl Host {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
         // real one (the same reasoning as the parked-stdin tape suppression below).
-        let pending = if self.cap_record.is_some() || self.cap_replay.is_some() {
-            None
-        } else {
-            pending
-        };
+        // #1366: the face is no longer forced sync under a W1 tape — a pool job is still run inline
+        // under a tape (see `punt_or_inline`, so the taped result is the real one), while a
+        // host-completed punt keeps the parking face: it has no job to run inline, parks, and its
+        // delivered value joins the tape at `deliver_cap`.
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -23065,6 +23105,7 @@ impl Host {
             }
             // Record: run live through a `RecordingMem` so any guest-window writes are captured,
             // then log the crossing for a future replay.
+            let mut pending = pending;
             let (result, mem_writes) = match mem {
                 Some(m) => {
                     let mut rec_mem = RecordingMem {
@@ -23077,20 +23118,31 @@ impl Host {
                         handle,
                         args,
                         Some(&mut rec_mem),
-                        pending,
+                        pending.as_deref_mut(),
                     );
                     (r, rec_mem.writes)
                 }
                 None => (
-                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None, pending),
+                    self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        None,
+                        pending.as_deref_mut(),
+                    ),
                     Vec::new(),
                 ),
             };
             if let Some(rec) = &mut self.cap_record {
                 // A parked blocking-stdin read (W4) is a placeholder the driver discards and
                 // re-issues — taping it would replay as a phantom EOF. Only the re-issued
-                // (completed) read joins the tape.
-                if !self.stdin_parked {
+                // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
+                // completed, or an offloaded job): its result slots are a placeholder the
+                // completion fills in later — a host-completed call's delivered value is taped by
+                // `deliver_cap` instead.
+                let punted = pending.as_deref().is_some_and(|p| p.is_some());
+                if !self.stdin_parked && !punted {
                     rec.push(CapRecord {
                         type_id,
                         op,
@@ -23649,7 +23701,9 @@ impl Host {
                 self.host_procs[idx as usize].handler = f;
                 match (punted, hosted) {
                     (Some(job), _) => self.punt_or_inline(job, pending),
-                    (None, Some(submit)) => self.punt_host(submit, pending),
+                    (None, Some(submit)) => {
+                        self.punt_host(type_id, op, handle, args, submit, pending)
+                    }
                     (None, None) => r,
                 }
             }

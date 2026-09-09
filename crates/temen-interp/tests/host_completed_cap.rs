@@ -147,7 +147,9 @@ fn host_completing_inside_submit_does_not_park() {
             return OffloadOutcome::Done(Ok(vec![a + 100]));
         }
         let c = Arc::clone(&comps_for_hook);
-        OffloadOutcome::Host(Box::new(move |id| c.complete_host(id, a + 100)))
+        OffloadOutcome::Host(Box::new(move |id| {
+            c.complete_host(id, a + 100);
+        }))
     }));
     let mut v = vcpu(&prog, host, h);
     match v.run() {

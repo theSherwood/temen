@@ -308,6 +308,14 @@ pub trait Debuggee {
         false
     }
 
+    /// #1366 — deliver the embedder's value for the host-completed cap call the session is parked
+    /// on (`StopReason::CapPark { id }`); the next resume continues past the call. `false` when
+    /// the session isn't parked on `id` (the `provideCap` request fails cleanly). Default:
+    /// unsupported.
+    fn provide_cap(&mut self, _id: u64, _value: i64) -> bool {
+        false
+    }
+
     // --- memory map (slice 5) --------------------------------------------------------------------
     /// The window's memory-map introspection as JSON (geometry, data segments, explicit-state
     /// pages, powerbox stack/heap regions). `None` when this backend doesn't expose it (the
@@ -963,6 +971,18 @@ impl BytecodeBackend {
             Engine::Single(run) => (run.stdin_parked(), run.frame_pc(0)),
             Engine::Threaded(run) => (run.stdin_parked(), run.frame_pc(0)),
         };
+        // #1366: parked on a host-completed cap call — live, paused past the call, resumable once
+        // `provideCap` delivers the value.
+        let cap = match &self.engine {
+            Engine::Single(run) => run.cap_parked(),
+            Engine::Threaded(_) => None,
+        };
+        if let (Some(id), Some(pc)) = (cap, pc) {
+            return Stop::Break {
+                reason: StopReason::CapPark { id },
+                pc,
+            };
+        }
         if let (true, Some(pc)) = (parked, pc) {
             return Stop::Break {
                 reason: StopReason::StdinPark,
@@ -1597,6 +1617,13 @@ impl Debuggee for BytecodeBackend {
             Engine::Threaded(run) => run.provide_stdin(bytes),
         }
         true
+    }
+    /// #1366 — single-vCPU sessions only (the scheduled engine keeps its inline decline).
+    fn provide_cap(&mut self, id: u64, value: i64) -> bool {
+        match &mut self.engine {
+            Engine::Single(run) => run.deliver_cap(id, value),
+            Engine::Threaded(_) => false,
+        }
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the

@@ -198,6 +198,7 @@ impl DapServer {
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
             "provideStdin" => self.on_provide_stdin(args),
+            "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
@@ -1071,6 +1072,26 @@ impl DapServer {
         (ok, Json::Null, vec![])
     }
 
+    /// #1366 — the custom `provideCap` request: deliver `arguments.value` (i64) for the
+    /// host-completed cap call the session is parked on (`arguments.id` = the `capId` of the
+    /// `stopped` event). The client then resumes and execution continues past the call. Fails
+    /// cleanly without a session, malformed arguments, or when the session isn't parked on `id`.
+    fn on_provide_cap(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let id = args.and_then(|a| a.get("id")).and_then(|v| v.as_i64());
+        let value = args.and_then(|a| a.get("value")).and_then(|v| v.as_i64());
+        let (Some(id), Some(value)) = (id, value) else {
+            return (false, Json::Null, vec![]);
+        };
+        if id < 0 {
+            return (false, Json::Null, vec![]);
+        }
+        let ok = session.inspector.provide_cap(id as u64, value);
+        (ok, Json::Null, vec![])
+    }
+
     /// The standard `setVariable` request (slice 8): write an integer value to a named local in
     /// the scope's frame. The write is recorded by the backend and re-applied on every seek
     /// replay, so reverse debugging stays truthful. Fails cleanly on the tree-walker, a non-int
@@ -1579,7 +1600,7 @@ impl DapServer {
         let mut events = self.output_events();
         let tid = self.stopped_thread_id();
         match stop {
-            Stop::Break { reason, .. } => events.push(stopped_event(dap_reason(reason), tid)),
+            Stop::Break { reason, .. } => events.push(break_event(reason, tid)),
             Stop::Finished(result) => {
                 self.terminated = true;
                 // Standard DAP: an `exited` event carrying the guest's exit code precedes
@@ -1686,6 +1707,25 @@ fn trap_name(trap: &Trap) -> &'static str {
 }
 
 /// A `stopped` event for `thread_id`.
+/// A `stopped` event for an engine break: the DAP reason plus, for a #1366 host-completed cap park,
+/// the completion id (`capId`) the client answers with `provideCap`.
+fn break_event(reason: StopReason, thread_id: i64) -> Event {
+    let cap_id = if let StopReason::CapPark { id } = &reason {
+        Some(*id)
+    } else {
+        None
+    };
+    let mut body = vec![
+        ("reason", Json::s(dap_reason(reason))),
+        ("threadId", Json::i(thread_id)),
+        ("allThreadsStopped", Json::Bool(true)),
+    ];
+    if let Some(id) = cap_id {
+        body.push(("capId", Json::i(id as i64)));
+    }
+    ("stopped", Json::obj(body))
+}
+
 fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
     (
         "stopped",
@@ -1783,6 +1823,7 @@ fn dap_reason(r: StopReason) -> &'static str {
         // W4 blocking stdin: parked at a `read` awaiting input — the client shows an input prompt
         // and resumes after `provideStdin`.
         StopReason::StdinPark => "stdin",
+        StopReason::CapPark { .. } => "cap",
     }
 }
 
