@@ -9781,7 +9781,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             &argv,
             vec![(file_key, src)],
             readback,
-            None,
+            ExecMode::None,
         )
     }
 }
@@ -9821,7 +9821,56 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
         .trim_start_matches('/')
         .to_string();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, None) }
+    unsafe {
+        op13_phase_open_impl(
+            sl(child_ptr, child_len),
+            &argv_refs,
+            seeds,
+            readback,
+            ExecMode::None,
+        )
+    }
+}
+
+/// Shared body of the two nimsem op-13 drivers: decode the `nifler` blob, pack argv/seeds/readback, and
+/// open [`op13_phase_open_impl`] with the `exec` posture `exec_of` builds from the decoded nifler.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
+unsafe fn nimsem_open_common(
+    child_ptr: *const u8,
+    child_len: usize,
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    exec_of: fn(std::sync::Arc<temen_ir::Module>) -> ExecMode,
+) -> i32 {
+    temen_op13jit_close();
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&nifler).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    let exec = exec_of(std::sync::Arc::new(nifler));
+    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
+        .trim_start_matches('/')
+        .to_string();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, exec) }
 }
 
 /// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
@@ -9831,8 +9880,8 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 /// (the dominant cost) tiers up. #1025 3d: the `nifler` blob is the **child-entry** `nifler_ce`, and the
 /// exec spawns it as a **confined §14 op-13 grandchild** ([`nimc::run_phase_op13`]) — the guest services
 /// its own `exec` through the confinement path rather than an inline host run (byte-identical `.p.nif`).
-/// Everything else matches `phase_open_argv` (packed argv/seeds, output key); nimsem's ~256 MiB peak grows
-/// in its own detached memory (#1288).
+/// The whole-card card uses [`temen_op13jit_nimsem_open_inline`] instead (lighter footprint); this
+/// confined form is kept for the headless posture and its gate.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
@@ -9850,32 +9899,58 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     out_ptr: *const u8,
     out_len: usize,
 ) -> i32 {
-    temen_op13jit_close();
-    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    // #1025 3d: the exec's nifler is the **child-entry** `nifler_ce` (run as a §14 op-13 grandchild).
-    let Ok(nifler_ce) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    if temen_verify::verify_module(&nifler_ce).is_err() {
-        return -STATUS_VERIFY_ERR;
-    }
-    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
-        .trim_start_matches('/')
-        .to_string();
-    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     unsafe {
-        op13_phase_open_impl(
-            sl(child_ptr, child_len),
-            &argv_refs,
-            seeds,
-            readback,
-            Some(std::sync::Arc::new(nifler_ce)),
+        nimsem_open_common(
+            child_ptr,
+            child_len,
+            nifler_ptr,
+            nifler_len,
+            argv_ptr,
+            argv_len,
+            seed_ptr,
+            seed_len,
+            out_ptr,
+            out_len,
+            ExecMode::Grandchild,
+        )
+    }
+}
+
+/// The **inline-exec** twin of [`temen_op13jit_nimsem_open`] (#1364): identical ABI, but the `nifler` blob
+/// is the **top-level** nifler and nimsem's `exec` runs it **inline** on the interpreter instead of emitting
+/// a `nifler_ce` §14 op-13 grandchild. Same byte-identical `.p.nif` (`exec_op13_nifler_matches_inline`), but
+/// it skips the ~13 MB nifler_ce decode+emit that pushed the tiered nimsem's engine footprint to the 1 GiB
+/// ceiling and OOM'd constrained tabs — so it's the whole-card orchestrator's default.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_nimsem_open_inline(
+    child_ptr: *const u8,
+    child_len: usize,
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+) -> i32 {
+    unsafe {
+        nimsem_open_common(
+            child_ptr,
+            child_len,
+            nifler_ptr,
+            nifler_len,
+            argv_ptr,
+            argv_len,
+            seed_ptr,
+            seed_len,
+            out_ptr,
+            out_len,
+            ExecMode::Inline,
         )
     }
 }
@@ -9935,6 +10010,19 @@ fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 /// key [`temen_op13jit_phase_output`] returns. Phase-agnostic: nifler, hexer, nimsem differ only in
 /// `argv`/`seeds`/`readback`/`exec_nifler`.
 ///
+/// How a tiered phase's `exec` cap services nimsem's `exec("nifler … parse …")` sub-spawn (`None` for
+/// the 3-cap phases — nifler, hexer — that never shell out).
+enum ExecMode {
+    /// 3-cap `{fs, stdout, exit}`: no `exec` cap (nifler crawl, hexer).
+    None,
+    /// 4-cap: `exec` runs the given top-level nifler **inline** on the interpreter (#1364) — no
+    /// nifler_ce decode+emit, so the tiered nimsem's engine footprint stays far under the 1 GiB ceiling.
+    Inline(std::sync::Arc<temen_ir::Module>),
+    /// 4-cap: `exec` spawns the given child-entry `nifler_ce` as a **confined §14 op-13 grandchild**
+    /// (#1025 3d, `run_phase_op13`) — more isolated, but pays the ~13 MB guest decode+emit.
+    Grandchild(std::sync::Arc<temen_ir::Module>),
+}
+
 /// # Safety
 /// `child_bytes` must be a live slice for the duration of the call.
 unsafe fn op13_phase_open_impl(
@@ -9942,7 +10030,7 @@ unsafe fn op13_phase_open_impl(
     argv: &[&str],
     seeds: Vec<(String, Vec<u8>)>,
     readback: String,
-    exec_nifler: Option<std::sync::Arc<temen_ir::Module>>,
+    exec: ExecMode,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
     let Ok(child) = temen_encode::decode_module(child_bytes) else {
@@ -9964,10 +10052,10 @@ unsafe fn op13_phase_open_impl(
     // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
     // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
     // exactly like `fs`, so its nifler sub-spawns run host-side while the phase's own compute tiers up.
-    let caps: &[&str] = if exec_nifler.is_some() {
-        &["fs", "stdout", "exit", "exec"]
-    } else {
+    let caps: &[&str] = if matches!(exec, ExecMode::None) {
         &["fs", "stdout", "exit"]
+    } else {
+        &["fs", "stdout", "exit", "exec"]
     };
     let driver_src = nimc::detached_parent_src(decl, argv, caps);
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
@@ -10005,25 +10093,29 @@ unsafe fn op13_phase_open_impl(
         Value::I32(stdout_h),
         Value::I32(exit_h),
     ];
-    if let Some(nifler_ce) = exec_nifler {
-        // #1025 3d: the `exec` cap = `make_exec` over the SAME shared memfs (`factory`), spawning nifler
-        // as a **confined §14 op-13 grandchild** (`run_phase_op13`) rather than an inline host-proc run —
-        // the guest services its own `exec` through the confinement path (matching the headless compile's
-        // Gap-2 keystone). `nifler_ce` is the child-entry nifler; it's passed as `make_exec`'s
-        // `Some(..)` arg (the first arg is then unused). The nifler grandchild's `.p.nif` is byte-identical
-        // to the inline run (`op13_nifler_crawl_matches_inline`). Forkable so op-13 can re-grant it.
-        let exec_init: temen_interp::HostProc = nimc::make_exec(
-            nifler_ce.clone(),
-            Some(nifler_ce.clone()),
-            std::sync::Arc::clone(&factory),
-        );
+    // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`) — for nimsem's `exec("nifler …
+    // parse …")` sub-spawn. Two postures (see [`ExecMode`]): `Inline` runs the top-level nifler on the
+    // interpreter (`make_exec`'s `None` grandchild arm; #1364, the memory-lean whole-card path), `Grandchild`
+    // spawns `nifler_ce` as a confined §14 op-13 grandchild (#1025 3d). Both write a byte-identical `.p.nif`
+    // (`exec_op13_nifler_matches_inline`); forkable so op-13 can re-grant it.
+    let exec_nifler = match &exec {
+        ExecMode::None => None,
+        ExecMode::Inline(n) => Some((std::sync::Arc::clone(n), None)),
+        ExecMode::Grandchild(ce) => {
+            Some((std::sync::Arc::clone(ce), Some(std::sync::Arc::clone(ce))))
+        }
+    };
+    if let Some((first, ce)) = exec_nifler {
+        let exec_init: temen_interp::HostProc =
+            nimc::make_exec(first.clone(), ce.clone(), std::sync::Arc::clone(&factory));
         let exec_fork: temen_interp::HostProcFork = {
-            let nifler_ce = std::sync::Arc::clone(&nifler_ce);
+            let first = std::sync::Arc::clone(&first);
+            let ce = ce.clone();
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    nifler_ce.clone(),
-                    Some(nifler_ce.clone()),
+                    first.clone(),
+                    ce.clone(),
                     std::sync::Arc::clone(&factory),
                 ))
             })

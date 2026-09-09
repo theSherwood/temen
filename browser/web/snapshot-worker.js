@@ -262,7 +262,7 @@ self.onmessage = async (e) => {
       let tier = null; // what the JS orchestrator pre-seeded (for telemetry / the wiring test)
       try {
         if (niflerCe && nimsemCe && hexerCe) {
-          tier = await jitNimWholeCardOp13(ex, memory, { niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard');
+          tier = await jitNimWholeCardOp13(ex, memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard');
         } else {
           await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
         }

@@ -1069,10 +1069,11 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
 // (`browser-nim-wholecard-op13-test`). `assets` = `{niflerCe, nimsemCe, hexerCe}` (niflerCe is both the
 // crawl child and nimsem's `exec` target). Best-effort: any phase that traps is left for the interpreter card.
 export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey) {
-  const { niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
+  const { nifler, niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
   const u8 = () => new Uint8Array(memory.buffer);
   const enc = new TextEncoder(), dec = new TextDecoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  const readErr = () => u8().slice(Number(ex.temen_stderr_ptr()), Number(ex.temen_stderr_ptr()) + ex.temen_stderr_len());
   const call1 = (fn, s) => {
     const b = enc.encode(s);
     const p = Number(ex.temen_alloc(b.length));
@@ -1155,18 +1156,17 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
     if (!src.length) { continue; } // unresolved import — the interpreter card redoes phase-1 for it
 
-    // nifler --deps parse <file> <out> as a detached op-13 child.
+    // nifler --deps parse <file> <out> on the INTERPRETER (#1364): emitting the ~13 MB nifler guest peaks
+    // the engine near the 1 GiB ceiling, so a constrained tab traps the grow and the whole card silently
+    // falls back to the multi-minute tree-walker. The crawl is cheap interpreted (its footprint is the
+    // nifler decode, a fraction of the emit's) — so we keep the tier-up budget for nimsem/hexer, where the
+    // time and the smaller emit actually are. `.p.nif` rides OUT, `.p.deps.nif` rides ERR.
     const out = `/nimcache/${stem}.p.nif`;
-    const cp = pushBytes(niflerCe), fb = enc.encode(file), ob = enc.encode(out);
-    const fp = pushBytes(fb), op = pushBytes(ob), sp = pushBytes(src);
-    const opened = ex.temen_op13jit_phase_open(cp, niflerCe.length, fp, fb.length, op, ob.length, sp, src.length);
-    ex.temen_dealloc(cp, niflerCe.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
-    if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, error: `nifler open ${stem}: ${opened}` }; }
-    const r = await drive(`${cacheKey}-nifler`);
-    if (r === null) return { crawled, error: `nifler trapped on ${stem}` };
-    const pnif = phaseRead(`nimcache/${stem}.p.nif`);
-    const deps = phaseRead(`nimcache/${stem}.p.deps.nif`);
-    ex.temen_op13jit_close();
+    const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
+    const fp = pushBytes(fb), op = pushBytes(ob);
+    ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
+    const pnif = readOut(), deps = readErr();
+    ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
     if (!pnif.length) { continue; }
     fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
     putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
@@ -1201,9 +1201,14 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const flag = role === 'System' ? ['--isSystem'] : role === 'Main' ? ['--isMain'] : [];
     const argv = packStrs(['nimsem', '--define:nimNativeAlloc', '--define:nimNativeIo', 'm', ...flag, `nimcache/${stem}.p.nif`]);
     const out = enc.encode(`nimcache/${stem}.s.nif`), seed = packFiles(fs);
-    const cp = pushBytes(nimsemCe), np = pushBytes(niflerCe), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
-    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, niflerCe.length, ap, argv.length, sp, seed.length, op, out.length);
-    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, niflerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
+    // #1364: pass the TOP-LEVEL nifler (not nifler_ce) so nimsem's exec→nifler runs inline on the
+    // interpreter instead of decoding+emitting the ~13 MB nifler_ce grandchild — that emit is what pushed
+    // the tiered nimsem toward the 1 GiB ceiling and OOM'd constrained tabs. nimsem still gets its 4th
+    // (exec) cap, so it works; the crawl above already seeded every module's `.p.nif`, so the exec is a
+    // rare fallback. `.p.nif` byte-identical either way (`exec_op13_nifler_matches_inline`).
+    const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const opened = ex.temen_op13jit_nimsem_open_inline(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
+    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
     const r = await drive(`${cacheKey}-nimsem`);
     if (r === null || r !== 0) { if (r !== null) ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem ${r === null ? 'trapped (' + lastTrap + ')' : 'status ' + r} on ${stem}` }; }
