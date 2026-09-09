@@ -114,14 +114,39 @@ pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
                 continue;
             }
             if let Some(inf) = balanced(&block, "infix") {
-                let segs: Vec<&str> = inf
-                    .trim_start_matches("(infix")
-                    .trim_end_matches(')')
-                    .split_whitespace()
-                    .filter(|t| *t != "/" && !t.starts_with('('))
-                    .collect();
-                if !segs.is_empty() {
-                    out.push(format!("/lib/{}.nim", segs.join("/")));
+                // The right operand may be `(bracket a b c)` — nim's `import pkg/[a, b, c]` multi-import.
+                // Expand it to one absolute import per element (`/lib/<prefix>/<a>.nim`, …); the prefix is
+                // the infix's plain segments (e.g. `std`) before the bracket. Without this, `std/[a, b]`
+                // wrongly flattened to a single `/lib/std/a/b.nim` (which resolves to nothing), so any
+                // stdlib module using bracket imports (strutils → `std/[assertions, parseutils]`, …) failed
+                // to crawl and then failed to sem-check.
+                if let Some(br) = balanced(&inf, "bracket") {
+                    let cut = inf.find(&br).unwrap();
+                    let prefix: Vec<&str> = inf[..cut]
+                        .trim_start_matches("(infix")
+                        .split_whitespace()
+                        .filter(|t| *t != "/" && !t.starts_with('('))
+                        .collect();
+                    for e in br
+                        .trim_start_matches("(bracket")
+                        .trim_end_matches(')')
+                        .split_whitespace()
+                        .filter(|t| !t.starts_with('('))
+                    {
+                        let mut segs = prefix.clone();
+                        segs.push(e);
+                        out.push(format!("/lib/{}.nim", segs.join("/")));
+                    }
+                } else {
+                    let segs: Vec<&str> = inf
+                        .trim_start_matches("(infix")
+                        .trim_end_matches(')')
+                        .split_whitespace()
+                        .filter(|t| *t != "/" && !t.starts_with('('))
+                        .collect();
+                    if !segs.is_empty() {
+                        out.push(format!("/lib/{}.nim", segs.join("/")));
+                    }
                 }
             } else if let Some(pre) = balanced(&block, "prefix") {
                 let segs: Vec<&str> = pre
@@ -790,6 +815,31 @@ mod tests {
     //! wasm cdylib uses). Skips unless the phase `.temen` are staged at `/tmp/e2e_temen` and the stdlib
     //! at `.nimtool/nimony/lib` — build them with `demos/nim_e2e_chain/build_e2e_chain.sh`.
     use super::*;
+
+    /// `parse_imports` must expand a bracket multi-import (`import std/[a, b]`, encoded as
+    /// `(infix / std (bracket a b))`) into ONE absolute path per element — not flatten it into a single
+    /// `/lib/std/a/b.nim` (the #1375 bug that stopped strutils and any bracket-importing stdlib from
+    /// crawling). Single imports and single-element brackets keep resolving as before. No assets needed.
+    #[test]
+    fn parse_imports_expands_bracket_multi_import() {
+        let deps = "(stmts (import (infix / std (bracket assertions parseutils))))";
+        assert_eq!(
+            parse_imports(deps, "/lib/std"),
+            vec![
+                "/lib/std/assertions.nim".to_string(),
+                "/lib/std/parseutils.nim".to_string(),
+            ],
+        );
+        // A plain `import std/syncio` still resolves to the single absolute path.
+        assert_eq!(
+            parse_imports("(stmts (import (infix / std syncio)))", "/lib/std"),
+            vec!["/lib/std/syncio.nim".to_string()],
+        );
+        // A `when`-guarded import is skipped (platform-specific).
+        assert!(
+            parse_imports("(stmts (import (when (infix / std posix))))", "/lib/std").is_empty()
+        );
+    }
 
     fn seed() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>)> {
         let dir = std::path::Path::new("/tmp/e2e_temen");
