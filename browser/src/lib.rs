@@ -2508,6 +2508,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
             // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
             bytecode::VcpuEvent::StdinPark => return PAR_TRAP,
+            // #1366: a host-completed cap park has no completer on this driver — fail closed.
+            bytecode::VcpuEvent::CapPending { .. } => return PAR_TRAP,
             // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
             // mints and seeds from this blob, then posts to a new Worker (see
             // [`PAR_INSTANTIATE_DETACHED`]). The by-name grant list has no path across Workers on this
