@@ -590,7 +590,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
 }
 
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
-export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey) {
+export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey, shared = 1) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Hand the module (+ optional stdin) to the cdylib: decode, outline, grant powerbox, emit `_start`.
   const modP = Number(ex.temen_alloc(moduleBytes.length));
@@ -601,9 +601,11 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
     stdinP = Number(ex.temen_alloc(stdinLen));
     u8().set(stdinBytes, stdinP);
   }
-  // shared=1: this demo instantiates the emitted module against the cdylib's **shared** memory
-  // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
-  const opened = ex.temen_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
+  // `shared`: 1 (default) instantiates the emitted module against the cdylib's **shared** memory
+  // (cross-origin-isolated threads build); a plain single-threaded host (e.g. the JACL playground's
+  // non-threads cdylib) passes 0 — a shared-mode emit LinkErrors against a non-shared memory. Same
+  // knob as `runWarmCoop`.
+  const opened = ex.temen_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, shared);
   // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams,
   // `thread.spawn`s, hosts fibers, …): try the **cooperative** tier-up driver before giving the
   // buffers up — its scheduler multiplexes every vCPU of the run on this one wasm thread, the
@@ -613,7 +615,7 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // emittable ever) → fall through to the throw and the caller's plain-interpreter fallback.
   let coop = false;
   if (opened !== 0 && ex.temen_coop_open &&
-      ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
+      ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, shared) === 0) {
     coop = true;
   }
   ex.temen_dealloc(modP, moduleBytes.length);
