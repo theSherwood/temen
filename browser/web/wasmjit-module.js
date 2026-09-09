@@ -413,6 +413,21 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     }
     return f;
   };
+  // Bounce shims are under 200 bytes each and a table rebuild instantiates one per interpreter-
+  // resident slot (~200 on the JACL compiler card). Going through the ASYNC compile queue for them is
+  // pathological: V8 can park one such `WebAssembly.instantiate` promise for seconds behind its own
+  // background work on the big emitted module (measured: the SECOND warm-coop run's rebuild took
+  // 6.2 s for 224 shims, one of them 6.15 s, while the first and third took ~50 ms — the playground's
+  // tier-up mode failed its second compile on this). Synchronous instantiation is immune (~25 ms for
+  // all 224) and a shim is far under the main-thread sync-compile budget; a shim that isn't (never
+  // seen) falls back to the async path.
+  const shimForFast = async (slot, code) => {
+    try {
+      return shimForSync(slot, code);
+    } catch {
+      return shimFor(slot, code);
+    }
+  };
   const shimForSync = (slot, code) => {
     const key = `${slot}#${code}`;
     let f = shims.get(key);
@@ -459,7 +474,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     for (let slot = 0; slot < tsize; slot++) {
       let entry = null;
       if (slot < nfuncs) {
-        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
+        entry = emitted['f' + slot] ?? await shimForFast(slot, -2);
       } else {
         const code = ex.temen_coop_slot_code(slot);
         if (code >= 0) {
@@ -468,7 +483,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
           if (cached !== undefined) entry = cached['f0'];
           else {
             const bytes = slotUnitBytes(slot);
-            entry = bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimFor(slot, code);
+            entry = bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, code);
           }
         }
       }
