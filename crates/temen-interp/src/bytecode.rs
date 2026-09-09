@@ -2991,6 +2991,14 @@ pub enum VcpuEvent {
         /// the resolved `Module` — only the engine that resolved the handle does.
         data: std::sync::Arc<[temen_ir::Data]>,
     },
+    /// #1366 — a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the guest's
+    /// `call.cap` punted to the embedder, which will supply the scalar asynchronously. The vCPU is
+    /// parked on it; the host services the request it recorded under `id` (in its submit hook),
+    /// then calls [`Vcpu::deliver_cap`]`(id, value)` and [`run`](Vcpu::run) again. The guest saw a
+    /// plain synchronous call. `dst` is the awaiting result slot (informational — `deliver_cap`
+    /// writes it). The single-threaded-embedder twin of the pool's inline wait; the
+    /// `StdinPark`/`push_stdin` shape generalized to any cap.
+    CapPending { id: u64, dst: u32 },
     /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
     /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
     /// The read did **not** complete (nothing written, pc un-advanced); the host pushes more bytes with
@@ -3618,6 +3626,38 @@ impl<'p> Vcpu<'p> {
         self.host.push_stdin(bytes);
     }
 
+    /// #1366 — finish a host-completed cap call the vCPU parked on ([`VcpuEvent::CapPending`] with
+    /// this `id`): `value` lands in the call's result slot and the completion record settles, then
+    /// [`run`](Vcpu::run) again. The twin of [`push_stdin`](Vcpu::push_stdin) for a cap the
+    /// embedder services asynchronously (the guest saw a plain synchronous `call.cap`).
+    pub fn deliver_cap(&mut self, id: u64, value: i64) {
+        let dst = self
+            .pending
+            .take()
+            .expect("deliver_cap with no pending CapPending");
+        let comps = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().completions(),
+            None => self.host.completions(),
+        };
+        let prefix = comps.complete_host(id, value);
+        let r = comps.try_take(id).unwrap_or(value);
+        if let Some((type_id, op, handle, args)) = prefix {
+            let rec = super::CapRecord {
+                type_id,
+                op,
+                handle,
+                args,
+                result: Ok(vec![value]),
+                mem_writes: Vec::new(),
+            };
+            match self.shared_host {
+                Some(m) => m.lock_unpoisoned().tape_cap_record(rec),
+                None => self.host.tape_cap_record(rec),
+            }
+        }
+        self.vt.active.set(dst, Reg::from_i64(r));
+    }
+
     /// Borrow this vCPU's owned powerbox — e.g. to read `stdout` after a [`run`](Vcpu::run) that parked
     /// or finished. `None`-safe only for an owned host; a `with_shared_host` vCPU services I/O through
     /// the shared lock, not here.
@@ -3628,6 +3668,12 @@ impl<'p> Vcpu<'p> {
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
     /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
     pub fn run(&mut self) -> VcpuEvent {
+        // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
+        // punts on its host. A cheap flag store per resume.
+        match self.shared_host {
+            Some(m) => m.lock_unpoisoned().completions().allow_host_completed(),
+            None => self.host.completions().allow_host_completed(),
+        }
         if let Some(t) = self.trap.take() {
             return VcpuEvent::Trapped(t);
         }
@@ -3730,14 +3776,28 @@ impl<'p> Vcpu<'p> {
                     return VcpuEvent::Join { handle };
                 }
                 Ok(VcpuStop::CapPending { id, dst }) => {
-                    // F2: the session driver keeps the inline completion wait — identical to
-                    // the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
                         None => self.host.completions(),
                     };
-                    let r = comps.wait(id);
-                    self.vt.active.set(dst, Reg::from_i64(r));
+                    if comps.is_host_owned(id) {
+                        // #1366 host-completed posture: the embedder finishes this one. If it
+                        // already did (inside its submit hook), deliver and keep going; else park
+                        // the vCPU and surface the id — resume via `deliver_cap` + `run`, the
+                        // `StdinPark`/`push_stdin` shape.
+                        match comps.try_take(id) {
+                            Some(r) => self.vt.active.set(dst, Reg::from_i64(r)),
+                            None => {
+                                self.pending = Some(dst);
+                                return VcpuEvent::CapPending { id, dst };
+                            }
+                        }
+                    } else {
+                        // F2: a pool-completed punt keeps the inline completion wait — identical
+                        // to the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
+                        let r = comps.wait(id);
+                        self.vt.active.set(dst, Reg::from_i64(r));
+                    }
                 }
                 Ok(VcpuStop::Wait {
                     base,
@@ -5123,6 +5183,12 @@ pub struct DebugRun {
     /// Cleared at each advance entry — the parked read re-executes on resume, so the state
     /// re-derives (re-parks or proceeds) rather than being carried (invariant 7).
     stdin_parked: bool,
+    /// #1366 — set when the last advance parked on a **host-completed cap call**: `(completion id,
+    /// awaiting result slot)`. The op already advanced `pc`; nothing more can run until the
+    /// embedder [`deliver_cap`](DebugRun::deliver_cap)s the value (advances refuse to proceed while
+    /// parked). Cleared by `deliver_cap` and on a checkpoint `restore` (a replay serves the call
+    /// from the tape and never re-parks).
+    cap_parked: Option<(u64, u32, Option<super::IrPc>)>,
     /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
     /// op with the op's [`MemEvent`](super::MemEvent), the run's `op_clock`, and task 0. `None`
     /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
@@ -5346,6 +5412,14 @@ enum FiberStep {
     /// `instantiate`, coroutine, tier-up. The single-vCPU [`DebugRun`] treats these as `Malformed`; the
     /// multi-vCPU [`ScheduledDebugRun`] dispatches the ones it schedules (spawn/join/wait/notify).
     Other(Outcome),
+    /// #1366 — the op punted to a host-completed cap: the debug run parks on completion `id`
+    /// (result slot `dst`); `at` is the call's own pc (captured before the op advanced), the stop
+    /// location the backend reports — the post-call position may be a terminator with no pc.
+    CapParked {
+        id: u64,
+        dst: u32,
+        at: Option<super::IrPc>,
+    },
 }
 
 /// Run **one op** of a debug session's active continuation (`vt.active`), applying any §12 fiber switch
@@ -5363,6 +5437,9 @@ fn debug_advance_fiber(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
+    // #1366: the op's own pc, before it advances — a host-completed park reports it as the stop
+    // location (the position after a call may be a terminator, which has no pc).
+    let at = vt.debug_active().cur_ir_pc(source);
     // Step-into a §14 coroutine body (single-vCPU `DebugRun` only): while a coroutine child is the
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
     // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
@@ -5510,9 +5587,15 @@ fn debug_advance_fiber(
         // corollary; checkpointing across one is already excluded by `checkpoint_safe`'s
         // replay-substate rules — the wait happens inside the advance, leaving no parked state).
         Ok(Outcome::CapPending { id, dst }) => {
-            let r = host.completions().wait(id);
-            vt.active.set(dst, Reg::from_i64(r));
-            FiberStep::Stepped
+            match host.completions().wait_unless_host_owned(id) {
+                Some(r) => {
+                    vt.active.set(dst, Reg::from_i64(r));
+                    FiberStep::Stepped
+                }
+                // #1366: a host-completed punt — the debug run parks on it (`cap_parked`) and the
+                // backend surfaces `StopReason::CapPark`; `deliver_cap` resumes.
+                None => FiberStep::CapParked { id, dst, at },
+            }
         }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
@@ -5954,6 +6037,7 @@ impl DebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             watchpoints: Vec::new(),
             stdin_parked: false,
+            cap_parked: None,
             access_sink: None,
             scheduled_writes: Vec::new(),
             write_cursor: 0,
@@ -6031,6 +6115,49 @@ impl DebugRun {
     /// cap tape so a later `seek` replays it faithfully.
     pub fn provide_stdin(&mut self, bytes: &[u8]) {
         self.host.push_stdin(bytes);
+    }
+
+    /// #1366 — the completion id this run is parked on (a host-completed cap call), if any. The
+    /// backend reports it as `StopReason::CapPark { id }`; [`deliver_cap`](DebugRun::deliver_cap)
+    /// resumes it.
+    pub fn cap_parked(&self) -> Option<u64> {
+        self.cap_parked.map(|(id, _, _)| id)
+    }
+
+    /// #1366 — the pc of the host-completed cap call this run is parked on (the stop location),
+    /// if parked and the call had a source position.
+    pub fn cap_park_pc(&self) -> Option<super::IrPc> {
+        self.cap_parked.and_then(|(_, _, at)| at)
+    }
+
+    /// #1366 — finish the host-completed cap call this run is parked on: `value` lands in the
+    /// call's result slot, the completion settles, the delivered value joins the cap tape as the
+    /// call's record (so a reverse `seek` replays it without re-parking), and the op counts on the
+    /// clock. `false` if the run isn't parked on `id`. The twin of `provide_stdin`.
+    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
+        let Some((pid, dst, _)) = self.cap_parked else {
+            return false;
+        };
+        if pid != id {
+            return false;
+        }
+        let comps = self.host.completions();
+        let prefix = comps.complete_host(id, value);
+        let _ = comps.try_take(id);
+        if let Some((type_id, op, handle, args)) = prefix {
+            self.host.tape_cap_record(super::CapRecord {
+                type_id,
+                op,
+                handle,
+                args,
+                result: Ok(vec![value]),
+                mem_writes: Vec::new(),
+            });
+        }
+        self.vt.active.set(dst, Reg::from_i64(value));
+        self.cap_parked = None;
+        self.op_clock += 1;
+        true
     }
 
     /// Install the session's per-op **access sink** ([`AccessSinkFn`]) — observation only, zero
@@ -6133,6 +6260,7 @@ impl DebugRun {
         self.done = None;
         self.at_bp = false;
         self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
+        self.cap_parked = None; // likewise: a replayed cap call is served from the tape
     }
 
     /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
@@ -6143,6 +6271,12 @@ impl DebugRun {
             return false;
         }
         self.at_bp = false;
+        // #1366: parked on a host-completed cap — nothing can advance until the embedder
+        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
+        if self.cap_parked.is_some() {
+            return false;
+        }
+        self.host.completions().allow_host_completed();
         self.stdin_parked = false;
         let Self {
             source,
@@ -6154,6 +6288,7 @@ impl DebugRun {
             done,
             op_clock,
             stdin_parked,
+            cap_parked,
             funcs,
             fn_block_base,
             fn_block_types,
@@ -6198,6 +6333,11 @@ impl DebugRun {
                 *stdin_parked = true;
                 false
             }
+            // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
+            FiberStep::CapParked { id, dst, at } => {
+                *cap_parked = Some((id, dst, at));
+                false
+            }
             // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
             FiberStep::Other(_) => {
                 *done = Some(Err(Trap::Malformed));
@@ -6212,6 +6352,12 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        // #1366: parked on a host-completed cap — nothing can advance until the embedder
+        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
+        if self.cap_parked.is_some() {
+            return None;
+        }
+        self.host.completions().allow_host_completed();
         self.stdin_parked = false;
         let Self {
             source,
@@ -6229,6 +6375,7 @@ impl DebugRun {
             funcs,
             watchpoints,
             stdin_parked,
+            cap_parked,
             access_sink,
             scheduled_writes,
             write_cursor,
@@ -6268,6 +6415,11 @@ impl DebugRun {
                 // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
                 FiberStep::Other(Outcome::StdinPark) => {
                     *stdin_parked = true;
+                    return None;
+                }
+                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -6365,6 +6517,11 @@ impl DebugRun {
                     *stdin_parked = true;
                     return None;
                 }
+                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
+                    return None;
+                }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
                 FiberStep::Other(_) => {
                     *done = Some(Err(Trap::Malformed));
@@ -6381,6 +6538,12 @@ impl DebugRun {
         if self.done.is_some() {
             return None;
         }
+        // #1366: parked on a host-completed cap — nothing can advance until the embedder
+        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
+        if self.cap_parked.is_some() {
+            return None;
+        }
+        self.host.completions().allow_host_completed();
         self.stdin_parked = false;
         let Self {
             source,
@@ -6393,6 +6556,7 @@ impl DebugRun {
             done,
             op_clock,
             stdin_parked,
+            cap_parked,
             funcs,
             fn_block_base,
             fn_block_types,
@@ -6436,6 +6600,11 @@ impl DebugRun {
                 // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
                 FiberStep::Other(Outcome::StdinPark) => {
                     *stdin_parked = true;
+                    return None;
+                }
+                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -7186,6 +7355,12 @@ fn service_advance(
         FiberStep::Trapped(t) => {
             *turn += 1;
             dbg_complete(tasks, ti, Err(t));
+        }
+        // #1366: a host-completed cap park has no completer on the scheduled engine (no
+        // `cap_parked` there yet) — fail closed, exactly like a trap.
+        FiberStep::CapParked { .. } => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Err(Trap::CapFault));
         }
         // A scheduler seam: the ones this engine dispatches, else `Declined`.
         FiberStep::Other(outcome) => match outcome {
@@ -11746,8 +11921,11 @@ impl CoopSched {
                             None => host.completions(),
                             Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
                         };
-                        let r = comps.wait(id);
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                        // #1366: a host-completed punt has no completer on this driver — decline.
+                        match comps.wait_unless_host_owned(id) {
+                            Some(r) => tasks[ti].vt.active.set(dst, Reg::from_i64(r)),
+                            None => complete(tasks, ti, Err(Trap::CapFault)),
+                        }
                     }
                 }
                 Ok(VcpuStop::ChildOffer { child, export, dst }) => {
@@ -14412,8 +14590,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // is the lock-release, already landed); fiber-waiter delivery through the
                 // real cross-thread futex is the I45/I73 residue, its own slice.
                 let comps = host.lock_unpoisoned().completions();
-                let r = comps.wait(id);
-                vt.active.set(dst, Reg::from_i64(r));
+                // #1366: a host-completed punt has no completer on this driver — decline.
+                match comps.wait_unless_host_owned(id) {
+                    Some(r) => vt.active.set(dst, Reg::from_i64(r)),
+                    None => return (Err(Trap::CapFault), mem),
+                }
             }
             Ok(VcpuStop::Wait {
                 base,
