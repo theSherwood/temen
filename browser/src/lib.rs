@@ -8432,6 +8432,11 @@ pub extern "C" fn temen_bash_coop_close() {
 /// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
 /// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
 /// resolve by name.
+///
+/// Decodes the library on **every** call. A host that runs many programs against one unchanging
+/// library (a language playground) should open it once with [`temen_link_lib_open`] and run through
+/// [`temen_link_run_lib`] on its handle instead (#1373) — same link, same result accessors, minus the
+/// per-run decode.
 #[no_mangle]
 pub extern "C" fn temen_link_run(
     prog_ptr: *const u8,
@@ -8443,63 +8448,184 @@ pub extern "C" fn temen_link_run(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let slice = |p: *const u8, n: usize| -> &'static [u8] {
-        if p.is_null() || n == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(p, n) }
+    let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Some(m) => m,
+        None => {
+            unsafe { LAST_STATUS = STATUS_DECODE_ERR };
+            return 0;
         }
     };
-    let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
+    let lib_exports = link_lib_exports(&lib);
+    link_run_against(
+        temen_ir::LinkUnitRef {
+            module: &lib,
+            exports: &lib_exports,
+            data_exports: &[],
+        },
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+/// The **resident link libraries** (#1373): decoded library units [`temen_link_lib_open`] keeps
+/// between [`temen_link_run_lib`] calls, so a host linking many programs against one (or a few)
+/// runtimes pays each library's decode once instead of on every run (measured ~35% of the browser's
+/// per-run link floor). Handle-addressed so a frontend with two runtimes — jacl's `jaclrt` for
+/// programs and `jaclrt_staging` for macro bodies — keeps both resident instead of thrashing one slot.
+struct LinkLib {
+    module: temen_ir::Module,
+    /// The library's inline exports as link symbols (`name → local funcidx`), computed once.
+    exports: Vec<(String, temen_ir::FuncIdx)>,
+}
+
+static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
+
+/// Decode a **library** unit (text or binary, sniffed like [`temen_link_run`]'s params) and keep it
+/// resident for [`temen_link_run_lib`]. Returns its handle (`>= 0`; the lowest free slot) or `-1` on a
+/// decode failure ([`STATUS_DECODE_ERR`] in [`temen_status`], nothing resident). The bytes are copied
+/// out (decoded), so the host may `temen_dealloc` them right after this returns.
+#[no_mangle]
+pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let Some(module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
+        set(STATUS_DECODE_ERR);
+        return -1;
+    };
+    let exports = link_lib_exports(&module);
+    // SAFETY: single-threaded wasm; exclusive access to the resident table.
+    let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
+    let lib = Some(LinkLib { module, exports });
+    let h = match libs.iter().position(Option::is_none) {
+        Some(i) => {
+            libs[i] = lib;
+            i
+        }
+        None => {
+            libs.push(lib);
+            libs.len() - 1
+        }
+    };
+    set(STATUS_OK);
+    h as i32
+}
+
+/// Drop the resident library `handle` ([`temen_link_lib_open`]). Unknown / already-closed handles are
+/// a no-op.
+#[no_mangle]
+pub extern "C" fn temen_link_lib_close(handle: i32) {
+    // SAFETY: single-threaded wasm; exclusive access to the resident table.
+    let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
+    if let Some(slot) = usize::try_from(handle).ok().and_then(|h| libs.get_mut(h)) {
+        *slot = None;
+    }
+}
+
+/// [`temen_link_run`] against the **resident** library `handle` ([`temen_link_lib_open`]): load only
+/// the program unit, link it as unit 1 against the resident unit 0, synthesize `_start`, verify, run —
+/// the same pipeline and result accessors as [`temen_link_run`], minus the library decode. An unknown
+/// or closed handle: [`STATUS_UNSUPPORTED`] and `0`.
+#[no_mangle]
+pub extern "C" fn temen_link_run_lib(
+    handle: i32,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
+    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
+    let Some(lib) = usize::try_from(handle)
+        .ok()
+        .and_then(|h| libs.get(h))
+        .and_then(Option::as_ref)
+    else {
+        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
+        return 0;
+    };
+    link_run_against(
+        temen_ir::LinkUnitRef {
+            module: &lib.module,
+            exports: &lib.exports,
+            data_exports: &[],
+        },
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+fn link_slice(p: *const u8, n: usize) -> &'static [u8] {
+    if p.is_null() || n == 0 {
+        &[]
+    } else {
+        // SAFETY: the host passes a live `temen_alloc`ation of `n` bytes.
+        unsafe { core::slice::from_raw_parts(p, n) }
+    }
+}
+
+/// A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start with a
+/// NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect; a resolved
+/// runnable module is a degenerate unit and loads fine), text rides the parser.
+fn link_load_unit(bytes: &[u8]) -> Option<temen_ir::Module> {
+    if temen_encode::wire::is_module_blob(bytes) {
+        temen_encode::decode_unit(bytes).ok()
+    } else {
+        temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+    }
+}
+
+fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> {
+    lib.exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect()
+}
+
+/// The shared half of [`temen_link_run`] / [`temen_link_run_lib`]: load the program unit, link it as
+/// unit 1 against `lib` (unit 0), synthesize the powerbox `_start` around `entry_name`, verify, run,
+/// and stash the outcome in the result slots. Returns the entry's value (`0` on any failure, with
+/// [`LAST_STATUS`] saying which).
+fn link_run_against(
+    lib: temen_ir::LinkUnitRef<'_>,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
         Ok(s) => s,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    let stdin = slice(stdin_ptr, stdin_len);
-
-    // A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start
-    // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
-    // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
-    let load_unit = |bytes: &[u8]| -> Option<temen_ir::Module> {
-        if temen_encode::wire::is_module_blob(bytes) {
-            temen_encode::decode_unit(bytes).ok()
-        } else {
-            temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
-        }
-    };
-    let program = match load_unit(slice(prog_ptr, prog_len)) {
+    let stdin = link_slice(stdin_ptr, stdin_len);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
         Some(m) => m,
         None => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    let lib = match load_unit(slice(lib_ptr, lib_len)) {
-        Some(m) => m,
-        None => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
-    };
-    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
-        .exports
-        .iter()
-        .map(|e| (e.name.clone(), e.func))
-        .collect();
-
-    let linked = match temen_ir::link_with_manifest(&[
-        temen_ir::LinkUnit {
-            module: lib,
-            exports: lib_exports,
-            ..Default::default()
-        },
-        temen_ir::LinkUnit {
-            module: program,
-            exports: vec![(entry_name.to_string(), 0)],
-            ..Default::default()
+    let prog_exports = [(entry_name.to_string(), 0)];
+    let linked = match temen_ir::link_with_manifest_ref(&[
+        lib,
+        temen_ir::LinkUnitRef {
+            module: &program,
+            exports: &prog_exports,
+            data_exports: &[],
         },
     ]) {
         Ok(m) => m,

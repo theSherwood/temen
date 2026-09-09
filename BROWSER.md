@@ -405,6 +405,24 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   (hello 14 + stdout, threads 4000, io 8 + 8×"tick\n", jit 1136, inst 40) plus a garbage-source
   parse-reject, all asserted.
 
+## Live link: `temen_link_run` and the resident library (#1373)
+
+`temen_link_run(prog, lib, entry, stdin)` is the language-agnostic live-editing path: decode both
+units (text or `.temeno`, sniffed by magic), `link_with_manifest`, `synth_manifest_start`, verify,
+run. It decodes the **library** on every call, and for a playground the library is the same runtime
+every run — measured on the JACL runtime (178 KB binary) + a 3 KB program unit in wasm32/Node:
+`temen_link_run` 10.9 ms/run, of which the library decode is ~3.8 ms.
+
+`temen_link_lib_open(lib)` decodes it once and keeps the `Module` resident, returning a handle (several
+libraries can be resident — jacl keeps its program runtime and its macro-staging runtime); `temen_link_run_lib(handle,
+prog, entry, stdin)` then links each program against it through the borrowed-unit linker entry
+(`temen_ir::link_with_manifest_ref`, same merged module as the owned one — `borrowed_units_link_
+identically_to_owned`) with the same result accessors: **7.2 ms/run** (1.5×). `temen_link_lib_close(handle)`
+drops it. `browser/bench_link_lib.mjs` is the measurement. What remains per run is the link's copy +
+relocation of the library's functions, `_start` synthesis, whole-module verify, and execution; the
+next cut is a pre-laid-out unit 0 (relocate the library once, append only the program's functions
+and re-resolve its edges) — a linker refactor, tracked on #1373.
+
 ## Remaining work / follow-ons
 
 Everything in the phase tracker is landed; this is the open list — each item its own slice, none a
