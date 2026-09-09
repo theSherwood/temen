@@ -13168,6 +13168,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
                         // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
                         // jobs return one i64 by contract).
+                        // #1366: a host-completed punt (`OffloadOutcome::Host`) has no completer
+                        // on the oracle — no driver surfaces the park to an embedder — so
+                        // neither parking nor the degenerate wait below could ever finish it.
+                        // Decline fail-closed rather than hang (invariant 9).
+                        if comps.is_host_owned(id) {
+                            return Err(Trap::CapFault);
+                        }
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -16945,11 +16952,19 @@ impl Drop for OffloadPool {
 pub struct Completions {
     mx: Mutex<CompletionState>,
     cv: Condvar,
+    /// #1366 — whether a driver that **surfaces** cap parks to the embedder is running this host
+    /// (set by [`bytecode::Vcpu::run`]). A host-completed punt is admitted only then; every other
+    /// driver could only wait inline on it, so the dispatch declines *before* the submit hook runs
+    /// — the embedder is never handed a request nobody can finish.
+    host_ok: std::sync::atomic::AtomicBool,
 }
 
 struct CompletionState {
     /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
     ready: BTreeMap<u64, i64>,
+    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt: completed by the embedder, never
+    /// by a pool worker. An inline waiter must not block on one (nobody could wake it).
+    host_owned: BTreeSet<u64>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
     /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
@@ -16982,12 +16997,26 @@ impl Completions {
         Completions {
             mx: Mutex::new(CompletionState {
                 ready: BTreeMap::new(),
+                host_owned: BTreeSet::new(),
                 in_flight: 0,
                 next_id: 0,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
+            host_ok: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
+    /// and completes them via `deliver_cap`, admitting [`OffloadOutcome::Host`] punts on this host.
+    pub fn allow_host_completed(&self) {
+        self.host_ok
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// #1366 — whether host-completed punts are admitted (see [`allow_host_completed`](Self::allow_host_completed)).
+    pub fn host_completed_allowed(&self) -> bool {
+        self.host_ok.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
@@ -17043,6 +17072,54 @@ impl Completions {
         Self::fiber_drain_locked(&mut g);
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
+    /// host-owned under the one lock.
+    fn mint_host_owned(&self) -> u64 {
+        let mut g = self.mx.lock_unpoisoned();
+        let id = g.next_id;
+        g.next_id += 1;
+        g.in_flight += 1;
+        g.host_owned.insert(id);
+        id
+    }
+
+    /// #1366 — whether `id` is a host-completed punt (the embedder, not a pool worker, finishes
+    /// it). A driver that surfaces parks checks this to decide between "surface the id" and the
+    /// inline pool wait.
+    pub fn is_host_owned(&self, id: u64) -> bool {
+        self.mx.lock_unpoisoned().host_owned.contains(&id)
+    }
+
+    /// #1366 — the embedder finishes a host-completed punt: post `result` for `id` and wake
+    /// waiters exactly as a pool worker's [`complete`](Completions::complete) would. The id stops
+    /// being host-owned. Unknown/foreign ids are ignored (no-op) rather than corrupting the store.
+    pub fn complete_host(&self, id: u64, result: i64) {
+        {
+            let mut g = self.mx.lock_unpoisoned();
+            if !g.host_owned.remove(&id) {
+                return;
+            }
+        }
+        self.complete(id, result);
+    }
+
+    /// #1366 — the inline-wait form for drivers that cannot surface a park: block for a
+    /// pool-completed `id` as [`wait`](Completions::wait) does, but **decline** (`None`) a
+    /// host-owned one, which no pool worker will ever complete — the caller traps `CapFault`
+    /// instead of hanging.
+    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+        let mut g = self.mx.lock_unpoisoned();
+        loop {
+            if let Some(r) = g.ready.remove(&id) {
+                return Some(r);
+            }
+            if g.host_owned.contains(&id) {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
@@ -17185,7 +17262,23 @@ pub enum OffloadOutcome {
     /// Would block: run this job off the vCPU thread. The call's declared signature must have at
     /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
     Offload(OffloadWork),
+    /// **Host-completed** (#1366): would block, and the *embedder* — not a pool thread — will
+    /// supply the scalar later. On the parking face the dispatch mints a completion id, marks it
+    /// host-owned, hands it to `submit` (so the host can record the request against that id), and
+    /// parks the caller; a resumable driver surfaces [`bytecode::VcpuEvent::CapPending`] and the
+    /// host finishes it with [`bytecode::Vcpu::deliver_cap`] (or [`Completions::complete_host`]).
+    /// This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
+    /// exist) services a cap asynchronously while the guest still sees a plain synchronous call.
+    /// Admitted only under a driver that surfaces the park (`Vcpu` flags its host via
+    /// [`Completions::allow_host_completed`]); any other driver has no way to complete it and
+    /// **declines** with `CapFault` before `submit` runs (invariant 9: decline, never diverge —
+    /// and never hang).
+    Host(HostCompletion),
 }
+
+/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once with the minted completion
+/// id on the parking face, before the caller parks.
+pub type HostCompletion = Box<dyn FnOnce(u64) + Send>;
 
 /// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
 /// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
@@ -19773,6 +19866,32 @@ impl Host {
                 Ok(Vec::new())
             }
             None => Ok(vec![job()]),
+        }
+    }
+
+    /// #1366 — dispose of a host-completed punt ([`OffloadOutcome::Host`]) per the dispatch face:
+    /// on the parking face mint a host-owned completion id, hand it to `submit`, and return it
+    /// through `pending` (the caller parks; a resumable driver surfaces the id and the embedder
+    /// completes it). On the sync face there is nothing to run inline and no one to complete the
+    /// call — decline fail-closed with `CapFault` rather than block forever.
+    fn punt_host(
+        &mut self,
+        submit: HostCompletion,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        // Only a driver that surfaces the park (`Vcpu`) can ever finish this call: decline before
+        // the submit hook runs under any other, so the embedder never records a dead request.
+        if !self.completions.host_completed_allowed() {
+            return Err(Trap::CapFault);
+        }
+        match pending {
+            Some(slot) => {
+                let id = self.completions.mint_host_owned();
+                submit(id);
+                *slot = Some(id);
+                Ok(Vec::new())
+            }
+            None => Err(Trap::CapFault),
         }
     }
 
@@ -23512,6 +23631,7 @@ impl Host {
                 // job (pool + `Pending` on the parking face, inline on the sync face). The
                 // window/minter are deliberately out of reach of an offloadable handler.
                 let mut punted: Option<OffloadWork> = None;
+                let mut hosted: Option<HostCompletion> = None;
                 let r = match &mut f {
                     ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
                     ProcHandler::Offloadable(f) => match f(op, args) {
@@ -23520,12 +23640,17 @@ impl Host {
                             punted = Some(job);
                             Ok(Vec::new()) // replaced below
                         }
+                        OffloadOutcome::Host(submit) => {
+                            hosted = Some(submit);
+                            Ok(Vec::new()) // replaced below
+                        }
                     },
                 };
                 self.host_procs[idx as usize].handler = f;
-                match punted {
-                    Some(job) => self.punt_or_inline(job, pending),
-                    None => r,
+                match (punted, hosted) {
+                    (Some(job), _) => self.punt_or_inline(job, pending),
+                    (None, Some(submit)) => self.punt_host(submit, pending),
+                    (None, None) => r,
                 }
             }
             Binding::Exit => {

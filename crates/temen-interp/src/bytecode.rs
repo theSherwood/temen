@@ -2991,6 +2991,14 @@ pub enum VcpuEvent {
         /// the resolved `Module` — only the engine that resolved the handle does.
         data: std::sync::Arc<[temen_ir::Data]>,
     },
+    /// #1366 — a **host-completed cap call** ([`crate::OffloadOutcome::Host`]): the guest's
+    /// `call.cap` punted to the embedder, which will supply the scalar asynchronously. The vCPU is
+    /// parked on it; the host services the request it recorded under `id` (in its submit hook),
+    /// then calls [`Vcpu::deliver_cap`]`(id, value)` and [`run`](Vcpu::run) again. The guest saw a
+    /// plain synchronous call. `dst` is the awaiting result slot (informational — `deliver_cap`
+    /// writes it). The single-threaded-embedder twin of the pool's inline wait; the
+    /// `StdinPark`/`push_stdin` shape generalized to any cap.
+    CapPending { id: u64, dst: u32 },
     /// **Blocking stdin park** (a persistent interactive session, e.g. the browser Postgres console):
     /// the guest `read` a `Stream{In}` cap whose buffer is exhausted, under [`Host::set_stdin_blocking`].
     /// The read did **not** complete (nothing written, pc un-advanced); the host pushes more bytes with
@@ -3618,6 +3626,24 @@ impl<'p> Vcpu<'p> {
         self.host.push_stdin(bytes);
     }
 
+    /// #1366 — finish a host-completed cap call the vCPU parked on ([`VcpuEvent::CapPending`] with
+    /// this `id`): `value` lands in the call's result slot and the completion record settles, then
+    /// [`run`](Vcpu::run) again. The twin of [`push_stdin`](Vcpu::push_stdin) for a cap the
+    /// embedder services asynchronously (the guest saw a plain synchronous `call.cap`).
+    pub fn deliver_cap(&mut self, id: u64, value: i64) {
+        let dst = self
+            .pending
+            .take()
+            .expect("deliver_cap with no pending CapPending");
+        let comps = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().completions(),
+            None => self.host.completions(),
+        };
+        comps.complete_host(id, value);
+        let r = comps.try_take(id).unwrap_or(value);
+        self.vt.active.set(dst, Reg::from_i64(r));
+    }
+
     /// Borrow this vCPU's owned powerbox — e.g. to read `stdout` after a [`run`](Vcpu::run) that parked
     /// or finished. `None`-safe only for an owned host; a `with_shared_host` vCPU services I/O through
     /// the shared lock, not here.
@@ -3628,6 +3654,12 @@ impl<'p> Vcpu<'p> {
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
     /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
     pub fn run(&mut self) -> VcpuEvent {
+        // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
+        // punts on its host. A cheap flag store per resume.
+        match self.shared_host {
+            Some(m) => m.lock_unpoisoned().completions().allow_host_completed(),
+            None => self.host.completions().allow_host_completed(),
+        }
         if let Some(t) = self.trap.take() {
             return VcpuEvent::Trapped(t);
         }
@@ -3730,14 +3762,28 @@ impl<'p> Vcpu<'p> {
                     return VcpuEvent::Join { handle };
                 }
                 Ok(VcpuStop::CapPending { id, dst }) => {
-                    // F2: the session driver keeps the inline completion wait — identical to
-                    // the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
                     let comps = match self.shared_host {
                         Some(m) => m.lock_unpoisoned().completions(),
                         None => self.host.completions(),
                     };
-                    let r = comps.wait(id);
-                    self.vt.active.set(dst, Reg::from_i64(r));
+                    if comps.is_host_owned(id) {
+                        // #1366 host-completed posture: the embedder finishes this one. If it
+                        // already did (inside its submit hook), deliver and keep going; else park
+                        // the vCPU and surface the id — resume via `deliver_cap` + `run`, the
+                        // `StdinPark`/`push_stdin` shape.
+                        match comps.try_take(id) {
+                            Some(r) => self.vt.active.set(dst, Reg::from_i64(r)),
+                            None => {
+                                self.pending = Some(dst);
+                                return VcpuEvent::CapPending { id, dst };
+                            }
+                        }
+                    } else {
+                        // F2: a pool-completed punt keeps the inline completion wait — identical
+                        // to the pre-F2 in-op wait (the I45 whole-vCPU posture for this driver).
+                        let r = comps.wait(id);
+                        self.vt.active.set(dst, Reg::from_i64(r));
+                    }
                 }
                 Ok(VcpuStop::Wait {
                     base,
@@ -5510,9 +5556,14 @@ fn debug_advance_fiber(
         // corollary; checkpointing across one is already excluded by `checkpoint_safe`'s
         // replay-substate rules — the wait happens inside the advance, leaving no parked state).
         Ok(Outcome::CapPending { id, dst }) => {
-            let r = host.completions().wait(id);
-            vt.active.set(dst, Reg::from_i64(r));
-            FiberStep::Stepped
+            match host.completions().wait_unless_host_owned(id) {
+                Some(r) => {
+                    vt.active.set(dst, Reg::from_i64(r));
+                    FiberStep::Stepped
+                }
+                // #1366: a host-completed punt has no completer on this driver — decline, don't hang.
+                None => FiberStep::Trapped(Trap::CapFault),
+            }
         }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
         // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
@@ -11746,8 +11797,11 @@ impl CoopSched {
                             None => host.completions(),
                             Some(k) => extra_envs[k].host.lock_unpoisoned().completions(),
                         };
-                        let r = comps.wait(id);
-                        tasks[ti].vt.active.set(dst, Reg::from_i64(r));
+                        // #1366: a host-completed punt has no completer on this driver — decline.
+                        match comps.wait_unless_host_owned(id) {
+                            Some(r) => tasks[ti].vt.active.set(dst, Reg::from_i64(r)),
+                            None => complete(tasks, ti, Err(Trap::CapFault)),
+                        }
                     }
                 }
                 Ok(VcpuStop::ChildOffer { child, export, dst }) => {
@@ -14412,8 +14466,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // is the lock-release, already landed); fiber-waiter delivery through the
                 // real cross-thread futex is the I45/I73 residue, its own slice.
                 let comps = host.lock_unpoisoned().completions();
-                let r = comps.wait(id);
-                vt.active.set(dst, Reg::from_i64(r));
+                // #1366: a host-completed punt has no completer on this driver — decline.
+                match comps.wait_unless_host_owned(id) {
+                    Some(r) => vt.active.set(dst, Reg::from_i64(r)),
+                    None => return (Err(Trap::CapFault), mem),
+                }
             }
             Ok(VcpuStop::Wait {
                 base,
