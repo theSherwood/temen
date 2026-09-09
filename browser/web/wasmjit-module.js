@@ -1068,8 +1068,14 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
 // skip-checks all satisfied) then only links + runs. Byte-identical to the all-interpreter card
 // (`browser-nim-wholecard-op13-test`). `assets` = `{niflerCe, nimsemCe, hexerCe}` (niflerCe is both the
 // crawl child and nimsem's `exec` target). Best-effort: any phase that traps is left for the interpreter card.
-export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey) {
+export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey, preStdlib = null) {
   const { nifler, niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
+  // #1364/#1375: `preStdlib` is a Map stem -> { pNif, depsNif, sNif, sIdx, xNif } of prebuilt stdlib
+  // artifacts (system.nim's sema alone is ~30 s and is user-independent). When present, those modules'
+  // crawl/nimsem/hexer are skipped: the products are seeded straight into the memfs + accumulator, so a
+  // Run only compiles the user's own modules. Empty/null = the full from-scratch tier-up.
+  const pre = preStdlib || new Map();
+  const produced = new Map(); // stem -> {pNif, depsNif, sNif, sIdx, xNif} for capture (prebuild tooling)
   const u8 = () => new Uint8Array(memory.buffer);
   const enc = new TextEncoder(), dec = new TextDecoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
@@ -1143,6 +1149,16 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const fs = parsePacked(readOut());
   fs.set(mainPath.replace(/^\//, ''), mainSrc);
 
+  // Seed every prebuilt stdlib product into both the memfs (nimsem/hexer read imports' products from the
+  // seed) and the accumulator (`temen_compile_nim_fs`'s final link reads .x.nif from it). Their phases are
+  // then skipped below.
+  const seedFile = (key, bytes) => { if (bytes && bytes.length) { fs.set(key, bytes); putFile(key, bytes); } };
+  for (const [stem, a] of pre) {
+    seedFile(`nimcache/${stem}.p.nif`, a.pNif); seedFile(`nimcache/${stem}.p.deps.nif`, a.depsNif);
+    seedFile(`nimcache/${stem}.s.nif`, a.sNif); seedFile(`nimcache/${stem}.s.idx.nif`, a.sIdx);
+    seedFile(`nimcache/${stem}.x.nif`, a.xNif);
+  }
+
   // ---- phase 1: crawl the import closure with nifler (tiered), capturing the module graph -----------
   const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
   const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
@@ -1153,6 +1169,22 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const { file, role } = work.pop();
     const stem = dec.decode(call1('temen_nim_module_suffix', file));
     if (mods.has(stem)) continue;
+    // Prebuilt stdlib module: skip the nifler run; rebuild its graph edges from the cached `.p.deps.nif`
+    // (so any not-prebuilt import it pulls still gets crawled), then move on — its .p/.s/.x are seeded.
+    if (pre.has(stem)) {
+      const deps = pre.get(stem).depsNif || new Uint8Array();
+      const dir = file.slice(0, file.lastIndexOf('/'));
+      const depStems = [];
+      if (deps.length) {
+        const dirB = enc.encode(dir), dp = pushBytes(deps), drp = pushBytes(dirB);
+        ex.temen_nim_parse_imports(dp, deps.length, drp, dirB.length);
+        const imports = dec.decode(readOut());
+        ex.temen_dealloc(dp, deps.length); ex.temen_dealloc(drp, dirB.length);
+        for (const imp of imports.split('\n')) if (imp) { depStems.push(dec.decode(call1('temen_nim_module_suffix', imp))); work.push({ file: imp, role: 'Import' }); }
+      }
+      mods.set(stem, { file, deps: depStems, role });
+      continue;
+    }
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
     if (!src.length) { continue; } // unresolved import — the interpreter card redoes phase-1 for it
 
@@ -1170,6 +1202,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     if (!pnif.length) { continue; }
     fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
     putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
+    if (role !== 'Main') { const e = produced.get(stem) || {}; e.pNif = pnif; e.depsNif = deps; produced.set(stem, e); }
     crawled++;
 
     const dir = file.slice(0, file.lastIndexOf('/'));
@@ -1197,6 +1230,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   // ---- phase 2: nimsem per module (tiered, 4-cap exec), dependency-ordered -------------------------
   let semmed = 0;
   for (const stem of order) {
+    if (pre.has(stem)) { semmed++; continue; } // prebuilt: .s.nif/.s.idx.nif already seeded
     const role = mods.get(stem).role;
     const flag = role === 'System' ? ['--isSystem'] : role === 'Main' ? ['--isMain'] : [];
     const argv = packStrs(['nimsem', '--define:nimNativeAlloc', '--define:nimNativeIo', 'm', ...flag, `nimcache/${stem}.p.nif`]);
@@ -1221,6 +1255,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     if (!snif.length) return { crawled, semmed, error: `nimsem produced no ${stem}.s.nif` };
     fs.set(`nimcache/${stem}.s.nif`, snif); putFile(`nimcache/${stem}.s.nif`, snif);
     if (sidx.length) { fs.set(`nimcache/${stem}.s.idx.nif`, sidx); putFile(`nimcache/${stem}.s.idx.nif`, sidx); }
+    if (mods.get(stem).role !== 'Main') { const e = produced.get(stem) || {}; e.sNif = snif; e.sIdx = sidx; produced.set(stem, e); }
     semmed++;
   }
 
@@ -1229,6 +1264,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
   for (const stem of order) {
+    if (pre.has(stem)) { hexed++; continue; } // prebuilt: .x.nif already seeded
     const isMain = stem === mainStem;
     const argv = packStrs(isMain
       ? ['hexer', 'c', '--bits:64', '--cpu:le', '--flags:br', '--isMain', '--app:console', `--outdir:${outdir}`, `nimcache/${stem}.s.nif`]
@@ -1245,10 +1281,11 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     ex.temen_op13jit_close();
     if (!xnif.length) return { crawled, semmed, hexed, error: `hexer produced no ${key}` };
     fs.set(key, xnif); putFile(key, xnif); hexed++;
+    if (!isMain) { const e = produced.get(stem) || {}; e.xNif = xnif; produced.set(stem, e); }
   }
 
   const tHexer = now();
-  return { crawled, semmed, hexed, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
+  return { crawled, semmed, hexed, produced, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of

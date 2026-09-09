@@ -25,6 +25,10 @@ if (!existsSync(`${ROOT}/web/assets/nim_stdlib.img.gz`) ||
     !existsSync(`${ROOT}/target/wasm32-unknown-unknown/release/temen_browser.wasm`)) {
   console.log('SKIP: stdlib image or threads wasm absent'); process.exit(0);
 }
+// #1375: this test asserts the pre-compiled stdlib pack is active (crawled === 1) — skip if it's absent.
+if (!existsSync(`${ROOT}/web/assets/nim_prestdlib.pack.gz`)) {
+  console.log('SKIP: web/assets/nim_prestdlib.pack.gz absent'); process.exit(0);
+}
 
 const chromium = await loadChromium();
 const { server, port } = await startServer(ROOT);
@@ -49,7 +53,9 @@ const res = await page.evaluate(async () => {
       fetchGz('./assets/nifler.temen.gz'), fetchGz('./assets/nimsem.temen.gz'), fetchGz('./assets/hexer.temen.gz'),
       fetchGz('./assets/nim_stdlib.img.gz'),
       fetchGz('./assets/nifler_ce.temen.gz'), fetchGz('./assets/nimsem_ce.temen.gz'), fetchGz('./assets/hexer_ce.temen.gz')]);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe };
+    // #1375: the pre-compiled stdlib pack (optional) — skips re-semchecking system.nim (~30 s).
+    const preStdlib = await fetchGz('./assets/nim_prestdlib.pack.gz').catch(() => null);
+    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
   };
   const source = 'import std/syncio\n\nproc greet(name: string): string =\n  "hello, " & name & "\\n"\n\nwrite(stdout, greet("Nim"))\nwrite(stdout, greet("the Temen"))\n';
 
@@ -75,8 +81,11 @@ const tieredUp = !t.error && t.semmed > 0 && t.hexed > 0;
 // page; a blank reply.stdout is the "no output on screen" bug (#1352 follow-up).
 const outOk = (res.replyStdout || '').includes('hello, Nim');
 const runEmitted = res.runTier === 'wasm-jit'; // #1357: the compiled program ran on the wasm-JIT tier
-const ok = res.ok && res.status === 0 && tieredUp && outOk && runEmitted;
-console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed} · runTier=${res.runTier}${t.error ? ` · tier ERR ${t.error}` : ''}`);
+// #1375: the pre-compiled stdlib pack must be active — the crawl skips every stdlib module, so only the
+// user's own `main` is crawled (crawled === 1). A regression (pack not used / key mismatch) crawls all 4.
+const preStdlibActive = t.crawled === 1;
+const ok = res.ok && res.status === 0 && tieredUp && outOk && runEmitted && preStdlibActive;
+console.log(`  nim-card-tierup: status ${res.status} · tier crawled=${t.crawled} semmed=${t.semmed} hexed=${t.hexed} · runTier=${res.runTier} · preStdlib=${preStdlibActive}${t.error ? ` · tier ERR ${t.error}` : ''}`);
 console.log(`  reply.stdout:    ${JSON.stringify((res.replyStdout || '').slice(0, 80))}`);
 console.log(`  streamed stdout: ${JSON.stringify((res.streamedStdout || '').slice(0, 80))}`);
 console.log(ok ? 'PASS — the shipped nim card compiled on the worker with the whole card tiered up' : 'FAIL');
