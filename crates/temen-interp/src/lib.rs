@@ -11423,7 +11423,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
                                     let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                    match serve_live_export(handle) {
+                                        // #744 — a live self-serve grant names one of OUR impl-exports,
+                                        // not a table handle: validate the export exists (its shape
+                                        // resolves). (A tagged value is negative, so `can_regrant`
+                                        // would refuse it as a non-grant — that is the fail-closed
+                                        // path every *other* record reader takes, unchanged.)
+                                        Some(k) => {
+                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
+                                        }
+                                        None => {
+                                            hg.can_regrant(handle)
+                                                .then_some(())
+                                                .ok_or(Trap::CapFault)?;
+                                        }
+                                    }
                                 }
                                 list.push((name, handle));
                             }
@@ -11506,7 +11520,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
                                     let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                    match serve_live_export(handle) {
+                                        // #744 — a live self-serve grant names one of OUR impl-exports,
+                                        // not a table handle: validate the export exists (its shape
+                                        // resolves). (A tagged value is negative, so `can_regrant`
+                                        // would refuse it as a non-grant — that is the fail-closed
+                                        // path every *other* record reader takes, unchanged.)
+                                        Some(k) => {
+                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
+                                        }
+                                        None => {
+                                            hg.can_regrant(handle)
+                                                .then_some(())
+                                                .ok_or(Trap::CapFault)?;
+                                        }
+                                    }
                                 }
                                 list.push((name, handle));
                             }
@@ -11644,7 +11672,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 for (name, gh) in &named {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
-                                        hg.regrant_into_child(*gh, &mut ch)
+                                        match serve_live_export(*gh) {
+                                            // #744 (EXEC.md row 4, the mediation-consistent form) —
+                                            // a **live self-serve** grant: install into the child a
+                                            // live-callee offer whose callee is THIS (the parent's)
+                                            // running powerbox, over our own impl-export `k`. The
+                                            // child's calls enqueue on our inbound queue and park
+                                            // until our `svc.wait` serve loop replies — the parent
+                                            // serves its child's `"exec"` with its own code. Only
+                                            // the CHILD's table holds the entry (granter → grantee,
+                                            // down the grant graph); we never hold a self-referential
+                                            // Arc, so there is no cycle and nothing for us to
+                                            // mis-call. `callee_slot: None` — non-durable (freeze
+                                            // refuses), the deferred durability story.
+                                            Some(k) => hg.offer_shape(k).map(|(names, sigs)| {
+                                                ch.install_live_impl(
+                                                    Arc::clone(host),
+                                                    k,
+                                                    names.into(),
+                                                    sigs.into(),
+                                                    None,
+                                                )
+                                            }),
+                                            None => hg.regrant_into_child(*gh, &mut ch),
+                                        }
                                     };
                                     if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
@@ -17426,6 +17477,36 @@ pub const CAP_SELF_PIPE: u32 = 16;
 /// context, so it is answered on every tier, never `-EINVAL`. The design reserved "12"; that number
 /// went to `reap` first, so `fuel.remaining` takes 13.
 pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
+
+/// #744 (EXEC.md row 4) — the **live self-serve grant** tag on a §14 named-grant record's `handle`
+/// field. A grant record whose `handle`, read as `u32`, has its top two bits `10` (this tag set,
+/// bit 30 clear) is not a table handle at all: it names the *granter's own impl-export*
+/// `handle & 0x3FFF_FFFF`, and the spawn installs into the CHILD a live-callee offer whose callee is
+/// the granter's running powerbox. The child's calls enqueue on the granter's inbound queue and park
+/// until its `svc.wait` serve loop replies: a parent serving its child's `"exec"` with **its own
+/// code** (the none-the-wiser nested shell). Mediation-consistent by construction (PROCESS.md §4 S9):
+/// the offer exists only in the grantee's table, handed *down* the granter's own grant graph — the
+/// granter never holds a self-referential cap (no reference cycle, nothing for it to mis-call), and no
+/// new peer arrow appears.
+///
+/// Why a tagged handle and not the record's reserved `flags` word: `flags` is documented
+/// reserved-and-**ignored**, and real callers (the C shims' unwritten `pad`, hand-built manager
+/// records) do not zero it — giving it meaning would misread their garbage. A negative handle is
+/// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
+/// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
+/// `-errno` range (top bits `11`). Honored by the eval-loop child-spawn arms (the op-17 record and
+/// op-13); every other record reader (a detached spawn, `exec_module`, the wasm marshal, the native
+/// builders) sees a negative handle and refuses it fail-closed through the unchanged `can_regrant` —
+/// no new code there. Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
+pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+
+/// #744 — decode a named-grant `handle`: `Some(export)` when it carries [`GRANT_SERVE_LIVE_TAG`] (top
+/// two bits `10`), else `None` (an ordinary table handle, or an `-errno`-range negative that stays a
+/// non-grant for `can_regrant` to refuse).
+pub fn serve_live_export(handle: i32) -> Option<u32> {
+    let h = handle as u32;
+    (h & 0xC000_0000 == GRANT_SERVE_LIVE_TAG).then_some(h & 0x3FFF_FFFF)
+}
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
