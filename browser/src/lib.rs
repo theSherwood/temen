@@ -9828,11 +9828,13 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 /// a 4th cap — **`exec`** (`make_exec` over the shared memfs) — so a tiered-up nimsem can shell out to
 /// nifler for stdlib parsing it didn't get pre-crawled. `exec` is a `HOST_PROC`, so nimsem-emitted's
 /// `exec` call bounces to `call_interp` over the granted host exactly like `fs`, while nimsem's **sema**
-/// (the dominant cost) tiers up. #1025 3d: the `nifler` blob is the **child-entry** `nifler_ce`, and the
-/// exec spawns it as a **confined §14 op-13 grandchild** ([`nimc::run_phase_op13`]) — the guest services
-/// its own `exec` through the confinement path rather than an inline host run (byte-identical `.p.nif`).
-/// Everything else matches `phase_open_argv` (packed argv/seeds, output key); nimsem's ~256 MiB peak grows
-/// in its own detached memory (#1288).
+/// (the dominant cost) tiers up. #1364: the `nifler` blob is the **top-level** nifler, and the exec runs it
+/// **inline** on the interpreter ([`op13_phase_open_impl`] passes `None` for the grandchild) — byte-identical
+/// `.p.nif` to the confined §14 op-13 grandchild (`exec_op13_nifler_matches_inline`), but it avoids the
+/// ~13 MB nifler_ce decode+emit (~850 MB engine peak) that OOM'd constrained tabs at the 1 GiB ceiling. The
+/// confined-grandchild path stays the default in the headless [`nimc::compile_nim_ce`]. Everything else
+/// matches `phase_open_argv` (packed argv/seeds, output key); nimsem's sema peak grows in its own detached
+/// memory (#1288).
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
@@ -9852,13 +9854,17 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    // #1025 3d: the exec's nifler is the **child-entry** `nifler_ce` (run as a §14 op-13 grandchild).
-    let Ok(nifler_ce) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+    // The exec's nifler grants nimsem its 4th (`exec`) cap. #1364: pass the **top-level** nifler here (not
+    // `nifler_ce`); `op13_phase_open_impl` runs it **inline** on the interpreter rather than as an emitted
+    // §14 op-13 grandchild — same `.p.nif` (`exec_op13_nifler_matches_inline`), but without the ~13 MB
+    // nifler_ce decode+emit that pushed the tiered nimsem's engine footprint to the 1 GiB ceiling.
+    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
         return -STATUS_DECODE_ERR;
     };
-    if temen_verify::verify_module(&nifler_ce).is_err() {
+    if temen_verify::verify_module(&nifler).is_err() {
         return -STATUS_VERIFY_ERR;
     }
+    let nifler = Some(std::sync::Arc::new(nifler));
     let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
         return -STATUS_DECODE_ERR;
     };
@@ -9875,7 +9881,7 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
             &argv_refs,
             seeds,
             readback,
-            Some(std::sync::Arc::new(nifler_ce)),
+            nifler,
         )
     }
 }
@@ -10005,25 +10011,24 @@ unsafe fn op13_phase_open_impl(
         Value::I32(stdout_h),
         Value::I32(exit_h),
     ];
-    if let Some(nifler_ce) = exec_nifler {
-        // #1025 3d: the `exec` cap = `make_exec` over the SAME shared memfs (`factory`), spawning nifler
-        // as a **confined §14 op-13 grandchild** (`run_phase_op13`) rather than an inline host-proc run —
-        // the guest services its own `exec` through the confinement path (matching the headless compile's
-        // Gap-2 keystone). `nifler_ce` is the child-entry nifler; it's passed as `make_exec`'s
-        // `Some(..)` arg (the first arg is then unused). The nifler grandchild's `.p.nif` is byte-identical
-        // to the inline run (`op13_nifler_crawl_matches_inline`). Forkable so op-13 can re-grant it.
-        let exec_init: temen_interp::HostProc = nimc::make_exec(
-            nifler_ce.clone(),
-            Some(nifler_ce.clone()),
-            std::sync::Arc::clone(&factory),
-        );
+    if let Some(nifler) = exec_nifler {
+        // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`), for nimsem's `exec("nifler
+        // … parse …")` sub-spawn. #1364: run nifler **inline** on the interpreter (`make_exec`'s `None`
+        // grandchild arm) rather than as a §14 op-13 emitted grandchild — the emitted path decodes+emits
+        // the ~13 MB nifler guest (~850 MB peak), which is what pushes the tiered nimsem's engine footprint
+        // to the 1 GiB ceiling and OOMs constrained tabs. The inline run's `.p.nif` is byte-identical
+        // (`exec_op13_nifler_matches_inline`); `nifler` here is the top-level nifler module. The orchestrator
+        // pre-crawls every module's `.p.nif`, so this exec is a rare fallback in practice. Forkable so op-13
+        // can re-grant it. (The confined-grandchild path stays available in the headless `compile_nim_ce`.)
+        let exec_init: temen_interp::HostProc =
+            nimc::make_exec(nifler.clone(), None, std::sync::Arc::clone(&factory));
         let exec_fork: temen_interp::HostProcFork = {
-            let nifler_ce = std::sync::Arc::clone(&nifler_ce);
+            let nifler = std::sync::Arc::clone(&nifler);
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    nifler_ce.clone(),
-                    Some(nifler_ce.clone()),
+                    nifler.clone(),
+                    None,
                     std::sync::Arc::clone(&factory),
                 ))
             })
