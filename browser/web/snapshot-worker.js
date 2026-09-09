@@ -353,7 +353,11 @@ self.onmessage = async (e) => {
           // The encoded linked module (BINARY — not `readStdout()`, which UTF-8-decodes) on the OUT stash.
           const linked = new Uint8Array(memory.buffer, Number(ex.temen_stdout_ptr()), linkLen).slice();
           try {
-            const rs = await runJitModule(ex, memory, linked, null, 'nim-run');
+            // Cache the emitted `_start` by a key derived from the LINKED BYTES, not a fixed string: two
+            // different user programs must not collide (a fixed key ran program A's `_start` for program B).
+            // Re-running the same program still cache-hits. FNV-1a over length + head/tail (cheap, stable).
+            const runKey = `nim-run-${prestdlibKey([linked])}`;
+            const rs = await runJitModule(ex, memory, linked, null, runKey);
             status = (rs === 0 || rs === 5) ? 0 : rs;
             ranEmitted = true; runTier = 'wasm-jit';
           } catch (_e) { /* emit declined → tree-walker fallback below */ }

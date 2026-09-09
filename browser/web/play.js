@@ -4478,6 +4478,47 @@ function setupTheme() {
   mq.addEventListener('change', () => { if (sel.value === 'auto') apply('auto'); }); // follow the OS live
 }
 
+// #1375: pre-warm the nim card's toolchain off the main thread. Its first compile otherwise pays a
+// ~5 s one-time guest emit (`nimsem_ce`/`hexer_ce` → wasm, cached per worker) on top of the ~3 s tiered
+// compile. A background compile of a trivial program warms the worker's emit cache + uploaded assets, so
+// the user's first real Run is the fast ~3 s path. Best-effort and at most once: a real Run started
+// mid-pre-warm just `cancelNim`s it (no worse than a cold first Run); a completed one makes the Run fast.
+let nimPrewarmed = false;
+async function nimPrewarm(c) {
+  const ex = c.ex;
+  if (nimPrewarmed || !snapshotClient || !ex.urls) return;
+  nimPrewarmed = true;
+  try {
+    const fetchGz = async (u) => (u ? gunzip(await fetchModule(u)) : null);
+    // Reuse `fetchModule`'s cache so the user's real Run re-downloads nothing; the worker caches the
+    // inflated assets after this, so the real Run re-uploads nothing either.
+    const getAssets = async () => {
+      const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib] = await Promise.all([
+        fetchGz(ex.urls.nifler), fetchGz(ex.urls.nimsem), fetchGz(ex.urls.hexer), fetchGz(ex.urls.stdlib),
+        fetchGz(ex.urls.niflerCe), fetchGz(ex.urls.nimsemCe), fetchGz(ex.urls.hexerCe),
+        ex.urls.preStdlib ? fetchGz(ex.urls.preStdlib).catch(() => null) : Promise.resolve(null),
+      ]);
+      return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
+    };
+    setState(c, 'warming', 'warming up the Nim toolchain…');
+    await snapshotClient.nimCompile(getAssets, 'import std/syncio\n\nwrite(stdout, "")\n', 'prewarm.nim', () => {});
+    setState(c, 'ready', 'toolchain warm — compile is fast');
+    globalThis.__nimPrewarmDone = true; // test/telemetry hook (harmless)
+  } catch (e) { globalThis.__nimPrewarmErr = String(e && e.message || e); /* best-effort; a real Run warms it anyway */ }
+}
+
+// Fire `nimPrewarm` once, when the nim card first scrolls near the viewport (a strong "about to use it"
+// signal) — not on page load, so it doesn't compete with the warm cards' prewarm on the shared worker.
+function setupNimPrewarm() {
+  const nimCard = cards.find((c) => c.ex.kind === 'nimc');
+  if (!nimCard || typeof IntersectionObserver !== 'function') return;
+  const obs = new IntersectionObserver((entries) => {
+    if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
+    if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
+  }, { rootMargin: '300px' });
+  obs.observe(nimCard.el.section);
+}
+
 async function main() {
   const demosEl = $('demos');
   for (const [name, ex] of Object.entries(EXAMPLES)) {
@@ -4562,6 +4603,7 @@ async function main() {
       if (typeof requestIdleCallback === 'function') requestIdleCallback(prewarmAll, { timeout: 3000 });
       else setTimeout(prewarmAll, 0);
     }
+    setupNimPrewarm(); // #1375: warm the nim toolchain when its card scrolls into view (not a warm card)
   } catch (e) {
     snapshotClient = null;
     console.warn('[Temen playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
