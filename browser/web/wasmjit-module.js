@@ -1205,7 +1205,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     // (exec) cap, so it works; the crawl above already seeded every module's `.p.nif`, so the exec is a
     // rare fallback. `.p.nif` byte-identical either way (`exec_op13_nifler_matches_inline`).
     const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
-    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
+    const opened = ex.temen_op13jit_nimsem_open_inline(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
     ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
     const r = await drive(`${cacheKey}-nimsem`);
