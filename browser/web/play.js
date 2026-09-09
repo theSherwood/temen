@@ -2790,7 +2790,7 @@ async function runNimc(c) {
   const source = c.editor.getValue();
   setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
   const t0 = performance.now();
-  let status, out, err;
+  let status, out, err, tierInfo = null;
   try {
     if (snapshotClient) {
       // Off the main thread (issue #1005): the whole toolchain runs on the snapshot worker's own engine,
@@ -2807,6 +2807,11 @@ async function runNimc(c) {
       ({ status } = r);
       out = r.stdout;
       err = r.stderr;
+      // What actually tiered up (the worker's real telemetry — not the hardcoded label below). `tier` is
+      // the whole-card orchestrator's result (`jitNimWholeCardOp13`: per-module crawl/nimsem/hexer on the
+      // wasm-JIT + per-phase ms); `runTier` is which tier ran the compiled program (#1357). A `tier.error`
+      // (or absent `tier`) means the orchestrator declined and the tree-walker did the compile.
+      tierInfo = { ...(r.tier || {}), runTier: r.runTier };
     } else {
       // Fallback: no worker (e.g. the page lacks cross-origin isolation) — run on the main thread. This
       // freezes the tab for the duration, but keeps the card working where a worker can't be spawned.
@@ -2848,8 +2853,19 @@ async function runNimc(c) {
     runEnd(rec, { ok: false });
     return;
   }
-  const ms = runStage(rec, 'compile+run:interpreter', performance.now() - t0).toFixed(0);
-  runTier(rec, 'interpreter');
+  // Report the tier the compiler ACTUALLY ran on (the worker's telemetry), not a hardcoded guess: the
+  // whole card tiers up when the orchestrator seeded every phase (`crawled`/`semmed`/`hexed` > 0, no
+  // `error`); otherwise the tree-walker did the compile. `runTier` (#1357) is the compiled program's tier.
+  const ti = tierInfo || {};
+  const tiered = !ti.error && ti.semmed > 0 && ti.hexed > 0;
+  const tm = ti.timings || {};
+  const compileTier = tiered ? 'wasm-jit (op-13)' : 'interpreter';
+  const ms = runStage(rec, `compile+run:${compileTier}`, performance.now() - t0).toFixed(0);
+  runTier(rec, tiered ? 'wasm-jit' : 'interpreter');
+  if (tierInfo) {
+    const fmt = (n) => (n === undefined ? '?' : `${Math.round(n)}ms`);
+    logTo(c, `tier: compile=${compileTier}${tiered ? ` (crawl ${fmt(tm.crawlMs)} · nimsem ${fmt(tm.nimsemMs)} · hexer ${fmt(tm.hexerMs)})` : ''} · run=${ti.runTier || 'interpreter'}${ti.error ? ` · orchestrator fell back: ${ti.error}` : ''}`);
+  }
   logTo(c, `compile+run → status ${status}, ${out.length}B stdout in ${ms}ms`);
   // 0 = OK, 5 = clean Exit. Any other status: a phase/link/run failure — show the diagnostic (stderr).
   if (status !== 0 && status !== 5) {
@@ -2862,7 +2878,7 @@ async function runNimc(c) {
   c.el.stdout.textContent =
     `${bar} your Nim, compiled by the Temen (nifler → nimsem → hexer → temen-leng) and run — stdout ${bar}\n${out}`;
   c.el.result.textContent = `${out.length} B stdout`;
-  setState(c, 'done', `compiled + ran your Nim · ${out.length} B stdout · ${ms}ms`);
+  setState(c, 'done', `compiled + ran your Nim · ${compileTier} · ${out.length} B stdout · ${ms}ms`);
   runEnd(rec, { ok: true, status, result: `${out.length} B stdout` });
 }
 
