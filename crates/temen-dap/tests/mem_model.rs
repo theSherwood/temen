@@ -134,6 +134,51 @@ fn model_state_is_seek_consistent() {
     assert_eq!(sa, sb, "seek(t) model state ≡ fresh from-0 run to t");
 }
 
+/// #1371: the same seek-consistency pin over a **bulk write** — 8192 distinct words (64 KiB) across
+/// ~60 checkpoint boundaries, the shape of a framebuffer clear. The trackers are journaled rather
+/// than cloned per stride, and a rewind past thousands of journaled changes must still reproduce the
+/// from-0 state exactly.
+#[test]
+fn model_state_is_seek_consistent_after_a_bulk_write() {
+    let src = store_loop(8192, 8);
+    let m = parse_module(&src).expect("parses");
+    let mk = |m: &temen_ir::Module| -> (BytecodeBackend, Arc<Mutex<MemModel>>) {
+        let mut b = BytecodeBackend::new(
+            m.clone(),
+            0,
+            &[],
+            u64::MAX,
+            false,
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("subset");
+        let model = Arc::new(Mutex::new(MemModel::new(MemModelCfg::default())));
+        let feed = Arc::clone(&model);
+        let sink: SharedSink = Arc::new(Mutex::new(
+            move |c: u64, t: usize, e: temen_interp::MemEvent| {
+                feed.lock()
+                    .unwrap_or_else(|x| x.into_inner())
+                    .observe(c, t, e)
+            },
+        ));
+        b.set_access_sink(sink);
+        (b, model)
+    };
+    let (mut a, model_a) = mk(&m);
+    let _ = Debuggee::run_until_stop(&mut a);
+    let full = model_a.lock().unwrap().counters();
+    assert!(full.4 >= 16, "the loop touched at least 16 pages: {full:?}");
+    let _ = Debuggee::seek(&mut a, 20_000); // mid-loop, many boundaries and words back
+    let (mut b, model_b) = mk(&m);
+    let _ = Debuggee::seek(&mut b, 20_000);
+    let sa = model_a.lock().unwrap().stats_json().to_string();
+    let sb = model_b.lock().unwrap().stats_json().to_string();
+    assert_eq!(sa, sb, "seek(t) after a bulk write ≡ fresh from-0 run to t");
+}
+
 /// **The DAP surface**: `launch` with `memModel` arms the model, `memModelStats` reads it back
 /// after the run, and the tree-walker (no sink) fails the launch closed.
 #[test]
