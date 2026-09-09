@@ -354,6 +354,21 @@ impl DapServer {
         // `memoryLimit: N` (slice 5): cap the Memory capability's total committed bytes — a
         // `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching
         // knob). Needs the powerbox's Memory grant on the bytecode engine; fail-closed elsewhere.
+        // #1366 slice (c): `hostCaps` — names of host-completed caps the embedder services (each
+        // guest `call.sym "<name>"` parks as `stopped{reason:"cap"}`, answered by `provideCap`).
+        // Bytecode + on-ramp powerbox only, like `blockStdin`/`fsImage` (fail-closed launch gate).
+        let host_caps: Vec<String> = args
+            .get("hostCaps")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !host_caps.is_empty() && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let mem_limit = args
             .get("memoryLimit")
             .and_then(|v| v.as_i64())
@@ -385,6 +400,7 @@ impl DapServer {
                 mem_limit,
                 seed,
                 fs_seed,
+                host_caps,
             ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
@@ -1600,7 +1616,17 @@ impl DapServer {
         let mut events = self.output_events();
         let tid = self.stopped_thread_id();
         match stop {
-            Stop::Break { reason, .. } => events.push(break_event(reason, tid)),
+            Stop::Break { reason, .. } => {
+                // #1366 slice (c): a declared-cap park carries the request for the client.
+                let request = if matches!(reason, StopReason::CapPark { .. }) {
+                    self.session
+                        .as_ref()
+                        .and_then(|s| s.inspector.cap_park_request())
+                } else {
+                    None
+                };
+                events.push(break_event(reason, tid, request));
+            }
             Stop::Finished(result) => {
                 self.terminated = true;
                 // Standard DAP: an `exited` event carrying the guest's exit code precedes
@@ -1709,7 +1735,7 @@ fn trap_name(trap: &Trap) -> &'static str {
 /// A `stopped` event for `thread_id`.
 /// A `stopped` event for an engine break: the DAP reason plus, for a #1366 host-completed cap park,
 /// the completion id (`capId`) the client answers with `provideCap`.
-fn break_event(reason: StopReason, thread_id: i64) -> Event {
+fn break_event(reason: StopReason, thread_id: i64, request: Option<(String, Vec<i64>)>) -> Event {
     let cap_id = if let StopReason::CapPark { id } = &reason {
         Some(*id)
     } else {
@@ -1722,6 +1748,10 @@ fn break_event(reason: StopReason, thread_id: i64) -> Event {
     ];
     if let Some(id) = cap_id {
         body.push(("capId", Json::i(id as i64)));
+    }
+    if let Some((name, args)) = request {
+        body.push(("capName", Json::s(&name)));
+        body.push(("args", Json::Arr(args.into_iter().map(Json::i).collect())));
     }
     ("stopped", Json::obj(body))
 }

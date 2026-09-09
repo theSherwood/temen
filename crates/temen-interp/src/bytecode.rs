@@ -5188,7 +5188,7 @@ pub struct DebugRun {
     /// embedder [`deliver_cap`](DebugRun::deliver_cap)s the value (advances refuse to proceed while
     /// parked). Cleared by `deliver_cap` and on a checkpoint `restore` (a replay serves the call
     /// from the tape and never re-parks).
-    cap_parked: Option<(u64, u32)>,
+    cap_parked: Option<(u64, u32, Option<super::IrPc>)>,
     /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
     /// op with the op's [`MemEvent`](super::MemEvent), the run's `op_clock`, and task 0. `None`
     /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
@@ -5412,6 +5412,14 @@ enum FiberStep {
     /// `instantiate`, coroutine, tier-up. The single-vCPU [`DebugRun`] treats these as `Malformed`; the
     /// multi-vCPU [`ScheduledDebugRun`] dispatches the ones it schedules (spawn/join/wait/notify).
     Other(Outcome),
+    /// #1366 — the op punted to a host-completed cap: the debug run parks on completion `id`
+    /// (result slot `dst`); `at` is the call's own pc (captured before the op advanced), the stop
+    /// location the backend reports — the post-call position may be a terminator with no pc.
+    CapParked {
+        id: u64,
+        dst: u32,
+        at: Option<super::IrPc>,
+    },
 }
 
 /// Run **one op** of a debug session's active continuation (`vt.active`), applying any §12 fiber switch
@@ -5429,6 +5437,9 @@ fn debug_advance_fiber(
     mem: &mut Option<Mem>,
     host: &mut Host,
 ) -> FiberStep {
+    // #1366: the op's own pc, before it advances — a host-completed park reports it as the stop
+    // location (the position after a call may be a terminator, which has no pc).
+    let at = vt.debug_active().cur_ir_pc(source);
     // Step-into a §14 coroutine body (single-vCPU `DebugRun` only): while a coroutine child is the
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
     // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
@@ -5583,7 +5594,7 @@ fn debug_advance_fiber(
                 }
                 // #1366: a host-completed punt — the debug run parks on it (`cap_parked`) and the
                 // backend surfaces `StopReason::CapPark`; `deliver_cap` resumes.
-                None => FiberStep::Other(Outcome::CapPending { id, dst }),
+                None => FiberStep::CapParked { id, dst, at },
             }
         }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
@@ -6110,7 +6121,13 @@ impl DebugRun {
     /// backend reports it as `StopReason::CapPark { id }`; [`deliver_cap`](DebugRun::deliver_cap)
     /// resumes it.
     pub fn cap_parked(&self) -> Option<u64> {
-        self.cap_parked.map(|(id, _)| id)
+        self.cap_parked.map(|(id, _, _)| id)
+    }
+
+    /// #1366 — the pc of the host-completed cap call this run is parked on (the stop location),
+    /// if parked and the call had a source position.
+    pub fn cap_park_pc(&self) -> Option<super::IrPc> {
+        self.cap_parked.and_then(|(_, _, at)| at)
     }
 
     /// #1366 — finish the host-completed cap call this run is parked on: `value` lands in the
@@ -6118,7 +6135,7 @@ impl DebugRun {
     /// call's record (so a reverse `seek` replays it without re-parking), and the op counts on the
     /// clock. `false` if the run isn't parked on `id`. The twin of `provide_stdin`.
     pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
-        let Some((pid, dst)) = self.cap_parked else {
+        let Some((pid, dst, _)) = self.cap_parked else {
             return false;
         };
         if pid != id {
@@ -6317,8 +6334,8 @@ impl DebugRun {
                 false
             }
             // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-            FiberStep::Other(Outcome::CapPending { id, dst }) => {
-                *cap_parked = Some((id, dst));
+            FiberStep::CapParked { id, dst, at } => {
+                *cap_parked = Some((id, dst, at));
                 false
             }
             // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -6401,8 +6418,8 @@ impl DebugRun {
                     return None;
                 }
                 // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::Other(Outcome::CapPending { id, dst }) => {
-                    *cap_parked = Some((id, dst));
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -6501,8 +6518,8 @@ impl DebugRun {
                     return None;
                 }
                 // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::Other(Outcome::CapPending { id, dst }) => {
-                    *cap_parked = Some((id, dst));
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -6586,8 +6603,8 @@ impl DebugRun {
                     return None;
                 }
                 // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::Other(Outcome::CapPending { id, dst }) => {
-                    *cap_parked = Some((id, dst));
+                FiberStep::CapParked { id, dst, at } => {
+                    *cap_parked = Some((id, dst, at));
                     return None;
                 }
                 // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
@@ -7338,6 +7355,12 @@ fn service_advance(
         FiberStep::Trapped(t) => {
             *turn += 1;
             dbg_complete(tasks, ti, Err(t));
+        }
+        // #1366: a host-completed cap park has no completer on the scheduled engine (no
+        // `cap_parked` there yet) — fail closed, exactly like a trap.
+        FiberStep::CapParked { .. } => {
+            *turn += 1;
+            dbg_complete(tasks, ti, Err(Trap::CapFault));
         }
         // A scheduler seam: the ones this engine dispatches, else `Declined`.
         FiberStep::Other(outcome) => match outcome {
