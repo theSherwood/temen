@@ -4371,7 +4371,8 @@ pub enum LinkError {
 /// re-verify it before running, since a unit is untrusted like any frontend output (a cross-unit
 /// signature mismatch is caught there).
 pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
-    link_impl(units, false)
+    let refs: Vec<LinkUnitRef<'_>> = units.iter().map(LinkUnitRef::from).collect();
+    link_impl(&refs, false)
 }
 
 /// [`link`], for **separate-artifact frontends** (a runtime library carrying live §7 capability
@@ -4387,10 +4388,41 @@ pub fn link(units: &[LinkUnit]) -> Result<Module, LinkError> {
 /// unaffected (an unresolved one is still [`LinkError::Unresolved`]). Feed the result to
 /// [`synth_manifest_start`] for a runnable powerbox module, and re-verify like any linked output.
 pub fn link_with_manifest(units: &[LinkUnit]) -> Result<Module, LinkError> {
+    let refs: Vec<LinkUnitRef<'_>> = units.iter().map(LinkUnitRef::from).collect();
+    link_impl(&refs, true)
+}
+
+/// A [`LinkUnit`] by reference — the unit's module and symbol tables **borrowed** for one link.
+/// The linker only ever reads a unit (it clones each unit's functions into the merged module as
+/// it relocates them), so an embedder that links the *same* library against many programs — the
+/// browser's live-editing path (#1373: decode the runtime once, re-link only each program) — keeps
+/// one decoded `Module` resident and links through this without cloning it into a `LinkUnit` first.
+#[derive(Clone, Copy)]
+pub struct LinkUnitRef<'a> {
+    pub module: &'a Module,
+    /// See [`LinkUnit::exports`].
+    pub exports: &'a [(String, FuncIdx)],
+    /// See [`LinkUnit::data_exports`].
+    pub data_exports: &'a [(String, u64)],
+}
+
+impl<'a> From<&'a LinkUnit> for LinkUnitRef<'a> {
+    fn from(u: &'a LinkUnit) -> Self {
+        LinkUnitRef {
+            module: &u.module,
+            exports: &u.exports,
+            data_exports: &u.data_exports,
+        }
+    }
+}
+
+/// [`link_with_manifest`] over **borrowed** units ([`LinkUnitRef`]) — byte-for-byte the same merged
+/// module; only the ownership of the inputs differs.
+pub fn link_with_manifest_ref(units: &[LinkUnitRef<'_>]) -> Result<Module, LinkError> {
     link_impl(units, true)
 }
 
-fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
+fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkError> {
     // Function and data layout: each unit's functions occupy `[fbase, fbase + n_funcs)` in the merged
     // list, and its data occupies the window region `[dbase, dbase + data_span)`. `data_span` is the
     // high-water mark of the unit's own (un-relocated) data.
@@ -4436,7 +4468,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
     // reindexed (base-added) window offsets, in declaration order. Symmetric with `exports`.
     let mut data_exports: Vec<DataExport> = Vec::new();
     for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
-        for (name, local) in &u.exports {
+        for (name, local) in u.exports {
             if *local as usize >= u.module.funcs.len() {
                 return Err(LinkError::BadExport {
                     symbol: name.clone(),
@@ -4453,7 +4485,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
                 func: fbase + local,
             });
         }
-        for (name, local_off) in &u.data_exports {
+        for (name, local_off) in u.data_exports {
             let addr = dbase + local_off;
             if data_tab.insert(name.clone(), addr).is_some() || funcs_tab.contains_key(name) {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
@@ -4495,7 +4527,7 @@ fn link_impl(units: &[LinkUnit], retain: bool) -> Result<Module, LinkError> {
             if !retain {
                 return Err(LinkError::Unresolved(imp.name.clone()));
             }
-            let shape = resolved_import_shape(&u.module, imp.shape).ok_or_else(|| {
+            let shape = resolved_import_shape(u.module, imp.shape).ok_or_else(|| {
                 LinkError::ImportShapeMismatch(format!(
                     "import `{}` has a malformed type-section reference",
                     imp.name
@@ -5268,6 +5300,21 @@ mod link_layout_tests {
     /// one unit's writable head onto the same page as the previous unit's read-only tail. Regression
     /// guard for the emit-object self-host libc, whose writable arena landed on the entry unit's
     /// read-only symbol page under the old 16-byte-tight stacking (task #20).
+    /// #1373: the borrowed-unit entry ([`link_with_manifest_ref`]) is the same linker — an embedder
+    /// holding one decoded library resident and re-linking programs against it must get exactly the
+    /// module the owned entry produces (the browser's live-editing path relies on this equality).
+    #[test]
+    fn borrowed_units_link_identically_to_owned() {
+        let a = data_unit(0, 4096 + 32, true);
+        let b = data_unit(32, 64, false);
+        let owned = link_with_manifest(&[a.clone(), b.clone()]).expect("owned link");
+        let refs = [LinkUnitRef::from(&a), LinkUnitRef::from(&b)];
+        let borrowed = link_with_manifest_ref(&refs).expect("borrowed link");
+        assert_eq!(owned, borrowed);
+        // The inputs are untouched (borrowed, not consumed): linking again is possible.
+        assert_eq!(link_with_manifest_ref(&refs).unwrap(), owned);
+    }
+
     #[test]
     fn stacked_units_never_share_a_host_page_between_ro_and_rw() {
         // Unit A ends in read-only data whose tail spills into a second 4 KiB page; unit B begins with
