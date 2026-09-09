@@ -441,10 +441,19 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   };
   // `key`: a surfaced JIT_INVOKE's code handle (a Number), or an installed slot's `(domain, unit)`
   // identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one cache.
+  // #1378 again, on the unit path: a guest-compiled §22 unit (a JACL macro body: ~1.1 KB) went through
+  // the ASYNC compile queue, and V8 parks that behind its background work on the just-compiled emitted
+  // module — measured 2.9 s / 3.7 s for the tour's two macro invokes on the first two warm-coop runs,
+  // 88 ms on the third. Instantiate synchronously when the unit is under the main-thread sync-compile
+  // budget (a `new WebAssembly.Module` over it throws — then the async path, as before).
   const unitFor = async (key, bytes) => {
     let unit = jitUnits.get(key);
     if (unit === undefined) {
-      unit = await instantiateUnit(bytes);
+      try {
+        unit = instantiateUnitSync(bytes);
+      } catch {
+        unit = await instantiateUnit(bytes);
+      }
       jitUnits.set(key, unit);
     }
     return unit;
