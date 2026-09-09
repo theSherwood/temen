@@ -32,6 +32,45 @@ let interpWarmPromise = null;
 // The nimony phase guests + stdlib image, cached here after the first `nimAssets` message so each
 // `nimCompile` Run re-uses them instead of re-posting ~28 MB across the worker boundary every time.
 let nimAssets = null;
+// #1375: the parsed pre-compiled stdlib artifacts (Map stem -> {pNif,depsNif,sNif,sIdx,xNif}), or null.
+let preStdlib = null;
+
+// 32-bit FNV-1a over each buffer's length + up to 256 head/tail bytes — the pack's wire-coupling key.
+// Mirrors `build-prestdlib.mjs`; buffers in the SAME order: [stdlib, niflerCe, nimsemCe, hexerCe].
+function prestdlibKey(bufs) {
+  let h = 0x811c9dc5 >>> 0;
+  const mix = (b) => { h = (h ^ b) >>> 0; h = Math.imul(h, 0x01000193) >>> 0; };
+  for (const buf of bufs) {
+    const u = new Uint8Array(buf), n = u.length;
+    for (const x of [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]) mix(x);
+    for (let i = 0; i < 256 && i < n; i++) mix(u[i]);
+    for (let i = 0; i < 256 && i < n; i++) mix(u[n - 1 - i]);
+  }
+  return h >>> 0;
+}
+
+// Parse the `nim_prestdlib.pack` blob (gunzipped): [u32 key][u32 count] then per module [u32 stemLen][stem]
+// and five [u32 len][bytes] files in order p, deps, s, sidx, x (little-endian). Mirrors `build-prestdlib.mjs`.
+// Returns { key, mods:Map } or null. A stale pack (key ≠ the loaded assets') MUST be ignored by the caller,
+// never seeded — its `.s.nif` would silently mis-compile against the current stdlib/guests.
+function parsePrestdlib(bytes) {
+  try {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let p = 0;
+    const rdU32 = () => { const v = dv.getUint32(p, true); p += 4; return v; };
+    const rdBytes = () => { const n = rdU32(); const b = bytes.slice(p, p + n); p += n; return b; };
+    const dec = new TextDecoder();
+    const key = rdU32();
+    const m = new Map();
+    const count = rdU32();
+    for (let i = 0; i < count; i++) {
+      const stem = dec.decode(rdBytes());
+      const pNif = rdBytes(), depsNif = rdBytes(), sNif = rdBytes(), sIdx = rdBytes(), xNif = rdBytes();
+      m.set(stem, { pNif, depsNif, sNif, sIdx, xNif });
+    }
+    return { key, mods: m };
+  } catch { return null; }
+}
 // Active only during a streaming Run (`runStream`/`nimCompile`): a fn that relays one stdout chunk to
 // the main thread. `null` at rest so the `stdout_chunk` import is a no-op for warm/prime dry runs.
 let chunkSink = null;
@@ -236,6 +275,16 @@ self.onmessage = async (e) => {
       // later `nimCompile` Runs need only ship the (small) source, not ~28 MB of guests each time.
       nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib,
         niflerCe: msg.niflerCe, nimsemCe: msg.nimsemCe, hexerCe: msg.hexerCe };
+      // #1375: the pre-compiled stdlib pack (parsed once, cached) — lets the whole-card orchestrator skip
+      // re-semchecking the stdlib (system.nim's sema alone is ~30 s). Optional: absent → full from-scratch.
+      // Trust it only when its wire-coupling key matches the loaded stdlib+guests; a stale pack would
+      // seed `.s.nif` that mis-compiles against the current stdlib, so a mismatch falls back to scratch.
+      preStdlib = null;
+      const parsed = msg.preStdlib && msg.preStdlib.length ? parsePrestdlib(msg.preStdlib) : null;
+      if (parsed) {
+        const want = prestdlibKey([nimAssets.stdlib, nimAssets.niflerCe, nimAssets.nimsemCe, nimAssets.hexerCe]);
+        if (parsed.key === want) preStdlib = parsed.mods;
+      }
       self.postMessage({ type: 'reply', id: msg.id, ok: true });
       return;
     }
@@ -262,7 +311,7 @@ self.onmessage = async (e) => {
       let tier = null; // what the JS orchestrator pre-seeded (for telemetry / the wiring test)
       try {
         if (niflerCe && nimsemCe && hexerCe) {
-          tier = await jitNimWholeCardOp13(ex, memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard');
+          tier = await jitNimWholeCardOp13(ex, memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard', preStdlib);
         } else {
           await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
         }

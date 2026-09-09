@@ -1060,6 +1060,7 @@ for x in xs:
       niflerCe: './assets/nifler_ce.temen.gz',
       nimsemCe: './assets/nimsem_ce.temen.gz',
       hexerCe: './assets/hexer_ce.temen.gz',
+      preStdlib: './assets/nim_prestdlib.pack.gz',
     },
     desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
       "nimony-on-Temen slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
@@ -2772,6 +2773,11 @@ async function runNimc(c) {
   // stdlib image ~2.4 MB; DecompressionStream inflates in-browser, no library). In the worker path this
   // runs **once** — the worker caches the guests — so re-Runs ship only the source, not ~28 MB again.
   const getAssets = async () => {
+    // #1375: the pre-compiled stdlib pack is optional — fetch best-effort so an older deploy without it
+    // still works (the worker just falls back to the full from-scratch tier-up).
+    const preStdlib = ex.urls.preStdlib
+      ? await fetchTimed(rec, c, ex.urls.preStdlib).then(gunzip).catch(() => null)
+      : null;
     const [gn, gs, gh, gl, gnc, gsc, ghc] = await Promise.all([
       fetchTimed(rec, c, ex.urls.nifler),
       fetchTimed(rec, c, ex.urls.nimsem),
@@ -2783,8 +2789,8 @@ async function runNimc(c) {
     ]);
     const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] =
       await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl), gunzip(gnc), gunzip(gsc), gunzip(ghc)]);
-    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B · +child-entry (${niflerCe.length + nimsemCe.length + hexerCe.length}B for the tiered whole card)`);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe };
+    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B · +child-entry (${niflerCe.length + nimsemCe.length + hexerCe.length}B for the tiered whole card)${preStdlib ? ` · +pre-compiled stdlib (${preStdlib.length}B, skips ~30 s system.nim sema)` : ''}`);
+    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
   };
   const main = 'prog.nim';
   const source = c.editor.getValue();

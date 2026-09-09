@@ -235,6 +235,18 @@ if want nim_driver_guest; then
   done
   [ "$ceok" = 1 ] && note "nim_card_ce ✓ (nifler_ce + nimsem_ce + hexer_ce → web/assets)" \
                   || note "nim_card_ce ✗ (a child-entry fixture missing/failed re-validate)"
+
+  # The pre-compiled stdlib pack (#1375): system.nim's sema is ~30 s and user-independent, so the card
+  # ships the stdlib's `.p/.s/.s.idx/.x.nif` prebuilt and each Run skips re-checking it (~42 s → ~3 s
+  # compile). WIRE-COUPLED to nimsem_ce/hexer_ce + the stdlib image (rebuilt just above), so regenerate
+  # here. Needs the threads wasm + playwright (the guests run on the browser engine); build-prestdlib.mjs
+  # is fail-soft (SKIPs without them), so this only refreshes the pack when the harness is present.
+  if [ -f browser/target/wasm32-unknown-unknown/release/temen_browser.wasm ]; then
+    ( cd browser && node build-prestdlib.mjs ) && note "nim_prestdlib ✓ (nim_prestdlib.pack.gz)" \
+      || note "nim_prestdlib SKIP/✗ (needs threads wasm + playwright — see build-prestdlib.mjs)"
+  else
+    note "nim_prestdlib SKIP (threads wasm absent; build the browser engine first)"
+  fi
 fi
 
 # --- 7) lua_snapshot.temen (Lua 5.4.7 core+libs + the two-phase snapshot harness → translate) -------
