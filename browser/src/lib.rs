@@ -12857,6 +12857,16 @@ static mut COOP_RUN: Option<CoopTierupRun> = None;
 /// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
 /// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
 /// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
+/// Host policy (#1384): override the emitter's per-function size cap
+/// (`temen_wasm_jit::MAX_EST_EMITTED_FN_BYTES`, estimated emitted bytes above which a function stays
+/// on the interpreter) for subsequent opens; `0` restores the default. The default guards the engine's
+/// hard limit; a host whose optimizer gives up lower — Chromium's TurboFan zone-OOMs the renderer on
+/// the JACL compiler's 0.5–0.8 MB functions — sets the cap it has measured before opening a card.
+#[no_mangle]
+pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
+    temen_wasm_jit::set_max_est_emitted_fn_bytes(bytes);
+}
+
 #[no_mangle]
 pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
     COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);

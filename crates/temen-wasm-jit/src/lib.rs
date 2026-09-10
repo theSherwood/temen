@@ -1344,12 +1344,35 @@ pub fn est_emitted_size(f: &Func) -> usize {
 /// pre-#1004 bulk-mem exclusion left the SQLite dispatcher). Shared by every subset computation so
 /// the size valve is uniform.
 fn cap_oversized(m: &Module, in_subset: &mut [bool]) {
+    let cap = max_est_emitted_fn_bytes();
     for (i, f) in m.funcs.iter().enumerate() {
-        if in_subset[i] && est_emitted_size(f) > MAX_EST_EMITTED_FN_BYTES {
+        if in_subset[i] && est_emitted_size(f) > cap {
             in_subset[i] = false;
         }
     }
 }
+
+/// The effective [`cap_oversized`] cap: [`MAX_EST_EMITTED_FN_BYTES`] unless overridden by
+/// [`set_max_est_emitted_fn_bytes`] (`0` = default).
+pub fn max_est_emitted_fn_bytes() -> usize {
+    match MAX_EST_EMITTED_FN_BYTES_OVERRIDE.load(core::sync::atomic::Ordering::Relaxed) {
+        0 => MAX_EST_EMITTED_FN_BYTES,
+        n => n,
+    }
+}
+
+/// Override the [`cap_oversized`] cap for subsequent emits (`0` restores the default). A **host
+/// policy** knob (the browser's `temen_coop_set_emit_cap`): [`MAX_EST_EMITTED_FN_BYTES`] guards the
+/// engine's hard per-function limit, but a host's *optimizer* can give up far below it — Chromium's
+/// TurboFan dies with `V8 process OOM (Zone)` optimizing the JACL compiler's 0.5–0.8 MB
+/// `br_table`-dispatch functions (#1384), crashing the renderer seconds after the run — so a host
+/// that has measured its limit keeps such functions on the interpreter (cross-tier leaves) from here.
+pub fn set_max_est_emitted_fn_bytes(bytes: usize) {
+    MAX_EST_EMITTED_FN_BYTES_OVERRIDE.store(bytes, core::sync::atomic::Ordering::Relaxed);
+}
+
+static MAX_EST_EMITTED_FN_BYTES_OVERRIDE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Cap on the **estimated** emitted size of the whole module (bytes) — the module-total analog of
 /// [`MAX_EST_EMITTED_FN_BYTES`] (#1038). The wasm-compiled engine runs under a hard linear-memory
@@ -6810,4 +6833,45 @@ fn set_result(cx: &FnCtx, code: &mut Vec<u8>, k: usize, next_val: &mut usize) {
     code.push(OP_LOCAL_SET);
     uleb(code, cx.local_of[k][*next_val] as u64);
     *next_val += 1;
+}
+
+#[cfg(test)]
+mod emit_cap_tests {
+    use super::*;
+
+    /// #1384: the host-set cap drops an over-cap function from the emit subset (it stays an
+    /// interpreter leaf) and `0` restores the default, which admits it again.
+    #[test]
+    fn host_emit_cap_drops_oversized_functions() {
+        let m = temen_ir::Module {
+            funcs: vec![temen_ir::Func {
+                params: vec![],
+                results: vec![],
+                blocks: vec![temen_ir::Block {
+                    params: vec![],
+                    insts: (0..64).map(|_| Inst::ConstI64(1)).collect(),
+                    term: Terminator::Return(vec![]),
+                }],
+            }],
+            ..Default::default()
+        };
+        let est = est_emitted_size(&m.funcs[0]);
+        assert!(est > 0 && est < MAX_EST_EMITTED_FN_BYTES);
+        let mut sub = vec![true];
+        cap_oversized(&m, &mut sub);
+        assert_eq!(sub, vec![true], "under the default cap: emitted");
+        set_max_est_emitted_fn_bytes(est - 1);
+        let mut sub = vec![true];
+        cap_oversized(&m, &mut sub);
+        assert_eq!(
+            sub,
+            vec![false],
+            "over the host cap: kept on the interpreter"
+        );
+        set_max_est_emitted_fn_bytes(0);
+        assert_eq!(max_est_emitted_fn_bytes(), MAX_EST_EMITTED_FN_BYTES);
+        let mut sub = vec![true];
+        cap_oversized(&m, &mut sub);
+        assert_eq!(sub, vec![true], "0 restores the default");
+    }
 }
