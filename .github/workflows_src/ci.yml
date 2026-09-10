@@ -1026,6 +1026,15 @@ jobs:
           # asserts the nim worker is spawned exactly ONCE (was 3×) with correct output each time —
           # deterministic (spawn count, not timing), so CI-robust. Reuses committed assets; SKIPs if absent.
           node browser-nim-worker-reuse-test.mjs
+          # #1386 (eager-prewarm automation guard): play.js warms the nim toolchain EAGERLY on load
+          # (requestIdleCallback) so the first Run is the fast ~3 s warm path — but that eager trigger is
+          # SKIPPED under automation (navigator.webdriver), because a browser test that drives its own
+          # compile right after load would collide with the background prewarm on the shared nim worker,
+          # run two full compiles at once, and thrash memory into the 30-min job timeout. This asserts, fast
+          # (no compile), that under Playwright the eager trigger does NOT auto-fire on load. SKIPs if the
+          # threads wasm is absent. (The scroll-into-view trigger — real users' fallback — is covered by
+          # browser-nim-prewarm-test.)
+          node browser-nim-eager-prewarm-gate-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
