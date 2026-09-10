@@ -4508,7 +4508,11 @@ async function nimPrewarm(c) {
 }
 
 // Fire `nimPrewarm` once, when the nim card first scrolls near the viewport (a strong "about to use it"
-// signal) — not on page load, so it doesn't compete with the warm cards' prewarm on the shared worker.
+// signal) — NOT on page load. The prewarm is a full background compile that allocates the compiler's large
+// foreign memories (the ~512 MiB nimsem window etc.); firing it on every load would burden every visitor
+// (including those who never touch the nim card) and, worse, would double the app's heaviest operation
+// against any near-simultaneous compile. The scroll signal (300 px margin) warms it just before use; with
+// the idle-worker reuse fix (#1386) that warm cache now actually survives to the user's first Run.
 function setupNimPrewarm() {
   const nimCard = cards.find((c) => c.ex.kind === 'nimc');
   if (!nimCard || typeof IntersectionObserver !== 'function') return;

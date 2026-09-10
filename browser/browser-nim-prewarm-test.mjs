@@ -1,8 +1,10 @@
 // Real-browser gate for the nim-card **pre-warm** (#1375): scrolling the nim card into view must fire a
 // background compile that warms the worker's guest-emit cache (`__nimPrewarmDone`) WITHOUT the user
-// clicking Run — so the user's first real Run is the fast (~3 s) tiered path, not the ~8 s first-emit one.
-// Asserts the pre-warm triggers and completes, then that a real compile through the shipped client path
-// is still correct. Logs first-vs-prewarmed timing (not asserted — CI machines vary).
+// clicking Run — so the user's first real Run is the fast (~3 s) tiered path, not the ~13 s first-emit one.
+// (The trigger is scroll-into-view, not load: the prewarm allocates the compiler's large foreign memories,
+// so it fires only on the "about to use it" signal, not for every visitor.) Asserts the pre-warm triggers
+// and completes, then that a real compile through the shipped client path is still correct — and, with the
+// idle-worker reuse fix (#1386), fast. Logs timing (not asserted — CI machines vary).
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -33,16 +35,15 @@ await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' })
 await page.waitForFunction(() => !!globalThis.__snapshotClient, null, { timeout: 30000 }).catch(() => {});
 
 // Scroll the nim card into view — the pre-warm trigger (IntersectionObserver). Find its section by the
-// nimc card's heading text ("Nim" + "toolchain").
+// nimc card's compile-a-whole-program section id (`demo-nim-compile…`).
 const scrolled = await page.evaluate(() => {
-  // The compile-a-whole-program card (kind 'nimc'); its section id starts with `demo-nim-compile`.
   const sec = document.querySelector('[id^="demo-nim-compile"]');
   if (sec) { sec.scrollIntoView(); return true; }
   return false;
 });
 if (!scrolled) { console.log('FAIL: could not find the nim card section to scroll into view'); await browser.close(); server.close(); process.exit(1); }
 
-// The pre-warm completes when `__nimPrewarmDone` flips (a full background compile, ~8 s cold).
+// The pre-warm completes when `__nimPrewarmDone` flips (a full background compile, ~13 s cold).
 const prewarmed = await page.waitForFunction(() => globalThis.__nimPrewarmDone === true, null, { timeout: 120000 })
   .then(() => true).catch(() => false);
 
