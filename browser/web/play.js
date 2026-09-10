@@ -4507,20 +4507,36 @@ async function nimPrewarm(c) {
   } catch (e) { globalThis.__nimPrewarmErr = String(e && e.message || e); /* best-effort; a real Run warms it anyway */ }
 }
 
-// Fire `nimPrewarm` once, when the nim card first scrolls near the viewport (a strong "about to use it"
-// signal) — NOT on page load. The prewarm is a full background compile that allocates the compiler's large
-// foreign memories (the ~512 MiB nimsem window etc.); firing it on every load would burden every visitor
-// (including those who never touch the nim card) and, worse, would double the app's heaviest operation
-// against any near-simultaneous compile. The scroll signal (300 px margin) warms it just before use; with
-// the idle-worker reuse fix (#1386) that warm cache now actually survives to the user's first Run.
+// Pre-warm the nim toolchain in the background on its OWN worker (NIMC_KEY) so the user's first Run is the
+// fast (~3 s) warm path, not the ~10 s cold one. The cold→warm gap is V8 tiering up (Liftoff→TurboFan) the
+// emitted nimsem/hexer guest code inside the worker's isolate — it lives only as long as the worker does
+// (the idle-worker reuse fix, #1386, keeps that alive across Runs) and can't be persisted, so warming early
+// is the only lever. Two triggers, both idempotent via `nimPrewarmed`:
+//   • EAGER, on load (requestIdleCallback, 4 s timeout guarantee) — pays the ~10 s in the background before
+//     the user reaches the card. SKIPPED under automation (`navigator.webdriver`): the prewarm is a full
+//     compile that allocates the toolchain's large foreign memories (~512 MiB nimsem window etc.), and a
+//     browser test that drives its own compile right after load would run two at once and thrash memory
+//     (a real CI 30-min-timeout hang, #1386). Real users are unaffected — and if one hits Run before the
+//     eager prewarm finishes, runNimc's cancelNim() terminates the in-flight (busy) worker, so no double
+//     compile. Deferred to idle so it yields to first paint and the warm cards' prewarm.
+//   • SCROLL-into-view (300 px) — always on: the fallback for backgrounded tabs (idle callbacks throttled
+//     there) and the "about to use it" signal browser tests exercise explicitly.
 function setupNimPrewarm() {
   const nimCard = cards.find((c) => c.ex.kind === 'nimc');
-  if (!nimCard || typeof IntersectionObserver !== 'function') return;
-  const obs = new IntersectionObserver((entries) => {
-    if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
-    if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
-  }, { rootMargin: '300px' });
-  obs.observe(nimCard.el.section);
+  if (!nimCard) return;
+  const automated = typeof navigator !== 'undefined' && navigator.webdriver;
+  if (!automated) {
+    const fire = () => { if (snapshotClient) nimPrewarm(nimCard); };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(fire, { timeout: 4000 });
+    else setTimeout(fire, 1500);
+  }
+  if (typeof IntersectionObserver === 'function') {
+    const obs = new IntersectionObserver((entries) => {
+      if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
+      if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
+    }, { rootMargin: '300px' });
+    obs.observe(nimCard.el.section);
+  }
 }
 
 async function main() {
@@ -4607,7 +4623,7 @@ async function main() {
       if (typeof requestIdleCallback === 'function') requestIdleCallback(prewarmAll, { timeout: 3000 });
       else setTimeout(prewarmAll, 0);
     }
-    setupNimPrewarm(); // #1375: warm the nim toolchain when its card scrolls into view (not a warm card)
+    setupNimPrewarm(); // #1375/#1386: warm the nim toolchain in the background (eager on load; scroll fallback)
   } catch (e) {
     snapshotClient = null;
     console.warn('[Temen playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
