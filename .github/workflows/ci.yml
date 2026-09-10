@@ -1019,6 +1019,13 @@ jobs:
           # (tier.semmed/hexed > 0 — not a silent interpreter fallback), proving the asset plumbing +
           # foreign-memory-in-a-Worker end-to-end. Reuses the threads module + committed assets.
           node browser-nim-card-tierup-test.mjs
+          # #1386 (warm-path regression): `runNimc` calls `snapshotClient.cancelNim()` before every compile;
+          # it used to terminate the nim worker unconditionally, throwing away the warmed guest-emit cache so
+          # every Run recompiled the ~5 s nimsem/hexer guests from cold (the deployed ~13–16 s). cancelNim now
+          # no-ops on an IDLE worker. Drives compile → cancelNim → compile ×3 (the real runNimc flow) and
+          # asserts the nim worker is spawned exactly ONCE (was 3×) with correct output each time —
+          # deterministic (spawn count, not timing), so CI-robust. Reuses committed assets; SKIPs if absent.
+          node browser-nim-worker-reuse-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
