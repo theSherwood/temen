@@ -1,8 +1,9 @@
-// Real-browser gate for the nim-card **pre-warm** (#1375): scrolling the nim card into view must fire a
+// Real-browser gate for the nim-card **eager pre-warm** (#1375/#1386): on load the page must fire a
 // background compile that warms the worker's guest-emit cache (`__nimPrewarmDone`) WITHOUT the user
-// clicking Run — so the user's first real Run is the fast (~3 s) tiered path, not the ~8 s first-emit one.
-// Asserts the pre-warm triggers and completes, then that a real compile through the shipped client path
-// is still correct. Logs first-vs-prewarmed timing (not asserted — CI machines vary).
+// scrolling to the card OR clicking Run — so the user's first real Run is the fast (~3 s) tiered path, not
+// the ~13 s first-emit one. Asserts the pre-warm triggers and completes on its own (no scroll), then that a
+// real compile through the shipped client path is still correct. Logs prewarmed timing (not asserted — CI
+// machines vary).
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -32,17 +33,8 @@ page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 await page.goto(`http://127.0.0.1:${port}/web/play.html`, { waitUntil: 'load' });
 await page.waitForFunction(() => !!globalThis.__snapshotClient, null, { timeout: 30000 }).catch(() => {});
 
-// Scroll the nim card into view — the pre-warm trigger (IntersectionObserver). Find its section by the
-// nimc card's heading text ("Nim" + "toolchain").
-const scrolled = await page.evaluate(() => {
-  // The compile-a-whole-program card (kind 'nimc'); its section id starts with `demo-nim-compile`.
-  const sec = document.querySelector('[id^="demo-nim-compile"]');
-  if (sec) { sec.scrollIntoView(); return true; }
-  return false;
-});
-if (!scrolled) { console.log('FAIL: could not find the nim card section to scroll into view'); await browser.close(); server.close(); process.exit(1); }
-
-// The pre-warm completes when `__nimPrewarmDone` flips (a full background compile, ~8 s cold).
+// Do NOT scroll and do NOT click Run: eager pre-warm (requestIdleCallback on load) must fire on its own.
+// It completes when `__nimPrewarmDone` flips (a full background compile, ~13 s cold).
 const prewarmed = await page.waitForFunction(() => globalThis.__nimPrewarmDone === true, null, { timeout: 120000 })
   .then(() => true).catch(() => false);
 
@@ -71,5 +63,5 @@ if (errors.length) console.log('ERRORS', errors.slice(0, 6));
 const outOk = (res.out || '').includes('hello, Nim');
 const ok = prewarmed && res.ok && res.status === 0 && outOk;
 console.log(`  nim-prewarm: prewarmDone=${prewarmed} · post-prewarm compile ${res.ms}ms · status ${res.status} · out=${JSON.stringify((res.out || '').slice(0, 40))}`);
-console.log(ok ? 'PASS — the nim card pre-warms on scroll-into-view; a subsequent compile is correct' : 'FAIL');
+console.log(ok ? 'PASS — the nim card pre-warms eagerly on load (no scroll); a subsequent compile is correct' : 'FAIL');
 process.exit(ok ? 0 : 1);

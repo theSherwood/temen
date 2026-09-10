@@ -4507,16 +4507,27 @@ async function nimPrewarm(c) {
   } catch (e) { globalThis.__nimPrewarmErr = String(e && e.message || e); /* best-effort; a real Run warms it anyway */ }
 }
 
-// Fire `nimPrewarm` once, when the nim card first scrolls near the viewport (a strong "about to use it"
-// signal) — not on page load, so it doesn't compete with the warm cards' prewarm on the shared worker.
+// Fire `nimPrewarm` EAGERLY on load (#1386): the nim toolchain's cold first compile is ~13 s of one-time
+// guest emit (nimsem/hexer), so paying it in the background — before the user scrolls to the card and hits
+// Run — makes even the *first* Run feel fast (~3 s warm). The nim card has its OWN worker (NIMC_KEY), so
+// this never evicts a warm card's snapshot, and the ~13 s emit runs on that worker thread, off the main
+// thread. We defer to `requestIdleCallback` so it yields to first paint and lets the warm cards' prewarm
+// (queued just above) grab the network first; the `timeout` guarantees it fires even if the page never idles.
+// The IntersectionObserver stays as a fallback for tabs that load backgrounded (idle callbacks are throttled
+// there) — `nimPrewarmed` guards it, so at most one prewarm actually runs.
 function setupNimPrewarm() {
   const nimCard = cards.find((c) => c.ex.kind === 'nimc');
-  if (!nimCard || typeof IntersectionObserver !== 'function') return;
-  const obs = new IntersectionObserver((entries) => {
-    if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
-    if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
-  }, { rootMargin: '300px' });
-  obs.observe(nimCard.el.section);
+  if (!nimCard) return;
+  const fire = () => { if (snapshotClient) nimPrewarm(nimCard); };
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(fire, { timeout: 4000 });
+  else setTimeout(fire, 1500);
+  if (typeof IntersectionObserver === 'function') {
+    const obs = new IntersectionObserver((entries) => {
+      if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
+      if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
+    }, { rootMargin: '300px' });
+    obs.observe(nimCard.el.section);
+  }
 }
 
 async function main() {
@@ -4603,7 +4614,7 @@ async function main() {
       if (typeof requestIdleCallback === 'function') requestIdleCallback(prewarmAll, { timeout: 3000 });
       else setTimeout(prewarmAll, 0);
     }
-    setupNimPrewarm(); // #1375: warm the nim toolchain when its card scrolls into view (not a warm card)
+    setupNimPrewarm(); // #1375/#1386: eagerly warm the nim toolchain in the background (its own worker)
   } catch (e) {
     snapshotClient = null;
     console.warn('[Temen playground] snapshot worker unavailable; warm cards use the main thread:', e.message);
