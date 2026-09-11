@@ -848,6 +848,140 @@ fn budget_plus_raw_quota_fails_closed() {
     );
 }
 
+// ===== #989 slice 1b — the record's Budget `channel` bounds a spawned child ======================
+
+/// The worst-case per-pipe host-served channel charge (`PIPE_CAP`, a full 64 KiB FIFO). Mirror of
+/// `temen_interp`'s internal constant; kept in sync by the `channel_budget_bounds_...` assertions.
+const PIPE_CAP: i64 = 64 << 10;
+
+/// Host-level harness for the §14 channel bound: a parent `(Instantiator, Budget-with-channel)`
+/// spawns func 1 through an op-17 record; the child loops minting host-served pipes
+/// (`self.pipe`, op 16) into its OWN powerbox and returns how many it minted before the mint was
+/// refused. When the funding budget's `channel` field bounded the child (slice 1b stamps it onto the
+/// child's `channel_cap`), the mint fails closed at exactly `channel / PIPE_CAP` pipes; an unbounded
+/// channel only stops when the handle table fills (many more). fuel/mem/spawn are all unbounded
+/// (`-1`) so the ONLY thing constraining the child is its channel ceiling. The parent joins and
+/// returns the child's count (post-spawn budget reads are 0 — consumed at commit — so the
+/// `run_budgeted`-shaped `join*1000 + fuel + mem` collapses to `count*1000`).
+fn run_channel_bounded_child(channel: i64) -> Result<Vec<Value>, temen_interp::Trap> {
+    let src = format!(
+        r#"memory 17
+func (i32, i32) -> (i64) {{
+block 0 (vinst: i32, vbud: i32) {{
+  vf0 = i64.const {f0}
+  vf8 = i64.const 65536
+  vf16 = i64.const {f16}
+  vmask = i64.const 4294967295
+  vb64 = i64.extend_i32_s vbud
+  vbm = i64.and vb64 vmask
+  vsh = i64.const 32
+  vbs = i64.shl vbm vsh
+  vmod = i64.const 4294967295
+  vf24 = i64.or vmod vbs
+  vf32 = i64.const 0
+  vf40 = i64.const 0
+  vf48 = i64.const 0
+{stores}
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vzero = i32.const 0
+  visneg = i32.lt_s vch vzero
+  br_if visneg 2(vbud) 1(vinst, vbud, vch)
+}}
+block 1 (vinst1: i32, vbud1: i32, vch1: i32) {{
+  vj = call.cap 6 1 (i32) -> (i64) vinst1 (vch1)
+  fld0 = i64.const 0
+  fld1 = i64.const 1
+  vfr = call.cap 14 1 (i64) -> (i64) vbud1 (fld0)
+  vmr = call.cap 14 1 (i64) -> (i64) vbud1 (fld1)
+  k = i64.const 1000
+  t0 = i64.mul vj k
+  t1 = i64.add t0 vfr
+  t2 = i64.add t1 vmr
+  return t2
+}}
+block 2 (vbud2: i32) {{
+  vneg = i64.const -1
+  return vneg
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vn0 = i64.const 0
+  br 1(vn0)
+}}
+block 1 (vn: i64) {{
+  vz = i32.const 0
+  vfds = i64.const 20480
+  vr = call.cap 4294967295 16 (i64) -> (i32) vz (vfds)
+  vrz = i32.const 0
+  vfail = i32.lt_s vr vrz
+  br_if vfail 2(vn) 3(vn)
+}}
+block 2 (vnf: i64) {{
+  return vnf
+}}
+block 3 (vnok: i64) {{
+  vone = i64.const 1
+  vn2 = i64.add vnok vone
+  br 1(vn2)
+  }}
+}}
+"#,
+        f0 = (1u64 << 32) as i64,
+        f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
+        stores = store_record(17408),
+    );
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+    let mut host = Host::new();
+    let ih = host.grant_instantiator(0, 128 << 10);
+    // fuel/mem/spawn unbounded — only `channel` constrains the child.
+    let bh = host.grant_budget_channel(-1, -1, -1, channel);
+    let mut fuel = 50_000_000u64;
+    let (res, _) = run_capture_reserved_with_host(
+        &m,
+        0,
+        &[Value::I32(ih), Value::I32(bh)],
+        &mut fuel,
+        &[],
+        0,
+        &mut host,
+    );
+    res
+}
+
+/// #989 slice 1b — a `Budget` split's `channel` field bounds a §14 child's host-served pipe memory:
+/// a channel of exactly 2×`PIPE_CAP` lets the child mint exactly two pipes before the third fails
+/// closed (`-EMFILE`), so the parent's join reports `2` (× 1000). An **unbounded** channel (`-1`,
+/// the default) mints far more (until the handle table fills), so the exact `2` is proof the
+/// funding budget's ceiling propagated onto the child's `channel_cap` at spawn.
+#[test]
+fn channel_budget_bounds_a_spawned_childs_pipe_mints() {
+    assert_eq!(
+        run_channel_bounded_child(2 * PIPE_CAP),
+        Ok(vec![Value::I64(2_000)]),
+        "a 2×PIPE_CAP channel budget bounds the child to exactly two pipe mints"
+    );
+    // A one-pipe ceiling bounds it to a single mint — the ceiling scales with the budget.
+    assert_eq!(
+        run_channel_bounded_child(PIPE_CAP),
+        Ok(vec![Value::I64(1_000)]),
+        "a 1×PIPE_CAP channel budget bounds the child to exactly one pipe mint"
+    );
+    // Unbounded channel: the child mints well past two (handle-table bound, not channel) — so the
+    // bounded cases above are enforcing the cap, not hitting some incidental limit at two.
+    let unbounded = run_channel_bounded_child(-1).expect("unbounded spawn runs");
+    let n = match unbounded.as_slice() {
+        [Value::I64(v)] => v / 1000,
+        other => panic!("unexpected unbounded result: {other:?}"),
+    };
+    assert!(
+        n > 2,
+        "an unbounded channel mints more than two pipes (got {n}) — the bound above is real"
+    );
+}
+
 /// §3c.2 — the budget-record program: a Budget-funded record spawn that the
 /// §3c.2 hook funds on every tier (the pre-3c.2 form of this test asserted the `-EINVAL`
 /// gap). The shared program: resolve "vm" + "bgt", build a record carrying the budget handle,
@@ -999,5 +1133,165 @@ fn spawn_bounded_budget_record_is_the_narrowed_jit_gap() {
         run_b(Backend::Jit),
         100_022,
         "native JIT: bounded spawn stays -EINVAL until child-quota threading"
+    );
+}
+
+// ===== #744 (EXEC.md row 4) — guest-served exec: a parent serves its child's "exec" ==============
+
+/// #744 — the **mediation-consistent guest-served exec** (EXEC.md row 4): the parent grants its child a
+/// `"exec"` capability backed by **its own code**, and the child is none-the-wiser. The grant is a
+/// named-grant record whose `handle` carries `GRANT_SERVE_LIVE_TAG` over the parent's impl-export
+/// index (export 0 here, interface `"exec"` with one op `run`) — the record's reserved `flags` word
+/// stays 0 and ignored, as the ABI promises: the spawn installs into the CHILD a
+/// live-callee offer whose callee is the parent's running powerbox. The child resolves `"exec"` by name
+/// and calls `run(40, 2)` — which parks it until the PARENT's `svc.wait` serve loop runs handler func 2
+/// over the parent's live world and replies `42`. The parent joins the child and returns
+/// `join*100 + served` = `42*100 + 1` = `4201`. The parent never holds a self-referential cap (the
+/// offer exists only in the child's table), so there is no reference cycle and nothing to mis-call.
+///
+/// `handle` is a parameter so the fail-closed edge is pinned too: a tag over an impl-export the
+/// parent does not have is refused at spawn (`CapFault`) before any child state is built.
+fn serve_live_src(handle: i32) -> String {
+    format!(
+        r#"memory 17
+type 0 func (i64, i64) -> (i64)
+type 1 interface {{ run: 0 }}
+export 0 interface "exec" 1 {{ run: 2 }}
+
+func (i32) -> (i64) {{
+block 0 (vinst: i32) {{
+  ; the grant name "exec" at 16484 (parent window, below the carve)
+  ce = i32.const 101
+  cx = i32.const 120
+  cc = i32.const 99
+  p0 = i64.const 16484
+  i32.store8 p0 ce
+  p1 = i64.const 16485
+  i32.store8 p1 cx
+  p2 = i64.const 16486
+  i32.store8 p2 ce
+  p3 = i64.const 16487
+  i32.store8 p3 cc
+  ; one grant record at 16384: {{name_off=16484, name_len=4, handle=TAG|export, flags=0 (reserved, ignored)}}
+  g0 = i64.const 16384
+  n16484 = i32.const 16484
+  i32.store g0 n16484
+  g4 = i64.const 16388
+  n4 = i32.const 4
+  i32.store g4 n4
+  g8 = i64.const 16392
+  vhandle = i32.const {handle}
+  i32.store g8 vhandle
+  g12 = i64.const 16396
+  z0 = i32.const 0
+  i32.store g12 z0
+  ; op-17 record at 17408: entry 1, carve off=65536 size_log2=16, no pager, module=-1 (self), no budget,
+  ; quota 0, grants=(16384, 1)
+  vf0 = i64.const {f0}
+  vf8 = i64.const 65536
+  vf16 = i64.const {f16}
+  vf24 = i64.const 4294967295
+  vf32 = i64.const 0
+  vf40 = i64.const 16384
+  vf48 = i64.const 1
+{stores}
+  vrp = i64.const 17408
+  vch = call.cap 6 17 (i64) -> (i32) vinst (vrp)
+  vzero = i32.const 0
+  visneg = i32.lt_s vch vzero
+  br_if visneg 2(vch) 1(vinst, vch)
+}}
+block 1 (vinst1: i32, vch1: i32) {{
+  ; serve the child's one `exec.run` call: OUR handler (func 2) answers over OUR live world
+  vz = i32.const 0
+  vn = call.cap 4294967295 10 () -> (i64) vz ()
+  vj = call.cap 6 1 (i32) -> (i64) vinst1 (vch1)
+  k = i64.const 100
+  t0 = i64.mul vj k
+  t1 = i64.add t0 vn
+  return t1
+}}
+block 2 (vbad: i32) {{
+  vb64 = i64.extend_i32_s vbad
+  return vb64
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  ; re-materialize "exec" in OUR window and resolve the live self-serve grant by name
+  ce = i32.const 101
+  cx = i32.const 120
+  cc = i32.const 99
+  a0 = i64.const 16484
+  i32.store8 a0 ce
+  a1 = i64.const 16485
+  i32.store8 a1 cx
+  a2 = i64.const 16486
+  i32.store8 a2 ce
+  a3 = i64.const 16487
+  i32.store8 a3 cc
+  len4 = i64.const 4
+  hexec = self.resolve a0 len4
+  ; `run(40, 2)` through it: parks us until the PARENT's serve loop answers with its own code
+  va = i64.const 40
+  vb = i64.const 2
+  vr = call.cap 268435456 0 (i64, i64) -> (i64) hexec (va, vb)
+  return vr
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (va: i64, vb: i64) {{
+  s = i64.add va vb
+  return s
+  }}
+}}
+"#,
+        handle = handle,
+        f0 = (1u64 << 32) as i64,
+        f16 = (16u64 | (0xFFFF_FFFFu64 << 32)) as i64,
+        stores = store_record(17408),
+    )
+}
+
+fn run_serve_live(handle: i32) -> Result<Vec<Value>, temen_interp::Trap> {
+    let src = serve_live_src(handle);
+    let m = parse_module(&src).expect("parse");
+    verify_module(&m).expect("verify");
+    let am = std::sync::Arc::new(m);
+    let mut host = Host::new();
+    // The parent's impl-exports (what `GRANT_SERVE_LIVE` names and `offer_shape` resolves) live on
+    // its registered self module — the same seeding the serve-loop and `child_offer` harnesses do.
+    host.set_self_module(&am);
+    let ih = host.grant_instantiator(0, 128 << 10);
+    let mut fuel = 50_000_000u64;
+    let (res, _) =
+        run_capture_reserved_with_host(&am, 0, &[Value::I32(ih)], &mut fuel, &[], 0, &mut host);
+    res
+}
+
+/// **The #744 pin**: the child's `exec.run(40, 2)` is answered by the PARENT's own handler over the
+/// parent's live world — `join*100 + served` = `4201`. This is the guest-served exec backend
+/// (EXEC.md row 4) end to end on the tree-walker oracle: mint-at-spawn into the child only, caller
+/// parks, parent serves, reply, join.
+#[test]
+fn a_parent_serves_its_childs_exec_with_its_own_code() {
+    assert_eq!(
+        run_serve_live(temen_interp::GRANT_SERVE_LIVE_TAG as i32),
+        Ok(vec![Value::I64(4_201)]),
+        "child's exec.run(40,2) → parent's handler replies 42; parent served 1 and joined 42"
+    );
+}
+
+/// The fail-closed edge: a tagged handle naming an impl-export the parent does NOT have (export 7;
+/// only export 0 exists) is refused at spawn (`CapFault`) — the shape must resolve before any child
+/// state is built, never a dangling live offer.
+#[test]
+fn a_live_self_serve_grant_of_a_missing_export_refuses_the_spawn() {
+    assert!(
+        matches!(
+            run_serve_live((temen_interp::GRANT_SERVE_LIVE_TAG | 7) as i32),
+            Err(temen_interp::Trap::CapFault)
+        ),
+        "a live self-serve grant of a nonexistent export fails the spawn closed"
     );
 }

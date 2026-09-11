@@ -9,7 +9,7 @@
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
 import { foreignImports } from './foreign-mem.js';
-import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl } from './wasmjit-module.js';
+import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl, jitNimWholeCardOp13 } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
 let memory = null; // the worker's own (private) shared WebAssembly.Memory
@@ -32,6 +32,45 @@ let interpWarmPromise = null;
 // The nimony phase guests + stdlib image, cached here after the first `nimAssets` message so each
 // `nimCompile` Run re-uses them instead of re-posting ~28 MB across the worker boundary every time.
 let nimAssets = null;
+// #1375: the parsed pre-compiled stdlib artifacts (Map stem -> {pNif,depsNif,sNif,sIdx,xNif}), or null.
+let preStdlib = null;
+
+// 32-bit FNV-1a over each buffer's length + up to 256 head/tail bytes — the pack's wire-coupling key.
+// Mirrors `build-prestdlib.mjs`; buffers in the SAME order: [stdlib, niflerCe, nimsemCe, hexerCe].
+function prestdlibKey(bufs) {
+  let h = 0x811c9dc5 >>> 0;
+  const mix = (b) => { h = (h ^ b) >>> 0; h = Math.imul(h, 0x01000193) >>> 0; };
+  for (const buf of bufs) {
+    const u = new Uint8Array(buf), n = u.length;
+    for (const x of [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255]) mix(x);
+    for (let i = 0; i < 256 && i < n; i++) mix(u[i]);
+    for (let i = 0; i < 256 && i < n; i++) mix(u[n - 1 - i]);
+  }
+  return h >>> 0;
+}
+
+// Parse the `nim_prestdlib.pack` blob (gunzipped): [u32 key][u32 count] then per module [u32 stemLen][stem]
+// and five [u32 len][bytes] files in order p, deps, s, sidx, x (little-endian). Mirrors `build-prestdlib.mjs`.
+// Returns { key, mods:Map } or null. A stale pack (key ≠ the loaded assets') MUST be ignored by the caller,
+// never seeded — its `.s.nif` would silently mis-compile against the current stdlib/guests.
+function parsePrestdlib(bytes) {
+  try {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let p = 0;
+    const rdU32 = () => { const v = dv.getUint32(p, true); p += 4; return v; };
+    const rdBytes = () => { const n = rdU32(); const b = bytes.slice(p, p + n); p += n; return b; };
+    const dec = new TextDecoder();
+    const key = rdU32();
+    const m = new Map();
+    const count = rdU32();
+    for (let i = 0; i < count; i++) {
+      const stem = dec.decode(rdBytes());
+      const pNif = rdBytes(), depsNif = rdBytes(), sNif = rdBytes(), sIdx = rdBytes(), xNif = rdBytes();
+      m.set(stem, { pNif, depsNif, sNif, sIdx, xNif });
+    }
+    return { key, mods: m };
+  } catch { return null; }
+}
 // Active only during a streaming Run (`runStream`/`nimCompile`): a fn that relays one stdout chunk to
 // the main thread. `null` at rest so the `stdout_chunk` import is a no-op for warm/prime dry runs.
 let chunkSink = null;
@@ -234,7 +273,18 @@ self.onmessage = async (e) => {
     if (msg.type === 'nimAssets') {
       // Cache the nimony phase guests + stdlib image (posted once). Kept as the worker's own copies so
       // later `nimCompile` Runs need only ship the (small) source, not ~28 MB of guests each time.
-      nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib };
+      nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib,
+        niflerCe: msg.niflerCe, nimsemCe: msg.nimsemCe, hexerCe: msg.hexerCe };
+      // #1375: the pre-compiled stdlib pack (parsed once, cached) — lets the whole-card orchestrator skip
+      // re-semchecking the stdlib (system.nim's sema alone is ~30 s). Optional: absent → full from-scratch.
+      // Trust it only when its wire-coupling key matches the loaded stdlib+guests; a stale pack would
+      // seed `.s.nif` that mis-compiles against the current stdlib, so a mismatch falls back to scratch.
+      preStdlib = null;
+      const parsed = msg.preStdlib && msg.preStdlib.length ? parsePrestdlib(msg.preStdlib) : null;
+      if (parsed) {
+        const want = prestdlibKey([nimAssets.stdlib, nimAssets.niflerCe, nimAssets.nimsemCe, nimAssets.hexerCe]);
+        if (parsed.key === want) preStdlib = parsed.mods;
+      }
       self.postMessage({ type: 'reply', id: msg.id, ok: true });
       return;
     }
@@ -246,18 +296,28 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'nim assets not loaded' });
         return;
       }
-      const { nifler, nimsem, hexer, stdlib } = nimAssets;
+      const { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe } = nimAssets;
       const mainName = msg.main || 'prog.nim';
       const src = new TextEncoder().encode(msg.source);
       const main = new TextEncoder().encode(mainName);
-      // #1025 route A: tier the phase-1 nifler import crawl up to the wasm-JIT. The JS-orchestrated crawl
-      // runs nifler on the emitted-wasm tier per module and seeds each `.p.nif` into the Rust accumulator
-      // that `temen_compile_nim_fs` mounts, so `compile_nim`'s phase-1 skips the interpreter nifler run for
-      // every module the crawl covered. Best-effort: any failure just falls back to full interpreter phase-1.
+      // #1025 3e: tier the WHOLE card up to the wasm-JIT. `jitNimWholeCardOp13` runs nifler + nimsem +
+      // hexer for every module as §14 op-13 detached emitted children and seeds every `.p/.s/.x` into the
+      // accumulator `temen_compile_nim_fs` mounts, so the final compile only links + runs — ~3.3× faster
+      // than the tree-walker, byte-identical (`browser-nim-wholecard-op13-test`). Best-effort and
+      // per-phase: any module/phase the orchestrator can't tier just isn't pre-seeded, so `compile_nim`
+      // runs it on the interpreter (needs the top-level guests, hence they ship too); a hard failure
+      // resets the accumulator and the whole compile falls back to the tree-walker. Requires the
+      // child-entry guests — if a page shipped without them (old cache), fall back to the phase-1 crawl.
+      let tier = null; // what the JS orchestrator pre-seeded (for telemetry / the wiring test)
       try {
-        await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
+        if (niflerCe && nimsemCe && hexerCe) {
+          tier = await jitNimWholeCardOp13(ex, memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, `/${mainName}`, src, 'nim-wholecard', preStdlib);
+        } else {
+          await jitNimCrawl(ex, memory, nifler, stdlib, `/${mainName}`, src, 'nim-nifler-crawl');
+        }
       } catch (e) {
-        ex.temen_nim_precrawl_reset(); // discard a partial crawl; interpreter phase-1 handles everything
+        ex.temen_nim_precrawl_reset(); // discard partial pre-seeds; the interpreter compile handles everything
+        tier = { error: String(e && e.message || e) };
       }
       // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
       // fresh view and fill them — the same discipline as play.js's `runNimc`.
@@ -274,24 +334,56 @@ self.onmessage = async (e) => {
       view.set(stdlib, ip);
       view.set(src, sp);
       view.set(main, mp);
-      // Live-stream the compiled program's stdout to the page (#1143): the tee on the final `_start`
-      // run fires `stdout_chunk`, relayed here for the duration of the compile+run.
-      chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      // Live-stream the compiled program's stdout to the page (#1143), accumulating a copy — some runs
+      // route the program's output through the streaming tee with the engine's captured buffer empty
+      // afterwards (#1360), so the streamed bytes are the reply's fallback source (PR #1356).
+      const streamAcc = [];
+      chunkSink = (bytes) => { streamAcc.push(bytes.slice()); self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]); };
+      let status, runTier = 'interpreter';
       try {
-        ex.temen_compile_nim_fs(
+        // #1357: tier the RUN too. Compile-to-linked-module (no run), then run the linked program on the
+        // **wasm-JIT** tier via `runJitModule` — so the user's program is emitted, not just the compiler.
+        // Fall back to the tree-walker (`temen_compile_nim_fs`) if the emit declines (a page-managing /
+        // out-of-subset `_start`) or if we can't get the linked module.
+        const linkLen = Number(ex.temen_compile_nim_link_fs(
           np, nifler.length, smp, nimsem.length, hp, hexer.length,
-          ip, stdlib.length, sp, src.length, mp, main.length);
+          ip, stdlib.length, sp, src.length, mp, main.length));
+        let ranEmitted = false;
+        if (linkLen > 0) {
+          // The encoded linked module (BINARY — not `readStdout()`, which UTF-8-decodes) on the OUT stash.
+          const linked = new Uint8Array(memory.buffer, Number(ex.temen_stdout_ptr()), linkLen).slice();
+          try {
+            // Cache the emitted `_start` by a key derived from the LINKED BYTES, not a fixed string: two
+            // different user programs must not collide (a fixed key ran program A's `_start` for program B).
+            // Re-running the same program still cache-hits. FNV-1a over length + head/tail (cheap, stable).
+            const runKey = `nim-run-${prestdlibKey([linked])}`;
+            const rs = await runJitModule(ex, memory, linked, null, runKey);
+            status = (rs === 0 || rs === 5) ? 0 : rs;
+            ranEmitted = true; runTier = 'wasm-jit';
+          } catch (_e) { /* emit declined → tree-walker fallback below */ }
+        }
+        if (!ranEmitted) {
+          ex.temen_compile_nim_fs(
+            np, nifler.length, smp, nimsem.length, hp, hexer.length,
+            ip, stdlib.length, sp, src.length, mp, main.length);
+          status = ex.temen_status();
+        }
       } finally {
         chunkSink = null;
       }
-      const status = ex.temen_status();
       ex.temen_dealloc(np, nifler.length);
       ex.temen_dealloc(smp, nimsem.length);
       ex.temen_dealloc(hp, hexer.length);
       ex.temen_dealloc(ip, stdlib.length);
       ex.temen_dealloc(sp, src.length);
       ex.temen_dealloc(mp, main.length);
-      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout: readStdout(), stderr: readStderr() });
+      let stdout = readStdout(); // a decoded STRING (matches play.js's `${out}`)
+      if (!stdout.length && streamAcc.length) {
+        const total = new Uint8Array(streamAcc.reduce((n, a) => n + a.length, 0));
+        let o = 0; for (const a of streamAcc) { total.set(a, o); o += a.length; }
+        stdout = new TextDecoder().decode(total);
+      }
+      self.postMessage({ type: 'reply', id: msg.id, ok: true, status, stdout, stderr: readStderr(), tier, runTier });
       return;
     }
     if (msg.type === 'stats') {

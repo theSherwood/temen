@@ -114,14 +114,39 @@ pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
                 continue;
             }
             if let Some(inf) = balanced(&block, "infix") {
-                let segs: Vec<&str> = inf
-                    .trim_start_matches("(infix")
-                    .trim_end_matches(')')
-                    .split_whitespace()
-                    .filter(|t| *t != "/" && !t.starts_with('('))
-                    .collect();
-                if !segs.is_empty() {
-                    out.push(format!("/lib/{}.nim", segs.join("/")));
+                // The right operand may be `(bracket a b c)` — nim's `import pkg/[a, b, c]` multi-import.
+                // Expand it to one absolute import per element (`/lib/<prefix>/<a>.nim`, …); the prefix is
+                // the infix's plain segments (e.g. `std`) before the bracket. Without this, `std/[a, b]`
+                // wrongly flattened to a single `/lib/std/a/b.nim` (which resolves to nothing), so any
+                // stdlib module using bracket imports (strutils → `std/[assertions, parseutils]`, …) failed
+                // to crawl and then failed to sem-check.
+                if let Some(br) = balanced(&inf, "bracket") {
+                    let cut = inf.find(&br).unwrap();
+                    let prefix: Vec<&str> = inf[..cut]
+                        .trim_start_matches("(infix")
+                        .split_whitespace()
+                        .filter(|t| *t != "/" && !t.starts_with('('))
+                        .collect();
+                    for e in br
+                        .trim_start_matches("(bracket")
+                        .trim_end_matches(')')
+                        .split_whitespace()
+                        .filter(|t| !t.starts_with('('))
+                    {
+                        let mut segs = prefix.clone();
+                        segs.push(e);
+                        out.push(format!("/lib/{}.nim", segs.join("/")));
+                    }
+                } else {
+                    let segs: Vec<&str> = inf
+                        .trim_start_matches("(infix")
+                        .trim_end_matches(')')
+                        .split_whitespace()
+                        .filter(|t| *t != "/" && !t.starts_with('('))
+                        .collect();
+                    if !segs.is_empty() {
+                        out.push(format!("/lib/{}.nim", segs.join("/")));
+                    }
                 }
             } else if let Some(pre) = balanced(&block, "prefix") {
                 let segs: Vec<&str> = pre
@@ -148,6 +173,18 @@ type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
 /// (stdout/stdin/exit/memory), a fresh `fs` grant, and — for `nimsem` — an `exec` cap. Returns the
 /// guest's captured stdout and its exit/return code. Mirrors `temen-run`'s `run_with_caps` (and the
 /// browser's `pg_setup`) but with the shared-factory `fs` + optional `exec` the multibinary driver needs.
+/// Format the tail of a phase's captured stdout for a failure message — the last ~2 KiB, lossy-decoded,
+/// so a nimony diagnostic (or the `[phase trapped: …]` reason `run_phase` appends) reaches the caller. A
+/// guest often prints its error right before it fails; without this the caller only sees a bare code.
+/// Empty output → empty string.
+fn diag_tail(out: &[u8]) -> String {
+    if out.is_empty() {
+        return String::new();
+    }
+    let start = out.len().saturating_sub(2048);
+    format!(": {}", String::from_utf8_lossy(&out[start..]).trim())
+}
+
 fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
     if onramp_check(m).is_err() {
         return (b"phase module is not a manifest module".to_vec(), -1);
@@ -216,7 +253,14 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
             _ => 0,
         }),
         Some((Err(Trap::Exit(c)), _)) => c as i64,
-        Some((Err(_), _)) => -1,
+        Some((Err(e), _)) => {
+            // A trap (not a clean exit) — e.g. a nimony front-end `unreachable` on an unsupported
+            // construct. The trap reason is the load-bearing diagnostic (the guest often prints nothing
+            // before trapping), so append it to the captured output for the caller to surface.
+            host.stdout
+                .extend_from_slice(format!("\n[phase trapped: {e:?}]").as_bytes());
+            -1
+        }
         None => -2, // bytecode engine declined (should not happen for these on-ramp guests)
     };
     (host.stdout, code)
@@ -584,6 +628,21 @@ pub fn compile_nim_ce(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<String, String> {
+    let m = compile_nim_ce_impl(nifler, nifler_ce, nimsem, hexer, files, main_nim)?;
+    run_linked(&m)
+}
+
+/// The shared compile body — phases 1–4 through the nim→powerbox link — returning the linked, verified
+/// `Module`. [`compile_nim_ce`] runs it on the tree-walker; [`compile_nim_ce_to_module`] hands it back so
+/// the browser can run it on the wasm-JIT tier (#1357).
+fn compile_nim_ce_impl(
+    nifler: &[u8],
+    nifler_ce: Option<&[u8]>,
+    nimsem: &[u8],
+    hexer: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    main_nim: &str,
+) -> Result<Module, String> {
     let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
     let nifler_ce_m: Option<Arc<Module>> = match nifler_ce {
         Some(bytes) => {
@@ -674,9 +733,9 @@ pub fn compile_nim_ce(
         }
         argv.push(&pnif);
         let exec = make_exec(nifler_m.clone(), nifler_ce_m.clone(), factory.clone());
-        let (_o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
+        let (o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
-            return Err(format!("nimsem failed on {stem} (code {code})"));
+            return Err(format!("nimsem failed on {stem} (code {code}){}", diag_tail(&o)));
         }
         if read(&handle, &format!("nimcache/{stem}.s.nif")).is_none() {
             return Err(format!("nimsem produced no {stem}.s.nif"));
@@ -716,9 +775,9 @@ pub fn compile_nim_ce(
                 } else {
                     vec!["hexer", "c", &s_nif]
                 };
-                let (_o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
+                let (o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
                 if code != 0 && code != 5 {
-                    return Err(format!("hexer failed on {stem} (code {code})"));
+                    return Err(format!("hexer failed on {stem} (code {code}){}", diag_tail(&o)));
                 }
                 read(&handle, &key).ok_or(format!("hexer produced no {key}"))?
             }
@@ -736,9 +795,28 @@ pub fn compile_nim_ce(
 
     let m = temen_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
     temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
-    // Stream the compiled program's stdout live (#1143): the tee fires the `stdout_chunk` host import,
-    // relayed to the page only while a streaming Run is active (a no-op otherwise).
-    let out = crate::onramp_exec_with_tee(&m, &[], crate::stream_tee());
+    Ok(m)
+}
+
+/// [`compile_nim_ce`] through **link** only — returns the linked nim→powerbox `Module` without running it
+/// (#1025 #1357). The browser card uses this so the final program can run on the **wasm-JIT tier**
+/// (`runJitModule`) instead of the tree-walker: the JS worker links here, then emits + runs the returned
+/// module. `compile_nim_ce` is the run-inline wrapper for the native oracle / headless callers.
+pub fn compile_nim_ce_to_module(
+    nifler: &[u8],
+    nifler_ce: Option<&[u8]>,
+    nimsem: &[u8],
+    hexer: &[u8],
+    files: Vec<(String, Vec<u8>)>,
+    main_nim: &str,
+) -> Result<Module, String> {
+    compile_nim_ce_impl(nifler, nifler_ce, nimsem, hexer, files, main_nim)
+}
+
+/// Run the linked module under the on-ramp powerbox (tree-walker), streaming its stdout live (#1143):
+/// the tee fires the `stdout_chunk` host import, relayed to the page only while a streaming Run is active.
+fn run_linked(m: &Module) -> Result<String, String> {
+    let out = crate::onramp_exec_with_tee(m, &[], crate::stream_tee());
     if out.status != crate::STATUS_OK && out.status != crate::STATUS_EXIT {
         return Err(format!("run failed (status {})", out.status));
     }
@@ -756,6 +834,31 @@ mod tests {
     //! wasm cdylib uses). Skips unless the phase `.temen` are staged at `/tmp/e2e_temen` and the stdlib
     //! at `.nimtool/nimony/lib` — build them with `demos/nim_e2e_chain/build_e2e_chain.sh`.
     use super::*;
+
+    /// `parse_imports` must expand a bracket multi-import (`import std/[a, b]`, encoded as
+    /// `(infix / std (bracket a b))`) into ONE absolute path per element — not flatten it into a single
+    /// `/lib/std/a/b.nim` (the #1375 bug that stopped strutils and any bracket-importing stdlib from
+    /// crawling). Single imports and single-element brackets keep resolving as before. No assets needed.
+    #[test]
+    fn parse_imports_expands_bracket_multi_import() {
+        let deps = "(stmts (import (infix / std (bracket assertions parseutils))))";
+        assert_eq!(
+            parse_imports(deps, "/lib/std"),
+            vec![
+                "/lib/std/assertions.nim".to_string(),
+                "/lib/std/parseutils.nim".to_string(),
+            ],
+        );
+        // A plain `import std/syncio` still resolves to the single absolute path.
+        assert_eq!(
+            parse_imports("(stmts (import (infix / std syncio)))", "/lib/std"),
+            vec!["/lib/std/syncio.nim".to_string()],
+        );
+        // A `when`-guarded import is skipped (platform-specific).
+        assert!(
+            parse_imports("(stmts (import (when (infix / std posix))))", "/lib/std").is_empty()
+        );
+    }
 
     fn seed() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>)> {
         let dir = std::path::Path::new("/tmp/e2e_temen");

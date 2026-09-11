@@ -4077,3 +4077,132 @@ fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
     );
     temen_coop_close();
 }
+
+// ---- #1345 (asset-free pin): `Jit.install`/`uninstall` reached INSIDE a cross-tier bounce -------
+
+/// The #1334 shape with the helpers **installing** and **uninstalling** instead of invoking: `_start`
+/// compiles the unit and calls the tier-up-eligible leaf `f2`, which `call.dyn`s slot 3 → `f3`, an
+/// interpreter-resident helper (it `call.cap`s `Jit.install`), so the emitted region **bounces** into
+/// it and the install lands on the nested interpretation (`drive_nested`'s #1233 arm) — moving the
+/// slot mirror mid-event. Back on the emitted frame `f2` `call.dyn`s the slot it was handed (the
+/// driver re-synced its table inside the bounce, so the edge reaches the unit's emitted `f0`
+/// natively), then `call.dyn`s slot 4 → `f4`, which `uninstall`s it (the second mirror move).
+fn coop_nested_install_guest_text(blob: &[u8]) -> String {
+    let (out_h, jit_h) = onramp_out_jit_handles();
+    let stores = word_stores("b", BLOB_BASE, blob);
+    format!(
+        r#"memory 16
+import 0 "vm_jit_compile" (i64, i64) -> (i64)
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+{stores}  vbp = i64.const {BLOB_BASE}
+  vbl = i64.const {blob_len}
+  vcode = call.import 0 (vbp, vbl)
+  vprobe = i64.const {NEST_PROBE}
+  vres = call 2 (vcode, vprobe)
+  vj = thread.join vt
+  vsum = i64.add vres vj
+  vsl = i64.const {SLOT}
+  i64.store vsl vsum
+  vout = i32.const {out_h}
+  vlen8 = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
+  return vsum
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vsp: i64, varg: i64) {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+func (i64, i64) -> (i64) {{
+block 0 (vcode: i64, vprobe: i64) {{
+  vs3 = i32.const 3
+  vslot = call.dyn (i64) -> (i64) vs3 (vcode)
+  vs = i32.wrap_i64 vslot
+  vu = call.dyn (i64) -> (i64) vs (vprobe)
+  vs4 = i32.const 4
+  vrc = call.dyn (i64) -> (i64) vs4 (vslot)
+  vr = i64.add vu vrc
+  vone = i64.const 1
+  vfin = i64.add vr vone
+  return vfin
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vcode: i64) {{
+  vjit = i32.const {jit_h}
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vcode)
+  return vslot
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (vslot: i64) {{
+  vjit = i32.const {jit_h}
+  vrc = call.cap 11 4 (i64) -> (i64) vjit (vslot)
+  return vrc
+  }}
+}}
+export 0 func "_start" 0
+"#,
+        blob_len = blob.len(),
+    )
+}
+
+#[test]
+fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&coop_nested_install_guest_text(&plain_unit_blob()))
+        .expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+
+    // Oracle: `unit(PROBE) + uninstall's 0 + 1`; worker 0.
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
+
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    let (d, tierups, invokes) = drive_coop_b2_session_allow_trap_counting(&m);
+    eprintln!(
+        "nested install: status={} value={} tierups={tierups} invokes={invokes} bounces={:?} syncs={}",
+        temen_status(),
+        temen_coop_value(),
+        d.bounces(),
+        d.bounce_syncs()
+    );
+    assert_eq!(temen_status(), want.status, "status parity with the oracle");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "value parity with the oracle"
+    );
+    let got_out =
+        unsafe { std::slice::from_raw_parts(temen_stdout_ptr(), temen_stdout_len()) }.to_vec();
+    assert_eq!(got_out, want.stdout, "stdout parity");
+    // Non-vacuity: the leaf tiered up; the region bounced exactly twice — into the installing helper
+    // and the uninstalling one — and the installed slot's `call.dyn` between them was native (a third
+    // bounce would mean the mirror move went unseen and the edge fell to a shim or trapped).
+    assert_eq!(tierups, 1, "the leaf tiered up");
+    assert_eq!(
+        invokes, 0,
+        "no task-level JIT event: both ops ran inside bounces"
+    );
+    assert_eq!(
+        d.bounces().len(),
+        2,
+        "two bounces (install, uninstall); the installed unit dispatched natively"
+    );
+    // Each op moved the slot mirror mid-event (#1233's `table_gen` bump inside the bounce), so the
+    // driver re-synced its table inside that bounce — before the emitted frame resumed.
+    assert_eq!(
+        d.bounce_syncs(),
+        2,
+        "the table re-synced inside the install bounce and again inside the uninstall bounce"
+    );
+    temen_coop_close();
+}

@@ -324,6 +324,9 @@ pub enum StopReason {
     /// and the clock did not advance; push bytes (the DAP `provideStdin` request) and resume —
     /// the parked read re-issues against them.
     StdinPark,
+    /// #1366 — parked on a **host-completed cap call** with this completion id: the embedder
+    /// services the request it recorded under `id`, then `deliver_cap`/`provideCap` resumes.
+    CapPark { id: u64 },
 }
 
 /// Which accesses a watchpoint fires on (`Inspector::set_watchpoint`).
@@ -6890,7 +6893,21 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         }
                     }
                 };
-                let result = if nested_refused || child_state_refused {
+                // #1289 R1 — a live **detached** §14 child (its own separate window, so it holds a
+                // `child_hosts` entry but has NO carve in `nested_children` — distinct from a
+                // `thread.spawn` sibling, which is in neither) cannot yet ride the parent's artifact:
+                // the subtree STW broadcasts `UNWINDING` only into carves within *this* window image,
+                // never reaching a detached child's separate window, so it would not self-unwind and
+                // its window would be silently dropped. Fail closed until the per-child-artifact
+                // capture lands (the detached-durable freeze slices). Unlike `nested_refused` this
+                // fires even with no live nested child. A completed-and-reaped child (its `threads`
+                // slot cleared) left nothing to capture and does not refuse.
+                let detached_live_refused = froze
+                    && v.child_hosts.keys().any(|slot| {
+                        !v.nested_children.iter().any(|c| c.slot == *slot)
+                            && v.threads.get(*slot).and_then(|t| *t).is_some()
+                    });
+                let result = if nested_refused || child_state_refused || detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
                     // Record this vCPU's own flattened extent (the live shadow-SP) *before* `freeze_drive`
@@ -11409,7 +11426,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
                                     let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                    match serve_live_export(handle) {
+                                        // #744 — a live self-serve grant names one of OUR impl-exports,
+                                        // not a table handle: validate the export exists (its shape
+                                        // resolves). (A tagged value is negative, so `can_regrant`
+                                        // would refuse it as a non-grant — that is the fail-closed
+                                        // path every *other* record reader takes, unchanged.)
+                                        Some(k) => {
+                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
+                                        }
+                                        None => {
+                                            hg.can_regrant(handle)
+                                                .then_some(())
+                                                .ok_or(Trap::CapFault)?;
+                                        }
+                                    }
                                 }
                                 list.push((name, handle));
                             }
@@ -11492,7 +11523,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
                                 {
                                     let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
+                                    match serve_live_export(handle) {
+                                        // #744 — a live self-serve grant names one of OUR impl-exports,
+                                        // not a table handle: validate the export exists (its shape
+                                        // resolves). (A tagged value is negative, so `can_regrant`
+                                        // would refuse it as a non-grant — that is the fail-closed
+                                        // path every *other* record reader takes, unchanged.)
+                                        Some(k) => {
+                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
+                                        }
+                                        None => {
+                                            hg.can_regrant(handle)
+                                                .then_some(())
+                                                .ok_or(Trap::CapFault)?;
+                                        }
+                                    }
                                 }
                                 list.push((name, handle));
                             }
@@ -11630,7 +11675,30 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 for (name, gh) in &named {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
-                                        hg.regrant_into_child(*gh, &mut ch)
+                                        match serve_live_export(*gh) {
+                                            // #744 (EXEC.md row 4, the mediation-consistent form) —
+                                            // a **live self-serve** grant: install into the child a
+                                            // live-callee offer whose callee is THIS (the parent's)
+                                            // running powerbox, over our own impl-export `k`. The
+                                            // child's calls enqueue on our inbound queue and park
+                                            // until our `svc.wait` serve loop replies — the parent
+                                            // serves its child's `"exec"` with its own code. Only
+                                            // the CHILD's table holds the entry (granter → grantee,
+                                            // down the grant graph); we never hold a self-referential
+                                            // Arc, so there is no cycle and nothing for us to
+                                            // mis-call. `callee_slot: None` — non-durable (freeze
+                                            // refuses), the deferred durability story.
+                                            Some(k) => hg.offer_shape(k).map(|(names, sigs)| {
+                                                ch.install_live_impl(
+                                                    Arc::clone(host),
+                                                    k,
+                                                    names.into(),
+                                                    sigs.into(),
+                                                    None,
+                                                )
+                                            }),
+                                            None => hg.regrant_into_child(*gh, &mut ch),
+                                        }
                                     };
                                     if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
@@ -11753,6 +11821,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
+                                    // #989 slice 1b — bound the child's host-served channel memory
+                                    // from the funding budget's `channel` (see the module-child branch
+                                    // below; `-1` = unbounded, a no-op vs. the default).
+                                    if let Some(b) = rec_b.as_ref() {
+                                        child_host.lock_unpoisoned().set_channel_cap(b.channel);
+                                    }
                                     let child_fuel = match rec_b.as_ref() {
                                         Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
                                         Some(_) => *fuel,
@@ -12093,8 +12167,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §14 transparency: the detached window equals the module's
                             // declared memory (a module with no memory can't spawn).
                             let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
-                            let admitted = !durable
-                                && ok_entry
+                            // #1289 R1 — a **durable** domain may now spawn a detached child (the
+                            // spawn gate no longer refuses on `durable`): freeze authority is a
+                            // per-grant capability, not a placement rule, so a durable parent and a
+                            // detached child coexist. Safety moves to the *freeze*: a parent that
+                            // freezes while a detached child is live fails closed (`detached_live_refused`
+                            // below) rather than silently dropping the child's separate window — until
+                            // the per-child-artifact capture (the detached-durable freeze slices) lands.
+                            let admitted = ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && payload_ok
@@ -12223,6 +12303,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         let mut hg = host.lock_unpoisoned();
                                         hg.take_budget(bh)
                                     });
+                                    // #989 slice 1b — a budget-funded spawn bounds the child's
+                                    // host-served channel memory too: stamp the funding budget's
+                                    // `channel` onto the child's `channel_cap`, the same way `spawn`
+                                    // tightens its vCPU ceiling below (`-1` = unbounded, a no-op vs.
+                                    // the default — so an unbudgeted / channel-unbounded spawn is
+                                    // unchanged). D48 containment: a parent's Budget split now bounds
+                                    // a child's pipe-FIFO bytes as it already bounds fuel/mem/spawn.
+                                    if let Some(b) = rec_b.as_ref() {
+                                        child_host.lock_unpoisoned().set_channel_cap(b.channel);
+                                    }
                                     let child_fuel = match rec_b.as_ref() {
                                         Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
                                         Some(_) => *fuel,
@@ -13132,6 +13222,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // blocking discipline), and an exactly-i64 reply (the wake pushes a raw
                         // i64 reg — the `Pending::CapResult` precedent; `Blocking`/offloadable
                         // jobs return one i64 by contract).
+                        // #1366: a host-completed punt (`OffloadOutcome::Host`) has no completer
+                        // on the oracle — no driver surfaces the park to an embedder — so
+                        // neither parking nor the degenerate wait below could ever finish it.
+                        // Decline fail-closed rather than hang (invariant 9).
+                        if comps.is_host_owned(id) {
+                            return Err(Trap::CapFault);
+                        }
                         let parkable = *cur == ROOT_FIBER
                             && !durable
                             && matches!(sched, SchedRef::Real(_))
@@ -16909,11 +17006,24 @@ impl Drop for OffloadPool {
 pub struct Completions {
     mx: Mutex<CompletionState>,
     cv: Condvar,
+    /// #1366 — whether a driver that **surfaces** cap parks to the embedder is running this host
+    /// (set by [`bytecode::Vcpu::run`]). A host-completed punt is admitted only then; every other
+    /// driver could only wait inline on it, so the dispatch declines *before* the submit hook runs
+    /// — the embedder is never handed a request nobody can finish.
+    host_ok: std::sync::atomic::AtomicBool,
 }
 
 struct CompletionState {
     /// Results posted by pool workers, keyed by completion id, awaiting their waiter.
     ready: BTreeMap<u64, i64>,
+    /// #1366 — ids minted for an [`OffloadOutcome::Host`] punt: completed by the embedder, never
+    /// by a pool worker. An inline waiter must not block on one (nobody could wake it).
+    host_owned: BTreeSet<u64>,
+    /// #1366 — for a host-owned id minted while the host is **recording** its cap tape: the call's
+    /// `(type_id, op, handle, args)`, so the *delivered* value (not the dispatch-time placeholder)
+    /// joins the tape as the call's `CapRecord` when the embedder completes it — a reverse `seek`
+    /// then serves it from the tape and never re-parks.
+    host_pending: BTreeMap<u64, (u32, u32, i32, Vec<i64>)>,
     /// Ids minted but not yet completed — `outstanding()` is the freeze/teardown drain signal.
     in_flight: usize,
     /// Next completion id. Monotonic per host; ids double as submission order (the cooperative
@@ -16946,12 +17056,27 @@ impl Completions {
         Completions {
             mx: Mutex::new(CompletionState {
                 ready: BTreeMap::new(),
+                host_owned: BTreeSet::new(),
+                host_pending: BTreeMap::new(),
                 in_flight: 0,
                 next_id: 0,
                 fiber_cells: BTreeMap::new(),
             }),
             cv: Condvar::new(),
+            host_ok: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// #1366 — declare that the running driver surfaces cap parks ([`bytecode::VcpuEvent::CapPending`])
+    /// and completes them via `deliver_cap`, admitting [`OffloadOutcome::Host`] punts on this host.
+    pub fn allow_host_completed(&self) {
+        self.host_ok
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// #1366 — whether host-completed punts are admitted (see [`allow_host_completed`](Self::allow_host_completed)).
+    pub fn host_completed_allowed(&self) -> bool {
+        self.host_ok.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// F3 (FIBER_PARK.md) — register the calling JIT fiber's wait cell for punt `id`, then run
@@ -17007,6 +17132,61 @@ impl Completions {
         Self::fiber_drain_locked(&mut g);
         drop(g);
         self.cv.notify_all();
+    }
+
+    /// #1366 — mint an id for a host-completed punt ([`OffloadOutcome::Host`]): minted + marked
+    /// host-owned under the one lock.
+    fn mint_host_owned(&self, record: Option<(u32, u32, i32, Vec<i64>)>) -> u64 {
+        let mut g = self.mx.lock_unpoisoned();
+        let id = g.next_id;
+        g.next_id += 1;
+        g.in_flight += 1;
+        g.host_owned.insert(id);
+        if let Some(prefix) = record {
+            g.host_pending.insert(id, prefix);
+        }
+        id
+    }
+
+    /// #1366 — whether `id` is a host-completed punt (the embedder, not a pool worker, finishes
+    /// it). A driver that surfaces parks checks this to decide between "surface the id" and the
+    /// inline pool wait.
+    pub fn is_host_owned(&self, id: u64) -> bool {
+        self.mx.lock_unpoisoned().host_owned.contains(&id)
+    }
+
+    /// #1366 — the embedder finishes a host-completed punt: post `result` for `id` and wake
+    /// waiters exactly as a pool worker's [`complete`](Completions::complete) would. The id stops
+    /// being host-owned. Unknown/foreign ids are ignored (no-op, `None`) rather than corrupting the
+    /// store. Returns the call's recorded `(type_id, op, handle, args)` when the host was taping
+    /// (so the caller can push the delivered value as the call's [`CapRecord`]).
+    pub fn complete_host(&self, id: u64, result: i64) -> Option<(u32, u32, i32, Vec<i64>)> {
+        let prefix = {
+            let mut g = self.mx.lock_unpoisoned();
+            if !g.host_owned.remove(&id) {
+                return None;
+            }
+            g.host_pending.remove(&id)
+        };
+        self.complete(id, result);
+        prefix
+    }
+
+    /// #1366 — the inline-wait form for drivers that cannot surface a park: block for a
+    /// pool-completed `id` as [`wait`](Completions::wait) does, but **decline** (`None`) a
+    /// host-owned one, which no pool worker will ever complete — the caller traps `CapFault`
+    /// instead of hanging.
+    pub fn wait_unless_host_owned(&self, id: u64) -> Option<i64> {
+        let mut g = self.mx.lock_unpoisoned();
+        loop {
+            if let Some(r) = g.ready.remove(&id) {
+                return Some(r);
+            }
+            if g.host_owned.contains(&id) {
+                return None;
+            }
+            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        }
     }
 
     /// Block until completion `id` is ready and take its result — the **single-fiber degenerate
@@ -17149,7 +17329,23 @@ pub enum OffloadOutcome {
     /// Would block: run this job off the vCPU thread. The call's declared signature must have at
     /// most one result (checked at the delivery site; more is a `CapFault`, fail-closed).
     Offload(OffloadWork),
+    /// **Host-completed** (#1366): would block, and the *embedder* — not a pool thread — will
+    /// supply the scalar later. On the parking face the dispatch mints a completion id, marks it
+    /// host-owned, hands it to `submit` (so the host can record the request against that id), and
+    /// parks the caller; a resumable driver surfaces [`bytecode::VcpuEvent::CapPending`] and the
+    /// host finishes it with [`bytecode::Vcpu::deliver_cap`] (or [`Completions::complete_host`]).
+    /// This is how a single-threaded embedder (the `wasm32` cdylib, where no offload pool can
+    /// exist) services a cap asynchronously while the guest still sees a plain synchronous call.
+    /// Admitted only under a driver that surfaces the park (`Vcpu` flags its host via
+    /// [`Completions::allow_host_completed`]); any other driver has no way to complete it and
+    /// **declines** with `CapFault` before `submit` runs (invariant 9: decline, never diverge —
+    /// and never hang).
+    Host(HostCompletion),
 }
+
+/// #1366 — the submit hook of an [`OffloadOutcome::Host`]: called once with the minted completion
+/// id on the parking face, before the caller parks.
+pub type HostCompletion = Box<dyn FnOnce(u64) + Send>;
 
 /// §12 — the **offloadable** registration's handler shape ([`Host::grant_host_proc_offloadable`]):
 /// scalars in, [`OffloadOutcome`] out. Compared to a plain [`HostProc`] it *loses* powers — no
@@ -17390,6 +17586,36 @@ pub const CAP_SELF_PIPE: u32 = 16;
 /// context, so it is answered on every tier, never `-EINVAL`. The design reserved "12"; that number
 /// went to `reap` first, so `fuel.remaining` takes 13.
 pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
+
+/// #744 (EXEC.md row 4) — the **live self-serve grant** tag on a §14 named-grant record's `handle`
+/// field. A grant record whose `handle`, read as `u32`, has its top two bits `10` (this tag set,
+/// bit 30 clear) is not a table handle at all: it names the *granter's own impl-export*
+/// `handle & 0x3FFF_FFFF`, and the spawn installs into the CHILD a live-callee offer whose callee is
+/// the granter's running powerbox. The child's calls enqueue on the granter's inbound queue and park
+/// until its `svc.wait` serve loop replies: a parent serving its child's `"exec"` with **its own
+/// code** (the none-the-wiser nested shell). Mediation-consistent by construction (PROCESS.md §4 S9):
+/// the offer exists only in the grantee's table, handed *down* the granter's own grant graph — the
+/// granter never holds a self-referential cap (no reference cycle, nothing for it to mis-call), and no
+/// new peer arrow appears.
+///
+/// Why a tagged handle and not the record's reserved `flags` word: `flags` is documented
+/// reserved-and-**ignored**, and real callers (the C shims' unwritten `pad`, hand-built manager
+/// records) do not zero it — giving it meaning would misread their garbage. A negative handle is
+/// already the ABI's non-grant space (`-errno` results; `can_regrant` refuses every negative), so the
+/// tag lives where nothing valid can collide; the `10` top bits keep it clear of the small-magnitude
+/// `-errno` range (top bits `11`). Honored by the eval-loop child-spawn arms (the op-17 record and
+/// op-13); every other record reader (a detached spawn, `exec_module`, the wasm marshal, the native
+/// builders) sees a negative handle and refuses it fail-closed through the unchanged `can_regrant` —
+/// no new code there. Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
+pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+
+/// #744 — decode a named-grant `handle`: `Some(export)` when it carries [`GRANT_SERVE_LIVE_TAG`] (top
+/// two bits `10`), else `None` (an ordinary table handle, or an `-errno`-range negative that stays a
+/// non-grant for `can_regrant` to refuse).
+pub fn serve_live_export(handle: i32) -> Option<u32> {
+    let h = handle as u32;
+    (h & 0xC000_0000 == GRANT_SERVE_LIVE_TAG).then_some(h & 0x3FFF_FFFF)
+}
 
 /// §3.6 slice 3 — the side table a [`Binding::LiveImpl`] indexes: the callee's live powerbox
 /// and the target impl-export. Index-carried so `Binding` stays `Copy`. Carries the export's
@@ -19717,6 +19943,12 @@ impl Host {
         job: OffloadWork,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
+        // §12 W1: under a tape (recording or replaying) a pool job runs **inline** regardless of
+        // the face, so the taped result is the real one and a replay never punts (moved here from
+        // the face selection so a #1366 host-completed punt — which has no job — can still park).
+        if self.cap_record.is_some() || self.cap_replay.is_some() {
+            return Ok(vec![job()]);
+        }
         match pending {
             Some(slot) => {
                 let id = self.completions.mint();
@@ -19737,6 +19969,51 @@ impl Host {
                 Ok(Vec::new())
             }
             None => Ok(vec![job()]),
+        }
+    }
+
+    /// #1366 — dispose of a host-completed punt ([`OffloadOutcome::Host`]) per the dispatch face:
+    /// on the parking face mint a host-owned completion id, hand it to `submit`, and return it
+    /// through `pending` (the caller parks; a resumable driver surfaces the id and the embedder
+    /// completes it). On the sync face there is nothing to run inline and no one to complete the
+    /// call — decline fail-closed with `CapFault` rather than block forever.
+    fn punt_host(
+        &mut self,
+        type_id: u32,
+        op: u32,
+        handle: i32,
+        args: &[i64],
+        submit: HostCompletion,
+        pending: Option<&mut Option<u64>>,
+    ) -> Result<Vec<i64>, Trap> {
+        // Only a driver that surfaces the park (`Vcpu`, `DebugRun`) can ever finish this call:
+        // decline before the submit hook runs under any other, so the embedder never records a
+        // dead request.
+        if !self.completions.host_completed_allowed() {
+            return Err(Trap::CapFault);
+        }
+        match pending {
+            Some(slot) => {
+                // While taping, remember the call so the *delivered* value can be recorded as its
+                // `CapRecord` (the dispatch-time placeholder below is never taped).
+                let record = self
+                    .cap_record
+                    .is_some()
+                    .then(|| (type_id, op, handle, args.to_vec()));
+                let id = self.completions.mint_host_owned(record);
+                submit(id);
+                *slot = Some(id);
+                Ok(Vec::new())
+            }
+            None => Err(Trap::CapFault),
+        }
+    }
+
+    /// #1366 — push a [`CapRecord`] onto this host's cap tape if it is recording (no-op otherwise):
+    /// the embedder's delivered value for a host-completed call, recorded by `deliver_cap`.
+    pub fn tape_cap_record(&mut self, rec: CapRecord) {
+        if let Some(r) = &mut self.cap_record {
+            r.push(rec);
         }
     }
 
@@ -22792,11 +23069,10 @@ impl Host {
         // §12: under a W1 tape, force punts inline (`pending = None` downstream) — a `Pending`
         // placeholder on the tape would replay as a phantom result; the inline run records the
         // real one (the same reasoning as the parked-stdin tape suppression below).
-        let pending = if self.cap_record.is_some() || self.cap_replay.is_some() {
-            None
-        } else {
-            pending
-        };
+        // #1366: the face is no longer forced sync under a W1 tape — a pool job is still run inline
+        // under a tape (see `punt_or_inline`, so the taped result is the real one), while a
+        // host-completed punt keeps the parking face: it has no job to run inline, parks, and its
+        // delivered value joins the tape at `deliver_cap`.
         // §7 executable named import (IMPORTS.md phase 1): the reserved pseudo-`type_id` carries the
         // **import index** in `op`; translate it through the instantiation-time binding table to the
         // bound `(type_id, op, granted handle)` and fall through to the ordinary flow. Translating
@@ -22910,6 +23186,7 @@ impl Host {
             }
             // Record: run live through a `RecordingMem` so any guest-window writes are captured,
             // then log the crossing for a future replay.
+            let mut pending = pending;
             let (result, mem_writes) = match mem {
                 Some(m) => {
                     let mut rec_mem = RecordingMem {
@@ -22922,20 +23199,31 @@ impl Host {
                         handle,
                         args,
                         Some(&mut rec_mem),
-                        pending,
+                        pending.as_deref_mut(),
                     );
                     (r, rec_mem.writes)
                 }
                 None => (
-                    self.cap_dispatch_slots_inner(type_id, op, handle, args, None, pending),
+                    self.cap_dispatch_slots_inner(
+                        type_id,
+                        op,
+                        handle,
+                        args,
+                        None,
+                        pending.as_deref_mut(),
+                    ),
                     Vec::new(),
                 ),
             };
             if let Some(rec) = &mut self.cap_record {
                 // A parked blocking-stdin read (W4) is a placeholder the driver discards and
                 // re-issues — taping it would replay as a phantom EOF. Only the re-issued
-                // (completed) read joins the tape.
-                if !self.stdin_parked {
+                // (completed) read joins the tape. Likewise a **punted** dispatch (#1366 host-
+                // completed, or an offloaded job): its result slots are a placeholder the
+                // completion fills in later — a host-completed call's delivered value is taped by
+                // `deliver_cap` instead.
+                let punted = pending.as_deref().is_some_and(|p| p.is_some());
+                if !self.stdin_parked && !punted {
                     rec.push(CapRecord {
                         type_id,
                         op,
@@ -23476,6 +23764,7 @@ impl Host {
                 // job (pool + `Pending` on the parking face, inline on the sync face). The
                 // window/minter are deliberately out of reach of an offloadable handler.
                 let mut punted: Option<OffloadWork> = None;
+                let mut hosted: Option<HostCompletion> = None;
                 let r = match &mut f {
                     ProcHandler::Sync(f) => f(op, args, mem, if mints { Some(self) } else { None }),
                     ProcHandler::Offloadable(f) => match f(op, args) {
@@ -23484,12 +23773,19 @@ impl Host {
                             punted = Some(job);
                             Ok(Vec::new()) // replaced below
                         }
+                        OffloadOutcome::Host(submit) => {
+                            hosted = Some(submit);
+                            Ok(Vec::new()) // replaced below
+                        }
                     },
                 };
                 self.host_procs[idx as usize].handler = f;
-                match punted {
-                    Some(job) => self.punt_or_inline(job, pending),
-                    None => r,
+                match (punted, hosted) {
+                    (Some(job), _) => self.punt_or_inline(job, pending),
+                    (None, Some(submit)) => {
+                        self.punt_host(type_id, op, handle, args, submit, pending)
+                    }
+                    (None, None) => r,
                 }
             }
             Binding::Exit => {

@@ -413,6 +413,21 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     }
     return f;
   };
+  // Bounce shims are under 200 bytes each and a table rebuild instantiates one per interpreter-
+  // resident slot (~200 on the JACL compiler card). Going through the ASYNC compile queue for them is
+  // pathological: V8 can park one such `WebAssembly.instantiate` promise for seconds behind its own
+  // background work on the big emitted module (measured: the SECOND warm-coop run's rebuild took
+  // 6.2 s for 224 shims, one of them 6.15 s, while the first and third took ~50 ms — the playground's
+  // tier-up mode failed its second compile on this). Synchronous instantiation is immune (~25 ms for
+  // all 224) and a shim is far under the main-thread sync-compile budget; a shim that isn't (never
+  // seen) falls back to the async path.
+  const shimForFast = async (slot, code) => {
+    try {
+      return shimForSync(slot, code);
+    } catch {
+      return shimFor(slot, code);
+    }
+  };
   const shimForSync = (slot, code) => {
     const key = `${slot}#${code}`;
     let f = shims.get(key);
@@ -427,10 +442,19 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   // `key`: a surfaced JIT_INVOKE's code handle (a Number — live for that invoke), or an installed
   // slot's `(domain, unit)` identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one
   // cache. An installed slot is never keyed by handle: the guest revokes it right after `install`.
+  // #1378 again, on the unit path: a guest-compiled §22 unit (a JACL macro body: ~1.1 KB) went through
+  // the ASYNC compile queue, and V8 parks that behind its background work on the just-compiled emitted
+  // module — measured 2.9 s / 3.7 s for the tour's two macro invokes on the first two warm-coop runs,
+  // 88 ms on the third. Instantiate synchronously when the unit is under the main-thread sync-compile
+  // budget (a `new WebAssembly.Module` over it throws — then the async path, as before).
   const unitFor = async (key, bytes) => {
     let unit = jitUnits.get(key);
     if (unit === undefined) {
-      unit = await instantiateUnit(bytes);
+      try {
+        unit = instantiateUnitSync(bytes);
+      } catch {
+        unit = await instantiateUnit(bytes);
+      }
       jitUnits.set(key, unit);
     }
     return unit;
@@ -460,7 +484,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     for (let slot = 0; slot < tsize; slot++) {
       let entry = null;
       if (slot < nfuncs) {
-        entry = emitted['f' + slot] ?? await shimFor(slot, -2);
+        entry = emitted['f' + slot] ?? await shimForFast(slot, -2);
       } else {
         const uid = ex.temen_coop_slot_unit(slot);
         if (uid >= 0n) {
@@ -468,7 +492,8 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
           if (cached !== undefined) entry = cached['f0'];
           else {
             const bytes = slotUnitBytes(slot);
-            entry = bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimFor(slot, uid);
+            entry =
+              bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, uid);
           }
         }
       }
@@ -589,7 +614,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
 }
 
 // Run an on-ramp module whose input is **stdin** (Lua/SQLite/hello) on the wasm-JIT.
-export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey) {
+export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey, shared = 1) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Hand the module (+ optional stdin) to the cdylib: decode, outline, grant powerbox, emit `_start`.
   const modP = Number(ex.temen_alloc(moduleBytes.length));
@@ -600,9 +625,11 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
     stdinP = Number(ex.temen_alloc(stdinLen));
     u8().set(stdinBytes, stdinP);
   }
-  // shared=1: this demo instantiates the emitted module against the cdylib's **shared** memory
-  // (cross-origin-isolated threads build). A plain single-threaded host passes 0.
-  const opened = ex.temen_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, 1);
+  // `shared`: 1 (default) instantiates the emitted module against the cdylib's **shared** memory
+  // (cross-origin-isolated threads build); a plain single-threaded host (e.g. the JACL playground's
+  // non-threads cdylib) passes 0 — a shared-mode emit LinkErrors against a non-shared memory. Same
+  // knob as `runWarmCoop`.
+  const opened = ex.temen_onramp_jit_run_open(modP, moduleBytes.length, stdinP, stdinLen, shared);
   // `_start` not whole-program-emittable (an InterpDriven guest — it `vm_map`s, streams,
   // `thread.spawn`s, hosts fibers, …): try the **cooperative** tier-up driver before giving the
   // buffers up — its scheduler multiplexes every vCPU of the run on this one wasm thread, the
@@ -612,7 +639,7 @@ export async function runJitModule(ex, memory, moduleBytes, stdinBytes, cacheKey
   // emittable ever) → fall through to the throw and the caller's plain-interpreter fallback.
   let coop = false;
   if (opened !== 0 && ex.temen_coop_open &&
-      ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, 1) === 0) {
+      ex.temen_coop_open(modP, moduleBytes.length, stdinP, stdinLen, shared) === 0) {
     coop = true;
   }
   ex.temen_dealloc(modP, moduleBytes.length);
@@ -1065,11 +1092,18 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
 // skip-checks all satisfied) then only links + runs. Byte-identical to the all-interpreter card
 // (`browser-nim-wholecard-op13-test`). `assets` = `{niflerCe, nimsemCe, hexerCe}` (niflerCe is both the
 // crawl child and nimsem's `exec` target). Best-effort: any phase that traps is left for the interpreter card.
-export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey) {
-  const { niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
+export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainPath, mainSrc, cacheKey, preStdlib = null) {
+  const { nifler, niflerCe, nimsemCe, hexerCe } = assets; // #1025 3d: nimsem's exec spawns niflerCe as a §14 grandchild
+  // #1364/#1375: `preStdlib` is a Map stem -> { pNif, depsNif, sNif, sIdx, xNif } of prebuilt stdlib
+  // artifacts (system.nim's sema alone is ~30 s and is user-independent). When present, those modules'
+  // crawl/nimsem/hexer are skipped: the products are seeded straight into the memfs + accumulator, so a
+  // Run only compiles the user's own modules. Empty/null = the full from-scratch tier-up.
+  const pre = preStdlib || new Map();
+  const produced = new Map(); // stem -> {pNif, depsNif, sNif, sIdx, xNif} for capture (prebuild tooling)
   const u8 = () => new Uint8Array(memory.buffer);
   const enc = new TextEncoder(), dec = new TextDecoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
+  const readErr = () => u8().slice(Number(ex.temen_stderr_ptr()), Number(ex.temen_stderr_ptr()) + ex.temen_stderr_len());
   const call1 = (fn, s) => {
     const b = enc.encode(s);
     const p = Number(ex.temen_alloc(b.length));
@@ -1139,6 +1173,16 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const fs = parsePacked(readOut());
   fs.set(mainPath.replace(/^\//, ''), mainSrc);
 
+  // Seed every prebuilt stdlib product into both the memfs (nimsem/hexer read imports' products from the
+  // seed) and the accumulator (`temen_compile_nim_fs`'s final link reads .x.nif from it). Their phases are
+  // then skipped below.
+  const seedFile = (key, bytes) => { if (bytes && bytes.length) { fs.set(key, bytes); putFile(key, bytes); } };
+  for (const [stem, a] of pre) {
+    seedFile(`nimcache/${stem}.p.nif`, a.pNif); seedFile(`nimcache/${stem}.p.deps.nif`, a.depsNif);
+    seedFile(`nimcache/${stem}.s.nif`, a.sNif); seedFile(`nimcache/${stem}.s.idx.nif`, a.sIdx);
+    seedFile(`nimcache/${stem}.x.nif`, a.xNif);
+  }
+
   // ---- phase 1: crawl the import closure with nifler (tiered), capturing the module graph -----------
   const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
   const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
@@ -1149,24 +1193,40 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const { file, role } = work.pop();
     const stem = dec.decode(call1('temen_nim_module_suffix', file));
     if (mods.has(stem)) continue;
+    // Prebuilt stdlib module: skip the nifler run; rebuild its graph edges from the cached `.p.deps.nif`
+    // (so any not-prebuilt import it pulls still gets crawled), then move on — its .p/.s/.x are seeded.
+    if (pre.has(stem)) {
+      const deps = pre.get(stem).depsNif || new Uint8Array();
+      const dir = file.slice(0, file.lastIndexOf('/'));
+      const depStems = [];
+      if (deps.length) {
+        const dirB = enc.encode(dir), dp = pushBytes(deps), drp = pushBytes(dirB);
+        ex.temen_nim_parse_imports(dp, deps.length, drp, dirB.length);
+        const imports = dec.decode(readOut());
+        ex.temen_dealloc(dp, deps.length); ex.temen_dealloc(drp, dirB.length);
+        for (const imp of imports.split('\n')) if (imp) { depStems.push(dec.decode(call1('temen_nim_module_suffix', imp))); work.push({ file: imp, role: 'Import' }); }
+      }
+      mods.set(stem, { file, deps: depStems, role });
+      continue;
+    }
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
     if (!src.length) { continue; } // unresolved import — the interpreter card redoes phase-1 for it
 
-    // nifler --deps parse <file> <out> as a detached op-13 child.
+    // nifler --deps parse <file> <out> on the INTERPRETER (#1364): emitting the ~13 MB nifler guest peaks
+    // the engine near the 1 GiB ceiling, so a constrained tab traps the grow and the whole card silently
+    // falls back to the multi-minute tree-walker. The crawl is cheap interpreted (its footprint is the
+    // nifler decode, a fraction of the emit's) — so we keep the tier-up budget for nimsem/hexer, where the
+    // time and the smaller emit actually are. `.p.nif` rides OUT, `.p.deps.nif` rides ERR.
     const out = `/nimcache/${stem}.p.nif`;
-    const cp = pushBytes(niflerCe), fb = enc.encode(file), ob = enc.encode(out);
-    const fp = pushBytes(fb), op = pushBytes(ob), sp = pushBytes(src);
-    const opened = ex.temen_op13jit_phase_open(cp, niflerCe.length, fp, fb.length, op, ob.length, sp, src.length);
-    ex.temen_dealloc(cp, niflerCe.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
-    if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, error: `nifler open ${stem}: ${opened}` }; }
-    const r = await drive(`${cacheKey}-nifler`);
-    if (r === null) return { crawled, error: `nifler trapped on ${stem}` };
-    const pnif = phaseRead(`nimcache/${stem}.p.nif`);
-    const deps = phaseRead(`nimcache/${stem}.p.deps.nif`);
-    ex.temen_op13jit_close();
+    const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
+    const fp = pushBytes(fb), op = pushBytes(ob);
+    ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
+    const pnif = readOut(), deps = readErr();
+    ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
     if (!pnif.length) { continue; }
     fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
     putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
+    if (role !== 'Main') { const e = produced.get(stem) || {}; e.pNif = pnif; e.depsNif = deps; produced.set(stem, e); }
     crawled++;
 
     const dir = file.slice(0, file.lastIndexOf('/'));
@@ -1194,13 +1254,19 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   // ---- phase 2: nimsem per module (tiered, 4-cap exec), dependency-ordered -------------------------
   let semmed = 0;
   for (const stem of order) {
+    if (pre.has(stem)) { semmed++; continue; } // prebuilt: .s.nif/.s.idx.nif already seeded
     const role = mods.get(stem).role;
     const flag = role === 'System' ? ['--isSystem'] : role === 'Main' ? ['--isMain'] : [];
     const argv = packStrs(['nimsem', '--define:nimNativeAlloc', '--define:nimNativeIo', 'm', ...flag, `nimcache/${stem}.p.nif`]);
     const out = enc.encode(`nimcache/${stem}.s.nif`), seed = packFiles(fs);
-    const cp = pushBytes(nimsemCe), np = pushBytes(niflerCe), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
-    const opened = ex.temen_op13jit_nimsem_open(cp, nimsemCe.length, np, niflerCe.length, ap, argv.length, sp, seed.length, op, out.length);
-    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, niflerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
+    // #1364: pass the TOP-LEVEL nifler (not nifler_ce) so nimsem's exec→nifler runs inline on the
+    // interpreter instead of decoding+emitting the ~13 MB nifler_ce grandchild — that emit is what pushed
+    // the tiered nimsem toward the 1 GiB ceiling and OOM'd constrained tabs. nimsem still gets its 4th
+    // (exec) cap, so it works; the crawl above already seeded every module's `.p.nif`, so the exec is a
+    // rare fallback. `.p.nif` byte-identical either way (`exec_op13_nifler_matches_inline`).
+    const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const opened = ex.temen_op13jit_nimsem_open_inline(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
+    ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
     const r = await drive(`${cacheKey}-nimsem`);
     if (r === null || r !== 0) { if (r !== null) ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem ${r === null ? 'trapped (' + lastTrap + ')' : 'status ' + r} on ${stem}` }; }
@@ -1213,6 +1279,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     if (!snif.length) return { crawled, semmed, error: `nimsem produced no ${stem}.s.nif` };
     fs.set(`nimcache/${stem}.s.nif`, snif); putFile(`nimcache/${stem}.s.nif`, snif);
     if (sidx.length) { fs.set(`nimcache/${stem}.s.idx.nif`, sidx); putFile(`nimcache/${stem}.s.idx.nif`, sidx); }
+    if (mods.get(stem).role !== 'Main') { const e = produced.get(stem) || {}; e.sNif = snif; e.sIdx = sidx; produced.set(stem, e); }
     semmed++;
   }
 
@@ -1221,6 +1288,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
   for (const stem of order) {
+    if (pre.has(stem)) { hexed++; continue; } // prebuilt: .x.nif already seeded
     const isMain = stem === mainStem;
     const argv = packStrs(isMain
       ? ['hexer', 'c', '--bits:64', '--cpu:le', '--flags:br', '--isMain', '--app:console', `--outdir:${outdir}`, `nimcache/${stem}.s.nif`]
@@ -1237,10 +1305,11 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     ex.temen_op13jit_close();
     if (!xnif.length) return { crawled, semmed, hexed, error: `hexer produced no ${key}` };
     fs.set(key, xnif); putFile(key, xnif); hexed++;
+    if (!isMain) { const e = produced.get(stem) || {}; e.xNif = xnif; produced.set(stem, e); }
   }
 
   const tHexer = now();
-  return { crawled, semmed, hexed, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
+  return { crawled, semmed, hexed, produced, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of

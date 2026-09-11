@@ -41,8 +41,9 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, FrozenChildState, FrozenFiber,
-    FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
+    Attestation, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, FrozenChildState,
+    FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch,
+    SHADOW_BASE,
 };
 use temen_ir::Module;
 
@@ -151,7 +152,15 @@ use temen_ir::Module;
 /// dropped, dangling its `JitTable` handle on thaw; now the subtree snapshot round-trips it. A child
 /// with no `Jit` cap writes the presence byte `0`, so a JIT-free subtree's child block grows by one
 /// byte per recorded child (a v18 child block had no such byte, so it mis-parses under v19).
-const FORMAT_VERSION: u16 = 19;
+/// v20 (#1289 R1, O14 remaining plumbing): a new Section 6 (`TAG_ATTEST`, after the JIT state) carries the
+/// domain's `Attestation` — `tier` + the `window_exposed`/`freeze_exposed` bits — so a domain's platform-vouched
+/// placement/exposure survives freeze→thaw instead of defaulting at the restore boundary. Emitted only when the
+/// attestation is **non-default** (a root's `{tier 1, window_exposed=false, freeze_exposed=false}`), so a
+/// plain-root artifact keeps the v19 section layout (only the version differs); restore applies a present
+/// section to the host and otherwise leaves it as the embedder configured it. This is the prerequisite for a
+/// detached child (which may be ancestor-freezable — `freeze_exposed=true` — and so non-default) to freeze as
+/// its own root-shaped artifact and thaw with its exposure intact (INVARIANTS.md #1289 R1).
+const FORMAT_VERSION: u16 = 20;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -172,6 +181,9 @@ const TAG_SERVE: u64 = 4;
 /// out-of-line units (instrumented+verified IR + `install` type id) and compile quotas. Emitted
 /// only when the domain holds granted JIT, so a JIT-free artifact keeps the pre-JIT layout.
 const TAG_JIT: u64 = 5;
+/// Attestation (#1289 R1, O14, v20) — the domain's platform-vouched `tier`/`window_exposed`/`freeze_exposed`.
+/// Emitted only when non-default (see `FORMAT_VERSION`), so a plain-root artifact keeps the pre-attest layout.
+const TAG_ATTEST: u64 = 6;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
 const B_STREAM: u8 = 0;
@@ -546,6 +558,18 @@ pub fn freeze_with_prots(
         section(&mut out, TAG_JIT, |b| write_jit(b, table_log2, &jit));
     }
 
+    // Section 6 — Attestation (#1289 R1, O14, v20): the domain's platform-vouched placement/exposure,
+    // so a thaw restores it rather than defaulting it at the boundary. Emitted only when non-default (a
+    // root's `Attestation::default()`), so a plain-root artifact keeps the pre-attest section layout.
+    let attest = host.attestation();
+    if attest != Attestation::default() {
+        section(&mut out, TAG_ATTEST, |b| {
+            b.push(attest.tier);
+            b.push(attest.window_exposed as u8);
+            b.push(attest.freeze_exposed as u8);
+        });
+    }
+
     Ok(out)
 }
 
@@ -621,6 +645,7 @@ pub fn restore_with_prots(
     let (mut header, mut win_body, mut handles_body, mut control_body) = (None, None, None, None);
     let mut serve_body = None;
     let mut jit_body = None;
+    let mut attest_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -632,6 +657,7 @@ pub fn restore_with_prots(
             TAG_HANDLES => handles_body = Some(body),
             TAG_SERVE => serve_body = Some(body),
             TAG_JIT => jit_body = Some(body),
+            TAG_ATTEST => attest_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -795,6 +821,36 @@ pub fn restore_with_prots(
             return Err(RestoreError::Malformed); // non-canonical: an empty trio elides the section
         }
         host.set_svc_state(queue, results, next_ticket);
+    }
+
+    // ---- Attestation (#1289 R1, O14, v20): decode Section 6 and re-stamp the host, so the domain's
+    // placement/exposure survives the thaw. The section is present iff the attestation is non-default
+    // (canonical); its absence leaves the host as the embedder configured it (a plain root's default). ----
+    if let Some(body) = attest_body {
+        let mut ar = Reader::new(body);
+        let tier = ar.u8()?;
+        let window_exposed = match ar.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(RestoreError::Malformed),
+        };
+        let freeze_exposed = match ar.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(RestoreError::Malformed),
+        };
+        if !ar.at_end() {
+            return Err(RestoreError::Malformed);
+        }
+        let attest = Attestation {
+            tier,
+            window_exposed,
+            freeze_exposed,
+        };
+        if attest == Attestation::default() {
+            return Err(RestoreError::Malformed); // non-canonical: a default attestation elides the section
+        }
+        host.set_attestation(attest);
     }
 
     Ok((window, prots, reserved_log2))

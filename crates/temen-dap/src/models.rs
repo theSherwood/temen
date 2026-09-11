@@ -11,6 +11,15 @@
 //! to clock 0), so when the stream's clock jumps backward the model restores its latest snapshot
 //! at-or-before the first replayed event and re-derives from there. Net effect, pinned by tests:
 //! after `seek(t)`, model state ≡ a fresh model observing a from-0 run to `t`.
+//!
+//! **What a snapshot holds.** Only the cache geometry + counters ([`State`], a few hundred slots).
+//! The two *address-keyed* trackers — the first-touch page set and the per-word shared-state map —
+//! grow with the memory a guest touches, so cloning them per stride made snapshot memory
+//! O(strides × words written): a 320×240 framebuffer clear (76,800 stores) grew the browser cdylib
+//! by ~700 MiB in one `continue` (#1371). They live outside the snapshot instead, with an **undo
+//! journal** — one `(event clock, previous value)` entry per *change* — that a backward jump pops
+//! back to the restored boundary. Memory is then O(changes), the same order as the run itself, and
+//! a loop re-writing the same words by the same task journals nothing.
 
 use crate::backend::CHECKPOINT_STRIDE;
 use crate::json::Json;
@@ -135,7 +144,8 @@ impl SetArray {
 }
 
 /// The rollback-able model state — everything a snapshot clones. Teaching-scale geometries keep
-/// clones cheap (a few hundred slots).
+/// clones cheap (a few hundred slots); the address-keyed trackers deliberately live outside it
+/// (see [`MemModel::pages`] / [`MemModel::words`] and the journal).
 #[derive(Clone, Debug)]
 struct State {
     /// Per-task L1s, indexed by the sink's task attribution (grown on first touch).
@@ -145,14 +155,18 @@ struct State {
     l1_misses: u64,
     l2_hits: u64,
     l2_misses: u64,
-    /// First-touch page set (page index = `addr / page_size`); `len()` = the fault count.
-    pages: std::collections::BTreeSet<u64>,
-    /// The **shared-state consumer** (slice 6, the X1 contested tracker): per 8-byte word, the
-    /// last task to write it and whether it is *contested* — written by one task and then touched
-    /// (read or written) by another. `(last_writer, contested)`; a never-written word is absent.
-    words: std::collections::BTreeMap<u64, (usize, bool)>,
     /// LRU tick, monotonically increasing per line touch.
     tick: u64,
+}
+
+/// One journaled tracker change: what to put back when the event that made it is rewound.
+#[derive(Clone, Debug)]
+enum Undo {
+    /// The page was first touched by this event: remove it.
+    Page(u64),
+    /// The word's `(last_writer, contested)` entry changed: restore the previous value (`None`
+    /// = the word was untracked before).
+    Word(u64, Option<(usize, bool)>),
 }
 
 /// The combined cache + paging model. Feed it the sink stream via [`MemModel::observe`]; read
@@ -169,8 +183,20 @@ pub struct MemModel {
     max_lines_per_event: u64,
     /// Whether to lay boundary snapshots (the time-travel ladder). On by default for debug
     /// sessions; a run-mode profiler (the browser W3 entry) turns it off — its clock only moves
-    /// forward and a long run would otherwise accumulate snapshots for nothing.
+    /// forward and a long run would otherwise accumulate snapshots (and journal entries) for
+    /// nothing.
     snapshots: bool,
+    /// First-touch page set (page index = `addr / page_size`); `len()` = the fault count.
+    pages: std::collections::BTreeSet<u64>,
+    /// The **shared-state consumer** (slice 6, the X1 contested tracker): per 8-byte word, the
+    /// last task to write it and whether it is *contested* — written by one task and then touched
+    /// (read or written) by another. `(last_writer, contested)`; a never-written word is absent.
+    words: std::collections::BTreeMap<u64, (usize, bool)>,
+    /// The undo journal for `pages`/`words`: `(clock of the event that made the change, undo)`,
+    /// appended in event order (clocks non-decreasing). A backward jump to boundary `b` pops every
+    /// entry with clock `>= b` — exactly the changes the snapshot at `b` predates. Only kept while
+    /// `snapshots` is on. One entry per *change*, never per stride.
+    journal: Vec<(u64, Undo)>,
 }
 
 impl MemModel {
@@ -184,14 +210,15 @@ impl MemModel {
                 l1_misses: 0,
                 l2_hits: 0,
                 l2_misses: 0,
-                pages: std::collections::BTreeSet::new(),
-                words: std::collections::BTreeMap::new(),
                 tick: 0,
             },
             snaps: Vec::new(),
             last_clock: u64::MAX,
             max_lines_per_event: 1 << 20,
             snapshots: true,
+            pages: std::collections::BTreeSet::new(),
+            words: std::collections::BTreeMap::new(),
+            journal: Vec::new(),
         }
     }
 
@@ -211,8 +238,15 @@ impl MemModel {
                 self.snaps.pop();
             }
             match self.snaps.last() {
-                Some((_, s)) => self.state = s.clone(),
-                None => self.state = MemModel::new(self.cfg).state,
+                Some((b, s)) => {
+                    let boundary = *b;
+                    self.state = s.clone();
+                    self.rewind(boundary);
+                }
+                None => {
+                    self.state = MemModel::new(self.cfg).state;
+                    self.rewind(0);
+                }
             }
         } else {
             // Forward: snapshot each stride boundary crossed since the last event — the state
@@ -232,10 +266,41 @@ impl MemModel {
             }
         }
         self.last_clock = clock;
-        self.apply(task, ev);
+        self.apply(clock, task, ev);
     }
 
-    fn apply(&mut self, task: usize, ev: MemEvent) {
+    /// Undo every journaled tracker change made by an event at-or-past `boundary` (the snapshot
+    /// just restored predates them all), newest first.
+    fn rewind(&mut self, boundary: u64) {
+        while self.journal.last().is_some_and(|(c, _)| *c >= boundary) {
+            let (_, undo) = self.journal.pop().expect("checked non-empty");
+            match undo {
+                Undo::Page(p) => {
+                    self.pages.remove(&p);
+                }
+                Undo::Word(w, Some(prev)) => {
+                    self.words.insert(w, prev);
+                }
+                Undo::Word(w, None) => {
+                    self.words.remove(&w);
+                }
+            }
+        }
+        if !self.snapshots {
+            // No ladder, no journal: a backward jump can only mean a from-0 restart.
+            self.pages.clear();
+            self.words.clear();
+        }
+    }
+
+    /// Record a tracker change made by the event at `clock` (only while the ladder is on).
+    fn note(&mut self, clock: u64, undo: Undo) {
+        if self.snapshots {
+            self.journal.push((clock, undo));
+        }
+    }
+
+    fn apply(&mut self, clock: u64, task: usize, ev: MemEvent) {
         match ev {
             MemEvent::Load { addr, width }
             | MemEvent::AtomicLoad { addr, width }
@@ -245,23 +310,23 @@ impl MemModel {
                     ev,
                     MemEvent::AtomicRmw { .. } | MemEvent::AtomicCmpxchg { .. }
                 );
-                self.span(task, addr, width as u64, write);
+                self.span(clock, task, addr, width as u64, write);
             }
             MemEvent::Store { addr, width } | MemEvent::AtomicStore { addr, width } => {
-                self.span(task, addr, width as u64, true);
+                self.span(clock, task, addr, width as u64, true);
             }
             MemEvent::Copy { dst, src, len } => {
-                self.span(task, src, len, false);
-                self.span(task, dst, len, true);
+                self.span(clock, task, src, len, false);
+                self.span(clock, task, dst, len, true);
             }
             MemEvent::Fill { dst, len } => {
-                self.span(task, dst, len, true);
+                self.span(clock, task, dst, len, true);
             }
         }
     }
 
-    /// Touch every line and page in `[addr, addr+len)`.
-    fn span(&mut self, task: usize, addr: u64, len: u64, write: bool) {
+    /// Touch every line and page in `[addr, addr+len)` for the event at `clock`.
+    fn span(&mut self, clock: u64, task: usize, addr: u64, len: u64, write: bool) {
         if len == 0 {
             return;
         }
@@ -275,26 +340,30 @@ impl MemModel {
         let page = self.cfg.page_size.max(1);
         let (pf, pl) = (addr / page, addr.saturating_add(len - 1) / page);
         for pi in pf..=pl {
-            self.state.pages.insert(pi);
+            if self.pages.insert(pi) {
+                self.note(clock, Undo::Page(pi));
+            }
         }
         // The shared-state tracker (8-byte words): a write records the writer; any touch by a
-        // task other than the last writer marks the word contested.
+        // task other than the last writer marks the word contested. Journaled only when the entry
+        // actually changes, so a task re-writing its own words costs nothing.
         let (wf, wl) = (addr / 8, addr.saturating_add(len - 1) / 8);
         let wcount = (wl - wf + 1).min(self.max_lines_per_event);
         for wi in wf..wf + wcount {
-            match self.state.words.get_mut(&wi) {
-                Some((writer, contested)) => {
-                    if *writer != task {
-                        *contested = true;
-                    }
-                    if write {
-                        *writer = task;
-                    }
+            let prev = self.words.get(&wi).copied();
+            let next = match prev {
+                Some((writer, contested)) => Some((
+                    if write { task } else { writer },
+                    contested || writer != task,
+                )),
+                None if write => Some((task, false)),
+                None => None,
+            };
+            if next != prev {
+                if let Some(n) = next {
+                    self.words.insert(wi, n);
                 }
-                None if write => {
-                    self.state.words.insert(wi, (task, false));
-                }
-                None => {}
+                self.note(clock, Undo::Word(wi, prev));
             }
         }
     }
@@ -394,14 +463,14 @@ impl MemModel {
                     ("misses", Json::i(st.l2_misses as i64)),
                 ]),
             ),
-            ("pageFaults", Json::i(st.pages.len() as i64)),
+            ("pageFaults", Json::i(self.pages.len() as i64)),
             (
                 "sharedState",
                 Json::obj(vec![
                     (
                         "contested",
                         Json::Arr(
-                            st.words
+                            self.words
                                 .iter()
                                 .filter(|(_, (_, c))| *c)
                                 .map(|(w, (writer, _))| {
@@ -413,7 +482,7 @@ impl MemModel {
                                 .collect(),
                         ),
                     ),
-                    ("trackedWords", Json::i(st.words.len() as i64)),
+                    ("trackedWords", Json::i(self.words.len() as i64)),
                 ]),
             ),
             (
@@ -432,7 +501,7 @@ impl MemModel {
             st.l1_misses,
             st.l2_hits,
             st.l2_misses,
-            st.pages.len() as u64,
+            self.pages.len() as u64,
         )
     }
 }
@@ -446,5 +515,81 @@ fn invalidate_others(l1s: &mut [SetArray], task: usize, line_idx: u64) {
                 l1.slots[sb + w].state = Mesi::Invalid;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn store(addr: u64) -> MemEvent {
+        MemEvent::Store { addr, width: 8 }
+    }
+
+    /// #1371: journal size tracks *changes*, not strides — a bulk write of `n` distinct words
+    /// spanning many checkpoint boundaries journals `n` word entries (+ its pages), and a second
+    /// pass by the same task over the same words journals nothing more.
+    #[test]
+    fn journal_grows_with_changes_not_strides() {
+        let mut m = MemModel::new(MemModelCfg::default());
+        let n = 20_000u64;
+        let base = 16_384u64;
+        for i in 0..n {
+            m.observe(i * 4, 0, store(base + i * 8)); // ~78 boundaries deep
+        }
+        let pages = (n * 8).div_ceil(m.cfg.page_size);
+        assert_eq!(m.words.len() as u64, n);
+        assert_eq!(m.pages.len() as u64, pages);
+        assert_eq!(m.journal.len() as u64, n + pages, "one entry per change");
+        assert!(m.snaps.len() > 50, "the ladder was laid: {}", m.snaps.len());
+        let after_first = m.journal.len();
+        for i in 0..n {
+            m.observe(n * 4 + i * 4, 0, store(base + i * 8));
+        }
+        assert_eq!(
+            m.journal.len(),
+            after_first,
+            "re-writes by the same task change nothing"
+        );
+    }
+
+    /// #1371: a backward clock jump rewinds the trackers to the restored boundary — including a
+    /// contested flag set after it — so a rebuilt run that restores at the 1024 boundary and
+    /// replays from there matches a fresh from-0 run to the same point.
+    #[test]
+    fn rewind_restores_trackers_across_a_boundary() {
+        // Task 0 writes a fresh word each tick; every 7th tick task 1 touches an old one.
+        let event = |c: u64| -> (usize, MemEvent) {
+            if c % 7 == 6 {
+                (1, store(16_384 + (c / 2) * 8))
+            } else {
+                (0, store(16_384 + c * 8))
+            }
+        };
+        let mut a = MemModel::new(MemModelCfg::default());
+        for c in 0..3_000 {
+            let (t, ev) = event(c);
+            a.observe(c, t, ev);
+        }
+        assert!(
+            a.words.values().any(|(_, c)| *c),
+            "the scenario contests some words"
+        );
+        // The engine restores at the 1024 boundary and replays from there to 1300.
+        for c in 1024..1_300 {
+            let (t, ev) = event(c);
+            a.observe(c, t, ev);
+        }
+        let mut b = MemModel::new(MemModelCfg::default());
+        for c in 0..1_300 {
+            let (t, ev) = event(c);
+            b.observe(c, t, ev);
+        }
+        assert_eq!(
+            a.stats_json().to_string(),
+            b.stats_json().to_string(),
+            "rewound trackers ≡ a fresh run to the same point"
+        );
+        assert_eq!(a.journal.len(), b.journal.len());
     }
 }

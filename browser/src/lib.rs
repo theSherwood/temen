@@ -2594,6 +2594,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
             // Blocking stdin is a single-threaded interactive-session feature (the Postgres console
             // runs on its own owned-host `Vcpu`, not the parallel driver); a worker vCPU never sets it.
             bytecode::VcpuEvent::StdinPark => return PAR_TRAP,
+            // #1366: a host-completed cap park has no completer on this driver — fail closed.
+            bytecode::VcpuEvent::CapPending { .. } => return PAR_TRAP,
             // #1286 slice 3b: a detached child — its window is a fresh `WebAssembly.Memory` the Worker
             // mints and seeds from this blob, then posts to a new Worker (see
             // [`PAR_INSTANTIATE_DETACHED`]). The by-name grant list has no path across Workers on this
@@ -4952,6 +4954,78 @@ pub unsafe extern "C" fn temen_compile_nim_fs(
                 EXIT_CODE = 0;
             }
             0
+        }
+        Err(diag) => {
+            set(STATUS_TRAP);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), Vec::new());
+                stash(&mut *core::ptr::addr_of_mut!(ERR), diag.into_bytes());
+                EXIT_CODE = 1;
+            }
+            0
+        }
+    }
+}
+
+/// **Compile a whole Nim program to its linked module, WITHOUT running it** (#1025 #1357). Same inputs
+/// and pre-crawl seeding as [`temen_compile_nim_fs`], but stops after the nim→powerbox link and stashes
+/// the **encoded linked module** on [`OUT`] (read via `temen_stdout_ptr`/`_len`), returning its length.
+/// The JS worker then runs that module on the **wasm-JIT tier** (`runJitModule`) — so the user's compiled
+/// program tiers up too, not just the compiler phases — with the tree-walker (`temen_compile_nim_fs`) as
+/// the fallback when the emit declines. `0` with a non-OK [`temen_status`] (diagnostic on
+/// `temen_stderr_*`) on a compile/link failure.
+///
+/// # Safety
+/// Each pointer/len names a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn temen_compile_nim_link_fs(
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    nimsem_ptr: *const u8,
+    nimsem_len: usize,
+    hexer_ptr: *const u8,
+    hexer_len: usize,
+    img_ptr: *const u8,
+    img_len: usize,
+    src_ptr: *const u8,
+    src_len: usize,
+    main_ptr: *const u8,
+    main_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let nifler = sl(nifler_ptr, nifler_len);
+    let nimsem = sl(nimsem_ptr, nimsem_len);
+    let hexer = sl(hexer_ptr, hexer_len);
+    let image = sl(img_ptr, img_len);
+    let src = sl(src_ptr, src_len).to_vec();
+    let main = String::from_utf8_lossy(sl(main_ptr, main_len)).into_owned();
+
+    let (mut files, _dirs) = match temen_fs::decode_image(image) {
+        Ok(x) => x,
+        Err(_) => {
+            set(STATUS_DECODE_ERR);
+            return 0;
+        }
+    };
+    files.push((main.clone(), src));
+    // SAFETY: single-threaded wasm; exclusive access — same pre-crawl seeding as `temen_compile_nim_fs`.
+    for (path, bytes) in unsafe { &*core::ptr::addr_of!(NIM_PRECRAWL) } {
+        files.push((path.clone(), bytes.clone()));
+    }
+
+    match nimc::compile_nim_ce_to_module(nifler, None, nimsem, hexer, files, &main) {
+        Ok(m) => {
+            let bytes = temen_encode::encode_module(&m);
+            let len = bytes.len() as i64;
+            set(STATUS_OK);
+            unsafe {
+                stash(&mut *core::ptr::addr_of_mut!(OUT), bytes);
+                stash(&mut *core::ptr::addr_of_mut!(ERR), Vec::new());
+                EXIT_CODE = 0;
+            }
+            len
         }
         Err(diag) => {
             set(STATUS_TRAP);
@@ -8444,6 +8518,11 @@ pub extern "C" fn temen_bash_coop_close() {
 /// The program is linked as unit 1 (its func 0 exported under `entry_name`) against the library as
 /// unit 0 (re-exporting the library's own inline exports), so the program's calls into the library
 /// resolve by name.
+///
+/// Decodes the library on **every** call. A host that runs many programs against one unchanging
+/// library (a language playground) should open it once with [`temen_link_lib_open`] and run through
+/// [`temen_link_run_lib`] on its handle instead (#1373) — same link, same result accessors, minus the
+/// per-run decode.
 #[no_mangle]
 pub extern "C" fn temen_link_run(
     prog_ptr: *const u8,
@@ -8455,63 +8534,184 @@ pub extern "C" fn temen_link_run(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
-    let set = |s: i32| unsafe { LAST_STATUS = s };
-    let slice = |p: *const u8, n: usize| -> &'static [u8] {
-        if p.is_null() || n == 0 {
-            &[]
-        } else {
-            unsafe { core::slice::from_raw_parts(p, n) }
+    let lib = match link_load_unit(link_slice(lib_ptr, lib_len)) {
+        Some(m) => m,
+        None => {
+            unsafe { LAST_STATUS = STATUS_DECODE_ERR };
+            return 0;
         }
     };
-    let entry_name = match core::str::from_utf8(slice(entry_ptr, entry_len)) {
+    let lib_exports = link_lib_exports(&lib);
+    link_run_against(
+        temen_ir::LinkUnitRef {
+            module: &lib,
+            exports: &lib_exports,
+            data_exports: &[],
+        },
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+/// The **resident link libraries** (#1373): decoded library units [`temen_link_lib_open`] keeps
+/// between [`temen_link_run_lib`] calls, so a host linking many programs against one (or a few)
+/// runtimes pays each library's decode once instead of on every run (measured ~35% of the browser's
+/// per-run link floor). Handle-addressed so a frontend with two runtimes — jacl's `jaclrt` for
+/// programs and `jaclrt_staging` for macro bodies — keeps both resident instead of thrashing one slot.
+struct LinkLib {
+    module: temen_ir::Module,
+    /// The library's inline exports as link symbols (`name → local funcidx`), computed once.
+    exports: Vec<(String, temen_ir::FuncIdx)>,
+}
+
+static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
+
+/// Decode a **library** unit (text or binary, sniffed like [`temen_link_run`]'s params) and keep it
+/// resident for [`temen_link_run_lib`]. Returns its handle (`>= 0`; the lowest free slot) or `-1` on a
+/// decode failure ([`STATUS_DECODE_ERR`] in [`temen_status`], nothing resident). The bytes are copied
+/// out (decoded), so the host may `temen_dealloc` them right after this returns.
+#[no_mangle]
+pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let Some(module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
+        set(STATUS_DECODE_ERR);
+        return -1;
+    };
+    let exports = link_lib_exports(&module);
+    // SAFETY: single-threaded wasm; exclusive access to the resident table.
+    let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
+    let lib = Some(LinkLib { module, exports });
+    let h = match libs.iter().position(Option::is_none) {
+        Some(i) => {
+            libs[i] = lib;
+            i
+        }
+        None => {
+            libs.push(lib);
+            libs.len() - 1
+        }
+    };
+    set(STATUS_OK);
+    h as i32
+}
+
+/// Drop the resident library `handle` ([`temen_link_lib_open`]). Unknown / already-closed handles are
+/// a no-op.
+#[no_mangle]
+pub extern "C" fn temen_link_lib_close(handle: i32) {
+    // SAFETY: single-threaded wasm; exclusive access to the resident table.
+    let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
+    if let Some(slot) = usize::try_from(handle).ok().and_then(|h| libs.get_mut(h)) {
+        *slot = None;
+    }
+}
+
+/// [`temen_link_run`] against the **resident** library `handle` ([`temen_link_lib_open`]): load only
+/// the program unit, link it as unit 1 against the resident unit 0, synthesize `_start`, verify, run —
+/// the same pipeline and result accessors as [`temen_link_run`], minus the library decode. An unknown
+/// or closed handle: [`STATUS_UNSUPPORTED`] and `0`.
+#[no_mangle]
+pub extern "C" fn temen_link_run_lib(
+    handle: i32,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
+    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
+    let Some(lib) = usize::try_from(handle)
+        .ok()
+        .and_then(|h| libs.get(h))
+        .and_then(Option::as_ref)
+    else {
+        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
+        return 0;
+    };
+    link_run_against(
+        temen_ir::LinkUnitRef {
+            module: &lib.module,
+            exports: &lib.exports,
+            data_exports: &[],
+        },
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+fn link_slice(p: *const u8, n: usize) -> &'static [u8] {
+    if p.is_null() || n == 0 {
+        &[]
+    } else {
+        // SAFETY: the host passes a live `temen_alloc`ation of `n` bytes.
+        unsafe { core::slice::from_raw_parts(p, n) }
+    }
+}
+
+/// A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start with a
+/// NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect; a resolved
+/// runnable module is a degenerate unit and loads fine), text rides the parser.
+fn link_load_unit(bytes: &[u8]) -> Option<temen_ir::Module> {
+    if temen_encode::wire::is_module_blob(bytes) {
+        temen_encode::decode_unit(bytes).ok()
+    } else {
+        temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
+    }
+}
+
+fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> {
+    lib.exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect()
+}
+
+/// The shared half of [`temen_link_run`] / [`temen_link_run_lib`]: load the program unit, link it as
+/// unit 1 against `lib` (unit 0), synthesize the powerbox `_start` around `entry_name`, verify, run,
+/// and stash the outcome in the result slots. Returns the entry's value (`0` on any failure, with
+/// [`LAST_STATUS`] saying which).
+fn link_run_against(
+    lib: temen_ir::LinkUnitRef<'_>,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
         Ok(s) => s,
         Err(_) => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    let stdin = slice(stdin_ptr, stdin_len);
-
-    // A unit is binary iff it opens with the container magic (`Temen\0`) — text IR can't start
-    // with a NUL, so the sniff is unambiguous. Binary rides `decode_unit` (the object dialect;
-    // a resolved runnable module is a degenerate unit and loads fine), text rides the parser.
-    let load_unit = |bytes: &[u8]| -> Option<temen_ir::Module> {
-        if temen_encode::wire::is_module_blob(bytes) {
-            temen_encode::decode_unit(bytes).ok()
-        } else {
-            temen_text::parse_module(core::str::from_utf8(bytes).ok()?).ok()
-        }
-    };
-    let program = match load_unit(slice(prog_ptr, prog_len)) {
+    let stdin = link_slice(stdin_ptr, stdin_len);
+    let program = match link_load_unit(link_slice(prog_ptr, prog_len)) {
         Some(m) => m,
         None => {
             set(STATUS_DECODE_ERR);
             return 0;
         }
     };
-    let lib = match load_unit(slice(lib_ptr, lib_len)) {
-        Some(m) => m,
-        None => {
-            set(STATUS_DECODE_ERR);
-            return 0;
-        }
-    };
-    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
-        .exports
-        .iter()
-        .map(|e| (e.name.clone(), e.func))
-        .collect();
-
-    let linked = match temen_ir::link_with_manifest(&[
-        temen_ir::LinkUnit {
-            module: lib,
-            exports: lib_exports,
-            ..Default::default()
-        },
-        temen_ir::LinkUnit {
-            module: program,
-            exports: vec![(entry_name.to_string(), 0)],
-            ..Default::default()
+    let prog_exports = [(entry_name.to_string(), 0)];
+    let linked = match temen_ir::link_with_manifest_ref(&[
+        lib,
+        temen_ir::LinkUnitRef {
+            module: &program,
+            exports: &prog_exports,
+            data_exports: &[],
         },
     ]) {
         Ok(m) => m,
@@ -9795,7 +9995,7 @@ pub unsafe extern "C" fn temen_op13jit_phase_open(
             &argv,
             vec![(file_key, src)],
             readback,
-            None,
+            ExecMode::None,
         )
     }
 }
@@ -9835,7 +10035,56 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
         .trim_start_matches('/')
         .to_string();
     let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, None) }
+    unsafe {
+        op13_phase_open_impl(
+            sl(child_ptr, child_len),
+            &argv_refs,
+            seeds,
+            readback,
+            ExecMode::None,
+        )
+    }
+}
+
+/// Shared body of the two nimsem op-13 drivers: decode the `nifler` blob, pack argv/seeds/readback, and
+/// open [`op13_phase_open_impl`] with the `exec` posture `exec_of` builds from the decoded nifler.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
+unsafe fn nimsem_open_common(
+    child_ptr: *const u8,
+    child_len: usize,
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+    exec_of: fn(std::sync::Arc<temen_ir::Module>) -> ExecMode,
+) -> i32 {
+    temen_op13jit_close();
+    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
+    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    if temen_verify::verify_module(&nifler).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    let exec = exec_of(std::sync::Arc::new(nifler));
+    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
+        return -STATUS_DECODE_ERR;
+    };
+    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
+        .trim_start_matches('/')
+        .to_string();
+    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+    unsafe { op13_phase_open_impl(sl(child_ptr, child_len), &argv_refs, seeds, readback, exec) }
 }
 
 /// The **nimsem** op-13 tier-up driver (#1025 3a.3): like [`temen_op13jit_phase_open_argv`], but grants
@@ -9845,8 +10094,8 @@ pub unsafe extern "C" fn temen_op13jit_phase_open_argv(
 /// (the dominant cost) tiers up. #1025 3d: the `nifler` blob is the **child-entry** `nifler_ce`, and the
 /// exec spawns it as a **confined §14 op-13 grandchild** ([`nimc::run_phase_op13`]) — the guest services
 /// its own `exec` through the confinement path rather than an inline host run (byte-identical `.p.nif`).
-/// Everything else matches `phase_open_argv` (packed argv/seeds, output key); nimsem's ~256 MiB peak grows
-/// in its own detached memory (#1288).
+/// The whole-card card uses [`temen_op13jit_nimsem_open_inline`] instead (lighter footprint); this
+/// confined form is kept for the headless posture and its gate.
 ///
 /// # Safety
 /// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
@@ -9864,32 +10113,58 @@ pub unsafe extern "C" fn temen_op13jit_nimsem_open(
     out_ptr: *const u8,
     out_len: usize,
 ) -> i32 {
-    temen_op13jit_close();
-    let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    // #1025 3d: the exec's nifler is the **child-entry** `nifler_ce` (run as a §14 op-13 grandchild).
-    let Ok(nifler_ce) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    if temen_verify::verify_module(&nifler_ce).is_err() {
-        return -STATUS_VERIFY_ERR;
-    }
-    let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    let Some(seeds) = parse_packed_files(sl(seed_ptr, seed_len)) else {
-        return -STATUS_DECODE_ERR;
-    };
-    let readback = String::from_utf8_lossy(sl(out_ptr, out_len))
-        .trim_start_matches('/')
-        .to_string();
-    let argv_refs: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
     unsafe {
-        op13_phase_open_impl(
-            sl(child_ptr, child_len),
-            &argv_refs,
-            seeds,
-            readback,
-            Some(std::sync::Arc::new(nifler_ce)),
+        nimsem_open_common(
+            child_ptr,
+            child_len,
+            nifler_ptr,
+            nifler_len,
+            argv_ptr,
+            argv_len,
+            seed_ptr,
+            seed_len,
+            out_ptr,
+            out_len,
+            ExecMode::Grandchild,
+        )
+    }
+}
+
+/// The **inline-exec** twin of [`temen_op13jit_nimsem_open`] (#1364): identical ABI, but the `nifler` blob
+/// is the **top-level** nifler and nimsem's `exec` runs it **inline** on the interpreter instead of emitting
+/// a `nifler_ce` §14 op-13 grandchild. Same byte-identical `.p.nif` (`exec_op13_nifler_matches_inline`), but
+/// it skips the ~13 MB nifler_ce decode+emit that pushed the tiered nimsem's engine footprint to the 1 GiB
+/// ceiling and OOM'd constrained tabs — so it's the whole-card orchestrator's default.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[allow(clippy::too_many_arguments)] // an FFI ABI: two module blobs + packed (ptr,len) pairs
+#[no_mangle]
+pub unsafe extern "C" fn temen_op13jit_nimsem_open_inline(
+    child_ptr: *const u8,
+    child_len: usize,
+    nifler_ptr: *const u8,
+    nifler_len: usize,
+    argv_ptr: *const u8,
+    argv_len: usize,
+    seed_ptr: *const u8,
+    seed_len: usize,
+    out_ptr: *const u8,
+    out_len: usize,
+) -> i32 {
+    unsafe {
+        nimsem_open_common(
+            child_ptr,
+            child_len,
+            nifler_ptr,
+            nifler_len,
+            argv_ptr,
+            argv_len,
+            seed_ptr,
+            seed_len,
+            out_ptr,
+            out_len,
+            ExecMode::Inline,
         )
     }
 }
@@ -9949,6 +10224,19 @@ fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 /// key [`temen_op13jit_phase_output`] returns. Phase-agnostic: nifler, hexer, nimsem differ only in
 /// `argv`/`seeds`/`readback`/`exec_nifler`.
 ///
+/// How a tiered phase's `exec` cap services nimsem's `exec("nifler … parse …")` sub-spawn (`None` for
+/// the 3-cap phases — nifler, hexer — that never shell out).
+enum ExecMode {
+    /// 3-cap `{fs, stdout, exit}`: no `exec` cap (nifler crawl, hexer).
+    None,
+    /// 4-cap: `exec` runs the given top-level nifler **inline** on the interpreter (#1364) — no
+    /// nifler_ce decode+emit, so the tiered nimsem's engine footprint stays far under the 1 GiB ceiling.
+    Inline(std::sync::Arc<temen_ir::Module>),
+    /// 4-cap: `exec` spawns the given child-entry `nifler_ce` as a **confined §14 op-13 grandchild**
+    /// (#1025 3d, `run_phase_op13`) — more isolated, but pays the ~13 MB guest decode+emit.
+    Grandchild(std::sync::Arc<temen_ir::Module>),
+}
+
 /// # Safety
 /// `child_bytes` must be a live slice for the duration of the call.
 unsafe fn op13_phase_open_impl(
@@ -9956,7 +10244,7 @@ unsafe fn op13_phase_open_impl(
     argv: &[&str],
     seeds: Vec<(String, Vec<u8>)>,
     readback: String,
-    exec_nifler: Option<std::sync::Arc<temen_ir::Module>>,
+    exec: ExecMode,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
     let Ok(child) = temen_encode::decode_module(child_bytes) else {
@@ -9978,10 +10266,10 @@ unsafe fn op13_phase_open_impl(
     // 3-cap {fs,stdout,exit}, or 4-cap {+exec} when the phase (nimsem) shells out to nifler. The exec is
     // a HOST_PROC cap — a tiered-up child's `exec` call bounces to `call_interp` over this granted host
     // exactly like `fs`, so its nifler sub-spawns run host-side while the phase's own compute tiers up.
-    let caps: &[&str] = if exec_nifler.is_some() {
-        &["fs", "stdout", "exit", "exec"]
-    } else {
+    let caps: &[&str] = if matches!(exec, ExecMode::None) {
         &["fs", "stdout", "exit"]
+    } else {
+        &["fs", "stdout", "exit", "exec"]
     };
     let driver_src = nimc::detached_parent_src(decl, argv, caps);
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
@@ -10019,25 +10307,29 @@ unsafe fn op13_phase_open_impl(
         Value::I32(stdout_h),
         Value::I32(exit_h),
     ];
-    if let Some(nifler_ce) = exec_nifler {
-        // #1025 3d: the `exec` cap = `make_exec` over the SAME shared memfs (`factory`), spawning nifler
-        // as a **confined §14 op-13 grandchild** (`run_phase_op13`) rather than an inline host-proc run —
-        // the guest services its own `exec` through the confinement path (matching the headless compile's
-        // Gap-2 keystone). `nifler_ce` is the child-entry nifler; it's passed as `make_exec`'s
-        // `Some(..)` arg (the first arg is then unused). The nifler grandchild's `.p.nif` is byte-identical
-        // to the inline run (`op13_nifler_crawl_matches_inline`). Forkable so op-13 can re-grant it.
-        let exec_init: temen_interp::HostProc = nimc::make_exec(
-            nifler_ce.clone(),
-            Some(nifler_ce.clone()),
-            std::sync::Arc::clone(&factory),
-        );
+    // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`) — for nimsem's `exec("nifler …
+    // parse …")` sub-spawn. Two postures (see [`ExecMode`]): `Inline` runs the top-level nifler on the
+    // interpreter (`make_exec`'s `None` grandchild arm; #1364, the memory-lean whole-card path), `Grandchild`
+    // spawns `nifler_ce` as a confined §14 op-13 grandchild (#1025 3d). Both write a byte-identical `.p.nif`
+    // (`exec_op13_nifler_matches_inline`); forkable so op-13 can re-grant it.
+    let exec_nifler = match &exec {
+        ExecMode::None => None,
+        ExecMode::Inline(n) => Some((std::sync::Arc::clone(n), None)),
+        ExecMode::Grandchild(ce) => {
+            Some((std::sync::Arc::clone(ce), Some(std::sync::Arc::clone(ce))))
+        }
+    };
+    if let Some((first, ce)) = exec_nifler {
+        let exec_init: temen_interp::HostProc =
+            nimc::make_exec(first.clone(), ce.clone(), std::sync::Arc::clone(&factory));
         let exec_fork: temen_interp::HostProcFork = {
-            let nifler_ce = std::sync::Arc::clone(&nifler_ce);
+            let first = std::sync::Arc::clone(&first);
+            let ce = ce.clone();
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    nifler_ce.clone(),
-                    Some(nifler_ce.clone()),
+                    first.clone(),
+                    ce.clone(),
                     std::sync::Arc::clone(&factory),
                 ))
             })
@@ -12651,6 +12943,16 @@ static mut COOP_RUN: Option<CoopTierupRun> = None;
 /// emittable leaf tiers up), which the differential harness uses to exercise the emitted **mechanism**
 /// with its tiny synthetic guests; `bench_tierup_cards.mjs` sweeps it to calibrate the default. The
 /// production default ([`temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES`]) applies until this is called.
+/// Host policy (#1384): override the emitter's per-function size cap
+/// (`temen_wasm_jit::MAX_EST_EMITTED_FN_BYTES`, estimated emitted bytes above which a function stays
+/// on the interpreter) for subsequent opens; `0` restores the default. The default guards the engine's
+/// hard limit; a host whose optimizer gives up lower — Chromium's TurboFan zone-OOMs the renderer on
+/// the JACL compiler's 0.5–0.8 MB functions — sets the cap it has measured before opening a card.
+#[no_mangle]
+pub extern "C" fn temen_coop_set_emit_cap(bytes: usize) {
+    temen_wasm_jit::set_max_est_emitted_fn_bytes(bytes);
+}
+
 #[no_mangle]
 pub extern "C" fn temen_coop_set_tierup_floor(bytes: usize) {
     COOP_TIERUP_FLOOR.store(bytes, std::sync::atomic::Ordering::Relaxed);

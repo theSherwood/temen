@@ -17,6 +17,7 @@ export class SnapshotClient {
   _workerFor(url) {
     let w = this._workers.get(url);
     if (w) return w;
+    if (url === SnapshotClient.NIMC_KEY) this.nimWorkerSpawns = (this.nimWorkerSpawns || 0) + 1; // test hook: reuse ⇒ stays 1
     const worker = new Worker(new URL('./snapshot-worker.js', import.meta.url), { type: 'module' });
     w = { worker, seq: 0, pending: new Map(), chunks: new Map(), prewarm: null };
     w.ready = new Promise((resolve, reject) => {
@@ -164,12 +165,20 @@ export class SnapshotClient {
     return this._request(w, 'nimCompile', { source, main }, onChunk);
   }
 
-  // Abandon an in-flight nim compile: terminate the nim worker (a runaway guest can't be interrupted
-  // cooperatively) and drop its record so the next `nimCompile` respawns a fresh engine and re-sends
-  // assets. Pending requests on it never resolve — the caller drops them.
+  // Abort an in-flight nim compile so a stuck/runaway guest (which can't be interrupted cooperatively)
+  // never wedges the card: terminate the worker and drop its record, so the next `nimCompile` respawns a
+  // fresh engine and re-sends assets. Pending requests on it never resolve — the caller drops them.
+  //
+  // Only fires when the worker is actually BUSY (a compile in flight). An IDLE worker is kept alive and
+  // reused: its engine holds the warmed guest-emit cache (`jitModuleCache`) that the pre-warm and each
+  // prior compile filled — terminating it there would throw that away and force every Run to re-emit the
+  // ~5 s nimsem/hexer guests from cold (the reason repeated Runs never got the warm ~3 s path, #1386).
+  // Reuse is safe: each compile resets the pre-crawl accumulator and keys its run module by content, and
+  // wasm memory plateaus at one compile's peak (each compile frees its own allocations).
   cancelNim() {
     const w = this._workers.get(SnapshotClient.NIMC_KEY);
     if (!w) return;
+    if (w.pending.size === 0) return; // idle → keep the warm worker; nothing to abort
     w.worker.terminate();
     this._workers.delete(SnapshotClient.NIMC_KEY);
   }

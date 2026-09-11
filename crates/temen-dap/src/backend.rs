@@ -57,13 +57,35 @@ fn io_cap(name: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// #1366 slice (c) — a **declared host-completed cap** the launch named (`hostCaps`) is parked on:
+/// the completion id the run parked with, the cap's name, and the guest's call arguments (a flat
+/// `call.sym "<name>"` — the guest's op rides in `args[0]` by convention, like `vm_fs`). Filled by
+/// the proc's submit hook, read back by the DAP `stopped` event, cleared by `provideCap`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapRequest {
+    pub id: u64,
+    pub name: String,
+    pub args: Vec<i64>,
+}
+
+/// The parked-request cell one session's declared procs share with its backend (`Arc` so a rebuilt
+/// run's procs write the same cell).
+pub type SharedCapRequest = std::sync::Arc<std::sync::Mutex<Option<CapRequest>>>;
+
 /// Grant the **on-ramp I/O powerbox** on `host` for module `m`: the §3e prefix (stdout/stdin/exit/
 /// memory/addrspace), each registered under its `self.resolve` name, plus the module's manifest
 /// imports bound to it (IMPORTS.md phase 4 — [`io_cap`] maps each import name to the granted handle).
 /// This is the powerbox a chibicc `_start` expects (minus the browser's graphical caps), so a debugged C
 /// program that `printf`s (→ a `write` cap) runs instead of `CapFault`ing; its output lands in
 /// `host.stdout`. The browser's `grant_onramp_caps` is the twin used for the non-debug Run path.
-fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
+fn grant_io_powerbox(
+    host: &mut Host,
+    m: &Module,
+    stdin: &[u8],
+    fs_seed: Option<&temen_fs::FsSeed>,
+    host_caps: &[String],
+    parked: &SharedCapRequest,
+) {
     host.stdin = stdin.to_vec();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let handles = [
@@ -86,7 +108,14 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
     // op, and bind the `vm_fs` slot to it below. Granted only when the module imports it (a plain
     // stdout-only program is unaffected); guest-private, no host disk, dropped at session end.
     let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
-        let mut inner = temen_fs::mem_fs_handler(false)();
+        // #1323 slice 3: seed the memfs with the launch's fs-image when one was supplied (a lesson's
+        // pre-seeded input files, e.g. a `colors.txt` the guest `fopen`s for read), else an empty
+        // scratch store. Each build clones the seed fresh, so a reverse-`seek` rebuild re-seeds
+        // identically (deterministic replay).
+        let mut inner = match fs_seed {
+            Some((files, dirs)) => temen_fs::mem_fs_seeded_handler(files.clone(), dirs.clone())(),
+            None => temen_fs::mem_fs_handler(false)(),
+        };
         let h = host.grant_host_proc(Box::new(
             move |_slot_op: u32,
                   args: &[i64],
@@ -104,11 +133,42 @@ fn grant_io_powerbox(host: &mut Host, m: &Module, stdin: &[u8]) {
     } else {
         None
     };
+    // #1366 slice (c): the launch's **declared host-completed caps** (`hostCaps`). Each name the
+    // module imports gets an offloadable proc that always punts to the host
+    // (`OffloadOutcome::Host`): the guest's flat `call.sym "<name>"` parks the run, the request
+    // lands in `parked` (read by the DAP `stopped{reason:"cap"}` event), and `provideCap` resumes
+    // it. Granted in launch order on every rebuild, so a reverse `seek`'s replay finds the same
+    // handles the tape recorded. Nothing here is graphics- or embedder-specific: temen never
+    // learns what a name means.
+    let mut declared: Vec<(String, i32)> = Vec::new();
+    for name in host_caps {
+        if !m.imports.iter().any(|im| &im.name == name) {
+            continue;
+        }
+        let cell = std::sync::Arc::clone(parked);
+        let cap_name = name.clone();
+        let h = host.grant_host_proc_offloadable(Box::new(move |_op: u32, args: &[i64]| {
+            let cell = std::sync::Arc::clone(&cell);
+            let name = cap_name.clone();
+            let args = args.to_vec();
+            temen_interp::OffloadOutcome::Host(Box::new(move |id| {
+                *cell.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(CapRequest { id, name, args });
+            }))
+        }));
+        host.register_cap_name(name, h);
+        declared.push((name.clone(), h));
+    }
     if !m.imports.is_empty() {
         let bindings = m
             .imports
             .iter()
             .map(|im| {
+                // #1366 slice (c): a declared host-completed cap — a flat `call.sym` (base op 0)
+                // on the proc granted above, like `vm_fs`.
+                if let Some((_, h)) = declared.iter().find(|(n, _)| *n == im.name) {
+                    return BoundImport::required(cap_id::HOST_PROC, 0, *h);
+                }
                 // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
                 // HostProc granted above; the guest's fs op rides in arg0.
                 if im.name == "vm_fs" {
@@ -150,13 +210,16 @@ fn build_single_run(
     stdin: &[u8],
     block_stdin: bool,
     mem_limit: Option<u64>,
+    fs_seed: Option<&temen_fs::FsSeed>,
+    host_caps: &[String],
+    parked: &SharedCapRequest,
     tape: &CapTape,
 ) -> Option<DebugRun> {
     if !powerbox {
         return DebugRun::new(module, func, args);
     }
     let mut host = Host::new();
-    grant_io_powerbox(&mut host, module, stdin);
+    grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
     // Slice 5: the Memory-capability growth cap — a `vm_map` past the limit returns -ENOMEM, so a
     // guest malloc observes NULL (the OOM-teaching knob). Re-armed on every seek rebuild.
     host.set_mem_map_limit(mem_limit);
@@ -191,11 +254,14 @@ fn build_scheduled_run(
     block_stdin: bool,
     mem_limit: Option<u64>,
     seed: Option<u64>,
+    fs_seed: Option<&temen_fs::FsSeed>,
+    host_caps: &[String],
+    parked: &SharedCapRequest,
     tape: &CapTape,
 ) -> Option<ScheduledDebugRun> {
     let mut run = if powerbox {
         let mut host = Host::new();
-        grant_io_powerbox(&mut host, module, stdin);
+        grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
         host.set_mem_map_limit(mem_limit);
         if block_stdin {
             host.set_stdin_blocking(true);
@@ -292,6 +358,21 @@ pub trait Debuggee {
     /// blocking stdin (the `provideStdin` request fails cleanly). Default: unsupported.
     fn provide_stdin(&mut self, _bytes: &[u8]) -> bool {
         false
+    }
+
+    /// #1366 — deliver the embedder's value for the host-completed cap call the session is parked
+    /// on (`StopReason::CapPark { id }`); the next resume continues past the call. `false` when
+    /// the session isn't parked on `id` (the `provideCap` request fails cleanly). Default:
+    /// unsupported.
+    fn provide_cap(&mut self, _id: u64, _value: i64) -> bool {
+        false
+    }
+
+    /// #1366 slice (c) — the declared host-completed cap the session is parked on: `(name, args)`
+    /// for the `stopped{reason:"cap"}` event's `capName`/`args`. `None` when not parked on a
+    /// declared cap (or on a backend without declared caps). Default: none.
+    fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
+        None
     }
 
     // --- memory map (slice 5) --------------------------------------------------------------------
@@ -474,6 +555,12 @@ struct RevTrace {
 /// engine-neutral free functions keyed on the `IrPc`), and the launch `func`/`args` so reverse
 /// debugging can rebuild a fresh run and replay to an earlier op clock.
 pub struct BytecodeBackend {
+    /// #1366 slice (c): the launch's declared host-completed cap names (`hostCaps`), re-granted on
+    /// every rebuild (see `grant_io_powerbox`).
+    host_caps: Vec<String>,
+    /// #1366 slice (c): the request the run is currently parked on (filled by a declared proc's
+    /// submit hook; read by `cap_park_request`; cleared by `provide_cap`).
+    parked_cap: SharedCapRequest,
     engine: Engine,
     module: Module,
     func: FuncIdx,
@@ -495,6 +582,10 @@ pub struct BytecodeBackend {
     powerbox: bool,
     /// Preloaded stdin for the powerbox (`read(0, …)`); empty for a pure-output program.
     stdin: Vec<u8>,
+    /// #1323 slice 3: the launch's fs-image seed (a lesson's pre-seeded files + dirs) mounted on the
+    /// `vm_fs` memfs; cloned fresh on every (re)build so a reverse-`seek` re-seeds identically.
+    /// `None` = an empty scratch store.
+    fs_seed: Option<temen_fs::FsSeed>,
     /// W4 blocking stdin: a `read` on an exhausted buffer parks the session
     /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Powerbox
     /// sessions on either bytecode engine (the threaded one since #1146 deeper — invariant 14).
@@ -588,7 +679,40 @@ impl BytecodeBackend {
         mem_limit: Option<u64>,
         seed: Option<u64>,
     ) -> Option<BytecodeBackend> {
+        Self::new_with_fs_seed(
+            module,
+            func,
+            args,
+            fuel,
+            powerbox,
+            stdin,
+            block_stdin,
+            mem_limit,
+            seed,
+            None,
+            Vec::new(),
+        )
+    }
+
+    /// #1323 slice 3: [`new`](Self::new) plus a `vm_fs` **memfs seed** — the launch's fs-image
+    /// (a lesson's pre-seeded input files) mounted so the guest can `fopen` them for read. `new`
+    /// is the unseeded (empty scratch store) shorthand.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_fs_seed(
+        module: Module,
+        func: FuncIdx,
+        args: &[Value],
+        fuel: u64,
+        powerbox: bool,
+        stdin: Vec<u8>,
+        block_stdin: bool,
+        mem_limit: Option<u64>,
+        seed: Option<u64>,
+        fs_seed: Option<temen_fs::FsSeed>,
+        host_caps: Vec<String>,
+    ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
+        let parked_cap: SharedCapRequest = SharedCapRequest::default();
         let engine = if bytecode::module_spawns_threads(&module) {
             // The powerbox rides the scheduled engine too now, so a threaded C guest's
             // `malloc`/`printf` work under the debugger (the seed is the slice-7 variation), and so
@@ -602,6 +726,9 @@ impl BytecodeBackend {
                 block_stdin,
                 mem_limit,
                 seed,
+                fs_seed.as_ref(),
+                &host_caps,
+                &parked_cap,
                 &tape,
             )?;
             Engine::Threaded(Box::new(run))
@@ -618,6 +745,9 @@ impl BytecodeBackend {
                 &stdin,
                 block_stdin,
                 mem_limit,
+                fs_seed.as_ref(),
+                &host_caps,
+                &parked_cap,
                 &tape,
             )?))
         };
@@ -633,6 +763,9 @@ impl BytecodeBackend {
             fuel,
             powerbox,
             stdin,
+            fs_seed,
+            host_caps,
+            parked_cap,
             block_stdin,
             mem_limit,
             tape,
@@ -680,6 +813,9 @@ impl BytecodeBackend {
             &self.stdin,
             self.block_stdin,
             self.mem_limit,
+            self.fs_seed.as_ref(),
+            &self.host_caps,
+            &self.parked_cap,
             &self.tape,
         )
     }
@@ -696,6 +832,9 @@ impl BytecodeBackend {
             self.block_stdin,
             self.mem_limit,
             self.seed,
+            self.fs_seed.as_ref(),
+            &self.host_caps,
+            &self.parked_cap,
             &self.tape,
         )
     }
@@ -910,6 +1049,21 @@ impl BytecodeBackend {
             Engine::Single(run) => (run.stdin_parked(), run.frame_pc(0)),
             Engine::Threaded(run) => (run.stdin_parked(), run.frame_pc(0)),
         };
+        // #1366: parked on a host-completed cap call — live, paused past the call, resumable once
+        // `provideCap` delivers the value.
+        let cap = match &self.engine {
+            Engine::Single(run) => run.cap_parked().map(|id| (id, run.cap_park_pc())),
+            Engine::Threaded(_) => None,
+        };
+        if let Some((id, at)) = cap {
+            // The stop location is the call itself (the position after it may be a terminator).
+            if let Some(pc) = at.or(pc) {
+                return Stop::Break {
+                    reason: StopReason::CapPark { id },
+                    pc,
+                };
+            }
+        }
         if let (true, Some(pc)) = (parked, pc) {
             return Stop::Break {
                 reason: StopReason::StdinPark,
@@ -1544,6 +1698,27 @@ impl Debuggee for BytecodeBackend {
             Engine::Threaded(run) => run.provide_stdin(bytes),
         }
         true
+    }
+    /// #1366 — single-vCPU sessions only (the scheduled engine keeps its inline decline).
+    fn provide_cap(&mut self, id: u64, value: i64) -> bool {
+        let ok = match &mut self.engine {
+            Engine::Single(run) => run.deliver_cap(id, value),
+            Engine::Threaded(_) => false,
+        };
+        if ok {
+            *self.parked_cap.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        ok
+    }
+    fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
+        let parked = match &self.engine {
+            Engine::Single(run) => run.cap_parked(),
+            Engine::Threaded(_) => None,
+        }?;
+        let g = self.parked_cap.lock().unwrap_or_else(|e| e.into_inner());
+        g.as_ref()
+            .filter(|r| r.id == parked)
+            .map(|r| (r.name.clone(), r.args.clone()))
     }
     /// The guest's captured stdout at the current stop (the on-ramp powerbox's `write` output). On a
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the

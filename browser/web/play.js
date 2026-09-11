@@ -1048,12 +1048,19 @@ for x in xs:
     editable: true,
     lang: 'nim',
     mode: 'io',
-    // Four assets: the three phase guests (gzipped `.temen`) + the nimony stdlib image (gzipped).
+    // The three phase guests (gzipped `.temen`) + the nimony stdlib image, plus the child-entry (`_ce`)
+    // variants that let the whole card tier up: `jitNimWholeCardOp13` op-13-spawns each phase as an
+    // emitted child (#1025 3e — ~3.3× faster than the tree-walker, byte-identical). The top-level guests
+    // stay for the interpreter fallback (a phase the orchestrator can't tier runs on the tree-walker).
     urls: {
       nifler: './assets/nifler.temen.gz',
       nimsem: './assets/nimsem.temen.gz',
       hexer: './assets/hexer.temen.gz',
       stdlib: './assets/nim_stdlib.img.gz',
+      niflerCe: './assets/nifler_ce.temen.gz',
+      nimsemCe: './assets/nimsem_ce.temen.gz',
+      hexerCe: './assets/hexer_ce.temen.gz',
+      preStdlib: './assets/nim_prestdlib.pack.gz',
     },
     desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
       "nimony-on-Temen slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
@@ -2766,21 +2773,30 @@ async function runNimc(c) {
   // stdlib image ~2.4 MB; DecompressionStream inflates in-browser, no library). In the worker path this
   // runs **once** — the worker caches the guests — so re-Runs ship only the source, not ~28 MB again.
   const getAssets = async () => {
-    const [gn, gs, gh, gl] = await Promise.all([
+    // #1375: the pre-compiled stdlib pack is optional — fetch best-effort so an older deploy without it
+    // still works (the worker just falls back to the full from-scratch tier-up).
+    const preStdlib = ex.urls.preStdlib
+      ? await fetchTimed(rec, c, ex.urls.preStdlib).then(gunzip).catch(() => null)
+      : null;
+    const [gn, gs, gh, gl, gnc, gsc, ghc] = await Promise.all([
       fetchTimed(rec, c, ex.urls.nifler),
       fetchTimed(rec, c, ex.urls.nimsem),
       fetchTimed(rec, c, ex.urls.hexer),
       fetchTimed(rec, c, ex.urls.stdlib),
+      fetchTimed(rec, c, ex.urls.niflerCe),
+      fetchTimed(rec, c, ex.urls.nimsemCe),
+      fetchTimed(rec, c, ex.urls.hexerCe),
     ]);
-    const [nifler, nimsem, hexer, stdlib] = await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl)]);
-    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B`);
-    return { nifler, nimsem, hexer, stdlib };
+    const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] =
+      await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl), gunzip(gnc), gunzip(gsc), gunzip(ghc)]);
+    logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B · +child-entry (${niflerCe.length + nimsemCe.length + hexerCe.length}B for the tiered whole card)${preStdlib ? ` · +pre-compiled stdlib (${preStdlib.length}B, skips ~30 s system.nim sema)` : ''}`);
+    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
   };
   const main = 'prog.nim';
   const source = c.editor.getValue();
   setState(c, 'running', 'compiling Nim (nifler → nimsem → hexer → link → run)…');
   const t0 = performance.now();
-  let status, out, err;
+  let status, out, err, tierInfo = null;
   try {
     if (snapshotClient) {
       // Off the main thread (issue #1005): the whole toolchain runs on the snapshot worker's own engine,
@@ -2797,6 +2813,11 @@ async function runNimc(c) {
       ({ status } = r);
       out = r.stdout;
       err = r.stderr;
+      // What actually tiered up (the worker's real telemetry — not the hardcoded label below). `tier` is
+      // the whole-card orchestrator's result (`jitNimWholeCardOp13`: per-module crawl/nimsem/hexer on the
+      // wasm-JIT + per-phase ms); `runTier` is which tier ran the compiled program (#1357). A `tier.error`
+      // (or absent `tier`) means the orchestrator declined and the tree-walker did the compile.
+      tierInfo = { ...(r.tier || {}), runTier: r.runTier };
     } else {
       // Fallback: no worker (e.g. the page lacks cross-origin isolation) — run on the main thread. This
       // freezes the tab for the duration, but keeps the card working where a worker can't be spawned.
@@ -2838,8 +2859,19 @@ async function runNimc(c) {
     runEnd(rec, { ok: false });
     return;
   }
-  const ms = runStage(rec, 'compile+run:interpreter', performance.now() - t0).toFixed(0);
-  runTier(rec, 'interpreter');
+  // Report the tier the compiler ACTUALLY ran on (the worker's telemetry), not a hardcoded guess: the
+  // whole card tiers up when the orchestrator seeded every phase (`crawled`/`semmed`/`hexed` > 0, no
+  // `error`); otherwise the tree-walker did the compile. `runTier` (#1357) is the compiled program's tier.
+  const ti = tierInfo || {};
+  const tiered = !ti.error && ti.semmed > 0 && ti.hexed > 0;
+  const tm = ti.timings || {};
+  const compileTier = tiered ? 'wasm-jit (op-13)' : 'interpreter';
+  const ms = runStage(rec, `compile+run:${compileTier}`, performance.now() - t0).toFixed(0);
+  runTier(rec, tiered ? 'wasm-jit' : 'interpreter');
+  if (tierInfo) {
+    const fmt = (n) => (n === undefined ? '?' : `${Math.round(n)}ms`);
+    logTo(c, `tier: compile=${compileTier}${tiered ? ` (crawl ${fmt(tm.crawlMs)} · nimsem ${fmt(tm.nimsemMs)} · hexer ${fmt(tm.hexerMs)})` : ''} · run=${ti.runTier || 'interpreter'}${ti.error ? ` · orchestrator fell back: ${ti.error}` : ''}`);
+  }
   logTo(c, `compile+run → status ${status}, ${out.length}B stdout in ${ms}ms`);
   // 0 = OK, 5 = clean Exit. Any other status: a phase/link/run failure — show the diagnostic (stderr).
   if (status !== 0 && status !== 5) {
@@ -2852,7 +2884,7 @@ async function runNimc(c) {
   c.el.stdout.textContent =
     `${bar} your Nim, compiled by the Temen (nifler → nimsem → hexer → temen-leng) and run — stdout ${bar}\n${out}`;
   c.el.result.textContent = `${out.length} B stdout`;
-  setState(c, 'done', `compiled + ran your Nim · ${out.length} B stdout · ${ms}ms`);
+  setState(c, 'done', `compiled + ran your Nim · ${compileTier} · ${out.length} B stdout · ${ms}ms`);
   runEnd(rec, { ok: true, status, result: `${out.length} B stdout` });
 }
 
@@ -4446,6 +4478,67 @@ function setupTheme() {
   mq.addEventListener('change', () => { if (sel.value === 'auto') apply('auto'); }); // follow the OS live
 }
 
+// #1375: pre-warm the nim card's toolchain off the main thread. Its first compile otherwise pays a
+// ~5 s one-time guest emit (`nimsem_ce`/`hexer_ce` → wasm, cached per worker) on top of the ~3 s tiered
+// compile. A background compile of a trivial program warms the worker's emit cache + uploaded assets, so
+// the user's first real Run is the fast ~3 s path. Best-effort and at most once: a real Run started
+// mid-pre-warm just `cancelNim`s it (no worse than a cold first Run); a completed one makes the Run fast.
+let nimPrewarmed = false;
+async function nimPrewarm(c) {
+  const ex = c.ex;
+  if (nimPrewarmed || !snapshotClient || !ex.urls) return;
+  nimPrewarmed = true;
+  try {
+    const fetchGz = async (u) => (u ? gunzip(await fetchModule(u)) : null);
+    // Reuse `fetchModule`'s cache so the user's real Run re-downloads nothing; the worker caches the
+    // inflated assets after this, so the real Run re-uploads nothing either.
+    const getAssets = async () => {
+      const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib] = await Promise.all([
+        fetchGz(ex.urls.nifler), fetchGz(ex.urls.nimsem), fetchGz(ex.urls.hexer), fetchGz(ex.urls.stdlib),
+        fetchGz(ex.urls.niflerCe), fetchGz(ex.urls.nimsemCe), fetchGz(ex.urls.hexerCe),
+        ex.urls.preStdlib ? fetchGz(ex.urls.preStdlib).catch(() => null) : Promise.resolve(null),
+      ]);
+      return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
+    };
+    setState(c, 'warming', 'warming up the Nim toolchain…');
+    await snapshotClient.nimCompile(getAssets, 'import std/syncio\n\nwrite(stdout, "")\n', 'prewarm.nim', () => {});
+    setState(c, 'ready', 'toolchain warm — compile is fast');
+    globalThis.__nimPrewarmDone = true; // test/telemetry hook (harmless)
+  } catch (e) { globalThis.__nimPrewarmErr = String(e && e.message || e); /* best-effort; a real Run warms it anyway */ }
+}
+
+// Pre-warm the nim toolchain in the background on its OWN worker (NIMC_KEY) so the user's first Run is the
+// fast (~3 s) warm path, not the ~10 s cold one. The cold→warm gap is V8 tiering up (Liftoff→TurboFan) the
+// emitted nimsem/hexer guest code inside the worker's isolate — it lives only as long as the worker does
+// (the idle-worker reuse fix, #1386, keeps that alive across Runs) and can't be persisted, so warming early
+// is the only lever. Two triggers, both idempotent via `nimPrewarmed`:
+//   • EAGER, on load (requestIdleCallback, 4 s timeout guarantee) — pays the ~10 s in the background before
+//     the user reaches the card. SKIPPED under automation (`navigator.webdriver`): the prewarm is a full
+//     compile that allocates the toolchain's large foreign memories (~512 MiB nimsem window etc.), and a
+//     browser test that drives its own compile right after load would run two at once and thrash memory
+//     (a real CI 30-min-timeout hang, #1386). Real users are unaffected — and if one hits Run before the
+//     eager prewarm finishes, runNimc's cancelNim() terminates the in-flight (busy) worker, so no double
+//     compile. Deferred to idle so it yields to first paint and the warm cards' prewarm.
+//   • SCROLL-into-view (300 px) — always on: the fallback for backgrounded tabs (idle callbacks throttled
+//     there) and the "about to use it" signal browser tests exercise explicitly.
+function setupNimPrewarm() {
+  const nimCard = cards.find((c) => c.ex.kind === 'nimc');
+  if (!nimCard) return;
+  const automated = typeof navigator !== 'undefined' && navigator.webdriver;
+  if (!automated) {
+    const fire = () => { if (snapshotClient) nimPrewarm(nimCard); };
+    if (typeof requestIdleCallback === 'function') requestIdleCallback(fire, { timeout: 4000 });
+    else setTimeout(fire, 1500);
+  }
+  if (typeof IntersectionObserver === 'function') {
+    const obs = new IntersectionObserver((entries) => {
+      if (!snapshotClient) return; // not ready yet — a later intersection (or the first Run) covers it
+      if (entries.some((e) => e.isIntersecting)) { obs.disconnect(); nimPrewarm(nimCard); }
+    }, { rootMargin: '300px' });
+    obs.observe(nimCard.el.section);
+  }
+}
+
 async function main() {
   const demosEl = $('demos');
   for (const [name, ex] of Object.entries(EXAMPLES)) {
@@ -4530,6 +4623,7 @@ async function main() {
       if (typeof requestIdleCallback === 'function') requestIdleCallback(prewarmAll, { timeout: 3000 });
       else setTimeout(prewarmAll, 0);
     }
+    setupNimPrewarm(); // #1375/#1386: warm the nim toolchain in the background (eager on load; scroll fallback)
   } catch (e) {
     snapshotClient = null;
     console.warn('[Temen playground] snapshot worker unavailable; warm cards use the main thread:', e.message);

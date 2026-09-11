@@ -1012,6 +1012,29 @@ jobs:
           # op-13 emitted children — the whole-card realization of `nimc::compile_nim` on the wasm-JIT tier.
           # Uses the committed nim assets + nifler_ce/nimsem_ce/hexer_ce; reuses the threads module.
           node browser-nim-wholecard-op13-test.mjs
+          # #1025 3e (SHIPPED card wiring): drive the playground's own `snapshotClient.nimCompile` — the exact
+          # path the nim card uses — with the committed web/assets guests (now incl. the child-entry `_ce`).
+          # The snapshot WORKER runs `jitNimWholeCardOp13` (whole card tiered) then link+run and reports what
+          # it pre-seeded; asserts the compile finished (status 0) and the worker actually tiered up
+          # (tier.semmed/hexed > 0 — not a silent interpreter fallback), proving the asset plumbing +
+          # foreign-memory-in-a-Worker end-to-end. Reuses the threads module + committed assets.
+          node browser-nim-card-tierup-test.mjs
+          # #1386 (warm-path regression): `runNimc` calls `snapshotClient.cancelNim()` before every compile;
+          # it used to terminate the nim worker unconditionally, throwing away the warmed guest-emit cache so
+          # every Run recompiled the ~5 s nimsem/hexer guests from cold (the deployed ~13–16 s). cancelNim now
+          # no-ops on an IDLE worker. Drives compile → cancelNim → compile ×3 (the real runNimc flow) and
+          # asserts the nim worker is spawned exactly ONCE (was 3×) with correct output each time —
+          # deterministic (spawn count, not timing), so CI-robust. Reuses committed assets; SKIPs if absent.
+          node browser-nim-worker-reuse-test.mjs
+          # #1386 (eager-prewarm automation guard): play.js warms the nim toolchain EAGERLY on load
+          # (requestIdleCallback) so the first Run is the fast ~3 s warm path — but that eager trigger is
+          # SKIPPED under automation (navigator.webdriver), because a browser test that drives its own
+          # compile right after load would collide with the background prewarm on the shared nim worker,
+          # run two full compiles at once, and thrash memory into the 30-min job timeout. This asserts, fast
+          # (no compile), that under Playwright the eager trigger does NOT auto-fire on load. SKIPs if the
+          # threads wasm is absent. (The scroll-into-view trigger — real users' fallback — is covered by
+          # browser-nim-prewarm-test.)
+          node browser-nim-eager-prewarm-gate-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to

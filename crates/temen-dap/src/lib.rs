@@ -198,6 +198,7 @@ impl DapServer {
             "reverseContinue" => self.on_reverse_continue(),
             "evaluate" => self.on_evaluate(args),
             "provideStdin" => self.on_provide_stdin(args),
+            "provideCap" => self.on_provide_cap(args),
             "memModelStats" => self.on_mem_model_stats(),
             "memoryMap" => self.on_memory_map(),
             "schedTrace" => self.on_sched_trace(),
@@ -353,6 +354,21 @@ impl DapServer {
         // `memoryLimit: N` (slice 5): cap the Memory capability's total committed bytes — a
         // `vm_map` past it returns -ENOMEM, so a guest malloc observes NULL (the OOM-teaching
         // knob). Needs the powerbox's Memory grant on the bytecode engine; fail-closed elsewhere.
+        // #1366 slice (c): `hostCaps` — names of host-completed caps the embedder services (each
+        // guest `call.sym "<name>"` parks as `stopped{reason:"cap"}`, answered by `provideCap`).
+        // Bytecode + on-ramp powerbox only, like `blockStdin`/`fsImage` (fail-closed launch gate).
+        let host_caps: Vec<String> = args
+            .get("hostCaps")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !host_caps.is_empty() && (engine != "bytecode" || !powerbox) {
+            return (false, Json::Null, vec![]);
+        }
         let mem_limit = args
             .get("memoryLimit")
             .and_then(|v| v.as_i64())
@@ -364,7 +380,16 @@ impl DapServer {
             // Slice 7: the seeded pick is honored on the threaded bytecode engine (a seed with a
             // single-vCPU module fails the launch inside `new` — fail-closed).
             let seed = args.get("seed").and_then(|v| v.as_i64()).map(|v| v as u64);
-            match BytecodeBackend::new(
+            // #1323 slice 3: an optional `fsImage` launch arg (base64 of a Temen fs-image blob — the
+            // same `encode_image` format the compile-time `extraFiles` use) pre-seeds the `vm_fs`
+            // memfs, so a debugged program can `fopen` a file the lesson provided (e.g. reading a
+            // seeded `colors.txt`). Absent/undecodable ⇒ an empty scratch store (unchanged).
+            let fs_seed = args
+                .get("fsImage")
+                .and_then(|v| v.as_str())
+                .and_then(base64_decode)
+                .and_then(|bytes| temen_fs::decode_image(&bytes).ok());
+            match BytecodeBackend::new_with_fs_seed(
                 module,
                 func,
                 &call_args,
@@ -374,6 +399,8 @@ impl DapServer {
                 block_stdin,
                 mem_limit,
                 seed,
+                fs_seed,
+                host_caps,
             ) {
                 // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
                 // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
@@ -1061,6 +1088,26 @@ impl DapServer {
         (ok, Json::Null, vec![])
     }
 
+    /// #1366 — the custom `provideCap` request: deliver `arguments.value` (i64) for the
+    /// host-completed cap call the session is parked on (`arguments.id` = the `capId` of the
+    /// `stopped` event). The client then resumes and execution continues past the call. Fails
+    /// cleanly without a session, malformed arguments, or when the session isn't parked on `id`.
+    fn on_provide_cap(&mut self, args: Option<&Json>) -> (bool, Json, Vec<Event>) {
+        let Some(session) = self.session.as_mut() else {
+            return (false, Json::Null, vec![]);
+        };
+        let id = args.and_then(|a| a.get("id")).and_then(|v| v.as_i64());
+        let value = args.and_then(|a| a.get("value")).and_then(|v| v.as_i64());
+        let (Some(id), Some(value)) = (id, value) else {
+            return (false, Json::Null, vec![]);
+        };
+        if id < 0 {
+            return (false, Json::Null, vec![]);
+        }
+        let ok = session.inspector.provide_cap(id as u64, value);
+        (ok, Json::Null, vec![])
+    }
+
     /// The standard `setVariable` request (slice 8): write an integer value to a named local in
     /// the scope's frame. The write is recorded by the backend and re-applied on every seek
     /// replay, so reverse debugging stays truthful. Fails cleanly on the tree-walker, a non-int
@@ -1569,7 +1616,17 @@ impl DapServer {
         let mut events = self.output_events();
         let tid = self.stopped_thread_id();
         match stop {
-            Stop::Break { reason, .. } => events.push(stopped_event(dap_reason(reason), tid)),
+            Stop::Break { reason, .. } => {
+                // #1366 slice (c): a declared-cap park carries the request for the client.
+                let request = if matches!(reason, StopReason::CapPark { .. }) {
+                    self.session
+                        .as_ref()
+                        .and_then(|s| s.inspector.cap_park_request())
+                } else {
+                    None
+                };
+                events.push(break_event(reason, tid, request));
+            }
             Stop::Finished(result) => {
                 self.terminated = true;
                 // Standard DAP: an `exited` event carrying the guest's exit code precedes
@@ -1676,6 +1733,29 @@ fn trap_name(trap: &Trap) -> &'static str {
 }
 
 /// A `stopped` event for `thread_id`.
+/// A `stopped` event for an engine break: the DAP reason plus, for a #1366 host-completed cap park,
+/// the completion id (`capId`) the client answers with `provideCap`.
+fn break_event(reason: StopReason, thread_id: i64, request: Option<(String, Vec<i64>)>) -> Event {
+    let cap_id = if let StopReason::CapPark { id } = &reason {
+        Some(*id)
+    } else {
+        None
+    };
+    let mut body = vec![
+        ("reason", Json::s(dap_reason(reason))),
+        ("threadId", Json::i(thread_id)),
+        ("allThreadsStopped", Json::Bool(true)),
+    ];
+    if let Some(id) = cap_id {
+        body.push(("capId", Json::i(id as i64)));
+    }
+    if let Some((name, args)) = request {
+        body.push(("capName", Json::s(&name)));
+        body.push(("args", Json::Arr(args.into_iter().map(Json::i).collect())));
+    }
+    ("stopped", Json::obj(body))
+}
+
 fn stopped_event(reason: &'static str, thread_id: i64) -> Event {
     (
         "stopped",
@@ -1773,6 +1853,7 @@ fn dap_reason(r: StopReason) -> &'static str {
         // W4 blocking stdin: parked at a `read` awaiting input — the client shows an input prompt
         // and resumes after `provideStdin`.
         StopReason::StdinPark => "stdin",
+        StopReason::CapPark { .. } => "cap",
     }
 }
 

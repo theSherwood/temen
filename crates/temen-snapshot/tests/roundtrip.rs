@@ -6,7 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -63,6 +63,23 @@ block 0 (v0: i64, v1: i64) {
   v4 = i64.const 100
   v5 = i64.add v3 v4
   return v5
+  }
+}
+"#;
+
+// A detached-shaped domain (#1289 R1): it polls `Clock.now` (the freeze point; the saved 42 must
+// reload, not re-issue to 0), then reads `self.attest` and returns `clock + packed_attestation`. A
+// thaw whose restore defaulted the attestation would report a different packed value here, so the
+// return value proves the artifact carried the domain's exposure across the codec.
+const SRC_ATTEST: &str = r#"
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i32.const 0
+  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)
+  va = self.attest
+  v3 = i64.extend_i32_u va
+  v4 = i64.add v2 v3
+  return v4
   }
 }
 "#;
@@ -163,6 +180,103 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
     );
 }
 
+/// #1289 R1 / R3 (slice 3): a **detached-shaped** domain (its own window, `window_exposed = false`)
+/// that an ancestor may freeze (`freeze_exposed = true`) freezes as its own **root-shaped artifact**
+/// (the one codec form) and thaws through the real §12 artifact with its exposure intact. The domain
+/// reads `self.attest` after the freeze point; the thawed run reports the **restored** packed
+/// attestation (v20 Section 6, slice 2) rather than the boundary default — proving the artifact is
+/// self-describing about a detached child's placement/exposure end-to-end (not just at `restore`).
+#[test]
+fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
+    let inst = instrument(SRC_ATTEST);
+    // Detached + ancestor-freezable: window not exposed, freeze exposed, tier 1.
+    let attest = Attestation {
+        tier: 1,
+        window_exposed: false,
+        freeze_exposed: true,
+    };
+    let packed = 1i64 | (1 << 9); // tier | (window_exposed<<8) | (freeze_exposed<<9) = 513
+
+    // Baseline: uninterrupted run, clock at 42 → 42 + packed.
+    let mut host = Host::new();
+    host.clock_ns = 42;
+    host.set_attestation(attest);
+    let clk = host.grant_clock();
+    let mut fuel = 100_000u64;
+    let (baseline, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &init_durable_window(WINDOW),
+        SIZE_LOG2,
+        &mut host,
+    );
+    assert_eq!(
+        baseline,
+        Ok(vec![Value::I64(42 + packed)]),
+        "uninterrupted: clock 42 + packed detached attestation"
+    );
+
+    // Freeze at the Clock.now poll (UNWINDING from the start), then serialize the real artifact.
+    let mut fhost = Host::new();
+    fhost.clock_ns = 42;
+    fhost.set_attestation(attest);
+    let clk = fhost.grant_clock();
+    let mut win = init_durable_window(WINDOW);
+    write_state(&mut win, STATE_UNWINDING);
+    let mut fuel = 100_000u64;
+    let (frozen, snapshot) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fhost,
+    );
+    assert_eq!(
+        frozen,
+        Ok(vec![Value::I64(0)]),
+        "freeze returns a placeholder"
+    );
+    let artifact = freeze(&inst, &snapshot, &fhost).expect("freeze");
+
+    // Restore into a FRESH host that was NOT told the domain is detached — the artifact must carry it.
+    let mut thost = Host::new();
+    assert_eq!(
+        thost.attestation(),
+        Attestation::default(),
+        "the restore host starts at the root default (not detached)"
+    );
+    let window = restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.attestation(),
+        attest,
+        "restore re-stamped the detached attestation from the artifact"
+    );
+
+    // Thaw + run: the domain re-reads self.attest and must report the restored (detached) exposure.
+    let mut win = window;
+    begin_thaw(&mut win, 0);
+    let caps = thost.capture_durable_handles().expect("durable");
+    let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let mut fuel = 100_000u64;
+    let (thawed, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut thost,
+    );
+    assert_eq!(
+        thawed, baseline,
+        "thawed run == uninterrupted: saved clock (42) reloaded AND detached attestation restored"
+    );
+}
+
 #[test]
 fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
     let inst = instrument(SRC_FIBER);
@@ -244,6 +358,75 @@ fn restore_refuses_a_mismatched_module() {
     let mut thost = Host::new();
     let err = restore(&artifact, &other, &mut thost).expect_err("digest mismatch must refuse");
     assert_eq!(err, RestoreError::ModuleMismatch, "R5 identity gate");
+}
+
+/// #1289 R1 / O14 (v20): a **non-default** `Attestation` rides the artifact (Section 6) and the
+/// restore host is re-stamped with it, instead of the boundary defaulting the domain's
+/// placement/exposure. The case that matters for R1 is an ancestor-freezable detached-shaped child
+/// (`freeze_exposed = true`, `window_exposed = false`) — non-default, so it must survive the cut.
+#[test]
+fn a_non_default_attestation_round_trips_through_the_codec() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock(); // slot 0 — SRC calls Clock.now
+    let attest = Attestation {
+        tier: 1,
+        window_exposed: false,
+        freeze_exposed: true,
+    };
+    host.set_attestation(attest);
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    // A fresh restore host defaults to the root attestation; restore must overwrite it from the artifact.
+    let mut thost = Host::new();
+    assert_eq!(
+        thost.attestation(),
+        Attestation::default(),
+        "a fresh host starts at the root default"
+    );
+    restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.attestation(),
+        attest,
+        "the artifact carried the domain's attestation across the freeze→thaw boundary"
+    );
+}
+
+/// A **default** (root) attestation elides Section 6 — the artifact is byte-identical regardless of
+/// how the default was reached, and an absent section leaves the restore host as the embedder
+/// configured it (the canonical/minimal-artifact discipline the rest of the codec follows).
+#[test]
+fn a_default_attestation_elides_the_attest_section() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    let win = init_durable_window(WINDOW);
+    let artifact_default = freeze(&inst, &win, &host).expect("freeze default");
+
+    let mut host2 = Host::new();
+    host2.grant_clock();
+    host2.set_attestation(Attestation::default());
+    let artifact_set = freeze(&inst, &win, &host2).expect("freeze default-set");
+    assert_eq!(
+        artifact_default, artifact_set,
+        "a default attestation elides the section regardless of how it was set"
+    );
+
+    // An absent section leaves whatever the embedder pre-stamped on the restore host (v19 behavior).
+    let mut thost = Host::new();
+    let preset = Attestation {
+        tier: 3,
+        window_exposed: false,
+        freeze_exposed: false,
+    };
+    thost.set_attestation(preset);
+    restore(&artifact_default, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        thost.attestation(),
+        preset,
+        "an absent attest section leaves the host as the embedder configured it"
+    );
 }
 
 #[test]
