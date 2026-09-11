@@ -173,6 +173,18 @@ type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
 /// (stdout/stdin/exit/memory), a fresh `fs` grant, and — for `nimsem` — an `exec` cap. Returns the
 /// guest's captured stdout and its exit/return code. Mirrors `temen-run`'s `run_with_caps` (and the
 /// browser's `pg_setup`) but with the shared-factory `fs` + optional `exec` the multibinary driver needs.
+/// Format the tail of a phase's captured stdout for a failure message — the last ~2 KiB, lossy-decoded,
+/// so a nimony diagnostic (or the `[phase trapped: …]` reason `run_phase` appends) reaches the caller. A
+/// guest often prints its error right before it fails; without this the caller only sees a bare code.
+/// Empty output → empty string.
+fn diag_tail(out: &[u8]) -> String {
+    if out.is_empty() {
+        return String::new();
+    }
+    let start = out.len().saturating_sub(2048);
+    format!(": {}", String::from_utf8_lossy(&out[start..]).trim())
+}
+
 fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
     if onramp_check(m).is_err() {
         return (b"phase module is not a manifest module".to_vec(), -1);
@@ -241,7 +253,14 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
             _ => 0,
         }),
         Some((Err(Trap::Exit(c)), _)) => c as i64,
-        Some((Err(_), _)) => -1,
+        Some((Err(e), _)) => {
+            // A trap (not a clean exit) — e.g. a nimony front-end `unreachable` on an unsupported
+            // construct. The trap reason is the load-bearing diagnostic (the guest often prints nothing
+            // before trapping), so append it to the captured output for the caller to surface.
+            host.stdout
+                .extend_from_slice(format!("\n[phase trapped: {e:?}]").as_bytes());
+            -1
+        }
         None => -2, // bytecode engine declined (should not happen for these on-ramp guests)
     };
     (host.stdout, code)
@@ -714,9 +733,9 @@ fn compile_nim_ce_impl(
         }
         argv.push(&pnif);
         let exec = make_exec(nifler_m.clone(), nifler_ce_m.clone(), factory.clone());
-        let (_o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
+        let (o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
-            return Err(format!("nimsem failed on {stem} (code {code})"));
+            return Err(format!("nimsem failed on {stem} (code {code}){}", diag_tail(&o)));
         }
         if read(&handle, &format!("nimcache/{stem}.s.nif")).is_none() {
             return Err(format!("nimsem produced no {stem}.s.nif"));
@@ -756,9 +775,9 @@ fn compile_nim_ce_impl(
                 } else {
                     vec!["hexer", "c", &s_nif]
                 };
-                let (_o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
+                let (o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
                 if code != 0 && code != 5 {
-                    return Err(format!("hexer failed on {stem} (code {code})"));
+                    return Err(format!("hexer failed on {stem} (code {code}){}", diag_tail(&o)));
                 }
                 read(&handle, &key).ok_or(format!("hexer produced no {key}"))?
             }
