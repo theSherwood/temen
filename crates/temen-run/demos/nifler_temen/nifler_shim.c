@@ -147,6 +147,77 @@ char *strerror(int e) {
   }
 }
 
+/* `strtod` — Nim's `parseBiggestFloat` (system.nim) pre-normalizes a float literal to a clean decimal
+ * string `[-]d.dddE±exp` and then calls `strtod` for the decimal→binary step. That call sits off the
+ * bare parse path, so it was a `--stub-externs` trap — compiling any module with a float literal (e.g.
+ * `std/parseutils`, `std/strutils`) traps the guest with `Unreachable` while native nimony links libc's
+ * strtod (#1382). Provide it: a **correctly-rounded fast path** — when the significand fits in 2^53 and
+ * the decimal exponent is in [-22, 22], a single multiply/divide by an exactly-representable power of
+ * ten is correctly rounded (Clinger; the fast path every float parser uses) — which covers essentially
+ * every literal a compiler sees; a power-by-squaring fallback handles the rare out-of-range magnitude. */
+static const double NIM_POW10[] = {
+    1e0,  1e1,  1e2,  1e3,  1e4,  1e5,  1e6,  1e7,  1e8,  1e9,  1e10, 1e11,
+    1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22};
+double strtod(const char *s, char **endptr) {
+  const char *p = s;
+  while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
+  int neg = 0;
+  if (*p == '+' || *p == '-') { neg = (*p == '-'); p++; }
+  unsigned long long mant = 0; /* significand accumulated exactly until it would overflow */
+  int exp10 = 0;               /* net power-of-ten scale (fraction digits / dropped int digits / exponent) */
+  int any = 0;
+  while (*p >= '0' && *p <= '9') {
+    any = 1;
+    if (mant < 1000000000000000000ULL) mant = mant * 10 + (unsigned)(*p - '0');
+    else exp10++; /* past 18 digits: keep magnitude in the exponent, drop the low digit */
+    p++;
+  }
+  if (*p == '.') {
+    p++;
+    while (*p >= '0' && *p <= '9') {
+      any = 1;
+      if (mant < 1000000000000000000ULL) { mant = mant * 10 + (unsigned)(*p - '0'); exp10--; }
+      p++;
+    }
+  }
+  if (!any) { if (endptr) *endptr = (char *)s; return 0.0; } /* not a number */
+  if (*p == 'e' || *p == 'E') {
+    const char *pe = p + 1;
+    int eneg = 0;
+    if (*pe == '+' || *pe == '-') { eneg = (*pe == '-'); pe++; }
+    if (*pe >= '0' && *pe <= '9') {
+      int e = 0;
+      while (*pe >= '0' && *pe <= '9') { if (e < 100000) e = e * 10 + (*pe - '0'); pe++; }
+      exp10 += eneg ? -e : e;
+      p = pe;
+    }
+  }
+  if (endptr) *endptr = (char *)p;
+  double result;
+  if (mant == 0) {
+    result = 0.0;
+  } else if (exp10 >= 0 && exp10 <= 22 && mant < (1ULL << 53)) {
+    result = (double)mant * NIM_POW10[exp10]; /* exact operands ⇒ correctly rounded */
+  } else if (exp10 < 0 && exp10 >= -22 && mant < (1ULL << 53)) {
+    result = (double)mant / NIM_POW10[-exp10]; /* exact operands ⇒ correctly rounded */
+  } else {
+    /* Out of the exact fast-path range (|exp10| > 22 or a >2^53 significand): scale in exact 10^22
+     * chunks — fewer roundings than power-by-squaring and no premature overflow for mid-range magnitudes.
+     * Not guaranteed correctly rounded at the extremes (within ~1 ULP for |exp10| ≳ 23, a few ULP near
+     * DBL_MAX / smallest subnormal). Such literals are astronomically rare in source; the fast path above
+     * covers every realistic one exactly. */
+    result = (double)mant;
+    int e = exp10 < 0 ? -exp10 : exp10;
+    while (e > 0) {
+      int step = e > 22 ? 22 : e;
+      if (exp10 < 0) result /= NIM_POW10[step];
+      else result *= NIM_POW10[step];
+      e -= step;
+    }
+  }
+  return neg ? -result : result;
+}
+
 /* `mmap`/`munmap` — hexer/nimony read NIF files through `std/memfiles` (`nifreader.nim`'s
  * `vfsOpenMmap`), i.e. `mmap(nil, size, PROT_READ, MAP_SHARED, fd, offset)`. There is no host address
  * space to map into, but a read-only file map is observationally just "the file's bytes at a stable

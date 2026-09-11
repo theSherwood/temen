@@ -663,6 +663,14 @@ struct Program {
     src: Box<[Option<(u32, u32)>]>,
 }
 
+thread_local! {
+    /// Debugging aid (#1382): the function index that most recently executed `Op::Unreachable`, so a
+    /// caller can name *where* a guest trapped — the trap itself is a unit variant carrying no location.
+    /// Best-effort and single-shot (a trap ends the run); `u32::MAX` means "none recorded". Read it right
+    /// after a run returns `Err(Trap::Unreachable)`.
+    pub static LAST_UNREACHABLE_FUNC: core::cell::Cell<u32> = const { core::cell::Cell::new(u32::MAX) };
+}
+
 /// A whole compiled module: one [`Program`] per function plus each function's result types (for
 /// reconstructing typed `Value`s at the entry boundary).
 pub struct Compiled {
@@ -16897,7 +16905,10 @@ impl Vm {
                         dst,
                     });
                 }
-                Op::Unreachable => return Err(Trap::Unreachable),
+                Op::Unreachable => {
+                    LAST_UNREACHABLE_FUNC.with(|c| c.set(cur as u32)); // #1382: record where we trapped
+                    return Err(Trap::Unreachable);
+                }
                 Op::Eval {
                     inst,
                     block_base,
