@@ -358,6 +358,16 @@ pub(crate) struct Translator {
     /// exactly as a local sret call assigned to an aggregate destination does. Empty unless the
     /// linker pooled sibling units' sret procs.
     ext_sret_procs: HashMap<String, TyDesc>,
+    /// **External proc parameter types** — sibling units' procs' declared scalar param [`ValType`]s
+    /// (one per nim param, aligned to the args a call passes; aggregates by-address are `i64`), under
+    /// the stem-suffixed names this module calls them by ([`export_proc_params`]). A cross-module call
+    /// lowers to an import whose signature `call_import` would otherwise derive from the *args* — so a
+    /// narrow (`i32`) result passed to a wider (`int`/`i64`) param went unwidened, and the module
+    /// failed to verify post-link (a `TypeMismatch`, #1400). With the callee's params known here,
+    /// `call_import` coerces each scalar arg to its param type via [`expr_typed`](FuncGen::expr_typed),
+    /// exactly as the local [`call_arg`](FuncGen::call_arg) path does. Empty unless the linker pooled
+    /// sibling units' proc params.
+    ext_proc_params: HashMap<String, Vec<ValType>>,
     /// **Funcref targets** — proc names taken as a funcref (`ref.func`) anywhere in the program: a
     /// proc name in value position (a call argument, a `gvar`/field initializer), not a call head.
     /// The **funcref ABI** gives every funcref a leading `$sp` param (so an indirect call can thread
@@ -430,6 +440,7 @@ impl Translator {
             ext_funcrefs: HashMap::default(),
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
+            ext_proc_params: HashMap::default(),
             funcref_targets: HashSet::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
@@ -1751,6 +1762,56 @@ impl Translator {
     pub fn import_sret_procs(&mut self, ext: &[(String, TyDesc)]) {
         for (name, desc) in ext {
             self.ext_sret_procs.insert(name.clone(), desc.clone());
+        }
+    }
+
+    /// A module's procs under their stem-suffixed global names, mapped to their **declared scalar
+    /// param [`ValType`]s** — one per nim param, in order, exactly as [`proc_sig`](Self::proc_sig)
+    /// derives a local proc's `params` (an aggregate param is by-address, so its slot is `i64`). This
+    /// is the input the linker pools so a *cross-module* caller can coerce each argument to the
+    /// callee's real param type (the arg-width twin of [`export_sret_procs`]). Without it, a
+    /// cross-module call declared its import signature from the *arg* types, so a narrow value passed
+    /// to a wider param went unwidened and the module failed to verify (#1400). Only real procs are
+    /// listed (`importc` procs are true libc imports whose signature the shim, not a sibling unit,
+    /// defines — leave those to arg-derived typing).
+    pub fn export_proc_params(
+        root: &Node,
+        stem: &str,
+    ) -> Result<Vec<(String, Vec<ValType>)>, LengError> {
+        // Resolve named types (proctypes, enums, distinct ints) exactly as the real per-unit
+        // translation does, so `param_val_ty` classifies a funcref param as `i32` (not the `i64` a
+        // bare named-type atom collapses to) — matching the callee's actually-emitted signature. This
+        // is why `export_sret_procs` collects types too; omitting it here declared a funcref param as
+        // `i64` and a call site then widened the `ref.func` to `i64` (a fresh mismatch).
+        let mut t = Translator::new();
+        t.scan_lenient = true; // tolerate cross-unit aggregate/proctype refs while enumerating
+        t.collect_types(root)?;
+        let mut out: Vec<(String, Vec<ValType>)> = Vec::new();
+        for item in root.args() {
+            if item.tag() != Some("proc") || is_importc_proc(item) {
+                continue;
+            }
+            let a = item.args();
+            if a.len() < 3 {
+                continue;
+            }
+            let params = t.params(&a[1])?;
+            out.push((
+                format!("{}{stem}", sym_def(&a[0])?),
+                params.into_iter().map(|(_, ty)| ty).collect(),
+            ));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
+        Ok(out)
+    }
+
+    /// Pre-register **external proc params** — sibling units' procs' declared param types, under the
+    /// stem-suffixed names this module calls them by ([`export_proc_params`]). See
+    /// [`ext_proc_params`](Self::ext_proc_params): this is what lets a cross-module call coerce each
+    /// scalar arg to the callee's real param type, so a narrow value reaches a wider param widened.
+    pub fn import_proc_params(&mut self, ext: &[(String, Vec<ValType>)]) {
+        for (name, params) in ext {
+            self.ext_proc_params.insert(name.clone(), params.clone());
         }
     }
 
@@ -4757,7 +4818,14 @@ impl<'a> FuncGen<'a> {
         // arg fixed (`fixed_end == args.len()`, no buffer).
         let varargs_fixed = self.t.varargs_imports.get(name).copied();
         let fixed_end = varargs_fixed.map_or(args.len(), |f| f.min(args.len()));
-        for arg in &args[..fixed_end] {
+        // The callee's declared param types, when the linker pooled them ([`ext_proc_params`]). A
+        // scalar arg is coerced to its param type (`want`), so a narrow value passed to a wider param
+        // is widened at the call site — mirroring the local [`call_arg`] path, which passes the
+        // callee's `params` to [`expr_typed`]. Without this the import signature is derived from the
+        // arg types and a width mismatch surfaces only post-link as a verify `TypeMismatch` (#1400).
+        // Cloned up front so the per-arg `expr_typed` can borrow `self` mutably.
+        let param_tys = self.t.ext_proc_params.get(name).cloned();
+        for (i, arg) in args[..fixed_end].iter().enumerate() {
             // Aggregate args pass by address (matching by-address params); scalars by value.
             if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
                 argvals.push(addr);
@@ -4766,6 +4834,10 @@ impl<'a> FuncGen<'a> {
                 let (addr, _) = self.lvalue_addr(arg)?;
                 argvals.push(addr);
                 argtys.push(ValType::I64);
+            } else if let Some(want) = param_tys.as_ref().and_then(|p| p.get(i)).copied() {
+                let v = self.expr_typed(arg, want)?;
+                argvals.push(v.id);
+                argtys.push(v.ty);
             } else {
                 let v = self.expr(arg)?;
                 argvals.push(v.id);

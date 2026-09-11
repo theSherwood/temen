@@ -506,6 +506,31 @@ fn nim_write_runs_under_the_powerbox() {
     );
 }
 
+/// **#1400 — a cross-module call widens narrow args to the callee's param type.** `std/strutils`
+/// (like `std/unicode` and `std/times`) has a proc that passes a narrow (`i32`) result to a
+/// cross-module callee whose real parameter is `int` (`i64`). Pre-fix, `call_import` derived the
+/// import signature from the *argument* types and never coerced them, so the unwidened `i32`
+/// surfaced only after the link as a verify `TypeMismatch` (the module fails to compile in the
+/// browser). The linker now pools each proc's declared param types ([`export_proc_params`]) and
+/// `call_import` coerces every scalar arg to its param type — exactly as the local `call_arg` path
+/// already did — so the linked module verifies. A bare `import std/strutils` pulls in the offending
+/// proc; the whole-program link + verify is the gate.
+#[test]
+fn nim_strutils_cross_module_arg_widths_verify() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(&path, "import std/strutils\n");
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    temen_verify::verify_module(&m)
+        .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
+}
+
 /// **#1054 — the nim→powerbox link is unit-order-independent.** A program with a `LongString` const
 /// (a string literal ≥ 8 bytes, past hexer's small-string optimization) linked against the nim
 /// runtime must print the same correct bytes **no matter what order the whole units are linked in**.
