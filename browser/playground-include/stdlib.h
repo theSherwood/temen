@@ -7,6 +7,7 @@
 // stdlib.h ships, so a threaded lesson's pthread stacks — 256 KiB each — and any large malloc grow
 // past the modest initial window instead of hitting a fixed arena cap). `free` is a no-op (MVP:
 // no reclamation). No authority beyond the granted Memory capability, all guest C.
+#include <__pg_linkage.h>
 #include <stdarg.h>
 
 typedef unsigned long size_t;
@@ -30,204 +31,52 @@ void __vm_atomic_store32(void *p, int v);                  // store (i32)
 
 #define __PG_HEAP_BASE 268435456L // 256 MiB: above the backed prefix, in the reserved tail
 #define __PG_HDR 16L              // per-allocation header (holds the payload size; 16-byte aligned)
-static long __pg_brk = __PG_HEAP_BASE;       // next free byte (bump pointer)
-static long __pg_committed = __PG_HEAP_BASE;  // first byte past committed
-static long __pg_page = 0;                     // cached host page granularity
-static int __pg_grow_lock = 0;                 // spinlock for heap *growth* only
-
-static inline long __pg_pagesize(void) {
-  if (__pg_page == 0) {
-    long p = __vm_page_size();
-    __pg_page = p > 0 ? p : 4096L;
-  }
-  return __pg_page;
-}
-
-// Lock-free fast path (atomic fetch-add claims a unique region); only page growth is serialized, so
-// a page is mapped exactly once. `__pg_committed` is published *after* the map, so a caller seeing
-// `committed >= end` knows its region is backed.
-static inline void *malloc(size_t n) {
-  n = (n + 15UL) & ~15UL; // 16-byte align the payload
-  long total = __PG_HDR + (long)n;
-  long hdr = __vm_atomic_add(&__pg_brk, total);
-  long payload = hdr + __PG_HDR;
-  long end = hdr + total;
-  if (end > __vm_atomic_load(&__pg_committed)) {
-    while (__vm_atomic_cas32(&__pg_grow_lock, 0, 1) != 0) {
-    }
-    long cur = __vm_atomic_load(&__pg_committed);
-    if (end > cur) {
-      long pg = __pg_pagesize();
-      long need = (end - cur + (pg - 1)) & ~(pg - 1);
-      if (__vm_map(cur, need, 3) != 0) {
-        __vm_atomic_store32(&__pg_grow_lock, 0);
-        return NULL; // out of memory
-      }
-      __vm_atomic_store(&__pg_committed, cur + need);
-    }
-    __vm_atomic_store32(&__pg_grow_lock, 0);
-  }
-  *(size_t *)hdr = n;
-  return (void *)payload;
-}
-static inline void free(void *p) { (void)p; }
-static inline void *calloc(size_t nm, size_t sz) {
-  // Fresh window pages are zero-filled by `map` and the bump allocator never reuses a byte, so the
-  // payload is already zero.
-  return malloc(nm * sz);
-}
-static inline void *realloc(void *old, size_t n) {
-  if (!old) return malloc(n);
-  size_t oldn = *(size_t *)((char *)old - __PG_HDR);
-  char *p = malloc(n);
-  if (p) {
-    size_t c = oldn < n ? oldn : n;
-    for (size_t i = 0; i < c; i++) p[i] = ((char *)old)[i];
-  }
-  return p;
-}
-
-static inline void abort(void) { exit(134); }
-
-static inline int abs(int x) { return x < 0 ? -x : x; }
-static inline long labs(long x) { return x < 0 ? -x : x; }
-
-static inline int atoi(const char *s) {
-  int sign = 1, v = 0;
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
-  while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
-  return sign * v;
-}
-static inline long atol(const char *s) {
-  long sign = 1, v = 0;
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
-  while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
-  return sign * v;
-}
-static inline long strtol(const char *s, char **end, int base) {
-  long sign = 1, v = 0;
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
-  if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; base = 16; }
-  if (base == 0) base = 10;
-  for (;;) {
-    int c = *s, d;
-    if (c >= '0' && c <= '9') d = c - '0';
-    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
-    else break;
-    if (d >= base) break;
-    v = v * base + d;
-    s++;
-  }
-  if (end) *end = (char *)s;
-  return sign * v;
-}
-
-static inline unsigned long strtoul(const char *s, char **end, int base) {
-  unsigned long v = 0;
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  if (*s == '+') s++;
-  if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; base = 16; }
-  if (base == 0) base = 10;
-  for (;;) {
-    int c = *s, d;
-    if (c >= '0' && c <= '9') d = c - '0';
-    else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
-    else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
-    else break;
-    if (d >= base) break;
-    v = v * base + d;
-    s++;
-  }
-  if (end) *end = (char *)s;
-  return v;
-}
-static inline long long strtoll(const char *s, char **end, int base) {
-  long long sign = 1;
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
-  return sign * (long long)strtoul(s, end, base);
-}
-static inline unsigned long long strtoull(const char *s, char **end, int base) {
-  return (unsigned long long)strtoul(s, end, base);
-}
-static inline long long atoll(const char *s) { return strtoll(s, (char **)0, 10); }
-static inline long long llabs(long long x) { return x < 0 ? -x : x; }
-
-// `strtod` — decimal float parse (integer part, fraction, optional `e` exponent). Demo-accurate: it
-// accumulates in `double` rather than doing bignum shortest-round-trip, so the last ULP of a long
-// mantissa can differ from glibc (the same trade the `<stdio.h>` float formatter documents).
-static inline double strtod(const char *s, char **end) {
-  while (*s == ' ' || *s == '\t' || *s == '\n') s++;
-  double sign = 1;
-  if (*s == '-') { sign = -1; s++; } else if (*s == '+') s++;
-  double v = 0;
-  while (*s >= '0' && *s <= '9') v = v * 10 + (*s++ - '0');
-  if (*s == '.') {
-    s++;
-    double scale = 0.1;
-    while (*s >= '0' && *s <= '9') { v += (*s++ - '0') * scale; scale *= 0.1; }
-  }
-  if (*s == 'e' || *s == 'E') {
-    s++;
-    int esign = 1, e = 0;
-    if (*s == '-') { esign = -1; s++; } else if (*s == '+') s++;
-    while (*s >= '0' && *s <= '9') e = e * 10 + (*s++ - '0');
-    double p = 1, base = 10;
-    for (int i = 0; i < e; i++) p *= base;
-    if (esign < 0) v /= p; else v *= p;
-  }
-  if (end) *end = (char *)s;
-  return sign * v;
-}
-static inline double atof(const char *s) { return strtod(s, (char **)0); }
-// `long double` is built as `double` (chibicc's -mlong-double-64), so strtold is strtod.
-static inline long double strtold(const char *s, char **end) { return strtod(s, end); }
 
 typedef struct { int quot, rem; } div_t;
 typedef struct { long quot, rem; } ldiv_t;
-static inline div_t div(int a, int b) { div_t r; r.quot = a / b; r.rem = a % b; return r; }
-static inline ldiv_t ldiv(long a, long b) { ldiv_t r; r.quot = a / b; r.rem = a % b; return r; }
 
-// `bsearch` over a sorted array (the qsort companion).
-static inline void *bsearch(const void *key, const void *base, size_t n, size_t sz,
-                            int (*cmp)(const void *, const void *)) {
-  size_t lo = 0, hi = n;
-  const char *a = (const char *)base;
-  while (lo < hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    int c = cmp(key, a + mid * sz);
-    if (c < 0) hi = mid;
-    else if (c > 0) lo = mid + 1;
-    else return (void *)(a + mid * sz);
-  }
-  return 0;
-}
+// ---- prototypes (a program unit, #1392) --------------------------------------------------
+// Same split as <stdio.h>: a translation unit compiled decls-only (`-include __pg_decls_only.h`)
+// sees these prototypes and links against the prebuilt libc unit that carries the bodies once,
+// instead of recompiling the allocator and the string/number conversions into every program. The
+// bodies are compiled in by default, where `__PG_FN` makes them `static inline` so an unused one is
+// dead-stripped — hence the guard around the prototypes, which would otherwise make them roots.
+#ifdef __PG_LIBC_DECLS_ONLY
+void *malloc(size_t n);
+void free(void *p);
+void *calloc(size_t nm, size_t sz);
+void *realloc(void *old, size_t n);
+void abort(void);
+int abs(int x);
+long labs(long x);
+int atoi(const char *s);
+long atol(const char *s);
+long strtol(const char *s, char **end, int base);
+unsigned long strtoul(const char *s, char **end, int base);
+long long strtoll(const char *s, char **end, int base);
+unsigned long long strtoull(const char *s, char **end, int base);
+long long atoll(const char *s);
+long long llabs(long long x);
+double strtod(const char *s, char **end);
+double atof(const char *s);
+long double strtold(const char *s, char **end);
+div_t div(int a, int b);
+ldiv_t ldiv(long a, long b);
+void *bsearch(const void *key, const void *base, size_t n, size_t sz,
+              int (*cmp)(const void *, const void *));
+char *getenv(const char *name);
+int rand(void);
+void srand(unsigned s);
+void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *));
+#endif /* __PG_LIBC_DECLS_ONLY */
 
-// No environment in the sandbox powerbox — a program that reads `getenv` gets NULL (unset), which is
-// the portable "not present" path every getenv caller must already handle.
-static inline char *getenv(const char *name) { (void)name; return 0; }
-
-// Deterministic LCG (no wall clock in the sandbox).
-static unsigned long __pg_rng = 1;
-static inline int rand(void) { __pg_rng = __pg_rng * 6364136223846793005UL + 1442695040888963407UL; return (int)((__pg_rng >> 33) & 0x7fffffff); }
-static inline void srand(unsigned s) { __pg_rng = s; }
-
-// Simple qsort (insertion sort — fine for demo-sized arrays; stable enough, no recursion depth).
-static inline void qsort(void *base, size_t n, size_t sz, int (*cmp)(const void *, const void *)) {
-  char *a = base;
-  char tmp[256];
-  if (sz > sizeof(tmp)) return; // demo cap
-  for (size_t i = 1; i < n; i++) {
-    for (size_t j = i; j > 0 && cmp(a + j * sz, a + (j - 1) * sz) < 0; j--) {
-      for (size_t k = 0; k < sz; k++) tmp[k] = a[j * sz + k];
-      for (size_t k = 0; k < sz; k++) a[j * sz + k] = a[(j - 1) * sz + k];
-      for (size_t k = 0; k < sz; k++) a[(j - 1) * sz + k] = tmp[k];
-    }
-  }
-}
+// ---- bodies -----------------------------------------------------------------------------
+// In their own file, not behind an `#ifdef` here: chibicc tokenizes a header in full before the
+// preprocessor drops the skipped groups, so text left in place would still be *tokenized* by a
+// decls-only compile — which is where nearly all of its remaining time goes (measured: the seeded libc
+// bodies are ~90% of a decls-only program's compile). A separate file is never opened at all.
+#ifndef __PG_LIBC_DECLS_ONLY
+#include <__pg_stdlib_impl.h>
+#endif
 
 #endif

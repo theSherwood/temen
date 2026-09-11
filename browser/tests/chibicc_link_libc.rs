@@ -1,7 +1,12 @@
 //! **The chibicc card as separate compilation** (#1392): compile a libc unit once, compile the
 //! user's translation unit against *declarations only*, and link the two — instead of compiling the
-//! source-level libc into every program. The compile win is ~66x (a `printf` program: 9.1s of
-//! header bodies vs 138ms of prototypes), and this is the path that has to work for it.
+//! source-level libc into every program. This is the path that has to work for it, and
+//! `the_real_seeded_libc_links_as_a_prebuilt_unit` prints what it buys. Measured there on a debug
+//! build (a three-call `printf`/`fprintf`/`puts` program): **12.4 s** with the libc's bodies compiled
+//! in, **1.0 s** compiled decls-only against a prebuilt libc unit — ~12x, with the emitted IR
+//! 353 KB → 1.2 KB. The libc unit itself costs 13.6 s, paid *once* (shippable beside `chibicc.temen`).
+//! The floor — a program with no headers at all — is 71 ms, so what is left in the 1.0 s is
+//! preprocessing the *declarations*, which no amount of splitting removes.
 //!
 //! Fail-soft: SKIPs if `chibicc.temen` isn't built.
 
@@ -21,6 +26,17 @@ fn emit_object(
     extra: &[(&str, &str)],
     debug: bool,
 ) -> String {
+    emit_object_flags(chibicc, path, extra, debug, &[])
+}
+
+/// [`emit_object`] with extra compiler flags (e.g. [`temen_browser::PG_DECLS_ONLY_ARGV`]).
+fn emit_object_flags(
+    chibicc: &temen_ir::Module,
+    path: &str,
+    extra: &[(&str, &str)],
+    debug: bool,
+    flags: &[&[u8]],
+) -> String {
     let mut files: Vec<(String, Vec<u8>)> = playground_include_files();
     for (name, body) in extra {
         files.push((name.to_string(), body.as_bytes().to_vec()));
@@ -29,6 +45,7 @@ fn emit_object(
     let image = temen_fs::encode_image(&files, &dirs);
     let tu = format!("/{path}");
     let mut argv: Vec<&[u8]> = vec![b"chibicc", b"--emit-object", b"-Iinclude"];
+    argv.extend_from_slice(flags);
     if debug {
         argv.push(b"-g");
     }
@@ -228,4 +245,190 @@ int main(void) {
         "31\n",
         "the user TU read the libc unit's global through the resolved data symbol"
     );
+}
+
+/// **The payoff** (#1392): the *real* seeded libc as a prebuilt unit. The libc's bodies are compiled
+/// once (`__pg_libc.c`), the user's program is compiled against declarations only (it force-includes
+/// `__pg_decls_only.h`) so it sees prototypes only, and the two link and run — including `fprintf(stdout, …)`, which reaches the
+/// libc unit's `__pg_std` array through a resolved data symbol rather than a private copy.
+#[test]
+fn the_real_seeded_libc_links_as_a_prebuilt_unit() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    const USER: &str = r#"#include <stdio.h>
+int main(void) {
+  printf("printf %d\n", 42);
+  fprintf(stdout, "fprintf %s\n", "shared-stdout");
+  puts("puts");
+  return 0;
+}
+"#;
+    let t0 = std::time::Instant::now();
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        false,
+    );
+    let lib_ms = t0.elapsed().as_millis();
+
+    let t1 = std::time::Instant::now();
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "in.c",
+        &[("in.c", USER)],
+        false,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+    let prog_ms = t1.elapsed().as_millis();
+
+    // The same program the old way: the libc's bodies compiled into it.
+    let t2 = std::time::Instant::now();
+    let whole_ir = emit_object(&chibicc, "in.c", &[("in.c", USER)], false);
+    let whole_ms = t2.elapsed().as_millis();
+
+    // The floor: a program with no headers at all. What's left above it in the decls-only compile is
+    // tokenizing + preprocessing the header text, which no amount of splitting removes.
+    let t3 = std::time::Instant::now();
+    let bare_ir = emit_object(
+        &chibicc,
+        "bare.c",
+        &[("bare.c", "int main(void) { return 0; }\n")],
+        false,
+    );
+    let bare_ms = t3.elapsed().as_millis();
+
+    eprintln!(
+        "#1392 compile: libc unit {lib_ms} ms (once) | program decls-only {prog_ms} ms | \
+         program with libc bodies inline {whole_ms} ms | floor (no headers) {bare_ms} ms | \
+         IR {} B decls-only vs {} B whole vs {} B floor",
+        prog_ir.len(),
+        whole_ir.len(),
+        bare_ir.len()
+    );
+    assert!(
+        prog_ir.len() * 4 < whole_ir.len(),
+        "a decls-only program unit should be far smaller: {} B vs {} B",
+        prog_ir.len(),
+        whole_ir.len()
+    );
+
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+    let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
+    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    assert!(
+        out.status == STATUS_OK || out.status == STATUS_EXIT,
+        "link+run status {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "printf 42\nfprintf shared-stdout\nputs\n"
+    );
+}
+
+/// **The card's shape** (#1392): the prebuilt libc unit goes *resident* once
+/// ([`temen_browser::temen_link_lib_open`]), and each compile then hands over only the user's small
+/// program unit — to [`temen_browser::temen_link_run_lib`] to run it, or to
+/// [`temen_browser::temen_link_text_lib`] to hand a debugger the linked program's IR text. Pins the
+/// data-symbol half of that, too: `fprintf(stdout, …)` resolves `__pg_std` out of the *resident*
+/// library, which the resident table used to drop on the floor (it linked with no data symbols at
+/// all, so the whole seeded-libc path would have failed the moment it went through a handle).
+#[test]
+fn the_resident_libc_unit_serves_both_running_and_stepping() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    const USER: &str = r#"#include <stdio.h>
+int main(void) {
+  fprintf(stdout, "resident %d\n", 7);
+  return 0;
+}
+"#;
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        true,
+    );
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "in.c",
+        &[("in.c", USER)],
+        true,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+
+    let h = temen_browser::temen_link_lib_open(lib_ir.as_ptr(), lib_ir.len());
+    assert!(
+        h >= 0,
+        "the libc unit goes resident (status {})",
+        temen_browser::temen_status()
+    );
+
+    // (a) run it: one resident library, the program unit by handle.
+    let ret = temen_browser::temen_link_run_lib(
+        h,
+        prog_ir.as_ptr(),
+        prog_ir.len(),
+        b"main".as_ptr(),
+        4,
+        core::ptr::null(),
+        0,
+    );
+    assert_eq!(
+        temen_browser::temen_status(),
+        STATUS_OK,
+        "link+run against the resident libc (ret={ret})"
+    );
+    assert_eq!(
+        read_out(),
+        b"resident 7\n",
+        "`fprintf(stdout, …)` reached the resident libc's __pg_std"
+    );
+
+    // (b) step it: the same handle, the same program unit, the linked program's IR text.
+    assert_eq!(
+        temen_browser::temen_link_text_lib(h, prog_ir.as_ptr(), prog_ir.len(), b"main".as_ptr(), 4),
+        0,
+        "link-to-text against the resident libc"
+    );
+    let text = String::from_utf8(read_out()).expect("IR text is utf8");
+    assert!(
+        text.contains("debug.loc"),
+        "the linked text carries merged debug info"
+    );
+    // Both units' files survive, so a stop on either side of the link resolves. The libc unit's
+    // functions are attributed to the header the bodies live in (`__pg_stdio_impl.h`) rather than to
+    // the one-line `__pg_libc.c` that includes it — which is what a step *into* `fprintf` should show.
+    assert!(
+        text.contains("\"/in.c\"") && text.contains("__pg_stdio_impl.h"),
+        "both units' source files survive into the debug session:\n{}",
+        text.lines()
+            .filter(|l| l.contains("debug.file"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // A closed handle declines instead of linking against whatever is left in the slot.
+    temen_browser::temen_link_lib_close(h);
+    assert!(
+        temen_browser::temen_link_text_lib(h, prog_ir.as_ptr(), prog_ir.len(), b"main".as_ptr(), 4)
+            < 0,
+        "a closed handle is not linkable"
+    );
+}
+
+/// The bytes the cdylib accessors currently hold (`temen_stdout_ptr`/`_len`).
+fn read_out() -> Vec<u8> {
+    let n = temen_browser::temen_stdout_len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the accessor pair describes a live stash owned by the cdylib.
+    unsafe { core::slice::from_raw_parts(temen_browser::temen_stdout_ptr(), n) }.to_vec()
 }
