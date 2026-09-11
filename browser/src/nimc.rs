@@ -398,7 +398,7 @@ pub(crate) fn drive_op13<'p>(
             bytecode::VcpuEvent::JitInstall { handle, code } => {
                 let (funcs, types) = match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code)
                 {
-                    Ok((f, t, _wasm)) => (Ok(f), t),
+                    Ok((f, t, _wasm, _id)) => (Ok(f), t),
                     Err(t) => (Err(t), std::sync::Arc::from(Vec::new())),
                 };
                 let _ = vcpu.deliver_jit_install(funcs, types);
@@ -409,7 +409,7 @@ pub(crate) fn drive_op13<'p>(
             }
             bytecode::VcpuEvent::JitInvoke { handle, code, .. } => {
                 match crate::par_resolve_unit_rt(vcpu.host_mut(), handle, code) {
-                    Ok((funcs, types, _wasm)) => vcpu.deliver_jit_invoke(Ok(funcs), types),
+                    Ok((funcs, types, _wasm, _id)) => vcpu.deliver_jit_invoke(Ok(funcs), types),
                     Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
                 }
             }
