@@ -928,7 +928,7 @@ impl DapServer {
         // Snapshot the in-scope locals, one per name (a shadowed name shows only its innermost
         // visible declaration). `debug` borrow ends before we read/allocate.
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let vars: Vec<(String, String, VarLoc, Option<TypeId>)> = debug
+        let mut vars: Vec<(String, String, VarLoc, Option<TypeId>, bool)> = debug
             .vars
             .iter()
             .filter(|v| in_scope(v))
@@ -936,11 +936,25 @@ impl DapServer {
                 if !seen.insert(v.name.clone()) {
                     return None;
                 }
-                best_for(&v.name).map(|b| (b.name.clone(), b.ty.clone(), b.loc.clone(), b.type_id))
+                best_for(&v.name).map(|b| {
+                    let is_local = b.func == frame.pc.func;
+                    (
+                        b.name.clone(),
+                        b.ty.clone(),
+                        b.loc.clone(),
+                        b.type_id,
+                        is_local,
+                    )
+                })
             })
             .collect();
+        // The frame's **own** locals first, then the module-scoped globals — a stable partition, so
+        // declaration order is preserved within each group. Without it the pane's order follows the
+        // debug table's, which for a *linked* program starts with the library's globals: a separately
+        // compiled libc (temen#1392) put `__pg_std`/`__pg_brk`/… above the user's `i`/`acc`.
+        vars.sort_by_key(|v| !v.4);
         let mut out = Vec::new();
-        for (name, ty, loc, type_id) in vars {
+        for (name, ty, loc, type_id, _) in vars {
             // A memory-located aggregate/array (`Window`, the wasm `WindowVia`, or a global's
             // `Fixed` address) is expandable: name a `Place` at its base address (resolved per pc by
             // the Inspector).
