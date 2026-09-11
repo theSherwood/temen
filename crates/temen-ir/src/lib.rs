@@ -4691,9 +4691,116 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
         types: merged_types,
-        // Merging per-unit debug info (with the reindexed function indices) is a follow-up.
-        debug_info: None,
+        // Per-unit debug info merges like every other index space (#1392): see `merge_debug_info`.
+        debug_info: merge_debug_info(units, &fbases, &dbases),
     })
+}
+
+/// Merge every unit's [`DebugInfo`] into one table set for the linked module (#1392), reindexing each
+/// unit's entries exactly as the linker reindexes its code:
+///
+/// * **function indices** (`locs`, `vars`, `func_names`) shift by the unit's `fbase` — the same shift
+///   the unit's functions took. A [`GLOBAL_SCOPE`] var is a sentinel, not a funcidx, so it is left
+///   alone (matching `offset_func_indices`).
+/// * **file and type indices** shift by the running length of the merged tables, since each unit's
+///   `files`/`types` are appended. Nested type references ([`TypeDef::Pointer::pointee`],
+///   [`TypeDef::Array::elem`], [`Field::ty`]) shift with them. Identical file paths in two units stay
+///   two entries — consumers key on the string, and deduping would buy nothing but a map.
+/// * a global's absolute [`VarLoc::Fixed`] window address shifts by the unit's `dbase`, exactly as its
+///   data segments did. Every other [`VarLoc`] is **frame**-relative (`Window` is `data-SP + off`) or
+///   value-indexed (`Ssa`/`SsaList`/`WindowVia`), so it survives relocation unchanged.
+///
+/// `None` when the merged tables would be empty — no unit carried debug info, or each carried only a
+/// vacuous one (`parse_module_debug` yields an empty `DebugInfo` for a module with no `debug.*`
+/// directives) — so a stripped release link still produces exactly what it did before this merge.
+/// [`ProducerBlob`]s pass through verbatim: they are opaque to the middle (§6 / D-DBG-7) and nothing
+/// parses them yet, but note that indices *inside* a blob remain unit-relative — a future DWARF/DI
+/// re-emitter linking multiple units must relocate them itself.
+fn merge_debug_info(
+    units: &[LinkUnitRef<'_>],
+    fbases: &[u32],
+    dbases: &[u64],
+) -> Option<DebugInfo> {
+    let mut out = DebugInfo::default();
+    for ((u, &fbase), &dbase) in units.iter().zip(fbases).zip(dbases) {
+        let Some(di) = &u.module.debug_info else {
+            continue;
+        };
+        let file_base = out.files.len() as u32;
+        let type_base = out.types.len() as TypeId;
+        out.files.extend(di.files.iter().cloned());
+        out.types
+            .extend(di.types.iter().map(|t| offset_type_def(t, type_base)));
+        out.locs.extend(di.locs.iter().map(|l| Loc {
+            func: l.func + fbase,
+            file: l.file + file_base,
+            ..*l
+        }));
+        out.vars.extend(di.vars.iter().map(|v| VarInfo {
+            func: if v.func == GLOBAL_SCOPE {
+                GLOBAL_SCOPE
+            } else {
+                v.func + fbase
+            },
+            type_id: v.type_id.map(|t| t + type_base),
+            loc: match &v.loc {
+                VarLoc::Fixed { addr } => VarLoc::Fixed { addr: addr + dbase },
+                other => other.clone(),
+            },
+            ..v.clone()
+        }));
+        out.func_names
+            .extend(di.func_names.iter().map(|n| FuncName {
+                func: n.func + fbase,
+                name: n.name.clone(),
+            }));
+        out.blobs.extend(di.blobs.iter().cloned());
+    }
+    // Vacuous in ⇒ nothing out (the same emptiness test `temen-text`'s printer applies).
+    let empty = out.files.is_empty()
+        && out.locs.is_empty()
+        && out.types.is_empty()
+        && out.vars.is_empty()
+        && out.blobs.is_empty()
+        && out.func_names.is_empty();
+    if empty {
+        return None;
+    }
+    Some(out)
+}
+
+/// One [`TypeDef`] with its nested [`TypeId`] references shifted by `base` (see `merge_debug_info`).
+fn offset_type_def(t: &TypeDef, base: TypeId) -> TypeDef {
+    match t {
+        TypeDef::Pointer {
+            name,
+            pointee,
+            size,
+        } => TypeDef::Pointer {
+            name: name.clone(),
+            pointee: pointee + base,
+            size: *size,
+        },
+        TypeDef::Array { name, elem, count } => TypeDef::Array {
+            name: name.clone(),
+            elem: elem + base,
+            count: *count,
+        },
+        TypeDef::Aggregate { name, size, fields } => TypeDef::Aggregate {
+            name: name.clone(),
+            size: *size,
+            fields: fields
+                .iter()
+                .map(|f| Field {
+                    name: f.name.clone(),
+                    offset: f.offset,
+                    ty: f.ty + base,
+                })
+                .collect(),
+        },
+        // No nested type references.
+        TypeDef::Base { .. } | TypeDef::Opaque { .. } => t.clone(),
+    }
 }
 
 /// How one unit-local import is handled by [`link`]/[`link_with_manifest`]: statically resolved
