@@ -178,3 +178,94 @@ fn the_linked_program_carries_both_units_debug_info() {
         assert!((l.file as usize) < di.files.len(), "loc file {}", l.file);
     }
 }
+
+/// **The card's own path**, end to end through the cdylib exports the browser calls (#1392): the
+/// committed unit goes resident, `temen_run_onramp_fs` compiles the user's C as a *program unit*
+/// (`CHIBICC_PROGRAM_UNIT` — `--emit-object` against declarations only), `temen_link_encode_lib` links
+/// it against the resident unit and hands back **runnable module bytes**, and those run. No IR text
+/// round trip for the linked libc, and the card's existing run passes need no change.
+#[test]
+fn the_card_path_compiles_a_program_unit_and_links_it_through_the_cdylib() {
+    let (Some(chibicc), Some(lib_bytes)) = (asset("chibicc.temen"), asset("pg_libc.temeno")) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+        return;
+    };
+    const USER: &str = r#"#include <stdio.h>
+int main(void) {
+  printf("card %d\n", 3);
+  fprintf(stdout, "and stdout\n");
+  return 7;
+}
+"#;
+    let h = temen_browser::temen_link_lib_open(lib_bytes.as_ptr(), lib_bytes.len());
+    assert!(h >= 0, "the committed unit goes resident");
+
+    // Pass 1 — compile, exactly as the card does (empty caller image; flags pick the program unit).
+    let flags = temen_browser::CHIBICC_DEBUG_INFO | temen_browser::CHIBICC_PROGRAM_UNIT;
+    temen_browser::temen_run_onramp_fs(
+        chibicc.as_ptr(),
+        chibicc.len(),
+        core::ptr::null(),
+        0,
+        USER.as_ptr(),
+        USER.len(),
+        flags,
+    );
+    assert_eq!(
+        temen_browser::temen_status(),
+        STATUS_OK,
+        "compile status; stderr: {}",
+        String::from_utf8_lossy(&read_err())
+    );
+    let unit = read_out();
+    // The payoff, visible on the card: the emitted IR is the user's program, not a libc.
+    assert!(
+        unit.len() < 8 * 1024,
+        "a program unit should be small; got {} B",
+        unit.len()
+    );
+
+    // Pass 1b — link against the resident unit, straight to runnable module bytes.
+    assert_eq!(
+        temen_browser::temen_link_encode_lib(h, unit.as_ptr(), unit.len(), b"main".as_ptr(), 4),
+        0,
+        "link+encode against the resident unit"
+    );
+    let module = read_out();
+    let m = temen_encode::decode_module(&module).expect("the linked module decodes as runnable");
+    assert!(
+        temen_verify::verify_module(&m).is_ok(),
+        "and verifies — it is what the card hands to either tier"
+    );
+
+    // Pass 2 — run it, the card's oracle tier.
+    let run = temen_browser::onramp_exec(&m, b"");
+    assert!(
+        run.status == STATUS_OK || run.status == STATUS_EXIT,
+        "run status {}",
+        run.status
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "card 3\nand stdout\n");
+    assert_eq!(run.value, 7, "the card shows `main`'s return value");
+
+    temen_browser::temen_link_lib_close(h);
+}
+
+/// The bytes the cdylib's stdout / stderr accessors currently hold.
+fn read_out() -> Vec<u8> {
+    let n = temen_browser::temen_stdout_len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: the accessor pair describes a live stash owned by the cdylib.
+    unsafe { core::slice::from_raw_parts(temen_browser::temen_stdout_ptr(), n) }.to_vec()
+}
+
+fn read_err() -> Vec<u8> {
+    let n = temen_browser::temen_stderr_len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // SAFETY: as above.
+    unsafe { core::slice::from_raw_parts(temen_browser::temen_stderr_ptr(), n) }.to_vec()
+}

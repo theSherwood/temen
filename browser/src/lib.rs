@@ -4130,15 +4130,34 @@ pub fn playground_libc_tu() -> &'static str {
 /// header is read. A header rather than a `-D`: the committed `chibicc.temen` asset predates `-D`.
 pub const PG_DECLS_ONLY_ARGV: &[&[u8]] = &[b"-include", b"__pg_decls_only.h"];
 
+/// `flags` bit 0 on the chibicc card entries ([`temen_run_onramp_fs`], [`temen_onramp_jit_run_open_fs`]):
+/// emit chibicc's `-g` **debug section**. Off by default — the `debug.*` waist is ~a third of the
+/// emitted IR, so a clean run compiles far less; set it only when the user opts into source-level
+/// debugging (the DAP panel maps C `file:line`/locals through it).
+pub const CHIBICC_DEBUG_INFO: i32 = 1;
+
+/// `flags` bit 1 on the chibicc card entries: compile a **program unit** (#1392) rather than a whole
+/// program — `--emit-object` against libc *declarations only* ([`PG_DECLS_ONLY_ARGV`]), to be linked
+/// against the prebuilt libc unit (`web/assets/pg_libc.temeno`, resident via
+/// [`temen_link_lib_open`]). The user's compile drops ~12x because it no longer carries the seeded
+/// libc's bodies; the host then runs it with [`temen_link_run_lib`] or steps it with
+/// [`temen_link_text_lib`] instead of `temen_parse`-ing the emitted text directly.
+pub const CHIBICC_PROGRAM_UNIT: i32 = 2;
+
 /// The chibicc card's argv (shared by the bytecode [`temen_run_onramp_fs`] and the JIT
-/// [`temen_onramp_jit_run_open_fs`]). `--data-page 65536`: the compiled program runs in the browser
-/// (64 KiB wasm host page), so its read-only globals must not share a host page with writable data
-/// (D40). Debug info is **off by default** (the `debug.*` waist is ~a third of the emitted IR, so a
-/// clean run compiles far less IR); pass `debug_info` (a `-g` flag) only when the user opts into
-/// source-level debugging (the DAP panel maps C `file:line`/locals through chibicc's debug section).
-fn chibicc_card_argv(debug_info: bool) -> Vec<&'static [u8]> {
+/// [`temen_onramp_jit_run_open_fs`]), selected by `flags` — [`CHIBICC_DEBUG_INFO`] and
+/// [`CHIBICC_PROGRAM_UNIT`].
+///
+/// `--data-page 65536`: the compiled program runs in the browser (64 KiB wasm host page), so its
+/// read-only globals must not share a host page with writable data (D40). It stays on for a program
+/// unit too — the linker page-aligns each unit's data, so the alignment survives the link.
+fn chibicc_card_argv(flags: i32) -> Vec<&'static [u8]> {
     let mut argv: Vec<&'static [u8]> = vec![b"chibicc", b"--data-page", b"65536"];
-    if debug_info {
+    if flags & CHIBICC_PROGRAM_UNIT != 0 {
+        argv.push(b"--emit-object");
+        argv.extend_from_slice(PG_DECLS_ONLY_ARGV);
+    }
+    if flags & CHIBICC_DEBUG_INFO != 0 {
         argv.push(b"-g");
     }
     argv.push(b"/in.c");
@@ -4269,8 +4288,11 @@ pub fn split_multifile_source(src: &[u8]) -> Vec<(String, Vec<u8>)> {
 /// mounting the user's source at `in.c` (the guest opens `/in.c`), the built-in playground libc
 /// headers under `include/` ([`playground_include_files`] — `<stdio.h>` etc.), plus, if `img_len > 0`,
 /// any caller headers from the `encode_image` blob at `[img_ptr, img_len)` (which win on a key clash).
-/// Seeds `argv = ["chibicc", "/in.c"]` and runs. The emitted TEMEN-IR **text** comes back on
-/// `temen_stdout_ptr`/`_len`, ready to hand to [`temen_parse`] → a runnable module. The seeded headers are
+/// Seeds `argv = ["chibicc", "/in.c"]` and runs (`flags` selects it — [`CHIBICC_DEBUG_INFO`] for `-g`,
+/// [`CHIBICC_PROGRAM_UNIT`] for a linkable unit against libc declarations only). The emitted TEMEN-IR
+/// **text** comes back on `temen_stdout_ptr`/`_len`, ready to hand to [`temen_parse`] → a runnable
+/// module, or — for a program unit — to [`temen_link_run_lib`] / [`temen_link_text_lib`] against the
+/// resident prebuilt libc unit. The seeded headers are
 /// guest C compiled in on `#include`, so a `printf` program prints (over the powerbox's ambient
 /// `write`) instead of trapping on an unresolved call. Sets [`temen_status`]/[`temen_exit_code`]; returns
 /// the guest's `i64` result (`0` on any non-`OK`/`EXIT`).
@@ -4282,7 +4304,7 @@ pub extern "C" fn temen_run_onramp_fs(
     img_len: usize,
     src_ptr: *const u8,
     src_len: usize,
-    debug_info: i32,
+    flags: i32,
 ) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
@@ -4306,7 +4328,7 @@ pub extern "C" fn temen_run_onramp_fs(
             return 0;
         }
     };
-    let argv = chibicc_card_argv(debug_info != 0);
+    let argv = chibicc_card_argv(flags);
     let out = onramp_fs_exec(&m, &image, &argv, &[]);
     set(out.status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
@@ -8732,6 +8754,58 @@ pub extern "C" fn temen_link_text_lib(
     }
 }
 
+/// [`temen_link_text_lib`]'s **binary** twin: link the program unit against the resident library
+/// `handle` and stash the linked module's `temen-encode` bytes (`temen_stdout_ptr`/`_len`), ready to run
+/// on either tier — `temen_run`/`moduleInterp` or the wasm-JIT. This is what the chibicc card uses
+/// (#1392): pass 1 compiles the user's TU to a program unit, this links it against the prebuilt libc
+/// unit, and the existing run passes are unchanged — no IR text round trip for the ~350 KB of linked
+/// libc the text waist would otherwise print and reparse. Returns 0, else a negative `STATUS_*`
+/// ([`STATUS_UNSUPPORTED`] for an unknown or closed handle).
+#[no_mangle]
+pub extern "C" fn temen_link_encode_lib(
+    handle: i32,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let fail = |s: i32| {
+        set(s);
+        -s
+    };
+    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    // SAFETY: single-threaded wasm; the resident library is read (never mutated) for the link.
+    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
+    let Some(lib) = usize::try_from(handle)
+        .ok()
+        .and_then(|h| libs.get(h))
+        .and_then(Option::as_ref)
+    else {
+        return fail(STATUS_UNSUPPORTED);
+    };
+    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let unit = temen_ir::LinkUnitRef {
+        module: &lib.module,
+        exports: &lib.exports,
+        data_exports: &lib.data_exports,
+    };
+    match link_program(unit, &program, entry) {
+        Ok(m) => {
+            let bytes = temen_encode::encode_module(&m);
+            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => fail(status),
+    }
+}
+
 /// A unit's **data** symbols for the linker (the twin of [`link_lib_exports`]): a separately
 /// compiled libc publishes its globals (`errno`, allocator bookkeeping) as data symbols, and a
 /// program unit that reads one resolves it cross-unit.
@@ -9490,7 +9564,7 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
     img_len: usize,
     src_ptr: *const u8,
     src_len: usize,
-    debug_info: i32,
+    flags: i32,
 ) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     // SAFETY: the host guarantees each range is a live `temen_alloc`ation it just filled.
@@ -9514,7 +9588,7 @@ pub extern "C" fn temen_onramp_jit_run_open_fs(
             return -status;
         }
     };
-    let argv = chibicc_card_argv(debug_info != 0);
+    let argv = chibicc_card_argv(flags);
     // The play threads build imports a **shared** memory, so the emitted module must too.
     match JitOnrampRun::open_owned_run_fs(&m, JIT_RUN_WIN_LOG2, true, &image, &argv, Vec::new()) {
         Ok(r) => {

@@ -1052,6 +1052,13 @@ jobs:
           # No assets — parses in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
           node browser-durable-persist-reload-test.mjs
           node browser-play-editor-test.mjs
+          # #1392 — the chibicc card's separate-compilation path in the *wasm* cdylib: the committed
+          # prebuilt libc unit (`web/assets/pg_libc.temeno`) goes resident, the user's C compiles as a
+          # small program unit against libc declarations only, `temen_link_encode_lib` links it straight
+          # to runnable module bytes, and it runs — asserted against the whole-program path's output, so
+          # the two agree. Also prints the in-engine win (measured here: 5.4 s → 0.47 s, 11.6x; IR
+          # 511 KB → 2.7 KB). SKIPs without the wasm build or either asset.
+          node browser-pg-libc-test.mjs
           # chibicc compile-time on V8 (bytecode vs wasm-JIT) — prints the speedup and asserts the two
           # tiers emit byte-identical IR (a second guard alongside chibicc_jit.rs). Uses the committed/
           # staged chibicc.temen; SKIPs if it's absent. Timing is informational — it only FAILs on IR

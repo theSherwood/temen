@@ -260,7 +260,12 @@ compiler bug is a clean error, never an escape.
    Measured (debug, a three-call `printf`/`fprintf`/`puts` program, `browser/tests/chibicc_link_libc.rs`):
    **12.4 s → 1.0 s** (~12×), IR 353 KB → 1.2 KB; the libc unit costs 13.6 s once. The card serves both
    halves from a resident unit — `temen_link_run_lib` to run, `temen_link_text_lib` to hand a DAP
-   session the linked program's IR text with both units' merged debug info. See BROWSER.md.
+   session the linked program's IR text with both units' merged debug info. The card is wired to it
+   (`web/play.js`, fail-soft if the asset is absent or stale), and the prebuilt unit is a committed asset
+   (`web/assets/pg_libc.temeno`, built by `browser/src/genlibc.rs` through `scripts/rebuild-assets.sh`).
+   In the *wasm* engine the card's own numbers are **5.4 s → 0.46 s** (11.6×), IR 511 KB → 2.7 KB, with
+   the libc resident in ~9 ms once and the link 9 ms — gated by `browser/browser-pg-libc-test.mjs`.
+   See BROWSER.md.
 
    **→ wasm-JIT tier DONE 2026-07-28 — chibicc compiles on emitted wasm.** The card's compile pass (the
    slow half) now takes the **"wasm-JIT" toggle** (default on): chibicc's whole `_start` emits to wasm

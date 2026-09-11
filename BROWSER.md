@@ -462,11 +462,29 @@ committed asset and itself an encoded unit — so it must be regenerated on any 
 change (`ONLY=pg_libc bash scripts/rebuild-assets.sh`).
 
 Both halves of the card are served from a **resident** libc unit: `temen_link_run_lib(handle, …)` to
-run, and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to hand a DAP session the
-linked program's IR text, carrying both units' debug info (the linker merges it, `temen_ir::link`).
-A resident library now keeps its **data** symbols as well as its functions: `<stdio.h>`'s `stdout` is
-`&__pg_std[1]`, so a program unit resolves that array out of the library rather than owning a private
-copy, and the resident table used to drop those symbols on the floor.
+run, `temen_link_encode_lib(handle, prog, entry)` to get the linked program's **runnable module bytes**
+(what the card uses — it keeps the existing interpreter/wasm-JIT run passes and avoids a text round trip
+for the ~350 KB of linked libc), and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to
+hand a DAP session the linked program's IR *text*, carrying both units' debug info (the linker merges
+it, `temen_ir::link`). A resident library keeps its **data** symbols as well as its functions:
+`<stdio.h>`'s `stdout` is `&__pg_std[1]`, so a program unit resolves that array out of the library
+rather than owning a private copy, and the resident table used to drop those symbols on the floor.
+
+**The card, as wired.** `web/play.js` opens the unit once per page (`openPgLibc`) and compiles with
+`flags = -g | CHIBICC_PROGRAM_UNIT` — the second bit on `temen_run_onramp_fs` /
+`temen_onramp_jit_run_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. It is
+fail-soft in both directions: a missing asset, or a stale one that `temen_link_lib_open` declines, drops
+the card back to the whole-program compile — slow but correct. Measured in the *wasm* engine by
+`browser/browser-pg-libc-test.mjs` (the gate for this path), on a `printf`/`snprintf`/`puts`/`fprintf`
+program with `-g`:
+
+| | compile | emitted IR | link | run |
+|---|---|---|---|---|
+| whole program (libc compiled in) | 5,410 ms | 511 KB | — (`temen_parse`) | |
+| program unit + prebuilt libc | **458 ms** | **2.7 KB** | 8 ms | 4 ms |
+
+**11.6x**, with the libc unit resident in 7 ms once. What is left in the 458 ms is preprocessing the
+*declarations*; the floor (a program with no headers at all) is ~70 ms.
 
 ## Remaining work / follow-ons
 

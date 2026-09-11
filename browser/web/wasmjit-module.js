@@ -808,15 +808,18 @@ export async function primeWarmJit(ex, memory, cacheKey, shared = 1) {
 // the built-in libc headers under `/include`, and emit its `_start`. The cdylib assembles the memfs +
 // argv (`temen_onramp_jit_run_open_fs`, sharing the bytecode card's `chibicc_card_image`), so this driver
 // just hands over the module + source. The emitted TEMEN-IR comes back on `temen_stdout_*` after finish.
-export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, debugInfo = 0, cacheKey) {
+// `flags` picks how to compile: bit 0 = `-g`, bit 1 = a linkable **program unit** against libc
+// declarations only (#1392). chibicc's emitted `_start` is independent of both (the source and argv are
+// fed through the memfs, not baked into the code), so `cacheKey` stays valid across them.
+export async function runJitCompiler(ex, memory, moduleBytes, srcBytes, flags = 0, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
   const modP = Number(ex.temen_alloc(moduleBytes.length));
   const srcP = Number(ex.temen_alloc(srcBytes.length));
   u8().set(moduleBytes, modP);
   u8().set(srcBytes, srcP);
-  // Empty header image (0, 0) — the cdylib seeds the built-in playground headers itself. `debugInfo`
-  // selects chibicc's `-g` debug section (off by default, matching the bytecode `temen_run_onramp_fs`).
-  const opened = ex.temen_onramp_jit_run_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length, debugInfo);
+  // Empty header image (0, 0) — the cdylib seeds the built-in playground headers itself. `flags` is the
+  // same word the bytecode `temen_run_onramp_fs` takes.
+  const opened = ex.temen_onramp_jit_run_open_fs(modP, moduleBytes.length, 0, 0, srcP, srcBytes.length, flags);
   ex.temen_dealloc(modP, moduleBytes.length);
   ex.temen_dealloc(srcP, srcBytes.length);
   if (opened !== 0) {

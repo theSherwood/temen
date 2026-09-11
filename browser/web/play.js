@@ -1814,6 +1814,9 @@ function presentFrameData(c, w, h, rgba) {
 const readModuleStdout = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + eng.ex.temen_stdout_len()));
+const readModuleStdoutBytes = () =>
+  new Uint8Array(eng.memory.buffer).slice(
+    eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + eng.ex.temen_stdout_len());
 const readModuleStderr = () =>
   new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(
     eng.ex.temen_stderr_ptr(), eng.ex.temen_stderr_ptr() + eng.ex.temen_stderr_len()));
@@ -2455,11 +2458,46 @@ async function runModule(c) {
   }
 }
 
+// The **prebuilt libc unit** (#1392), resident for the life of the page. The seeded playground libc is
+// guest C, so it used to be re-compiled into every program on every Run — nearly the whole compile cost
+// (a `printf` program: ~9 s). It is now compiled once at build time into `assets/pg_libc.temeno`
+// (`browser/src/genlibc.rs`), and the user's C is compiled *decls-only* against the headers' prototypes
+// (`CHIBICC_PROGRAM_UNIT` = flags bit 1) and linked against this unit — ~12x cheaper.
+//
+// Fail-soft in both directions: if the asset is absent (a tree without the build) or stale (wire drift —
+// `temen_link_lib_open` declines it), the card falls back to the whole-program compile, slow but correct.
+const PG_LIBC_URL = './assets/pg_libc.temeno';
+let pgLibcHandle = -1; // >= 0 once resident; -2 once we've tried and given up
+async function openPgLibc(rec, c) {
+  if (pgLibcHandle !== -1) return pgLibcHandle;
+  let bytes;
+  try {
+    bytes = await fetchTimed(rec, c, PG_LIBC_URL);
+  } catch (e) {
+    logTo(c, `prebuilt libc unit unavailable (${e.message}); compiling the libc into the program`);
+    pgLibcHandle = -2;
+    return -2;
+  }
+  const p = eng.ex.temen_alloc(bytes.length);
+  new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const h = eng.ex.temen_link_lib_open(p, bytes.length);
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (h < 0) {
+    logTo(c, `prebuilt libc unit declined (status ${eng.ex.temen_status()} — stale asset? see AGENTS.md); ` +
+      'compiling the libc into the program');
+    pgLibcHandle = -2;
+    return -2;
+  }
+  pgLibcHandle = h;
+  return h;
+}
+
 // The in-browser C compiler (SELFHOST_C.md §7 step 5) — two Temen passes in the sandbox:
 //   1. compile: run `chibicc.temen` over the editor's C, seeded on an `fs` cap at `/in.c`
 //      (`temen_run_onramp_fs`), and capture the emitted TEMEN-IR *text* on stdout;
-//   2. encode + run: `temen_parse` that text into a module, then run it (`moduleInterp`) — the compiled
-//      program's result is its `main` return value.
+//   2. link/encode + run: with the prebuilt libc unit resident, `temen_link_encode_lib` links the emitted
+//      program unit against it straight to module bytes; otherwise `temen_parse` encodes the
+//      whole-program text. Then run it (`moduleInterp`) — the result is `main`'s return value.
 // Pass 1 (running chibicc) is the slow part, so it takes the "wasm-JIT" toggle: chibicc's whole
 // `_start` emits to wasm (333 funcs; the cap-call/float helpers bounce cross-tier), running the compile
 // several× faster than the bytecode interpreter — with a fallback to `temen_run_onramp_fs` if the emit is
@@ -2498,10 +2536,10 @@ async function runChibicc(c) {
   let cstatus, compileTier = 'interpreter';
   if (useJit) {
     try {
-      // The cdylib seeds the memfs + argv and emits `_start`; `gOn` selects the `-g` debug section.
-      // chibicc's emitted `_start` is source-independent (the C source is fed via memfs, not baked
-      // into the code), so cache it under a stable key — every compile reuses the compiled Module.
-      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, gOn, 'chibicc-compiler');
+      // The cdylib seeds the memfs + argv and emits `_start`; `flags` selects `-g` and the program-unit
+      // mode. chibicc's emitted `_start` is independent of both (the source and argv are fed via memfs,
+      // not baked into the code), so cache it under a stable key — every compile reuses the Module.
+      cstatus = await runJitCompiler(eng.ex, eng.memory, compiler, srcBytes, flags, 'chibicc-compiler');
       compileTier = 'wasm-JIT';
     } catch (e) {
       logTo(c, `wasm-JIT compile unavailable (${e.message}); falling back to the interpreter`);
@@ -2517,7 +2555,7 @@ async function runChibicc(c) {
     const view = new Uint8Array(eng.memory.buffer);
     view.set(compiler, p);
     view.set(srcBytes, sp);
-    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, gOn);
+    eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, flags);
     cstatus = eng.ex.temen_status();
     eng.ex.temen_dealloc(p, compiler.length);
     eng.ex.temen_dealloc(sp, srcBytes.length);
@@ -2531,29 +2569,44 @@ async function runChibicc(c) {
   const cstderr = readModuleStderr();
   c.el.stdout.textContent = ir; // show the emitted Temen IR
   runNote(rec, { compileTier, irBytes: ir.length });
-  logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B Temen IR in ${compileMs.toFixed(0)}ms (status ${cstatus})`);
+  logTo(c, `compiled (${compileTier}): ${srcBytes.length}B C → ${ir.length}B Temen IR` +
+    `${sep ? ' (program unit — libc prebuilt)' : ''} in ${compileMs.toFixed(0)}ms (status ${cstatus})`);
   if ((cstatus !== 0 && cstatus !== 5) || ir.length === 0) {
     setState(c, 'error', `compile failed: status ${cstatus}${cstderr ? ` — ${cstderr.trim()}` : ''}`);
     runEnd(rec, { ok: false, status: cstatus });
     return;
   }
 
-  // Pass 2 — encode the IR (temen_parse: parse + verify + encode) into a runnable module. Timed on its own
-  // so the console split shows how much of "run" is really encode vs. execution.
+  // Pass 2 — turn the emitted IR into a runnable module. With the prebuilt libc resident this is a
+  // **link** (`temen_link_encode_lib`: the program unit against the resident unit, `_start` synthesized,
+  // verified, encoded) and stays binary throughout — no text round trip for the ~350 KB of linked libc.
+  // Without it, the whole-program path: `temen_parse` (parse + verify + encode) over the emitted text.
   const tEncode = performance.now();
   const irBytes = new TextEncoder().encode(ir);
   const ip = eng.ex.temen_alloc(irBytes.length);
   new Uint8Array(eng.memory.buffer).set(irBytes, ip);
-  const ok = eng.ex.temen_parse(ip, irBytes.length);
-  const parsed = new Uint8Array(eng.memory.buffer).slice(
-    eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
+  let parsed, linkErr = '';
+  if (sep) {
+    const entry = new TextEncoder().encode('main');
+    const ep = eng.ex.temen_alloc(entry.length);
+    new Uint8Array(eng.memory.buffer).set(entry, ep);
+    const lok = eng.ex.temen_link_encode_lib(libH, ip, irBytes.length, ep, entry.length);
+    if (lok === 0) parsed = readModuleStdoutBytes();
+    else linkErr = `link failed: status ${eng.ex.temen_status()}`;
+    eng.ex.temen_dealloc(ep, entry.length);
+  } else {
+    const ok = eng.ex.temen_parse(ip, irBytes.length);
+    parsed = new Uint8Array(eng.memory.buffer).slice(
+      eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
+    if (ok !== 1) linkErr = `encode failed: ${new TextDecoder().decode(parsed)}`;
+  }
   eng.ex.temen_dealloc(ip, irBytes.length);
-  if (ok !== 1) {
-    setState(c, 'error', `encode failed: ${new TextDecoder().decode(parsed)}`);
+  if (linkErr) {
+    setState(c, 'error', linkErr);
     runEnd(rec, { ok: false });
     return;
   }
-  runStage(rec, 'encode', performance.now() - tEncode);
+  runStage(rec, sep ? 'link' : 'encode', performance.now() - tEncode);
   runNote(rec, { moduleBytes: parsed.length });
 
   // Pass 3 — run the compiled .temen artifact. It rides the wasm-JIT too (not just the compiler): the
@@ -2580,7 +2633,10 @@ async function runChibicc(c) {
   // powerbox's ambient `write`), with the emitted Temen IR below it as a divider-separated section —
   // so both the payoff and "look, real IR" are visible. A pure return-value program shows just IR.
   const progOut = r.stdout || '';
-  const irSection = `${'─'.repeat(18)} compiled to ${ir.length} B of Temen IR ${'─'.repeat(18)}\n${ir}`;
+  const irLabel = sep
+    ? `compiled to ${ir.length} B of Temen IR (a program unit — the libc is prebuilt and linked)`
+    : `compiled to ${ir.length} B of Temen IR`;
+  const irSection = `${'─'.repeat(18)} ${irLabel} ${'─'.repeat(18)}\n${ir}`;
   c.el.stdout.textContent = progOut ? `${progOut}\n${irSection}` : irSection;
   // Status line now shows the compile/run split by tier, so "where the time went" is visible on-page.
   const split = `compile ${compileMs.toFixed(0)}ms (${compileTier}) · run ${runMs.toFixed(0)}ms (${runTierName})`;
@@ -3811,21 +3867,44 @@ function dapHandle(c, reply) {
 // Fetch chibicc and compile the card's current C source to TEMEN-IR text with `-g` (the debug waist:
 // source lines + variable names), for a source-level debug session. Returns `{ ir, status, stderr }`;
 // the caller reports a failed compile. Mirrors `runChibicc`'s pass 1, always debug-on.
+//
+// Separate compilation reaches the debugger too (#1392): with the prebuilt libc unit resident, compile
+// the user's C as a program unit and hand back the **linked** program's IR text (`temen_link_text_lib`)
+// — the linker merges both units' debug info, so breakpoints on C lines and C locals still bind, and a
+// step *into* `printf` lands in the libc's own file. Same fail-soft as the run path: no unit (or a stale
+// one) falls back to the whole-program `-g` compile.
 async function chibiccCompileIR(c) {
   const compiler = await fetchModule(c.ex.url, onFetchProgress(c, baseName(c.ex.url)));
   const srcBytes = new TextEncoder().encode(c.editor.getValue());
   if (srcBytes.length === 0) return { ir: '', status: -1, stderr: 'empty source' };
+  const libH = await openPgLibc(null, c);
+  const sep = libH >= 0;
   const p = eng.ex.temen_alloc(compiler.length);
   const sp = eng.ex.temen_alloc(srcBytes.length);
   const view = new Uint8Array(eng.memory.buffer);
   view.set(compiler, p);
   view.set(srcBytes, sp);
-  eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, 1); // 1 = -g
-  const status = eng.ex.temen_status();
-  const ir = readModuleStdout();
+  // flags: bit 0 = `-g` (always, this is the debug path); bit 1 = a program unit to be linked.
+  eng.ex.temen_run_onramp_fs(p, compiler.length, 0, 0, sp, srcBytes.length, sep ? 3 : 1);
+  let status = eng.ex.temen_status();
+  let ir = readModuleStdout();
   const stderr = readModuleStderr();
   eng.ex.temen_dealloc(p, compiler.length);
   eng.ex.temen_dealloc(sp, srcBytes.length);
+  if (sep && (status === 0 || status === 5) && ir.length > 0) {
+    const unit = new TextEncoder().encode(ir), entry = new TextEncoder().encode('main');
+    const up = eng.ex.temen_alloc(unit.length);
+    const ep = eng.ex.temen_alloc(entry.length);
+    const v2 = new Uint8Array(eng.memory.buffer);
+    v2.set(unit, up);
+    v2.set(entry, ep);
+    const lok = eng.ex.temen_link_text_lib(libH, up, unit.length, ep, entry.length);
+    if (lok === 0) ir = readModuleStdout();
+    else status = eng.ex.temen_status();
+    eng.ex.temen_dealloc(up, unit.length);
+    eng.ex.temen_dealloc(ep, entry.length);
+    if (lok !== 0) return { ir: '', status, stderr: `link against the prebuilt libc failed: status ${status}` };
+  }
   return { ir, status, stderr };
 }
 
