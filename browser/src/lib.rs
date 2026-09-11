@@ -8456,11 +8456,12 @@ pub extern "C" fn temen_link_run(
         }
     };
     let lib_exports = link_lib_exports(&lib);
+    let lib_data = link_unit_data_exports(&lib);
     link_run_against(
         temen_ir::LinkUnitRef {
             module: &lib,
             exports: &lib_exports,
-            data_exports: &[],
+            data_exports: &lib_data,
         },
         prog_ptr,
         prog_len,
@@ -8590,6 +8591,140 @@ fn link_lib_exports(lib: &temen_ir::Module) -> Vec<(String, temen_ir::FuncIdx)> 
         .collect()
 }
 
+/// **Link a program against a library and hand back the linked program's IR text** (#1392) — the
+/// *debugger* path, the twin of [`temen_link_run`]'s run path. A host that wants to **step** a
+/// separately-compiled program passes this text to its DAP session (`programText`): the linker now
+/// merges both units' debug info, and the text waist carries it, so stepping and variable
+/// inspection work across the link. Read the text back through [`temen_stdout_ptr`] /
+/// [`temen_stdout_len`]; returns 0 on success, else a negative `STATUS_*` (also in [`LAST_STATUS`]).
+///
+/// This is what makes the seeded libc worth moving into a prebuilt unit: compiling the user's TU
+/// against declarations alone is ~66x faster than compiling the libc bodies into it, and that win
+/// now reaches debug sessions and not just release runs.
+#[no_mangle]
+pub extern "C" fn temen_link_text(
+    prog_ptr: *const u8,
+    prog_len: usize,
+    lib_ptr: *const u8,
+    lib_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let fail = |s: i32| {
+        set(s);
+        -s
+    };
+    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let Some(lib) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let lib_exports = link_lib_exports(&lib);
+    let lib_data = link_unit_data_exports(&lib);
+    let unit = temen_ir::LinkUnitRef {
+        module: &lib,
+        exports: &lib_exports,
+        data_exports: &lib_data,
+    };
+    match link_program(unit, &program, entry) {
+        Ok(m) => {
+            let text = temen_text::print_module(&m);
+            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), text.into_bytes()) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => fail(status),
+    }
+}
+
+/// A unit's **data** symbols for the linker (the twin of [`link_lib_exports`]): a separately
+/// compiled libc publishes its globals (`errno`, allocator bookkeeping) as data symbols, and a
+/// program unit that reads one resolves it cross-unit.
+fn link_unit_data_exports(m: &temen_ir::Module) -> Vec<(String, u64)> {
+    m.data_exports
+        .iter()
+        .map(|d| (d.name.clone(), d.offset))
+        .collect()
+}
+
+/// Link `program` (unit 1) against `lib` (unit 0), take `entry` as the program's entry, wrap it in
+/// the powerbox `_start` and verify — everything [`temen_link_run`] does *except* running. Public so
+/// a host can hand the linked program to a debugger instead (#1392): the module's IR text
+/// ([`temen_text::print_module`]) carries the debug info the linker now merges across units.
+///
+/// The program's entry is resolved through the unit's **own** export table rather than assumed to be
+/// func 0. A chibicc `--emit-object` TU exports `main` *and* its own whole-program `_start`
+/// bootstrap, and that bootstrap sits at func 0 — so the func-0 assumption picked it, whose
+/// paramless signature then failed `synth_manifest_start`'s "entry takes one i64" rule. That stale
+/// `_start` is dropped, too: a *linked* program's entry is the caller's choice, so a unit's own
+/// bootstrap export is meaningless after linking and would collide with the `_start` synthesized
+/// here. A unit that exports nothing under `entry` keeps the original convention (func 0).
+pub fn link_program(
+    lib: temen_ir::LinkUnitRef<'_>,
+    program: &temen_ir::Module,
+    entry: &str,
+) -> Result<temen_ir::Module, i32> {
+    let mut prog_exports = link_lib_exports(program);
+    prog_exports.retain(|(n, _)| n != "_start");
+    if !prog_exports.iter().any(|(n, _)| n == entry) {
+        prog_exports.push((entry.to_string(), 0));
+    }
+    let prog_data = link_unit_data_exports(program);
+    let linked = temen_ir::link_with_manifest_ref(&[
+        lib,
+        temen_ir::LinkUnitRef {
+            module: program,
+            exports: &prog_exports,
+            data_exports: &prog_data,
+        },
+    ])
+    .map_err(|_| STATUS_UNSUPPORTED)?;
+    let entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
+    let module =
+        temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;
+    // Verify before handing it on: a program that references an undefined proc links to an
+    // unresolvable manifest import / out-of-range target, which would otherwise fault deep in the
+    // engine. Reject it cleanly so a typo can't take down the playground's wasm instance.
+    if temen_verify::verify_module(&module).is_err() {
+        return Err(STATUS_UNSUPPORTED);
+    }
+    Ok(module)
+}
+
+/// [`link_program`] + run, over two already-decoded units — the native core the browser FFI and the
+/// native tests share.
+pub fn link_run_units(
+    lib: &temen_ir::Module,
+    program: &temen_ir::Module,
+    entry: &str,
+    stdin: &[u8],
+) -> PbOutcome {
+    let lib_exports = link_lib_exports(lib);
+    let lib_data = link_unit_data_exports(lib);
+    let unit = temen_ir::LinkUnitRef {
+        module: lib,
+        exports: &lib_exports,
+        data_exports: &lib_data,
+    };
+    match link_program(unit, program, entry) {
+        Ok(m) => onramp_exec(&m, stdin),
+        Err(status) => PbOutcome {
+            status,
+            value: 0,
+            exit_code: 0,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            framebuffer: None,
+        },
+    }
+}
+
 /// The shared half of [`temen_link_run`] / [`temen_link_run_lib`]: load the program unit, link it as
 /// unit 1 against `lib` (unit 0), synthesize the powerbox `_start` around `entry_name`, verify, run,
 /// and stash the outcome in the result slots. Returns the entry's value (`0` on any failure, with
@@ -8619,42 +8754,13 @@ fn link_run_against(
             return 0;
         }
     };
-    let prog_exports = [(entry_name.to_string(), 0)];
-    let linked = match temen_ir::link_with_manifest_ref(&[
-        lib,
-        temen_ir::LinkUnitRef {
-            module: &program,
-            exports: &prog_exports,
-            data_exports: &[],
-        },
-    ]) {
+    let module = match link_program(lib, &program, entry_name) {
         Ok(m) => m,
-        Err(_) => {
-            set(STATUS_UNSUPPORTED);
+        Err(status) => {
+            set(status);
             return 0;
         }
     };
-    let entry = match linked.resolve_export(entry_name) {
-        Some(e) => e,
-        None => {
-            set(STATUS_UNSUPPORTED);
-            return 0;
-        }
-    };
-    let module = match temen_ir::synth_manifest_start(linked, entry, false) {
-        Ok(m) => m,
-        Err(_) => {
-            set(STATUS_UNSUPPORTED);
-            return 0;
-        }
-    };
-    // Verify before running: a program that references an undefined proc links to an unresolvable
-    // manifest import / out-of-range target, which would otherwise fault deep in the engine. Reject
-    // it cleanly (STATUS_UNSUPPORTED) so a typo can't take down the playground's wasm instance.
-    if temen_verify::verify_module(&module).is_err() {
-        set(STATUS_UNSUPPORTED);
-        return 0;
-    }
 
     let out = onramp_exec(&module, stdin);
     set(out.status);
