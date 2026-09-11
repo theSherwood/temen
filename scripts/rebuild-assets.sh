@@ -19,7 +19,8 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc onramp shell forth uxn nifler nim_hello nim_phases nim_driver_guest lua_snapshot
+#   Steps:  leng chibicc pg_libc onramp shell forth uxn nifler nim_hello nim_phases nim_driver_guest
+#           lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -103,6 +104,20 @@ if want chibicc; then
   else
     note "chibicc SKIP/✗ (clang / llvm-link?)"
   fi
+fi
+
+# --- 2b) pg_libc.temeno (the prebuilt seeded-libc unit, #1392) ---------------------------------------
+# Self-hosted, no toolchain: runs the *committed* chibicc.temen (step 2's output) over
+# `browser/playground-include/__pg_libc.c` through the on-ramp powerbox, and encodes the emitted
+# object as a linkable unit. It is doubly wire-coupled (the chibicc asset it reads, the unit it
+# writes), so it must be regenerated on any IR / encoder / wire change — `browser/tests/pg_libc_asset.rs`
+# is the gate. `genlibc` re-decodes what it writes (exports + debug info), so no `validate` here:
+# prep_temen's powerbox assertion does not apply to a library unit.
+if want pg_libc; then
+  echo "=== [pg_libc] browser: cargo run --bin genlibc (chibicc.temen over __pg_libc.c) ==="
+  ( cd "$REPO/browser" && cargo run --release --bin genlibc ) \
+    && note "pg_libc ✓ (web/assets/pg_libc.temeno)" \
+    || note "pg_libc ✗ (chibicc.temen decodable? see output above)"
 fi
 
 # --- 3) on-ramp C guests + qjs (build-onramp-assets.mjs; also copies temen-leng into web/assets) -----

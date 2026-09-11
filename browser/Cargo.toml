@@ -21,6 +21,12 @@ path = "src/genfixture.rs"
 name = "gencorpus"
 path = "src/gencorpus.rs"
 
+# The prebuilt libc unit (#1392): runs the committed `chibicc.temen` over `__pg_libc.c` to build
+# `web/assets/pg_libc.temeno`. Self-hosted (no clang) — driven by `scripts/rebuild-assets.sh`.
+[[bin]]
+name = "genlibc"
+path = "src/genlibc.rs"
+
 # `live` adds the host-backed powerbox entry `temen_run_live`, which declares real wasm **imports**
 # (`temen_host.host_write` / `host_now_ns`). Off by default so the standard artifact stays import-free
 # (`temen_run`/`run_guest`/`temen_run_pb` need no host functions); build `--features live` for the

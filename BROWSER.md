@@ -453,12 +453,59 @@ decls-only against a prebuilt libc unit (~12x), with the emitted IR 353 KB → 1
 itself costs 13.6 s, paid *once*. The floor (a program with no headers at all) is 71 ms, so what is
 left in the 1.0 s is preprocessing the *declarations* — which no split removes.
 
+The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 144 KB, 58 function exports
+plus the `__pg_std` data symbol, built with `-g`. `browser/src/genlibc.rs` builds it by running the
+*committed* `chibicc.temen` over `__pg_libc.c` through the same on-ramp powerbox the card uses, so it
+needs only cargo (no clang, no LLVM); `scripts/rebuild-assets.sh`'s `pg_libc` step is the entry point
+and `browser/tests/pg_libc_asset.rs` is the gate. It is doubly wire-coupled — produced by one
+committed asset and itself an encoded unit — so it must be regenerated on any IR / encoder / wire
+change (`ONLY=pg_libc bash scripts/rebuild-assets.sh`).
+
 Both halves of the card are served from a **resident** libc unit: `temen_link_run_lib(handle, …)` to
-run, and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to hand a DAP session the
-linked program's IR text, carrying both units' debug info (the linker merges it, `temen_ir::link`).
-A resident library now keeps its **data** symbols as well as its functions: `<stdio.h>`'s `stdout` is
-`&__pg_std[1]`, so a program unit resolves that array out of the library rather than owning a private
-copy, and the resident table used to drop those symbols on the floor.
+run, `temen_link_encode_lib(handle, prog, entry)` to get the linked program's **runnable module bytes**
+(what the card uses — it keeps the existing interpreter/wasm-JIT run passes and avoids a text round trip
+for the ~350 KB of linked libc), and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to
+hand a DAP session the linked program's IR *text*, carrying both units' debug info (the linker merges
+it, `temen_ir::link`). A resident library keeps its **data** symbols as well as its functions:
+`<stdio.h>`'s `stdout` is `&__pg_std[1]`, so a program unit resolves that array out of the library
+rather than owning a private copy, and the resident table used to drop those symbols on the floor.
+
+**The card, as wired.** `web/play.js` opens the unit once per page (`openPgLibc`) and compiles with
+`flags = -g | CHIBICC_PROGRAM_UNIT` — the second bit on `temen_run_onramp_fs` /
+`temen_onramp_jit_run_open_fs`, which adds `--emit-object` and `-include __pg_decls_only.h`. It is
+fail-soft in both directions: a missing asset, or a stale one that `temen_link_lib_open` declines, drops
+the card back to the whole-program compile — slow but correct. Measured in the *wasm* engine by
+`browser/browser-pg-libc-test.mjs` (the gate for this path), on a `printf`/`snprintf`/`puts`/`fprintf`
+program with `-g`:
+
+| | compile | emitted IR | link | run |
+|---|---|---|---|---|
+| whole program (libc compiled in) | 5,410 ms | 511 KB | — (`temen_parse`) | |
+| program unit + prebuilt libc | **458 ms** | **2.7 KB** | 8 ms | 4 ms |
+
+**11.6x**, with the libc unit resident in 7 ms once. What is left in the 458 ms is preprocessing the
+*declarations*; the floor (a program with no headers at all) is ~70 ms.
+
+A *linked* program's merged debug-info file table starts with the **library's** files, so file 0 is no
+longer the user's source. `dapSourceName` therefore prefers the file the editor actually shows
+(`/in.c` for a chibicc card) over `debug.file 0` — aimed at file 0, breakpoints bound inside the
+prebuilt libc and never fired on a C line.
+
+**Running the playground's Chromium tests locally.** `browser-play-editor-test.mjs` (and the rest of
+the `browser-*.mjs` suite the real-browser job runs) needs the **threads** cdylib — `web/par.js`
+refuses a plain build with `engine load failed: not a threads build (no imported memory)`, and the
+page then never reaches `ready`, which looks like a harness problem rather than a missing build. Build
+it the way CI does (nightly + `rust-src`, since shared memory needs `-Z build-std`):
+
+```
+RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals   -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824   -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base   -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align   -Clink-arg=--export=__wasm_init_tls"   cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+npm install playwright@1.56.1 && npx playwright install chromium   # the version CI pins
+node browser-play-editor-test.mjs
+```
+
+A Node harness that instantiates the cdylib directly must then supply the shared `env.memory`
+(`engineImports(memory)`) and read linear memory from *it*, not from `exports.memory` — see
+`browser-pg-libc-test.mjs`, which handles either build.
 
 ## Remaining work / follow-ons
 
