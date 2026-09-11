@@ -237,6 +237,7 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     init_mem[base..].copy_from_slice(&blob);
 
     let mut fuel = u64::MAX;
+    bytecode::LAST_UNREACHABLE_FUNC.with(|c| c.set(u32::MAX)); // reset before the run (#1382)
     let outcome = bytecode::compile_and_run_capture_reserved_with_host(
         m,
         0,
@@ -256,9 +257,17 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
         Some((Err(e), _)) => {
             // A trap (not a clean exit) — e.g. a nimony front-end `unreachable` on an unsupported
             // construct. The trap reason is the load-bearing diagnostic (the guest often prints nothing
-            // before trapping), so append it to the captured output for the caller to surface.
+            // before trapping), so append it — with the trapping guest function index for `unreachable`
+            // (#1382) — to the captured output for the caller to surface.
+            let loc = match e {
+                Trap::Unreachable => match bytecode::LAST_UNREACHABLE_FUNC.with(|c| c.get()) {
+                    u32::MAX => String::new(),
+                    f => format!(" in guest fn #{f}"),
+                },
+                _ => String::new(),
+            };
             host.stdout
-                .extend_from_slice(format!("\n[phase trapped: {e:?}]").as_bytes());
+                .extend_from_slice(format!("\n[phase trapped: {e:?}{loc}]").as_bytes());
             -1
         }
         None => -2, // bytecode engine declined (should not happen for these on-ramp guests)
