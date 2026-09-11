@@ -4577,7 +4577,18 @@ impl<'p> Vcpu<'p> {
     /// callback's trap — the host must unwind the emitted unit and deliver it via
     /// [`deliver_jit_invoke_trap`](Vcpu::deliver_jit_invoke_trap) (an `Exit` included: it must
     /// resolve the invoke as the interpreted path would, not be swallowed).
-    pub fn bounce_call(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+    ///
+    /// `mirror` (#1339) is the driver's dispatch-table mirror, lent for the duration of the bounce so
+    /// a §22 `Jit.install`/`uninstall` the callback reaches — a guest whose *emitted* frame defines
+    /// and dispatches units — moves it before the emitted frame resumes; the driver rebuilds its
+    /// table when the generation advances. `None` where there is no shared table to mirror (the
+    /// native embedding), and for a §14 child, whose installs stay in its own table (#1296).
+    pub fn bounce_call(
+        &mut self,
+        target: u32,
+        io: &mut [i64],
+        mirror: Option<JitMirror<'_>>,
+    ) -> Result<usize, Trap> {
         step(&mut self.fuel, None)?; // fuel unification: the dispatch-site safepoint
         let dom = self.own_dom.as_ref().unwrap_or(&self.prog.dom);
         let slot = (target as usize) & (dom.table.len() - 1);
@@ -4636,7 +4647,7 @@ impl<'p> Vcpu<'p> {
                 Some(BounceRunCtx {
                     fiber_sp: &mut self.fiber_sp,
                     fiber_meta: &mut self.fiber_meta,
-                    jit_mirror: None,
+                    jit_mirror: mirror,
                 }),
             )?
         };
@@ -9788,13 +9799,20 @@ struct BounceRunCtx<'a> {
     jit_mirror: Option<JitMirror<'a>>,
 }
 
-/// The coop driver's dispatch-table mirror ([`CoopSched`]'s `slot_codes` / `slot_units` /
-/// `table_gen`), lent to a tier-up-region bounce so an install serviced inside it keeps the mirror
-/// exact (#1233).
-struct JitMirror<'a> {
-    codes: &'a mut Vec<i32>,
-    units: &'a mut Vec<(u32, u32)>,
-    gen: &'a mut u32,
+/// A wasm-JIT driver's dispatch-table mirror — the `slot → (domain, unit)` array and its generation
+/// — **lent** to a tier-up-region bounce so a §22 install serviced *inside* the bounce keeps the
+/// driver's table exact (#1233 on the cooperative driver, #1339 on the parallel one). Without it the
+/// mirror only moves at the pump's own install arm, and an install reached from an emitted frame
+/// leaves the driver rebuilding a stale table (the next emitted `call.dyn` traps → decline).
+///
+/// The cooperative driver lends [`CoopSched`]'s fields; the parallel driver lends its process-global
+/// mirror through [`Vcpu::bounce_call`] (its installs are shared across Workers, so the mirror must
+/// be too). A §14 child lends nothing: its installs stay in its own table (#1296).
+pub struct JitMirror<'a> {
+    /// `slot → (domain, unit)`; `None` = empty or natural-prefix.
+    pub units: &'a mut Vec<Option<(u32, u32)>>,
+    /// Bumped on every install/uninstall, so a driver rebuilds only when the mirror moved.
+    pub gen: &'a mut u32,
 }
 
 #[allow(clippy::too_many_arguments)] // the nested-drive seam: window + registry halves, all borrowed
@@ -9935,16 +9953,14 @@ fn drive_nested(
             // `None`) it stays the §22 contract's inert `CapFault`: a unit never re-installs. (A
             // `Jit.invoke` reached the same way is serviced by the arm below, #1334.)
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
+                let _ = code; // the mirror keys on the unit identity, not the (revocable) handle
                 let ((funcs, types), unit_id) = host.with(|p| resolve_jit_unit(p, h, code))?;
                 let res = match compile_module(&funcs, &types) {
                     Some(unit) => match jit_install_into(source, table, unit) {
                         Some(slot) => {
                             if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
-                                if let Some(e) = m.codes.get_mut(slot) {
-                                    *e = code;
-                                }
                                 if let Some(e) = m.units.get_mut(slot) {
-                                    *e = unit_id;
+                                    *e = Some(unit_id);
                                 }
                                 *m.gen = m.gen.wrapping_add(1); // slot mirror changed → re-sync
                             }
@@ -9961,8 +9977,8 @@ fn drive_nested(
                 let n_real = source.primary().progs.len();
                 let res = if jit_uninstall_from(source, table, slot as usize, n_real) {
                     if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
-                        if let Some(e) = m.codes.get_mut(slot as usize) {
-                            *e = -1; // a freed slot must trap in the driver's table too
+                        if let Some(e) = m.units.get_mut(slot as usize) {
+                            *e = None; // a freed slot must trap in the driver's table too
                         }
                         *m.gen = m.gen.wrapping_add(1);
                     }
@@ -11028,24 +11044,22 @@ struct CoopSched {
     /// types)` — the same one-outstanding-round-trip discipline as `pending_tierup` (a tier-up and an
     /// invoke are never outstanding at once: each is one `pump` yield). `None` off the browser driver.
     pending_jit: Option<(usize, usize, Box<[ValType]>)>,
-    /// #926 slice 2f — the driver-table **slot → code-handle mirror** for the browser B2 coop driver:
-    /// `slot_codes[s]` is the §22 code handle a guest `Jit.install`ed at dispatch slot `s` (`-1`
-    /// empty/natural), recorded at the pump's install/uninstall arms so the JS host can rebuild its
-    /// `WebAssembly.Table` at each event boundary (the twin of the single-shot pump's `slot_codes`).
-    /// Sized `1 << host.jit_table_log2()` — length 1 and unused on the native `drive` (no shared table).
-    slot_codes: Vec<i32>,
-    /// #1009: a generation counter bumped on each `Jit.install`/`Jit.uninstall` (the only `slot_codes`
+    /// #926 slice 2f / #1233 — the driver-table **slot → unit-identity mirror** for the browser B2
+    /// coop driver: `slot_units[s]` is the `(domain, unit)` a guest `Jit.install`ed at dispatch slot
+    /// `s` (`None` = empty or a natural-prefix slot), recorded wherever an install is serviced so the
+    /// JS host can rebuild its `WebAssembly.Table`. Sized `1 << host.jit_table_log2()` — length 1 and
+    /// unused on the native `drive` (no shared table).
+    ///
+    /// The key is the **unit index, not the code handle**: a handle is guest-revocable and
+    /// `compile → install → release` is the ordinary pattern (the unit stays installed, only its
+    /// handle dies), so a mirror keyed on handles lost every released unit at the next table rebuild
+    /// and nulled a live slot (`IndirectCallToNull`, #1233). The unit index is append-only, so this
+    /// key never dies while the slot is filled.
+    slot_units: Vec<Option<(u32, u32)>>,
+    /// #1009: a generation counter bumped on each `Jit.install`/`Jit.uninstall` (the only `slot_units`
     /// mutations) so the browser B2 driver rebuilds its `WebAssembly.Table` only when the mirror
-    /// changed — a dispatch-heavy card that never installs syncs the table once, not per tier-up. The
-    /// single-shot pump's `table_gen` twin (read via [`CoopRun::table_gen`]).
+    /// changed — a dispatch-heavy card that never installs syncs the table once, not per tier-up.
     table_gen: u32,
-    /// #1233 — the slot → **unit identity** `(domain, unit)` mirror beside `slot_codes`: the key the
-    /// host fetches an installed slot's emitted wasm by ([`CoopRun::slot_unit`]). A code *handle* is
-    /// guest-revocable — `Jit.release` right after `install` is the ordinary pattern (the unit stays,
-    /// its handle is revoked) — so a driver that keyed the fetch on `slot_codes` lost every released
-    /// unit at its next table rebuild (`IndirectCallToNull`). The unit index is append-only, so this
-    /// key never dies while the slot is filled. Meaningful only where `slot_codes[s] >= 0`.
-    slot_units: Vec<(u32, u32)>,
     /// #926 slice 2g — the **invoke-confined** fiber registry for a surfaced emitted `Jit.invoke`'s
     /// cross-tier bounces (the twin of [`Vcpu::invoke_fibers`]). While a `Jit.invoke` unit runs on the
     /// host, its `env.call_interp` callbacks share this registry across the invoke's several bounces (a
@@ -11223,9 +11237,8 @@ impl CoopSched {
             pending_jit: None,
             // Sized to the domain table (`Domain::new(_, host.jit_table_log2())`), so a `Jit.install`'s
             // returned slot always indexes it. `1 << 0 == 1` and unused on the native `drive`.
-            slot_codes: vec![-1i32; 1usize << host.jit_table_log2()],
+            slot_units: vec![None; 1usize << host.jit_table_log2()],
             table_gen: 0,
-            slot_units: vec![(0, 0); 1usize << host.jit_table_log2()],
             // Empty until a surfaced `Jit.invoke` bounces; populated only across that invoke's bounces.
             invoke_fibers: Vec::new(),
             suspend_on_idle: false,
@@ -11260,7 +11273,6 @@ impl CoopSched {
             page_checked,
             pending_tierup,
             pending_jit,
-            slot_codes,
             slot_units,
             table_gen,
             // The invoke-confined registry is threaded only by `CoopRun::bounce` (an emitted invoke's
@@ -13152,22 +13164,19 @@ impl CoopSched {
                             Some(k) => jit_install_into(&dom.source, &extra_envs[k].table, unit),
                         } {
                             Some(slot) => {
-                                // #926 slice 2f: mirror `slot → code` (+ `slot → unit`, #1233) so the
-                                // browser B2 driver can rebuild its `WebAssembly.Table` when the mirror
-                                // moves. The install itself always runs interpreted (a unit with a
-                                // `call.cap` never emits) — here between host events, or (#1233) inside
-                                // a tier-up region's bounce via `drive_nested`'s twin of this arm, after
-                                // which the driver re-syncs before the emitted frame resumes. Twin of
-                                // the single-shot pump's `slot_codes` recording; inert on the native drive.
+                                // #926 slice 2f: mirror `slot → (domain, unit)` so the browser B2
+                                // driver can rebuild its `WebAssembly.Table` when the mirror moves.
+                                // The install itself always runs interpreted (a unit with a `call.cap`
+                                // never emits) — here between host events, or (#1233) inside a tier-up
+                                // region's bounce via `drive_nested`'s twin of this arm, after which
+                                // the driver re-syncs before the emitted frame resumes. Inert on the
+                                // native drive (no shared table).
                                 // The mirror is the ROOT's emitted dispatch table: a §14 child's
                                 // install stays in the child's own table (#1296) — mirroring it here
                                 // would publish the child's unit into the parent's `call.dyn` slots.
                                 if tasks[ti].env.is_none() {
-                                    if let Some(e) = slot_codes.get_mut(slot) {
-                                        *e = code;
-                                    }
                                     if let Some(e) = slot_units.get_mut(slot) {
-                                        *e = unit_id; // #1233: the host's fetch key survives `release`
+                                        *e = Some(unit_id); // #1233: survives the guest's `release`
                                     }
                                     *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                                 }
@@ -13203,8 +13212,8 @@ impl CoopSched {
                     };
                     let res = if cleared {
                         // Keep the B2 mirror exact — a freed slot must trap in the JS table too.
-                        if let Some(e) = slot_codes.get_mut(slot as usize) {
-                            *e = -1;
+                        if let Some(e) = slot_units.get_mut(slot as usize) {
+                            *e = None;
                         }
                         *table_gen = table_gen.wrapping_add(1); // slot mirror changed → re-sync
                         0
@@ -13694,24 +13703,14 @@ impl CoopRun {
         &mut self.host
     }
 
-    /// #926 slice 2f — the §22 code handle installed at dispatch-table `slot` (`-1` empty/natural):
-    /// the browser B2 driver's slot mirror, from which it rebuilds its `WebAssembly.Table` at each
-    /// event boundary (a slot at or past the program's `f{i}` prefix holds an installed unit's `f0`).
-    pub fn slot_code(&self, slot: u32) -> i32 {
-        self.sched
-            .slot_codes
-            .get(slot as usize)
-            .copied()
-            .unwrap_or(-1)
-    }
-
-    /// #1233 — the `(domain, unit)` identity installed at `slot` (`None` empty/natural): the key the
-    /// host fetches the slot's emitted wasm by. Unlike [`slot_code`](Self::slot_code) it survives the
-    /// guest's `Jit.release` of the code handle (the unit stays installed; only its handle dies).
+    /// #926 slice 2f / #1233 — the `(domain, unit)` identity installed at dispatch-table `slot`
+    /// (`None` = empty or natural-prefix): the browser B2 driver's slot mirror, from which it
+    /// rebuilds its `WebAssembly.Table` when the generation moves (a slot at or past the program's
+    /// `f{i}` prefix holds an installed unit's `f0`). Keyed on the unit index rather than the §22
+    /// code handle so it survives the guest's `Jit.release` of that handle — see
+    /// [`CoopSched::slot_units`].
     pub fn slot_unit(&self, slot: u32) -> Option<(u32, u32)> {
-        (self.slot_code(slot) >= 0)
-            .then(|| self.sched.slot_units.get(slot as usize).copied())
-            .flatten()
+        self.sched.slot_units.get(slot as usize).copied().flatten()
     }
 
     /// #1009: the dispatch-table generation — bumped on each `Jit.install`/`Jit.uninstall` the
@@ -13848,7 +13847,6 @@ impl CoopRun {
             fiber_sp,
             fiber_meta,
             invoke_fibers,
-            slot_codes,
             slot_units,
             table_gen,
             ..
@@ -13867,7 +13865,6 @@ impl CoopRun {
                         fiber_meta,
                         // #1233: an install serviced inside the bounce updates the ROOT's mirror.
                         jit_mirror: Some(JitMirror {
-                            codes: slot_codes,
                             units: slot_units,
                             gen: table_gen,
                         }),

@@ -143,15 +143,34 @@ self.onmessage = async (e) => {
         __indirect_function_table: jitTable,
       },
     }).exports;
-  // Get-or-instantiate the unit for a code handle (cached per Worker); null if it has no emitted wasm.
-  const jitUnitFor = (code) => {
+  // #1339: get-or-instantiate the unit installed at `slot`, keyed and fetched by its `(domain, unit)`
+  // identity — never by the §22 code handle, which the guest revokes right after `install` (the unit
+  // stays installed, only its handle dies), so a by-handle fetch came back empty and nulled a live
+  // slot. Cached per Worker; null if the unit has no emitted wasm (interpreter-only).
+  // The **pending invoke's** unit: its code handle is live for the duration of the `Jit.invoke`, so
+  // it is the right cache key here (unlike an installed slot's — see `jitUnitForSlot`). Bytes come
+  // from the per-vCPU pending stash the event published.
+  const jitUnitForPending = () => {
+    const code = ex.temen_par_jit_code(v);
     let inst = jitInstCache.get(code);
     if (inst) return inst;
-    const len = ex.temen_par_jit_code_wasm_by_handle_len(code);
+    const len = ex.temen_par_jit_code_wasm_len(v);
     if (len === 0) return null;
-    const ptr = Number(ex.temen_par_jit_code_wasm_by_handle_ptr(code));
+    const ptr = Number(ex.temen_par_jit_code_wasm_ptr(v));
     inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
     jitInstCache.set(code, inst);
+    return inst;
+  };
+  const jitUnitForSlot = (slot) => {
+    const uid = ex.temen_par_jit_slot_unit(slot);
+    if (uid < 0n) return null;
+    let inst = jitInstCache.get(uid);
+    if (inst) return inst;
+    const len = ex.temen_par_jit_unit_wasm_by_slot_len(slot);
+    if (len === 0) return null;
+    const ptr = Number(ex.temen_par_jit_unit_wasm_by_slot_ptr(slot));
+    inst = jitInstantiate(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
+    jitInstCache.set(uid, inst);
     return inst;
   };
   // #1347: a natural-prefix slot (a program function) that the tier-up module did not emit gets a
@@ -159,6 +178,15 @@ self.onmessage = async (e) => {
   // Worker's vCPU (`temen_par_inst_call_interp` → `bounce_call`, the live window + powerbox), the
   // coop driver's `shimFor`. Instantiated once per slot (the program never changes within a run).
   const jitShims = new Map();
+  // #1339: a shim bounce on the ROOT vCPU lends the process-global §22 slot mirror, so a guest that
+  // `Jit.install`s from its *emitted* frame (Forth's outer interpreter) moves the mirror before the
+  // frame resumes; rebuild the table right there, since no event boundary intervenes. A confined
+  // child uses `temen_par_inst_call_interp` instead — its installs stay in its own table (#1296).
+  const rootCallInterp = (t, a) => {
+    const bounce = role === 'root' ? ex.temen_par_root_call_interp : ex.temen_par_inst_call_interp;
+    if (bounce(v, t, a) !== 0) throw new Error('cross-tier trap');
+    if (role === 'root' && ex.temen_par_jit_table_gen() !== jitSyncedGen) jitSyncTable();
+  };
   const jitShimFor = (slot) => {
     let f = jitShims.get(slot);
     if (f !== undefined) return f;
@@ -170,7 +198,7 @@ self.onmessage = async (e) => {
       env: {
         memory,
         trap: () => {},
-        call_interp: (t, a) => { if (ex.temen_par_inst_call_interp(v, t, a) !== 0) throw new Error('cross-tier trap'); },
+        call_interp: rootCallInterp,
       },
     }).exports['t'];
     jitShims.set(slot, f);
@@ -181,7 +209,13 @@ self.onmessage = async (e) => {
   // the tier-up module's emitted `f{slot}` if it emitted, else a bounce shim (#1347); a slot past it
   // holds an installed unit's `f0`, or null when empty/uninstalled (so a stale `call_indirect`
   // traps). Called before each invoke.
+  // #1339: rebuild only when the shared slot mirror actually moved (`temen_par_jit_table_gen`) — a
+  // run that never installs syncs once, not per invoke. The generation also covers an install made
+  // from INSIDE a bounce (see `rootCallInterp`), which the per-event sync alone would miss.
+  let jitSyncedGen = -1;
   const jitSyncTable = () => {
+    const gen = ex.temen_par_jit_table_gen();
+    if (gen === jitSyncedGen) return;
     const size = 1 << ex.temen_par_jit_table_log2();
     const nfuncs = ex.temen_par_nfuncs();
     for (let slot = 0; slot < size; slot++) {
@@ -189,11 +223,10 @@ self.onmessage = async (e) => {
         jitTable.set(slot, (emitted && emitted['f' + slot]) || jitShimFor(slot));
         continue;
       }
-      const code = ex.temen_par_jit_slot_code(slot);
-      if (code < 0) { jitTable.set(slot, null); continue; }
-      const inst = jitUnitFor(code);
+      const inst = jitUnitForSlot(slot);
       jitTable.set(slot, inst ? inst['f0'] : null);
     }
+    jitSyncedGen = gen;
   };
 
   // §14 instantiate real codegen (BROWSER.md slice 5 + VM-in-VM): a confined child whose granted-unit
@@ -560,11 +593,11 @@ self.onmessage = async (e) => {
       let unit = jitUnit;
       if (jitB2) {
         jitSyncTable();
-        unit = jitUnitFor(ex.temen_par_jit_code(v));
+        unit = jitUnitForPending();
       } else if (!unit) {
         // Runtime-`Jit.compile` path without B2: resolve the invoked unit by its code handle (each
         // Worker instantiates + caches per handle; the emitted bytes live on the shared host).
-        unit = jitUnitFor(ex.temen_par_jit_code(v));
+        unit = jitUnitForPending();
       }
       if (!unit) { ex.temen_par_deliver_jit_invoke_trap(v); continue; }
       // #717 host sync: the event's committed-extent snapshot → the unit instance's `"mapped"`
