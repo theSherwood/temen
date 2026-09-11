@@ -712,6 +712,10 @@ jobs:
     # contract of #1392 — the seeded libc's three-way linkage split (`__pg_linkage.h`), the
     # cross-unit data symbols `fprintf(stdout, …)` resolves through, and the merged debug info a
     # debug session steps on. It runs ~60 s; a header edit that breaks any of those fails the PR.
+    # `pg_libc_asset` gates the committed prebuilt libc unit (`web/assets/pg_libc.temeno`) the card
+    # links against: it is doubly wire-coupled (built by the committed `chibicc.temen`, and itself an
+    # encoded unit), so an IR / encoder / wire change must regenerate it via `scripts/rebuild-assets.sh`
+    # (ONLY=pg_libc). Two of its three tests need no compile at all, so drift surfaces in ~1 s.
     name: browser host guests (runtime-invariant gate)
     runs-on: ubuntu-latest
     # Backstop against a liveness hang (mirrors the `check` job): the invariant set
@@ -738,7 +742,7 @@ jobs:
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
             --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
-            --test chibicc_link_libc
+            --test chibicc_link_libc --test pg_libc_asset
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)

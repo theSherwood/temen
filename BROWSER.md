@@ -453,6 +453,14 @@ decls-only against a prebuilt libc unit (~12x), with the emitted IR 353 KB → 1
 itself costs 13.6 s, paid *once*. The floor (a program with no headers at all) is 71 ms, so what is
 left in the 1.0 s is preprocessing the *declarations* — which no split removes.
 
+The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 144 KB, 58 function exports
+plus the `__pg_std` data symbol, built with `-g`. `browser/src/genlibc.rs` builds it by running the
+*committed* `chibicc.temen` over `__pg_libc.c` through the same on-ramp powerbox the card uses, so it
+needs only cargo (no clang, no LLVM); `scripts/rebuild-assets.sh`'s `pg_libc` step is the entry point
+and `browser/tests/pg_libc_asset.rs` is the gate. It is doubly wire-coupled — produced by one
+committed asset and itself an encoded unit — so it must be regenerated on any IR / encoder / wire
+change (`ONLY=pg_libc bash scripts/rebuild-assets.sh`).
+
 Both halves of the card are served from a **resident** libc unit: `temen_link_run_lib(handle, …)` to
 run, and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to hand a DAP session the
 linked program's IR text, carrying both units' debug info (the linker merges it, `temen_ir::link`).
