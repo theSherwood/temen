@@ -707,6 +707,11 @@ jobs:
     # heavy self-host / asset / real-guest tests (chibicc*, jacl, bash, doom, the
     # reactor cards) stay in `browser-real` + the nightly full run — they need staged
     # assets and are slow. When you add a new inline-guest host test, add it here too.
+    # `chibicc_link_libc` is the one chibicc suite here: it needs no staging (the committed
+    # `chibicc.temen` asset, SKIPping fail-soft without it) and it gates the separate-compilation
+    # contract of #1392 — the seeded libc's three-way linkage split (`__pg_linkage.h`), the
+    # cross-unit data symbols `fprintf(stdout, …)` resolves through, and the merged debug info a
+    # debug session steps on. It runs ~60 s; a header edit that breaks any of those fails the PR.
     name: browser host guests (runtime-invariant gate)
     runs-on: ubuntu-latest
     # Backstop against a liveness hang (mirrors the `check` job): the invariant set
@@ -732,7 +737,8 @@ jobs:
             --test fork --test warm_grow --test mem_profile \
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
-            --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor
+            --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
+            --test chibicc_link_libc
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)

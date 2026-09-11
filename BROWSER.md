@@ -423,6 +423,43 @@ relocation of the library's functions, `_start` synthesis, whole-module verify, 
 next cut is a pre-laid-out unit 0 (relocate the library once, append only the program's functions
 and re-resolve its edges) — a linker refactor, tracked on #1373.
 
+## Separate compilation for the chibicc card: a prebuilt libc unit (#1392)
+
+A C compile in the playground spent nearly all its time on the part of the program the *user did not
+write*: the seeded `browser/playground-include/` libc is guest C, so its bodies were re-compiled into
+every program on every Run (measured on the issue: 8.9 s for a `printf` program, 12.2 s for a
+graphics lesson, against 182 ms for an empty `main` with no headers).
+
+The seeded headers are now split so the libc can be compiled **once** as its own unit and linked:
+
+- `__pg_linkage.h` defines `__PG_FN` / `__PG_DATA` — the linkage of every seeded definition, in the
+  three ways it gets compiled. Whole program (the default, unchanged): `static inline`, which is what
+  lets chibicc's `mark_live` pass dead-strip an unused `snprintf`/`qsort` (external linkage instead
+  costs +8% IR on a three-call `printf` program). The libc unit (`__PG_LIBC_UNIT`): external, so
+  `--emit-object` publishes each body in the unit's export table. A program unit
+  (`__PG_LIBC_DECLS_ONLY`): the bodies are absent entirely.
+- The bodies live in their **own files** (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`), included from the
+  header only when the bodies are wanted — not behind an `#ifdef` in place. chibicc tokenizes a header
+  in full before the preprocessor drops skipped groups, so body text left in place is still
+  *tokenized* by a decls-only compile: moving it out took that compile from 370 ms to 108 ms.
+- `browser/playground-include/__pg_libc.c` is the libc unit's TU (`temen_browser::playground_libc_tu`),
+  and `PG_DECLS_ONLY_ARGV` (`-include __pg_decls_only.h`) is what puts a program unit in decls-only
+  mode. A seeded header rather than a `-D`, because the committed `chibicc.temen` asset predates
+  chibicc's `-D`.
+
+Measured by `browser/tests/chibicc_link_libc.rs` on a debug build, a three-call
+`printf`/`fprintf`/`puts` program: **12.4 s** with the libc's bodies compiled in, **1.0 s**
+decls-only against a prebuilt libc unit (~12x), with the emitted IR 353 KB → 1.2 KB. The libc unit
+itself costs 13.6 s, paid *once*. The floor (a program with no headers at all) is 71 ms, so what is
+left in the 1.0 s is preprocessing the *declarations* — which no split removes.
+
+Both halves of the card are served from a **resident** libc unit: `temen_link_run_lib(handle, …)` to
+run, and `temen_link_text_lib(handle, prog, entry)` — the debugger twin — to hand a DAP session the
+linked program's IR text, carrying both units' debug info (the linker merges it, `temen_ir::link`).
+A resident library now keeps its **data** symbols as well as its functions: `<stdio.h>`'s `stdout` is
+`&__pg_std[1]`, so a program unit resolves that array out of the library rather than owning a private
+copy, and the resident table used to drop those symbols on the floor.
+
 ## Remaining work / follow-ons
 
 Everything in the phase tracker is landed; this is the open list — each item its own slice, none a
