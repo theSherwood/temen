@@ -486,6 +486,27 @@ program with `-g`:
 **11.6x**, with the libc unit resident in 7 ms once. What is left in the 458 ms is preprocessing the
 *declarations*; the floor (a program with no headers at all) is ~70 ms.
 
+A *linked* program's merged debug-info file table starts with the **library's** files, so file 0 is no
+longer the user's source. `dapSourceName` therefore prefers the file the editor actually shows
+(`/in.c` for a chibicc card) over `debug.file 0` — aimed at file 0, breakpoints bound inside the
+prebuilt libc and never fired on a C line.
+
+**Running the playground's Chromium tests locally.** `browser-play-editor-test.mjs` (and the rest of
+the `browser-*.mjs` suite the real-browser job runs) needs the **threads** cdylib — `web/par.js`
+refuses a plain build with `engine load failed: not a threads build (no imported memory)`, and the
+page then never reaches `ready`, which looks like a harness problem rather than a missing build. Build
+it the way CI does (nightly + `rust-src`, since shared memory needs `-Z build-std`):
+
+```
+RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals   -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824   -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base   -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align   -Clink-arg=--export=__wasm_init_tls"   cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown
+npm install playwright@1.56.1 && npx playwright install chromium   # the version CI pins
+node browser-play-editor-test.mjs
+```
+
+A Node harness that instantiates the cdylib directly must then supply the shared `env.memory`
+(`engineImports(memory)`) and read linear memory from *it*, not from `exports.memory` — see
+`browser-pg-libc-test.mjs`, which handles either build.
+
 ## Remaining work / follow-ons
 
 Everything in the phase tracker is landed; this is the open list — each item its own slice, none a

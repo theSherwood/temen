@@ -50,9 +50,15 @@ int main(void) {
 `;
 const EXPECT = 'i=1\ni=2\ni=3\npi=3.14\nand stdout\n';
 
-const { instance } = await WebAssembly.instantiate(readFileSync(WASM), engineImports());
-const ex = instance.exports;
-const u8 = () => new Uint8Array(ex.memory.buffer);
+// Works on either cdylib build: the threads one imports a shared `env.memory` (what the real-browser
+// job builds, and what `web/par.js` gives the page), the plain one owns its own.
+const mod = await WebAssembly.compile(readFileSync(WASM));
+const shared = WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')
+  ? new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }) // mirrors par.js / the build's --max-memory
+  : null;
+const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(shared));
+const memory = shared || ex.memory;
+const u8 = () => new Uint8Array(memory.buffer);
 const enc = new TextEncoder(), dec = new TextDecoder();
 // Every load re-reads `ex.memory.buffer`: `temen_alloc` can grow (and so detach) linear memory.
 const load = (b) => { const p = Number(ex.temen_alloc(b.length)); u8().set(b, p); return p; };

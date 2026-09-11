@@ -2531,7 +2531,12 @@ async function runChibicc(c) {
   setState(c, 'running', `compiling…${useJit ? ' [wasm-JIT]' : ''}`);
   // `-g` iff the card's "debug info" checkbox is ticked (else clean, fast IR — see `temen_run_onramp_fs`).
   const gOn = c.el.gflag && c.el.gflag.checked ? 1 : 0;
-  runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn });
+  // Separate compilation (#1392): with the prebuilt libc unit resident, compile the user's TU as a
+  // *program unit* against libc declarations only and link — instead of compiling the libc in.
+  const libH = await openPgLibc(rec, c);
+  const sep = libH >= 0;
+  const flags = gOn | (sep ? 2 /* CHIBICC_PROGRAM_UNIT */ : 0);
+  runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn, prebuiltLibc: sep });
   const tCompile = performance.now();
   let cstatus, compileTier = 'interpreter';
   if (useJit) {
@@ -3753,7 +3758,15 @@ let dapSource = 'source.temt'; // the DAP source path breakpoints target this se
 // one, else the name the engine's auto debug info uses (temen-text's AUTO_DEBUG_FILE = "source.temt"), so
 // breakpoints bind for a hand-written program with no explicit `debug` section. For chibicc this reads
 // the *compiled IR*'s `debug.file` (`/in.c`) — the C editor lines still map through chibicc's debug.loc.
-function dapSourceName(src) {
+//
+// `prefer` names the file the editor actually shows, and wins when the IR declares it (#1392): a
+// *linked* program's merged file table starts with the **library's** files — the prebuilt libc's
+// `include/__pg_stdio_impl.h` is file 0 — so file 0 is no longer the user's source, and breakpoints
+// aimed at it would bind in the libc and never fire on a C line.
+function dapSourceName(src, prefer) {
+  if (prefer && new RegExp(`debug\\.file\\s+\\d+\\s+"${prefer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`).test(src)) {
+    return prefer;
+  }
   const m = /debug\.file\s+0\s+"([^"]+)"/.exec(src);
   return m ? m[1] : 'source.temt';
 }
@@ -3941,7 +3954,9 @@ async function startDebug(c) {
   dapWatch = new Set();
   dapStopped = 1;
   dapThread = 1;
-  dapSource = dapSourceName(programText); // breakpoints target the launched program's `debug.file`
+  // Breakpoints target the launched program's `debug.file`. For a chibicc card that is the memfs path
+  // the card compiles (`/in.c` — `chibicc_card_argv`), which after a link is not file 0 any more.
+  dapSource = dapSourceName(programText, c.ex.kind === 'chibicc' ? '/in.c' : null);
   c.el.result.textContent = '';
   c.el.dbgVars.innerHTML = '';
   // Clear the output pane for a chibicc session — the guest's own stdout (its `printf`s under the I/O
