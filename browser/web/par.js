@@ -40,6 +40,14 @@ export async function loadEngine() {
         const h = globalThis.__temen_webgpu_op;
         return h ? BigInt(h(op, a, b, c, ptr, len, memory)) : -1n;
       },
+      // The JS-defined powerbox's seam (`web/powerbox.js`, `src/jspb.rs`): one guest capability call —
+      // `slot` says which name the page bound, `mem` is the opaque handle to the calling guest's
+      // window. A no-op (-ENOSYS) unless a page installs a servicer on `globalThis.__temen_js_cap_call`
+      // (`definePowerbox` does, for the duration of its run). Returns a BigInt (the import is i64).
+      js_cap_call: (slot, op, argsPtr, nArgs, mem) => {
+        const h = globalThis.__temen_js_cap_call;
+        return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;
+      },
       // The live-stdout tee (`temen_run_onramp_stream`): each write's [ptr,ptr+len) in linear memory.
       // A no-op unless a page installs a sink on `globalThis.__temen_stdout_chunk` (play.js does during a
       // streaming Run) — it receives a fresh copy of the chunk (the wasm memory may move after).

@@ -672,6 +672,13 @@ jobs:
           cargo run --bin gencorpus
           cargo build --release --lib --target wasm32-unknown-unknown
           node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
+      # A powerbox defined in JS (BROWSER.md): the `temen_host.js_cap_call` import, the `temen_jspb_*`
+      # exports and the shipped `web/powerbox.js` end to end — a JS capability reads the guest's window,
+      # another writes it back, and an import the page never bound refuses the run. Node only (no
+      # browser): it reuses the wasm32 build above.
+      - name: JS-defined powerbox (headless)
+        working-directory: browser
+        run: node browser-jspb-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 
   browser-jit-host-gates:
     # The browser crate's Rust **host** tests (built for the runner, not wasm) run a real compiler
@@ -742,7 +749,7 @@ jobs:
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
             --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
-            --test chibicc_link_libc --test pg_libc_asset
+            --test chibicc_link_libc --test pg_libc_asset --test jspb
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)
