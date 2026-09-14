@@ -11788,6 +11788,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     Some(cm) => {
                                         ch.bind_child_manifest(&cm.imports, &cm.types).is_ok()
                                     }
+                                    // #1234: a **same-module** child runs our program, so its import
+                                    // manifest *is* ours — bind it against the child's own attenuated
+                                    // powerbox, through the same binder and the same `CHILD_BINDABLE`
+                                    // policy a separate-module child goes through. Without it a guest
+                                    // that nests a confined copy of itself (the Forth `sandbox` word)
+                                    // `CapFault`s on its first `call.import`, holding a granted
+                                    // `stdout`/`jit` it has no way to reach. Only when the spawn
+                                    // actually handed it caps by name: a grant-less child was given
+                                    // nothing to bind, so its slots stay empty and fail closed on use
+                                    // exactly as before.
+                                    None if !named.is_empty() => {
+                                        let (im, ty) = {
+                                            let hg = host.lock_unpoisoned();
+                                            (
+                                                hg.module_imports(SELF_MODULE),
+                                                hg.module_types(SELF_MODULE),
+                                            )
+                                        };
+                                        match (im, ty) {
+                                            (Some(im), Some(ty)) => {
+                                                ch.bind_same_module_manifest(&im, &ty).is_ok()
+                                            }
+                                            _ => true,
+                                        }
+                                    }
                                     None => true,
                                 };
                                 if !manifest_ok {
@@ -18525,6 +18550,21 @@ impl BoundImport {
         }
     }
 
+    /// An **unbound `required`** entry (#1234): the slot is declared but nothing is bound, so
+    /// `call.import` through it is a fail-closed `CapFault` *and* `import.attach` may not retarget
+    /// it (unlike an empty `rebindable` slot). What a same-module §14 child gets for an import it
+    /// inherited from its parent's manifest and was granted nothing for — see
+    /// [`Host::bind_same_module_manifest`].
+    pub fn withheld() -> BoundImport {
+        BoundImport {
+            type_id: 0,
+            op: 0,
+            handle: 0,
+            bound: false,
+            rebindable: false,
+        }
+    }
+
     /// A `rebindable` entry: `handle` is the initial binding (`Some`) or the slot starts empty
     /// (`None` — `call.import` traps until an `import.attach` fills it). The `(type_id, op)`
     /// template is fixed either way: attach swaps *which object*, never *which interface*.
@@ -18755,6 +18795,12 @@ impl Default for Host {
         Host::new()
     }
 }
+
+/// The spawn-record `module` selector meaning **this module** — a §14 child that runs the parent's
+/// own program rather than a granted separate `Module` (CONSOLIDATION.md §3d, [`temen_ir::SpawnRec`]).
+/// `Host::module_imports`/`module_types` accept it so a same-module child's manifest is fetched
+/// through the same call as a separate-module child's (#1234).
+pub const SELF_MODULE: i32 = -1;
 
 impl Host {
     pub fn new() -> Host {
@@ -19089,12 +19135,24 @@ impl Host {
     /// JIT's op-13 child builder reads it (via `temen_run::child_bind_imports`) to bind the child's
     /// slots — the same manifest the interpreter's inline spawn reads from its `ModuleGrant`.
     pub fn module_imports(&self, handle: i32) -> Option<Arc<[temen_ir::Import]>> {
+        if handle == SELF_MODULE {
+            return self
+                .self_module
+                .as_ref()
+                .map(|m| Arc::from(m.imports.clone()));
+        }
         self.resolve_module(handle).ok().map(|g| g.imports.clone())
     }
 
     /// The type section of a granted §14 `Module` (§3.5): read beside [`Host::module_imports`]
     /// by the child-manifest binder to resolve each import's requirement set.
     pub fn module_types(&self, handle: i32) -> Option<Arc<[temen_ir::TypeEntry]>> {
+        if handle == SELF_MODULE {
+            return self
+                .self_module
+                .as_ref()
+                .map(|m| Arc::from(m.types.clone()));
+        }
         self.resolve_module(handle).ok().map(|g| g.types.clone())
     }
 
@@ -19114,30 +19172,80 @@ impl Host {
     ///    import index; callers surface `-EINVAL` before any child code runs).
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
-    /// lockstep).
+    /// lockstep). [`Host::bind_same_module_manifest`] is the same walk with step 3 softened — see
+    /// there for why a same-module child may not refuse over an unmet `required` slot.
     pub fn bind_child_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
+        self.bind_manifest(imports, tsec, false)
+    }
+
+    /// #1234 — [`Host::bind_child_manifest`] for a §14 **same-module** child: the identical walk,
+    /// except that a `required` slot with nothing to bind is left **empty** (fail-closed at use,
+    /// and not attachable) instead of refusing the spawn.
+    ///
+    /// The difference is whose manifest it is. A separate-module child's manifest describes *that
+    /// child's* own needs, so an unmet `required` import is a real instantiation failure and §3.3
+    /// says withhold. A same-module child runs the **parent's** program, so its manifest is the
+    /// parent's entire import surface — it never declared those needs, and a parent that re-grants
+    /// two of its seven capabilities would otherwise be unable to nest at all. The authority story
+    /// is unchanged either way: an empty slot `CapFault`s on use, so a child still reaches exactly
+    /// what it was granted.
+    pub fn bind_same_module_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+    ) -> Result<(), u32> {
+        self.bind_manifest(imports, tsec, true)
+    }
+
+    fn bind_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+        lenient: bool,
+    ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
         }
-        let policy = |name: &str| match name {
-            "write" => Some((cap_id::STREAM, 1u32)),
-            "read" => Some((cap_id::STREAM, 0u32)),
-            "exit" => Some((cap_id::EXIT, 0u32)),
-            // §3e/§4 memory management (`vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` = ops 0/1/2/3 on
-            // the `AddressSpace` cap — the same map the reference resolver uses, `temen-run` §7). An
-            // allocating §14 child (a real compiler phase's `malloc`) binds these to the child's own
-            // auto-granted `AddressSpace` (`first_of` below), whose range is exactly `[0, child_size)` —
-            // so a child grows its heap only inside its carve (confinement, §2, unchanged), rather than
-            // `CapFault`ing on its first `malloc`.
-            "vm_map" => Some((cap_id::ADDRESS_SPACE, 0u32)),
-            "vm_unmap" => Some((cap_id::ADDRESS_SPACE, 1u32)),
-            "vm_protect" => Some((cap_id::ADDRESS_SPACE, 2u32)),
-            "vm_page_size" => Some((cap_id::ADDRESS_SPACE, 3u32)),
-            _ => None,
+        // Which import names a §14 child may bind, as **data** over the one shared name→cap table
+        // ([`temen_ir::default_cap_resolver`], invariant 15) rather than a second copy of it. This
+        // list is the confinement-relevant half and is meant to be read at a glance; the
+        // `(type_id, op)` each name resolves to is not restated here.
+        //
+        // `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`: an allocating §14 child (a real compiler
+        // phase's `malloc`) binds these to the child's own auto-granted `AddressSpace` (`first_of`
+        // below), whose range is exactly `[0, child_size)` — so a child grows its heap only inside
+        // its own window (confinement, §2, unchanged) rather than `CapFault`ing on its first
+        // `malloc`.
+        //
+        // `vm_jit_*` (#1234): a child holding a **granted** `Jit` binds the §22 driver ops, so a
+        // guest that compiles code can spawn a confined copy of itself that can too — the Forth
+        // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
+        // is what confers the authority; this list only lets the child's manifest *reach* it.
+        const CHILD_BINDABLE: &[&str] = &[
+            "write",
+            "read",
+            "exit",
+            "vm_map",
+            "vm_unmap",
+            "vm_protect",
+            "vm_page_size",
+            "vm_jit_compile",
+            "vm_jit_compile_linked",
+            "vm_jit_invoke2",
+            "vm_jit_release",
+            "vm_jit_install",
+            "vm_jit_uninstall",
+        ];
+        let policy = |name: &str| {
+            CHILD_BINDABLE
+                .contains(&name)
+                .then(|| temen_ir::default_cap_resolver(name))
+                .flatten()
+                .map(|c| (c.type_id, c.op))
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {
             (0..CAP).find_map(|slot| {
@@ -19176,6 +19284,18 @@ impl Host {
         let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
+            // Whether an unmet slot may be left empty rather than refusing the spawn: a
+            // `rebindable` one always may (it is declared empty-able), and every one may for a
+            // same-module child (see `bind_same_module_manifest`). The *entry* still records the
+            // declared mode, so a lenient-empty `required` slot stays un-attachable.
+            let soft = rebindable || lenient;
+            let unmet = || {
+                if rebindable {
+                    BoundImport::rebindable(0, 0, None)
+                } else {
+                    BoundImport::withheld()
+                }
+            };
             let Some((req_names, req_sigs)) = requirement(im) else {
                 return Err(i as u32);
             };
@@ -19197,8 +19317,8 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19228,8 +19348,8 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19253,8 +19373,8 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19298,8 +19418,8 @@ impl Host {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
                 }
-                None if rebindable => {
-                    bindings.push(BoundImport::rebindable(0, 0, None));
+                None if soft => {
+                    bindings.push(unmet());
                     remaps.push(None);
                 }
                 None => return Err(i as u32),
@@ -20641,6 +20761,26 @@ impl Host {
         match &self.err_sink {
             Some(s) => s.lock_unpoisoned().clone(),
             None => self.stderr.clone(),
+        }
+    }
+
+    /// S2 — **drain** the effective stdout, leaving it empty: the mutating twin of
+    /// [`Host::stdout_bytes`]. A run-result reader must use one of the two rather than touching
+    /// `stdout` directly: the first stdio-inheriting child spawn *moves* this host's buffer into a
+    /// shared sink ([`Host::shared_stdout`]), so a guest that spawned one would otherwise appear to
+    /// have written nothing at all — its own writes included (#1234).
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        match &self.out_sink {
+            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
+            None => std::mem::take(&mut self.stdout),
+        }
+    }
+
+    /// S2 — the stderr analogue of [`Host::take_stdout`].
+    pub fn take_stderr(&mut self) -> Vec<u8> {
+        match &self.err_sink {
+            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
+            None => std::mem::take(&mut self.stderr),
         }
     }
     pub fn grant_exit(&mut self) -> i32 {

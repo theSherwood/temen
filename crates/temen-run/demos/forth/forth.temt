@@ -42,7 +42,13 @@
 ;           to the carried 256 KiB, so a driver staging above it would silently seed nothing.
 ;
 ;   --- per-unit scratch (rebuilt every prompt, may be clobbered between them) ---
-;   0x40000 closed-block arena   0x50000 assembled unit blob   0x60000 input buffer (256 KiB)
+;   0x40000 closed-block arena   0x50000 assembled unit blob   0x60000 input buffer (64 KiB)
+;   0x70000 `sandbox` spawn scratch (two 16-byte grant records at +0x00/+0x10, the 56-byte §3d spawn
+;           record at +0x40)   0x80000 `sandbox` child carve (512 KiB)
+;
+; The map therefore tops out at 0x70000 (448 KiB), which is what makes `sandbox` (76) possible: a §14
+; child is a power-of-two sub-carve of our own window, so nesting a copy of *this* kernel needs the
+; whole map to fit one — 2^19 (512 KiB) at 0x80000, clear of everything above.
 ;
 ; Kernel globals (8-byte cells at 0x10000 = 65536):
 ;   65536 HERE      65544 IN_POS    65552 IN_LEN    65560 DICT_N    65576 VS_DEPTH
@@ -76,7 +82,7 @@
 ;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
-;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)
+;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)  75 child_start(x)  76 sandbox(p,n)
 
 memory 20
 
@@ -110,6 +116,11 @@ data 33072 "expected a name"
 data 33088 "line "
 data 33104 ": "
 data 33120 "heap exhausted"
+data 33136 "stdout"
+data 33144 "jit"
+data 33152 "instantiator"
+data 33168 "no sandbox capability"
+data 33192 "sandbox: program too large"
 
 ; ---- the prelude (0x9000 = 36864, NUL-terminated): the primitive table + the library, in Forth ----
 data 36864 "prim : 2 0 0 1
@@ -194,6 +205,7 @@ prim atomic! 11 2 0 0
 prim atomic+! 7 2 1 0
 prim atomic-xchg 7 2 1 5
 prim cas 9 3 1 0
+prim sandbox 0 2 1 76
 : negate ( n -- n ) 0 swap - ;
 : invert ( n -- n ) -1 xor ;
 : 1+ ( n -- n ) 1 + ;
@@ -2672,14 +2684,15 @@ block 7 () {
   }
 }
 
-; 48 read_stdin() -> n: read all of stdin into the input buffer (up to 256 KiB).
+; 48 read_stdin() -> n: read all of stdin into the input buffer (up to 64 KiB — #1234 shrank it from
+; 256 KiB so the whole kernel map fits a 2^19 `sandbox` carve; see the memory map above).
 func () -> (i64) {
 block 0 () {
   z = i64.const 0
   br 1(z)
   }
 block 1 (n: i64) {
-  cap = i64.const 262144
+  cap = i64.const 65536
   room = i64.sub cap n
   z = i64.const 0
   full = i64.le_s room z
@@ -4175,5 +4188,155 @@ block 2 (p2: i64, n2: i64) {
   call 5 ()
   z = i32.const 0
   return z
+  }
+}
+
+; ================================================================================================
+; 75 child_start(x) -> status: the entry a `sandbox`ed child runs (#1234). Its program is already in
+; its window — `sandbox` seeded the prompt-staging region below, `{len: i64}` then the text — so the
+; child just hands the buffer to `prompt` (74), which runs the prelude on its first call exactly as
+; `_start` does. Signature is the §14 child-entry shape; the arg is the child's own `Instantiator`,
+; which this kernel deliberately ignores (a sandbox does not nest a sandbox).
+func (i64) -> (i64) {
+block 0 (x: i64) {
+  lp = i64.const 245760
+  n = i64.load lp
+  p = i64.const 245768
+  st = call 74 (p, n)
+  r = i64.extend_i32_u st
+  return r
+  }
+}
+
+; ================================================================================================
+; 76 sandbox(addr, len) -> status: run `[addr, len)` as a Forth program in a **confined child domain**
+; that can compute and print and nothing else (#1234). `s" 2 3 + . cr" sandbox`.
+;
+; The child is this same kernel, nested: a §14 same-module child over a 2^19 sub-carve of our own
+; window at 0x80000, entered at `child_start` (75). Same-module is what makes it cheap — no `Module`
+; grant, no `Budget`, no second program to ship; the engine runs our own funcs over a window we
+; sub-allocate, which is why the kernel map has to fit in half a window (see the map above).
+;
+; It is born with only what we hand it, by name, in the spawn record's grant list: `stdout` and
+; `jit`. No stdin. No `instantiator` — the child's auto-granted one is its entry arg, never
+; registered under a name, so `sandbox` inside a sandbox finds nothing and says so. `jit` is there
+; because a Forth that cannot define a word is not a Forth; the child's `vm_jit_*` imports bind to
+; that grant (`Host::bind_child_manifest`, through the record's `-1 = self` module selector).
+;
+; Its *memory* is the carve and nothing else: our dictionary, REPL stack and heap sit below 0x80000
+; where the child has no address for them. What it does start with is a copy of our data segments
+; (the child's window is raw backing — segments materialize only for a separate-module child), which
+; is exactly the prelude it needs to build its own dictionary from scratch.
+;
+; Tier note: the two interpreters nest this kernel; the Cranelift tier refuses (`compile_child` has
+; no per-child fiber/thread runtime yet, and this kernel has `task`/`yield`/`resume` and
+; `spawn`/`join`), so a `sandbox` line there is a loud refusal, not a silent no-op.
+;
+; Returns the child's status, `-1` if the host granted no sandbox capability or the program is
+; larger than the child's staging region (both said out loud, not silent), or the spawn's own
+; `-EINVAL` if the carve was refused.
+func (i64, i64) -> (i64) {
+block 0 (addr: i64, len: i64) {
+  ip = i64.const 33152
+  il = i64.const 12
+  hinst = self.resolve ip il
+  np = i64.const 33136
+  nl = i64.const 6
+  hout = self.resolve np nl
+  jp = i64.const 33144
+  jl = i64.const 3
+  hjit = self.resolve jp jl
+  ; a `self.resolve` miss is -EINVAL, never a trap: OR the three handles and test the sign bit.
+  x = i32.or hinst hout
+  y = i32.or x hjit
+  z32 = i32.const 0
+  miss = i32.lt_s y z32
+  br_if miss 1() 2(addr, len, hinst, hout, hjit)
+  }
+block 1 () {
+  m = i64.const 33168
+  l = i64.const 21
+  call 2 (m, l)
+  nl1 = i64.const 10
+  call 1 (nl1)
+  neg = i64.const -1
+  return neg
+  }
+block 2 (addr: i64, len: i64, hinst: i32, hout: i32, hjit: i32) {
+  ; the child's staging region is 16 KiB, minus the 8-byte length header.
+  cap = i64.const 16376
+  big = i64.gt_s len cap
+  br_if big 3() 4(addr, len, hinst, hout, hjit)
+  }
+block 3 () {
+  m2 = i64.const 33192
+  l2 = i64.const 26
+  call 2 (m2, l2)
+  nl2 = i64.const 10
+  call 1 (nl2)
+  neg2 = i64.const -1
+  return neg2
+  }
+block 4 (addr: i64, len: i64, hinst: i32, hout: i32, hjit: i32) {
+  ; Seed the carve: our data segments (0x08000..0x10000 — messages + prelude) at the same offsets
+  ; inside it, then the program as {len, text} at the child's prompt staging (0x3C000).
+  ddst = i64.const 557056
+  dsrc = i64.const 32768
+  dn = i64.const 32768
+  mem.copy ddst dsrc dn
+  lp = i64.const 770048
+  i64.store lp len
+  tp = i64.const 770056
+  mem.copy tp addr len
+  ; Grant record 0 at the spawn scratch (0x70000): the child's `write` binds to the cap named
+  ; "stdout" — our own, so its output lands in our stream (§7c stdio inheritance).
+  g0 = i64.const 458752
+  n0 = i64.const 33136
+  i64.store32 g0 n0
+  six = i64.const 6
+  i64.store32 g0 six offset=4
+  i32.store g0 hout offset=8
+  zero = i64.const 0
+  i64.store32 g0 zero offset=12
+  ; Grant record 1: likewise "jit". The child installs into its **own** dispatch table, so its
+  ; words cannot collide with or reach ours.
+  g1 = i64.const 458768
+  n1 = i64.const 33144
+  i64.store32 g1 n1
+  three = i64.const 3
+  i64.store32 g1 three offset=4
+  i32.store g1 hjit offset=8
+  i64.store32 g1 zero offset=12
+  ; The §3d spawn record at 0x70040: version 0, entry 75, carve (0x80000, 2^19), no pager
+  ; (u32::MAX), module -1 = this one, no budget, no quota, the two grants above.
+  r = i64.const 458816
+  i64.store32 r zero
+  e75 = i64.const 75
+  i64.store32 r e75 offset=4
+  cbase = i64.const 524288
+  i64.store r cbase offset=8
+  s19 = i64.const 19
+  i64.store32 r s19 offset=16
+  mx = i64.const 4294967295
+  i64.store32 r mx offset=20
+  neg1 = i64.const -1
+  i64.store32 r neg1 offset=24
+  i64.store32 r zero offset=28
+  i64.store r zero offset=32
+  i64.store r g0 offset=40
+  two = i64.const 2
+  i64.store r two offset=48
+  ch = call.cap 6 17 (i64) -> (i32) hinst (r)
+  z32b = i32.const 0
+  refused = i32.lt_s ch z32b
+  br_if refused 5(ch) 6(hinst, ch)
+  }
+block 5 (ch: i32) {
+  v = i64.extend_i32_s ch
+  return v
+  }
+block 6 (hinst: i32, ch: i32) {
+  st = call.cap 6 1 (i32) -> (i64) hinst (ch)
+  return st
   }
 }
