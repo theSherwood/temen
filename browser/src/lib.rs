@@ -4761,7 +4761,7 @@ pub unsafe extern "C" fn temen_run_nifler_crawl_fs(
         }
     };
     let mut fuel = u64::MAX;
-    bytecode::compile_and_run_capture_reserved_with_host(
+    let outcome = bytecode::compile_and_run_capture_reserved_with_host(
         &m,
         0,
         &[],
@@ -4770,6 +4770,25 @@ pub unsafe extern "C" fn temen_run_nifler_crawl_fs(
         temen_ir::DEFAULT_RESERVED_LOG2,
         &mut host,
     );
+    // What nifler printed. A parse error is reported here and the `.p.nif` simply never appears, so
+    // without this the caller sees `STATUS_OK` and an empty output and cannot say why — the crawl then
+    // skips the module and nimsem dies later with a baffling `cannot open <stem>.s.nif` (#1364).
+    // Retained on [`CRAWL_DIAG`] for `temen_run_nifler_crawl_diag`.
+    // nifler's *diagnostics* are text on the capture / its streams; its `.p.nif` output goes to the
+    // memfs, not stdout. Keep only the printable text so a caller can put this in a message — a run
+    // that wrote binary here has nothing to say.
+    let mut raw = host.stdout_bytes();
+    raw.extend_from_slice(&host.stderr_bytes());
+    let trapped = !matches!(&outcome, Some((Ok(_), _)));
+    let text = String::from_utf8_lossy(&raw);
+    let mut diag: Vec<u8> = text
+        .chars()
+        .filter(|c| *c == '\n' || (!c.is_control() && *c != '\u{fffd}'))
+        .collect::<String>()
+        .into_bytes();
+    if let Some(Err(t)) = outcome.as_ref().map(|(r, _)| r.as_ref()) {
+        diag.extend_from_slice(format!("\ntrap: {t:?}").as_bytes());
+    }
     let (files, _dirs) = fs.seed();
     let read = |k: &str| {
         files
@@ -4778,13 +4797,37 @@ pub unsafe extern "C" fn temen_run_nifler_crawl_fs(
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
     };
+    let pnif = read(&readback);
+    let produced = !pnif.is_empty();
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), read(&readback));
+        stash(&mut *core::ptr::addr_of_mut!(OUT), pnif);
         stash(&mut *core::ptr::addr_of_mut!(ERR), read(&deps_key));
+        *core::ptr::addr_of_mut!(CRAWL_DIAG) = diag;
+    }
+    // The run's outcome was previously discarded and `STATUS_OK` returned unconditionally. A crawl that
+    // parsed nothing is a failure the caller must be able to see.
+    if !produced {
+        let status = if trapped { STATUS_TRAP } else { STATUS_UNSUPPORTED };
+        set(status);
+        return -status;
     }
     set(STATUS_OK);
     STATUS_OK
+}
+
+/// What the last [`temen_run_nifler_crawl_fs`] printed (its stdout + stderr) — a nifler parse error,
+/// when it produced no `.p.nif`. Stashed onto [`OUT`]; returns the length.
+static mut CRAWL_DIAG: Vec<u8> = Vec::new();
+
+/// Stash the last crawl's diagnostics (see [`CRAWL_DIAG`]) onto [`OUT`] and return the length.
+#[no_mangle]
+pub extern "C" fn temen_run_nifler_crawl_diag() -> usize {
+    // SAFETY: single-threaded wasm; exclusive access.
+    let bytes = unsafe { (*core::ptr::addr_of!(CRAWL_DIAG)).clone() };
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
 }
 
 /// Read an arbitrary file the open single-shot JIT run wrote to its retained memfs (the crawl's
@@ -10974,6 +11017,34 @@ pub extern "C" fn temen_op13jit_phase_output() -> usize {
                 files.into_iter().find(|(kk, _)| kk == k).map(|(_, v)| v)
             }
             _ => None,
+        })
+        .unwrap_or_default();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// Stash the phase child's **diagnostics** — what it wrote to the granted `stdout`/`stderr` streams —
+/// onto [`OUT`] and return the length. This is where a nimony phase puts its error messages, and it
+/// was previously unreachable: a phase that fails a semantic check exits **0** and simply writes no
+/// output file, so the orchestrator could only report "produced no `<stem>.s.nif`" and fall back to
+/// the tree-walker, which then spends minutes reaching the same error. Call after a step returns
+/// [`OP13JIT_DONE`], alongside [`temen_op13jit_phase_read`].
+#[no_mangle]
+pub extern "C" fn temen_op13jit_phase_diag() -> usize {
+    // SAFETY: single-threaded wasm; exclusive access to the driver + the OUT stash.
+    let bytes = unsafe { (*core::ptr::addr_of_mut!(OP13_JIT)).as_mut() }
+        .map(|d| {
+            let host = d.root.host_mut();
+            let mut out = host.stdout_bytes();
+            let err = host.stderr_bytes();
+            if !err.is_empty() {
+                if !out.is_empty() {
+                    out.push(b'\n');
+                }
+                out.extend_from_slice(&err);
+            }
+            out
         })
         .unwrap_or_default();
     let len = bytes.len();

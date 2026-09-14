@@ -1128,6 +1128,20 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     ex.temen_dealloc(p, b.length);
     return readOut().slice(0, len);
   };
+  // What the phase child printed (its granted stdout/stderr). A nimony phase that fails a semantic
+  // check exits **0** and writes no output file, so "produced no <stem>.s.nif" is all the file-level
+  // check can say — and the worker then falls back to the tree-walker, which spends minutes arriving
+  // at the same error. Read the diagnostic and put it in the message instead. Trimmed: a phase can be
+  // chatty, and only the tail (where the error is) is useful in a one-line card status.
+  const phaseDiag = () => {
+    if (!ex.temen_op13jit_phase_diag) return ''; // older cdylib: no accessor, same behaviour as before
+    const len = ex.temen_op13jit_phase_diag();
+    if (!len) return '';
+    const txt = dec.decode(readOut().slice(0, len)).trim();
+    if (!txt) return '';
+    const lines = txt.split('\n').filter((l) => l.trim());
+    return ': ' + lines.slice(-4).join(' | ');
+  };
   // Pack helpers for the phase-open ABI: strings `[count][len,bytes]…`, files `[count][nlen,name,dlen,data]…`.
   const u32 = (n) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, n, true); return b; };
   const cat = (arrs) => { const out = new Uint8Array(arrs.reduce((a, x) => a + x.length, 0)); let o = 0; for (const x of arrs) { out.set(x, o); o += x.length; } return out; };
@@ -1226,7 +1240,18 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
     const pnif = readOut(), deps = readErr();
     ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
-    if (!pnif.length) { continue; }
+    // nifler parsed nothing. This used to `continue` silently, which is the worst possible outcome:
+    // the module never gets a `.p.nif`, so it is never semmed, and a *dependent* module's nimsem dies
+    // much later with `cannot open <stem>.s.nif` — a message that names the wrong module and says
+    // nothing about the cause. Report it here, where the cause is (#1364).
+    if (!pnif.length) {
+      let why = '';
+      if (ex.temen_run_nifler_crawl_diag) {
+        const dl = ex.temen_run_nifler_crawl_diag();
+        if (dl) why = ': ' + dec.decode(readOut().slice(0, dl)).trim().split('\n').filter((l) => l.trim()).slice(-3).join(' | ');
+      }
+      return { crawled, error: `nifler could not parse ${file}${why}` };
+    }
     fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
     putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
     if (role !== 'Main') { const e = produced.get(stem) || {}; e.pNif = pnif; e.depsNif = deps; produced.set(stem, e); }
@@ -1278,8 +1303,9 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     // products, so both must be threaded into the growing memfs — missing the index fails the importer.
     const snif = phaseRead(`nimcache/${stem}.s.nif`);
     const sidx = phaseRead(`nimcache/${stem}.s.idx.nif`);
+    const diag = snif.length ? '' : phaseDiag(); // read before close tears the driver down
     ex.temen_op13jit_close();
-    if (!snif.length) return { crawled, semmed, error: `nimsem produced no ${stem}.s.nif` };
+    if (!snif.length) return { crawled, semmed, error: `nimsem rejected ${stem}${diag || ` (produced no ${stem}.s.nif)`}` };
     fs.set(`nimcache/${stem}.s.nif`, snif); putFile(`nimcache/${stem}.s.nif`, snif);
     if (sidx.length) { fs.set(`nimcache/${stem}.s.idx.nif`, sidx); putFile(`nimcache/${stem}.s.idx.nif`, sidx); }
     if (mods.get(stem).role !== 'Main') { const e = produced.get(stem) || {}; e.sNif = snif; e.sIdx = sidx; produced.set(stem, e); }
@@ -1305,8 +1331,9 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const r = await drive(`${cacheKey}-hexer`);
     if (r === null) return { crawled, semmed, hexed, error: `hexer trapped on ${stem}` };
     const xnif = phaseRead(key);
+    const diag = xnif.length ? '' : phaseDiag(); // read before close tears the driver down
     ex.temen_op13jit_close();
-    if (!xnif.length) return { crawled, semmed, hexed, error: `hexer produced no ${key}` };
+    if (!xnif.length) return { crawled, semmed, hexed, error: `hexer rejected ${stem}${diag || ` (produced no ${key})`}` };
     fs.set(key, xnif); putFile(key, xnif); hexed++;
     if (!isMain) { const e = produced.get(stem) || {}; e.xNif = xnif; produced.set(stem, e); }
   }
