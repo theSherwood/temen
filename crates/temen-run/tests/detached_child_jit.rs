@@ -193,13 +193,29 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// PROCESS.md §5 / #1289 R1 — the tree-walker's `!durable` op-15 gate is lifted (freeze authority is a
-/// per-grant capability, not a placement rule), so the two backends now **diverge** on a durable detached
-/// spawn: the interpreter admits it and charges the window to `Budget.mem`, while the native thunk still
-/// declines `-EINVAL` with the budget intact — a tracked in-flight decline until the native freeze path is
-/// wired (the later detached-durable freeze slices). This pins that transition state.
+/// #1412 — **a durable detached spawn declines identically on the interpreter and the native JIT.**
+///
+/// This test previously asserted the opposite, and its old name said so:
+/// `a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_native_jit`. It was
+/// added with #1289 R1 to pin what that ruling left behind — R1 lifted the tree-walker's `!durable`
+/// op-15 gate and only the tree-walker's, so the two backends diverged, and this test recorded the
+/// divergence as the intended "transition state".
+///
+/// INVARIANTS #9 does not have a transition state. The tree-walk interpreter defines guest-observable
+/// semantics and the other engines match it or decline to it; two engines giving a verified module two
+/// different answers is the thing the invariant exists to forbid. A test asserting that they disagree
+/// cannot go red when the disagreement is wrong — which is how it stood for six days.
+///
+/// Owner decision 2026-09-14 (#1412): R1's end state stands (freeze authority is a per-grant
+/// capability; a durable parent will spawn detached children whose freeze *captures* them), but its
+/// spawn lift is deferred until freeze authority exists in code (#1440) and the per-child capture
+/// lands (#1361). Until then both backends refuse, probeably, charging nothing.
+///
+/// So the assertion inverts: not "they differ, as planned", but **"they agree"**. That is what makes
+/// this a pin rather than a record. It extends `temen-interp`'s `durable_detached_parity.rs`
+/// (oracle ↔ resumable engine) to the third engine.
 #[test]
-fn a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_native_jit() {
+fn a_durable_detached_spawn_declines_the_same_way_on_the_interpreter_and_the_native_jit() {
     let p = module(SPAWN_ONLY_PARENT);
     let c = module(CHILD);
 
@@ -234,8 +250,8 @@ fn a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_
         );
     }
 
-    // Interpreter tier: R1 admits the durable detached spawn (returns a non-negative slot) and charges
-    // the child's 2^16 window to `Budget.mem`, exactly as a non-durable spawn does.
+    // Interpreter tier: the same answer, byte for byte. `-22` is `-EINVAL`, matching the native thunk
+    // above — and it is a *value*, so the run completes and the guest could have handled it.
     {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
@@ -247,18 +263,21 @@ fn a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_
             &mut fuel,
             &mut host,
         )
-        .expect("interp run");
+        .expect("interp run: the refusal is a value, so the run still completes");
         let slot = match r.first() {
             Some(Value::I64(x)) => *x,
             other => panic!("unexpected interp result {other:?}"),
         };
-        assert!(
-            slot >= 0,
-            "interp: durable detached spawn admits, slot {slot}"
+        assert_eq!(
+            slot, -22,
+            "interp must give the native JIT's answer for the same module (INVARIANTS #9): \
+             -EINVAL, not an admission"
         );
+        // And, like the native thunk, it charges nothing — the gate sits before the quota take, so the
+        // guest keeps the budget for something it *is* allowed to do.
         assert!(
-            !host.budget_mem_take(h[2], 1 << 16),
-            "interp: the admitted spawn charged the child's window — the quota is now exhausted"
+            host.budget_mem_take(h[2], 1 << 16),
+            "interp: the refusal charged the budget nothing, exactly as the native thunk's does"
         );
     }
 }

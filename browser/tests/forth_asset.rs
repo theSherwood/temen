@@ -89,3 +89,31 @@ fn forth_card_reports_errors_and_recovers() {
         "3 \nline 2: unknown word near bogus\nline 3: stack effect mismatch near ;\n3 \n"
     );
 }
+
+/// #1234 — `sandbox` on the browser on-ramp: the word runs its program in a §14 child of the
+/// guest's own window, using the `"instantiator"` the on-ramp powerbox grants and the `"stdout"` /
+/// `"jit"` it re-grants into the child by name. The child's output joins ours (§7c stdio
+/// inheritance), and its dictionary does not: `cube` is unknown back in the parent.
+#[test]
+fn forth_sandbox_runs_on_the_onramp() {
+    let bytes = include_bytes!("../web/assets/forth.temen");
+    let m = temen_encode::decode_module(bytes).expect("decode forth.temen");
+    let out = onramp_exec(
+        &m,
+        b": sq ( n -- n ) dup * ;\n\
+          7 sq . cr\n\
+          s\" : cube ( n -- n ) dup dup * * ; 3 cube . cr\" sandbox drop\n\
+          9 sq . cr\n\
+          2 cube . cr\n",
+    );
+    assert_eq!(
+        out.status,
+        STATUS_OK,
+        "stdout so far: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "49 \n27 \n81 \nline 5: unknown word near cube\n"
+    );
+}

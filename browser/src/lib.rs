@@ -2944,8 +2944,8 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.take_stdout(),
+        stderr: host.take_stderr(),
         framebuffer: None, // the browser-corpus powerbox grants no `display` cap
     }
 }
@@ -3044,6 +3044,13 @@ fn grant_onramp_caps(
     MouseQueue,
 ) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    // §3.5: register the running module's self-referential surface, as `temen-run`'s `grant_caps`
+    // does — "the one place every run path registers the running module". Without it `self.type_id`,
+    // `self.covers`, `export.handle` and `call.import.dyn` fail closed here but not under the CLI,
+    // and the unconditional NULL guard (#1094, INVARIANTS #13) is never recorded. #1234 needs it for
+    // a third reason: a §14 **same-module** child's import manifest *is* this module's, and the
+    // spawn arms fetch it through `Host::module_imports(SELF_MODULE)`.
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
     // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
     // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
@@ -3059,6 +3066,10 @@ fn grant_onramp_caps(
         let h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), ONRAMP_JIT_TABLE_LOG2);
         host.set_jit_validator(browser_jit_validator);
         host.set_jit_hosts_fibers(true);
+        // #1234: name it too, so a §14 child can be spawned with `jit` re-granted by name (the
+        // Forth kernel's `sandbox` nests a copy of itself, which needs a Jit to compile its words).
+        // temen-run's powerbox registers the same name from `canonical_cap_name`.
+        host.register_cap_name("jit", h);
         granted.jit = Some(h);
     }
     // #1323 (c_interpret #16, file I/O): a guest that imports `vm_fs` (the chibicc `__vm_fs` builtin →
@@ -3270,15 +3281,15 @@ fn grant_onramp_caps(
         }));
         host.register_cap_name("fs", handle);
     }
-    // #816: an **opt-in** §14 `Instantiator` over the guest's own window, named `"instantiator"` —
-    // OFF by default (the playground never sets the knob), so the default on-ramp powerbox keeps
-    // exactly the reference-parity grant set above; neither it nor `temen-run`'s reference powerbox
-    // grants spawn authority ambiently, and widening that default is an owner-level policy decision
-    // (least authority, INVARIANTS). The knob exists for the differential harness — the
-    // env-routed child tier-up (#1117) needs a guest that can `instantiate` to be exercised
-    // end-to-end over real emitted wasm — and for an embedder that deliberately opts a session in.
-    // Spawn authority is a strict subset of the guest's own reach (children are window sub-carves
-    // with attenuated fuel), granted last so every other handle keeps its value.
+    // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
+    // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
+    // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
+    // reference hosts — one frontier, INVARIANTS #14. Spawn authority is a strict subset of the
+    // guest's own reach: a child is a sub-carve of *this* window with fuel sub-allocated from this
+    // guest's own quota, its powerbox attenuated to what the parent re-grants by name, and it can
+    // reach nothing the parent could not already reach directly. The knob stays for an embedder that
+    // wants the narrower set (and for the differential harness, whose env-routed child tier-up
+    // (#1117) toggles it); granted last so every other handle keeps its value.
     if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
@@ -3287,15 +3298,15 @@ fn grant_onramp_caps(
     (frame, keys, mouse)
 }
 
-/// #816: whether [`grant_onramp_caps`] additionally grants the opt-in `"instantiator"` capability.
-/// Default `false`; see the knob's rationale at the grant site. Set via
+/// #816/#1234: whether [`grant_onramp_caps`] grants the `"instantiator"` capability. Default
+/// `true` (parity with `temen-run`'s powerbox); see the rationale at the grant site. Cleared via
 /// [`temen_onramp_set_grant_instantiator`].
 static ONRAMP_GRANT_INSTANTIATOR: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+    std::sync::atomic::AtomicBool::new(true);
 
 /// #816: opt subsequent on-ramp opens (plain, coop, JIT alike — every path through
 /// [`grant_onramp_caps`]) in or out of the `"instantiator"` grant. A test/embedder knob, exactly
-/// like [`temen_coop_set_tierup_floor`]; the playground never calls it.
+/// like [`temen_coop_set_tierup_floor`]; the playground leaves it at its default.
 #[no_mangle]
 pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
     ONRAMP_GRANT_INSTANTIATOR.store(on != 0, std::sync::atomic::Ordering::Relaxed);
@@ -3369,8 +3380,8 @@ pub fn onramp_exec_with_tee(
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.take_stdout(),
+        stderr: host.take_stderr(),
         framebuffer,
     }
 }
@@ -3930,8 +3941,8 @@ pub fn onramp_fs_exec(
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.take_stdout(),
+        stderr: host.take_stderr(),
         framebuffer: None,
     }
 }
@@ -3994,8 +4005,8 @@ pub fn onramp_fs_exec_readback(
             status,
             value,
             exit_code,
-            stdout: host.stdout,
-            stderr: host.stderr,
+            stdout: host.take_stdout(),
+            stderr: host.take_stderr(),
             framebuffer: None,
         },
         produced,
@@ -7531,8 +7542,8 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     set(status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.take_stdout());
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.take_stderr());
         EXIT_CODE = exit_code;
     }
     value
@@ -9789,7 +9800,7 @@ pub extern "C" fn temen_onramp_jit_present() -> i32 {
     // The tick's stdout (cross-tier `write`s land in the reactor's host): drain it into the stdout
     // slot (read via `temen_stdout_*`), exactly as `temen_onramp_frame` does for the interpreter, so a
     // guest's console output reaches the page on this tier too.
-    let stdout = std::mem::take(&mut r.host.stdout);
+    let stdout = r.host.take_stdout();
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), stdout) };
     let (rgba, w, h) = match r.take_frame() {
@@ -14831,8 +14842,8 @@ pub extern "C" fn temen_detached_oracle_run(
     };
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.take_stdout());
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.take_stderr());
         EXIT_CODE = code;
         RUN_VALUE = value;
     }

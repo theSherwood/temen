@@ -2054,17 +2054,136 @@ pub unsafe extern "C" fn budget_take(
     }
 }
 
-pub fn production_grant_hooks() -> temen_jit::GrantChildHooks {
+/// #1234 — the `Mutex<Host>`-ctx twin of a §14 child hook. Every hook below reaches the run's
+/// **parent** host through the ctx the run baked into its `call.cap` sites, and there are two shapes
+/// for that one pointer: a single-threaded run bakes a raw `*mut Host` (with [`cap_thunk`]), a
+/// concurrent one a `*const Mutex<Host>` (with [`cap_thunk_locked`]) — the same split that keeps the
+/// D45 fast path off the locked arm, for the same reason. The pointer cannot say which it is, so the
+/// shape has to be chosen where the thunk is: [`production_grant_hooks`] takes `locked` and hands
+/// back the matching family. Each locked hook takes the lock and delegates to its raw twin, so there
+/// is one implementation of every hook, not two. (The §14 thunks are reached straight from emitted
+/// code, not through `cap_thunk_locked`, so the lock is free when these run.)
+macro_rules! locked_parent_hook {
+    ($name:ident, $raw:ident, ($($a:ident: $t:ty),* $(,)?) -> $r:ty) => {
+        /// # Safety
+        /// `ctx` is the concurrent run's live `*const Mutex<Host>`; every other argument is its
+        /// raw twin's.
+        pub unsafe extern "C" fn $name(ctx: *mut c_void, $($a: $t),*) -> $r {
+            let m = &*(ctx as *const Mutex<Host>);
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            let raw = &mut *g as *mut Host as *mut c_void;
+            $raw(raw, $($a),*)
+        }
+    };
+}
+
+locked_parent_hook!(
+    grant_child_build_locked,
+    grant_child_build,
+    (grant_handle: i32, child_size: u64, out: *mut temen_jit::GrantChild) -> i32
+);
+locked_parent_hook!(
+    grant_named_child_build_locked,
+    grant_named_child_build,
+    (
+        mem_base: *mut u8,
+        mem_size: u64,
+        grants_ptr: u64,
+        grants_n: u64,
+        child_size: u64,
+        out: *mut temen_jit::GrantChild,
+        trap_out: *mut i64,
+    ) -> i32
+);
+locked_parent_hook!(
+    grant_detached_child_build_locked,
+    grant_detached_child_build,
+    (
+        mem_base: *mut u8,
+        mem_size: u64,
+        grants_ptr: u64,
+        grants_n: u64,
+        child_size: u64,
+        out: *mut temen_jit::GrantChild,
+        trap_out: *mut i64,
+    ) -> i32
+);
+locked_parent_hook!(
+    budget_mem_take_locked,
+    budget_mem_take,
+    (budget: i32, bytes: u64) -> i32
+);
+locked_parent_hook!(
+    child_bind_imports_locked,
+    child_bind_imports,
+    (child_ctx: *mut c_void, module: i64) -> i32
+);
+locked_parent_hook!(
+    child_offer_mint_locked,
+    child_offer_mint,
+    (child_ctx: *mut c_void, export: i64) -> i32
+);
+locked_parent_hook!(
+    budget_take_locked,
+    budget_take,
+    (
+        handle: i32,
+        child_size: u64,
+        mode: i32,
+        out: *mut temen_jit::BudgetTaken,
+        trap_out: *mut i64,
+    ) -> i32
+);
+
+/// The production §14 child hooks for a run whose cap ctx is a raw `*mut Host` (`locked = false`) or
+/// a `*const Mutex<Host>` (`locked = true`) — see [`locked_parent_hook`]. `release` and
+/// `register_serve` take the *child* ctx (always a shared `Arc<Mutex<Host>>`), so they are the same
+/// function either way.
+pub fn production_grant_hooks(locked: bool) -> temen_jit::GrantChildHooks {
     temen_jit::GrantChildHooks {
-        build: grant_child_build,
-        build_named: grant_named_child_build,
-        build_detached: grant_detached_child_build,
-        budget_mem_take,
+        build: if locked {
+            grant_child_build_locked
+        } else {
+            grant_child_build
+        },
+        build_named: if locked {
+            grant_named_child_build_locked
+        } else {
+            grant_named_child_build
+        },
+        build_detached: if locked {
+            grant_detached_child_build_locked
+        } else {
+            grant_detached_child_build
+        },
+        budget_mem_take: if locked {
+            budget_mem_take_locked
+        } else {
+            budget_mem_take
+        },
         release: grant_child_release,
-        bind_imports: child_bind_imports,
-        mint: child_offer_mint,
+        bind_imports: if locked {
+            child_bind_imports_locked
+        } else {
+            child_bind_imports
+        },
+        mint: if locked {
+            child_offer_mint_locked
+        } else {
+            child_offer_mint
+        },
         thunk: cap_thunk_locked,
         register_serve: child_register_serve,
+    }
+}
+
+/// The production [`temen_jit::BudgetTaker`] for a run of the given ctx shape — the `set_budget_taker`
+/// twin of [`production_grant_hooks`].
+pub fn production_budget_taker(locked: bool) -> temen_jit::BudgetTaker {
+    if locked {
+        budget_take_locked
+    } else {
+        budget_take
     }
 }
 
@@ -2452,9 +2571,17 @@ pub unsafe extern "C" fn child_bind_imports(
         let types = parent
             .module_types(module as i32)
             .unwrap_or_else(|| Arc::from(Vec::new()));
-        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
+        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL). A
+        // **same-module** child (`module == SELF_MODULE`, #1234) binds leniently instead — its
+        // manifest is the parent's whole import surface, not one written for it, so an unmet
+        // `required` slot is left empty (fail-closed at use) rather than refusing the spawn.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
-        if child.bind_child_manifest(&imports, &types).is_err() {
+        let bound = if module as i32 == temen_interp::SELF_MODULE {
+            child.bind_same_module_manifest(&imports, &types)
+        } else {
+            child.bind_child_manifest(&imports, &types)
+        };
+        if bound.is_err() {
             return -22;
         }
     }
@@ -3792,9 +3919,10 @@ unsafe fn powerbox_compile_run(
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
         // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
-        cm.set_grant_child_hooks(Some(production_grant_hooks()));
-        cm.set_budget_taker(Some(budget_take));
-        cm.set_budget_taker(Some(budget_take));
+        // #1234: this arm bakes a `*const Mutex<Host>` ctx (`cap_thunk_locked`), so the child hooks
+        // must be the locked family — the raw ones would read the mutex header as a `Host`.
+        cm.set_grant_child_hooks(Some(production_grant_hooks(true)));
+        cm.set_budget_taker(Some(production_budget_taker(true)));
         if let Some(ip) = interrupt_ptr {
             m.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3836,8 +3964,8 @@ unsafe fn powerbox_compile_run(
     }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
-    cm.set_grant_child_hooks(Some(production_grant_hooks()));
-    cm.set_budget_taker(Some(budget_take));
+    cm.set_grant_child_hooks(Some(production_grant_hooks(false)));
+    cm.set_budget_taker(Some(production_budget_taker(false)));
     if let Some(ip) = interrupt_ptr {
         host.set_epoch_cell(ip as usize);
     }
@@ -4093,8 +4221,8 @@ impl PowerboxProgram {
             cm.enable_fiber_hosting(quota)
                 .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
         }
-        cm.set_grant_child_hooks(Some(production_grant_hooks()));
-        cm.set_budget_taker(Some(budget_take));
+        cm.set_grant_child_hooks(Some(production_grant_hooks(false)));
+        cm.set_budget_taker(Some(production_budget_taker(false)));
         Ok(PowerboxProgram {
             inst,
             win,
@@ -4133,8 +4261,8 @@ impl PowerboxProgram {
             );
             return Err(trap_err_with_output(
                 msg,
-                &self.host.stdout,
-                &self.host.stderr,
+                &self.host.stdout_bytes(),
+                &self.host.stderr_bytes(),
             ));
         }
         let folded = outcome_from_jit(&self.inst.module.funcs[0].results, jr.outcome);
@@ -4143,15 +4271,18 @@ impl PowerboxProgram {
             Err(e) => {
                 return Err(trap_err_with_output(
                     e,
-                    &self.host.stdout,
-                    &self.host.stderr,
+                    &self.host.stdout_bytes(),
+                    &self.host.stderr_bytes(),
                 ))
             }
         };
         Ok(Run {
             outcome,
-            stdout: std::mem::take(&mut self.host.stdout),
-            stderr: std::mem::take(&mut self.host.stderr),
+            // #1234: **not** `host.stdout` — the first stdio-inheriting child spawn moves this
+            // host's buffer into a shared sink, so the drain has to go through the accessor or a
+            // guest that sandboxed anything reads back as silent.
+            stdout: self.host.take_stdout(),
+            stderr: self.host.take_stderr(),
         })
     }
 }
@@ -4290,6 +4421,25 @@ fn value_slot(v: Value) -> i64 {
 /// identically see matching handle values (the differential paths rely on this). (The mock
 /// `Blocking` cap left this set with CONSOLIDATION §5a — test harnesses that exercise the
 /// offload pool grant it themselves and register the `"blocking"` name.)
+/// The canonical §7 name for the capability an import of this name binds — the inverse of the
+/// vocabulary in [`POWERBOX_CAP_NAMES`]. `None` for an import with no canonical counterpart.
+fn canonical_cap_name(import: &str) -> Option<&'static str> {
+    Some(match import {
+        "write" => "stdout",
+        "read" => "stdin",
+        "stderr" => "stderr",
+        "exit" => "exit",
+        "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" => "addrspace",
+        "vm_jit_compile"
+        | "vm_jit_compile_linked"
+        | "vm_jit_invoke2"
+        | "vm_jit_release"
+        | "vm_jit_install"
+        | "vm_jit_uninstall" => "jit",
+        _ => return None,
+    })
+}
+
 fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
@@ -4326,6 +4476,15 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     for (name, handle) in POWERBOX_CAP_NAMES[5..].iter().zip(&v[5..]) {
         h.register_cap_name(name, *handle);
     }
+    // #1234: a §14 `Instantiator` over the guest's own window, resolvable by name only — it is *not*
+    // part of the fixed §3e positional prefix (that arity is an ABI: `_start` reads its caps by
+    // index), so a translated guest is unperturbed and only a guest that asks for `"instantiator"`
+    // by name finds one. Spawn authority is a strict subset of the guest's own reach: a child is a
+    // sub-carve of this window, funded from this guest's own fuel, with a powerbox attenuated to
+    // what the parent re-grants by name. The browser on-ramp grants the same cap under the same
+    // name (`grant_onramp_caps`) so both reference hosts present one frontier (INVARIANTS #14).
+    let inst = h.grant_instantiator(0, win);
+    h.register_cap_name("instantiator", inst);
     v
 }
 
@@ -5748,12 +5907,18 @@ impl Instance {
         // `?` used to drop it with the `Host`. Fold it into the error instead.
         let outcome = match folded {
             Ok(o) => o,
-            Err(e) => return Err(trap_err_with_output(e, &host.stdout, &host.stderr)),
+            Err(e) => {
+                return Err(trap_err_with_output(
+                    e,
+                    &host.stdout_bytes(),
+                    &host.stderr_bytes(),
+                ))
+            }
         };
         Ok(Run {
             outcome,
-            stdout: host.stdout,
-            stderr: host.stderr,
+            stdout: host.take_stdout(),
+            stderr: host.take_stderr(),
         })
     }
 
@@ -5819,12 +5984,18 @@ impl Instance {
         let (res, _snap) = cap.ok_or("module is outside the parallel engine's subset")?;
         let outcome = match outcome_from_interp(res) {
             Ok(o) => o,
-            Err(e) => return Err(trap_err_with_output(e, &host.stdout, &host.stderr)),
+            Err(e) => {
+                return Err(trap_err_with_output(
+                    e,
+                    &host.stdout_bytes(),
+                    &host.stderr_bytes(),
+                ))
+            }
         };
         Ok(Run {
             outcome,
-            stdout: host.stdout,
-            stderr: host.stderr,
+            stdout: host.take_stdout(),
+            stderr: host.take_stderr(),
         })
     }
 
@@ -5863,16 +6034,16 @@ impl Instance {
         let jit = run_jit(m, &[], &mut hj, &config.limits, init_mem.as_deref())?;
 
         let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
-        if hi.stdout != hj.stdout {
+        if hi.stdout_bytes() != hj.stdout_bytes() {
             return Err("interp/JIT stdout diverge".into());
         }
-        if hi.stderr != hj.stderr {
+        if hi.stderr_bytes() != hj.stderr_bytes() {
             return Err("interp/JIT stderr diverge".into());
         }
         Ok(Run {
             outcome,
-            stdout: hi.stdout,
-            stderr: hi.stderr,
+            stdout: hi.take_stdout(),
+            stderr: hi.take_stderr(),
         })
     }
 
@@ -5998,6 +6169,17 @@ impl Instance {
                     }
                     let handle = (cap.grant)(h, win);
                     h.register_cap_name(name, handle);
+                    // §7 F7: also register the **canonical** name for this interface, so a guest can
+                    // name its own capabilities without knowing what it happened to call its imports.
+                    // A guest delegating a cap into a §14 child (#1234) needs exactly this: grant
+                    // lists name caps canonically (`"stdout"`), while a manifest guest's own grants
+                    // are otherwise only reachable as `"write"`. First registration wins, so an
+                    // explicit `"stderr"` import never displaces `"stdout"`.
+                    if let Some(canon) = canonical_cap_name(name) {
+                        if h.resolve_cap_name(canon).is_none() {
+                            h.register_cap_name(canon, handle);
+                        }
+                    }
                     bindings.push(if rebindable {
                         temen_interp::BoundImport::rebindable(cap.type_id, cap.op, Some(handle))
                     } else {
@@ -6078,8 +6260,8 @@ impl Instance {
         let outcome = diff_outcome(&m.funcs[fidx as usize].results, interp, jit)?;
         Ok(Run {
             outcome,
-            stdout: h.stdout,
-            stderr: h.stderr,
+            stdout: h.take_stdout(),
+            stderr: h.take_stderr(),
         })
     }
 }
@@ -6224,8 +6406,8 @@ impl Session {
         self.backend
     }
     /// Bytes the guest has written to stdout across all calls so far.
-    pub fn stdout(&self) -> &[u8] {
-        &self.host.stdout
+    pub fn stdout(&self) -> Vec<u8> {
+        self.host.stdout_bytes()
     }
     /// Bytes the guest has written to stderr across all calls so far.
     pub fn stderr(&self) -> &[u8] {
@@ -6260,7 +6442,7 @@ impl DiffSession {
                 .get(..persist.min(s.snap.len()))
                 .unwrap_or(&[])
                 .to_vec();
-            let stdout = s.host.stdout.clone();
+            let stdout = s.host.stdout_bytes();
             match &agreed {
                 None => agreed = Some((results, prefix, stdout)),
                 Some((r0, w0, o0)) => {
@@ -6284,7 +6466,7 @@ impl DiffSession {
     }
 
     /// Captured stdout (identical across backends — asserted on every call).
-    pub fn stdout(&self) -> &[u8] {
+    pub fn stdout(&self) -> Vec<u8> {
         self.sessions[0].stdout()
     }
 }
