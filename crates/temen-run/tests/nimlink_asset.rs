@@ -81,7 +81,7 @@ fn in_guest_link_matches_native_link_nim_powerbox() {
 
     // Host-side oracle: the in-tree linker on the same unit.
     let units = vec![temen_leng::WholeModule { stem, src: &src }];
-    let m = temen_leng::link_nim_powerbox(&units).expect("native link_nim_powerbox");
+    let m = temen_leng::link_nim_powerbox(&units, None).expect("native link_nim_powerbox");
     let expected = temen_encode::encode_module(&m);
 
     // In-sandbox: feed the packed unit on stdin, capture the encoded linked module on stdout.

@@ -222,15 +222,29 @@ __PG_FN int __pf_vprint(struct __pf_sink *s, const char *fmt, va_list ap) {
       else if (fmt[i] == '#') alt = 1;
       else break;
     }
-    // width
+    // width — a literal run of digits, or `*` to take it from the argument list (a negative `*`
+    // width means left-justify by that many columns, per C).
     int width = 0;
-    while (fmt[i] >= '0' && fmt[i] <= '9') { width = width * 10 + (fmt[i] - '0'); i++; }
-    // precision
+    if (fmt[i] == '*') {
+      width = va_arg(ap, int);
+      i++;
+      if (width < 0) { left = 1; width = -width; }
+    } else {
+      while (fmt[i] >= '0' && fmt[i] <= '9') { width = width * 10 + (fmt[i] - '0'); i++; }
+    }
+    // precision — likewise `.N` or `.*`. nim's `formatBiggestFloat` emits exactly `%#.*g`/`%#.*f`/
+    // `%#.*e`, so `.*` is the form that matters for it; a negative `.*` precision means "omitted".
     int prec = -1;
     if (fmt[i] == '.') {
       i++;
-      prec = 0;
-      while (fmt[i] >= '0' && fmt[i] <= '9') { prec = prec * 10 + (fmt[i] - '0'); i++; }
+      if (fmt[i] == '*') {
+        prec = va_arg(ap, int);
+        i++;
+        if (prec < 0) prec = -1;
+      } else {
+        prec = 0;
+        while (fmt[i] >= '0' && fmt[i] <= '9') { prec = prec * 10 + (fmt[i] - '0'); i++; }
+      }
     }
     // length modifiers (accepted, and `l`/`ll`/`z` widen the fetch to 64-bit)
     int lng = 0;

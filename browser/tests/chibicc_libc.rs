@@ -142,6 +142,49 @@ int main(void) {
     );
 }
 
+/// **`*` width and precision from the argument list** (#1422). `printf("%.*f", 3, x)` takes the
+/// precision from an `int` argument rather than the format string; nim's `formatBiggestFloat` emits
+/// exactly `%#.*g`/`%#.*e`/`%#.*f`, so the nim card cannot format a float without it. A negative `*`
+/// width means left-justify; a negative `*` precision means "omitted". Also covers the hyperbolics and
+/// the `float` (`…f`) overloads added for nim's `std/math`.
+#[test]
+fn printf_star_width_precision_and_new_math() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen absent");
+        return;
+    };
+    let (status, out) = compile_and_run(
+        &chibicc,
+        r#"
+#include <stdio.h>
+#include <math.h>
+int main(void) {
+  printf("[%.*f]\n", 3, 3.14159);
+  printf("[%*d]\n", 5, 42);
+  printf("[%-*d]\n", 5, 42);
+  printf("[%*d]\n", -5, 42);
+  printf("[%.*e]\n", 2, 2.5);
+  printf("%.4f %.4f %.4f\n", sinh(1.0), cosh(1.0), tanh(1.0));
+  printf("%.4f %.4f %.4f\n", asinh(1.0), acosh(2.0), atanh(0.5));
+  printf("%.4f %.4f\n", (double)sinf(1.0f), (double)tanhf(1.0f));
+  return 0;
+}
+"#,
+    );
+    assert_eq!(status, STATUS_OK, "run status");
+    assert_eq!(
+        out,
+        "[3.142]\n\
+         [   42]\n\
+         [42   ]\n\
+         [42   ]\n\
+         [2.50e+00]\n\
+         1.1752 1.5431 0.7616\n\
+         0.8814 1.3170 0.5493\n\
+         0.8415 0.7616\n"
+    );
+}
+
 /// The extended `<string.h>` / `<stdlib.h>` / `<ctype.h>` surface: `strdup`, `strncat`, `strspn`/
 /// `strcspn`, `strcasecmp`, `bsearch`, `strtoul` (hex).
 #[test]

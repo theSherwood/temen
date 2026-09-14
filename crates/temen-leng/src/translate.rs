@@ -110,6 +110,25 @@ fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
     None
 }
 
+/// The C name in a `(pragmas … (importc "name") …)` node — the symbol a bottom-edge leaf actually
+/// binds to (`c_snprintf` is `snprintf`, nim's `sin(float32)` overload is `sinf`). The nim symbol
+/// alone can't say which: the `float32`/`float64` overloads share a name and differ only by their
+/// `importc`. `None` when the pragma carries no explicit name (the C name is then the nim symbol's).
+fn importc_name(pragmas: Option<&Node>) -> Option<String> {
+    let p = pragmas?;
+    if p.tag() != Some("pragmas") {
+        return None;
+    }
+    for prag in p.args() {
+        if prag.tag() == Some("importc") {
+            if let Some(name) = prag.args().first().and_then(|n| n.as_atom()) {
+                return Some(name.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
 /// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
 fn is_string_literal(node: &Node) -> bool {
     matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
@@ -1780,6 +1799,31 @@ impl Translator {
         for (name, desc) in ext {
             self.ext_sret_procs.insert(name.clone(), desc.clone());
         }
+    }
+
+    /// Every **`importc` proc** a module declares, as `(leng symbol, C name)` — `("c_snprintf.0.",
+    /// "snprintf")`, `("sin.1.", "sinf")`, `("sin.2.", "sin")`. These are the bottom-edge leaves: procs
+    /// with no body, whose calls lower to Temen imports the runtime must bind. The C name is what
+    /// decides which leaf the prebuilt guest libc can serve — the nim symbol can't, because the
+    /// `float32`/`float64` overloads share one name and differ only in their `importc`. The linker
+    /// needs this *before* any unit is translated (to mark libc-served leaves frame-needing), which is
+    /// why it is a standalone scan. Falls back to the nim symbol when the pragma names no C symbol.
+    pub fn importc_procs(root: &Node) -> Result<Vec<(String, String)>, LengError> {
+        let mut out = Vec::new();
+        for item in root.args() {
+            if item.tag() == Some("proc") && is_importc_proc(item) {
+                let a = item.args();
+                if let Some(first) = a.first() {
+                    let sym = sym_def(first)?;
+                    let c = importc_name(a.get(3))
+                        .unwrap_or_else(|| sym.split('.').next().unwrap_or(&sym).to_string());
+                    out.push((sym, c));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// A module's procs under their stem-suffixed global names, mapped to their **declared scalar

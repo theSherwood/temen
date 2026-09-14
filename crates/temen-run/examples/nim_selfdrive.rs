@@ -527,8 +527,8 @@ fn main() {
         .collect();
 
     if io_mode {
-        let m: Module =
-            temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("nim→powerbox: {e}"));
+        let m: Module = temen_leng::link_nim_powerbox(&units, None)
+            .unwrap_or_else(|e| panic!("nim→powerbox: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
         assert!(
             temen_run::is_named_powerbox_entry(&m),

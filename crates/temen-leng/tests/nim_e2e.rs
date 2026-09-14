@@ -498,7 +498,8 @@ fn nim_write_runs_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(
         run.stdout, b"hello, temen\n",
@@ -526,7 +527,8 @@ fn nim_strutils_cross_module_arg_widths_verify() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
 }
@@ -544,7 +546,7 @@ fn link_verify_std_module(module: &str) {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units)
+    let m = temen_leng::link_nim_powerbox(&units, None)
         .unwrap_or_else(|e| panic!("bridge link `{module}`: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
@@ -660,7 +662,7 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("link: {e}"));
+    let m = temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("link: {e}"));
 
     // Read an 8-byte little-endian word from the linked data image at window offset `off`.
     let read_word = |off: u64| -> u64 {
@@ -862,6 +864,129 @@ fn real_formatted_output_runs_end_to_end() {
 // (tracked separately). Those modules `link`+`verify` (their own tests); running them waits on the
 // runtime-provider work.
 // -------------------------------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------------------------------
+// Runtime providers (#1422): programs that need the **prebuilt guest libc**. `snprintf` (nim's
+// `formatBiggestFloat`), `strtod`, and the libm transcendentals are far too large to hand-write as
+// Temen text, so `link_nim_powerbox` links the same guest-C libc the chibicc playground card uses
+// (`browser/web/assets/pg_libc.temeno`, built by `genlibc`). Each test diffs the program's real
+// output against the oracle captured from the native nimony toolchain.
+// -------------------------------------------------------------------------------------------------
+
+/// The committed guest libc, or `None` when the asset is absent (the caller then skips).
+fn guest_libc() -> Option<Vec<u8>> {
+    std::fs::read("../../browser/web/assets/pg_libc.temeno").ok()
+}
+
+/// Compile `src`, link it against the guest libc, and run `_start` under the **standard powerbox**
+/// (the same engine the browser's `temen_run_onramp` wraps), returning the bytes it wrote to stdout.
+fn run_libc_program(src: &str) -> Option<Vec<u8>> {
+    let path = toolchain_path()?;
+    let libc = guest_libc()?;
+    let mods = compile_to_leng(&path, src);
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units, Some(&libc))
+        .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // The guest libc's file/heap caps resolve to stubs at link, so the program's manifest is the one
+    // `write` STREAM cap — exactly as it is without the libc.
+    assert_eq!(
+        m.imports
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["write"],
+        "linking the guest libc must not widen the program's capability manifest"
+    );
+    let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
+    Some(run.stdout)
+}
+
+/// **#1422 — `std/strutils` float formatting runs.** `formatBiggestFloat` calls C `snprintf` with
+/// `%#.*g`/`%#.*e`/`%#.*f`; the guest libc serves it (varargs are clang-wasm-style on both sides, so
+/// it binds with no shim). Output is diffed against the native-nimony oracle.
+#[test]
+fn real_strutils_float_formatting_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "write(stdout, formatFloat(3.14159, ffDecimal, 3))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(2.5, ffScientific, 2))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(1.0, ffDefault, -1))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"3.142|2.50e+00|1");
+}
+
+/// **#1422 — `std/parseutils` float parsing runs.** `parseBiggestFloat` falls back to C `strtod`
+/// for anything its fast path won't take; the guest libc serves it. Diffed against the
+/// native-nimony oracle (4 characters consumed, value 2.75).
+#[test]
+fn real_parseutils_strtod_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "import std/parseutils\n",
+        "var f: BiggestFloat = 0.0\n",
+        "let n = parseBiggestFloat(\"2.75xyz\", f)\n",
+        "write(stdout, $n)\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(f, ffDecimal, 2))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"4|2.75");
+}
+
+/// **#1422 — `std/times` links and runs.** `times` (and `monotimes`) reach `std/posix`, whose
+/// `clock_gettime`/`open`/`execve`/… leaves the compute shim now serves as fail-closed stubs — a
+/// sandboxed program gets no ambient clock, filesystem or process table, so `clock_gettime` reports a
+/// deterministic zero timespec. Before, those leaves were unbound and the program refused to start.
+#[test]
+fn real_times_module_runs() {
+    let src = "import std/syncio\nimport std/times\nwrite(stdout, \"times ok\")\n";
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"times ok");
+}
+
+/// **#1422 — `std/math` transcendentals run.** nim imports each as a `float64`/`float32` pair
+/// (`sin`/`sinf`), and the guest libc now carries both, plus the hyperbolics built on `exp`/`log`/
+/// `sqrt`. Values are printed through `formatFloat`, so this covers the libm *and* `snprintf` paths.
+#[test]
+fn real_math_transcendentals_run() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "import std/math\n",
+        "write(stdout, formatFloat(sin(0.5), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(cos(0.5), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(tanh(1.0), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(arctan(1.0), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(sinh(1.0), ffDecimal, 6))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"0.479426|0.877583|0.761594|0.785398|1.175201");
+}
 
 #[test]
 fn real_tables_ops_run_correctly() {

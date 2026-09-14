@@ -153,4 +153,45 @@ __PG_FN double asin(double x) {
 }
 __PG_FN double acos(double x) { return M_PI_2 - asin(x); }
 
+
+// ---- hyperbolics -------------------------------------------------------------------------
+// Built on `exp`/`log`/`sqrt` above. nim's `std/math` imports these directly (`sinh`…`atanh`),
+// so a nim program that pulls in `math` needs them to link (#1422).
+__PG_FN double sinh(double x) { double e = exp(x); return (e - 1.0 / e) * 0.5; }
+__PG_FN double cosh(double x) { double e = exp(x); return (e + 1.0 / e) * 0.5; }
+__PG_FN double tanh(double x) {
+  if (x > 20.0) return 1.0;                 // e^40 already saturates the ratio to 1
+  if (x < -20.0) return -1.0;
+  double e = exp(2.0 * x);
+  return (e - 1.0) / (e + 1.0);
+}
+// `asinh` is odd; reflect negatives so the `x + sqrt(x^2+1)` never cancels catastrophically.
+__PG_FN double asinh(double x) {
+  return x < 0.0 ? -log(-x + sqrt(x * x + 1.0)) : log(x + sqrt(x * x + 1.0));
+}
+__PG_FN double acosh(double x) { return x < 1.0 ? __pg_nan() : log(x + sqrt(x * x - 1.0)); }
+__PG_FN double atanh(double x) {
+  if (x > 1.0 || x < -1.0) return __pg_nan();
+  if (x == 1.0) return __pg_inf();
+  if (x == -1.0) return -__pg_inf();
+  return 0.5 * log((1.0 + x) / (1.0 - x));
+}
+
+// ---- float32 overloads -------------------------------------------------------------------
+// nim declares every one of these beside its `float64` twin (`func sin*(x: float32): float32
+// {.importc: "sinf".}`), so both spellings are imported whenever `std/math` is pulled in. Computing
+// in `double` and narrowing is correct to `float` precision.
+__PG_FN float sinf(float x) { return (float)sin((double)x); }
+__PG_FN float cosf(float x) { return (float)cos((double)x); }
+__PG_FN float tanf(float x) { return (float)tan((double)x); }
+__PG_FN float asinf(float x) { return (float)asin((double)x); }
+__PG_FN float acosf(float x) { return (float)acos((double)x); }
+__PG_FN float atanf(float x) { return (float)atan((double)x); }
+__PG_FN float sinhf(float x) { return (float)sinh((double)x); }
+__PG_FN float coshf(float x) { return (float)cosh((double)x); }
+__PG_FN float tanhf(float x) { return (float)tanh((double)x); }
+__PG_FN float asinhf(float x) { return (float)asinh((double)x); }
+__PG_FN float acoshf(float x) { return (float)acosh((double)x); }
+__PG_FN float atanhf(float x) { return (float)atanh((double)x); }
+
 #endif

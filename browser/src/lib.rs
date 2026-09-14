@@ -4953,6 +4953,20 @@ pub unsafe extern "C" fn temen_nim_precrawl_put(
     unsafe { (*core::ptr::addr_of_mut!(NIM_PRECRAWL)).push((path, bytes)) };
 }
 
+/// Seed the **prebuilt guest libc** (`web/assets/pg_libc.temeno`) the nim→powerbox link binds
+/// `snprintf`/`strtod`/the libm transcendentals against (#1422). The host fetches the asset once and
+/// hands it over before compiling; without it a nim program that formats a float (`formatFloat`),
+/// parses one, or calls `sin` links with those leaves unbound and cannot run. Call it again to
+/// replace the buffer.
+///
+/// # Safety
+/// `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_libc_put(ptr: *const u8, len: usize) {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec();
+    nimc::set_libc(bytes);
+}
+
 /// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
 /// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
 /// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via

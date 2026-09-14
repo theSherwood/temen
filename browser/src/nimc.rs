@@ -835,7 +835,8 @@ fn compile_nim_ce_impl(
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
 
-    let m = temen_leng::link_nim_powerbox(&units).map_err(|e| format!("nim→powerbox link: {e}"))?;
+    let m = temen_leng::link_nim_powerbox(&units, nim_libc())
+        .map_err(|e| format!("nim→powerbox link: {e}"))?;
     temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
     Ok(m)
 }
@@ -853,6 +854,27 @@ pub fn compile_nim_ce_to_module(
     main_nim: &str,
 ) -> Result<Module, String> {
     compile_nim_ce_impl(nifler, nifler_ce, nimsem, hexer, files, main_nim)
+}
+
+/// The **prebuilt guest libc** the nim→powerbox link binds `snprintf`/`strtod`/libm against
+/// (`web/assets/pg_libc.temeno`; #1422). Seeded once by the host through
+/// [`temen_nim_libc_put`](crate::temen_nim_libc_put) rather than threaded through every compile entry
+/// point — the same shape as the pre-crawl accumulator above. Empty until the host supplies it, and
+/// then the link simply leaves those leaves unbound (a program that formats a float or calls `sin`
+/// cannot run, exactly as before).
+static mut NIM_LIBC: Vec<u8> = Vec::new();
+
+/// Replace the seeded guest libc. Called from the FFI shim on the host's behalf.
+pub(crate) fn set_libc(bytes: Vec<u8>) {
+    // SAFETY: single-threaded wasm; exclusive access (as `NIM_PRECRAWL`).
+    unsafe { *core::ptr::addr_of_mut!(NIM_LIBC) = bytes };
+}
+
+/// The seeded guest libc, or `None` when the host never supplied one.
+fn nim_libc() -> Option<&'static [u8]> {
+    // SAFETY: single-threaded wasm; read-only view of a host-seeded buffer.
+    let b = unsafe { &*core::ptr::addr_of!(NIM_LIBC) };
+    (!b.is_empty()).then_some(b.as_slice())
 }
 
 /// Run the linked module under the on-ramp powerbox (tree-walker), streaming its stdout live (#1143):

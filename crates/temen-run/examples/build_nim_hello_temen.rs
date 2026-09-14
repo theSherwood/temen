@@ -68,7 +68,7 @@ fn main() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let module = temen_leng::link_nim_powerbox(&units)
+    let module = temen_leng::link_nim_powerbox(&units, None)
         .unwrap_or_else(|e| panic!("nim→powerbox bridge: {e}"));
     // Verify before shipping (the escape-freedom floor, DESIGN §2a) and sanity-check the entry shape.
     temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify: {e:?}"));

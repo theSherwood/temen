@@ -276,7 +276,7 @@ self.onmessage = async (e) => {
       // Cache the nimony phase guests + stdlib image (posted once). Kept as the worker's own copies so
       // later `nimCompile` Runs need only ship the (small) source, not ~28 MB of guests each time.
       nimAssets = { nifler: msg.nifler, nimsem: msg.nimsem, hexer: msg.hexer, stdlib: msg.stdlib,
-        niflerCe: msg.niflerCe, nimsemCe: msg.nimsemCe, hexerCe: msg.hexerCe };
+        niflerCe: msg.niflerCe, nimsemCe: msg.nimsemCe, hexerCe: msg.hexerCe, libc: msg.libc };
       // #1375: the pre-compiled stdlib pack (parsed once, cached) — lets the whole-card orchestrator skip
       // re-semchecking the stdlib (system.nim's sema alone is ~30 s). Optional: absent → full from-scratch.
       // Trust it only when its wire-coupling key matches the loaded stdlib+guests; a stale pack would
@@ -298,7 +298,18 @@ self.onmessage = async (e) => {
         self.postMessage({ type: 'reply', id: msg.id, ok: false, error: 'nim assets not loaded' });
         return;
       }
-      const { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe } = nimAssets;
+      const { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, libc } = nimAssets;
+      // #1422: seed the prebuilt guest libc once per worker, before either compile path. The nim
+      // link binds `snprintf`/`strtod`/libm against it, so a program that formats or parses a float
+      // (or calls `sin`) runs instead of linking with those leaves unbound. Absent asset = unchanged
+      // pre-#1422 behaviour.
+      if (libc && libc.length && !nimAssets._libcSeeded) {
+        const lp = Number(ex.temen_alloc(libc.length));
+        new Uint8Array(memory.buffer).set(libc, lp);
+        ex.temen_nim_libc_put(lp, libc.length);
+        ex.temen_dealloc(lp, libc.length);
+        nimAssets._libcSeeded = true;
+      }
       const mainName = msg.main || 'prog.nim';
       const src = new TextEncoder().encode(msg.source);
       const main = new TextEncoder().encode(mainName);

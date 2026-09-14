@@ -515,7 +515,7 @@ fn main() {
         // I/O program: bridge nimony's bottom edge to the §3e powerbox (`sysWrite(fd,buf,len)` → the
         // STREAM `write` cap) via `link_nim_powerbox`, then run `_start` under the powerbox (host grants
         // stdout) and assert the captured **stdout** — the same bridge the `nim_hello` card ships.
-        let m: Module = temen_leng::link_nim_powerbox(&units)
+        let m: Module = temen_leng::link_nim_powerbox(&units, None)
             .unwrap_or_else(|e| panic!("nim→powerbox link: {e}"));
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
         assert!(

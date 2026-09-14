@@ -99,7 +99,7 @@ pub extern "C" fn main() -> i32 {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    match temen_leng::link_nim_powerbox(&units) {
+    match temen_leng::link_nim_powerbox(&units, None) {
         Ok(m) => {
             let bytes = temen_encode::encode_module(&m);
             write_stdout(&bytes);
