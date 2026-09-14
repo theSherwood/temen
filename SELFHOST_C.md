@@ -254,9 +254,10 @@ compiler bug is a clean error, never an escape.
    `__PG_FN`/`__PG_DATA`: whole program (`static inline`, unchanged, still dead-stripped), the **libc
    unit** (`__PG_LIBC_UNIT` → external linkage, so `--emit-object` exports the bodies), and a
    **program unit** (`__PG_LIBC_DECLS_ONLY` → prototypes and `extern` data only, linked against the
-   prebuilt unit). The bodies sit in their own files (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`) rather
-   than behind an `#ifdef`, because chibicc tokenizes a header in full before the preprocessor drops
-   skipped groups — moving them out cut the decls-only compile from 370 ms to 108 ms on its own.
+   prebuilt unit). The bodies sit in their own files (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`,
+   `__pg_string_impl.h`, `__pg_math_impl.h`) rather than behind an `#ifdef`, because chibicc tokenizes
+   a header in full before the preprocessor drops skipped groups — moving them out cut the decls-only
+   compile from 370 ms to 108 ms on its own.
    Measured (debug, a three-call `printf`/`fprintf`/`puts` program, `browser/tests/chibicc_link_libc.rs`):
    **12.4 s → 1.0 s** (~12×), IR 353 KB → 1.2 KB; the libc unit costs 13.6 s once. The card serves both
    halves from a resident unit — `temen_link_run_lib` to run, `temen_link_text_lib` to hand a DAP

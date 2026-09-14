@@ -438,10 +438,11 @@ The seeded headers are now split so the libc can be compiled **once** as its own
   costs +8% IR on a three-call `printf` program). The libc unit (`__PG_LIBC_UNIT`): external, so
   `--emit-object` publishes each body in the unit's export table. A program unit
   (`__PG_LIBC_DECLS_ONLY`): the bodies are absent entirely.
-- The bodies live in their **own files** (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`), included from the
-  header only when the bodies are wanted — not behind an `#ifdef` in place. chibicc tokenizes a header
-  in full before the preprocessor drops skipped groups, so body text left in place is still
-  *tokenized* by a decls-only compile: moving it out took that compile from 370 ms to 108 ms.
+- The bodies live in their **own files** (`__pg_stdio_impl.h`, `__pg_stdlib_impl.h`,
+  `__pg_string_impl.h`, `__pg_math_impl.h`), included from the header only when the bodies are wanted —
+  not behind an `#ifdef` in place. chibicc tokenizes a header in full before the preprocessor drops
+  skipped groups, so body text left in place is still *tokenized* by a decls-only compile: moving it
+  out took that compile from 370 ms to 108 ms.
 - `browser/playground-include/__pg_libc.c` is the libc unit's TU (`temen_browser::playground_libc_tu`),
   and `PG_DECLS_ONLY_ARGV` (`-include __pg_decls_only.h`) is what puts a program unit in decls-only
   mode. A seeded header rather than a `-D`, because the committed `chibicc.temen` asset predates
@@ -453,8 +454,9 @@ decls-only against a prebuilt libc unit (~12x), with the emitted IR 353 KB → 1
 itself costs 13.6 s, paid *once*. The floor (a program with no headers at all) is 71 ms, so what is
 left in the 1.0 s is preprocessing the *declarations* — which no split removes.
 
-The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 144 KB, 58 function exports
-plus the `__pg_std` data symbol, built with `-g`. `browser/src/genlibc.rs` builds it by running the
+The unit is a **committed asset** — `browser/web/assets/pg_libc.temeno`, 174 KB, 119 function exports
+plus the `__pg_std` data symbol, built with `-g`. It carries `<stdio.h>`, `<stdlib.h>`, `<string.h>` and
+`<math.h>`; the rest of the seeded headers are small enough to stay inline. `browser/src/genlibc.rs` builds it by running the
 *committed* `chibicc.temen` over `__pg_libc.c` through the same on-ramp powerbox the card uses, so it
 needs only cargo (no clang, no LLVM); `scripts/rebuild-assets.sh`'s `pg_libc` step is the entry point
 and `browser/tests/pg_libc_asset.rs` is the gate. It is doubly wire-coupled — produced by one
