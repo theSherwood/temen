@@ -5100,55 +5100,68 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
     }
 }
 
-/// What [`gc_unreachable_funcs`] did: the old→new funcidx map (`None` = dropped) and the count.
+/// What [`stub_unreachable_funcs`] did.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct GcFuncs {
-    /// Indexed by the *old* funcidx: its new index, or `None` if the function was dropped.
-    pub map: Vec<Option<FuncIdx>>,
-    /// How many functions were dropped (`0` ⇒ the module is unchanged and `map` is the identity).
-    pub dropped: usize,
+pub struct StubbedFuncs {
+    /// How many function bodies were replaced by a trap (`0` ⇒ the module is unchanged).
+    pub stubbed: usize,
 }
 
-/// Why [`gc_unreachable_funcs`] declined or failed.
+/// Why [`stub_unreachable_funcs`] declined.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum GcError {
-    /// The module's data image contains funcidxs baked into bytes ([`Module::data_funcrefs`]), which
-    /// this pass cannot rewrite — renumbering would silently retarget them. Declines, changing
-    /// nothing. (A [`link`]ed module has an empty list because the linker already baked them, so a
-    /// caller that links units carrying `data.funcref` must not run this pass on the result; check the
-    /// *units*, as [`crate::link`]'s consumers do.)
+    /// The module's data image has funcidxs baked into bytes ([`Module::data_funcrefs`]), which this
+    /// pass cannot see — the linker resolved and cleared them, so a function reachable *only* from a
+    /// static initializer would look unreachable and be stubbed out from under its caller. Declines,
+    /// changing nothing. (A [`link`]ed module always has an empty list, so check the **units**, as
+    /// the linker's consumers do.)
     DataFuncrefs,
-    /// A live function referenced a funcidx the reachability walk had marked dead. This is a bug in
-    /// the walk (an unhandled funcidx-bearing form), reported rather than applied: a wrong remap
-    /// would silently call the wrong function. The module is left untouched.
-    MissedEdge { from: FuncIdx, to: FuncIdx },
-    /// A root index was out of range.
+    /// A root, or a call target, was out of range — the verifier's job, not this pass's.
     BadRoot(FuncIdx),
 }
 
-/// **Drop functions nothing can reach, and renumber every funcidx that named one** — link-time
-/// dead-code elimination (#1407).
+/// **Replace the body of every function nothing can reach with a trap** — link-time dead-code
+/// elimination (#1407).
 ///
 /// [`link`] merges whole modules: every function of a library unit lands in the linked program
 /// whether or not anything reaches it. A program that calls only `printf` still carries the seeded
-/// libc's `<string.h>` and the whole series-based libm. This is the reachability walk that removes
-/// them — the cross-unit twin of what chibicc's own `mark_live` does *within* a translation unit.
+/// libc's `<string.h>` and the whole series-based libm — weight every launch pays to verify and
+/// bytecode-compile. This is the reachability walk that empties them: the cross-unit twin of what
+/// chibicc's own `mark_live` does *within* a translation unit.
+///
+/// # Why it stubs instead of removing
+///
+/// **Function indices are observable.** `call.indirect` masks an `i32` into the domain's dispatch
+/// table, whose slot `i` *is* funcidx `i` ([`DomainTable::new`]'s natural prefix), padded to a power
+/// of two. A `funcref` is "just the function index as an `i32`" and deliberately forgeable (§3c), so
+/// an index can arrive from arithmetic or a literal, not only from [`Inst::RefFunc`]. Removing
+/// functions would renumber the table *and shrink the mask*: an index that selected one function
+/// would select another. Safety would survive — the slot's signature re-check and the trapping
+/// padding are what make a forged index inert — but **behaviour would not**, and a program whose
+/// indirect call silently retargets is exactly the failure this pass must not introduce.
+///
+/// Keeping every index and emptying the dead bodies preserves the table exactly: a `ref.func`-derived
+/// call lands where it always did, and a forged index that happens to select an unreachable function
+/// now traps rather than executing code nothing could reach — strictly safer than before. It also
+/// means there is no renumbering at all: no index map, nothing for a caller to remap, and no way for
+/// an unhandled funcidx-bearing form to cause a silent miscompile.
+///
+/// The saving is the bodies, which is where the cost was: verify and bytecode-compile walk a
+/// one-block trap instead of a function.
+///
+/// # Roots and edges
 ///
 /// Roots are the module's addressable surface — every [`Module::exports`] entry and every
-/// [`ImplExport`] op — plus `extra_roots`, for a funcidx the caller intends to invoke directly (the
-/// entry it is about to hand [`synth_manifest_start`], say). **A funcidx the caller holds but does not
-/// pass is not a root**: indices move, so resolve names to indices *before* calling this, and remap
-/// anything you kept through [`GcFuncs::map`].
-///
-/// Edges are followed from a live function's body: [`Inst::Call`], [`Inst::RefFunc`],
-/// [`Inst::ThreadSpawn`] and [`Terminator::ReturnCall`] — the same set [`offset_func_indices`]
-/// rewrites, and the two must stay in step. A [`Inst::CallImport`] names an import slot, not a
-/// function, so it is not an edge.
-///
-/// Fails rather than guessing: a module with baked data funcrefs is declined
-/// ([`GcError::DataFuncrefs`]), and a reference to a function the walk dropped is reported
-/// ([`GcError::MissedEdge`]) instead of applied. On any error the module is unchanged.
-pub fn gc_unreachable_funcs(m: &mut Module, extra_roots: &[FuncIdx]) -> Result<GcFuncs, GcError> {
+/// [`ImplExport`] op — plus `extra_roots`, for a funcidx the caller invokes directly (the entry it is
+/// about to hand [`synth_manifest_start`], say). Edges are followed from a live body: [`Inst::Call`],
+/// [`Inst::RefFunc`], [`Inst::ThreadSpawn`] and [`Terminator::ReturnCall`] — the same set
+/// [`offset_func_indices`] rewrites, and the two must stay in step. A [`Inst::CallImport`] names an
+/// import slot, not a function, so it is not an edge; a [`Inst::CallIndirect`] names no function at
+/// all, which is the whole reason indices are preserved.
+pub fn stub_unreachable_funcs(
+    m: &mut Module,
+    extra_roots: &[FuncIdx],
+) -> Result<StubbedFuncs, GcError> {
     let n = m.funcs.len();
     if !m.data_funcrefs.is_empty() {
         return Err(GcError::DataFuncrefs);
@@ -5194,106 +5207,37 @@ pub fn gc_unreachable_funcs(m: &mut Module, extra_roots: &[FuncIdx]) -> Result<G
             }
         }
         for e in edges {
-            if (e as usize) >= n {
-                return Err(GcError::BadRoot(e)); // out of range; the verifier's job, not ours
-            }
             push(e, &mut live, &mut work)?;
         }
     }
-    // --- plan ---------------------------------------------------------------------------------
-    let mut map: Vec<Option<FuncIdx>> = alloc::vec![None; n];
-    let mut next: FuncIdx = 0;
-    for (i, &alive) in live.iter().enumerate() {
-        if alive {
-            map[i] = Some(next);
-            next += 1;
-        }
-    }
-    let dropped = n - next as usize;
-    if dropped == 0 {
-        return Ok(GcFuncs { map, dropped: 0 });
-    }
-    // Every reference a surviving function makes must land on a survivor. It will, if the walk above
-    // saw every funcidx-bearing form — so a miss is reported, never applied.
-    for (i, &alive) in live.iter().enumerate() {
-        if !alive {
+    // --- stub ---------------------------------------------------------------------------------
+    // The signature stays (the table's slot check reads it); the body becomes one diverging block, so
+    // the only way to arrive is a forged index, and arriving traps.
+    let mut stubbed = 0;
+    for (i, f) in m.funcs.iter_mut().enumerate() {
+        if live[i] {
             continue;
         }
-        for b in &m.funcs[i].blocks {
-            let check = |to: FuncIdx| -> Result<(), GcError> {
-                if map[to as usize].is_none() {
-                    return Err(GcError::MissedEdge {
-                        from: i as FuncIdx,
-                        to,
-                    });
-                }
-                Ok(())
-            };
-            for inst in &b.insts {
-                match inst {
-                    Inst::Call { func, .. }
-                    | Inst::RefFunc { func }
-                    | Inst::ThreadSpawn { func, .. } => check(*func)?,
-                    _ => {}
-                }
-            }
-            if let Terminator::ReturnCall { func, .. } = &b.term {
-                check(*func)?;
-            }
-        }
+        f.blocks = alloc::vec![Block {
+            params: f.params.clone(),
+            insts: Vec::new(),
+            term: Terminator::Unreachable,
+        }];
+        stubbed += 1;
     }
-    // --- apply --------------------------------------------------------------------------------
-    let mut kept: Vec<Func> = Vec::with_capacity(next as usize);
-    for (i, f) in m.funcs.drain(..).enumerate() {
-        if live[i] {
-            kept.push(f);
-        }
+    if stubbed == 0 {
+        return Ok(StubbedFuncs { stubbed: 0 });
     }
-    m.funcs = kept;
-    let at = |f: FuncIdx| map[f as usize].expect("checked above");
-    for f in &mut m.funcs {
-        for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                match inst {
-                    Inst::Call { func, .. }
-                    | Inst::RefFunc { func }
-                    | Inst::ThreadSpawn { func, .. } => *func = at(*func),
-                    _ => {}
-                }
-            }
-            if let Terminator::ReturnCall { func, .. } = &mut b.term {
-                *func = at(*func);
-            }
-        }
-    }
-    for e in &mut m.exports {
-        e.func = at(e.func);
-    }
-    for e in &mut m.impl_exports {
-        for f in &mut e.ops {
-            *f = at(*f);
-        }
-    }
-    // Debug info for a dropped function is dropped with it — a dangling `func` would make a stepper
-    // resolve a stop to the wrong source line (and the DAP's range checks reject it outright).
+    // A stubbed function's debug info describes instructions that no longer exist: a stepper would
+    // resolve a stop inside it to a stale line, and a variable to a stale slot. Drop it. Indices do
+    // not move, so nothing else is rewritten — the surviving entries are already correct.
     if let Some(di) = &mut m.debug_info {
-        di.locs.retain(|l| map[l.func as usize].is_some());
-        for l in &mut di.locs {
-            l.func = at(l.func);
-        }
+        di.locs.retain(|l| live[l.func as usize]);
         di.vars
-            .retain(|v| v.func == GLOBAL_SCOPE || map[v.func as usize].is_some());
-        for v in &mut di.vars {
-            if v.func != GLOBAL_SCOPE {
-                v.func = at(v.func);
-            }
-        }
-        di.func_names.retain(|nm| map[nm.func as usize].is_some());
-        for nm in &mut di.func_names {
-            nm.func = at(nm.func);
-        }
+            .retain(|v| v.func == GLOBAL_SCOPE || live[v.func as usize]);
+        di.func_names.retain(|nm| live[nm.func as usize]);
     }
-    Ok(GcFuncs { map, dropped })
+    Ok(StubbedFuncs { stubbed })
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`

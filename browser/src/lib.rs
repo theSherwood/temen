@@ -9103,18 +9103,14 @@ pub fn link_program_multi(
     // exactly what a host can still address by name afterwards.
     //
     // Skipped when either unit baked a funcidx into its data image (`data.funcref`): the linker has
-    // already written those bytes and nothing can find them again to renumber, so collecting would
-    // silently retarget them. chibicc emits none; a nim-style unit can, and simply keeps every
-    // function — slower, correct.
+    // already resolved and cleared those, so a function reachable *only* from a static initializer
+    // would look unreachable and be emptied out from under its caller. chibicc emits none; a nim-style
+    // unit can, and simply keeps every body — slower, correct.
     if libs.iter().all(|u| u.module.data_funcrefs.is_empty()) && program.data_funcrefs.is_empty() {
         linked
             .exports
             .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
-        if let Ok(gc) = temen_ir::gc_unreachable_funcs(&mut linked, &[entry_idx]) {
-            if let Some(moved) = gc.map[entry_idx as usize] {
-                entry_idx = moved;
-            }
-        }
+        let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
     }
     let module =
         temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;

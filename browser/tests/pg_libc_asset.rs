@@ -338,19 +338,34 @@ fn the_linked_program_drops_what_it_cannot_reach() {
     let entry = whole.resolve_export("main").expect("entry");
     let whole = temen_ir::synth_manifest_start(whole, entry, false).expect("synth");
 
-    assert!(
-        linked.funcs.len() * 2 < whole.funcs.len(),
-        "a `puts`-only program should keep a small fraction of the libc: {} of {} funcs",
-        linked.funcs.len(),
-        whole.funcs.len()
-    );
-    eprintln!(
-        "#1407 gc: {} funcs kept of {} ({} B vs {} B encoded)",
-        linked.funcs.len(),
-        whole.funcs.len(),
+    // The index space is deliberately unchanged (a funcidx is observable through `call.indirect`), so
+    // the win shows up as *bodies*: count functions that still have instructions, and compare encoded
+    // size.
+    let with_bodies = |m: &temen_ir::Module| {
+        m.funcs
+            .iter()
+            .filter(|f| f.blocks.iter().any(|b| !b.insts.is_empty()))
+            .count()
+    };
+    let (kept, total) = (with_bodies(&linked), with_bodies(&whole));
+    let (small, big) = (
         temen_encode::encode_module(&linked).len(),
         temen_encode::encode_module(&whole).len(),
     );
+    assert_eq!(
+        linked.funcs.len(),
+        whole.funcs.len(),
+        "the index space must not move: `call.indirect` masks into a table whose slot i is funcidx i"
+    );
+    assert!(
+        kept * 2 < total,
+        "a `puts`-only program should keep a small fraction of the libc's bodies: {kept} of {total}"
+    );
+    assert!(
+        small * 2 < big,
+        "and the encoded module should shrink with them: {small} B vs {big} B"
+    );
+    eprintln!("#1407 gc: {kept} bodies kept of {total} ({small} B vs {big} B encoded)");
 
     // Still correct, still steppable: it runs, and the debug info that survived is in range.
     let out = temen_browser::onramp_exec(&linked, b"");

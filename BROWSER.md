@@ -513,26 +513,38 @@ A Node harness that instantiates the cdylib directly must then supply the shared
 
 `link` merges whole modules: a program that calls `printf` also carried the prebuilt libc's
 `<string.h>` and the whole series-based libm, because every unit's exports land in the merged export
-table and every export is addressable. `temen_ir::gc_unreachable_funcs` is the reachability walk that
-removes them — the cross-unit twin of what chibicc's `mark_live` does *within* a translation unit.
+table and every export is addressable. `temen_ir::stub_unreachable_funcs` is the reachability walk that
+empties them — the cross-unit twin of what chibicc's `mark_live` does *within* a translation unit.
+
+**It stubs rather than removes, and that is the load-bearing decision.** A funcidx is *observable*:
+`call.indirect` masks an `i32` into the domain dispatch table, whose slot `i` **is** funcidx `i`
+(`DomainTable::new`'s natural prefix), padded to a power of two with trapping slots — and a `funcref`
+is "just the function index as an `i32`", deliberately forgeable (§3c). So an index can arrive from
+arithmetic or a literal, not only from `ref.func`. Removing functions would renumber that table *and
+shrink its mask*: an index that selected one function would select another. Safety would survive — the
+slot's signature re-check and the trapping padding are what make a forged index inert — but behaviour
+would not, and a silently retargeted indirect call is exactly what this pass must not introduce.
+
+Keeping every index and emptying the dead bodies preserves the table exactly: a `ref.func`-derived call
+lands where it always did, and a forged index that selects an unreachable function now traps instead of
+running code nothing could reach — strictly safer than before. It also means nothing is renumbered, so
+there is no index map for callers to thread through and no way for an unhandled funcidx-bearing form to
+cause a silent miscompile. The saving is the bodies, which is where the cost was.
 
 Roots are the module's addressable surface (every `exports` entry, every `ImplExport` op) plus the
-caller's `extra_roots`, for a funcidx it means to invoke by index — the entry it is about to hand
-`synth_manifest_start`. Edges are followed from a live body: `Call`, `RefFunc` (the address-taken
-case a call-graph-only walk would drop), `ThreadSpawn`, `ReturnCall` — the same set
-`offset_func_indices` rewrites, and **the two must stay in step**. It fails rather than guessing: a
-module whose data image has funcidxs baked into bytes (`data.funcref`, which the linker has already
-written and nothing can locate again) is declined, and a live reference to a function the walk dropped
-is reported as `MissedEdge` instead of applied — a wrong renumber is silent, so it is never applied on
-a maybe.
+caller's `extra_roots`. Edges are followed from a live body: `Call`, `RefFunc` (the address-taken case
+a call-graph-only walk would miss), `ThreadSpawn`, `ReturnCall` — the same set `offset_func_indices`
+rewrites, and **the two must stay in step**. A module whose data image has funcidxs baked into bytes
+(`data.funcref`, resolved and cleared by the linker) is declined: a function reachable only from a
+static initializer would look unreachable and be emptied out from under its caller.
 
 The library's exports have to be pruned first or there is nothing to collect — they existed to
 *resolve* the program's calls, and a linked executable does not re-export its libc. `link_program`
 keeps the program unit's own surface and collects from there. Measured on the chibicc card, a
-`puts`-only program: **11 functions kept of 123, 11 KB instead of 174 KB**; the `printf`/`snprintf`/
-`malloc`/`fprintf` program in `browser-pg-libc-test.mjs`, 175 KB → 119 KB, and its debug-session IR
-text 798 KB → 527 KB. That is paid back on every launch (verify + bytecode-compile) and on every
-relaunch.
+`puts`-only program: **11 bodies kept of 122, 12.6 KB encoded instead of 174 KB**; the
+`printf`/`snprintf`/`malloc`/`fprintf` program in `browser-pg-libc-test.mjs`, 175 KB → 121 KB, and its
+debug-session IR text 798 KB → 537 KB. That is paid back on every launch (verify +
+bytecode-compile) and on every relaunch.
 
 `temen_link_run_libs` / `temen_link_text_libs` / `temen_link_encode_libs` take a **list** of resident
 handles (#1408) — `temen_link_lib_open` could always keep several libraries resident, but the
