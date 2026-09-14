@@ -2950,6 +2950,43 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
+/// Whether the **on-ramp powerbox** would bind a manifest import named `name`, given the handle set
+/// it granted for this module — the predicate behind [`temen_module_imports`].
+///
+/// It asks the one shared definition (#912): [`temen_ir::PowerboxHandles::bind`], the same call
+/// [`grant_onramp_caps`] makes to build its instantiation-time bindings, so the answer cannot drift
+/// from what actually happens at launch. Asking the *name table* instead would be wrong, and
+/// concretely so: `default_cap_resolver("stderr")` resolves (it is `Stream` write, like `write`),
+/// but the on-ramp never grants a `stderr` handle, so `bind` returns `None` and the slot stays
+/// unbound. Reporting such a name as served would hand the program to a runner that faults on its
+/// first write to it.
+///
+/// `vm_fs` is the one name outside that ABI: [`grant_onramp_caps`] grants a private memfs for it
+/// directly (#1323), binding the slot to a `HostProc` rather than through the powerbox prefix.
+///
+/// A name this returns `false` for is not an error — it is a **named host-completed cap** the
+/// embedder itself serves (#1366), which only the debug session can park for. That is the
+/// distinction an embedder needs before it picks a run path, and why it is worth asking up front
+/// instead of discovering it as a `CapFault`.
+pub(crate) fn onramp_serves_import(name: &str, granted: &temen_ir::PowerboxHandles) -> bool {
+    name == "vm_fs" || granted.bind(name).is_some()
+}
+
+/// The handle set [`grant_onramp_caps`] *would* grant for `m`, for answering
+/// [`onramp_serves_import`] before anything is launched. Handle **values** are irrelevant to "is
+/// this name bound" — only which fields are populated is — so the prefix carries placeholders.
+///
+/// The two grant decisions mirror `grant_onramp_caps` and must stay with it: the §3e prefix is
+/// always granted, and `Jit` only when the guest declares a `vm_jit_*` import (least authority).
+/// `stderr` is never granted by this powerbox, which `PowerboxHandles::prefix` already encodes.
+fn onramp_granted_shape(m: &temen_ir::Module) -> temen_ir::PowerboxHandles {
+    let mut granted = temen_ir::PowerboxHandles::prefix([0; 5]);
+    if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
+        granted.jit = Some(0);
+    }
+    granted
+}
+
 /// Gate an on-ramp module (IMPORTS.md phase 4): the runtime never rewrites. A module that declares
 /// imports must carry the **powerbox entry shape** — a paramless func 0 exported as `_start`
 /// (`temen-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
@@ -8902,6 +8939,94 @@ pub extern "C" fn temen_link_encode_libs(
         temen_encode::encode_module,
     )
 }
+
+/// Report what a module **declares as host capabilities**, and which of them the on-ramp powerbox can
+/// serve. `[ptr, len)` is a module in either form [`link_load_unit`] accepts — an encoded blob or
+/// Temen text — so a host can ask this of a program it has just linked without re-encoding it.
+///
+/// An embedder needs two answers before it launches: *what do I grant*, and *can the release runner
+/// run this at all*. Both live in [`temen_ir::Module::imports`]; [`temen_ir::Inst::CallSym`] and
+/// [`temen_ir::Inst::CallImport`] carry only an **index** into that table, so there is no name
+/// anywhere in the instruction stream to read. A host that instead scrapes emitted IR text for a name
+/// gets a *different answer on a linked module than on a whole-program one*, with no error — the
+/// regression c_interpret#26 describes. This is the query that makes that unnecessary.
+///
+/// Returns `1` and stashes one line per declared import, in declaration order, `served\tname`:
+///
+/// ```text
+/// 1\tvm_fs
+/// 1\twrite
+/// 0\tfb_poll
+/// ```
+///
+/// `1` = the on-ramp powerbox binds this name ([`onramp_serves_import`], which asks the shared
+/// powerbox ABI the launch itself uses); `0` = the **embedder** must
+/// serve it. So "what do I grant" is the whole list, and "the release runner can run this as-is" is
+/// *every line begins with `1`*. An import-free module stashes nothing and still returns `1` — the
+/// empty list is a true answer, not a failure.
+///
+/// Returns `0` and **clears** the stash if the bytes don't load ([`STATUS_DECODE_ERR`]), or if any
+/// import name contains a tab or newline ([`STATUS_UNSUPPORTED`]) — a refusal never leaves the previous
+/// module's report readable, so a host that skips the return code reads an empty list rather than
+/// granting against the wrong program. The name check matters for the same reason: the report gates
+/// *what the host grants*, so a module carrying the name `"a\n1\tinstantiator"` must not be able to
+/// forge a line and talk an embedder into granting a capability it never declared. No real capability
+/// name contains either byte, so refusing is free and fails closed.
+///
+/// Read the stash via [`temen_module_imports_ptr`] + [`temen_module_imports_len`] before the next
+/// call. It has its own slot, so querying never clobbers a link's stashed text on
+/// [`temen_stdout_ptr`] — the host can read the two in either order.
+#[no_mangle]
+pub extern "C" fn temen_module_imports(ptr: *const u8, len: usize) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    // Every refusal clears the slot. A host that reads the report without checking the return code
+    // must not be handed the *previous* module's answer and grant against it.
+    let refuse = |s: i32| {
+        // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+        unsafe { stash(&mut *core::ptr::addr_of_mut!(IMPORTS), Vec::new()) };
+        set(s);
+        0
+    };
+    let Some(m) = link_load_unit(link_slice(ptr, len)) else {
+        return refuse(STATUS_DECODE_ERR);
+    };
+    if m.imports
+        .iter()
+        .any(|im| im.name.contains('\t') || im.name.contains('\n'))
+    {
+        return refuse(STATUS_UNSUPPORTED);
+    }
+    let granted = onramp_granted_shape(&m);
+    let mut out = Vec::new();
+    for im in &m.imports {
+        out.push(if onramp_serves_import(&im.name, &granted) {
+            b'1'
+        } else {
+            b'0'
+        });
+        out.push(b'\t');
+        out.extend_from_slice(im.name.as_bytes());
+        out.push(b'\n');
+    }
+    // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(IMPORTS), out) };
+    set(STATUS_OK);
+    1
+}
+
+/// Pointer / length of the most recent [`temen_module_imports`] report (cdylib-managed, like `PARSE`;
+/// do not `temen_dealloc` it).
+#[no_mangle]
+pub extern "C" fn temen_module_imports_ptr() -> *const u8 {
+    unsafe { (*core::ptr::addr_of!(IMPORTS)).0 }
+}
+#[no_mangle]
+pub extern "C" fn temen_module_imports_len() -> usize {
+    unsafe { (*core::ptr::addr_of!(IMPORTS)).1 }
+}
+/// The stashed [`temen_module_imports`] report. Its own slot so the query never clobbers a link's
+/// stashed module text on `OUT`.
+static mut IMPORTS: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
 /// The shared body of the link-and-stash entries: resolve the handles, load the program unit, link,
 /// and stash `render`'s bytes on [`temen_stdout_ptr`]/[`temen_stdout_len`]. `0` on success, else a

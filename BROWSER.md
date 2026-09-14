@@ -592,6 +592,47 @@ single-handle entries could only link one. Units link in the order given with th
 unknown or closed handle anywhere in the list declines the whole call, so a stale handle can never
 link against whatever now occupies that slot. The single-handle forms remain as wrappers.
 
+## Ask the module what it needs: `temen_module_imports` (c_interpret#26)
+
+An embedder has two questions to answer before it launches a program, and both are about the same
+list: **what capabilities do I grant**, and **can my run-to-completion runner serve this at all** (a
+named host-completed cap, #1366, can only be parked for by the debug session). `temen_module_imports`
+answers both from `Module::imports`, stashed one line per import as `served<TAB>name`:
+
+```
+1	vm_fs        ← the on-ramp powerbox binds this name
+1	write
+0	fb_poll      ← the embedder must serve this one
+```
+
+So "grant these" is the whole list, and "the release runner can run this as-is" is *every line begins
+with `1`*. The `served` column is `onramp_serves_import`, which asks the one shared
+powerbox ABI (#912): `PowerboxHandles::bind`, the same call `grant_onramp_caps` makes to build its
+instantiation-time bindings, against the handle set that grant *would* produce for this module. So it
+cannot drift from what happens at launch.
+
+Asking the **name table** instead would be wrong, concretely: `default_cap_resolver("stderr")`
+resolves — it is `Stream` write, op 1, identical to `write` — but the on-ramp grants no `stderr`
+handle, so `bind` returns `None` and the slot stays unbound. Only the binding can tell those two
+apart, and reporting `stderr` as served would hand the program to a runner that fails closed on its
+first write to it. `vm_fs` is the one name outside that ABI, granted a private memfs directly
+(#1323). The only thing mirrored from `grant_onramp_caps` is its two *grant decisions* — the §3e
+prefix always, `Jit` only when the guest declares a `vm_jit_*` import — which is what
+`onramp_granted_shape` reproduces; keep those two in step with it. The query takes either a module blob or Temen text, so a host
+can ask about a program it has just linked without re-encoding it, and it has its own stash slot so it
+never clobbers a link's text on `temen_stdout_ptr`.
+
+**Why it exists.** c_interpret answered both questions by scraping emitted IR text for
+`call.sym "<name>"`. That only ever worked by accident: `Inst::CallSym` carries a **`u32` index** into
+the import table, not a name, and a whole-program compile happened to render the name inline. Once
+programs were linked from separately-compiled units the same program rendered as `call.sym 6 v8(…)`,
+the scrape found nothing, and the host silently stopped granting caps and started routing interactive
+programs to the runner that cannot serve them — no error anywhere. `tests/module_imports.rs` pins that
+exact shape. Two fail-closed properties are worth knowing: a refusal **clears** the stash (so a host
+that skips the return code reads an empty list rather than granting against the previous program), and
+an import name containing a tab or newline is refused outright, because the report gates what gets
+granted and a crafted name must not be able to forge a line into it.
+
 ## Remaining work / follow-ons
 
 Everything in the phase tracker is landed; this is the open list — each item its own slice, none a
