@@ -15457,6 +15457,7 @@ fn lower_float_intrinsic(
             | "llvm.copysign"
             | "llvm.fmuladd"
             | "llvm.fma"
+            | "llvm.is.fpclass"
     );
     if !recognized {
         return Ok(None);
@@ -15698,9 +15699,270 @@ fn lower_float_intrinsic(
                 b: c,
             })
         }
+        // `llvm.is.fpclass(x, mask)` — the IEEE class test, `mask` an immediate.
+        "llvm.is.fpclass" => {
+            let mask = args
+                .get(1)
+                .and_then(|a| a.as_constant())
+                .and_then(|k| match k {
+                    Constant::Int { value, .. } => Some(*value as u32),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::Unsupported("llvm.is.fpclass: `mask` must be a constant int".into())
+                })?;
+            let x = ctx.operand(args[0])?;
+            lower_is_fpclass(ctx, x, ty, mask)?
+        }
         _ => return Ok(None),
     };
     Ok(Some(idx))
+}
+
+/// Lower `llvm.is.fpclass.f32/f64(x, mask)` — the IEEE **class test** clang ≥ 22 emits for
+/// `isnan`/`isinf`/`isfinite`/`isnormal`/`signbit` (older clangs emitted an `fcmp` chain or a
+/// libcall, which is why the LLVM 18 → 22 pin surfaced it). `mask` is a 10-bit immediate, one bit
+/// per IEEE class in LangRef order: snan, qnan, −inf, −normal, −subnormal, −zero, +zero,
+/// +subnormal, +normal, +inf.
+///
+/// The class is read off the **bit pattern** (sign / biased exponent / mantissa) rather than from an
+/// `fcmp` chain: exact for every input, and the only formulation that can separate signaling from
+/// quiet NaN. Only the predicates the mask actually selects are emitted, so the common tests stay
+/// tiny — `isnan` is two compares, `isinf` three.
+fn lower_is_fpclass(
+    ctx: &mut BlockCtx,
+    x: ValIdx,
+    ty: FloatTy,
+    mask: u32,
+) -> Result<ValIdx, Error> {
+    const ALL: u32 = 0x3ff;
+    let mask = mask & ALL;
+    if mask == 0 {
+        return Ok(ctx.push(Inst::ConstI32(0)));
+    }
+    if mask == ALL {
+        return Ok(ctx.push(Inst::ConstI32(1)));
+    }
+    // Per-format bit layout: (carrier, reinterpret, exponent shift, all-ones exponent, mantissa
+    // mask, the mantissa's quiet-NaN bit).
+    let (ity, reinterp, exp_shift, exp_ones, man_mask, quiet_bit) = match ty {
+        FloatTy::F32 => (
+            IntTy::I32,
+            CastOp::ReinterpF32I32,
+            23_i64,
+            0xff_i64,
+            0x7f_ffff_i64,
+            0x40_0000_i64,
+        ),
+        FloatTy::F64 => (
+            IntTy::I64,
+            CastOp::ReinterpF64I64,
+            52_i64,
+            0x7ff_i64,
+            0xf_ffff_ffff_ffff_i64,
+            0x8_0000_0000_0000_i64,
+        ),
+    };
+    let bits = ctx.push(Inst::Cast { op: reinterp, a: x });
+    let k = |ctx: &mut BlockCtx, v: i64| {
+        ctx.push(match ity {
+            IntTy::I32 => Inst::ConstI32(v as i32),
+            IntTy::I64 => Inst::ConstI64(v),
+        })
+    };
+    let bin = |ctx: &mut BlockCtx, op: BinOp, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::IntBin { ty: ity, op, a, b })
+    };
+    let cmp = |ctx: &mut BlockCtx, op: CmpOp, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::IntCmp { ty: ity, op, a, b })
+    };
+    let zero = k(ctx, 0);
+    let sh = k(ctx, exp_shift);
+    let ones = k(ctx, exp_ones);
+    let mm = k(ctx, man_mask);
+    let shifted = bin(ctx, BinOp::ShrU, bits, sh);
+    let exp = bin(ctx, BinOp::And, shifted, ones);
+    let man = bin(ctx, BinOp::And, bits, mm);
+    let exp_is_ones = cmp(ctx, CmpOp::Eq, exp, ones);
+    let exp_is_zero = cmp(ctx, CmpOp::Eq, exp, zero);
+    let man_is_zero = cmp(ctx, CmpOp::Eq, man, zero);
+    // `bits < 0` under a signed compare is exactly the sign bit, at either width.
+    let is_neg = cmp(ctx, CmpOp::LtS, bits, zero);
+    // Bool combinators: every predicate here is a 0/1 `i32`, so bitwise is logical.
+    let and2 = |ctx: &mut BlockCtx, a: ValIdx, b: ValIdx| {
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::And,
+            a,
+            b,
+        })
+    };
+    let not1 = |ctx: &mut BlockCtx, a: ValIdx| {
+        let one = ctx.push(Inst::ConstI32(1));
+        ctx.push(Inst::IntBin {
+            ty: IntTy::I32,
+            op: BinOp::Xor,
+            a,
+            b: one,
+        })
+    };
+    // The four **magnitude** classes, in the order their (negative, positive) mask bits pair up.
+    // NaN is signless, so it is handled separately below.
+    let magnitude = |ctx: &mut BlockCtx, i: usize| match i {
+        0 => and2(ctx, exp_is_ones, man_is_zero), // inf
+        1 => {
+            let not_ones = not1(ctx, exp_is_ones);
+            let not_zero = not1(ctx, exp_is_zero);
+            and2(ctx, not_ones, not_zero) // normal
+        }
+        2 => {
+            let man_nz = not1(ctx, man_is_zero);
+            and2(ctx, exp_is_zero, man_nz) // subnormal
+        }
+        _ => and2(ctx, exp_is_zero, man_is_zero), // zero
+    };
+    let mut acc: Option<ValIdx> = None;
+    let or_in = |ctx: &mut BlockCtx, acc: &mut Option<ValIdx>, p: ValIdx| {
+        *acc = Some(match *acc {
+            None => p,
+            Some(prev) => ctx.push(Inst::IntBin {
+                ty: IntTy::I32,
+                op: BinOp::Or,
+                a: prev,
+                b: p,
+            }),
+        });
+    };
+    // snan / qnan (bits 0, 1) — `exp == ones && man != 0`, split on the mantissa's quiet bit.
+    if mask & 0b11 != 0 {
+        let man_nz = not1(ctx, man_is_zero);
+        let is_nan = and2(ctx, exp_is_ones, man_nz);
+        let p = if mask & 0b11 == 0b11 {
+            is_nan
+        } else {
+            let qb = k(ctx, quiet_bit);
+            let q = bin(ctx, BinOp::And, man, qb);
+            let quiet = cmp(ctx, CmpOp::Ne, q, zero);
+            let want = if mask & 0b10 != 0 {
+                quiet
+            } else {
+                not1(ctx, quiet)
+            };
+            and2(ctx, is_nan, want)
+        };
+        or_in(ctx, &mut acc, p);
+    }
+    // The signed classes: (negative bit, positive bit) per magnitude — −inf/+inf, −normal/+normal,
+    // −subnormal/+subnormal, −zero/+zero. Selected on both signs ⇒ the sign test drops out.
+    for (i, (neg_bit, pos_bit)) in [
+        (1 << 2, 1 << 9),
+        (1 << 3, 1 << 8),
+        (1 << 4, 1 << 7),
+        (1 << 5, 1 << 6),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (want_neg, want_pos) = (mask & neg_bit != 0, mask & pos_bit != 0);
+        if !want_neg && !want_pos {
+            continue;
+        }
+        let m = magnitude(ctx, i);
+        let p = match (want_neg, want_pos) {
+            (true, true) => m,
+            (true, false) => and2(ctx, m, is_neg),
+            (false, true) => {
+                let pos = not1(ctx, is_neg);
+                and2(ctx, m, pos)
+            }
+            (false, false) => unreachable!(),
+        };
+        or_in(ctx, &mut acc, p);
+    }
+    Ok(acc.expect("a non-empty class mask selects at least one predicate"))
+}
+
+/// Lower `llvm.modf.f32/f64(x)` → the `{fractional, integral}` pair, recorded as a 2-field
+/// aggregate (consumed by `extractvalue 0`/`1`) exactly like the `with.overflow` family. clang ≥ 22
+/// emits this intrinsic where older clangs emitted a libcall to C `modf(x, &iptr)` — a *different*
+/// shape (out-pointer, one result), which is why the intrinsic must never be name-redirected onto a
+/// guest-defined `modf` (see [`libm_intrinsic_target`]'s caller).
+///
+/// Lowered inline, no libm: `integral = trunc(x)`, `frac = copysign(x - integral, x)`. The
+/// `copysign` fixes the one case plain subtraction gets wrong — `modf(-0.0)` is `-0.0`, but
+/// `-0.0 - -0.0` is `+0.0`. `±inf` is special-cased to `±0` (`inf - inf` is NaN); a NaN input falls
+/// through as NaN in both fields, as LangRef requires. Returns `true` if handled.
+fn lower_modf_intrinsic(
+    ctx: &mut BlockCtx,
+    c: &crate::ll::ast::Call,
+    types: &Types,
+) -> Result<bool, Error> {
+    let Some(name) = callee_name(c) else {
+        return Ok(false);
+    };
+    if name.rsplit_once('.').map_or(name.as_str(), |(b, _)| b) != "llvm.modf" {
+        return Ok(false);
+    }
+    let [(arg, _)] = c.arguments.as_slice() else {
+        return unsup("llvm.modf takes exactly one argument");
+    };
+    let ty = float_ty(val_type(arg.get_type(types).as_ref())?)?;
+    let x = ctx.operand(arg)?;
+    let (zero, inf) = match ty {
+        FloatTy::F32 => (
+            ctx.push(Inst::ConstF32(0.0f32.to_bits())),
+            ctx.push(Inst::ConstF32(f32::INFINITY.to_bits())),
+        ),
+        FloatTy::F64 => (
+            ctx.push(Inst::ConstF64(0.0f64.to_bits())),
+            ctx.push(Inst::ConstF64(f64::INFINITY.to_bits())),
+        ),
+    };
+    let integral = ctx.push(Inst::FUn {
+        ty,
+        op: FUnOp::Trunc,
+        a: x,
+    });
+    let d = ctx.push(Inst::FBin {
+        ty,
+        op: FBinOp::Sub,
+        a: x,
+        b: integral,
+    });
+    let finite_frac = ctx.push(Inst::FBin {
+        ty,
+        op: FBinOp::Copysign,
+        a: d,
+        b: x,
+    });
+    let ax = ctx.push(Inst::FUn {
+        ty,
+        op: FUnOp::Abs,
+        a: x,
+    });
+    let is_inf = ctx.push(Inst::FCmp {
+        ty,
+        op: FCmpOp::Eq,
+        a: ax,
+        b: inf,
+    });
+    let signed_zero = ctx.push(Inst::FBin {
+        ty,
+        op: FBinOp::Copysign,
+        a: zero,
+        b: x,
+    });
+    let frac = ctx.push(Inst::Select {
+        cond: is_inf,
+        a: signed_zero,
+        b: finite_frac,
+    });
+    if let Some(dest) = &c.dest {
+        if let Some(&vid) = ctx.s.name2id.get(dest) {
+            ctx.agg.insert(vid, vec![frac, integral]);
+        }
+    }
+    Ok(true)
 }
 
 /// Whether a `call` is a droppable intrinsic with no guest-visible effect for our subset —
@@ -15873,6 +16135,49 @@ fn libm_intrinsic_target(name: &str) -> Option<String> {
         "f32" => Some(format!("{base}f")),
         _ => None,
     }
+}
+
+/// A call's argument list measured in signature **slots** (an i128 argument is two — `param_vtypes`).
+/// The unit both the definition-shape check and the argument marshaling count in.
+fn call_arg_slots(c: &crate::ll::ast::Call, types: &Types) -> usize {
+    c.arguments
+        .iter()
+        .map(|(a, _)| {
+            if i128_pair(a.get_type(types).as_ref()).is_some() {
+                2
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+/// The name a **direct** call actually lands on — `None` for a call through a function pointer.
+///
+/// Normally the callee's own name. The one rewrite is the float-math **intrinsic** no recognizer
+/// lowered (`llvm.log.f64`, `llvm.exp.f32`, … — clang ≥ 22 emits these where older clangs emitted
+/// the libcall): it resolves to the guest-defined libm function of the same name when the program
+/// links one (Postgres bundles openlibm: `log`, `exp`, `pow`, `sin`, …; `f32` → the `…f` variant).
+///
+/// The redirect is allowed **only when that definition's shape matches this call site** — a
+/// non-variadic definition taking exactly the slots the site passes. An intrinsic whose shape
+/// differs from its C namesake is then never redirected: `llvm.modf.f64(x)` returns
+/// `{fractional, integral}` while C `modf(x, &iptr)` takes an out-pointer and returns one double,
+/// so the name-only redirect emitted a 2-argument `call` against a 3-parameter callee — a module
+/// that cannot verify (`CallArgCountMismatch`), which is what reddened the `demo_tcl_repl_stdin`
+/// nightly capstone. Refusing here leaves such a call on the strict undefined-external path: fail
+/// closed at translate, or a trap stub under `stub_unresolved_externs` — never a bad call.
+fn direct_callee(ctx: &BlockCtx, c: &crate::ll::ast::Call, slots: usize) -> Option<String> {
+    let name = callee_name(c)?;
+    Some(
+        libm_intrinsic_target(&name)
+            .filter(|t| {
+                ctx.def_sigs
+                    .get(t)
+                    .is_some_and(|(params, va)| !va && params.len() == slots)
+            })
+            .unwrap_or(name),
+    )
 }
 
 /// Is this a call to a Rust **panic/abort lang item**? Under `-C panic=abort` the panic entry points
@@ -18643,6 +18948,10 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         if lower_overflow_intrinsic(ctx, c, types)? {
             return Ok(());
         }
+        // `llvm.modf.f32/f64` → `{fractional, integral}`, likewise recorded as the aggregate itself.
+        if lower_modf_intrinsic(ctx, c, types)? {
+            return Ok(());
+        }
         // `llvm.vector.reduce.*` (the horizontal reduce auto-vectorization emits) → an unrolled
         // lane fold to a scalar.
         if let Some(idx) = lower_vector_reduce(ctx, c, types)? {
@@ -18742,7 +19051,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `(ptr, ptr)` definition). The definition decides the fixed/marshaled split, whether a
         // va-area is deposited at all, and the widths the fixed args coerce to (the native ABI
         // hides all three). An arity violation the ABI cannot paper over fails closed.
-        let def_sig = callee_name(c).and_then(|n| ctx.def_sigs.get(&n).cloned());
+        //
+        // The name resolved first ([`direct_callee`]): a float-math intrinsic no recognizer lowered
+        // can resolve to a guest-defined libm function of the same name, and when it does, it is the
+        // *definition's* signature this call must follow — same rule, one place.
+        // The argument list in signature **slots** (an i128 argument is two, `param_vtypes`) — the
+        // unit both the definition-shape check below and the argument marshaling count in.
+        let arg_slots = call_arg_slots(c, types);
+        let callee = direct_callee(ctx, c, arg_slots);
+        let def_sig = callee.as_ref().and_then(|n| ctx.def_sigs.get(n).cloned());
         // §varargs / old-C **indirect** drift (#802): a `(...)` call through a function POINTER can
         // name a non-variadic definition whose type the site cannot know (bash's `typedef int
         // Function ()` cleanup tables: `(*cleanup)(arg)` against `void pop_stream(void)`). The
@@ -18752,18 +19069,6 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         // `synth_dispatcher`): the deposit is skipped here because the dispatcher owns ALL
         // marshaling (its default arm reproduces the strict varargs `call.dyn` exactly).
         let dispatcher = dispatch_key_for(c, types).and_then(|k| ctx.dispatch_map.get(&k).copied());
-        // The argument list in signature **slots** (an i128 argument is two, `param_vtypes`).
-        let arg_slots: usize = c
-            .arguments
-            .iter()
-            .map(|(a, _)| {
-                if i128_pair(a.get_type(types).as_ref()).is_some() {
-                    2
-                } else {
-                    1
-                }
-            })
-            .sum();
         let (fixed, coerce_to): (Option<usize>, Option<Vec<ValType>>) = if dispatcher.is_some() {
             (None, None)
         } else {
@@ -18836,20 +19141,15 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
         }
         // A direct call (named, defined function) lowers to `call <idx>`; an indirect call (through
         // a function-pointer value) lowers to `call.dyn <sig>` (§3c: mask + type-id check).
-        let inst = match callee_name(c) {
+        let inst = match callee {
             Some(name) => {
-                // Reaching here means every recognizer/synthesizer/capability declined `name` — it is a
-                // genuinely undefined external. Strict default: fail closed. With `stub_unresolved_externs`:
-                // mint (or reuse) a trap stub and call it, deferring the fail-closed to run time (§2a).
-                // A float math **intrinsic** no recognizer lowered (`llvm.log.f64`, `llvm.exp.f32`, …
-                // — clang ≥22 emits these where older clangs emitted the libcall) resolves to the
-                // guest-defined libm function of the same name when the program links one (Postgres
-                // bundles openlibm: `log`, `exp`, `pow`, `sin`, …; `f32` → the `…f` variant). Same
-                // signature, same `(sp, args…)` convention as any direct call.
-                let libm = libm_intrinsic_target(&name)
-                    .filter(|t| ctx.name2idx.contains_key(t))
-                    .unwrap_or_else(|| name.clone());
-                let func = match ctx.name2idx.get(&libm) {
+                // `name` is what [`direct_callee`] resolved — the callee's own name, or the
+                // guest-defined libm function a float intrinsic redirects to when its shape matches.
+                // Not being in `name2idx` means every recognizer/synthesizer/capability declined it and
+                // nothing defines it: it is a genuinely undefined external. Strict default: fail closed.
+                // With `stub_unresolved_externs`: mint (or reuse) a trap stub and call it, deferring the
+                // fail-closed to run time (§2a).
+                let func = match ctx.name2idx.get(&name) {
                     Some(&idx) => idx,
                     None => match ctx.stubs {
                         Some(cell) => {

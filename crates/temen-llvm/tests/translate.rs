@@ -5947,6 +5947,291 @@ entry:\n\
         .expect("a stubbed extern called with two arities must still verify");
 }
 
+/// The IEEE class bits `llvm.is.fpclass`'s mask immediate is built from (LangRef order).
+#[cfg(test)]
+mod fpclass_bits {
+    pub const SNAN: u32 = 1 << 0;
+    pub const QNAN: u32 = 1 << 1;
+    pub const NEG_INF: u32 = 1 << 2;
+    pub const NEG_NORMAL: u32 = 1 << 3;
+    pub const NEG_SUBNORMAL: u32 = 1 << 4;
+    pub const NEG_ZERO: u32 = 1 << 5;
+    pub const POS_ZERO: u32 = 1 << 6;
+    pub const POS_SUBNORMAL: u32 = 1 << 7;
+    pub const POS_NORMAL: u32 = 1 << 8;
+    pub const POS_INF: u32 = 1 << 9;
+    pub const ALL: u32 = 0x3ff;
+}
+
+/// Translate `run()`, verify, and run it on both tiers, asserting they agree on the returned `i64`.
+#[cfg(test)]
+fn run_ll_i64(what: &str, src: &str) -> i64 {
+    let t = temen_llvm::translate_ll_str(src).unwrap_or_else(|e| panic!("translate {what}: {e:?}"));
+    let module = t.module;
+    temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify {what}: {e:?}"));
+    // `@run` need not be function 0 — a module that also defines the libm namesake puts it later.
+    let entry = t
+        .exports
+        .iter()
+        .find(|(n, _)| n == "run")
+        .map(|(_, i)| *i)
+        .unwrap_or_else(|| panic!("{what}: the module exports no `run`"));
+    let full = vec![Value::I64(t.entry_sp as i64)];
+    let mut fuel = 1_000_000u64;
+    let interp = temen_interp::run(&module, entry, &full, &mut fuel)
+        .unwrap_or_else(|e| panic!("interp {what}: {e:?}"));
+    let Some(Value::I64(got)) = interp.first().copied() else {
+        panic!("{what}: interp returned {interp:?}, want one i64")
+    };
+    let slots: Vec<i64> = full.iter().map(to_slot).collect();
+    match temen_jit::compile_and_run(&module, entry, &slots).expect("jit run") {
+        JitOutcome::Returned(s) => assert_eq!(s[0], got, "{what}: JIT disagrees with the interp"),
+        other => panic!("{what}: unexpected JIT outcome {other:?}"),
+    }
+    got
+}
+
+#[test]
+fn is_fpclass_classifies_every_ieee_class() {
+    // Regression (the `demo_micropython_repl_stdin` nightly capstone, `guest trapped (Unreachable)`):
+    // clang ≥ 22 lowers `isnan`/`isinf`/`isfinite`/`isnormal`/`signbit` to `llvm.is.fpclass`, which no
+    // recognizer knew — under `stub_unresolved_externs` it became a trap stub, and MicroPython trapped
+    // on its first float classification (`mp_obj_float_binary_op`, the `2**0.5` path). The LLVM 18 → 22
+    // pin is what surfaced it; clang 18 emitted an `fcmp` chain.
+    //
+    // One case per IEEE class: the value's own class bit must answer 1 and every other bit 0, so a
+    // predicate that is too wide or too narrow fails. `snan`/`qnan` pin the mantissa quiet-bit split
+    // an `fcmp`-chain lowering cannot express.
+    use fpclass_bits::*;
+    let classes: [(&str, &str, u32); 10] = [
+        ("snan", "0x7FF0000000000001", SNAN),
+        ("qnan", "0x7FF8000000000000", QNAN),
+        ("-inf", "0xFFF0000000000000", NEG_INF),
+        ("-normal", "0xBFF0000000000000", NEG_NORMAL),
+        ("-subnormal", "0x8000000000000001", NEG_SUBNORMAL),
+        ("-zero", "0x8000000000000000", NEG_ZERO),
+        ("+zero", "0x0000000000000000", POS_ZERO),
+        ("+subnormal", "0x0000000000000001", POS_SUBNORMAL),
+        ("+normal", "0x3FF0000000000000", POS_NORMAL),
+        ("+inf", "0x7FF0000000000000", POS_INF),
+    ];
+    let probe = |value: &str, mask: u32| -> i64 {
+        let src = format!(
+            "declare i1 @llvm.is.fpclass.f64(double, i32)\n\
+             define i64 @run() {{\n\
+             entry:\n\
+               %c = call i1 @llvm.is.fpclass.f64(double {value}, i32 {mask})\n\
+               %r = select i1 %c, i64 1, i64 0\n\
+               ret i64 %r\n\
+             }}\n"
+        );
+        run_ll_i64(&format!("is.fpclass({value}, {mask:#x})"), &src)
+    };
+    for (name, value, bit) in classes {
+        assert_eq!(probe(value, bit), 1, "{name}: its own class bit must match");
+        assert_eq!(
+            probe(value, ALL & !bit),
+            0,
+            "{name}: every other class bit must not match"
+        );
+        // The degenerate masks fold to a constant either way.
+        assert_eq!(probe(value, 0), 0, "{name}: the empty mask matches nothing");
+        assert_eq!(probe(value, ALL), 1, "{name}: the full mask matches all");
+    }
+    // The composite masks clang actually emits, over every class.
+    let composites: [(&str, u32); 4] = [
+        ("isnan", SNAN | QNAN),
+        ("isinf", NEG_INF | POS_INF),
+        (
+            "isfinite",
+            NEG_NORMAL | NEG_SUBNORMAL | NEG_ZERO | POS_ZERO | POS_SUBNORMAL | POS_NORMAL,
+        ),
+        ("isnormal", NEG_NORMAL | POS_NORMAL),
+    ];
+    for (what, mask) in composites {
+        for (name, value, bit) in classes {
+            let want = i64::from(mask & bit != 0);
+            assert_eq!(probe(value, mask), want, "{what} of {name}");
+        }
+    }
+    // The `f32` overload reads a different bit layout (8-bit exponent, 23-bit mantissa, quiet bit
+    // 0x400000) — the same sweep over `float`, so a layout typo cannot hide behind the `f64` cases.
+    let probe32 = |value: &str, mask: u32| -> i64 {
+        let src = format!(
+            "declare i1 @llvm.is.fpclass.f32(float, i32)\n\
+             define i64 @run() {{\n\
+             entry:\n\
+               %c = call i1 @llvm.is.fpclass.f32(float {value}, i32 {mask})\n\
+               %r = select i1 %c, i64 1, i64 0\n\
+               ret i64 %r\n\
+             }}\n"
+        );
+        run_ll_i64(&format!("is.fpclass.f32({value}, {mask:#x})"), &src)
+    };
+    // `.ll` writes a `float` constant as the `double` image of its value, so these are the `double`
+    // bit patterns of representative `float` classes. The signaling NaN is left to the `f64` sweep
+    // above: a `double`→`float` narrowing quiets it, so the textual form cannot carry one.
+    let classes32: [(&str, &str, u32); 9] = [
+        ("qnan", "0x7FF8000000000000", QNAN),
+        ("-inf", "0xFFF0000000000000", NEG_INF),
+        ("-normal", "0xBFF0000000000000", NEG_NORMAL),
+        ("-subnormal", "0xB800000000000000", NEG_SUBNORMAL),
+        ("-zero", "0x8000000000000000", NEG_ZERO),
+        ("+zero", "0x0000000000000000", POS_ZERO),
+        ("+subnormal", "0x3800000000000000", POS_SUBNORMAL),
+        ("+normal", "0x3FF0000000000000", POS_NORMAL),
+        ("+inf", "0x7FF0000000000000", POS_INF),
+    ];
+    for (name, value, bit) in classes32 {
+        assert_eq!(probe32(value, bit), 1, "f32 {name}: its own class bit");
+        assert_eq!(
+            probe32(value, ALL & !bit),
+            0,
+            "f32 {name}: every other class bit"
+        );
+    }
+}
+
+#[test]
+fn modf_intrinsic_splits_fraction_and_integral() {
+    // Regression (the `demo_tcl_repl_stdin`/`demo_tcl_init_stdin` nightly capstones,
+    // `CallArgCountMismatch { expected: 3, found: 2 }`): clang ≥ 22 lowers C `modf(x, &iptr)` to
+    // `llvm.modf.f64`, which returns `{fractional, integral}` and takes ONE argument. With no
+    // recognizer, the name-only intrinsic→libm redirect sent it at the guest openlibm's
+    // `modf(double, double*)` — a 2-argument `call` against a 3-parameter callee, so the module
+    // could not verify (Tcl's `ExprRoundFunc`/`TclCompareTwoNumbers`).
+    //
+    // Bit-exact expectations: the signed zeros are the point. `modf(-0.0)` is `-0.0` in both fields,
+    // but a plain `x - trunc(x)` yields `+0.0`; `±inf` must give `±0.0` fractional, where the same
+    // subtraction yields NaN.
+    let probe = |value: &str, field: u32| -> i64 {
+        let src = format!(
+            "declare {{ double, double }} @llvm.modf.f64(double)\n\
+             define i64 @run() {{\n\
+             entry:\n\
+               %p = call {{ double, double }} @llvm.modf.f64(double {value})\n\
+               %v = extractvalue {{ double, double }} %p, {field}\n\
+               %b = bitcast double %v to i64\n\
+               ret i64 %b\n\
+             }}\n"
+        );
+        run_ll_i64(&format!("modf({value}).{field}"), &src)
+    };
+    let cases: [(&str, f64, f64); 6] = [
+        ("3.5", 0.5, 3.0),
+        ("-3.5", -0.5, -3.0),
+        ("0.0", 0.0, 0.0),
+        ("-0.0", -0.0, -0.0),
+        ("0x7FF0000000000000", 0.0, f64::INFINITY),
+        ("0xFFF0000000000000", -0.0, f64::NEG_INFINITY),
+    ];
+    for (value, frac, integral) in cases {
+        assert_eq!(
+            probe(value, 0) as u64,
+            frac.to_bits(),
+            "modf({value}) fractional part (bit-exact, signed zero included)"
+        );
+        assert_eq!(
+            probe(value, 1) as u64,
+            integral.to_bits(),
+            "modf({value}) integral part (bit-exact, signed zero included)"
+        );
+    }
+    // NaN in ⇒ NaN in both fields.
+    for field in 0..2 {
+        let bits = probe("0x7FF8000000000000", field) as u64;
+        assert!(
+            f64::from_bits(bits).is_nan(),
+            "modf(NaN) field {field} must be NaN, got {bits:#x}"
+        );
+    }
+    // The `f32` overload, same shape — its own constants, so a width typo cannot hide.
+    let probe32 = |value: &str, field: u32| -> i64 {
+        let src = format!(
+            "declare {{ float, float }} @llvm.modf.f32(float)\n\
+             define i64 @run() {{\n\
+             entry:\n\
+               %p = call {{ float, float }} @llvm.modf.f32(float {value})\n\
+               %v = extractvalue {{ float, float }} %p, {field}\n\
+               %b = bitcast float %v to i32\n\
+               %z = zext i32 %b to i64\n\
+               ret i64 %z\n\
+             }}\n"
+        );
+        run_ll_i64(&format!("modf.f32({value}).{field}"), &src)
+    };
+    let cases32: [(&str, f32, f32); 4] = [
+        ("3.5", 0.5, 3.0),
+        ("-3.5", -0.5, -3.0),
+        ("-0.0", -0.0, -0.0),
+        ("0xFFF0000000000000", -0.0, f32::NEG_INFINITY),
+    ];
+    for (value, frac, integral) in cases32 {
+        assert_eq!(
+            probe32(value, 0) as u32,
+            frac.to_bits(),
+            "modf.f32({value}) fractional part"
+        );
+        assert_eq!(
+            probe32(value, 1) as u32,
+            integral.to_bits(),
+            "modf.f32({value}) integral part"
+        );
+    }
+}
+
+#[test]
+fn intrinsic_libm_redirect_requires_a_matching_definition() {
+    // The rule behind both capstone failures, pinned directly: an unlowered float intrinsic may
+    // resolve to a guest-defined libm function of the same name ONLY when that definition's shape
+    // matches the call site. `llvm.sincos.f64` takes one argument and returns a pair; C `sincos`
+    // takes two out-pointers — redirecting on the name alone emitted a `call` no verifier would
+    // accept. A shape mismatch now stays on the strict undefined-external path.
+    use temen_llvm::TranslateOptions;
+    let drifted = "\
+define void @sincos(double %x, ptr %s, ptr %c) {\n\
+entry:\n\
+  ret void\n\
+}\n\
+declare { double, double } @llvm.sincos.f64(double)\n\
+define double @run(double %x) {\n\
+entry:\n\
+  %p = call { double, double } @llvm.sincos.f64(double %x)\n\
+  %s = extractvalue { double, double } %p, 0\n\
+  ret double %s\n\
+}\n";
+    assert!(
+        temen_llvm::translate_ll_str(drifted).is_err(),
+        "a shape-mismatched intrinsic must fail closed, not redirect onto the C namesake"
+    );
+    let opts = TranslateOptions {
+        stub_unresolved_externs: true,
+        ..TranslateOptions::default()
+    };
+    let t = temen_llvm::translate_ll_str_with_options(drifted, opts)
+        .expect("under stubs it translates (the trap stub defers the fail-closed to run time)");
+    temen_verify::verify_module(&t.module).expect("and the stubbed module still verifies");
+
+    // The redirect itself stays alive where the shapes DO agree: `llvm.log.f64` → the guest's `log`.
+    let matching = "\
+define double @log(double %x) {\n\
+entry:\n\
+  ret double 4.2e1\n\
+}\n\
+declare double @llvm.log.f64(double)\n\
+define i64 @run() {\n\
+entry:\n\
+  %r = call double @llvm.log.f64(double 1.0)\n\
+  %i = fptosi double %r to i64\n\
+  ret i64 %i\n\
+}\n";
+    assert_eq!(
+        run_ll_i64("llvm.log.f64 → the guest's log", matching),
+        42,
+        "a shape-matching intrinsic must still resolve to the guest-defined libm function"
+    );
+}
+
 #[test]
 fn vector_mask_bitwise_any_match() {
     // The SIMD "**any lane matches**" idiom (Postgres' `simd.h`): several `<N x i1>` comparison masks
