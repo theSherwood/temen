@@ -1109,6 +1109,13 @@ jobs:
           # threads wasm is absent. (The scroll-into-view trigger — real users' fallback — is covered by
           # browser-nim-prewarm-test.)
           node browser-nim-eager-prewarm-gate-test.mjs
+          # #1422 (nim runtime providers): a nim program that formats a float could compile but not RUN —
+          # `formatBiggestFloat` calls C `snprintf`, which had no implementation, so the linked module
+          # carried unbound manifest imports and refused to start. The nim->powerbox link now binds those
+          # leaves against the prebuilt guest-C libc the chibicc card already uses (assets/pg_libc.temeno),
+          # seeded through temen_nim_libc_put. This drives that production FFI path and diffs the output
+          # against the native-nimony oracle. SKIPs if the threads wasm or the libc asset is absent.
+          node browser-nim-libc-test.mjs
           # #816 Slice C (invariant 14, durability axis, cross-host leg): a vm_map-GROWN durability-
           # instrumented guest frozen to a §12 SVMD artifact (temen_durable_freeze), persisted to
           # IndexedDB, and — after a real page reload into a fresh wasm instance — thawed and resumed to
