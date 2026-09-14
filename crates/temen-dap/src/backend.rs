@@ -34,28 +34,9 @@ use temen_interp::MemEvent;
 use crate::json::Json;
 use temen_interp::{
     cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
-    StreamRole, Trap, Value, VarValue, WatchId, WatchKind,
+    Trap, Value, VarValue, WatchId, WatchKind,
 };
 use temen_ir::{FuncIdx, Module};
-
-/// The on-ramp import-name → `(cap type_id, op)` policy for the I/O + memory caps a manifest program
-/// (a chibicc `_start`) imports — a twin of the browser's `onramp_cap_resolver` and temen-run's
-/// `default_cap_resolver`, kept small and self-contained here so `temen-dap` needn't depend on the
-/// browser/runtime crates. Covers the caps a debugged C program actually reaches (`write`/`read`/`exit`
-/// + the `vm_*` memory ops); anything else leaves its slot unbound (fail-closed at dispatch).
-fn io_cap(name: &str) -> Option<(u32, u32)> {
-    Some(match name {
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        _ => return None,
-    })
-}
 
 /// #1366 slice (c) — a **declared host-completed cap** the launch named (`hostCaps`) is parked on:
 /// the completion id the run parked with, the cap's name, and the guest's call arguments (a flat
@@ -88,19 +69,10 @@ fn grant_io_powerbox(
 ) {
     host.stdin = stdin.to_vec();
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let handles = [
-        host.grant_stream(StreamRole::Out),
-        host.grant_stream(StreamRole::In),
-        host.grant_exit(),
-        host.grant_memory(),
-        host.grant_address_space(0, win),
-    ];
-    for (name, h) in ["stdout", "stdin", "exit", "memory", "addrspace"]
-        .iter()
-        .zip(&handles)
-    {
-        host.register_cap_name(name, *h);
-    }
+    // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
+    // performs (#912), so a debugged guest sees the same handles in the same order the Run path gives
+    // it. This session's own capabilities (`vm_fs`, the declared host-completed ones) follow.
+    let granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
     // #1323 (c_interpret #16, file I/O): a debugged program that does file I/O reaches a private,
     // in-memory **read-write** scratch filesystem through the `vm_fs` seam (chibicc `__vm_fs` builtin
     // → `call.sym "vm_fs"`, a flat call with base op 0 and the fs op in arg0). Mirror the browser Run
@@ -177,20 +149,13 @@ fn grant_io_powerbox(
                         None => BoundImport::rebindable(0, 0, None),
                     };
                 }
-                let Some((type_id, op)) = io_cap(&im.name) else {
-                    return BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (type_id, op) {
-                    (cap_id::STREAM, 1) => handles[0],
-                    (cap_id::STREAM, _) => handles[1],
-                    (cap_id::EXIT, _) => handles[2],
-                    // One kind post-§4: the vm_map family (ops 0–3) binds the whole-window
-                    // grant; sub/region_create bind the sized one (op-keyed, like Stream).
-                    (cap_id::ADDRESS_SPACE, 0..=3) => handles[3],
-                    (cap_id::ADDRESS_SPACE, _) => handles[4],
-                    _ => return BoundImport::rebindable(0, 0, None),
-                };
-                BoundImport::required(type_id, op, handle)
+                // The shared powerbox ABI (#912): the name's capability and the handle this
+                // session granted for it. A name it did not grant (the `Jit` cap, `stderr`) or a
+                // dynamic-only interface leaves its slot unbound — fail-closed at dispatch.
+                match granted.bind(&im.name) {
+                    Some((cap, handle)) => BoundImport::required(cap.type_id, cap.op, handle),
+                    None => BoundImport::rebindable(0, 0, None),
+                }
             })
             .collect();
         host.set_import_bindings(bindings);

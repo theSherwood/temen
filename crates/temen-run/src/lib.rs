@@ -3692,47 +3692,13 @@ pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
 }
 
 /// The reference host's capability-import name policy (§7 "Host-defined capabilities &
-/// discoverability"): the standard `name → (type_id, op)` binding a manifest module's import
-/// names resolve to when the powerbox binds its slots ([`Instance::grant_caps`],
-/// [`run_powerbox`]). This is the default "powerbox ABI" the bundled toolchain agrees on; a
-/// *different* host binds these (or entirely new) names to its own capabilities via
-/// [`instantiate_with_imports`] — that is the §7 late binding.
-///
-/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is chosen
-/// by interface when the slot is bound, never by this policy — so two names can share an
-/// interface and differ only by which handle their slots bind (e.g. `write`/`read` are both
-/// `Stream`, bound to stdout vs stdin).
-pub fn default_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
-    use temen_interp::cap_id;
-    let (type_id, op): (u32, u32) = match name {
-        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint. `write` and `stderr` are
-        // both write (op 1); the manifest binding uses the name to pick stdout vs the stderr handle.
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "stderr" => (cap_id::STREAM, 1),
-        // Exit (noreturn).
-        "exit" => (cap_id::EXIT, 0),
-        // Memory management (§3e/§4).
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        // AddressSpace / SharedRegion aliasing (§13/§14).
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        "vm_region_map" => (cap_id::SHARED_REGION, 0),
-        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
-        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // Guest-driven JIT (§22).
-        "vm_jit_compile" => (cap_id::JIT, 0),
-        "vm_jit_compile_linked" => (cap_id::JIT, 5),
-        "vm_jit_invoke2" => (cap_id::JIT, 1),
-        "vm_jit_release" => (cap_id::JIT, 2),
-        "vm_jit_install" => (cap_id::JIT, 3),
-        "vm_jit_uninstall" => (cap_id::JIT, 4),
-        _ => return None,
-    };
-    Some(temen_ir::ResolvedCap { type_id, op })
-}
+/// discoverability") — **re-exported** from `temen_ir`, where the table lives so the native runner,
+/// the browser cdylib and the debugger cannot drift (#912). This is
+/// the standard `name → (type_id, op)` binding a manifest module's import names resolve to when the
+/// powerbox binds its slots ([`Instance::grant_caps`], [`run_powerbox`]); a *different* host binds
+/// these (or entirely new) names to its own capabilities via [`instantiate_with_imports`] — the §7
+/// late binding.
+pub use temen_ir::default_cap_resolver;
 
 fn typed(t: ValType, v: i64) -> Value {
     match t {
@@ -4338,12 +4304,16 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // the synchronous `call.cap`). In-domain stack switches, not an escape vector.
     h.set_jit_hosts_fibers(true);
     let mem_log2 = (win != 0).then(|| win.trailing_zeros() as u8);
+    // The §3e prefix + its canonical-name registration is the shared sequence every powerbox host
+    // performs (#912); the CLI appends the two capabilities only it grants, keeping the prefix
+    // indices — guest-visible through `self.count`/`self.get` — unchanged.
+    let [stdout, stdin, exit, memory, addrspace] = h.grant_powerbox_prefix(win);
     let v = [
-        h.grant_stream(StreamRole::Out),
-        h.grant_stream(StreamRole::In),
-        h.grant_exit(),
-        h.grant_memory(),
-        h.grant_address_space(0, win),
+        stdout,
+        stdin,
+        exit,
+        memory,
+        addrspace,
         // Reserve the `call.dyn` install table at `CLI_JIT_TABLE_LOG2` — the **same** value the
         // JIT compile uses (see [`powerbox_compile_run`]) — so a `Jit.install` guest has room.
         h.grant_jit_with_table(mem_log2, CLI_JIT_TABLE_LOG2),
@@ -4351,9 +4321,9 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
         // the earlier handle indices are unchanged. Reached by the `"stderr"` manifest import.
         h.grant_stream(StreamRole::Err),
     ];
-    // §7 register the granted set under canonical names (F7) so a powerbox guest can also
-    // `cap.self`-resolve its capabilities by name, not only through its manifest slots.
-    for (name, handle) in POWERBOX_CAP_NAMES.iter().zip(&v) {
+    // §7 register the two appended grants under their canonical names (F7; the prefix registered its
+    // own) so a powerbox guest can `cap.self`-resolve them by name too.
+    for (name, handle) in POWERBOX_CAP_NAMES[5..].iter().zip(&v[5..]) {
         h.register_cap_name(name, *handle);
     }
     v
@@ -6059,39 +6029,26 @@ impl Instance {
                 let [stdout, stdin, exit, memory, addrspace, jit, stderr] =
                     grant_powerbox_prefix(h, win);
                 if !self.module.imports.is_empty() {
-                    use temen_interp::cap_id;
+                    let granted = temen_ir::PowerboxHandles {
+                        stdout,
+                        stdin,
+                        exit,
+                        memory,
+                        addrspace,
+                        jit: Some(jit),
+                        stderr: Some(stderr),
+                    };
                     let bindings = self
                         .module
                         .imports
                         .iter()
-                        .map(|im| {
-                            let Some(cap) = default_cap_resolver(&im.name) else {
-                                // Unknown name: declared but unbound — fail-closed at dispatch.
-                                return temen_interp::BoundImport::rebindable(0, 0, None);
-                            };
-                            // `write` and `stderr` are both `Stream` write (op 1); the name breaks the
-                            // tie (stdout vs the appended stderr handle) since op alone can't.
-                            if im.name == "stderr" {
-                                return temen_interp::BoundImport::required(
-                                    cap.type_id,
-                                    cap.op,
-                                    stderr,
-                                );
+                        .map(|im| match granted.bind(&im.name) {
+                            Some((cap, handle)) => {
+                                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
                             }
-                            let handle = match (cap.type_id, cap.op) {
-                                (cap_id::STREAM, 1) => stdout, // write
-                                (cap_id::STREAM, _) => stdin,  // read
-                                (cap_id::EXIT, _) => exit,
-                                // One kind post-§4: the vm_map family (ops 0–3) binds the
-                                // whole-window grant; sub/region_create bind the sized one
-                                // (op-keyed, like Stream above).
-                                (cap_id::ADDRESS_SPACE, 0..=3) => memory,
-                                (cap_id::ADDRESS_SPACE, _) => addrspace,
-                                (cap_id::JIT, _) => jit,
-                                // e.g. SharedRegion: dynamic-mode only — never a manifest slot.
-                                _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                            };
-                            temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                            // Unknown name, or a capability this host did not grant: declared but
+                            // unbound — fail-closed at dispatch.
+                            None => temen_interp::BoundImport::rebindable(0, 0, None),
                         })
                         .collect();
                     h.set_import_bindings(bindings);

@@ -2950,45 +2950,6 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
-/// The canonical names of the **on-ramp** powerbox prefix, in grant order — the fixed §3e `VM_CAP_*`
-/// vocabulary the LLVM on-ramp's synthesized `_start` expects (and `temen-run` grants). This differs
-/// from [`POWERBOX_CAP_NAMES`] after slot 3: the hand-written browser corpus uses `(stderr, clock)`
-/// at slots 4/5, but an on-ramp guest wants `(memory, addrspace)` there — `memory` is what `malloc`
-/// grows the heap through, so Lua/SQLite need it. See `LLVM.md` §N (the powerbox on-ramp).
-const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrspace"];
-
-/// The reference host's §7 capability-import name policy — a browser-side twin of `temen-run`'s
-/// `default_cap_resolver`. The on-ramp emits `call.sym "<name>"` for each libc→capability shim
-/// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `call.cap`
-/// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
-/// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
-pub(crate) fn onramp_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
-    use temen_interp::cap_id;
-    let (type_id, op): (u32, u32) = match name {
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        "vm_region_map" => (cap_id::SHARED_REGION, 0),
-        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
-        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // Guest-driven JIT (§22) — the macro-staging on-ramp grants the Jit cap; mirrors
-        // temen-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
-        "vm_jit_compile" => (cap_id::JIT, 0),
-        "vm_jit_compile_linked" => (cap_id::JIT, 5),
-        "vm_jit_invoke2" => (cap_id::JIT, 1),
-        "vm_jit_release" => (cap_id::JIT, 2),
-        "vm_jit_install" => (cap_id::JIT, 3),
-        "vm_jit_uninstall" => (cap_id::JIT, 4),
-        _ => return None,
-    };
-    Some(temen_ir::ResolvedCap { type_id, op })
-}
-
 /// Gate an on-ramp module (IMPORTS.md phase 4): the runtime never rewrites. A module that declares
 /// imports must carry the **powerbox entry shape** — a paramless func 0 exported as `_start`
 /// (`temen-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
@@ -3046,16 +3007,10 @@ fn grant_onramp_caps(
     MouseQueue,
 ) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let handles: [i32; 5] = [
-        host.grant_stream(StreamRole::Out),
-        host.grant_stream(StreamRole::In),
-        host.grant_exit(),
-        host.grant_memory(),
-        host.grant_address_space(0, win),
-    ];
-    for (name, handle) in ONRAMP_CAP_NAMES.iter().zip(&handles) {
-        host.register_cap_name(name, *handle);
-    }
+    // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
+    // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
+    // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
+    let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
     // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
     // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
     // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
@@ -3063,14 +3018,12 @@ fn grant_onramp_caps(
     // into the host program's ~800 functions by index) and fiber hosting (a staged macro runs on the
     // compiler's scheduler root, which suspends). `browser_jit_validator` verifies every submitted
     // unit — the security hinge, so this stays "as secure as wasm".
-    let jit_h: Option<i32> = if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
+    if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
         let h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), ONRAMP_JIT_TABLE_LOG2);
         host.set_jit_validator(browser_jit_validator);
         host.set_jit_hosts_fibers(true);
-        Some(h)
-    } else {
-        None
-    };
+        granted.jit = Some(h);
+    }
     // #1323 (c_interpret #16, file I/O): a guest that imports `vm_fs` (the chibicc `__vm_fs` builtin →
     // `call.sym "vm_fs"`) gets a private, in-memory **read-write** scratch filesystem — the existing
     // `temen-fs` memfs, the same backend Postgres/chibicc use. `__vm_fs` is "a flat call.sym (base op
@@ -3116,24 +3069,16 @@ fn grant_onramp_caps(
                         None => temen_interp::BoundImport::rebindable(0, 0, None),
                     };
                 }
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => handles[0],
-                    (cap_id::STREAM, _) => handles[1],
-                    (cap_id::EXIT, _) => handles[2],
-                    // One kind post-§4 (op-keyed like Stream): vm_map family → the
-                    // whole-window grant, sub/region_create → the sized one.
-                    (cap_id::ADDRESS_SPACE, 0..=3) => handles[3],
-                    (cap_id::ADDRESS_SPACE, _) => handles[4],
-                    (cap_id::JIT, _) => match jit_h {
-                        Some(h) => h,
-                        None => return temen_interp::BoundImport::rebindable(0, 0, None),
-                    },
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                // The shared powerbox ABI (#912): the name's capability and the handle this run
+                // granted for it. A name this host did not grant (`stderr`, or `Jit` on a guest that
+                // declares no `vm_jit_*` import) or a dynamic-only interface leaves its slot
+                // unbound — fail-closed at dispatch.
+                match granted.bind(&im.name) {
+                    Some((cap, handle)) => {
+                        temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                    }
+                    None => temen_interp::BoundImport::rebindable(0, 0, None),
+                }
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -3844,22 +3789,26 @@ fn pg_setup(
     // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use temen_interp::cap_id;
+        // The shared powerbox ABI (#912). This headless powerbox grants no *sized* address space, so
+        // the whole-window `memory` grant serves both address-space roles; `Jit`/`stderr` are not
+        // granted at all, and an import naming one leaves its slot unbound (fail-closed at dispatch).
+        let granted = temen_ir::PowerboxHandles {
+            stdout: out,
+            stdin: inp,
+            exit,
+            memory,
+            addrspace: memory,
+            jit: None,
+            stderr: None,
+        };
         let bindings = m
             .imports
             .iter()
-            .map(|im| {
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => out,
-                    (cap_id::STREAM, _) => inp,
-                    (cap_id::EXIT, _) => exit,
-                    (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            .map(|im| match granted.bind(&im.name) {
+                Some((cap, handle)) => {
+                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                }
+                None => temen_interp::BoundImport::rebindable(0, 0, None),
             })
             .collect();
         host.set_import_bindings(bindings);

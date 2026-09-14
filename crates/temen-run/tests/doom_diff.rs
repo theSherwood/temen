@@ -11,26 +11,10 @@
 //! via `DOOM_TEMEN` / `DOOM_WAD` / `DOOM_NATIVE_FRAMES`; the defaults match the demo scripts' cache.
 //! Run:  `cargo test -p temen-run --test doom_diff -- --ignored --nocapture`
 
-use temen_interp::{bytecode, cap_id, Host, StreamRole};
+use temen_interp::{bytecode, Host, StreamRole};
 
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-/// The on-ramp's §7 libc→capability import names (`write`/`read`/`exit`/`vm_*`) and the
-/// `(type_id, op)` each manifest slot binds to at instantiation.
-fn onramp_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
-    let (type_id, op) = match name {
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        _ => return None,
-    };
-    Some(temen_ir::ResolvedCap { type_id, op })
 }
 
 #[test]
@@ -74,19 +58,22 @@ fn doom_frame_hashes_match_native() {
     ] {
         host.register_cap_name(name, h);
     }
+    // The shared powerbox ABI (#912): one definition of name → capability → handle. This harness
+    // grants no *sized* address space, so the whole-window `memory` grant serves both roles.
+    let granted = temen_ir::PowerboxHandles {
+        stdout,
+        stdin,
+        exit,
+        memory,
+        addrspace: memory,
+        jit: None,
+        stderr: None,
+    };
     let bindings = m
         .imports
         .iter()
-        .map(|im| match onramp_resolver(&im.name) {
-            Some(cap) => {
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => stdout,
-                    (cap_id::STREAM, _) => stdin,
-                    (cap_id::EXIT, _) => exit,
-                    _ => memory,
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-            }
+        .map(|im| match granted.bind(&im.name) {
+            Some((cap, handle)) => temen_interp::BoundImport::required(cap.type_id, cap.op, handle),
             // Unknown name: declared but unbound — a dispatch through it is a fail-closed CapFault.
             None => temen_interp::BoundImport::rebindable(0, 0, None),
         })
