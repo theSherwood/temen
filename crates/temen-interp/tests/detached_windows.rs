@@ -480,15 +480,28 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// PROCESS.md §5 / #1289 R1: a **durable** domain may now **spawn** a detached child (the tree-walker's
-/// `!durable` op-15 gate is lifted — freeze authority is a per-grant capability, not a placement rule).
-/// The spawn succeeds (returns a non-negative slot) and charges `Budget.mem` the child's window, exactly
-/// as a non-durable spawn does; the durability constraint moves to the *freeze* (a freeze while the
-/// detached child is live fails closed — `a_durable_freeze_with_a_live_detached_child_fails_closed` in
-/// `durable_nesting.rs`), never a silent drop. (The bytecode servicer + native thunk still decline a
-/// durable detached spawn — a tracked in-flight decline until their freeze path is wired.)
+/// #1412 (owner decision 2026-09-14): a **durable** domain **refuses** op 15, on this engine as on
+/// the other two — probeably (`-EINVAL`), charging nothing.
+///
+/// This reverses #1289 R1's slice-1 lift, deliberately and temporarily. R1 is right about the end
+/// state: freeze authority is a per-grant capability, not a placement rule, so a durable parent and a
+/// detached child should coexist. But R1 lifted the gate *here only*, one day after #1299 added it to
+/// the resumable engine, and the compensating safety it moved to — `detached_live_refused` at the
+/// freeze — exists only on this path and fails with `Trap::ThreadFault`. That left the oracle
+/// admitting what two engines refused (INVARIANTS #9) and ending a durable run in a trap on a platform
+/// lifecycle action the guest cannot see coming (INVARIANTS #5).
+///
+/// The agreed end state is to admit the spawn **and capture the child**, gated on the parent holding
+/// freeze authority over it (PROCESS.md O14's "refuse unless a freeze-authority holder is registered").
+/// That needs freeze authority to exist in code — it is doc-only today, implicit in nesting — and the
+/// per-child-artifact capture (#1361). Until both land, agreeing with the other engines is the honest
+/// resting state: fail-closed, #9 restored, and `detached_live_refused` unreachable, so no durable run
+/// can be killed by a freeze.
+///
+/// **This test is expected to be rewritten again** when the capture lands — at which point it asserts
+/// the spawn succeeds, the budget is charged, and the freeze captures the child.
 #[test]
-fn a_durable_domain_spawns_a_detached_child_and_charges_the_budget() {
+fn a_durable_domain_refuses_a_detached_spawn_until_the_capture_lands() {
     let a = module(SPAWN_ONLY_PARENT);
     let b = module(ATTEST_MOD);
     let mut host = Host::new();
@@ -504,10 +517,42 @@ fn a_durable_domain_spawns_a_detached_child_and_charges_the_budget() {
         &mut fuel,
         &mut host,
     )
+    .expect("the refusal is a value, so the run still completes");
+    assert!(
+        matches!(r.as_slice(), [Value::I64(s)] if *s < 0),
+        "a durable domain's detached spawn refuses probeably, never traps: {r:?}"
+    );
+    // A refused spawn charges nothing — the gate sits before the quota take, so the budget is intact
+    // and the guest can still use it for something it *is* allowed to do.
+    assert!(
+        host.budget_mem_take(hw, 1 << 12),
+        "the refusal must charge nothing: the full window quota is still available"
+    );
+}
+
+/// The same module in a **non-durable** domain still spawns and still charges — so the test above
+/// pins the `durable` gate specifically, not a broken op 15. Without this pair, a change that broke
+/// detached spawns outright would leave the refusal test passing for the wrong reason.
+#[test]
+fn a_non_durable_domain_still_spawns_a_detached_child_and_charges_the_budget() {
+    let a = module(SPAWN_ONLY_PARENT);
+    let b = module(ATTEST_MOD);
+    let mut host = Host::new();
+    let hi = host.grant_instantiator(0, 1u64 << 17);
+    let hm = host.grant_module(&b);
+    let hw = host.grant_budget(0, (1 << 12) as i64, 0);
+    let mut fuel = 5_000_000u64;
+    let r = run_with_host(
+        &a,
+        0,
+        &[Value::I32(hi), Value::I32(hm), Value::I32(hw)],
+        &mut fuel,
+        &mut host,
+    )
     .expect("run");
     assert!(
         matches!(r.as_slice(), [Value::I64(s)] if *s >= 0),
-        "the durable domain now spawns the detached child, returning its slot: {r:?}"
+        "a non-durable domain spawns the detached child, returning its slot: {r:?}"
     );
     assert!(
         !host.budget_mem_take(hw, 1 << 12),

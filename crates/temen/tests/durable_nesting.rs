@@ -1327,12 +1327,24 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
 
-/// #1289 R1 — a durable domain may now **spawn** a detached child (op 15), but **freezing** while that
-/// child is live **fails closed** (`ThreadFault`), never silently dropping the child's separate window.
-/// A detached child holds a `child_hosts` entry but has no carve in `nested_children` (unlike a nested
-/// child) and its own window never sees the subtree `UNWINDING` broadcast — so it cannot yet ride the
-/// parent's artifact. The parent is frozen from the start; it spawns the detached child at its op-15
-/// cap call, then the trailing poll observes `UNWINDING` with the child live → refuse.
+/// #1412 (owner decision 2026-09-14) — **a freeze can no longer be killed by this path.**
+///
+/// Under #1289 R1 a durable domain could spawn a detached child, and freezing while that child was
+/// live failed closed with `Trap::ThreadFault` — a *trap*, ending the run, on a platform lifecycle
+/// action the guest cannot see coming. INVARIANTS #5 is explicit that "a lifecycle event is never a
+/// domain-killing surprise", so that was the wrong failure shape even though the fail-closed instinct
+/// was right.
+///
+/// With the interim spawn gate restored (#1412), a durable domain's op-15 refuses probeably, the
+/// detached child never comes into existence, and `detached_live_refused` is unreachable by
+/// construction — so the freeze simply completes. This test pins that: **not** `ThreadFault`.
+///
+/// The parent is frozen from the start, so the run's value is the unwind's rather than the guest's
+/// `-EINVAL` (the spawn's own refusal is pinned in `detached_windows.rs`); what matters here is the
+/// absence of a trap.
+///
+/// **Rewritten again when the capture lands** (#1361): the spawn succeeds, and the freeze captures the
+/// child into its own artifact rather than refusing anything.
 const PARENT_DETACHED: &str = "memory 18
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
@@ -1349,7 +1361,7 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 ";
 
 #[test]
-fn a_durable_freeze_with_a_live_detached_child_fails_closed() {
+fn a_durable_freeze_is_never_killed_by_a_detached_child() {
     let parent = instrument(PARENT_DETACHED);
     let child_mod = child(); // memory 17 = the op-15 size_log2
 
@@ -1370,9 +1382,13 @@ fn a_durable_freeze_with_a_live_detached_child_fails_closed() {
         SIZE_LOG2,
         &mut host,
     );
-    assert_eq!(
-        r,
-        Err(Trap::ThreadFault),
-        "a freeze with a live detached child fails closed, not a silent drop: {r:?}"
+    assert!(
+        !matches!(r, Err(Trap::ThreadFault)),
+        "a freeze must not end the domain in a trap: the detached spawn is refused as a value, so \
+         there is no live detached child for the freeze to choke on (INVARIANTS #5) — got {r:?}"
+    );
+    assert!(
+        r.is_ok(),
+        "and the freeze completes rather than failing some other way: {r:?}"
     );
 }
