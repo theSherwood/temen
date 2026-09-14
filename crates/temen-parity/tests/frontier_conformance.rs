@@ -194,7 +194,12 @@ fn the_uncheckable_rows_are_exactly_the_ones_that_need_a_live_peer_or_a_host_clo
 }
 
 /// Coverage may only improve. A cell that was audited must not silently revert to `Unaudited`, and
-/// the two conformance-tested axes must stay fully audited.
+/// the two axes whose predicate classifies *every* row must stay fully audited.
+///
+/// The third conformance-tested axis, `debugger`, is not in that loop on purpose: its predicate is
+/// reached by running the capability's ops, and four rows hold ops only a running guest or a live
+/// peer can reach. `tests/debugger_conformance.rs` pins which four, so those cells cannot quietly
+/// spread — the count floor below is what stops the column from emptying out.
 #[test]
 fn audited_coverage_does_not_regress() {
     let (n, d) = (col(Axis::Nesting), col(Axis::Durability));
@@ -217,8 +222,9 @@ fn audited_coverage_does_not_regress() {
         .filter(|cell| cell.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 32,
-        "audited cell count fell to {audited}; it was 32 when the matrix landed. Filling axes in is \
-         the work (#1413) — emptying them is a regression."
+        audited >= 44,
+        "audited cell count fell to {audited}; it was 32 when the matrix landed and 44 once the \
+         `debugger` column was driven. Filling axes in is the work (#1413) — emptying them is a \
+         regression."
     );
 }

@@ -7472,8 +7472,56 @@ fn service_advance(
             // (as in the single-vCPU `DebugRun`); `drive` reports `SchedStop::StdinPark` once nothing
             // else can run, and `provide_stdin` re-admits the task so the read re-issues.
             Outcome::StdinPark => tasks[ti].state = DbgTaskState::BlockedStdin,
-            // coroutine / tier-up — outside this engine's slice.
-            _ => return Serviced::Declined,
+            // Everything this engine does **not** dispatch, named rather than caught by a `_`
+            // (#1414). The debugger path is the one native driver whose event match had a wildcard;
+            // `pump` and `run_vcpu_parallel` are already exhaustive, so a new `Outcome` variant fails
+            // to build there and must be handled. Here it silently joined the declined set — which is
+            // the same shape as #1412, where a new answer slipped in without anything going red.
+            //
+            // Declining is still the right *answer* for all of these (INVARIANTS #9: a tier that
+            // cannot service something falls back rather than running it wrong; the caller re-runs on
+            // an engine that can). What changes is that it is now a decision per variant instead of a
+            // default, so adding an `Outcome` forces someone to say which group it belongs to.
+
+            // Not reachable: a step that completed or suspended is `FiberStep::Stepped`/`Finished`,
+            // never `Other` (which is documented as "a non-fiber seam the caller must apply").
+            // Declined rather than `unreachable!()` — an impossible-looking arm is a bad place to
+            // introduce a panic, and the fallback is correct either way.
+            Outcome::Done(_) | Outcome::Suspended => return Serviced::Declined,
+
+            // Coroutines and fibers: this engine schedules tasks, not continuations.
+            Outcome::ContNew { .. } | Outcome::ContResume { .. } | Outcome::FiberSuspend { .. } => {
+                return Serviced::Declined
+            }
+
+            // Tier-up: the debug tier is the interpreter by construction (INVARIANTS #9's
+            // observability corollary — stepping wants an interpreter).
+            Outcome::TierUp { .. } => return Serviced::Declined,
+
+            // Serving / cap plumbing: needs the host's serve loop and waiter table.
+            Outcome::CapPending { .. }
+            | Outcome::LiveCall { .. }
+            | Outcome::SvcWait
+            | Outcome::ChildOffer { .. }
+            | Outcome::CloneCaller { .. } => return Serviced::Declined,
+
+            // Process / POSIX seams: fork, exec, reap and pipes are the personality's, driven by the
+            // run harness rather than the debug scheduler.
+            Outcome::Reap { .. }
+            | Outcome::Exec { .. }
+            | Outcome::ForkSelf { .. }
+            | Outcome::ReapWait { .. }
+            | Outcome::PipeRead { .. }
+            | Outcome::PipeWrite { .. } => return Serviced::Declined,
+
+            // §22 guest-JIT: compiling and invoking guest-emitted units needs the JIT tables the
+            // debug run does not stand up.
+            Outcome::JitInstall { .. }
+            | Outcome::JitUninstall { .. }
+            | Outcome::JitInvoke { .. } => return Serviced::Declined,
+
+            // §GC root scan: walks the live fiber stacks via the fiber runtime.
+            Outcome::GcRoots { .. } => return Serviced::Declined,
         },
     }
     Serviced::Ran

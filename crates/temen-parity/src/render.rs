@@ -235,14 +235,23 @@ pub fn render_frontier_markdown() -> String {
             }
         }
     }
+    // Derived, not stated: the count of conformed columns tracks `Axis::is_conformed`, so filling
+    // an axis in cannot leave this sentence claiming the old number (INVARIANTS #15 — one place).
+    let conformed: Vec<&str> = Axis::ALL
+        .iter()
+        .filter(|a| a.is_conformed())
+        .map(|a| a.short())
+        .collect();
     s.push_str(&format!(
         "**{audited} of {total} cells audited** ({} capabilities × {} axes). An {} cell is not a \
-         passing cell — it means nobody has established what it is. Two axes are checked against \
-         live predicates by `tests/frontier_conformance.rs`; the rest state the manifest's belief \
-         and nothing more.\n\n",
+         passing cell — it means nobody has established what it is. {} of the seven columns ({}) \
+         are checked against live predicates by the conformance tests in `crates/temen-parity/\
+         tests/`; the rest state the manifest's belief and nothing more.\n\n",
         Capability::ALL.len(),
         Axis::ALL.len(),
         Status::Unaudited.glyph(),
+        conformed.len(),
+        conformed.join(", "),
     ));
 
     s.push_str("## Legend\n\n");
