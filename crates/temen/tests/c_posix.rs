@@ -964,23 +964,16 @@ fn c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr() {
     // breaks; the re-run completes `-EINTR` at the park site and the handler fires (slice 1) — 42.
     // Before this the parked read polled forever with no writer and the run deadlocked.
     //
-    // #1173 — the parallel leg is timing-nondeterministic (the sleep-polled pipe read races the
-    // interrupt; the EINTR-vs-EOF ordering under real threads is not yet airtight — condvar doors on
-    // the shared pipe backing are the follow-up), so it intermittently returns EOF(0) instead of
-    // EINTR(42). Retry a bounded number of times: a genuine regression never yields 42 across all
-    // attempts, while the intermittent race is tolerated. The interp (above) and coop bytecode twins
-    // stay strict. Drop this retry when #1173's race-free pipe read lands.
-    let mut p = run_bytecode_parallel_only(EINTR_CAUGHT_SRC, |_| {});
-    for _ in 0..8 {
-        if p.result == vec![Value::I32(42)] {
-            break;
-        }
-        p = run_bytecode_parallel_only(EINTR_CAUGHT_SRC, |_| {});
-    }
+    // #1173 — this leg used to need a bounded retry: the dispatch's per-op park flags live on the
+    // shared `Host`, and every vCPU of a domain shares one on the parallel driver, so the raiser
+    // thread's own dispatch could take `main`'s pipe-read park. `main` then kept the placeholder `0`
+    // its rewound read had returned — an EOF that never happened — at ~20% per attempt. The flags are
+    // now drained in the dispatch's own lock scope, so this is strict again, like the two twins above.
+    let p = run_bytecode_parallel_only(EINTR_CAUGHT_SRC, |_| {});
     assert_eq!(
         p.result,
         vec![Value::I32(42)],
-        "parallel bytecode: the concurrent raiser's SIGINT broke the blocked read with -EINTR — matching the oracle (retried per #1173)"
+        "parallel bytecode: the concurrent raiser's SIGINT broke the blocked read with -EINTR — matching the oracle"
     );
 }
 
