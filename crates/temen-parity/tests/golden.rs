@@ -1,21 +1,99 @@
-//! The checked-in `OPS_PARITY.md` must equal what the generator produces. If this fails, the
-//! manifest changed without regenerating the doc — run `cargo run -p temen-parity`.
+//! The checked-in parity views must equal what the generator produces. If either fails, the manifest
+//! changed without regenerating — run `cargo run -p temen-parity`.
+//!
+//! Both views are pinned, not just the markdown: `ops_parity.json` is what the playground's parity
+//! page renders (#1418), so an unpinned JSON would let the page show a stale matrix with nothing
+//! noticing — the exact "zero coverage, silently" shape the fuzz-matrix check exists to prevent.
 
-#[test]
-fn ops_parity_md_is_up_to_date() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("OPS_PARITY.md");
+use std::path::{Path, PathBuf};
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
+}
+
+/// Compare line-ending-insensitively: this checks the file is not *stale*, and a Windows checkout
+/// (autocrlf) rewrites it to CRLF while the generator always emits LF. Normalizing both sides keeps
+/// the staleness check meaningful on every platform.
+fn assert_fresh(path: PathBuf, fresh: String, what: &str) {
     let on_disk =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let fresh = temen_parity::render_markdown();
-    // Compare line-ending-insensitively: this checks the doc is not *stale*, and a Windows checkout
-    // (autocrlf) rewrites the file to CRLF while the generator always emits LF. Normalizing both
-    // sides keeps the staleness check meaningful on every platform.
     let norm = |s: &str| s.replace("\r\n", "\n");
     assert!(
         norm(&on_disk) == norm(&fresh),
-        "OPS_PARITY.md is stale — regenerate with `cargo run -p temen-parity`",
+        "{what} is stale — regenerate with `cargo run -p temen-parity`",
+    );
+}
+
+#[test]
+fn ops_parity_md_is_up_to_date() {
+    assert_fresh(
+        repo_root().join("OPS_PARITY.md"),
+        temen_parity::render_markdown(),
+        "OPS_PARITY.md",
+    );
+}
+
+#[test]
+fn ops_parity_json_is_up_to_date() {
+    assert_fresh(
+        repo_root()
+            .join("browser")
+            .join("web")
+            .join("assets")
+            .join("ops_parity.json"),
+        temen_parity::render_json(),
+        "browser/web/assets/ops_parity.json",
+    );
+}
+
+/// The JSON is parsed by a browser, so a malformed escape would break the page rather than fail a
+/// test. There is no JSON parser in this dependency-free crate, so check the properties that a
+/// hand-rolled writer can plausibly get wrong: balanced structure, and every cell naming a status the
+/// page knows. (Full parse coverage is the page's own smoke test in `browser/`.)
+#[test]
+fn ops_parity_json_is_well_formed_and_uses_known_status_ids() {
+    let j = temen_parity::render_json();
+
+    // Balanced braces/brackets outside of string literals, tracking escapes.
+    let (mut braces, mut brackets, mut in_str, mut esc) = (0i32, 0i32, false, false);
+    for c in j.chars() {
+        if in_str {
+            match c {
+                _ if esc => esc = false,
+                '\\' => esc = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => braces += 1,
+            '}' => braces -= 1,
+            '[' => brackets += 1,
+            ']' => brackets -= 1,
+            _ => {}
+        }
+        assert!(
+            braces >= 0 && brackets >= 0,
+            "unbalanced JSON: closes early"
+        );
+    }
+    assert!(!in_str, "unterminated JSON string");
+    assert_eq!((braces, brackets), (0, 0), "unbalanced JSON at EOF");
+
+    // Every status id the ops array uses must be one the `statuses` map declares — otherwise the page
+    // renders a cell it has no colour or label for.
+    for st in ["full", "declines", "notyet", "conditional"] {
+        assert!(
+            j.contains(&format!("\"{st}\": {{ \"glyph\"")),
+            "status `{st}` missing from the JSON's `statuses` map"
+        );
+    }
+    let cells_declared = j.matches("\"cells\": [").count();
+    assert_eq!(
+        cells_declared,
+        temen_parity::catalog().len(),
+        "every catalogued op must emit a cells array"
     );
 }

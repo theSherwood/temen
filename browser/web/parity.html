@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Same pre-paint theme resolution as play.html, and the same storage key, so moving between the
+         two pages never flashes or disagrees about the theme. -->
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('temen-play:theme') || 'auto';
+          var dark = pref === 'dark' || (pref === 'auto' && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+        } catch (e) {
+          document.documentElement.dataset.theme =
+            matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+      })();
+    </script>
+    <title>Op × backend parity — Temen</title>
+    <style>
+      /* The playground's token set, verbatim — this page is part of that site, not a visitor. */
+      :root {
+        --bg: #ffffff; --fg: #1a1d21; --muted: #5c6673; --faint: #8a94a3;
+        --border: #e2e6ec; --surface: #f7f8fa; --accent: #2f57d6; --accent-soft: #eef1fb;
+        --good: #1a7f37; --bad: #b00020;
+        /* Status colours. `declines` is deliberately NOT red: folding to the oracle is the design
+           working, not a failure. Only `notyet` — a real gap — gets the warning colour. */
+        --st-full: var(--good);
+        --st-declines: var(--faint);
+        --st-notyet: #b26a00;
+        --st-conditional: var(--accent);
+      }
+      :root[data-theme="dark"] {
+        --bg: #111417; --fg: #dfe3e8; --muted: #9aa4b2; --faint: #6f7a89;
+        --border: #262c34; --surface: #1a1e23; --accent: #7c8cff; --accent-soft: #1b2340;
+        --good: #4cc585; --bad: #ff6b81;
+        --st-notyet: #e0a34a;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0; background: var(--bg); color: var(--fg);
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+      }
+      .wrap { max-width: 1100px; margin: 0 auto; padding-inline: 16px; padding-block: 24px 64px; }
+      a { color: var(--accent); }
+      h1 { font-size: 1.4rem; margin: 0 0 4px; letter-spacing: -.01em; }
+      .sub { color: var(--muted); margin: 0 0 18px; max-width: 70ch; }
+      code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
+
+      /* Summary strip: answers "where are we" before any scrolling. */
+      .summary { display: flex; flex-wrap: wrap; gap: 1px; background: var(--border);
+                 border: 1px solid var(--border); margin-bottom: 18px; }
+      .sm { background: var(--bg); padding: 10px 14px; flex: 1 1 130px; }
+      .sm .n { font-family: ui-monospace, monospace; font-size: 1.35rem; font-weight: 600;
+               font-variant-numeric: tabular-nums; display: block; }
+      .sm .k { color: var(--muted); font-size: 12px; }
+      .sm.full .n { color: var(--st-full); }
+      .sm.declines .n { color: var(--st-declines); }
+      .sm.notyet .n { color: var(--st-notyet); }
+      .sm.conditional .n { color: var(--st-conditional); }
+
+      .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 14px; }
+      input[type="search"], select {
+        font: inherit; padding: 6px 9px; border: 1px solid var(--border);
+        border-radius: 4px; background: var(--bg); color: var(--fg);
+      }
+      input[type="search"] { min-width: 200px; flex: 1 1 220px; }
+      label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+      button.link {
+        font: inherit; background: none; border: none; color: var(--accent);
+        cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px;
+      }
+      button.link:focus-visible, input:focus-visible, select:focus-visible {
+        outline: 2px solid var(--accent); outline-offset: 2px;
+      }
+
+      .tablewrap { overflow-x: auto; border: 1px solid var(--border); }
+      table { border-collapse: collapse; width: 100%; }
+      th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--border); }
+      thead th {
+        position: sticky; top: 0; background: var(--surface); z-index: 1;
+        font-size: 11px; text-transform: uppercase; letter-spacing: .07em; color: var(--muted);
+        font-weight: 600; white-space: nowrap;
+      }
+      thead th.c { text-align: center; }
+      tbody tr:last-child td { border-bottom: none; }
+      td.op { font-family: ui-monospace, monospace; white-space: nowrap; }
+      td.fam { color: var(--muted); font-size: 12px; white-space: nowrap; }
+      td.c { text-align: center; }
+      /* The glyph carries the status, and the colour reinforces it — never colour alone (the glyph is
+         what a colour-blind or monochrome reader gets). */
+      .cell { font-size: 14px; cursor: help; }
+      .cell.full { color: var(--st-full); }
+      .cell.declines { color: var(--st-declines); }
+      .cell.notyet { color: var(--st-notyet); }
+      .cell.conditional { color: var(--st-conditional); }
+      tr.has-note td.op::after { content: "*"; color: var(--muted); }
+      tr.open { background: var(--accent-soft); }
+      tr.notes td { background: var(--surface); color: var(--muted); font-size: 13px; padding: 8px 12px; }
+      tr.notes li { margin: 2px 0; }
+      tr.notes ul { margin: 0; padding-left: 18px; }
+
+      .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 0;
+                color: var(--muted); font-size: 12.5px; }
+      .legend span { display: flex; align-items: center; gap: 6px; }
+      .empty { padding: 24px; color: var(--muted); text-align: center; }
+      footer { margin-top: 28px; color: var(--faint); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>Op × backend parity</h1>
+      <p class="sub">
+        Every IR op against the four backends (<code>DESIGN.md</code> §3). The tree-walk interpreter is
+        the <strong>oracle</strong> — it defines observable behaviour; the bytecode interpreter is held
+        bit-exact against it; the two JITs are fail-closed accelerators that fold what they cannot run
+        back to the oracle (<code>INVARIANTS.md</code> #9). Generated from the same manifest as
+        <a href="https://github.com/theSherwood/temen/blob/main/OPS_PARITY.md">OPS_PARITY.md</a> and
+        pinned by a golden test, so this page cannot show a matrix the tree does not have.
+        <a href="play.html">← playground</a>
+      </p>
+
+      <div class="summary" id="summary"></div>
+
+      <div class="controls">
+        <input type="search" id="q" placeholder="Search op or family…" aria-label="Search op or family" />
+        <label>Status
+          <select id="status">
+            <option value="">any</option>
+            <option value="full">full</option>
+            <option value="declines">declines</option>
+            <option value="notyet">not yet</option>
+            <option value="conditional">conditional</option>
+          </select>
+        </label>
+        <label>on
+          <select id="backend"><option value="">any backend</option></select>
+        </label>
+        <button class="link" id="disagree" type="button">Only where the JITs disagree</button>
+        <button class="link" id="reset" type="button">Reset</button>
+      </div>
+
+      <div class="tablewrap">
+        <table>
+          <thead>
+            <tr>
+              <th>op</th><th>family</th>
+              <th class="c" id="h0"></th><th class="c" id="h1"></th>
+              <th class="c" id="h2"></th><th class="c" id="h3"></th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+        <div class="empty" id="empty" hidden>No ops match.</div>
+      </div>
+
+      <div class="legend" id="legend"></div>
+      <footer id="foot">Loading…</footer>
+    </div>
+
+    <script>
+      // The matrix is static data generated by `cargo run -p temen-parity`; this page only renders it.
+      const state = { data: null, q: '', status: '', backend: '', disagree: false };
+
+      const el = (id) => document.getElementById(id);
+
+      function statusOf(op, backendIdx) {
+        return backendIdx === '' ? op.cells : [op.cells[Number(backendIdx)]];
+      }
+
+      function matches(op) {
+        if (state.q) {
+          const q = state.q.toLowerCase();
+          if (!op.op.toLowerCase().includes(q) && !op.family.toLowerCase().includes(q)) return false;
+        }
+        if (state.status && !statusOf(op, state.backend).includes(state.status)) return false;
+        // "The JITs disagree" — Cranelift (2) vs wasm-JIT (3). The interpreters are Full everywhere by
+        // construction, so a disagreement between those two columns is where the interesting work is.
+        if (state.disagree && op.cells[2] === op.cells[3]) return false;
+        return true;
+      }
+
+      function render() {
+        const { data } = state;
+        const rows = el('rows');
+        rows.textContent = '';
+        const shown = data.ops.filter(matches);
+
+        for (const op of shown) {
+          const tr = document.createElement('tr');
+          if (op.notes.length) tr.className = 'has-note';
+
+          const td = (cls, text) => {
+            const d = document.createElement('td');
+            if (cls) d.className = cls;
+            d.textContent = text;
+            return d;
+          };
+          tr.append(td('op', op.op), td('fam', op.family));
+
+          for (const id of op.cells) {
+            const d = document.createElement('td');
+            d.className = 'c';
+            const span = document.createElement('span');
+            span.className = 'cell ' + id;
+            span.textContent = data.statuses[id].glyph;
+            span.title = data.statuses[id].label;
+            d.append(span);
+            tr.append(d);
+          }
+          rows.append(tr);
+
+          if (op.notes.length) {
+            // Notes are the "why" behind a decline or a gap — the column the markdown crams into one
+            // cell. Here they get their own row, revealed on click so the table stays scannable.
+            const nr = document.createElement('tr');
+            nr.className = 'notes';
+            nr.hidden = true;
+            const ntd = document.createElement('td');
+            ntd.colSpan = 6;
+            const ul = document.createElement('ul');
+            for (const n of op.notes) {
+              const li = document.createElement('li');
+              li.textContent = n;
+              ul.append(li);
+            }
+            ntd.append(ul);
+            nr.append(ntd);
+            rows.append(nr);
+            tr.style.cursor = 'pointer';
+            tr.tabIndex = 0;
+            const toggle = () => {
+              nr.hidden = !nr.hidden;
+              tr.classList.toggle('open', !nr.hidden);
+            };
+            tr.addEventListener('click', toggle);
+            tr.addEventListener('keydown', (e) => {
+              if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+            });
+          }
+        }
+
+        el('empty').hidden = shown.length > 0;
+        el('foot').textContent =
+          `Showing ${shown.length} of ${data.ops.length} ops. Generated by \`cargo run -p temen-parity\`; ` +
+          `pinned by crates/temen-parity/tests/golden.rs.`;
+      }
+
+      function renderSummary(data) {
+        // Count over every column, so the strip describes the whole matrix rather than a slice of it.
+        const counts = { full: 0, declines: 0, notyet: 0, conditional: 0 };
+        for (const op of data.ops) for (const c of op.cells) counts[c]++;
+        const s = el('summary');
+        const tile = (cls, n, k) => {
+          const d = document.createElement('div');
+          d.className = 'sm ' + cls;
+          const nn = document.createElement('span');
+          nn.className = 'n';
+          nn.textContent = String(n);
+          const kk = document.createElement('span');
+          kk.className = 'k';
+          kk.textContent = k;
+          d.append(nn, kk);
+          return d;
+        };
+        s.append(tile('', data.ops.length, 'ops × 4 backends'));
+        for (const id of ['full', 'declines', 'notyet', 'conditional']) {
+          s.append(tile(id, counts[id], data.statuses[id].label));
+        }
+      }
+
+      function renderLegend(data) {
+        const l = el('legend');
+        for (const id of ['full', 'declines', 'notyet', 'conditional']) {
+          const sp = document.createElement('span');
+          const g = document.createElement('span');
+          g.className = 'cell ' + id;
+          g.textContent = data.statuses[id].glyph;
+          const t = document.createElement('span');
+          t.textContent = data.statuses[id].label;
+          sp.append(g, t);
+          l.append(sp);
+        }
+      }
+
+      async function main() {
+        let data;
+        try {
+          const res = await fetch('assets/ops_parity.json');
+          if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+          data = await res.json();
+        } catch (e) {
+          el('foot').textContent = `Could not load assets/ops_parity.json — ${e.message}. ` +
+            `Regenerate it with \`cargo run -p temen-parity\`.`;
+          return;
+        }
+        state.data = data;
+
+        data.backends.forEach((b, i) => {
+          el('h' + i).textContent = b.replace(/^temen-/, '');
+          const o = document.createElement('option');
+          o.value = String(i);
+          o.textContent = b;
+          el('backend').append(o);
+        });
+
+        renderSummary(data);
+        renderLegend(data);
+        render();
+
+        el('q').addEventListener('input', (e) => { state.q = e.target.value; render(); });
+        el('status').addEventListener('change', (e) => { state.status = e.target.value; render(); });
+        el('backend').addEventListener('change', (e) => { state.backend = e.target.value; render(); });
+        el('disagree').addEventListener('click', () => { state.disagree = !state.disagree; render(); });
+        el('reset').addEventListener('click', () => {
+          Object.assign(state, { q: '', status: '', backend: '', disagree: false });
+          el('q').value = ''; el('status').value = ''; el('backend').value = '';
+          render();
+        });
+      }
+
+      main();
+    </script>
+  </body>
+</html>
