@@ -41,12 +41,12 @@ fn parse_module(ir: &str) -> Result<temen_ir::Module, temen_text::ParseError> {
     parse_module_raw(ir)
 }
 
-/// Bind `m`'s import manifest against the 8 granted powerbox handles (IMPORTS.md phase 3): import
-/// `i`'s name maps to `(type_id, op)` via `temen_run::default_cap_resolver` and to the granted
-/// handle by interface — the same mapping `temen_run::Instance::grant_caps` installs. A name outside
-/// the fixed policy leaves its slot unbound (fail-closed CapFault at dispatch).
+/// Bind `m`'s import manifest against the granted powerbox handles (IMPORTS.md phase 3): each import
+/// name maps to its capability **and** handle through the shared powerbox ABI
+/// ([`temen_ir::PowerboxHandles::bind`]) — the same mapping `temen_run::Instance::grant_caps`
+/// installs. A name outside the fixed policy leaves its slot unbound (fail-closed CapFault at
+/// dispatch).
 fn bind_imports(h: &mut Host, m: &temen_ir::Module, handles: &[Value; 7]) {
-    use temen_interp::cap_id;
     if m.imports.is_empty() {
         return;
     }
@@ -54,26 +54,24 @@ fn bind_imports(h: &mut Host, m: &temen_ir::Module, handles: &[Value; 7]) {
         Value::I32(x) => x,
         _ => 0,
     };
+    // The shared powerbox ABI (#912) — the same name → capability → handle mapping every host
+    // installs. (The harness's test-only `Blocking` mock, handle 5, is reached by name via
+    // `self.resolve`, never through a manifest slot: no import name denotes it.)
+    let granted = temen_ir::PowerboxHandles {
+        stdout: hv(0),
+        stdin: hv(1),
+        exit: hv(2),
+        memory: hv(3),
+        addrspace: hv(4),
+        jit: Some(hv(6)),
+        stderr: None,
+    };
     let bindings = m
         .imports
         .iter()
-        .map(|im| {
-            let Some(cap) = temen_run::default_cap_resolver(&im.name) else {
-                return temen_interp::BoundImport::rebindable(0, 0, None);
-            };
-            let handle = match (cap.type_id, cap.op) {
-                (cap_id::STREAM, 1) => hv(0),
-                (cap_id::STREAM, _) => hv(1),
-                (cap_id::EXIT, _) => hv(2),
-                // One kind post-§4 (op-keyed like Stream): vm_map family → the whole-window
-                // grant, sub/region_create → the sized one.
-                (cap_id::ADDRESS_SPACE, 0..=3) => hv(3),
-                (cap_id::ADDRESS_SPACE, _) => hv(4),
-                (cap_id::BLOCKING, _) => hv(5),
-                (cap_id::JIT, _) => hv(6),
-                _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-            };
-            temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+        .map(|im| match granted.bind(&im.name) {
+            Some((cap, handle)) => temen_interp::BoundImport::required(cap.type_id, cap.op, handle),
+            None => temen_interp::BoundImport::rebindable(0, 0, None),
         })
         .collect();
     h.set_import_bindings(bindings);

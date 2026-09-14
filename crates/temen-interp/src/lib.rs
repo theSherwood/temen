@@ -20646,6 +20646,29 @@ impl Host {
     pub fn grant_exit(&mut self) -> i32 {
         self.grant(cap_id::EXIT, Binding::Exit)
     }
+    /// Grant the **§3e powerbox prefix** — `[stdout, stdin, exit, memory, addrspace]`, the grant
+    /// order of `temen_ir::POWERBOX_CAP_NAMES[..5]` — and register each under its canonical name so a
+    /// guest can also re-find it with `self.resolve` (F7). `win` is the module's declared window
+    /// size, which bounds the sized `AddressSpace` grant (`0` for a module with no memory).
+    ///
+    /// This is the sequence every host offering the powerbox performs before binding a manifest
+    /// module's slots ([`temen_ir::PowerboxHandles::bind`]) — one definition rather than one per host
+    /// (#912): the grant *order* is guest-visible ABI, because `self.count`/`self.get` enumerate
+    /// handles in it. A host adds its own capabilities after this prefix, leaving these indices
+    /// stable.
+    pub fn grant_powerbox_prefix(&mut self, win: u64) -> [i32; 5] {
+        let handles = [
+            self.grant_stream(StreamRole::Out),
+            self.grant_stream(StreamRole::In),
+            self.grant_exit(),
+            self.grant_memory(),
+            self.grant_address_space(0, win),
+        ];
+        for (name, handle) in temen_ir::POWERBOX_CAP_NAMES.iter().zip(&handles) {
+            self.register_cap_name(name, *handle);
+        }
+        handles
+    }
     pub fn grant_clock(&mut self) -> i32 {
         self.grant(cap_id::CLOCK, Binding::Clock)
     }
