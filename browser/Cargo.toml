@@ -27,6 +27,12 @@ path = "src/gencorpus.rs"
 name = "genlibc"
 path = "src/genlibc.rs"
 
+# Attribution for the debug session's slowdown vs the release runner (c_interpret#26): which part of
+# the gap is the session itself and which is per-op debug bookkeeping. A measurement, not a gate.
+[[bin]]
+name = "benchdebug"
+path = "src/benchdebug.rs"
+
 [features]
 # Opt-in per-function call profiler (tier-up break-even measurement) — surfaces `temen_callprof_*`
 # and enables the interp's counter. Never in a shipped build; a measurement cdylib only.
