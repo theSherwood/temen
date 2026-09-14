@@ -175,6 +175,11 @@ fn prefix(ty: ValType) -> &'static str {
     }
 }
 
+/// A cross-module proc's pooled signature under its stem-suffixed global name: `(name, param
+/// ValTypes, return ValType)` (`None` return = void/sret). The linker pools these across units so a
+/// cross-module call coerces its args and result to the callee's real signature (#1400 / #1404).
+pub type ProcParamSig = (String, Vec<ValType>, Option<ValType>);
+
 /// A proc's TEMEN-visible signature, collected so calls can resolve names → indices.
 struct Sig {
     index: u32,
@@ -368,6 +373,17 @@ pub(crate) struct Translator {
     /// exactly as the local [`call_arg`](FuncGen::call_arg) path does. Empty unless the linker pooled
     /// sibling units' proc params.
     ext_proc_params: HashMap<String, Vec<ValType>>,
+    /// **External proc return types** — sibling units' procs' declared scalar return [`ValType`] (the
+    /// return-side twin of [`ext_proc_params`](Self::ext_proc_params)), under the stem-suffixed names
+    /// this module calls them by. `None` maps a void/sret callee. A cross-module call otherwise
+    /// declared its import's *return* from the call-site's expected type — but the resolved callee's
+    /// real return can be narrower (a `bool`-returning `equalStrings` is `i32`, used in an `i64`
+    /// context), and the linker binds by name without reconciling it, so the narrow result surfaced in
+    /// a wide slot as a post-link `TypeMismatch` (#1404). With the real return known, `call_import`
+    /// declares the import returning it and converts the result to the call site's expected type,
+    /// exactly as the local call path produces `sig.ret` and lets [`expr_typed`](FuncGen::expr_typed)
+    /// coerce it. Empty unless the linker pooled sibling units' proc returns.
+    ext_proc_rets: HashMap<String, Option<ValType>>,
     /// **Funcref targets** — proc names taken as a funcref (`ref.func`) anywhere in the program: a
     /// proc name in value position (a call argument, a `gvar`/field initializer), not a call head.
     /// The **funcref ABI** gives every funcref a leading `$sp` param (so an indirect call can thread
@@ -441,6 +457,7 @@ impl Translator {
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
             ext_proc_params: HashMap::default(),
+            ext_proc_rets: HashMap::default(),
             funcref_targets: HashSet::default(),
             tls_mode: false,
             tls_vars: HashMap::default(),
@@ -1766,18 +1783,19 @@ impl Translator {
     }
 
     /// A module's procs under their stem-suffixed global names, mapped to their **declared scalar
-    /// param [`ValType`]s** — one per nim param, in order, exactly as [`proc_sig`](Self::proc_sig)
-    /// derives a local proc's `params` (an aggregate param is by-address, so its slot is `i64`). This
-    /// is the input the linker pools so a *cross-module* caller can coerce each argument to the
-    /// callee's real param type (the arg-width twin of [`export_sret_procs`]). Without it, a
-    /// cross-module call declared its import signature from the *arg* types, so a narrow value passed
-    /// to a wider param went unwidened and the module failed to verify (#1400). Only real procs are
-    /// listed (`importc` procs are true libc imports whose signature the shim, not a sibling unit,
-    /// defines — leave those to arg-derived typing).
-    pub fn export_proc_params(
-        root: &Node,
-        stem: &str,
-    ) -> Result<Vec<(String, Vec<ValType>)>, LengError> {
+    /// param [`ValType`]s and return [`ValType`]** — one param per nim param, in order, plus the
+    /// return (`None` for a void/sret proc), exactly as [`proc_sig`](Self::proc_sig) /
+    /// [`proc_body`](Self::proc_body) derive a local proc's signature (an aggregate param is
+    /// by-address, so its slot is `i64`; an aggregate return is by `$sret`, so the scalar return is
+    /// `None`). This is the input the linker pools so a *cross-module* caller can coerce each argument
+    /// to the callee's real param type and its result from the callee's real return type (the
+    /// arg/return-width twin of [`export_sret_procs`]). Without it, a cross-module call declared its
+    /// import signature from the *call site* — the arg types and the expected return — so a narrow
+    /// value passed to a wider param went unwidened (#1400) and a narrow return landed in a wide slot
+    /// (#1404), both failing to verify post-link. Only real procs are listed (`importc` procs are true
+    /// libc imports whose signature the shim, not a sibling unit, defines — leave those to call-site
+    /// typing).
+    pub fn export_proc_params(root: &Node, stem: &str) -> Result<Vec<ProcParamSig>, LengError> {
         // Resolve named types (proctypes, enums, distinct ints) exactly as the real per-unit
         // translation does, so `param_val_ty` classifies a funcref param as `i32` (not the `i64` a
         // bare named-type atom collapses to) — matching the callee's actually-emitted signature. This
@@ -1786,7 +1804,7 @@ impl Translator {
         let mut t = Translator::new();
         t.scan_lenient = true; // tolerate cross-unit aggregate/proctype refs while enumerating
         t.collect_types(root)?;
-        let mut out: Vec<(String, Vec<ValType>)> = Vec::new();
+        let mut out: Vec<(String, Vec<ValType>, Option<ValType>)> = Vec::new();
         for item in root.args() {
             if item.tag() != Some("proc") || is_importc_proc(item) {
                 continue;
@@ -1796,22 +1814,31 @@ impl Translator {
                 continue;
             }
             let params = t.params(&a[1])?;
+            // Mirror `proc_body`: an aggregate return is by `$sret`, so the scalar return is `None`.
+            let ret = if t.ret_sret(&a[2])?.is_some() {
+                None
+            } else {
+                t.ret_ty(&a[2])?
+            };
             out.push((
                 format!("{}{stem}", sym_def(&a[0])?),
                 params.into_iter().map(|(_, ty)| ty).collect(),
+                ret,
             ));
         }
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
         Ok(out)
     }
 
-    /// Pre-register **external proc params** — sibling units' procs' declared param types, under the
-    /// stem-suffixed names this module calls them by ([`export_proc_params`]). See
-    /// [`ext_proc_params`](Self::ext_proc_params): this is what lets a cross-module call coerce each
-    /// scalar arg to the callee's real param type, so a narrow value reaches a wider param widened.
-    pub fn import_proc_params(&mut self, ext: &[(String, Vec<ValType>)]) {
-        for (name, params) in ext {
+    /// Pre-register **external proc params and returns** — sibling units' procs' declared param types
+    /// and return type, under the stem-suffixed names this module calls them by ([`export_proc_params`]).
+    /// See [`ext_proc_params`](Self::ext_proc_params) / [`ext_proc_rets`](Self::ext_proc_rets): this is
+    /// what lets a cross-module call coerce each scalar arg to the callee's real param type and its
+    /// result from the callee's real return type.
+    pub fn import_proc_params(&mut self, ext: &[ProcParamSig]) {
+        for (name, params, ret) in ext {
             self.ext_proc_params.insert(name.clone(), params.clone());
+            self.ext_proc_rets.insert(name.clone(), *ret);
         }
     }
 
@@ -1828,10 +1855,21 @@ impl Translator {
     pub fn proc_frame_nodes(
         root: &Node,
         stem: &str,
+        ext_types: &[(String, Layout)],
         ext_sret: &[(String, TyDesc)],
     ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
         let mut t = Translator::new();
-        t.scan_lenient = true; // enumerating proc frames; tolerate unresolvable cross-module aggregates
+        // Enumerating proc frames; tolerate unresolvable cross-module aggregates.
+        t.scan_lenient = true;
+        // Import the pooled sibling-unit type layouts **before** scanning, exactly as the real
+        // per-unit translation ([`translate_object_module`]) does. `proc_needs_frame` classifies a
+        // local whose type is a cross-module aggregate as frame-resident only if `tydesc` resolves
+        // that name to an aggregate — which needs the sibling's layout. Without it the pre-scan
+        // under-reported frame-need for a proc using a cross-module aggregate (a `string`/seq local, a
+        // top-level `ini` const), so the callee was emitted with a hidden `$sp` the caller never
+        // passed — a post-link `CallArgCountMismatch` (#1405). Sret-return sizing (`agg_temp_bytes`)
+        // likewise needs these layouts.
+        t.import_types(ext_types);
         t.collect_types(root)?;
         t.collect_globals(root)?;
         // A funcref target / indirect caller is frame-needing under the funcref ABI (`proc_needs_frame`
@@ -4867,18 +4905,34 @@ impl<'a> FuncGen<'a> {
             argvals.push(buf);
             argtys.push(ValType::I64);
         }
-        let slot = self.t.register_import(name, &argtys, ret)?;
+        // The import's declared **return** type. For a callee the linker pooled ([`ext_proc_rets`]),
+        // use its *real* return — the resolved proc's actual signature — not the call site's expected
+        // type: the linker binds the import to that proc by name and never reconciles the return
+        // width, so declaring a wider return than the callee has left a narrow result in a wide slot
+        // (#1404). The result is then converted to the caller's expected type below, exactly as the
+        // local call path produces `sig.ret` and lets `expr_typed` coerce it. A non-pooled callee (a
+        // libc import) keeps call-site typing (`ret`).
+        let real_ret = self.t.ext_proc_rets.get(name).copied();
+        let decl_ret = real_ret.unwrap_or(ret);
+        let slot = self.t.register_import(name, &argtys, decl_ret)?;
         let arglist = argvals
             .iter()
             .map(|id| format!("v{id}"))
             .collect::<Vec<_>>()
             .join(", ");
-        match ret {
-            Some(ty) => {
+        match decl_ret {
+            Some(rty) => {
                 let id = self.fresh();
                 self.cur_buf
                     .push_str(&format!("  v{id} = call.import {slot} ({arglist})\n"));
-                Ok(Val { id, ty })
+                let v = Val { id, ty: rty };
+                // Coerce the callee's real return to the call site's expected type (a `bool`→`i32`
+                // result used in an `i64` context, say). A statement-position call (`ret` None)
+                // leaves the produced value unused.
+                match ret {
+                    Some(want) if want != rty => Ok(self.convert(v, want)),
+                    _ => Ok(v),
+                }
             }
             None => {
                 self.cur_buf

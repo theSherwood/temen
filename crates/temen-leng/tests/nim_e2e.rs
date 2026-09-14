@@ -531,6 +531,53 @@ fn nim_strutils_cross_module_arg_widths_verify() {
         .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
 }
 
+/// Compile `import std/<module>`, link it against the nim runtime, and verify — the shape both
+/// cross-module width regressions ([`nim_json_cross_module_return_widths_verify`],
+/// [`nim_frame_needing_module_init_verify`]) gate on. Skips cleanly without the toolchain.
+fn link_verify_std_module(module: &str) {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(&path, &format!("import std/{module}\n"));
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units)
+        .unwrap_or_else(|e| panic!("bridge link `{module}`: {e}"));
+    temen_verify::verify_module(&m)
+        .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
+}
+
+/// **#1404 — a cross-module call widens its result to the callee's real return type.** `std/json`'s
+/// `getTok` calls `system.equalStrings`, which returns `bool` (`i32`), and uses the result in an
+/// `i64` comparison. Pre-fix, `call_import` declared the import's *return* from the call site's
+/// expected type (`i64`), but the linker binds the import to the real proc by name without
+/// reconciling the return width — so after the link a narrow (`i32`) result sat in a wide (`i64`)
+/// slot and the module failed to verify (`TypeMismatch`). The linker now pools each proc's real
+/// return type ([`export_proc_params`]) and `call_import` declares the import with it and coerces the
+/// result to the call site's expected type — the return-side twin of the #1400 arg fix.
+#[test]
+fn nim_json_cross_module_return_widths_verify() {
+    link_verify_std_module("json");
+}
+
+/// **#1405 — a frame-needing module-init is pooled so cross-module init calls pass its `$sp`.** A
+/// module whose top-level code uses a cross-module aggregate (`std/md5`, `std/monotimes`) compiles
+/// its `ini` proc frame-needing (a hidden leading `$sp`), and `std/editdistance` calls a
+/// frame-needing `unicode.size`. Pre-fix, the linker's frame fixpoint pre-scan
+/// ([`proc_frame_nodes`]) ran without the pooled cross-module type layouts, so `proc_needs_frame`
+/// under-reported the frame — the callee was emitted with a `$sp` the caller never passed
+/// (`CallArgCountMismatch`). The pre-scan now imports the pooled types, exactly as the real
+/// translation does, so its frame-need matches and the `$sp` is threaded.
+#[test]
+fn nim_frame_needing_module_init_verify() {
+    link_verify_std_module("md5");
+    link_verify_std_module("monotimes");
+    link_verify_std_module("editdistance");
+}
+
 /// **#1054 — the nim→powerbox link is unit-order-independent.** A program with a `LongString` const
 /// (a string literal ≥ 8 bytes, past hexer's small-string optimization) linked against the nim
 /// runtime must print the same correct bytes **no matter what order the whole units are linked in**.

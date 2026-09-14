@@ -218,7 +218,7 @@ fn translate_object_module(
     ext_funcrefs: &[(String, translate::FnPtrSig)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
-    ext_proc_params: &[(String, Vec<ValType>)],
+    ext_proc_params: &[translate::ProcParamSig],
     ext_consts: &[(String, i64)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
@@ -426,11 +426,13 @@ fn link_selected_with_extra(
     // that does so becomes frame-needing — so the sret set must be known **before** the frame
     // fixpoint (`proc_frame_nodes`) runs, hence a first pass over the units to build it.
     let mut pooled_sret: Vec<(String, translate::TyDesc)> = Vec::new();
-    // Pooled **proc param types** across all units (stem-suffixed name → declared param ValTypes): a
-    // cross-module call coerces each scalar arg to the callee's real param type, so a narrow value
-    // reaches a wider param widened (the arg-width twin of `pooled_sret`; #1400). Without it the
-    // import signature is arg-derived and a width mismatch fails verification post-link.
-    let mut pooled_proc_params: Vec<(String, Vec<ValType>)> = Vec::new();
+    // Pooled **proc param types and return type** across all units (stem-suffixed name → declared
+    // param ValTypes + return ValType): a cross-module call coerces each scalar arg to the callee's
+    // real param type and its result from the callee's real return type, so a narrow value reaches a
+    // wider param widened (#1400) and a narrow return lands widened (#1404) — the arg/return-width
+    // twin of `pooled_sret`. Without it the import signature is call-site-derived and a width mismatch
+    // fails verification post-link.
+    let mut pooled_proc_params: Vec<translate::ProcParamSig> = Vec::new();
     // Pooled **scalar-int consts** across all units (stem-suffixed name → value): a scalar `const` is
     // inlined at use and never exported as data, so a cross-module reference to one (`replRune.0.<uni>`,
     // which `fastRuneAt`'s template expansion plants in every consumer) has no data symbol to bind.
@@ -453,6 +455,7 @@ fn link_selected_with_extra(
         frame_nodes.extend(translate::Translator::proc_frame_nodes(
             &root,
             stem,
+            &pooled,
             &pooled_sret,
         )?);
     }
