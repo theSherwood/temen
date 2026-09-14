@@ -90,6 +90,19 @@ impl Status {
             Status::Conditional => "🔶",
         }
     }
+
+    /// A stable machine id for the JSON view (`OPS_PARITY.json`) — what the playground page keys
+    /// its filters and colours on. Deliberately not the glyph: an emoji is a rendering choice, and a
+    /// consumer that has to `if (cell === "✅")` is coupled to one. Never renumber or rename these
+    /// without updating `browser/web/parity.html`.
+    pub fn id(self) -> &'static str {
+        match self {
+            Status::Full => "full",
+            Status::Declines => "declines",
+            Status::NotYet => "notyet",
+            Status::Conditional => "conditional",
+        }
+    }
 }
 
 /// One backend's verdict for one op: a [`Status`] plus a short human note (reason / issue id /
@@ -437,4 +450,4 @@ mod catalog;
 pub use catalog::{catalog, Focus, Op};
 
 mod render;
-pub use render::render_markdown;
+pub use render::{render_json, render_markdown};
