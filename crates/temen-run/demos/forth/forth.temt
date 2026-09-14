@@ -36,7 +36,10 @@
 ;   0x10400 virtual stack   0x10C00 control stack   0x11400 block table   0x12400 type table
 ;   0x13000 output buffer   0x14000 open-block scratch
 ;   0x18000 dictionary (32-byte entries, 80 KiB = 2560 max)   0x2C000 REPL stack (16 KiB)
-;   0x30000 heap (`here`, 64 KiB — `allot`/`,` refuse past 0x40000)
+;   0x30000 heap (`here`, 48 KiB — `allot`/`,` refuse past 0x3C000)
+;   0x3C000 prompt staging (16 KiB): where a `JitSession` driver seeds the line it passes to
+;           `prompt` (74). It has to be *below* the snapshot line — `JitSession::seed_window` clamps
+;           to the carried 256 KiB, so a driver staging above it would silently seed nothing.
 ;
 ;   --- per-unit scratch (rebuilt every prompt, may be clobbered between them) ---
 ;   0x40000 closed-block arena   0x50000 assembled unit blob   0x60000 input buffer (256 KiB)
@@ -73,7 +76,7 @@
 ;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
-;   72 find_do(skip)    73 do_loop(id)
+;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)
 
 memory 20
 
@@ -86,6 +89,7 @@ import 5 "vm_jit_release" (i64) -> (i64)
 import 6 "vm_jit_uninstall" (i64) -> (i64)
 
 export 0 func "_start" 0
+export 1 func "prompt" 74
 
 ; ---- messages (0x8000 = 32768) ----
 data 32768 "stack underflow"
@@ -285,7 +289,7 @@ block 3 () {
   }
 }
 
-; 3 allot(n): HERE += n, refusing to grow past the heap's 0x40000 limit (#1235). Above that line the
+; 3 allot(n): HERE += n, refusing to grow past the heap's 0x3C000 limit (#1235). Above that line the
 ; window is per-unit scratch a prompt rebuilds, so an unchecked bump would silently corrupt the
 ; closed-block arena instead of faulting at the window edge as it did when the heap ran to 2^20.
 ;
@@ -298,7 +302,7 @@ block 0 (n: i64) {
   hp = i64.const 65536
   h = i64.load hp
   h1 = i64.add h n
-  lim = i64.const 262144
+  lim = i64.const 245760
   over = i64.gt_u h1 lim
   br_if over 1() 2(h1)
   }
@@ -2574,13 +2578,35 @@ block 13 (slot: i64, ni: i64, no: i64) {
   p = i64.load np
   nl = i64.const 65704
   n = i64.load nl
+  old = call 34 (p, n)
   z = i64.const 0
-  call 35 (p, n, z, ni, no, slot)
-  br 14()
+  had = i64.ne old z
+  br_if had 15(old, slot, ni, no, p, n) 17(slot, ni, no, p, n)
   }
 block 14 () {
   call 40 ()
   return
+  }
+; #1235 slice 3 — redefinition frees the shadowed word's install slot. `lookup` is newest-first, so
+; the entry this definition shadows can never be reached again; without the `uninstall` its slot
+; leaks and a redefinition-heavy session exhausts the 1024-slot table (`install error -28`).
+; Only kind-0 entries own a slot, and a prelude prim's payload is a natural-prefix index the engine's
+; `uninstall` rejects outright (`-EINVAL`) — so the result is deliberately ignored, as `release` is.
+block 15 (old: i64, slot: i64, ni: i64, no: i64, p: i64, n: i64) {
+  k = i64.load32_s old offset=12
+  zk = i64.const 0
+  isword = i64.eq k zk
+  br_if isword 16(old, slot, ni, no, p, n) 17(slot, ni, no, p, n)
+  }
+block 16 (old: i64, slot: i64, ni: i64, no: i64, p: i64, n: i64) {
+  oldslot = i64.load old offset=24
+  freed = call.import 6 (oldslot)
+  br 17(slot, ni, no, p, n)
+  }
+block 17 (slot: i64, ni: i64, no: i64, p: i64, n: i64) {
+  z = i64.const 0
+  call 35 (p, n, z, ni, no, slot)
+  br 14()
   }
 }
 
@@ -4111,5 +4137,43 @@ block 18 () {
   }
 block 19 () {
   return
+  }
+}
+
+; ================================================================================================
+; 74 prompt(ptr, len) -> 0: run ONE prompt's worth of Forth from the window at `[ptr, len)`, with the
+; dictionary, REPL stack and heap carried in from the previous prompt (#1235). The `_start` twin for
+; a `temen_run::JitSession` REPL, which re-enters this entry per prompt and auto-compacts the code
+; arena between them — so a long session's fresh-unit-per-line churn never exhausts the quota.
+;
+; Self-initializing: HERE is 0 only before the first prompt, so the first call seeds the heap pointer
+; and runs the prelude exactly as `_start` does; later prompts skip straight to the line. That keeps
+; the entry a plain `(ptr, len)` with no "first?" flag for the driver to thread. LINE resets per
+; prompt: each prompt is its own input, so errors count from 1 within it.
+func (i64, i64) -> (i32) {
+block 0 (ptr: i64, len: i64) {
+  hp = i64.const 65536
+  h = i64.load hp
+  zero = i64.const 0
+  seeded = i64.ne h zero
+  br_if seeded 2(ptr, len) 1(ptr, len)
+  }
+block 1 (p: i64, n: i64) {
+  hp1 = i64.const 65536
+  heap = i64.const 196608
+  i64.store hp1 heap
+  pp = i64.const 36864
+  pl = call 54 (pp)
+  call 42 (pp, pl)
+  br 2(p, n)
+  }
+block 2 (p2: i64, n2: i64) {
+  lnp = i64.const 65784
+  onel = i64.const 1
+  i64.store lnp onel
+  call 42 (p2, n2)
+  call 5 ()
+  z = i32.const 0
+  return z
   }
 }
