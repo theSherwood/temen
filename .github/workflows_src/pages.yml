@@ -50,6 +50,7 @@ jobs:
   # it defaults to building — fail-safe toward publishing, never toward a silent stale skip.
   gate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       changed: ${{ steps.check.outputs.changed }}
     steps:
@@ -68,6 +69,7 @@ jobs:
     needs: gate
     if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -193,6 +195,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
