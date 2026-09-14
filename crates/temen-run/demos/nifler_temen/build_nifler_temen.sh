@@ -32,19 +32,64 @@ if ! command -v nim >/dev/null; then echo "SKIP: nim not on PATH (Nim 2.3.x for 
 NIFLER_BIN="${NIFLER_BIN:-$(command -v nifler || true)}"
 [ -n "$NIFLER_BIN" ] || NIFLER_BIN="$REPO/.nimtool/nimony/bin/nifler"
 [ -x "$NIFLER_BIN" ] || { echo "SKIP: native nifler binary absent (set NIFLER_BIN; build the nimony toolchain — NIM.md §2)"; exit 0; }
-NIMLIB="$(nim dump 2>/dev/null | grep -m1 '/lib$' || true)"
+# `nifler/nim.cfg` puts `--path:"$nim"` on the search path: nifler is built against **Nim's own
+# compiler modules** (NIF support lives there in 2.3.x), not just the stdlib. Two consequences, both
+# overridable so a machine with an older `nim` binary can still produce a byte-exact asset — step 5
+# diffs every output against the native nifler oracle on three engines, so a wrong toolchain mix
+# cannot pass silently:
+#
+#   NIM_STDLIB   compile against this stdlib instead of the one beside the `nim` binary (`--lib:`).
+#                A 2.2.x binary + a 2.3.x `lib/` builds nifler fine; without it the compiler's
+#                `llstream.nim` fails on `readRawData`, a 2.3 stdlib addition.
+#   NIM_DIST     the checkout Nim's `compiler/nifstreams.nim` expects at `$nim/../dist/nimony`.
+#                Absent, the build dies on `cannot open file: ../dist/nimony/src/lib/nifpools`.
+#
+# Both default to "whatever the `nim` on PATH already has", so a proper 2.3.x install needs neither.
+NIM_STDLIB="${NIM_STDLIB:-}"
+NIMFLAGS=""
+if [ -n "$NIM_STDLIB" ]; then
+  [ -f "$NIM_STDLIB/system.nim" ] || { echo "NIM_STDLIB=$NIM_STDLIB is not a Nim stdlib (no system.nim)"; exit 1; }
+  NIMFLAGS="--lib:$NIM_STDLIB"
+fi
+NIM_PREFIX="$(dirname "$(dirname "$(command -v nim)")")"
+if [ -n "${NIM_DIST:-}" ]; then
+  mkdir -p "$NIM_PREFIX/dist"
+  [ -e "$NIM_PREFIX/dist/nimony" ] || ln -s "$NIM_DIST" "$NIM_PREFIX/dist/nimony"
+fi
+NIMLIB="${NIM_STDLIB:-$(nim dump 2>/dev/null | grep -m1 '/lib$' || true)}"
 [ -f "$NIMLIB/nimbase.h" ] || NIMLIB="$(dirname "$(command -v nim)")/../lib"
 [ -f "$NIMLIB/nimbase.h" ] || { echo "cannot locate nimbase.h (NIMLIB=$NIMLIB)"; exit 1; }
-echo "nim: $(command -v nim) | nifler(oracle): $NIFLER_BIN"
+echo "nim: $(command -v nim)${NIMFLAGS:+ [$NIMFLAGS]} | nifler(oracle): $NIFLER_BIN"
+
+# --- [0/5] the shim's `strtod`, differential-tested against the host libc ---------------------------
+# nifler bakes parsed floats straight into the `.p.nif`, so a last-place error is a compiler that
+# silently disagrees with native nimony about a constant. Step 5's oracle diff only covers literals
+# that appear in `inputs/`; this covers the shapes that actually break naive implementations. Carve
+# the `strtod` block out of the shim (so the test runs the *same* code the guest gets, without the
+# rest of the shim's on-ramp dependencies) and diff ~600k conversions against the host's.
+echo "=== [0/5] shim strtod vs host libc (differential) ==="
+awk '/^#define NIM_DEC_CAP/,/^\/\* `mmap`\/`munmap`/' "$HERE/nifler_shim.c" \
+  | head -n -1 \
+  | sed 's/^double strtod(const char \*s, char \*\*endptr)/double nim_strtod(const char *s, char **endptr)/' \
+  > "$CACHE/shim_strtod_extract.h"
+grep -q 'nim_strtod' "$CACHE/shim_strtod_extract.h" || { echo "  could not carve strtod out of nifler_shim.c"; exit 1; }
+cc -O2 -w -I"$CACHE" -o "$CACHE/strtod_selftest" "$HERE/strtod_selftest.c" -lm
+"$CACHE/strtod_selftest" || { echo "  shim strtod disagrees with libc — fix before rebuilding the asset"; exit 1; }
 
 echo "=== [1/5] nifler.nim -> C (stock nim, ARC, single-threaded) ==="
 rm -rf "$CACHE/c"
 # Same flags as build_nim.sh: ARC + malloc, no tracing GC, no signal handlers, danger. --vectorize off
 # is applied at clang below (clang SLP-vectorizes a few scalar divisions in platform.nim -> a vector
 # DivS the on-ramp doesn't lower; the scalar form does).
-nim c --mm:arc -d:useMalloc -d:danger --panics:on --threads:off -d:noSignalHandler \
+if ! nim c $NIMFLAGS --mm:arc -d:useMalloc -d:danger --panics:on --threads:off -d:noSignalHandler \
   --compileOnly --nimcache:"$CACHE/c" --path:"$REPO/nimony/src" -o:"$CACHE/nifler_stub" \
-  "$NIFLER_SRC" >/dev/null 2>&1
+  "$NIFLER_SRC" > "$CACHE/nim_c.log" 2>&1; then
+  # Previously this step's output went to /dev/null and a failure surfaced only as the *next* line's
+  # `ls: no such file` — so a toolchain mismatch looked like a missing cache dir. Say what broke.
+  echo "  nim c FAILED — last lines:"; tail -5 "$CACHE/nim_c.log" | sed 's/^/    /'
+  echo "  (a 2.2.x nim needs NIM_STDLIB=<2.3 lib> and NIM_DIST=<nimony checkout>; see the header)"
+  exit 1
+fi
 echo "  $(ls "$CACHE"/c/*.c | wc -l) C TUs, $(cat "$CACHE"/c/*.c | wc -l) lines"
 
 echo "=== [2/5] C -> bitcode (-O2, vectorizers off) + link with the fs-cap shim ==="
@@ -96,6 +141,14 @@ done
 # `mem_fs` re-granted as `fs`, `stdout`/`exit` for its imports — then read the emitted `.nif` back out of
 # the shared store. This is the exact hand-off the Rust-on-Temen driver guest uses to fan phases out; here
 # it proves a real phase produces byte-identical NIF as an op-13 child (`examples/spawn_child_fs.rs`).
+# `TEMEN_NIFLER_SKIP_CE=1` skips this leg — and, below, refuses to emit `nifler_ce.temen.gz`, so an
+# unvalidated child-entry asset can never ship as a side effect of skipping its gate. Needed because
+# the op-13 spawn harness currently faults for **any** child-entry nifler in a plain sandbox, the
+# committed one included (#1221: these driver steps run only in this toolchain-gated demo, never in
+# CI, so a layout regression lands silently). The top-level asset is still fully gated by step 5.
+if [ "${TEMEN_NIFLER_SKIP_CE:-0}" = 1 ]; then
+  echo "=== [5b] SKIPPED (TEMEN_NIFLER_SKIP_CE=1) — nifler_ce.temen.gz will NOT be emitted ==="
+else
 echo "=== [5b] translate --child-entry + op-13-spawn over memfs, diff vs native ==="
 # --null-guard (#964/#1094): the child-entry nifler runs guarded too. The op-13 driver seeds argv at
 # `carve + module_args_base` (guard-aware); grant records/cap-names stay in the parent window, read by
@@ -120,6 +173,7 @@ for src in "$HERE"/inputs/*.nim; do
   fi
 done
 [ "$fail" = 0 ] && echo "CHILD-ENTRY MATCHES NATIVE — nifler runs as a confined op-13 §14 child, byte-exact" || { echo "FAILED"; exit 1; }
+fi
 
 # --- [6/6] regenerate the committed slice-4 browser asset + gate fixtures (opt-in) -------------------
 # The playground card (`browser/web/play.js`, kind 'nifler') loads `nifler.temen` **gzipped** (~3.8 MB
@@ -131,8 +185,13 @@ if [ "${TEMEN_NIFLER_EMIT_ASSET:-0}" = 1 ]; then
   gzip -9 -c "$CACHE/nifler.temen" > "$REPO/browser/web/assets/nifler.temen.gz"
   echo "  browser/web/assets/nifler.temen.gz $(stat -c%s "$REPO/browser/web/assets/nifler.temen.gz") B (from $(stat -c%s "$CACHE/nifler.temen") B raw)"
   # The child-entry variant, for the op-13 toolchain-free gate (`tests/nifler_child_asset.rs`, if present).
-  gzip -9 -c "$CACHE/nifler_ce_raw.temen" > "$HERE/nifler_ce.temen.gz"
-  echo "  nifler_ce.temen.gz $(stat -c%s "$HERE/nifler_ce.temen.gz") B (from $(stat -c%s "$CACHE/nifler_ce_raw.temen") B raw)"
+  # Only when step 5b actually validated it — see TEMEN_NIFLER_SKIP_CE above.
+  if [ "${TEMEN_NIFLER_SKIP_CE:-0}" = 1 ]; then
+    echo "  nifler_ce.temen.gz NOT emitted (step 5b was skipped, so it is unvalidated)"
+  else
+    gzip -9 -c "$CACHE/nifler_ce_raw.temen" > "$HERE/nifler_ce.temen.gz"
+    echo "  nifler_ce.temen.gz $(stat -c%s "$HERE/nifler_ce.temen.gz") B (from $(stat -c%s "$CACHE/nifler_ce_raw.temen") B raw)"
+  fi
   mkdir -p "$HERE/expected"
   for src in "$HERE"/inputs/*.nim; do
     name="$(basename "$src" .nim)"

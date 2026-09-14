@@ -1,0 +1,23 @@
+(.nif27)
+(.vendor "Nifler")
+(.dialect "nim-parsed")
+(stmts@,5,in.nim
+ (const@2,1 FLT_MIN . . .
+  (suf@A 1.17549435E-38 "f32"))
+ (const@2,2 FLT_EPSILON . . .
+  (suf@E 0.00000011920929 "f32"))
+ (const@2,3 DBL_MIN . . . 2.2250738585072014E-308@A)
+ (const@2,4 DBL_EPSILON . . . 2.220446049250313E-16@E)
+ (const@2,5 DBL_MAX . . . 1.7976931348623157E+308@A)
+ (const@2,6 big . . . 1.5E+100@6)
+ (const@2,7 small . . . 1.5E-100@8)
+ (const@2,8 longMantissa . . . 2.220446049250313@F)
+ (proc@,A use@5 . . .
+  (params@8)float@4 . .
+  (stmts@2,1
+   (asgn@7 result~7
+    (infix@r \2B
+     (infix~A \2B
+      (infix~F \2B
+       (infix~8 \2B
+        (infix~6 \2B DBL_EPSILON~C big@2)small@2)longMantissa@2)DBL_MIN@2)DBL_MAX@2)))))
