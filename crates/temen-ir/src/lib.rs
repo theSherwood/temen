@@ -3239,6 +3239,21 @@ impl Func {
         })
     }
 
+    /// Whether this function contains a `suspend` op ([`Inst::Suspend`]) — the *yielding* half of
+    /// the fiber family, split out of [`uses_fibers`](Func::uses_fibers) the way
+    /// [`uses_futex`](Func::uses_futex) is split out of
+    /// [`uses_concurrency`](Func::uses_concurrency).
+    ///
+    /// `cont.new`/`cont.resume` create and drive a fiber and are self-contained: whoever runs them
+    /// owns both sides. `suspend` is the one that needs a *resumer already on the stack* — so a
+    /// function reached where no fiber is active (a cross-tier bounce entry, whose nested drive has
+    /// an empty resume chain) can run the other two but not this one. #1370.
+    pub fn uses_suspend(&self) -> bool {
+        self.blocks
+            .iter()
+            .any(|b| b.insts.iter().any(|i| matches!(i, Inst::Suspend { .. })))
+    }
+
     /// Whether this function contains any `setjmp`/`longjmp` op ([`Inst::SetJmp`]/[`Inst::LongJmp`]).
     /// Used to reject a §14 JIT child that uses `setjmp` (no per-child `setjmp` runtime yet — like
     /// `uses_concurrency` for fibers/threads).
