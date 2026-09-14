@@ -351,3 +351,22 @@ fn forth_on_the_bytecode_engine() {
         assert_eq!(String::from_utf8(run.stdout).unwrap(), expected);
     }
 }
+
+/// #1235 — **the heap is bounded, and says so.** The kernel's memory map splits at `0x40000`: below
+/// it is state a `JitSession` REPL carries across prompts (dictionary, REPL stack, heap), above it is
+/// per-unit scratch each prompt rebuilds (the closed-block arena, the assembled blob, the input
+/// buffer). That makes an unchecked `allot` past the line *silently corrupt the arena*, where the old
+/// map — heap last, running to the 2^20 window edge — merely faulted. So `allot` refuses instead, and
+/// the session keeps running: the next line still works, and the heap pointer did not move.
+#[test]
+fn forth_allot_past_the_heap_limit_is_refused() {
+    // 64 KiB of heap: a modest `allot` fits, a 1 MiB one cannot.
+    assert_eq!(forth("here 1000 allot here swap - . cr\n"), "1000 \n");
+    // Past the limit: reported inline, `here` unmoved (`=` → -1 is true; 1 here is the `=` result
+    // for "unchanged"), and the REPL lives on — the next line still runs.
+    assert_eq!(forth("1000000 allot\n42 . cr\n"), "heap exhausted\n42 \n");
+    assert_eq!(
+        forth("here 1000000 allot here = . cr\n"),
+        "heap exhausted\n1 \n"
+    );
+}
