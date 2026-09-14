@@ -4950,6 +4950,20 @@ pub unsafe extern "C" fn temen_nim_precrawl_put(
     unsafe { (*core::ptr::addr_of_mut!(NIM_PRECRAWL)).push((path, bytes)) };
 }
 
+/// Seed the **prebuilt guest libc** (`web/assets/pg_libc.temeno`) the nim→powerbox link binds
+/// `snprintf`/`strtod`/the libm transcendentals against (#1422). The host fetches the asset once and
+/// hands it over before compiling; without it a nim program that formats a float (`formatFloat`),
+/// parses one, or calls `sin` links with those leaves unbound and cannot run. Call it again to
+/// replace the buffer.
+///
+/// # Safety
+/// `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_libc_put(ptr: *const u8, len: usize) {
+    let bytes = unsafe { core::slice::from_raw_parts(ptr, len) }.to_vec();
+    nimc::set_libc(bytes);
+}
+
 /// **Compile any Nim in the browser — the nimony compiler card** (NIM.md §3c/§3e, #958). Decode the
 /// three phase modules (`nifler`/`nimsem`/`hexer`), mount the stdlib image on the shared memfs and add
 /// the editor's Nim as `[main].nim`, then run the whole nimony toolchain **client-side** via
@@ -6859,11 +6873,16 @@ impl JitOnrampRun {
 
     /// The captured streams / exit — read after the emitted `f0` returns or unwinds (same contract as
     /// [`onramp_exec`]). `value` is `f0`'s return (meaningful when it returned rather than `exit`ed).
-    pub fn stdout(&self) -> &[u8] {
-        &self.host.stdout
+    ///
+    /// Both read through [`Host::stdout_bytes`]/[`Host::stderr_bytes`] rather than the raw `stdout`
+    /// field: once a sink is promoted (a child host shares this one's stdio) the field stops receiving
+    /// writes and the accessor is the only thing that sees them. Reading the field is a second route
+    /// through one behaviour, and the route that silently returns nothing (#1360).
+    pub fn stdout(&self) -> Vec<u8> {
+        self.host.stdout_bytes()
     }
-    pub fn stderr(&self) -> &[u8] {
-        &self.host.stderr
+    pub fn stderr(&self) -> Vec<u8> {
+        self.host.stderr_bytes()
     }
     /// The run's **primary output**: the retained memfs file for a file-output phase guest (nifler's
     /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `temen_onramp_jit_run_finish` hands
@@ -6879,7 +6898,7 @@ impl JitOnrampRun {
                     .map(|(_, v)| v)
                     .unwrap_or_default()
             }
-            None => self.host.stdout.clone(),
+            None => self.host.stdout_bytes(),
         }
     }
 

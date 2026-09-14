@@ -3345,6 +3345,21 @@ pub const POWERBOX_HEAP_BRK: u64 = 32;
 /// The guest heap's committed-boundary word (`i64`), just above [`POWERBOX_HEAP_BRK`]. The allocator
 /// `Memory.map`-commits upward from here into the reserved tail (§1a sparse address space).
 pub const POWERBOX_HEAP_TOP: u64 = 40;
+/// An **empty, NUL-terminated `argv`** (one null word) at window offset 48, and its `envp` twin at
+/// 56. A C `main(argc, argv, envp)` is never handed a *null* `argv`/`envp` — it is handed a pointer
+/// to an array whose first entry is NULL. A frontend's `_start` that has no arguments to pass must
+/// therefore point them here, not at 0: a runtime that walks `envp` until it sees NULL (nim's
+/// `getEnvVarsC`, and every C `environ` scan) dereferences the pointer before it can discover there
+/// is nothing there, and a null one faults against the #1094 NULL guard (#1422).
+///
+/// Both sit in page 0's reserved scratch, in the gap between the heap-state words above and the
+/// args buffer at [`POWERBOX_ARGS_BASE`] — and, under the guarded layout, in the gap between the
+/// durable control words (`durable::ARM_QUIESCE_OFF`, +32) and the shadow stack
+/// (`durable::SHADOW_BASE`, +64), so they collide with neither.
+pub const POWERBOX_EMPTY_ARGV: u64 = 48;
+/// The `envp` twin of [`POWERBOX_EMPTY_ARGV`]; see it for why an empty vector is a pointer to NULL
+/// rather than NULL itself.
+pub const POWERBOX_EMPTY_ENVP: u64 = 56;
 /// The powerbox globals / data-stack base (= [`POWERBOX_ARGS_END`]): page 0 is the writable
 /// stash + heap state + format scratch + args buffer, so a frontend's globals and the data stack
 /// live at/above this page — a read-only global never shares page 0 with the writable stash, and

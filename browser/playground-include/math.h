@@ -62,6 +62,24 @@ double atan(double x);
 double atan2(double y, double x);
 double asin(double x);
 double acos(double x);
+double sinh(double x);
+double cosh(double x);
+double tanh(double x);
+double asinh(double x);
+double acosh(double x);
+double atanh(double x);
+float sinf(float x);
+float cosf(float x);
+float tanf(float x);
+float asinf(float x);
+float acosf(float x);
+float atanf(float x);
+float sinhf(float x);
+float coshf(float x);
+float tanhf(float x);
+float asinhf(float x);
+float acoshf(float x);
+float atanhf(float x);
 #endif /* __PG_LIBC_DECLS_ONLY */
 
 // ---- bodies -----------------------------------------------------------------------------

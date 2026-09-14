@@ -1117,6 +1117,10 @@ for x in xs:
       nimsemCe: './assets/nimsem_ce.temen.gz',
       hexerCe: './assets/hexer_ce.temen.gz',
       preStdlib: './assets/nim_prestdlib.pack.gz',
+      // #1422: the prebuilt guest libc the nim->powerbox link binds `snprintf`/`strtod`/libm against,
+      // so a program that formats or parses a float (or calls `sin`) can actually run. Not gzipped —
+      // it is the same `.temeno` unit the chibicc card links against (`PG_LIBC_URL`).
+      libc: './assets/pg_libc.temeno',
     },
     desc: "**Compile a whole Nim program in your browser** (NIM.md §3c/§3e; #958) — the capstone of the " +
       "nimony-on-Temen slices. The `nifler` card above runs *one* phase (parse); this runs the **entire " +
@@ -2904,10 +2908,15 @@ async function runNimc(c) {
       fetchTimed(rec, c, ex.urls.nimsemCe),
       fetchTimed(rec, c, ex.urls.hexerCe),
     ]);
+    // The guest libc rides along uncompressed; a tree without the asset just gets `null` and the link
+    // leaves those leaves unbound (same behaviour as before #1422).
+    const libc = ex.urls.libc
+      ? await fetchTimed(rec, c, ex.urls.libc).catch(() => null)
+      : null;
     const [nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe] =
       await Promise.all([gunzip(gn), gunzip(gs), gunzip(gh), gunzip(gl), gunzip(gnc), gunzip(gsc), gunzip(ghc)]);
     logTo(c, `inflated: nifler ${nifler.length}B · nimsem ${nimsem.length}B · hexer ${hexer.length}B · stdlib ${stdlib.length}B · +child-entry (${niflerCe.length + nimsemCe.length + hexerCe.length}B for the tiered whole card)${preStdlib ? ` · +pre-compiled stdlib (${preStdlib.length}B, skips ~30 s system.nim sema)` : ''}`);
-    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
+    return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib, libc };
   };
   const main = 'prog.nim';
   const source = c.editor.getValue();
@@ -2938,7 +2947,15 @@ async function runNimc(c) {
     } else {
       // Fallback: no worker (e.g. the page lacks cross-origin isolation) — run on the main thread. This
       // freezes the tab for the duration, but keeps the card working where a worker can't be spawned.
-      const { nifler, nimsem, hexer, stdlib } = await getAssets();
+      const { nifler, nimsem, hexer, stdlib, libc } = await getAssets();
+      // #1422: seed the guest libc on THIS engine too (the main-thread fallback runs a different
+      // instance from the worker's), so `snprintf`/`strtod`/libm bind here as well.
+      if (libc && libc.length) {
+        const lp = Number(eng.ex.temen_alloc(libc.length));
+        new Uint8Array(eng.memory.buffer).set(libc, lp);
+        eng.ex.temen_nim_libc_put(lp, libc.length);
+        eng.ex.temen_dealloc(lp, libc.length);
+      }
       const srcBytes = new TextEncoder().encode(source);
       const mainBytes = new TextEncoder().encode(main);
       // Alloc every buffer before writing any (temen_alloc may grow/detach linear memory), then take one
@@ -4731,7 +4748,10 @@ async function nimPrewarm(c) {
         fetchGz(ex.urls.niflerCe), fetchGz(ex.urls.nimsemCe), fetchGz(ex.urls.hexerCe),
         ex.urls.preStdlib ? fetchGz(ex.urls.preStdlib).catch(() => null) : Promise.resolve(null),
       ]);
-      return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib };
+      const libc = ex.urls.libc
+        ? await fetch(ex.urls.libc).then((r) => r.arrayBuffer()).then((b) => new Uint8Array(b)).catch(() => null)
+        : null;
+      return { nifler, nimsem, hexer, stdlib, niflerCe, nimsemCe, hexerCe, preStdlib, libc };
     };
     setState(c, 'warming', 'warming up the Nim toolchain…');
     await snapshotClient.nimCompile(getAssets, 'import std/syncio\n\nwrite(stdout, "")\n', 'prewarm.nim', () => {});

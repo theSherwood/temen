@@ -347,14 +347,26 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 /// ceiling *is* that window top. [`seed_powerbox_heap`] bakes both words into the linked module's
 /// data image (post-link, where the window is known); see it for the #1051/#1054/#1060 rationale.
 fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
+    // `argc = 0`, and `argv`/`envp` point at **one-entry NULL-terminated vectors** rather than being
+    // NULL themselves (#1422): `_start` writes the terminator into the reserved page-0 scratch at
+    // [`temen_ir::POWERBOX_EMPTY_ARGV`]/[`POWERBOX_EMPTY_ENVP`] and hands `main` their addresses.
+    // Passing 0 is what a C `main` is never given, and nim's `getEnvVarsC` walks `nimEnviron` until
+    // it reads NULL — so a null `envp` faulted on the very first load against the #1094 guard,
+    // taking every module that reaches `std/envvars` (`os`, `paths`, `strtabs`, `appdirs`, …) down
+    // with it. One store each, paid once per run.
+    let argv = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ARGV;
+    let envp = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP;
     let text = format!(
         "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
          func () -> (i32) {{\n\
          block 0 () {{\n\
          \x20 v0 = data.top\n\
          \x20 v1 = i32.const 0\n\
-         \x20 v2 = i64.const 0\n\
-         \x20 v3 = i64.const 0\n\
+         \x20 vz = i64.const 0\n\
+         \x20 v2 = i64.const {argv}\n\
+         \x20 i64.store v2 vz\n\
+         \x20 v3 = i64.const {envp}\n\
+         \x20 i64.store v3 vz\n\
          \x20 v4 = call.import 0 (v0, v1, v2, v3)\n\
          \x20 return v4\n\
          \x20 }}\n\
@@ -480,6 +492,20 @@ fn link_selected_with_extra(
         .filter(|(_, own, _)| *own)
         .map(|(name, _, _)| name.clone())
         .collect();
+    // **Guest-libc leaves are frame-needing** ([`LIBC_SERVED`]): every chibicc-compiled function takes
+    // a leading `$sp`, so a nim call site must pass one. Seeding the leaf symbols here makes
+    // `call_import` prepend `sp + frame_size` (its `ext_frame_procs` check is on the *bare* import
+    // name) and, through the fixpoint below, makes every caller frame-needing so it owns an `$sp` to
+    // hand down. A callee edge is recorded in its **globalized** form (`proc_frame_nodes` suffixes a
+    // trailing-`.` name with the importer's stem), so seed both spellings.
+    for ((stem, _, _), root) in units.iter().zip(&roots) {
+        for (sym, c) in translate::Translator::importc_procs(root)? {
+            if libc_serves(&c) {
+                pooled_frame_procs.insert(format!("{sym}{stem}"));
+                pooled_frame_procs.insert(sym);
+            }
+        }
+    }
     loop {
         let mut added = false;
         for (name, _, callees) in &frame_nodes {
@@ -704,7 +730,179 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     ("dlopen", 17),
     ("dlclose", 18),
     ("dlsym", 19),
+    // **POSIX leaves nim's `std/posix` declares** (pulled in by `std/times`/`std/monotimes`). A
+    // sandboxed program is granted no ambient filesystem, process table, or clock, so these are
+    // fail-closed stubs rather than real syscalls: `open`/`getdents64`/`wait4`/`execve` report
+    // failure, `close` succeeds harmlessly, and `clock_gettime` writes a **zero timespec** and
+    // succeeds — a deterministic epoch, so a `times` program runs and reads a well-defined time
+    // instead of being handed ambient authority (#1422). Granting a real clock is a capability
+    // decision for the host, not a default of the nim bottom edge.
+    ("open", 20),
+    ("close", 21),
+    ("getdents64", 22),
+    ("wait4", 23),
+    ("execve", 24),
+    ("clock_gettime", 25),
+    // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
+    // `memfiles`/`osproc`/`terminal`/`rawthreads` declare (#1422). Same posture as the six above and
+    // for the same reason: a playground guest is granted no ambient filesystem, environment, process
+    // table, or OS threads, so every one of these is a **fail-closed stub** — the metadata and
+    // mutation calls report failure, `getcwd`/`c_getenv` report "absent" (a null pointer, i.e. an
+    // empty environment and no current directory), and `nanosleep` succeeds immediately.
+    //
+    // The point is *linkability*, not emulation: a program that only uses the pure half of these
+    // modules — `paths`/`pathnorm` string manipulation, a `strtabs` table, `os`'s path helpers — now
+    // links and runs, where before the whole module failed to link and nothing in it was reachable.
+    // A program that genuinely touches the filesystem gets nim's ordinary error path (an `OSError`,
+    // an empty result) instead of a link failure. Serving any of these for real is a capability the
+    // host grants, not a default of the nim bottom edge.
+    ("stat", 26),
+    ("lstat", 27),
+    ("fstat", 28),
+    ("mkdir", 29),
+    ("rmdir", 30),
+    ("unlink", 31),
+    ("chdir", 32),
+    ("getcwd", 33),
+    ("readlink", 34),
+    ("ftruncate", 35),
+    ("munmap", 36),
+    ("c_rename", 37),
+    ("c_getenv", 38),
+    ("c_setenv", 39),
+    ("c_unsetenv", 40),
+    ("fork", 41),
+    ("exitnow", 42),
+    ("pipe", 43),
+    ("dup2", 44),
+    ("setpgid", 45),
+    ("kill", 46),
+    ("nanosleep", 47),
+    ("sysconf", 48),
+    ("nativeIoctl", 49),
+    ("pthread_attr_init", 50),
+    ("pthread_attr_setstacksize", 51),
+    ("pthread_attr_destroy", 52),
+    ("pthread_create", 53),
+    ("pthread_join", 54),
+    ("cpusetZero", 55),
+    ("cpusetIncl", 56),
+    ("setAffinity", 57),
+    ("syscall", 58),
 ];
+
+/// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
+/// bottom-edge leaves whose real implementation is far too large to hand-write as Temen text the way
+/// [`POWERBOX_COMPUTE_SHIM`] does: C's `snprintf` (nim's `formatBiggestFloat` needs `%#.*g`/`%#.*e`/
+/// `%#.*f` with correct rounding), `strtod`, and the libm transcendentals. They come from the same
+/// guest-C libc the chibicc playground card uses, compiled once into a linkable unit.
+///
+/// Matched on the leaf's **`importc` C name**, not its nim symbol: nim's `float32`/`float64`
+/// overloads share one name (`sin`) and differ only by their `importc` (`sinf` / `sin`).
+///
+/// **ABI note.** Every chibicc-compiled function takes a leading **`$sp`** (its frame pointer), so a
+/// nim call site must pass one. [`link_selected_with_extra`] therefore seeds these leaves into the
+/// whole-program frame set, which makes `call_import` prepend `sp + frame_size` exactly as it does
+/// for a frame-needing nim proc — and makes every *caller* frame-needing through the same fixpoint,
+/// so it has an `$sp` to hand down. C varargs are already clang-wasm-style (one pointer to a slot
+/// buffer), which is precisely how leng marshals a `{.varargs.}` import, so `snprintf` binds with no
+/// shim. This table is the single authority: it decides both what is frame-marked and what is bound,
+/// so the two can never disagree (a name the libc turns out not to export is simply left unbound).
+const LIBC_SERVED: &[&str] = &[
+    "snprintf", "strtod",
+    // libm, float64 and the float32 (`…f`) overloads nim declares alongside them.
+    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf", "asinhf",
+    "acoshf", "atanhf",
+];
+
+/// True if the prebuilt guest libc serves the bottom-edge leaf whose `importc` C name is `c_name`.
+fn libc_serves(c_name: &str) -> bool {
+    LIBC_SERVED.contains(&c_name)
+}
+
+/// The **guest-libc leaves** a set of nim units imports, as `(import symbol, C name)` — the `importc`
+/// procs whose C name is in [`LIBC_SERVED`]. Drives both the frame seeding and [`nim_libc_units`].
+///
+/// Each leaf is yielded under **both spellings the linker may see**: the bare leng symbol
+/// (`c_snprintf.0.`, how a module calls a leaf it declares itself) and the stem-suffixed global
+/// (`sin.2.mat7cnfv21`, how a *sibling* module calls a leaf `std/math` declares). A cross-module call
+/// resolves the callee to its global name, so binding only the bare form would leave every libm leaf
+/// an unbound manifest import.
+pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |name: String, c: &str| {
+        if !out.iter().any(|(s, _)| *s == name) {
+            out.push((name, c.to_string()));
+        }
+    };
+    for u in units {
+        let root = nif::parse(u.src).map_err(LengError::Parse)?;
+        for (sym, c) in translate::Translator::importc_procs(&root)? {
+            if libc_serves(&c) {
+                push(format!("{sym}{}", u.stem), &c);
+                push(sym, &c);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Stubs for the guest libc's **non-`write` host caps**. The prebuilt libc is one translation unit,
+/// so linking it for `snprintf`/`strtod` also pulls in its file/heap layer (`fopen`, `malloc`, …) —
+/// dead for a nim program, which has its own allocator and I/O, but their capability imports would
+/// still have to be bound at instantiation or the run refuses to start. Resolving them here to
+/// fail-closed stubs keeps the nim program's manifest to the single `write` STREAM cap it actually
+/// uses (pg_libc's `write` has the same `(buf, len) -> n` shape, so it unifies with the syscall
+/// adapter's). A nim program never reaches these; if one ever did, it sees a clean failure (`-1` /
+/// EOF / a null mapping), never a silent wrong answer. Func order is fixed — see
+/// [`LIBC_CAP_STUB_NAMES`].
+const LIBC_CAP_STUBS: &str = "\
+func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) { v5 = i64.const -1 return v5 } }
+func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
+func (i32) -> () { block 0 (v0: i32) { return } }
+func (i64, i64, i32) -> (i64) { block 0 (v0: i64, v1: i64, v2: i32) { v3 = i64.const 0 return v3 } }
+func () -> (i64) { block 0 () { v0 = i64.const 65536 return v0 } }";
+
+/// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
+const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "read", "exit", "vm_map", "vm_page_size"];
+
+/// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
+/// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus
+/// [`LIBC_CAP_STUBS`]. `libc` is an encoded `.temeno` — the committed unit `genlibc` builds by
+/// compiling the playground C headers with the committed `chibicc.temen`. A leaf the libc turns out
+/// not to export is skipped: it stays an unbound manifest import rather than failing the link.
+pub fn nim_libc_units(
+    libc: &[u8],
+    units: &[WholeModule],
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let module = temen_encode::decode_unit(libc)
+        .map_err(|e| LengError::Malformed(format!("decode guest libc unit: {e:?}")))?;
+    let mut exports: Vec<(String, u32)> = Vec::new();
+    for (sym, c) in libc_leaves_of(units)? {
+        if let Some(e) = module.exports.iter().find(|e| e.name == c) {
+            exports.push((sym, e.func));
+        }
+    }
+    let libc_unit = temen_ir::LinkUnit {
+        module,
+        exports,
+        ..Default::default()
+    };
+    let stubs = temen_text::parse_module(LIBC_CAP_STUBS)
+        .map_err(|e| LengError::Malformed(format!("libc cap stubs parse: {e:?}")))?;
+    let stub_unit = temen_ir::LinkUnit {
+        module: stubs,
+        exports: LIBC_CAP_STUB_NAMES
+            .iter()
+            .enumerate()
+            .map(|(i, n)| ((*n).to_string(), i as u32))
+            .collect(),
+        ..Default::default()
+    };
+    Ok(vec![libc_unit, stub_unit])
+}
 
 /// The **syscall adapter** unit. nimony spells its bottom-edge syscalls `sysWrite(fd, buf, len)` (etc.,
 /// the C `write` ABI), but the §3e powerbox's STREAM `write` cap is `(buf, len) -> n` — no `fd`. This
@@ -748,7 +946,7 @@ fn compute_leaf_index(name: &str) -> Option<u32> {
 /// names (`sysWrite.0.` …) aren't known until link — then the adapter is bound onto them and the whole
 /// thing re-linked. Re-verify the result like any linked output (the caller runs `run_powerbox`, which
 /// verifies).
-pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
+pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<Module, LengError> {
     // #1051/#1054: link the `system` unit **first**, as belt-and-suspenders. The real fix for #1051
     // is the heap seed in [`synth_start_unit`] — without it the guest heap arena started at 0 and
     // overlapped placed static data, so a heap allocation could reuse a program's `LongString` const
@@ -768,7 +966,13 @@ pub fn link_nim_powerbox(units: &[WholeModule]) -> Result<Module, LengError> {
         .collect();
     reordered.sort_by_key(|u| !u.stem.starts_with("sysv"));
     let units: &[WholeModule] = &reordered;
-    let runtime = nim_powerbox_runtime(units)?;
+    let mut runtime = nim_powerbox_runtime(units)?;
+    // The **prebuilt guest libc** ([`LIBC_SERVED`]), when the caller supplies it: `snprintf`/`strtod`/
+    // libm, which no hand-written shim could reasonably carry. Without it those leaves stay unbound
+    // manifest imports and a program that formats a float (or calls `sin`) cannot run.
+    if let Some(libc) = libc {
+        runtime.extend(nim_libc_units(libc, units)?);
+    }
     // Pass 2: link with the compute shim + the adapter. Only the powerbox `write` cap is left.
     link_whole_powerbox_manifest(units, runtime)
 }
@@ -809,6 +1013,18 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
 
     // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
     let m1 = link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports.clone())?])?;
+
+    // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
+    // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
+    // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
+    // program is linked. Both passes feed one export list, so the final compute unit serves both.
+    for imp in &m1.imports {
+        if let Some(i) = compute_leaf_index(&imp.name) {
+            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
+                compute_exports.push((imp.name.clone(), i));
+            }
+        }
+    }
 
     // Map each retained syscall onto the adapter's fixed func order.
     let mut adapter_exports: Vec<(String, u32)> = Vec::new();

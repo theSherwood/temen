@@ -161,7 +161,7 @@ pub unsafe extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     };
 
     let units = [temen_leng::WholeModule { stem, src }];
-    let module = match temen_leng::link_nim_powerbox(&units) {
+    let module = match temen_leng::link_nim_powerbox(&units, None) {
         Ok(m) => m,
         Err(_) => return 3,
     };

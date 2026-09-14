@@ -110,6 +110,46 @@ fn exportc_name(pragmas: Option<&Node>) -> Option<String> {
     None
 }
 
+/// The C name in a `(pragmas … (importc "name") …)` node — the symbol a bottom-edge leaf actually
+/// binds to (`c_snprintf` is `snprintf`, nim's `sin(float32)` overload is `sinf`). The nim symbol
+/// alone can't say which: the `float32`/`float64` overloads share a name and differ only by their
+/// `importc`. `None` when the pragma carries no explicit name (the C name is then the nim symbol's).
+fn importc_name(pragmas: Option<&Node>) -> Option<String> {
+    let p = pragmas?;
+    if p.tag() != Some("pragmas") {
+        return None;
+    }
+    for prag in p.args() {
+        if prag.tag() == Some("importc") {
+            if let Some(name) = prag.args().first().and_then(|n| n.as_atom()) {
+                return Some(name.trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The **seed value for an `importc` *global***, by C name — the data twin of the `importc` *proc*
+/// leaves `temen_leng`'s `COMPUTE_LEAVES` binds. An `importc` gvar has no definition anywhere in the
+/// compiled program (that is what `importc` means); nimony's C backend gets one from libc or from
+/// the generated `main`'s prologue. Leng lowers it to an ordinary zero-initialized global instead, so
+/// unless it is seeded here it is a null pointer forever.
+///
+/// `nimEnviron` is the only one today: `std/envvars`' `getEnvVarsC` walks it until it reads NULL, so
+/// a null pointer faults on the first load against the #1094 guard rather than reporting "no
+/// variables" — taking `getEnv`/`existsEnv`, and every module that reaches them, down with it
+/// (#1422). Seeding it with the address of the empty `envp` vector `_start` builds
+/// ([`temen_ir::POWERBOX_EMPTY_ENVP`]) makes the scan terminate immediately: the sandbox's
+/// environment is empty, which is exactly what it is.
+fn importc_global_seed(cname: &str) -> Option<[u8; 8]> {
+    match cname {
+        "nimEnviron" => {
+            Some((temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP).to_le_bytes())
+        }
+        _ => None,
+    }
+}
+
 /// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
 fn is_string_literal(node: &Node) -> bool {
     matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
@@ -666,6 +706,15 @@ impl Translator {
                         };
                         self.tls_vars.insert(name, (off, desc));
                         continue;
+                    }
+                    // An `importc` gvar (`nimEnviron`) has no definition to link against — seed it
+                    // with the value the powerbox runtime stands behind it (see
+                    // [`importc_global_seed`]) rather than leaving the null the window is zeroed to.
+                    if let Some(bytes) = importc_name(a.get(1))
+                        .as_deref()
+                        .and_then(importc_global_seed)
+                    {
+                        self.data_inits.push((off, bytes.to_vec()));
                     }
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
                     // (the window is otherwise zero).
@@ -1780,6 +1829,31 @@ impl Translator {
         for (name, desc) in ext {
             self.ext_sret_procs.insert(name.clone(), desc.clone());
         }
+    }
+
+    /// Every **`importc` proc** a module declares, as `(leng symbol, C name)` — `("c_snprintf.0.",
+    /// "snprintf")`, `("sin.1.", "sinf")`, `("sin.2.", "sin")`. These are the bottom-edge leaves: procs
+    /// with no body, whose calls lower to Temen imports the runtime must bind. The C name is what
+    /// decides which leaf the prebuilt guest libc can serve — the nim symbol can't, because the
+    /// `float32`/`float64` overloads share one name and differ only in their `importc`. The linker
+    /// needs this *before* any unit is translated (to mark libc-served leaves frame-needing), which is
+    /// why it is a standalone scan. Falls back to the nim symbol when the pragma names no C symbol.
+    pub fn importc_procs(root: &Node) -> Result<Vec<(String, String)>, LengError> {
+        let mut out = Vec::new();
+        for item in root.args() {
+            if item.tag() == Some("proc") && is_importc_proc(item) {
+                let a = item.args();
+                if let Some(first) = a.first() {
+                    let sym = sym_def(first)?;
+                    let c = importc_name(a.get(3))
+                        .unwrap_or_else(|| sym.split('.').next().unwrap_or(&sym).to_string());
+                    out.push((sym, c));
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// A module's procs under their stem-suffixed global names, mapped to their **declared scalar

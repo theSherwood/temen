@@ -498,7 +498,8 @@ fn nim_write_runs_under_the_powerbox() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
     let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
     assert_eq!(
         run.stdout, b"hello, temen\n",
@@ -526,7 +527,8 @@ fn nim_strutils_cross_module_arg_widths_verify() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("strutils linked module must verify (#1400): {e:?}"));
 }
@@ -544,7 +546,7 @@ fn link_verify_std_module(module: &str) {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units)
+    let m = temen_leng::link_nim_powerbox(&units, None)
         .unwrap_or_else(|e| panic!("bridge link `{module}`: {e}"));
     temen_verify::verify_module(&m)
         .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
@@ -660,7 +662,7 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let m = temen_leng::link_nim_powerbox(&units).unwrap_or_else(|e| panic!("link: {e}"));
+    let m = temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("link: {e}"));
 
     // Read an 8-byte little-endian word from the linked data image at window offset `off`.
     let read_word = |off: u64| -> u64 {
@@ -862,6 +864,129 @@ fn real_formatted_output_runs_end_to_end() {
 // (tracked separately). Those modules `link`+`verify` (their own tests); running them waits on the
 // runtime-provider work.
 // -------------------------------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------------------------------
+// Runtime providers (#1422): programs that need the **prebuilt guest libc**. `snprintf` (nim's
+// `formatBiggestFloat`), `strtod`, and the libm transcendentals are far too large to hand-write as
+// Temen text, so `link_nim_powerbox` links the same guest-C libc the chibicc playground card uses
+// (`browser/web/assets/pg_libc.temeno`, built by `genlibc`). Each test diffs the program's real
+// output against the oracle captured from the native nimony toolchain.
+// -------------------------------------------------------------------------------------------------
+
+/// The committed guest libc, or `None` when the asset is absent (the caller then skips).
+fn guest_libc() -> Option<Vec<u8>> {
+    std::fs::read("../../browser/web/assets/pg_libc.temeno").ok()
+}
+
+/// Compile `src`, link it against the guest libc, and run `_start` under the **standard powerbox**
+/// (the same engine the browser's `temen_run_onramp` wraps), returning the bytes it wrote to stdout.
+fn run_libc_program(src: &str) -> Option<Vec<u8>> {
+    let path = toolchain_path()?;
+    let libc = guest_libc()?;
+    let mods = compile_to_leng(&path, src);
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units, Some(&libc))
+        .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // The guest libc's file/heap caps resolve to stubs at link, so the program's manifest is the one
+    // `write` STREAM cap — exactly as it is without the libc.
+    assert_eq!(
+        m.imports
+            .iter()
+            .map(|i| i.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["write"],
+        "linking the guest libc must not widen the program's capability manifest"
+    );
+    let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
+    Some(run.stdout)
+}
+
+/// **#1422 — `std/strutils` float formatting runs.** `formatBiggestFloat` calls C `snprintf` with
+/// `%#.*g`/`%#.*e`/`%#.*f`; the guest libc serves it (varargs are clang-wasm-style on both sides, so
+/// it binds with no shim). Output is diffed against the native-nimony oracle.
+#[test]
+fn real_strutils_float_formatting_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "write(stdout, formatFloat(3.14159, ffDecimal, 3))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(2.5, ffScientific, 2))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(1.0, ffDefault, -1))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"3.142|2.50e+00|1");
+}
+
+/// **#1422 — `std/parseutils` float parsing runs.** `parseBiggestFloat` falls back to C `strtod`
+/// for anything its fast path won't take; the guest libc serves it. Diffed against the
+/// native-nimony oracle (4 characters consumed, value 2.75).
+#[test]
+fn real_parseutils_strtod_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "import std/parseutils\n",
+        "var f: BiggestFloat = 0.0\n",
+        "let n = parseBiggestFloat(\"2.75xyz\", f)\n",
+        "write(stdout, $n)\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(f, ffDecimal, 2))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"4|2.75");
+}
+
+/// **#1422 — `std/times` links and runs.** `times` (and `monotimes`) reach `std/posix`, whose
+/// `clock_gettime`/`open`/`execve`/… leaves the compute shim now serves as fail-closed stubs — a
+/// sandboxed program gets no ambient clock, filesystem or process table, so `clock_gettime` reports a
+/// deterministic zero timespec. Before, those leaves were unbound and the program refused to start.
+#[test]
+fn real_times_module_runs() {
+    let src = "import std/syncio\nimport std/times\nwrite(stdout, \"times ok\")\n";
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"times ok");
+}
+
+/// **#1422 — `std/math` transcendentals run.** nim imports each as a `float64`/`float32` pair
+/// (`sin`/`sinf`), and the guest libc now carries both, plus the hyperbolics built on `exp`/`log`/
+/// `sqrt`. Values are printed through `formatFloat`, so this covers the libm *and* `snprintf` paths.
+#[test]
+fn real_math_transcendentals_run() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "import std/math\n",
+        "write(stdout, formatFloat(sin(0.5), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(cos(0.5), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(tanh(1.0), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(arctan(1.0), ffDecimal, 6))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, formatFloat(sinh(1.0), ffDecimal, 6))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP: nimony toolchain or guest libc asset absent");
+        return;
+    };
+    assert_eq!(out, b"0.479426|0.877583|0.761594|0.785398|1.175201");
+}
 
 #[test]
 fn real_tables_ops_run_correctly() {
@@ -1080,6 +1205,162 @@ fn totality_sweep_760() {
     eprintln!("===== end sweep =====\n");
 }
 
+/// **#1422 — `std/os` path handling runs.** The whole `os` module used to fail to *link*: its posix
+/// bottom edge (`stat`/`getcwd`/`c_getenv`/`fork`/…) had no provider, so even the **pure** half —
+/// string-only path manipulation that touches no filesystem at all — was unreachable. With the
+/// fail-closed posix stubs it links, and the path helpers give byte-identical answers to native
+/// nimony (they are pure string functions; nothing here consults a real filesystem).
+#[test]
+fn real_os_path_helpers_run() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/os\n",
+        "\n",
+        "let j = joinPath(\"a/b\", \"c.txt\")\n",
+        "let p = parentDir(\"a/b/c.txt\")\n",
+        "let f = extractFilename(\"a/b/c.txt\")\n",
+        "let e = changeFileExt(\"a/b/c.txt\", \"nif\")\n",
+        "write(stdout, j & \"|\" & p & \"|\" & f & \"|\" & e)\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_os_path_helpers_run (no toolchain / libc asset)");
+        return;
+    };
+    // Native `nimony c --run` prints exactly this.
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "a/b/c.txt|a/b|c.txt|a/b/c.nif"
+    );
+}
+
+/// **#1422 — `std/strtabs` runs.** `strtabs` reaches the posix edge only through `os`'s environment
+/// helpers; the table itself is pure. Previously unlinkable for that reason alone.
+#[test]
+fn real_strtabs_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strtabs\n",
+        "\n",
+        "var t = newStringTable(modeCaseSensitive)\n",
+        "t[\"a\"] = \"1\"\n",
+        "t[\"b\"] = \"2\"\n",
+        "write(stdout, t.getOrDefault(\"a\") & \"|\" & t.getOrDefault(\"b\") & \"|\" & $t.len & \"|\" & $t.hasKey(\"c\"))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_strtabs_runs (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "1|2|2|false");
+}
+
+/// **#1422 — `std/envvars` runs, and the sandbox's empty environment is *indistinguishable* from a
+/// host where the variable is simply unset.** `c_getenv` stubs to a null pointer, so `getEnv` yields
+/// `""` and `existsEnv` yields `false` — byte-identical to native nimony for an unset name. The guest
+/// is told "absent", never handed the host's environment.
+#[test]
+fn real_envvars_report_an_empty_environment() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/envvars\n",
+        "\n",
+        "write(stdout, \"[\" & getEnv(\"TEMEN_NO_SUCH_VAR_12345\") & \"]|\" & $existsEnv(\"TEMEN_NO_SUCH_VAR_12345\"))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_envvars_report_an_empty_environment (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "[]|false");
+}
+
+/// **#1422 stage-3 runnability sweep.** The `#760` sweep above answers "does it *translate*?"; this
+/// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
+/// [`STD_MODULES_ALL`] it compiles a driver that imports the module, links it through the real
+/// `link_nim_powerbox` **with the guest libc**, and checks the result verifies and asks for nothing
+/// beyond the one `write` stream cap. A module that links with an extra manifest entry has an
+/// unbound bottom-edge leaf: it would fail to instantiate in the playground, so it is not runnable.
+///
+/// This is a **diagnostic, not a gate** — it drives the whole nimony toolchain once per module
+/// (~20 minutes for the full list), so it is gated on `NIM_RUN_SWEEP=1` and stays out of CI. What
+/// gates in CI is the handful of `real_*_runs` tests above: each one actually *runs* a program from
+/// one of these modules and diffs the output against the native-nimony oracle, which is a stronger
+/// claim than "it linked" and costs seconds. Run the sweep when you change the bottom edge, to see
+/// what moved. `NIM_RUN_SWEEP_STRICT=1` narrows it to [`STD_MODULES`] and asserts instead of
+/// reporting, for a bisect.
+#[test]
+fn runnability_sweep() {
+    if std::env::var("NIM_RUN_SWEEP").is_err() {
+        eprintln!("SKIP runnability_sweep (set NIM_RUN_SWEEP=1 to run)");
+        return;
+    }
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP runnability_sweep (no nimony toolchain)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP runnability_sweep (no guest libc asset)");
+        return;
+    };
+    let strict = std::env::var("NIM_RUN_SWEEP_STRICT").is_ok();
+    let mods: &[&str] = if strict { STD_MODULES } else { STD_MODULES_ALL };
+    let mut runnable: Vec<&str> = Vec::new();
+    let mut unrunnable: Vec<(&str, String)> = Vec::new();
+    let mut nim_fail: Vec<(&str, String)> = Vec::new();
+    for (i, m) in mods.iter().enumerate() {
+        eprintln!("[{}/{}] std/{m} …", i + 1, mods.len());
+        let src = format!("import std/syncio\nimport std/{m}\n\nwrite(stdout, \"ok\")\n");
+        let leng = match try_compile_to_leng(&path, m, &src) {
+            Ok(v) => v,
+            Err(e) => {
+                nim_fail.push((m, e));
+                continue;
+            }
+        };
+        let units: Vec<temen_leng::WholeModule> = leng
+            .iter()
+            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+            .collect();
+        match temen_leng::link_nim_powerbox(&units, Some(&libc)) {
+            Err(e) => unrunnable.push((m, format!("link: {e}"))),
+            Ok(module) => match temen_verify::verify_module(&module) {
+                Err(e) => unrunnable.push((m, format!("verify: {e:?}"))),
+                Ok(()) => {
+                    let extra: Vec<&str> = module
+                        .imports
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .filter(|n| *n != "write")
+                        .collect();
+                    if extra.is_empty() {
+                        runnable.push(m);
+                    } else {
+                        unrunnable.push((m, format!("unbound leaves: {}", extra.join(", "))));
+                    }
+                }
+            },
+        }
+    }
+    eprintln!(
+        "\n===== #1422 runnability sweep: {} runnable / {} unrunnable / {} nimony-fail =====",
+        runnable.len(),
+        unrunnable.len(),
+        nim_fail.len()
+    );
+    for (m, why) in &nim_fail {
+        eprintln!("  [nimony] std/{m}: {why}");
+    }
+    for (m, why) in &unrunnable {
+        eprintln!("  [unrunnable] std/{m}: {why}");
+    }
+    eprintln!("  runnable: {}", runnable.join(" "));
+    eprintln!("===== end runnability sweep =====\n");
+    if strict {
+        assert!(
+            unrunnable.is_empty(),
+            "modules that compile but cannot run: {unrunnable:?}"
+        );
+    }
+}
+
 /// Feature-probe programs — one construct family each, to surface translator gaps without needing a
 /// whole stdlib module. Kept small and self-contained.
 const FEATURE_PROBES: &[(&str, &str)] = &[
@@ -1095,6 +1376,73 @@ const FEATURE_PROBES: &[(&str, &str)] = &[
 
 /// Stdlib modules the sweep exercises via `import std/<m>` drivers (NIM_SWEEP_STD=1). A spread across
 /// strings, containers, numerics, and parsing — the constructs a real program (and nimony itself) hit.
+/// **Every** `std/` module in the vendored nimony stdlib — the denominator the stage-3 runnability
+/// sweep reports against. [`STD_MODULES`] is the subset we hold green; this is the full surface, so
+/// the sweep's "unrunnable"/"nimony-fail" lists say what is left rather than silently omitting it.
+const STD_MODULES_ALL: &[&str] = &[
+    "algorithm",
+    "appdirs",
+    "assertions",
+    "atomics",
+    "base64",
+    "bitops",
+    "cmdline",
+    "complex",
+    "cpuinfo",
+    "deques",
+    "dirs",
+    "editdistance",
+    "encodings",
+    "envvars",
+    "fenv",
+    "formatfloat",
+    "hashes",
+    "heapqueue",
+    "intsets",
+    "ioring",
+    "json",
+    "lexbase",
+    "locks",
+    "math",
+    "md5",
+    "memfiles",
+    "monotimes",
+    "options",
+    "os",
+    "oserrors",
+    "osproc",
+    "parsejson",
+    "parseopt",
+    "parseutils",
+    "pathnorm",
+    "paths",
+    "random",
+    "rationals",
+    "rawthreads",
+    "result",
+    "rlocks",
+    "sequtils",
+    "sets",
+    "setutils",
+    "sha1",
+    "smartcli",
+    "streams",
+    "strtabs",
+    "strutils",
+    "sugar",
+    "syncio",
+    "tables",
+    "terminal",
+    "threadpool",
+    "ticketlocks",
+    "times",
+    "typetraits",
+    "unicode",
+    "varints",
+    "widestrs",
+    "wordwrap",
+];
+
 const STD_MODULES: &[&str] = &[
     "strutils",
     "sequtils",

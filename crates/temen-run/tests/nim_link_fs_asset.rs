@@ -145,7 +145,7 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
         src: &src,
     }];
     let expected = temen_encode::encode_module(
-        &temen_leng::link_nim_powerbox(&units).expect("native link_nim_powerbox"),
+        &temen_leng::link_nim_powerbox(&units, None).expect("native link_nim_powerbox"),
     );
 
     let child = temen_encode::decode_module(&temen).expect("decode nim-link-fs.temen");

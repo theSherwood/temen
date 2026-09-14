@@ -232,6 +232,18 @@ if want nim_driver_guest; then
   else
     note "nim_link SKIP/✗ (rustc +1.81.0 + rust-src + llvm-18 — see build_nim_link.sh)"
   fi
+  # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
+  # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
+  # pipeline, same gate shape (`nim_link_fs_asset`), so it is rebuilt here beside `nim_link` — it is
+  # coupled to exactly the same leng changes, and leaving it out of this script meant a leng change
+  # silently left it stale while its byte-identical gate went red.
+  if bash crates/temen-run/demos/nim_frontend/build_nim_link_fs.sh >/dev/null 2>&1 \
+     && gunzip -c "$FX/nim-link-fs.temen.gz" > /tmp/rebuild_nim_link_fs.temen 2>/dev/null \
+     && validate /tmp/rebuild_nim_link_fs.temen; then
+    note "nim_link_fs ✓ (nim-link-fs.temen.gz)"
+  else
+    note "nim_link_fs SKIP/✗ (rustc + rust-src + llvm-link/opt — see build_nim_link_fs.sh)"
+  fi
   # The nimc card's whole-card tier-up (#1025 3e) op-13-spawns the CHILD-ENTRY phase guests; the
   # playground fetches them from web/assets, so mirror the committed `_ce` fixtures there (they're the
   # same wire-coupled modules the browser op-13 tests use — nifler_ce from the nifler demo, nimsem_ce +
