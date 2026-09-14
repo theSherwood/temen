@@ -280,3 +280,34 @@ approval; adding one always requires owner sign-off:
   byte snapshot cannot reproduce a live alias into shared backing, so `layout_snapshot_safe`
   fail-closes on a `Backed` region. Recorded as the current behavior; **not yet ratified** as a
   permanent exception.
+
+## 15. One path per behaviour
+
+Every behaviour has **one** implementation path. Where a second position is genuinely required — a
+second engine, a second concurrency driver, a second host target, a second placement — it is a
+**parameter of one shared structure**, never a copy of the code: the shared structure is what gets
+maintained, and each position in it is data (a row, a config, a trait impl, a `cfg`), not a fork.
+Invariant 13 forbids two *forms* of a datum; this forbids two *routes* through the same behaviour.
+
+The cost model is the point. Every duplicated path multiplies the invariant-14 propagation burden by
+one: N copies means every accepted capability must be carried N times, and every divergence between
+them is a bug no single test can see. That multiplication — not line count — is what the prime
+directive (invariant 1) is actually about.
+
+A suffix is a parameter that escaped into the name space. `compile_and_run_capture_reserved_with_host_durable_mv_interruptible`
+is the smell in its pure form: the suffix set *is* the axis set, enumerated as names that nothing can
+iterate, rather than as a struct that everything can.
+
+**The deliberate second implementation is exempt, and it is exempt by naming its differential.** A
+second implementation whose *whole purpose* is to disagree — `temen-spec` restating the semantics
+independently of `temen-interp`, the tree-walk/bytecode seam, `Region::Paged` as an independent
+reference backing — is not a duplicated path; it is a test instrument, and the test that consumes it
+is what makes it legitimate. The rule for admitting one: **name the differential it feeds.** If no
+test compares the two, they are not independent implementations, they are a fork.
+
+*Violated by:* a second run loop, dispatch table, or host-glue family that mirrors an existing one by
+hand; a new `*_with_*` entry point where an options struct would do; a test file copied to cover
+another backend or axis where a parameterised harness exists; a capability variant added per
+parameter combination rather than per parameter. (Owner decision 2026-09-14; sharpens invariants 1 +
+13 + 14. Evidence: the six browser driver families and their hand-mirroring bug stream — #1026,
+#1339, #1347, #748 — and the 44-entry `run`/`compile_and_run` family; #1414 is the convergence.)
