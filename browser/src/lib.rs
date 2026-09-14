@@ -3007,6 +3007,13 @@ fn grant_onramp_caps(
     MouseQueue,
 ) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    // §3.5: register the running module's self-referential surface, as `temen-run`'s `grant_caps`
+    // does — "the one place every run path registers the running module". Without it `self.type_id`,
+    // `self.covers`, `export.handle` and `call.import.dyn` fail closed here but not under the CLI,
+    // and the unconditional NULL guard (#1094, INVARIANTS #13) is never recorded. #1234 needs it for
+    // a third reason: a §14 **same-module** child's import manifest *is* this module's, and the
+    // spawn arms fetch it through `Host::module_imports(SELF_MODULE)`.
+    host.set_self_module(&std::sync::Arc::new(m.clone()));
     // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
     // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
     // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
