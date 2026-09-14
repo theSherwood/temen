@@ -28,6 +28,15 @@ abstraction, configurability, or cleverness until something concrete demands it.
 If a change makes the verifier or the confinement path harder to read, it is
 probably wrong. When in doubt, do less.
 
+**Consolidate code paths.** The most expensive thing you can add is not a line — it is a
+*second route* through a behaviour that already has one. Every duplicated path (a second run
+driver, a second dispatch table, a second host-glue family, a copied test file) multiplies the
+invariant-14 propagation burden by one, forever. Where a second position is needed, make it a
+**parameter of the existing structure**, not a copy: a row, a config, a trait impl. A telescoping
+name (`..._with_host_durable_mv_interruptible`) is a parameter that escaped into the name space —
+take it back. See `INVARIANTS.md` #15, which also carves out the one legitimate case (a second
+implementation that exists to be differentialled against the first).
+
 ## Tests, fuzzing, benchmarks — early, not eventually
 
 - **Tests from the first commit.** Every component lands with tests. The
