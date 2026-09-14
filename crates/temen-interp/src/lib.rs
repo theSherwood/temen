@@ -11808,7 +11808,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         };
                                         match (im, ty) {
                                             (Some(im), Some(ty)) => {
-                                                ch.bind_child_manifest(&im, &ty).is_ok()
+                                                ch.bind_same_module_manifest(&im, &ty).is_ok()
                                             }
                                             _ => true,
                                         }
@@ -18550,6 +18550,21 @@ impl BoundImport {
         }
     }
 
+    /// An **unbound `required`** entry (#1234): the slot is declared but nothing is bound, so
+    /// `call.import` through it is a fail-closed `CapFault` *and* `import.attach` may not retarget
+    /// it (unlike an empty `rebindable` slot). What a same-module §14 child gets for an import it
+    /// inherited from its parent's manifest and was granted nothing for — see
+    /// [`Host::bind_same_module_manifest`].
+    pub fn withheld() -> BoundImport {
+        BoundImport {
+            type_id: 0,
+            op: 0,
+            handle: 0,
+            bound: false,
+            rebindable: false,
+        }
+    }
+
     /// A `rebindable` entry: `handle` is the initial binding (`Some`) or the slot starts empty
     /// (`None` — `call.import` traps until an `import.attach` fills it). The `(type_id, op)`
     /// template is fixed either way: attach swaps *which object*, never *which interface*.
@@ -18780,7 +18795,6 @@ impl Default for Host {
         Host::new()
     }
 }
-
 
 /// The spawn-record `module` selector meaning **this module** — a §14 child that runs the parent's
 /// own program rather than a granted separate `Module` (CONSOLIDATION.md §3d, [`temen_ir::SpawnRec`]).
@@ -19134,7 +19148,10 @@ impl Host {
     /// by the child-manifest binder to resolve each import's requirement set.
     pub fn module_types(&self, handle: i32) -> Option<Arc<[temen_ir::TypeEntry]>> {
         if handle == SELF_MODULE {
-            return self.self_module.as_ref().map(|m| Arc::from(m.types.clone()));
+            return self
+                .self_module
+                .as_ref()
+                .map(|m| Arc::from(m.types.clone()));
         }
         self.resolve_module(handle).ok().map(|g| g.types.clone())
     }
@@ -19155,11 +19172,40 @@ impl Host {
     ///    import index; callers surface `-EINVAL` before any child code runs).
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
-    /// lockstep).
+    /// lockstep). [`Host::bind_same_module_manifest`] is the same walk with step 3 softened — see
+    /// there for why a same-module child may not refuse over an unmet `required` slot.
     pub fn bind_child_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
+    ) -> Result<(), u32> {
+        self.bind_manifest(imports, tsec, false)
+    }
+
+    /// #1234 — [`Host::bind_child_manifest`] for a §14 **same-module** child: the identical walk,
+    /// except that a `required` slot with nothing to bind is left **empty** (fail-closed at use,
+    /// and not attachable) instead of refusing the spawn.
+    ///
+    /// The difference is whose manifest it is. A separate-module child's manifest describes *that
+    /// child's* own needs, so an unmet `required` import is a real instantiation failure and §3.3
+    /// says withhold. A same-module child runs the **parent's** program, so its manifest is the
+    /// parent's entire import surface — it never declared those needs, and a parent that re-grants
+    /// two of its seven capabilities would otherwise be unable to nest at all. The authority story
+    /// is unchanged either way: an empty slot `CapFault`s on use, so a child still reaches exactly
+    /// what it was granted.
+    pub fn bind_same_module_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+    ) -> Result<(), u32> {
+        self.bind_manifest(imports, tsec, true)
+    }
+
+    fn bind_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+        lenient: bool,
     ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
@@ -19238,6 +19284,18 @@ impl Host {
         let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
+            // Whether an unmet slot may be left empty rather than refusing the spawn: a
+            // `rebindable` one always may (it is declared empty-able), and every one may for a
+            // same-module child (see `bind_same_module_manifest`). The *entry* still records the
+            // declared mode, so a lenient-empty `required` slot stays un-attachable.
+            let soft = rebindable || lenient;
+            let unmet = || {
+                if rebindable {
+                    BoundImport::rebindable(0, 0, None)
+                } else {
+                    BoundImport::withheld()
+                }
+            };
             let Some((req_names, req_sigs)) = requirement(im) else {
                 return Err(i as u32);
             };
@@ -19259,8 +19317,8 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19290,8 +19348,8 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19315,8 +19373,8 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if rebindable => {
-                            bindings.push(BoundImport::rebindable(0, 0, None));
+                        None if soft => {
+                            bindings.push(unmet());
                             remaps.push(None);
                             continue;
                         }
@@ -19360,8 +19418,8 @@ impl Host {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
                 }
-                None if rebindable => {
-                    bindings.push(BoundImport::rebindable(0, 0, None));
+                None if soft => {
+                    bindings.push(unmet());
                     remaps.push(None);
                 }
                 None => return Err(i as u32),

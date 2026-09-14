@@ -90,10 +90,7 @@ fn a_sandboxed_definition_does_not_escape() {
 /// never registered under a name, so the inner `sandbox` finds nothing and says so.
 #[test]
 fn a_sandbox_cannot_sandbox() {
-    let (out, _) = run(
-        Backend::Bytecode,
-        "s\" 0 0 sandbox . cr\" sandbox drop\n",
-    );
+    let (out, _) = run(Backend::Bytecode, "s\" 0 0 sandbox . cr\" sandbox drop\n");
     assert!(
         out.contains("no sandbox capability"),
         "inner sandbox must be refused: {out:?}"
@@ -111,10 +108,7 @@ fn a_sandbox_cannot_sandbox() {
 /// (`*mut Host`) hooks that path read the mutex header as a `Host` — a SIGSEGV, not a refusal.
 #[test]
 fn the_jit_tier_declines_a_fiber_bearing_child() {
-    let r = try_run(
-        Backend::Jit,
-        "s\" 1 2 + . cr\" sandbox drop\n",
-    );
+    let r = try_run(Backend::Jit, "s\" 1 2 + . cr\" sandbox drop\n");
     let e = r.expect_err("the JIT tier cannot nest this kernel");
     assert!(e.contains("CapFault"), "expected a refusal, got: {e}");
 }

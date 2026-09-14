@@ -1051,8 +1051,12 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     // confined copy of itself reaches its granted `stdout`/`jit` through `call.import` instead of
     // `CapFault`ing, on this backend exactly as on the two interpreter tiers (§3.3 withhold: a
     // `required` slot with nothing to bind fails the spawn closed, probeable `-EINVAL`).
+    //
+    // **Only when the spawn handed the child caps by name** — same gate as the interpreter arms. A
+    // grant-less child was given nothing to bind, so its slots stay empty and fail closed on use,
+    // exactly as before this existed; binding it anyway would refuse spawns that used to work.
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
-    if bind_addr != 0 {
+    if bind_addr != 0 && grants_n > 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
         if bind(rt.cap_ctx, gc.ctx, -1) != 0 {
             release(gc.ctx);

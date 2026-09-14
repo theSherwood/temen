@@ -12661,7 +12661,7 @@ impl CoopSched {
                         let im = child_host.module_imports(super::SELF_MODULE);
                         let ty = child_host.module_types(super::SELF_MODULE);
                         if let (Some(im), Some(ty)) = (im, ty) {
-                            if child_host.bind_child_manifest(&im, &ty).is_err() {
+                            if child_host.bind_same_module_manifest(&im, &ty).is_err() {
                                 tasks[ti]
                                     .vt
                                     .active

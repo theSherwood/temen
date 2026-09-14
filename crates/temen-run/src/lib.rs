@@ -2571,9 +2571,17 @@ pub unsafe extern "C" fn child_bind_imports(
         let types = parent
             .module_types(module as i32)
             .unwrap_or_else(|| Arc::from(Vec::new()));
-        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL).
+        // §3.3 withhold: nonzero fails the spawn closed at the JIT call site (-EINVAL). A
+        // **same-module** child (`module == SELF_MODULE`, #1234) binds leniently instead — its
+        // manifest is the parent's whole import surface, not one written for it, so an unmet
+        // `required` slot is left empty (fail-closed at use) rather than refusing the spawn.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
-        if child.bind_child_manifest(&imports, &types).is_err() {
+        let bound = if module as i32 == temen_interp::SELF_MODULE {
+            child.bind_same_module_manifest(&imports, &types)
+        } else {
+            child.bind_child_manifest(&imports, &types)
+        };
+        if bound.is_err() {
             return -22;
         }
     }
@@ -5899,7 +5907,13 @@ impl Instance {
         // `?` used to drop it with the `Host`. Fold it into the error instead.
         let outcome = match folded {
             Ok(o) => o,
-            Err(e) => return Err(trap_err_with_output(e, &host.stdout_bytes(), &host.stderr_bytes())),
+            Err(e) => {
+                return Err(trap_err_with_output(
+                    e,
+                    &host.stdout_bytes(),
+                    &host.stderr_bytes(),
+                ))
+            }
         };
         Ok(Run {
             outcome,
@@ -5970,7 +5984,13 @@ impl Instance {
         let (res, _snap) = cap.ok_or("module is outside the parallel engine's subset")?;
         let outcome = match outcome_from_interp(res) {
             Ok(o) => o,
-            Err(e) => return Err(trap_err_with_output(e, &host.stdout_bytes(), &host.stderr_bytes())),
+            Err(e) => {
+                return Err(trap_err_with_output(
+                    e,
+                    &host.stdout_bytes(),
+                    &host.stderr_bytes(),
+                ))
+            }
         };
         Ok(Run {
             outcome,
