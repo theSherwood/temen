@@ -5156,18 +5156,17 @@ pub fn gc_unreachable_funcs(m: &mut Module, extra_roots: &[FuncIdx]) -> Result<G
     // --- mark ---------------------------------------------------------------------------------
     let mut live = alloc::vec![false; n];
     let mut work: Vec<FuncIdx> = Vec::new();
-    let mut push =
-        |f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>| -> Result<(), GcError> {
-            let i = f as usize;
-            if i >= live.len() {
-                return Err(GcError::BadRoot(f));
-            }
-            if !live[i] {
-                live[i] = true;
-                work.push(f);
-            }
-            Ok(())
-        };
+    let push = |f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>| -> Result<(), GcError> {
+        let i = f as usize;
+        if i >= live.len() {
+            return Err(GcError::BadRoot(f));
+        }
+        if !live[i] {
+            live[i] = true;
+            work.push(f);
+        }
+        Ok(())
+    };
     for e in &m.exports {
         push(e.func, &mut live, &mut work)?;
     }
@@ -5221,7 +5220,7 @@ pub fn gc_unreachable_funcs(m: &mut Module, extra_roots: &[FuncIdx]) -> Result<G
             continue;
         }
         for b in &m.funcs[i].blocks {
-            let mut check = |to: FuncIdx| -> Result<(), GcError> {
+            let check = |to: FuncIdx| -> Result<(), GcError> {
                 if map[to as usize].is_none() {
                     return Err(GcError::MissedEdge {
                         from: i as FuncIdx,
