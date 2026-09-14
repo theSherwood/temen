@@ -7783,9 +7783,7 @@ fn bind_powerbox_imports(h: &mut temen_interp::Host, m: &temen_ir::Module, grant
         .imports
         .iter()
         .map(|im| match granted.bind(&im.name) {
-            Some((cap, handle)) => {
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-            }
+            Some((cap, handle)) => temen_interp::BoundImport::required(cap.type_id, cap.op, handle),
             None => temen_interp::BoundImport::rebindable(0, 0, None),
         })
         .collect();
