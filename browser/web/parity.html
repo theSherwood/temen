@@ -30,6 +30,10 @@
         --st-declines: var(--faint);
         --st-notyet: #b26a00;
         --st-conditional: var(--accent);
+        /* An unaudited cell is *unknown*, not passing — muted, so it reads as absent information
+           rather than a verdict. The op matrix has none; the frontier matrix (#1413) is full of them
+           while it is filled in. */
+        --st-unaudited: var(--faint);
       }
       :root[data-theme="dark"] {
         --bg: #111417; --fg: #dfe3e8; --muted: #9aa4b2; --faint: #6f7a89;
@@ -95,6 +99,7 @@
       .cell.declines { color: var(--st-declines); }
       .cell.notyet { color: var(--st-notyet); }
       .cell.conditional { color: var(--st-conditional); }
+      .cell.unaudited { color: var(--st-unaudited); }
       tr.has-note td.op::after { content: "*"; color: var(--muted); }
       tr.open { background: var(--accent-soft); }
       tr.notes td { background: var(--surface); color: var(--muted); font-size: 13px; padding: 8px 12px; }
@@ -132,6 +137,7 @@
             <option value="declines">declines</option>
             <option value="notyet">not yet</option>
             <option value="conditional">conditional</option>
+            <option value="unaudited">unaudited</option>
           </select>
         </label>
         <label>on
@@ -249,7 +255,9 @@
 
       function renderSummary(data) {
         // Count over every column, so the strip describes the whole matrix rather than a slice of it.
-        const counts = { full: 0, declines: 0, notyet: 0, conditional: 0 };
+        // Keyed off the JSON's own `statuses` map, not a literal list — a status added to the
+        // manifest then shows up here without a second place to remember to edit.
+        const counts = Object.fromEntries(Object.keys(data.statuses).map((k) => [k, 0]));
         for (const op of data.ops) for (const c of op.cells) counts[c]++;
         const s = el('summary');
         const tile = (cls, n, k) => {
@@ -265,14 +273,17 @@
           return d;
         };
         s.append(tile('', data.ops.length, 'ops × 4 backends'));
-        for (const id of ['full', 'declines', 'notyet', 'conditional']) {
+        for (const id of Object.keys(data.statuses)) {
+          // Skip a status this matrix does not use — the op matrix has no unaudited cells, and a
+          // zero tile would imply the question was asked and answered.
+          if (counts[id] === 0 && id === 'unaudited') continue;
           s.append(tile(id, counts[id], data.statuses[id].label));
         }
       }
 
       function renderLegend(data) {
         const l = el('legend');
-        for (const id of ['full', 'declines', 'notyet', 'conditional']) {
+        for (const id of Object.keys(data.statuses)) {
           const sp = document.createElement('span');
           const g = document.createElement('span');
           g.className = 'cell ' + id;

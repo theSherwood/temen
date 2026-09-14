@@ -25,4 +25,10 @@ fn main() {
         .join("ops_parity.json");
     std::fs::write(&json_out, temen_parity::render_json()).expect("write ops_parity.json");
     eprintln!("wrote {}", json_out.display());
+
+    // The capability × axis frontier matrix (#1413) — INVARIANTS #14's other six axes.
+    let frontier_out = root.join("FRONTIER.md");
+    std::fs::write(&frontier_out, temen_parity::render_frontier_markdown())
+        .expect("write FRONTIER.md");
+    eprintln!("wrote {}", frontier_out.display());
 }

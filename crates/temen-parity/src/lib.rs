@@ -78,6 +78,13 @@ pub enum Status {
     /// Cranelift fiber/thread/`setjmp` ops need the x86-64-unix stack-switch substrate; the wasm-JIT
     /// is absent on native and the Cranelift JIT on the browser). The note names the condition.
     Conditional,
+    /// **Not audited** — nobody has established what this cell is. Distinct from [`Status::NotYet`],
+    /// which is a *known* gap with a convergence plan; this is an admission of ignorance.
+    ///
+    /// It exists so the frontier matrix ([`crate::frontier`]) can be honest while it is filled in:
+    /// an unaudited cell is visible, countable, and cannot be mistaken for a passing one. The op ×
+    /// backend matrix has none, and that is itself worth being able to state.
+    Unaudited,
 }
 
 impl Status {
@@ -88,6 +95,7 @@ impl Status {
             Status::Declines => "⛔",
             Status::NotYet => "🚧",
             Status::Conditional => "🔶",
+            Status::Unaudited => "❔",
         }
     }
 
@@ -101,6 +109,7 @@ impl Status {
             Status::Declines => "declines",
             Status::NotYet => "notyet",
             Status::Conditional => "conditional",
+            Status::Unaudited => "unaudited",
         }
     }
 }
@@ -449,5 +458,6 @@ pub fn supports_term(backend: Backend, term: &Terminator) -> bool {
 mod catalog;
 pub use catalog::{catalog, Focus, Op};
 
+pub mod frontier;
 mod render;
-pub use render::{render_json, render_markdown};
+pub use render::{render_frontier_markdown, render_json, render_markdown};
