@@ -188,7 +188,7 @@ block 0 (vsp: i64, vh: i64) {
     kind: 'jspb',
     editable: true,
     desc: 'Everywhere else on this page a guest’s capabilities are implemented Rust-side. Here the ' +
-      'page defines them: the JavaScript below <em>is</em> the powerbox — one function per capability ' +
+      'page defines them: the JavaScript below is itself the powerbox — one function per capability ' +
       'the guest imports, bound by name when the module is instantiated. The guest logs a line, has the ' +
       'host uppercase a string inside its own window (proving the host can write back, bounds-checked), ' +
       'and reads the host clock. Edit either pane and Run; give the guest an import the JS doesn’t ' +
