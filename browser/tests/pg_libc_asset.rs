@@ -283,3 +283,191 @@ fn read_err() -> Vec<u8> {
     // SAFETY: as above.
     unsafe { core::slice::from_raw_parts(temen_browser::temen_stderr_ptr(), n) }.to_vec()
 }
+
+/// **Dead-code elimination across the link** (#1407): a program that calls one libc function must not
+/// carry the other 118. Measured against the same program linked with the collection declined, so this
+/// pins the *effect*, not a hand-written number that drifts with the libc's size.
+#[test]
+fn the_linked_program_drops_what_it_cannot_reach() {
+    let (Some(lib), Some(prog)) = (
+        pg_libc(),
+        program_unit("#include <stdio.h>\nint main(void) { puts(\"hi\"); return 0; }\n"),
+    ) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+        return;
+    };
+    let lib_exports: Vec<(String, temen_ir::FuncIdx)> = lib
+        .exports
+        .iter()
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    let lib_data: Vec<(String, u64)> = lib
+        .data_exports
+        .iter()
+        .map(|d| (d.name.clone(), d.offset))
+        .collect();
+    let unit = temen_ir::LinkUnitRef {
+        module: &lib,
+        exports: &lib_exports,
+        data_exports: &lib_data,
+    };
+    let linked = temen_browser::link_program(unit, &prog, "main").expect("links");
+
+    // The uncollected shape, for comparison: the same units linked with every library export still a
+    // root. The program's exports come from its own table (minus chibicc's whole-program `_start`
+    // bootstrap at func 0, whose paramless signature `synth_manifest_start` rejects) — the same
+    // resolution `link_program` does, so the only difference between the two modules is the collection.
+    let mut prog_exports: Vec<(String, temen_ir::FuncIdx)> = prog
+        .exports
+        .iter()
+        .filter(|e| e.name != "_start")
+        .map(|e| (e.name.clone(), e.func))
+        .collect();
+    if !prog_exports.iter().any(|(n, _)| n == "main") {
+        prog_exports.push(("main".to_string(), 0));
+    }
+    let whole = temen_ir::link_with_manifest_ref(&[
+        unit,
+        temen_ir::LinkUnitRef {
+            module: &prog,
+            exports: &prog_exports,
+            data_exports: &[],
+        },
+    ])
+    .expect("links");
+    let entry = whole.resolve_export("main").expect("entry");
+    let whole = temen_ir::synth_manifest_start(whole, entry, false).expect("synth");
+
+    // The index space is deliberately unchanged (a funcidx is observable through `call.indirect`), so
+    // the win shows up as *bodies*: count functions that still have instructions, and compare encoded
+    // size.
+    let with_bodies = |m: &temen_ir::Module| {
+        m.funcs
+            .iter()
+            .filter(|f| f.blocks.iter().any(|b| !b.insts.is_empty()))
+            .count()
+    };
+    let (kept, total) = (with_bodies(&linked), with_bodies(&whole));
+    let (small, big) = (
+        temen_encode::encode_module(&linked).len(),
+        temen_encode::encode_module(&whole).len(),
+    );
+    assert_eq!(
+        linked.funcs.len(),
+        whole.funcs.len(),
+        "the index space must not move: `call.indirect` masks into a table whose slot i is funcidx i"
+    );
+    assert!(
+        kept * 2 < total,
+        "a `puts`-only program should keep a small fraction of the libc's bodies: {kept} of {total}"
+    );
+    assert!(
+        small * 2 < big,
+        "and the encoded module should shrink with them: {small} B vs {big} B"
+    );
+    eprintln!("#1407 gc: {kept} bodies kept of {total} ({small} B vs {big} B encoded)");
+
+    // Still correct, still steppable: it runs, and the debug info that survived is in range.
+    let out = temen_browser::onramp_exec(&linked, b"");
+    assert!(
+        out.status == STATUS_OK || out.status == STATUS_EXIT,
+        "run status {}",
+        out.status
+    );
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    let di = linked
+        .debug_info
+        .as_ref()
+        .expect("debug info survives the gc");
+    for l in &di.locs {
+        assert!(
+            (l.func as usize) < linked.funcs.len(),
+            "loc func {} out of range after the gc ({} funcs)",
+            l.func,
+            linked.funcs.len()
+        );
+    }
+    assert!(
+        di.files.iter().any(|f| f.contains("/in.c")),
+        "the user's own file is still there: {:?}",
+        di.files
+    );
+}
+
+/// **Several resident libraries at once** (#1408): the same program links against the prebuilt libc
+/// passed as a one-entry handle list, and an unknown handle anywhere in the list declines the whole
+/// call rather than linking against whatever occupies that slot.
+#[test]
+fn the_multi_handle_entries_link_and_fail_closed() {
+    let (Some(chibicc), Some(lib_bytes)) = (asset("chibicc.temen"), asset("pg_libc.temeno")) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+        return;
+    };
+    const USER: &str = "#include <stdio.h>\nint main(void) { puts(\"multi\"); return 3; }\n";
+    let h = temen_browser::temen_link_lib_open(lib_bytes.as_ptr(), lib_bytes.len());
+    assert!(h >= 0, "resident");
+
+    let flags = temen_browser::CHIBICC_DEBUG_INFO | temen_browser::CHIBICC_PROGRAM_UNIT;
+    temen_browser::temen_run_onramp_fs(
+        chibicc.as_ptr(),
+        chibicc.len(),
+        core::ptr::null(),
+        0,
+        USER.as_ptr(),
+        USER.len(),
+        flags,
+    );
+    assert_eq!(temen_browser::temen_status(), STATUS_OK, "compile");
+    let unit = read_out();
+
+    let handles = [h];
+    let rv = temen_browser::temen_link_run_libs(
+        handles.as_ptr(),
+        handles.len(),
+        unit.as_ptr(),
+        unit.len(),
+        b"main".as_ptr(),
+        4,
+        core::ptr::null(),
+        0,
+    );
+    assert!(
+        temen_browser::temen_status() == STATUS_OK || temen_browser::temen_status() == STATUS_EXIT,
+        "run status {}",
+        temen_browser::temen_status()
+    );
+    assert_eq!(String::from_utf8_lossy(&read_out()), "multi\n");
+    assert_eq!(rv, 3, "`main`'s return value");
+
+    // An empty list is legal and links: `link_with_manifest_ref` *retains* an unresolved name as a
+    // host-bound manifest import rather than failing, so a library-less program is a well-formed
+    // module whose `puts` is simply unbound. (Running it is what would fault — not this call's job.)
+    assert_eq!(
+        temen_browser::temen_link_encode_libs(
+            core::ptr::null(),
+            0,
+            unit.as_ptr(),
+            unit.len(),
+            b"main".as_ptr(),
+            4
+        ),
+        0,
+        "an empty handle list is a legal link, not an error"
+    );
+
+    // A bad handle beside a good one declines the whole call.
+    let bogus = [h, 9999];
+    assert!(
+        temen_browser::temen_link_text_libs(
+            bogus.as_ptr(),
+            bogus.len(),
+            unit.as_ptr(),
+            unit.len(),
+            b"main".as_ptr(),
+            4
+        ) < 0,
+        "one unknown handle fails the list closed"
+    );
+
+    temen_browser::temen_link_lib_close(h);
+}

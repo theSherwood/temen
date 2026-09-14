@@ -8853,6 +8853,145 @@ pub extern "C" fn temen_link_text_lib(
     }
 }
 
+/// Resolve a host-passed list of resident-library handles to borrowed link units (#1408). `None` if
+/// any handle is unknown or closed — fail-closed, so a stale handle can never silently link against
+/// whatever now occupies that slot.
+fn resident_units(handles: &[i32]) -> Option<Vec<temen_ir::LinkUnitRef<'static>>> {
+    // SAFETY: single-threaded wasm; the resident libraries are read (never mutated) for the link, and
+    // the table lives for the instance (a `static mut`).
+    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
+    let mut out = Vec::with_capacity(handles.len());
+    for &h in handles {
+        let lib = usize::try_from(h)
+            .ok()
+            .and_then(|i| libs.get(i))
+            .and_then(Option::as_ref)?;
+        out.push(temen_ir::LinkUnitRef {
+            module: &lib.module,
+            exports: &lib.exports,
+            data_exports: &lib.data_exports,
+        });
+    }
+    Some(out)
+}
+
+/// The handle list a `*_libs` entry was handed: `count` `i32`s at `ptr`. An empty list is legal — a
+/// program with no libraries links fine — and so is a null pointer with count 0.
+fn handle_slice(ptr: *const i32, count: usize) -> &'static [i32] {
+    if ptr.is_null() || count == 0 {
+        &[]
+    } else {
+        // SAFETY: the host passes a live `temen_alloc`ation of `count` i32s it just filled.
+        unsafe { core::slice::from_raw_parts(ptr, count) }
+    }
+}
+
+/// [`temen_link_run_lib`] against **several** resident libraries (#1408): `handles` is `handles_len`
+/// `i32`s in linking order, the program linked last. [`temen_link_lib_open`] could always keep many
+/// libraries resident, but the single-handle entries could only ever link one — the case #1373
+/// anticipated (a frontend with a program runtime *and* a macro-staging runtime), and the case a host
+/// wants for a prebuilt libc alongside a prebuilt graphics unit. Same accessors and return convention
+/// as [`temen_link_run_lib`]; an unknown or closed handle anywhere in the list declines the whole call
+/// ([`STATUS_UNSUPPORTED`]).
+#[no_mangle]
+pub extern "C" fn temen_link_run_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let Some(units) = resident_units(handle_slice(handles_ptr, handles_len)) else {
+        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
+        return 0;
+    };
+    link_run_against_multi(
+        &units, prog_ptr, prog_len, entry_ptr, entry_len, stdin_ptr, stdin_len,
+    )
+}
+
+/// [`temen_link_text_lib`] against several resident libraries (#1408) — see [`temen_link_run_libs`]
+/// for the handle list.
+#[no_mangle]
+pub extern "C" fn temen_link_text_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    link_lib_stash(
+        handle_slice(handles_ptr, handles_len),
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        |m| temen_text::print_module(m).into_bytes(),
+    )
+}
+
+/// [`temen_link_encode_lib`] against several resident libraries (#1408) — see
+/// [`temen_link_run_libs`] for the handle list.
+#[no_mangle]
+pub extern "C" fn temen_link_encode_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    link_lib_stash(
+        handle_slice(handles_ptr, handles_len),
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        temen_encode::encode_module,
+    )
+}
+
+/// The shared body of the link-and-stash entries: resolve the handles, load the program unit, link,
+/// and stash `render`'s bytes on [`temen_stdout_ptr`]/[`temen_stdout_len`]. `0` on success, else a
+/// negative `STATUS_*`.
+fn link_lib_stash(
+    handles: &[i32],
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    render: impl FnOnce(&temen_ir::Module) -> Vec<u8>,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let fail = |s: i32| {
+        set(s);
+        -s
+    };
+    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let Some(units) = resident_units(handles) else {
+        return fail(STATUS_UNSUPPORTED);
+    };
+    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    match link_program_multi(&units, &program, entry) {
+        Ok(m) => {
+            let bytes = render(&m);
+            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => fail(status),
+    }
+}
+
 /// [`temen_link_text_lib`]'s **binary** twin: link the program unit against the resident library
 /// `handle` and stash the linked module's `temen-encode` bytes (`temen_stdout_ptr`/`_len`), ready to run
 /// on either tier — `temen_run`/`moduleInterp` or the wasm-JIT. This is what the chibicc card uses
@@ -8932,22 +9071,51 @@ pub fn link_program(
     program: &temen_ir::Module,
     entry: &str,
 ) -> Result<temen_ir::Module, i32> {
+    link_program_multi(&[lib], program, entry)
+}
+
+/// [`link_program`] against **several** libraries at once (#1408) — the units are laid out in the
+/// order given, with the program last, so a later library may resolve against an earlier one. One
+/// library is the common case and has its own name above.
+pub fn link_program_multi(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    program: &temen_ir::Module,
+    entry: &str,
+) -> Result<temen_ir::Module, i32> {
     let mut prog_exports = link_lib_exports(program);
     prog_exports.retain(|(n, _)| n != "_start");
     if !prog_exports.iter().any(|(n, _)| n == entry) {
         prog_exports.push((entry.to_string(), 0));
     }
     let prog_data = link_unit_data_exports(program);
-    let linked = temen_ir::link_with_manifest_ref(&[
-        lib,
-        temen_ir::LinkUnitRef {
-            module: program,
-            exports: &prog_exports,
-            data_exports: &prog_data,
-        },
-    ])
-    .map_err(|_| STATUS_UNSUPPORTED)?;
+    let mut units: Vec<temen_ir::LinkUnitRef<'_>> = libs.to_vec();
+    units.push(temen_ir::LinkUnitRef {
+        module: program,
+        exports: &prog_exports,
+        data_exports: &prog_data,
+    });
+    let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
     let entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
+    // **Drop what nothing reaches** (#1407). The link merges whole modules, so a program that calls
+    // `printf` also carries the prebuilt libc's `<string.h>` and the whole series-based libm — dead
+    // weight every launch pays to verify and bytecode-compile.
+    //
+    // The library's exports have to go first, or there is nothing to collect: `link` publishes *every*
+    // unit's exports in the merged table, so all 119 libc names would be roots. They existed to
+    // *resolve* the program's calls, and that is done — a linked executable does not re-export its
+    // libc. What stays is the program unit's own surface (`prog_exports`, which includes `entry`),
+    // exactly what a host can still address by name afterwards.
+    //
+    // Skipped when either unit baked a funcidx into its data image (`data.funcref`): the linker has
+    // already resolved and cleared those, so a function reachable *only* from a static initializer
+    // would look unreachable and be emptied out from under its caller. chibicc emits none; a nim-style
+    // unit can, and simply keeps every body — slower, correct.
+    if libs.iter().all(|u| u.module.data_funcrefs.is_empty()) && program.data_funcrefs.is_empty() {
+        linked
+            .exports
+            .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
+        let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
+    }
     let module =
         temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;
     // Verify before handing it on: a program that references an undefined proc links to an
@@ -9000,6 +9168,28 @@ fn link_run_against(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
+    link_run_against_multi(
+        &[lib],
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+/// [`link_run_against`] over several library units (#1408) — the shared body; one library is the
+/// common case and has its own name above.
+fn link_run_against_multi(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
         Ok(s) => s,
@@ -9016,7 +9206,7 @@ fn link_run_against(
             return 0;
         }
     };
-    let module = match link_program(lib, &program, entry_name) {
+    let module = match link_program_multi(libs, &program, entry_name) {
         Ok(m) => m,
         Err(status) => {
             set(status);
