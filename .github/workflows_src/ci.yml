@@ -20,7 +20,16 @@ on:
     - cron: "0 7 * * *" # daily extended fuzz
   workflow_dispatch:
 concurrency:
-  group: ci-${{ github.ref }}
+  # Keyed by event AND ref. A scheduled run shares `github.ref` (refs/heads/main) with every push to
+  # main, so under a ref-only key the ~60-minute nightly was cancelled by the next merge: 6 of the 16
+  # nightlies before this change concluded `cancelled`, and the 2026-09-14 run died at 14:41:27 — the
+  # exact second the following merge's run started — taking the capstones job with it. That silently
+  # drops the deep jobs nothing else runs (miri, asan/tsan, loom, fuzz, capstones, the std lane); it is
+  # how the `llvm.modf` capstone regression (#1428) sat unseen for days. Note the guard has to be the
+  # *group*, not `cancel-in-progress`: that flag belongs to the incoming run, and the incoming run here
+  # is the merge — it would still cancel the nightly. Superseding is unchanged within an event (a new
+  # push to a PR branch still cancels that PR's in-flight run); only cross-event kills stop.
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 env:
   CARGO_TERM_COLOR: always
@@ -82,7 +91,7 @@ jobs:
       # re-run instead of eating the whole job budget (a 29 min apt stall burned one 2026-07-23).
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        run: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
@@ -493,7 +502,7 @@ jobs:
         # be — the test uses plain `clang` (any version the on-ramp's textual reader accepts).
         # ISSUES.md I34: bound the fetch so a wedged mirror fails fast into a re-run.
         timeout-minutes: 15
-        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y clang
+        run: bash scripts/ci/apt-prep.sh clang
       # The heavy self-compile gate is #[ignore]d — too slow (~2 min) for the inner
       # `cargo test --workspace` loop: it `make`s chibicc, compiles ~10 TUs `--emit-object`, links +
       # verifies a ~300-function module, runs it on the tree-walk interpreter AND the JIT, and
@@ -529,7 +538,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: install clang (native reference compiler)
         timeout-minutes: 15
-        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y clang
+        run: bash scripts/ci/apt-prep.sh clang
       - run: cargo test -p temen --test c_link -j 2 -- --ignored whole_cc1_compiles_giant_tus
 
   # The #[ignore]d full-depth CORRECTNESS gates (not benches) were one 90-min job (`full-depth-gates`)
@@ -869,9 +878,11 @@ jobs:
         timeout-minutes: 10
         working-directory: browser
         run: |
-          # I67/#1017: `--with-deps` runs its own internal `apt-get update`, so the azure-mirror
-          # scrub must happen here too — the hardened LLVM step below runs after this one.
-          sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          # I67/#1017/#1374: `--with-deps` runs its own internal `apt-get update`, so the third-party
+          # source scrub must happen here too — the hardened LLVM step below runs after this one.
+          # Scrub only (no packages): `--with-deps` installs what it needs itself. Absolute path —
+          # this step's `working-directory` is `browser/`.
+          bash "$GITHUB_WORKSPACE/scripts/ci/apt-prep.sh"
           npm install playwright@1.56.1
           npx playwright install --with-deps chromium
 
@@ -1323,7 +1334,7 @@ jobs:
       # bound it so an apt-mirror wedge fails fast into a re-run.
       - name: install mingw cross toolchain
         timeout-minutes: 15
-        run: sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true && sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+        run: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64
       - run: cargo clippy -p temen-jit --features stack-check --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 
   stack-guard-cross-os:
