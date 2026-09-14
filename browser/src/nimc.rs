@@ -18,7 +18,7 @@ use temen_interp::{
 };
 use temen_ir::Module;
 
-use crate::{onramp_cap_resolver, onramp_check, pg_args_blob};
+use crate::{onramp_check, pg_args_blob};
 
 // ---- nimony's module-stem hash (gear2/modnames.nim + lib/tinyhashes.nim), reproduced exactly -------
 
@@ -234,22 +234,27 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     // Manifest slot bindings for the on-ramp powerbox imports (stdout/stdin/exit/memory) — fs/exec are
     // reached by name (`self.resolve`) instead, so they're not bound here.
     if !m.imports.is_empty() {
-        use temen_interp::cap_id;
+        // The shared powerbox ABI (#912). Like the Postgres powerbox, this one grants no *sized*
+        // address space, so the whole-window `memory` grant serves both address-space roles; an
+        // import naming a capability granted here by name only (`fs`/`exec`) — or not at all —
+        // leaves its slot unbound, fail-closed at dispatch.
+        let granted = temen_ir::PowerboxHandles {
+            stdout: out,
+            stdin: inp,
+            exit,
+            memory,
+            addrspace: memory,
+            jit: None,
+            stderr: None,
+        };
         let bindings = m
             .imports
             .iter()
-            .map(|im| {
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => out,
-                    (cap_id::STREAM, _) => inp,
-                    (cap_id::EXIT, _) => exit,
-                    (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            .map(|im| match granted.bind(&im.name) {
+                Some((cap, handle)) => {
+                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                }
+                None => temen_interp::BoundImport::rebindable(0, 0, None),
             })
             .collect();
         host.set_import_bindings(bindings);

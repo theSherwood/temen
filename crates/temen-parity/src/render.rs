@@ -1,4 +1,6 @@
-//! Render the catalog + manifest as the human-readable `OPS_PARITY.md` matrix.
+//! Render the catalog + manifest as the human-readable `OPS_PARITY.md` matrix and as the
+//! machine-readable `OPS_PARITY.json` the playground's parity page reads (#1418). Two renderings,
+//! one manifest.
 
 use crate::{catalog, Backend, Status};
 
@@ -89,4 +91,105 @@ pub fn render_markdown() -> String {
     }
 
     s
+}
+
+/// Render the same matrix as JSON, for the playground's parity page (#1418).
+///
+/// A **second rendering of the one manifest**, not a second source of truth (INVARIANTS #15): both
+/// views call `catalog()` + `Op::cells()`, so a classification can never differ between the markdown
+/// and the page, and the golden test pins both against the generator.
+///
+/// Hand-rolled rather than pulled through `serde`: `temen-parity`'s only dependency is `temen-ir`
+/// (the classification must not be able to depend on anything else), and the shape here is four
+/// scalar fields — a dependency would cost more than it saves.
+pub fn render_json() -> String {
+    let ops = catalog();
+    let mut s = String::new();
+
+    s.push_str("{\n");
+    s.push_str("  \"_generated\": \"do not edit by hand — `cargo run -p temen-parity`\",\n");
+    s.push_str("  \"backends\": [");
+    for (i, b) in Backend::ALL.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        s.push_str(&format!("\"{}\"", b.short()));
+    }
+    s.push_str("],\n");
+    s.push_str("  \"statuses\": {\n");
+    for (i, st) in [
+        Status::Full,
+        Status::Declines,
+        Status::NotYet,
+        Status::Conditional,
+    ]
+    .iter()
+    .enumerate()
+    {
+        s.push_str(&format!(
+            "    \"{}\": {{ \"glyph\": \"{}\", \"label\": \"{}\" }}{}\n",
+            st.id(),
+            st.glyph(),
+            match st {
+                Status::Full => "Full",
+                Status::Declines => "Declines (parity not expected)",
+                Status::NotYet => "Not yet (parity not achieved)",
+                Status::Conditional => "Conditional",
+            },
+            if i == 3 { "" } else { "," }
+        ));
+    }
+    s.push_str("  },\n");
+    s.push_str("  \"ops\": [\n");
+    for (i, op) in ops.iter().enumerate() {
+        let cells = op.cells();
+        s.push_str("    { \"op\": ");
+        json_str(&mut s, &op.mnemonic);
+        s.push_str(", \"family\": ");
+        json_str(&mut s, op.family);
+        s.push_str(", \"cells\": [");
+        for (j, c) in cells.iter().enumerate() {
+            if j > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("\"{}\"", c.status.id()));
+        }
+        s.push_str("], \"notes\": [");
+        // Distinct, order-preserving — the same set the markdown's `notes` column joins.
+        let mut notes: Vec<&str> = Vec::new();
+        for c in &cells {
+            if !c.note.is_empty() && !notes.contains(&c.note) {
+                notes.push(c.note);
+            }
+        }
+        for (j, n) in notes.iter().enumerate() {
+            if j > 0 {
+                s.push_str(", ");
+            }
+            json_str(&mut s, n);
+        }
+        s.push_str("] }");
+        s.push_str(if i + 1 == ops.len() { "\n" } else { ",\n" });
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
+/// Append `v` as a JSON string literal, escaping what RFC 8259 requires. The catalog's mnemonics and
+/// notes are ASCII prose today, but escaping is not optional for a format a browser parses: one
+/// stray quote or backslash in a future note would silently produce an unparseable page.
+fn json_str(out: &mut String, v: &str) {
+    out.push('"');
+    for ch in v.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }

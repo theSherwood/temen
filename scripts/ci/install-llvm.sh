@@ -12,11 +12,10 @@
 set -euo pipefail
 LLVM_MAJOR=22
 
-# ISSUES.md I67: drop the runner's unused microsoft/azure apt sources so a transient 403/outage from
-# those mirrors can't fail `apt-get update` before we install anything.
-sudo rm -f /etc/apt/sources.list.d/microsoft* /etc/apt/sources.list.d/azure* \
-  && sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
-       /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+# Drop the runner's unused third-party apt sources so a transient outage or publish window on one of
+# those mirrors can't fail `apt-get update` before we install anything (I67/#1017, #1374). Scrub only
+# — the LLVM repo is added just below, and this script runs its own update/install after that.
+bash "$(dirname "$0")/apt-prep.sh"
 
 codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
 curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm.gpg --yes

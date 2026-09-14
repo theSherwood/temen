@@ -4206,6 +4206,107 @@ pub struct ResolvedCap {
     pub op: u32,
 }
 
+/// The reference **powerbox ABI**: the standard `name → (type_id, op)` binding an import name
+/// resolves to when a host binds a manifest module's slots (IMPORTS.md §2.1). One definition, shared
+/// by every host that offers the §3e powerbox — the native runner, the browser cdylib and the
+/// debugger used to keep hand-written twins of this table, and a divergence between them meant the
+/// *same guest* bound different capabilities per host (#912; the class INVARIANTS #9 bans).
+///
+/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is chosen by
+/// the host from what it actually granted ([`PowerboxHandles::bind`]), never by this policy — so two
+/// names can share an interface and differ only by which handle their slots bind (`write`/`read` are
+/// both `Stream`, bound to stdout vs stdin). This is the vocabulary the bundled toolchain agrees on;
+/// a *different* host binds these (or entirely new) names to its own capabilities through the §7
+/// late binding instead.
+pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
+    let (type_id, op): (u32, u32) = match name {
+        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint. `write` and `stderr` are
+        // both write (op 1); the binding uses the name to pick stdout vs the stderr handle.
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
+        "stderr" => (cap_id::STREAM, 1),
+        // Exit (noreturn).
+        "exit" => (cap_id::EXIT, 0),
+        // Memory management (§3e/§4).
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
+        // AddressSpace / SharedRegion aliasing (§13/§14).
+        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
+        "vm_region_map" => (cap_id::SHARED_REGION, 0),
+        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
+        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
+        // Guest-driven JIT (§22).
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
+        _ => return None,
+    };
+    Some(ResolvedCap { type_id, op })
+}
+
+/// The handles a host granted for the canonical powerbox, in [`POWERBOX_CAP_NAMES`] order. The five
+/// of the §3e prefix are mandatory (`temen_interp::Host::grant_powerbox_prefix` grants exactly
+/// those); `jit` and `stderr` are `None` for a host that does not grant them, and an import naming
+/// one it did not grant is left **unbound** — fail-closed at dispatch, never silently bound to the
+/// wrong endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PowerboxHandles {
+    pub stdout: i32,
+    pub stdin: i32,
+    pub exit: i32,
+    pub memory: i32,
+    pub addrspace: i32,
+    pub jit: Option<i32>,
+    pub stderr: Option<i32>,
+}
+
+impl PowerboxHandles {
+    /// The §3e prefix alone (`[stdout, stdin, exit, memory, addrspace]`, the grant order of
+    /// `POWERBOX_CAP_NAMES[..5]`), with no `jit`/`stderr`.
+    pub fn prefix([stdout, stdin, exit, memory, addrspace]: [i32; 5]) -> PowerboxHandles {
+        PowerboxHandles {
+            stdout,
+            stdin,
+            exit,
+            memory,
+            addrspace,
+            jit: None,
+            stderr: None,
+        }
+    }
+
+    /// Bind one manifest import: the capability `name` denotes **and** the handle this host granted
+    /// for it. `None` ⇒ leave the slot unbound (a dispatch through it is a fail-closed `CapFault`):
+    /// an unknown name, a dynamic-mode-only interface (`SharedRegion` is minted at runtime, never a
+    /// manifest slot), or a capability this host chose not to grant.
+    pub fn bind(&self, name: &str) -> Option<(ResolvedCap, i32)> {
+        let cap = default_cap_resolver(name)?;
+        // `write` and `stderr` are both `Stream` write (op 1), so op alone cannot break the tie —
+        // only the name can.
+        let handle = if name == "stderr" {
+            self.stderr?
+        } else {
+            match (cap.type_id, cap.op) {
+                (cap_id::STREAM, 1) => self.stdout,
+                (cap_id::STREAM, _) => self.stdin,
+                (cap_id::EXIT, _) => self.exit,
+                // One kind post-§4 (op-keyed like Stream): the vm_map family (ops 0–3) binds the
+                // whole-window grant; sub/region_create bind the sized one.
+                (cap_id::ADDRESS_SPACE, 0..=3) => self.memory,
+                (cap_id::ADDRESS_SPACE, _) => self.addrspace,
+                (cap_id::JIT, _) => self.jit?,
+                _ => return None,
+            }
+        };
+        Some((cap, handle))
+    }
+}
+
 /// What an import **name** binds to when [`resolve_imports_with`] lowers it — **link-time symbol
 /// resolution** (IMPORTS.md §2.5: the linker legitimately produces new module bytes; the runtime
 /// never rewrites — a manifest module's imports bind to slots at instantiation instead). The §7

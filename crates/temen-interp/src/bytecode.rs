@@ -12650,6 +12650,26 @@ impl CoopSched {
                         None => host.self_module.clone(),
                         Some(k) => extra_envs[k].host.lock_unpoisoned().self_module.clone(),
                     };
+                    // #1234: and its import manifest is ours too — bind the *parent's* manifest
+                    // against the child's attenuated powerbox, the same binder + `CHILD_BINDABLE`
+                    // policy the op-13 separate-module arm uses below (and the tree-walker's op-0
+                    // arm). Without it a nested copy of the parent `CapFault`s on its first
+                    // `call.import` despite holding a granted `stdout`/`jit`. Only for a child the
+                    // spawn handed caps to by name: a grant-less child has nothing to bind and
+                    // keeps its empty, fail-closed slots.
+                    if grants.is_some() {
+                        let im = child_host.module_imports(super::SELF_MODULE);
+                        let ty = child_host.module_types(super::SELF_MODULE);
+                        if let (Some(im), Some(ty)) = (im, ty) {
+                            if child_host.bind_same_module_manifest(&im, &ty).is_err() {
+                                tasks[ti]
+                                    .vt
+                                    .active
+                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
+                                continue;
+                            }
+                        }
+                    }
                     let child_args = if want_as {
                         vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                     } else {
