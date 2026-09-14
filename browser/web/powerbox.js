@@ -84,7 +84,9 @@ export function definePowerbox(eng, caps) {
 
   const readErr = () => {
     const p = ex.temen_jspb_error_ptr(), n = Number(ex.temen_jspb_error_len());
-    return n ? dec.decode(new Uint8Array(memory.buffer, Number(p), n)) : '';
+    // `.slice()` first: the threads build's memory is a SharedArrayBuffer, and TextDecoder refuses a
+    // view onto shared memory.
+    return n ? dec.decode(new Uint8Array(memory.buffer, Number(p), n).slice()) : '';
   };
 
   return {
