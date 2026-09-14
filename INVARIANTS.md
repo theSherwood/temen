@@ -14,14 +14,28 @@ configurability, or cleverness until something concrete demands it. When in doub
 measured regression, or a named consumer — but **closing an existing capability's cross-axis gap
 is itself a concrete demand (invariant 14), not speculation**. (AGENTS.md prime directive; DESIGN.md §1.)
 
-## 2. Confinement is the masking lowering
+## 2. Confinement is the access lowering
 
-Memory safety for the host rests on one pass: every guest access is masked to `[0, size)` or
-proven bounded. The verifier secures typing, control flow, and index ranges — **not** memory.
-The target is "as secure as Wasmtime"; in-process isolation is not a Spectre boundary.
-*Violated by:* any feature that adds emitted-code or window-access surface outside the
-masking regime — new lowerings are suspect by default; prefer reusing an existing guarded
-seam (as the JIT serve loop reused `invoke_extra`). (DESIGN.md §1a/§4; the fuzzed hinge.)
+Memory safety for the host rests on one pass: every guest access is **bounded to `[0, mapped)` or
+proven bounded**, and an access that is not admitted **faults** — it is never aliased back into the
+window. The verifier secures typing, control flow, and index ranges — **not** memory. The target is
+"as secure as Wasmtime"; in-process isolation is not a Spectre boundary.
+*Violated by:* any feature that adds emitted-code or window-access surface outside the confinement
+regime — new lowerings are suspect by default; prefer reusing an existing guarded seam (as the JIT
+serve loop reused `invoke_extra`). (DESIGN.md §1a/§4; the fuzzed hinge.)
+
+**The mechanism is trap-confinement, not masking (restated 2026-09-14).** This invariant said
+"masked to `[0, size)`" long after the mechanism stopped being a mask. D63 replaced D38's
+`trapnz` + `& (reserved−1)` clamp with a bounds check plus a branchless
+`select_spectre_guard(oob, guard_offset, addr+offset)` redirect: on every admitted access the
+redirect is a no-op and the address is exactly `mem_base + (addr+offset)`; on a misspeculated
+out-of-bounds access it lands on the `PROT_NONE` guard. `temen-mask`'s own header states it
+plainly — *"there is **no masking** — an out-of-bounds address is never aliased back into the
+window, it faults."* The old AND clamp survives in the bulk-span path and the wasm-JIT tier;
+those are the two places to converge or record, and until one of those happens the name
+`temen-mask`/`mask_addr` is legacy vocabulary for a retired design (INVARIANTS #13 — a rename is
+tracked, not assumed). Nothing about the security property changed here; the invariant's
+description of it was simply stale, on the one page a reader is told to read first.
 
 ## 3. Authority moves only down the grant graph
 
@@ -71,7 +85,8 @@ Traps stay reserved for what can never be legitimate: forged handles (a generati
 issued), typing violations on live handles, and escape-adjacent faults. Cancellation is a
 value: revocation completes calls with an errno whether the caller was parked mid-call or
 calls after — a lifecycle event is never a domain-killing surprise. *Violated by:* any new
-trap reachable from a benign race or another party's lifecycle action. (D42; I41.)
+trap reachable from a benign race or another party's lifecycle action. (D42; originally
+ISSUES.md I41 — retired, resolve via `git log`.)
 
 ## 6. One world per domain
 
@@ -79,7 +94,9 @@ A domain's handlers, threads, and fibers share one window, one powerbox, one fue
 A handler trap is terminal for the domain — never resume over half-mutated state. Safety is
 serial-by-default with explicit opt-in ladders (multi-consumer serving, threading) whose
 cost — the threading discipline — is the guest's stated choice. *Violated by:* partial-state
-recovery, transactional handler worlds, or implicit parallelism. (IMPORTS.md §3.6; I37/I39.)
+recovery, transactional handler worlds, or implicit parallelism. (IMPORTS.md §3.6; I37 —
+still cited in FORK.md/DURABILITY.md/PROCESS.md; I39 was in the retired ISSUES.md, resolve
+via `git log`.)
 
 **One lifetime, too (owner, 2026-07-24):** executors never anchor a domain's lifetime;
 ownership does. A domain ends itself (`exit`, or any trap — both domain-wide, on every
@@ -107,7 +124,8 @@ exactly-once claims. (§3.6 rewound parks; PROCESS.md O10; DURABILITY.md §13.)
 
 Service calls carry shell-frequency control traffic — single-slot scalar replies. Bulk data
 rides `SharedRegion` rings the guests own. *Violated by:* widening the dispatch/reply ABI to
-carry payloads, or any hot path routed through handlers. (F6; I39; the c_shell rings.)
+carry payloads, or any hot path routed through handlers. (F6; originally ISSUES.md I39 —
+retired, resolve via `git log`; the c_shell rings.)
 
 ## 9. The interpreter is the oracle; decline, never diverge
 
