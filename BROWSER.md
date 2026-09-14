@@ -509,6 +509,37 @@ A Node harness that instantiates the cdylib directly must then supply the shared
 (`engineImports(memory)`) and read linear memory from *it*, not from `exports.memory` — see
 `browser-pg-libc-test.mjs`, which handles either build.
 
+## Link-time dead-code elimination, and linking against several units (#1407 / #1408)
+
+`link` merges whole modules: a program that calls `printf` also carried the prebuilt libc's
+`<string.h>` and the whole series-based libm, because every unit's exports land in the merged export
+table and every export is addressable. `temen_ir::gc_unreachable_funcs` is the reachability walk that
+removes them — the cross-unit twin of what chibicc's `mark_live` does *within* a translation unit.
+
+Roots are the module's addressable surface (every `exports` entry, every `ImplExport` op) plus the
+caller's `extra_roots`, for a funcidx it means to invoke by index — the entry it is about to hand
+`synth_manifest_start`. Edges are followed from a live body: `Call`, `RefFunc` (the address-taken
+case a call-graph-only walk would drop), `ThreadSpawn`, `ReturnCall` — the same set
+`offset_func_indices` rewrites, and **the two must stay in step**. It fails rather than guessing: a
+module whose data image has funcidxs baked into bytes (`data.funcref`, which the linker has already
+written and nothing can locate again) is declined, and a live reference to a function the walk dropped
+is reported as `MissedEdge` instead of applied — a wrong renumber is silent, so it is never applied on
+a maybe.
+
+The library's exports have to be pruned first or there is nothing to collect — they existed to
+*resolve* the program's calls, and a linked executable does not re-export its libc. `link_program`
+keeps the program unit's own surface and collects from there. Measured on the chibicc card, a
+`puts`-only program: **11 functions kept of 123, 11 KB instead of 174 KB**; the `printf`/`snprintf`/
+`malloc`/`fprintf` program in `browser-pg-libc-test.mjs`, 175 KB → 119 KB, and its debug-session IR
+text 798 KB → 527 KB. That is paid back on every launch (verify + bytecode-compile) and on every
+relaunch.
+
+`temen_link_run_libs` / `temen_link_text_libs` / `temen_link_encode_libs` take a **list** of resident
+handles (#1408) — `temen_link_lib_open` could always keep several libraries resident, but the
+single-handle entries could only link one. Units link in the order given with the program last; an
+unknown or closed handle anywhere in the list declines the whole call, so a stale handle can never
+link against whatever now occupies that slot. The single-handle forms remain as wrappers.
+
 ## Remaining work / follow-ons
 
 Everything in the phase tracker is landed; this is the open list — each item its own slice, none a

@@ -5100,6 +5100,203 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
     }
 }
 
+/// What [`gc_unreachable_funcs`] did: the old→new funcidx map (`None` = dropped) and the count.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct GcFuncs {
+    /// Indexed by the *old* funcidx: its new index, or `None` if the function was dropped.
+    pub map: Vec<Option<FuncIdx>>,
+    /// How many functions were dropped (`0` ⇒ the module is unchanged and `map` is the identity).
+    pub dropped: usize,
+}
+
+/// Why [`gc_unreachable_funcs`] declined or failed.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GcError {
+    /// The module's data image contains funcidxs baked into bytes ([`Module::data_funcrefs`]), which
+    /// this pass cannot rewrite — renumbering would silently retarget them. Declines, changing
+    /// nothing. (A [`link`]ed module has an empty list because the linker already baked them, so a
+    /// caller that links units carrying `data.funcref` must not run this pass on the result; check the
+    /// *units*, as [`crate::link`]'s consumers do.)
+    DataFuncrefs,
+    /// A live function referenced a funcidx the reachability walk had marked dead. This is a bug in
+    /// the walk (an unhandled funcidx-bearing form), reported rather than applied: a wrong remap
+    /// would silently call the wrong function. The module is left untouched.
+    MissedEdge { from: FuncIdx, to: FuncIdx },
+    /// A root index was out of range.
+    BadRoot(FuncIdx),
+}
+
+/// **Drop functions nothing can reach, and renumber every funcidx that named one** — link-time
+/// dead-code elimination (#1407).
+///
+/// [`link`] merges whole modules: every function of a library unit lands in the linked program
+/// whether or not anything reaches it. A program that calls only `printf` still carries the seeded
+/// libc's `<string.h>` and the whole series-based libm. This is the reachability walk that removes
+/// them — the cross-unit twin of what chibicc's own `mark_live` does *within* a translation unit.
+///
+/// Roots are the module's addressable surface — every [`Module::exports`] entry and every
+/// [`ImplExport`] op — plus `extra_roots`, for a funcidx the caller intends to invoke directly (the
+/// entry it is about to hand [`synth_manifest_start`], say). **A funcidx the caller holds but does not
+/// pass is not a root**: indices move, so resolve names to indices *before* calling this, and remap
+/// anything you kept through [`GcFuncs::map`].
+///
+/// Edges are followed from a live function's body: [`Inst::Call`], [`Inst::RefFunc`],
+/// [`Inst::ThreadSpawn`] and [`Terminator::ReturnCall`] — the same set [`offset_func_indices`]
+/// rewrites, and the two must stay in step. A [`Inst::CallImport`] names an import slot, not a
+/// function, so it is not an edge.
+///
+/// Fails rather than guessing: a module with baked data funcrefs is declined
+/// ([`GcError::DataFuncrefs`]), and a reference to a function the walk dropped is reported
+/// ([`GcError::MissedEdge`]) instead of applied. On any error the module is unchanged.
+pub fn gc_unreachable_funcs(m: &mut Module, extra_roots: &[FuncIdx]) -> Result<GcFuncs, GcError> {
+    let n = m.funcs.len();
+    if !m.data_funcrefs.is_empty() {
+        return Err(GcError::DataFuncrefs);
+    }
+    // --- mark ---------------------------------------------------------------------------------
+    let mut live = alloc::vec![false; n];
+    let mut work: Vec<FuncIdx> = Vec::new();
+    let mut push =
+        |f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>| -> Result<(), GcError> {
+            let i = f as usize;
+            if i >= live.len() {
+                return Err(GcError::BadRoot(f));
+            }
+            if !live[i] {
+                live[i] = true;
+                work.push(f);
+            }
+            Ok(())
+        };
+    for e in &m.exports {
+        push(e.func, &mut live, &mut work)?;
+    }
+    for e in &m.impl_exports {
+        for &f in &e.ops {
+            push(f, &mut live, &mut work)?;
+        }
+    }
+    for &f in extra_roots {
+        push(f, &mut live, &mut work)?;
+    }
+    while let Some(f) = work.pop() {
+        let mut edges: Vec<FuncIdx> = Vec::new();
+        for b in &m.funcs[f as usize].blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => edges.push(*func),
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &b.term {
+                edges.push(*func);
+            }
+        }
+        for e in edges {
+            if (e as usize) >= n {
+                return Err(GcError::BadRoot(e)); // out of range; the verifier's job, not ours
+            }
+            push(e, &mut live, &mut work)?;
+        }
+    }
+    // --- plan ---------------------------------------------------------------------------------
+    let mut map: Vec<Option<FuncIdx>> = alloc::vec![None; n];
+    let mut next: FuncIdx = 0;
+    for (i, &alive) in live.iter().enumerate() {
+        if alive {
+            map[i] = Some(next);
+            next += 1;
+        }
+    }
+    let dropped = n - next as usize;
+    if dropped == 0 {
+        return Ok(GcFuncs { map, dropped: 0 });
+    }
+    // Every reference a surviving function makes must land on a survivor. It will, if the walk above
+    // saw every funcidx-bearing form — so a miss is reported, never applied.
+    for (i, &alive) in live.iter().enumerate() {
+        if !alive {
+            continue;
+        }
+        for b in &m.funcs[i].blocks {
+            let mut check = |to: FuncIdx| -> Result<(), GcError> {
+                if map[to as usize].is_none() {
+                    return Err(GcError::MissedEdge {
+                        from: i as FuncIdx,
+                        to,
+                    });
+                }
+                Ok(())
+            };
+            for inst in &b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => check(*func)?,
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &b.term {
+                check(*func)?;
+            }
+        }
+    }
+    // --- apply --------------------------------------------------------------------------------
+    let mut kept: Vec<Func> = Vec::with_capacity(next as usize);
+    for (i, f) in m.funcs.drain(..).enumerate() {
+        if live[i] {
+            kept.push(f);
+        }
+    }
+    m.funcs = kept;
+    let at = |f: FuncIdx| map[f as usize].expect("checked above");
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => *func = at(*func),
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &mut b.term {
+                *func = at(*func);
+            }
+        }
+    }
+    for e in &mut m.exports {
+        e.func = at(e.func);
+    }
+    for e in &mut m.impl_exports {
+        for f in &mut e.ops {
+            *f = at(*f);
+        }
+    }
+    // Debug info for a dropped function is dropped with it — a dangling `func` would make a stepper
+    // resolve a stop to the wrong source line (and the DAP's range checks reject it outright).
+    if let Some(di) = &mut m.debug_info {
+        di.locs.retain(|l| map[l.func as usize].is_some());
+        for l in &mut di.locs {
+            l.func = at(l.func);
+        }
+        di.vars
+            .retain(|v| v.func == GLOBAL_SCOPE || map[v.func as usize].is_some());
+        for v in &mut di.vars {
+            if v.func != GLOBAL_SCOPE {
+                v.func = at(v.func);
+            }
+        }
+        di.func_names.retain(|nm| map[nm.func as usize].is_some());
+        for nm in &mut di.func_names {
+            nm.func = at(nm.func);
+        }
+    }
+    Ok(GcFuncs { map, dropped })
+}
+
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`
 /// at instantiation; `readonly` ones are protected after the copy so guest writes fault.
 #[derive(Clone, PartialEq, Eq, Debug)]
