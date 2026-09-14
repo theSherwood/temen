@@ -312,7 +312,7 @@ fn run_shell_ex(
         cap_thunk,
         &mut jh as *mut Host as *mut c_void,
         Some(temen_run::module_resolver),
-        Some(grant_hooks()),
+        Some(grant_hooks(&mut jh as *mut Host)),
     )
     .expect("jit compiles");
     assert!(

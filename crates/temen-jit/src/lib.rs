@@ -806,6 +806,20 @@ pub struct GrantChildHooks {
     /// Called after compile, before the child thread starts; cleared by the releaser (host-side
     /// `Host::set_child_serve_ctx(0)`) so a stale pointer is never read after child exit.
     pub register_serve: ChildServeRegistrar,
+    /// #1234 — the **parent host pointer these hooks decode**, in the shape *this* family expects.
+    ///
+    /// Every hook above needs the run's parent host, and each one casts this pointer itself. The
+    /// run bakes one of two shapes for its `call.cap` sites — a raw host pointer (decoded by the
+    /// single-threaded thunk) or a lock cell (decoded by the concurrent one) — and the hooks have
+    /// to agree with whichever the run chose. The thunk never disagrees because it and its ctx are
+    /// arguments to the *same* [`CompiledModule::compile`] call; the hooks were the outlier, set by
+    /// a separate `set_grant_child_hooks` and left to interpret a pointer chosen elsewhere. When
+    /// those two sites drifted, a hook read a lock header as a host — memory corruption reachable
+    /// from guest code. Carrying the pointer here, set in the same call as the family that decodes
+    /// it, makes that drift unrepresentable.
+    ///
+    /// Null is legal only when the hooks are never invoked.
+    pub parent_ctx: *mut core::ffi::c_void,
 }
 
 /// Register / clear a granted child's serve context on its shared powerbox — see

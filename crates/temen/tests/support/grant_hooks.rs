@@ -2,20 +2,18 @@
 //! for the granted-spawn / applet / fork integration suites (#923). Byte-identical copies previously
 //! lived in thirteen test files.
 
+use temen_interp::Host;
 use temen_jit::GrantChildHooks;
+use temen_run::CapCtx;
 
-/// The full production [`GrantChildHooks`] table — temen-run's child build / bind / release / mint /
-/// thunk / serve entry points — as the granted-spawn tests install it on the JIT.
-pub fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: temen_run::grant_child_build,
-        build_named: temen_run::grant_named_child_build,
-        build_detached: temen_run::grant_detached_child_build,
-        budget_mem_take: temen_run::budget_mem_take,
-        bind_imports: temen_run::child_bind_imports,
-        release: temen_run::grant_child_release,
-        mint: temen_run::child_offer_mint,
-        thunk: temen_run::cap_thunk_locked,
-        register_serve: temen_run::child_register_serve,
-    }
+/// The production [`GrantChildHooks`] table for a run that baked `host` as its raw `call.cap` ctx —
+/// i.e. one compiled with `temen_run::cap_thunk`, which is what every caller here does.
+///
+/// #1234: this used to hand-roll the table, which meant it also hand-picked which *shape* of parent
+/// pointer the hooks would decode — a choice that has to agree with the ctx the run baked, and that
+/// nothing checked. It now delegates to [`temen_run::production_grant_hooks`], which derives the
+/// family and the pointer from one [`CapCtx`], so the tests exercise the same table production does
+/// (invariant 15) and cannot pair it with the wrong ctx.
+pub fn grant_hooks(host: *mut Host) -> GrantChildHooks {
+    temen_run::production_grant_hooks(CapCtx::Raw(host))
 }

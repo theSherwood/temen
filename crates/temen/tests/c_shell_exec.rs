@@ -236,7 +236,7 @@ fn run(
             temen_run::cap_thunk,
             &mut host as *mut Host as *mut c_void,
             Some(temen_run::module_resolver),
-            Some(grant_hooks()),
+            Some(grant_hooks(&mut host as *mut Host)),
         )
         .expect("jit");
         let code = match jo {

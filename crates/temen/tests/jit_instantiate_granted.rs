@@ -135,7 +135,7 @@ fn run_jit(stream_grant: bool) -> (JitOutcome, Vec<u8>) {
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut core::ffi::c_void,
         None,
-        Some(grant_hooks()),
+        Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit");
     (jo, host.stdout_bytes())

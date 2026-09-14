@@ -2135,11 +2135,54 @@ locked_parent_hook!(
     ) -> i32
 );
 
-/// The production §14 child hooks for a run whose cap ctx is a raw `*mut Host` (`locked = false`) or
-/// a `*const Mutex<Host>` (`locked = true`) — see [`locked_parent_hook`]. `release` and
-/// `register_serve` take the *child* ctx (always a shared `Arc<Mutex<Host>>`), so they are the same
-/// function either way.
-pub fn production_grant_hooks(locked: bool) -> temen_jit::GrantChildHooks {
+/// #1234 — **the parent host a run baked into its `call.cap` sites, together with the shape it
+/// baked.** A single-threaded run bakes a raw `*mut Host` decoded by [`cap_thunk`]; a concurrent one
+/// bakes a `*const Mutex<Host>` decoded by [`cap_thunk_locked`]. The two thunks differ in more than
+/// a lock (the locked one must not hold its guard across anything that re-enters guest code — the
+/// serve loop, `Jit.invoke`, the §3.6 caller transport), so the split is load-bearing and stays.
+///
+/// What does not have to stay is *deducing* the shape at each use. The thunk never got it wrong —
+/// it and its ctx are arguments to the same `CompiledModule::compile` call. The §14 child hooks
+/// did: they were registered separately and decoded a pointer chosen elsewhere, so when the run had
+/// picked the other shape they read a lock header as a `Host`. Threading one value through both
+/// sites makes the pair a fact rather than a convention.
+#[derive(Clone, Copy)]
+pub enum CapCtx {
+    /// A single-threaded run: the raw host, decoded by [`cap_thunk`].
+    Raw(*mut Host),
+    /// A concurrent run: the per-domain lock cell, decoded by [`cap_thunk_locked`].
+    Locked(*const Mutex<Host>),
+}
+
+impl CapCtx {
+    /// The thunk that decodes this shape — pass it and [`CapCtx::ptr`] to the same compile.
+    pub fn thunk(self) -> temen_jit::CapThunk {
+        match self {
+            CapCtx::Raw(_) => cap_thunk,
+            CapCtx::Locked(_) => cap_thunk_locked,
+        }
+    }
+
+    /// The opaque pointer to bake, valid only for [`CapCtx::thunk`] and the hook family
+    /// [`production_grant_hooks`] returns for this same value.
+    pub fn ptr(self) -> *mut c_void {
+        match self {
+            CapCtx::Raw(h) => h as *mut c_void,
+            CapCtx::Locked(m) => m as *mut c_void,
+        }
+    }
+
+    fn is_locked(self) -> bool {
+        matches!(self, CapCtx::Locked(_))
+    }
+}
+
+/// The production §14 child hooks for a run with this cap ctx: the family that decodes `ctx`'s shape
+/// (see [`locked_parent_hook`]) *and* `ctx` itself as `parent_ctx`, so a hook can never be handed a
+/// pointer it does not know how to read. `release` and `register_serve` take the *child* ctx (always
+/// a shared `Arc<Mutex<Host>>`), so they are the same function either way.
+pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
+    let locked = ctx.is_locked();
     temen_jit::GrantChildHooks {
         build: if locked {
             grant_child_build_locked
@@ -2174,13 +2217,15 @@ pub fn production_grant_hooks(locked: bool) -> temen_jit::GrantChildHooks {
         },
         thunk: cap_thunk_locked,
         register_serve: child_register_serve,
+        parent_ctx: ctx.ptr(),
     }
 }
 
-/// The production [`temen_jit::BudgetTaker`] for a run of the given ctx shape — the `set_budget_taker`
-/// twin of [`production_grant_hooks`].
-pub fn production_budget_taker(locked: bool) -> temen_jit::BudgetTaker {
-    if locked {
+/// The production [`temen_jit::BudgetTaker`] for a run with this cap ctx — the `set_budget_taker`
+/// twin of [`production_grant_hooks`]. It reads the same `parent_ctx` the hooks carry (the nursery
+/// hands every hook that pointer), so passing the run's `CapCtx` here keeps the two in step.
+pub fn production_budget_taker(ctx: CapCtx) -> temen_jit::BudgetTaker {
+    if ctx.is_locked() {
         budget_take_locked
     } else {
         budget_take
@@ -3881,12 +3926,14 @@ unsafe fn powerbox_compile_run(
 ) -> Result<JitRun, temen_jit::JitError> {
     let interrupt_ptr = interrupt.map(std::sync::Arc::as_ptr);
     if let Some(m) = locked {
-        let ctx = m as *const Mutex<Host> as *mut c_void;
+        // #1234: one value carries the shape and the pointer — the compile below and the hooks
+        // further down both take it, so they cannot disagree about how to read it.
+        let cc = CapCtx::Locked(m as *const Mutex<Host>);
         let mut cm = CompiledModule::compile(
             module,
             func,
-            cap_thunk_locked,
-            ctx,
+            cc.thunk(),
+            cc.ptr(),
             temen_ir::DEFAULT_RESERVED_LOG2,
             None,
             None,
@@ -3919,10 +3966,8 @@ unsafe fn powerbox_compile_run(
             .unwrap_or_else(|e| e.into_inner())
             .set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
         // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
-        // #1234: this arm bakes a `*const Mutex<Host>` ctx (`cap_thunk_locked`), so the child hooks
-        // must be the locked family — the raw ones would read the mutex header as a `Host`.
-        cm.set_grant_child_hooks(Some(production_grant_hooks(true)));
-        cm.set_budget_taker(Some(production_budget_taker(true)));
+        cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+        cm.set_budget_taker(Some(production_budget_taker(cc)));
         if let Some(ip) = interrupt_ptr {
             m.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3942,11 +3987,13 @@ unsafe fn powerbox_compile_run(
             snapshot,
         });
     }
+    // #1234: the single-threaded shape, as one value — the compile and the hooks below both read it.
+    let cc = CapCtx::Raw(raw_host);
     let mut cm = CompiledModule::compile(
         module,
         func,
-        cap_thunk,
-        raw_host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         temen_ir::DEFAULT_RESERVED_LOG2,
         None,
         None,
@@ -3964,8 +4011,8 @@ unsafe fn powerbox_compile_run(
     }
     host.set_jit_native_ctx(&mut cm as *mut CompiledModule as usize);
     // CALLS.md 5c.1c — production granted-child hooks + the kill cell for thunk-blocked waits.
-    cm.set_grant_child_hooks(Some(production_grant_hooks(false)));
-    cm.set_budget_taker(Some(production_budget_taker(false)));
+    cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+    cm.set_budget_taker(Some(production_budget_taker(cc)));
     if let Some(ip) = interrupt_ptr {
         host.set_epoch_cell(ip as usize);
     }
@@ -4192,15 +4239,15 @@ impl PowerboxProgram {
         // compiles against, and so `jit_hosts_fibers()` is known below. `run` resets these contents
         // (fresh caps re-granted deterministically) each call, but the box — hence the address — stays.
         let mut host = Box::new(Host::new());
-        let ctx = &mut *host as *mut Host as *mut c_void;
+        let cc = CapCtx::Raw(&mut *host as *mut Host);
         inst.grant_caps(&mut host, win);
         let quota = temen_jit::Quota::default();
         let mut cm = Box::new(
             CompiledModule::compile(
                 &inst.module,
                 0,
-                cap_thunk,
-                ctx,
+                cc.thunk(),
+                cc.ptr(),
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 None, // sub
                 None, // resolve_module
@@ -4221,8 +4268,8 @@ impl PowerboxProgram {
             cm.enable_fiber_hosting(quota)
                 .map_err(|e| format!("JIT fiber-hosting setup failed: {e:?}"))?;
         }
-        cm.set_grant_child_hooks(Some(production_grant_hooks(false)));
-        cm.set_budget_taker(Some(production_budget_taker(false)));
+        cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+        cm.set_budget_taker(Some(production_budget_taker(cc)));
         Ok(PowerboxProgram {
             inst,
             win,
