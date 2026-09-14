@@ -9082,6 +9082,42 @@ fn run(
     drive(dom, entry, args, fuel, mem, host, u64::MAX)
 }
 
+/// The per-op park/interrupt flags one capability dispatch may raise (#1173). They live on the shared
+/// [`Host`], but they describe **one op** — so they must be taken in the same lock scope as the
+/// dispatch that set them. On the parallel driver every vCPU of a domain shares one `Host`, and
+/// draining them under a later lock let a sibling vCPU's dispatch take another's park: the parked
+/// reader kept the placeholder `0` its rewound read had returned, and the sibling completed `-EINTR`
+/// into its own `dst`. Grouping them makes "take them all, now, together" the only shape available.
+struct DispatchParks {
+    /// A `Stream{In}` read that found an empty buffer under `set_stdin_blocking`.
+    stdin: bool,
+    /// A personality caller-request (`fork` / blocking `waitpid`).
+    request: Option<super::ParkEvent>,
+    /// A pipe read that found an empty FIFO with writers still open.
+    pipe_read: Option<u32>,
+    /// A pipe write that found a full FIFO with readers still open.
+    pipe_write: Option<u32>,
+    /// A signal interrupted a blocking op: the latch a driver's interrupt path set.
+    sig_interrupt: bool,
+}
+
+impl DispatchParks {
+    /// Drain every per-op flag from `p`. Call ONLY inside the dispatch's own lock scope.
+    fn take(p: &mut Host) -> Self {
+        let parks = Self {
+            stdin: p.take_stdin_parked(),
+            request: p.take_park_request(),
+            pipe_read: p.take_pipe_read_parked(),
+            pipe_write: p.take_pipe_write_parked(),
+            sig_interrupt: p.take_sig_interrupt(),
+        };
+        // The wake flags a peer's write/close raised need no action at a dispatch site — both drivers
+        // poll pipe readiness at their settle — but they are per-op too, so they drain here as well.
+        let _ = (p.take_pipe_wake(), p.take_pipe_wake_writers());
+        parks
+    }
+}
+
 /// Why [`Vm::resume`] returned. `Done`/`Suspended` are the run-to-completion + budget cases; the
 /// `Cont*`/`Suspend` cases are §12 fiber switches handled within [`step_vcpu`] (a vCPU's own fiber
 /// registry); the `Thread*`/`Memory*` cases are §12 multi-vCPU events handled by the [`drive`]
@@ -16151,9 +16187,32 @@ impl Vm {
                     }
                     let gm = mem.as_mut().map(|m| m as &mut dyn GuestMem);
                     let mut pending_id = None;
-                    let res = host.with(|p| {
-                        p.cap_dispatch_slots_pending(*type_id, *op, h, &argv, gm, &mut pending_id)
-                    })?;
+                    // #1173 — take this dispatch's PER-OP park/interrupt flags in the SAME lock scope
+                    // as the dispatch that sets them. They live on the shared `Host`, and on the
+                    // PARALLEL driver every vCPU of a domain shares one, so draining them under a
+                    // later, separate `with` let a sibling thread's unrelated dispatch — landing in
+                    // the gap — take THIS op's flags: the parked reader then fell through to the
+                    // non-park arm and kept the placeholder `0` its rewound read had returned (a pipe
+                    // read answering EOF that never happened), while the sibling wrote the `-EINTR`
+                    // into its own `dst`. That is the `EINTR(42)` → `0` flake, at ~20% per attempt.
+                    // Under one lock the flags are what they always meant to be: extra return values
+                    // of this dispatch, unreachable by any other vCPU.
+                    let (res, parks) = host.with(|p| {
+                        let r = p.cap_dispatch_slots_pending(
+                            *type_id,
+                            *op,
+                            h,
+                            &argv,
+                            gm,
+                            &mut pending_id,
+                        );
+                        // Drain unconditionally (the tree-walker's park site does the same): a flag
+                        // only ever means "the op *this* dispatch just ran wants to park", so one
+                        // left set would misfire on a later, unrelated op. The wake flags need no
+                        // action here — the drivers poll readiness at their settle.
+                        (r, DispatchParks::take(p))
+                    });
+                    let res = res?;
                     // §12 parking-on-blocking: a punted offloadable dispatch. The `with` scope
                     // above already released the shared-host lock. The exactly-`i64` case is
                     // surfaced as [`Outcome::CapPending`] so the DRIVER chooses the wait shape
@@ -16197,10 +16256,7 @@ impl Vm {
                     } else {
                         (*type_id, *op)
                     };
-                    if eff_tid == super::cap_id::STREAM
-                        && eff_op == 0
-                        && host.with(|p| p.take_stdin_parked())
-                    {
+                    if eff_tid == super::cap_id::STREAM && eff_op == 0 && parks.stdin {
                         // #1146 (deeper) — the stdin park's EINTR leg. The scheduler drivers' interrupt
                         // paths (the cooperative all-parked sweep / the parallel poll break) latch
                         // `set_sig_interrupt` and re-admit this task; the rewound read re-executes and
@@ -16213,8 +16269,8 @@ impl Vm {
                         // insert (the pre-park race) — complete `-EINTR` in `dst` and advance instead of
                         // parking; the caught handler is delivered at the next safepoint. `SA_RESTART`
                         // leaves it to re-park (data resumes it).
-                        let sig_flag = host.with(|p| p.take_sig_interrupt());
-                        let interrupted = (sig_flag && !host.with(|p| p.signal_restart()))
+                        let interrupted = (parks.sig_interrupt
+                            && !host.with(|p| p.signal_restart()))
                             || host.with(|p| p.park_interrupted());
                         if interrupted {
                             self.regs[base + *dst as usize] = Reg::from_i64(temen_ir::errno::EINTR);
@@ -16235,7 +16291,7 @@ impl Vm {
                     // past the op — the driver writes both return-twice replies; `waitpid` REWINDS it, so
                     // it re-executes on wake after the driver parks the task. The cooperative driver owns
                     // both ([`Outcome::ForkSelf`]/[`Outcome::ReapWait`]); other drivers `ThreadFault`.
-                    if let Some(ev) = host.with(|p| p.take_park_request()) {
+                    if let Some(ev) = parks.request {
                         self.module = module;
                         self.cur = cur;
                         self.base = base;
@@ -16271,14 +16327,8 @@ impl Vm {
                     // the all-parked sweep) alongside the park flags, unconditionally: consuming it even on
                     // the non-parking path keeps a mixed feed (bytes AND a signal in one `feed_terminal`)
                     // from leaving it set to spuriously interrupt a *later* read. It only *acts* below.
-                    let (pipe_read_park, pipe_write_park, sig_flag) = host.with(|p| {
-                        (
-                            p.take_pipe_read_parked(),
-                            p.take_pipe_write_parked(),
-                            p.take_sig_interrupt(),
-                        )
-                    });
-                    let _ = host.with(|p| (p.take_pipe_wake(), p.take_pipe_wake_writers()));
+                    let (pipe_read_park, pipe_write_park, sig_flag) =
+                        (parks.pipe_read, parks.pipe_write, parks.sig_interrupt);
                     // A signal interrupted this blocking pipe read/write: either the sweep set the flag
                     // above, or a deliverable signal is already pending at the park insert (the slice-D
                     // pre-park race). When so — and the delivery does not carry `SA_RESTART` — complete
