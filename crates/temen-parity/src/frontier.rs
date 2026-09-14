@@ -22,14 +22,30 @@
 //! renderer, the JSON view and the playground page work for either without a second set of glyphs,
 //! ids and colours to keep in step.
 //!
-//! ## Why these two axes first
+//! ## Which axes are filled in, and why those
 //!
-//! **Nesting** and **durability** are the two that are *already* decided by an explicit,
+//! **Nesting** and **durability** came first: both are *already* decided by an explicit,
 //! wildcard-free predicate in the tree — `Host::can_regrant` and the `NonDurableKind` match in
 //! `capture_durable_handles`. So they can be derived and conformance-tested rather than asserted,
-//! which is the difference between a matrix and a wish-list. The other five axes are populated as
-//! their predicates become locatable; until then their cells read [`Status::Unaudited`], which is
-//! the point — an unaudited cell is visible, countable, and cannot be mistaken for a passing one.
+//! which is the difference between a matrix and a wish-list.
+//!
+//! **Debugger** followed, and is a different shape. No single function classifies capabilities on
+//! it: two gates decide, the bytecode lowering's `(type_id, op)` table and `service_advance`'s
+//! decline set, and neither is keyed by capability — the first is over op pairs, the second over
+//! scheduler seams. So the column is derived by *running* each capability's ops under
+//! `ScheduledDebugRun` and folding the verdicts (`tests/debugger_conformance.rs`). It became
+//! derivable at all only once the debugger driver's declines were named rather than caught by a `_`
+//! (#1414): before that a new seam joined the declined set silently, so a column reading it would
+//! have gone stale with nothing going red.
+//!
+//! Four rows on that column stay [`Status::Unaudited`] — `Jit` (its `invoke` needs a unit only a
+//! running guest can mint), `JitCode`, `Offer` and `LiveImpl` (a live peer). A row is scored only
+//! when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
+//! wish the matrix exists to avoid.
+//!
+//! The remaining four axes are populated as their predicates become locatable; until then their
+//! cells read `Unaudited`, which is the point — an unaudited cell is visible, countable, and cannot
+//! be mistaken for a passing one.
 //!
 //! ## What the first rendering already showed
 //!
@@ -200,11 +216,15 @@ impl Axis {
         }
     }
 
-    /// Whether this column's cells are checked against a live predicate by
-    /// `tests/frontier_conformance.rs`. An unconformed column states the manifest's belief and
+    /// Whether this column's cells are checked against a live predicate — `nesting` and
+    /// `durability` by `tests/frontier_conformance.rs`, `debugger` by
+    /// `tests/debugger_conformance.rs`. An unconformed column states the manifest's belief and
     /// nothing more — worth saying out loud in the rendered matrix.
+    ///
+    /// A conformed column may still hold `Unaudited` cells (`debugger` holds four): the claim is
+    /// that the column is *checked*, not that every row in it could be reached.
     pub fn is_conformed(self) -> bool {
-        matches!(self, Axis::Nesting | Axis::Durability)
+        matches!(self, Axis::Nesting | Axis::Durability | Axis::Debugger)
     }
 }
 
@@ -226,6 +246,13 @@ const fn declines(note: &'static str) -> Cell {
     }
 }
 
+const fn conditional(note: &'static str) -> Cell {
+    Cell {
+        status: Status::Conditional,
+        note,
+    }
+}
+
 /// **The classifier.** Exhaustive over [`Capability`], no wildcard arm — a new capability fails to
 /// compile until it is classified on all seven axes.
 ///
@@ -235,7 +262,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
     match c {
         // Coordinate-free value caps: copyable into a child (`resolve_copyable`) and value-typed, so
         // they ride a freeze. The only rows that are unconditionally `Full` on both audited axes.
-        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, U, U, U],
+        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, U, U, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
         // FIFO into the child (the cross-domain `cmd1 | cmd2` grant), while a freeze cannot carry the
@@ -247,7 +274,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
 
         // Re-granting aliases the SAME backing into the child (the explicit data plane); a byte
@@ -260,21 +287,40 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            conditional(
+                "map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by \
+                 name in the bytecode lowering",
+            ),
         ],
 
         // Window-coordinate authority: a child is minted its OWN `AddressSpace`/`Instantiator` over
         // its own window, never handed the parent's — the parent's names coordinates meaningless in
         // the child (PROCESS.md §4: never implicit carve addresses). Both are value-typed, so they
         // survive a freeze.
-        Capability::AddressSpace | Capability::Instantiator => [
+        Capability::AddressSpace => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
             U,
             U,
             U,
             U,
-        U,
+            F,
+        ],
+        // Identical to `AddressSpace` on both predicate-audited axes, and deliberately its own arm
+        // because the **debugger** axis splits them: the memory half of the §14 pair compiles whole
+        // for the debug tier, the spawn half does not.
+        Capability::Instantiator => [
+            declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
+            F,
+            U,
+            U,
+            U,
+            U,
+            conditional(
+                "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
+                 coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches \
+                 the debug scheduler and is declined",
+            ),
         ],
 
         // The one row that declines on BOTH audited axes. Its index into `Host::budgets` is
@@ -287,7 +333,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
 
         // An immutable instantiable artifact: shared into the child (FORK.md §8.6), but its host-side
@@ -299,7 +345,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
         Capability::ModuleLoader => [
             declines("not in `can_regrant`: a child that may mint modules must be granted one explicitly"),
@@ -308,7 +354,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
 
         // #1296 — a §22 `Jit` grant crosses into a §14 child with a FRESH, empty unit table (sharing
@@ -334,7 +380,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
         // Only a *forkable* host proc crosses (one carrying a provider fork factory); a factory-less
         // opaque closure cannot be re-minted over the shared provider state.
@@ -348,7 +394,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
+            F,
         ],
 
         // Guest-side shapes: both re-grant into a child (an offer wires the interface; a live impl

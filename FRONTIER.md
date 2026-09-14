@@ -4,7 +4,7 @@
 
 INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `OPS_PARITY.md` machine-checks one of them at op granularity; this matrix is the machine for the rest (#1413). Rows are powerbox capability kinds; columns are the seven axes.
 
-**32 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. Two axes are checked against live predicates by `tests/frontier_conformance.rs`; the rest state the manifest's belief and nothing more.
+**44 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. 3 of the seven columns (nesting, durability, debugger) are checked against live predicates by the conformance tests in `crates/temen-parity/tests/`; the rest state the manifest's belief and nothing more.
 
 ## Legend
 
@@ -22,26 +22,26 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - **target** — same on native / wasm32 / Windows?
 - **concurrency** — carried by both the coop and per-Worker drivers?
 - **code origin** — usable from a §22 guest-JIT unit as from the base module?
-- **debugger** — observable under the debug tier?
+- **debugger** — observable under the debug tier? *(conformance-tested)*
 
 ## Matrix
 
 | capability | nesting | durability | backend | target | concurrency | code origin | debugger |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| `Stream` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Exit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Clock` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `PipeEnd` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Budget` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Module` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
+| `Stream` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `Exit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `Clock` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `PipeEnd` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | 🔶 |
+| `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | 🔶 |
+| `Budget` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `Module` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `JitCode` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Blocking` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `HostProc` | 🔶 | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
+| `Blocking` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `HostProc` | 🔶 | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `Offer` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `LiveImpl` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 
@@ -52,12 +52,14 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`SharedRegion`**
 - *durability* ⛔ — a snapshot cannot reproduce a live alias into shared backing (#14 exception)
+- *debugger* 🔶 — map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by name in the bytecode lowering
 
 **`AddressSpace`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
 
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
+- *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
 - *nesting* ⛔ — index-carrying: the child is granted a sub-budget by split/transfer, not the handle
