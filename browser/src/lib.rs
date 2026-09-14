@@ -34,6 +34,11 @@ mod nimc;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 
+// A powerbox whose capabilities are **defined in JS** (`temen_jspb_*`): the page names them, the
+// module's import manifest binds them, one wasm import services every call. Built on both targets —
+// natively the JS side is a test hook, so the binding path is testable off-browser (`tests/jspb.rs`).
+pub mod jspb;
+
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
 /// In-wasm roundtrip probe: parse → **encode** → **decode** → run, entirely inside the sandbox, so
@@ -9089,9 +9094,8 @@ pub fn link_program_multi(
         exports: &prog_exports,
         data_exports: &prog_data,
     });
-    let linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
-    let mut linked = linked;
-    let mut entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
+    let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
+    let entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
     // **Drop what nothing reaches** (#1407). The link merges whole modules, so a program that calls
     // `printf` also carries the prebuilt libc's `<string.h>` and the whole series-based libm — dead
     // weight every launch pays to verify and bytecode-compile.

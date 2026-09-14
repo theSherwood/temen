@@ -68,7 +68,7 @@ async function init(cfg) {
     ({ exports } = await WebAssembly.instantiate(module, {
       env: { memory },
       // No GPU surface and no card-output streaming in a bash Worker → both host seams stubbed.
-      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {} },
+      temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n },
     }));
     exports.__stack_pointer.value = stackTop;
     if (exports.__tls_size.value > 0) exports.__wasm_init_tls(tlsBase);

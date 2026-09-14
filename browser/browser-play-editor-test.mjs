@@ -81,6 +81,45 @@ try {
     ? ok('Temen text ran via the editor → 14')
     : fail(`hello run: ${JSON.stringify(hello)}`);
 
+  // The "JS powerbox" card: the page defines the guest's capabilities in JavaScript (`web/powerbox.js`
+  // over the `temen_jspb_*` seam). Two editors — the Temen guest and the powerbox implementing it.
+  // Running it proves the whole loop through the DOM: a capability reads the guest's window (the
+  // greeting reaches the output pane), one writes it back (the second line comes back uppercased), and
+  // a pure one returns the host clock as the guest's result.
+  const jspbCard = 'JS powerbox (capabilities defined in JavaScript)';
+  const panes = await page.evaluate((sel) => {
+    const cms = [...document.querySelectorAll(`${sel} .CodeMirror`)].map((e) => e.CodeMirror);
+    return { n: cms.length, modes: cms.map((cm) => cm.getOption('mode')) };
+  }, card(jspbCard));
+  panes.n === 2 && panes.modes[0] === 'temen' && panes.modes[1] === 'text/javascript'
+    ? ok('JS-powerbox card: guest + JavaScript panes')
+    : fail(`JS-powerbox panes: ${JSON.stringify(panes)}`);
+
+  await runCard(page, jspbCard);
+  const jspb = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+    stdout: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(jspbCard));
+  jspb.state === 'done' && jspb.stdout.includes('hello from the guest') &&
+    jspb.stdout.includes('THE HOST IS JAVASCRIPT') && Number(jspb.result) > 1_600_000_000_000
+    ? ok('JS-powerbox card ran: window read + host write-back + host clock, all from JS')
+    : fail(`JS-powerbox run: ${JSON.stringify(jspb)}`);
+
+  // An import the JavaScript does not define refuses the run — fail-closed, before a guest op runs.
+  await page.evaluate((sel) => {
+    const cm = [...document.querySelectorAll(`${sel} .CodeMirror`)][1].CodeMirror;
+    cm.setValue(cm.getValue().replace("'js.now'", "'js.later'"));
+  }, card(jspbCard));
+  await runCard(page, jspbCard);
+  const refused = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    text: document.querySelector(`${sel} .state`).textContent,
+  }), card(jspbCard));
+  refused.state === 'error' && refused.text.includes('js.now')
+    ? ok('JS-powerbox card: an unbound import refuses the run, naming itself')
+    : fail(`JS-powerbox unbound import: ${JSON.stringify(refused)}`);
+
   // The Lua card mounted a Lua-mode editor with the Lua source…
   const lua = await page.evaluate((sel) => {
     const cm = document.querySelector(`${sel} .CodeMirror`)?.CodeMirror;

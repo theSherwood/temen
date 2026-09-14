@@ -509,6 +509,41 @@ A Node harness that instantiates the cdylib directly must then supply the shared
 (`engineImports(memory)`) and read linear memory from *it*, not from `exports.memory` — see
 `browser-pg-libc-test.mjs`, which handles either build.
 
+## A powerbox defined in JavaScript (`temen_jspb_*`, #1419)
+
+Every other run entry in the cdylib hands the guest a powerbox whose capabilities are implemented
+**Rust-side**: `powerbox_exec`'s fixed §3e prefix (stdout/stdin/exit/…), `grant_onramp_caps`'
+`display`/`keyboard`/`fs`. The `webgpu` capability already showed what a *JS-implemented* capability
+looks like — a `HostProc` closure that marshals each op out through a wasm import — but it is one
+hard-coded capability with a fixed op vocabulary, chosen by Rust.
+
+`browser/src/jspb.rs` generalizes exactly that shape into the general case, so an embedder can define
+**its own** powerbox without touching Rust:
+
+| Piece | What it is |
+|---|---|
+| `temen_jspb_reset()` / `temen_jspb_bind(name)` | the page declares capability **names**; each bind returns the *slot* JS dispatches on |
+| `temen_jspb_run(module)` | grant one `HostProc` per name, bind the module's **import manifest** by name (IMPORTS.md §2.1), run its entry on the bytecode engine |
+| `temen_host.js_cap_call(slot, op, args, n, mem)` | the one wasm import the page supplies: service one capability call |
+| `temen_jspb_read` / `temen_jspb_write` | the calling guest's window, **bounds-checked**, live for that call only |
+| `temen_jspb_error_ptr/_len` | why a run was refused (an unbound import names itself) or trapped |
+| `web/powerbox.js` | the page-side sugar: `definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)` |
+
+The guest side is ordinary §7: it names each capability with `call.sym "<name>"`, and the manifest
+binds name → handle at instantiation (the module bytes are never rewritten). Authority is unchanged
+— a JS capability is an iface-13 `HostProc` like any other, the guest only ever holds a masked,
+type-checked handle, the window pointer never crosses to JS, and an import the page did **not** bind
+refuses the run before a single guest op executes.
+
+Single-threaded and main-thread by construction: a JS capability can only be serviced where its
+function lives, so this path runs on the page (no Workers, no shared powerbox). A Worker vCPU that
+somehow reached the seam gets `-ENOSYS` from the stub import.
+
+Gates: `browser/tests/jspb.rs` (native — registry, name binding, window read/write, fail-closed
+refusal, `-ENOSYS` with no servicer), `browser/browser-jspb-test.mjs` (headless node — the real wasm
+import, the ABI marshalling, and the shipped `web/powerbox.js`), and the playground's **"JS
+powerbox"** card, whose guest program the native test mirrors.
+
 ## Link-time dead-code elimination, and linking against several units (#1407 / #1408)
 
 `link` merges whole modules: a program that calls `printf` also carried the prebuilt libc's

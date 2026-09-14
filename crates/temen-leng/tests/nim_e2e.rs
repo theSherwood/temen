@@ -849,6 +849,95 @@ fn real_formatted_output_runs_end_to_end() {
     );
 }
 
+// -------------------------------------------------------------------------------------------------
+// Run-correctness of covered stdlib modules (#1382). Verify-passing is necessary but not sufficient:
+// a wrong-sign width conversion or a mis-threaded frame would verify yet compute the wrong bytes.
+// These compile a program exercising real ops of a covered module, run it on **both engines** (§9
+// interp/JIT parity, enforced inside `run_io_program`), and diff the output against the oracle
+// captured from the native nimony toolchain — a true differential test of the leng codegen.
+//
+// Scope: the pure-compute containers/integer modules run today. The formatting/parsing modules
+// (strutils/json/unicode/…) additionally need libc `c_snprintf`/`c_strtod`, math needs the libm
+// transcendentals, and times/monotimes need clock syscalls — none yet provided by the runtime shim
+// (tracked separately). Those modules `link`+`verify` (their own tests); running them waits on the
+// runtime-provider work.
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn real_tables_ops_run_correctly() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/tables\n",
+        "var t = initTable[string, int]()\n",
+        "t[\"a\"] = 2\n",
+        "t[\"b\"] = 40\n",
+        "write(stdout, $t.getOrDefault(\"a\"))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(t.getOrDefault(\"a\") + t.getOrDefault(\"b\")))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $t.len)\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(\"b\" in t))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(\"z\" in t))\n",
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(&path, src)),
+        b"2|42|2|true|false",
+        "tables ops match the native-nimony oracle on both engines"
+    );
+}
+
+#[test]
+fn real_sets_ops_run_correctly() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/sets\n",
+        "var s = initHashSet[int]()\n",
+        "s.incl(3)\n",
+        "s.incl(7)\n",
+        "s.incl(3)\n",
+        "write(stdout, $s.len)\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(7 in s))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(4 in s))\n",
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(&path, src)),
+        b"2|true|false",
+        "sets ops match the native-nimony oracle on both engines"
+    );
+}
+
+#[test]
+fn real_bitops_ops_run_correctly() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/bitops\n",
+        "write(stdout, $countSetBits(0xF0F0'u32))\n",
+        "write(stdout, \"|\")\n",
+        "write(stdout, $(0b1010 shl 2))\n",
+    );
+    assert_eq!(
+        run_io_program(&compile_to_leng(&path, src)),
+        b"8|40",
+        "bitops ops match the native-nimony oracle on both engines"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // #760 W1 totality sweep (diagnostic, gated on NIM_SWEEP=1). Compiles a corpus of real Nim through
 // the toolchain, links each program whole, and tallies the `Unsupported`/`Malformed` reasons —

@@ -561,6 +561,25 @@ sequence. Plus a C-ABI mirror (`temen_session_*`).
   between children — shell-side *interception* (`cmd > file`, `cmd | cmd2`) needs the guest-served
   `Endpoint` (PROCESS.md §4, still [PROPOSED]) — and need (3)'s signal surface.
 
+- **F16 — a powerbox defined by the JS embedder** (#1419). *Landed (browser).* Phase 5 gave C embedders the
+  whole surface (`temen-capi`: name-keyed imports + a function-pointer host-capability ABI + F5's
+  bounds-checked guest-memory accessors). The **browser** embedder had no equivalent: every powerbox a
+  page could hand a guest was assembled Rust-side (`powerbox_exec`'s fixed §3e prefix,
+  `grant_onramp_caps`' `display`/`keyboard`/`fs`), with `webgpu` the one JS-implemented capability —
+  hard-coded name, hard-coded ops. `browser/src/jspb.rs` generalizes that shape: a page registers
+  arbitrary **names** (`temen_jspb_bind`), each becomes its own `HostProc` handle, the module's import
+  manifest binds name → handle at instantiation (§2.1 — no rewriting), and every call is serviced
+  through one wasm import (`temen_host.js_cap_call`) with the calling guest's window reachable only
+  through the bounds-checked `temen_jspb_read`/`temen_jspb_write` — the JS twin of F5. `web/powerbox.js`
+  is the page-side sugar (`definePowerbox(eng, { 'js.log': (args, mem) => … }).run(module)`), and the
+  playground's **"JS powerbox"** card is the demo: two editors, the guest and the JavaScript that
+  implements its capabilities. Authority-neutral (iface-13 `HostProc`, masked handles, fail-closed on
+  an unbound import) and main-thread-only by construction — a JS capability is serviced where its
+  function lives. Gates: `browser/tests/jspb.rs`, `browser/browser-jspb-test.mjs`, and the card's own
+  assertions in `browser-play-editor-test.mjs`. Open: the seam is browser-only and run-once (a
+  reactor `Session` equivalent — bind once, call exports repeatedly from JS — is the obvious next
+  slice), and a JS capability returns exactly one `i64`.
+
 ---
 
 ## Open questions

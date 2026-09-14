@@ -49,7 +49,7 @@ self.onmessage = async (e) => {
   // no-op — a guest that resolves the `webgpu` cap here gets -1 and skips. Without it the instantiate
   // fails with "Import temen_host: module is not an object or function".
   // `stdout_chunk` (the live-stdout tee) is likewise stubbed — a Worker vCPU streams no card output.
-  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {} } }));
+  ({ exports: ex } = await WebAssembly.instantiate(module, { env: { memory }, temen_host: { ...foreignImports(memory), webgpu_op: () => -1n, stdout_chunk: () => {}, js_cap_call: () => -38n } }));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
   // Views over the shared memory, refreshed when stale: the shared WebAssembly.Memory can GROW
