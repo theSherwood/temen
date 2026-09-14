@@ -50,7 +50,16 @@ static long ring_read(long b, char *dst, long cap) {
       __vm_notify((void *)(b + 4), 1);
       return k;
     }
-    if (__vm_atomic_load32((void *)(b + 8))) return 0;
+    if (__vm_atomic_load32((void *)(b + 8))) {
+      /* The writer publishes `head` BEFORE `done` (both SeqCst), so a `done` we observe here can be
+         NEWER than the `h`/`t` loaded at the top of this turn: bytes may have landed in that window,
+         and `used` is stale. Re-read before calling EOF — declaring it on the stale `used` drops the
+         writer's last chunk, which is the stage's ENTIRE output when it answers in one write. That
+         is #1022/#1430: the last ring stage emitting nothing on the OS-threaded arms. */
+      if ((long)__vm_atomic_load32((void *)b) - (long)__vm_atomic_load32((void *)(b + 4)) > 0)
+        continue;  /* drain it on the next turn, then EOF */
+      return 0;
+    }
     int st = __vm_wait32((void *)b, (int)h, ring_to());
     if (st == 2) { tos++; if (tos > 6) { ring_bail = 1; return -1; } }
   }
