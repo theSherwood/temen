@@ -1045,6 +1045,22 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         return 0; // `*trap_out` already set by the builder
     }
 
+    // #1234 — bind the child's import manifest against the powerbox just built, exactly as the op-13
+    // and op-15 thunks do below. A same-module child's manifest is the *parent's* own running module,
+    // which the binder fetches with the record's `-1 = self` module selector — so a guest that nests a
+    // confined copy of itself reaches its granted `stdout`/`jit` through `call.import` instead of
+    // `CapFault`ing, on this backend exactly as on the two interpreter tiers (§3.3 withhold: a
+    // `required` slot with nothing to bind fails the spawn closed, probeable `-EINVAL`).
+    let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
+    if bind_addr != 0 {
+        let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
+        if bind(rt.cap_ctx, gc.ctx, -1) != 0 {
+            release(gc.ctx);
+            release(gc.retained_ctx);
+            return EINVAL as i32;
+        }
+    }
+
     let child_fuel_addr = rt.arm_child_fuel(fuel); // §5 fuel: clamp to parent-remaining (0 ⇒ un-metered)
     let compiled = crate::compile_child(
         child_funcs,

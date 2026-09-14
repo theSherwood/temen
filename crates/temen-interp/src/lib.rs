@@ -11788,6 +11788,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     Some(cm) => {
                                         ch.bind_child_manifest(&cm.imports, &cm.types).is_ok()
                                     }
+                                    // #1234: a **same-module** child runs our program, so its import
+                                    // manifest *is* ours — bind it against the child's own attenuated
+                                    // powerbox, through the same binder and the same `CHILD_BINDABLE`
+                                    // policy a separate-module child goes through. Without it a guest
+                                    // that nests a confined copy of itself (the Forth `sandbox` word)
+                                    // `CapFault`s on its first `call.import`, holding a granted
+                                    // `stdout`/`jit` it has no way to reach. Only when the spawn
+                                    // actually handed it caps by name: a grant-less child was given
+                                    // nothing to bind, so its slots stay empty and fail closed on use
+                                    // exactly as before.
+                                    None if !named.is_empty() => {
+                                        let (im, ty) = {
+                                            let hg = host.lock_unpoisoned();
+                                            (
+                                                hg.module_imports(SELF_MODULE),
+                                                hg.module_types(SELF_MODULE),
+                                            )
+                                        };
+                                        match (im, ty) {
+                                            (Some(im), Some(ty)) => {
+                                                ch.bind_child_manifest(&im, &ty).is_ok()
+                                            }
+                                            _ => true,
+                                        }
+                                    }
                                     None => true,
                                 };
                                 if !manifest_ok {
@@ -18793,6 +18818,13 @@ impl Default for Host {
     }
 }
 
+
+/// The spawn-record `module` selector meaning **this module** — a §14 child that runs the parent's
+/// own program rather than a granted separate `Module` (CONSOLIDATION.md §3d, [`temen_ir::SpawnRec`]).
+/// `Host::module_imports`/`module_types` accept it so a same-module child's manifest is fetched
+/// through the same call as a separate-module child's (#1234).
+pub const SELF_MODULE: i32 = -1;
+
 impl Host {
     pub fn new() -> Host {
         Host {
@@ -19126,12 +19158,21 @@ impl Host {
     /// JIT's op-13 child builder reads it (via `temen_run::child_bind_imports`) to bind the child's
     /// slots — the same manifest the interpreter's inline spawn reads from its `ModuleGrant`.
     pub fn module_imports(&self, handle: i32) -> Option<Arc<[temen_ir::Import]>> {
+        if handle == SELF_MODULE {
+            return self
+                .self_module
+                .as_ref()
+                .map(|m| Arc::from(m.imports.clone()));
+        }
         self.resolve_module(handle).ok().map(|g| g.imports.clone())
     }
 
     /// The type section of a granted §14 `Module` (§3.5): read beside [`Host::module_imports`]
     /// by the child-manifest binder to resolve each import's requirement set.
     pub fn module_types(&self, handle: i32) -> Option<Arc<[temen_ir::TypeEntry]>> {
+        if handle == SELF_MODULE {
+            return self.self_module.as_ref().map(|m| Arc::from(m.types.clone()));
+        }
         self.resolve_module(handle).ok().map(|g| g.types.clone())
     }
 
@@ -20698,6 +20739,26 @@ impl Host {
         match &self.err_sink {
             Some(s) => s.lock_unpoisoned().clone(),
             None => self.stderr.clone(),
+        }
+    }
+
+    /// S2 — **drain** the effective stdout, leaving it empty: the mutating twin of
+    /// [`Host::stdout_bytes`]. A run-result reader must use one of the two rather than touching
+    /// `stdout` directly: the first stdio-inheriting child spawn *moves* this host's buffer into a
+    /// shared sink ([`Host::shared_stdout`]), so a guest that spawned one would otherwise appear to
+    /// have written nothing at all — its own writes included (#1234).
+    pub fn take_stdout(&mut self) -> Vec<u8> {
+        match &self.out_sink {
+            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
+            None => std::mem::take(&mut self.stdout),
+        }
+    }
+
+    /// S2 — the stderr analogue of [`Host::take_stdout`].
+    pub fn take_stderr(&mut self) -> Vec<u8> {
+        match &self.err_sink {
+            Some(s) => std::mem::take(&mut *s.lock_unpoisoned()),
+            None => std::mem::take(&mut self.stderr),
         }
     }
     pub fn grant_exit(&mut self) -> i32 {
