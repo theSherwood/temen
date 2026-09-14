@@ -154,18 +154,8 @@ fn parse_child() -> temen_ir::Module {
 
 /// The production [`GrantChildHooks`] table (temen-run's child build/bind/release/mint/thunk/serve) as the
 /// granted-spawn suites install it on the JIT — the same table `temen/tests/c_shell_exec.rs` uses.
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: temen_run::grant_child_build,
-        build_named: temen_run::grant_named_child_build,
-        build_detached: temen_run::grant_detached_child_build,
-        budget_mem_take: temen_run::budget_mem_take,
-        bind_imports: temen_run::child_bind_imports,
-        release: temen_run::grant_child_release,
-        mint: temen_run::child_offer_mint,
-        thunk: temen_run::cap_thunk_locked,
-        register_serve: temen_run::child_register_serve,
-    }
+fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
+    temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
 }
 
 /// Build a host granting `inst`/`child`/`fs` by name over a fresh counter; returns `(host, counter)`.
@@ -220,7 +210,7 @@ fn run_jit(
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
         Some(temen_run::module_resolver),
-        Some(grant_hooks()),
+        Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
     let out = match jo {
