@@ -143,9 +143,8 @@ node corpus.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm   # was
 cargo run --manifest-path wt/Cargo.toml --release -- \
   target/wasm64-unknown-unknown/release/temen_browser.wasm                 # wasm64: 187/187
 
-# Live host imports — guest console/clock bound to real wasm imports (default build is import-free)
-cargo build --release --lib --target wasm32-unknown-unknown --features live
-node live.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm corpus/live.temenc
+# A powerbox defined in JS — guest capabilities bound to page functions through `temen_host.js_cap_call`
+node browser-jspb-test.mjs target/wasm32-unknown-unknown/release/temen_browser.wasm
 ```
 
 `browser/` (`temen-browser`) is a detached `[workspace]` crate (kept out of the main workspace because
@@ -216,11 +215,15 @@ no RO data is unaffected.
   run entry, and frees it after — no 1 MiB scratch cap. Output streams come back as cdylib-managed
   allocations valid until the next run. Demonstrated by a **2 MiB echo** roundtrip in the
   differential. `temen_abi_is64()` tells a host whether the pointer/length ABI is `i32` or `i64`.
-- **Live capabilities → a feature-gated variant.** Real host imports are mandatory at instantiation
-  for *every* entry, so binding a capability to the live host (`temen_run_live`, bridging guest
-  `call.cap`s to `temen_host.host_write`/`host_now_ns` via `grant_host_fn`) lives behind
-  `--features live` — the default build stays import-free for the compute/powerbox path, and the
-  live build adds exactly the two `temen_host` imports.
+- **Live capabilities → one general seam, not a feature-gated variant.** Real host imports are
+  mandatory at instantiation for *every* entry, so the first pass put the host-backed powerbox
+  (`temen_run_live`: two fixed capabilities bridged to `temen_host.host_write`/`host_now_ns`) behind
+  `--features live`, keeping the default build import-free. That is no longer the shape: the wasm32
+  build declares host imports unconditionally (`webgpu_op`, `stdout_chunk`, the `foreign_*` family),
+  every embedder already supplies them as stubs, and **`temen_jspb_*` binds *arbitrary* named
+  capabilities to page functions** through one import — which subsumed the two hard-coded ones. The
+  `live` feature and its entry are deleted (invariant 15: one path per behaviour); see the
+  JS-powerbox section below.
 
 ---
 
@@ -300,7 +303,7 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   import-free; validated on wasm32 (5-case differential above) and wasm64 (`run_powerbox() == 17`).
 - [x] **Memory ABI (`temen_alloc`/`temen_dealloc`).** Replaced the fixed 1 MiB scratch buffers: the host
   reserves linear memory of any size for module/stdin and reads captured streams from cdylib-managed
-  allocations; `temen_run`/`temen_run0`/`temen_run_pb`/`temen_run_live` all take `(ptr, len)`. Validated by
+  allocations; `temen_run`/`temen_run0`/`temen_run_pb` all take `(ptr, len)`. Validated by
   the 2 MiB echo (wasm32) and a direct `temen_alloc` call on wasm64. `temen_abi_is64()` exposes the
   pointer width. Follow-up: an `alloc`-returning result struct so multi-value returns avoid statics.
 - [x] **Memory-snapshot capture (`temen_run_capture`).** The "host hands in a buffer, the guest
@@ -359,7 +362,9 @@ built wasm32 binary: **zero** symbols for `Scheduler` / `worker_loop` / `DetSche
   a NORMAL run (→ 2001), an UNWINDING **freeze** (a byte-identical 128 KiB snapshot wasm vs native),
   and a REWINDING **thaw** fed that snapshot back (→ reproduces 2001, ends NORMAL). wasm64
   `run_durable() == 2001`. **✅ Every bytecode-engine feature is now proven in wasm.**
-- [x] **Live host imports (`--features live`).** `temen_run_live` bridges guest capabilities to **real
+- [x] **Live host imports (`--features live`).** *(Superseded and deleted — the general JS-powerbox
+  seam below does this for arbitrary named capabilities; kept as the record of the first pass.)*
+  `temen_run_live` bridged guest capabilities to **real
   wasm imports** via `Host::grant_host_fn` (iface 13): a `(console, clock)` powerbox where
   `console.write` forwards the guest's bytes to the imported `temen_host.host_write` (live host console,
   *during* the run) and `clock.now` reads `temen_host.host_now_ns` (real host time). Feature-gated so
@@ -616,8 +621,6 @@ in session discussion; collected here so the next slice has a home to be picked 
   (`temen_run_pb` streams, `temen_run_capture` snapshots, `temen_parse` output, `temen_par_stdout`) all go
   through single-reader `static mut` slots with ptr/len accessor pairs. An `temen_alloc`-returned
   result struct would drop the statics and the call-order contracts ("call `len` first").
-  Same slice: the `--features live` path still uses fixed scratch buffers — the one entry the
-  `temen_alloc`/`temen_dealloc` ABI conversion skipped.
 - [x] **A real-language playground tab.** Landed, well past the original ask — the "pre-compiled
   modules first" half: the playground's demo sidebar now runs C reactor guests (bounce / life /
   mandelzoom / the **Uxn** virtual machine over its Varvara devices, plus an editable **Uxntal**
@@ -1381,7 +1384,8 @@ partitioning is per-function anyway). Revisit fibers when JSPI / core stack-swit
   didn't disturb engine semantics.
 - **Runs in a wasm host:** `node browser/run.mjs` (smoke), `node browser/corpus.mjs` (the 187/187
   differential vs native on wasm32), `browser/wt` (wasm64 via a Wasmtime embedding), and
-  `node browser/live.mjs` (host-import demo, `--features live`). The 17 embedded `--invoke` probes under
+  `node browser/browser-jspb-test.mjs` (the JS-defined powerbox over real host imports). The 17
+  embedded `--invoke` probes under
   **Reproduce** spot-check each feature on wasm64 directly.
 - **Runs in a real browser:** `node browser/browser-test.mjs` (Chromium via Playwright) — cross-origin
   isolated, the powerbox prints `"hello, powerbox!"`, one guest's vCPUs run across real Web Workers
