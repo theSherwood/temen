@@ -1284,6 +1284,15 @@ and an `int[3]`, and the scripted conversation expands `p` → `x=11, y=22` and 
 [1]=200, [2]=300`. The `evaluate` member/index half landed in slice 10 and pointer-deref
 expansion in slice 11; richer render names (the C tag) in slice 12 (all below).
 
+**Built — a frame's own locals come before the module's globals in the Locals scope.** The pane
+deliberately shows both (a C debugger's Variables view lists module-scoped globals alongside the
+frame's locals), and their order used to follow the debug table's — fine while a program's own debug
+info was the only debug info in the module. **Separate compilation** (#1392) broke that: a program
+linked against a prebuilt library carries the *library's* debug tables first, so a separately compiled
+libc pushed `__pg_std`/`__pg_brk`/… above the user's own `i`/`acc` in every lesson's pane. The
+partition in `frame_locals` is stable, so declaration order survives within each group. Test:
+`locals_order.rs` (globals declared ahead of the locals, as a link produces).
+
 **Built — `evaluate` member / index / arrow access (W4 slice 10, the consumer half completed).**
 `evaluate` now resolves `a.b`, `arr[i]`, and `p->x` (and combinations like `p.x + arr[i]`,
 `pp[0].y`) over the structured types. The scalar `expr` evaluator grew a frontend-agnostic
