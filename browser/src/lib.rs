@@ -11,7 +11,8 @@
 //!     (compute-only), and returns its first `i64` result. **Fail-closed:** a module the engine
 //!     can't compile yields `STATUS_UNSUPPORTED` rather than any tree-walker fallback.
 //!   * [`temen_run_pb`] — the **powerbox**: streams/clock/exit, I/O marshalled through allocations.
-//!     `temen_run_live` (feature `live`) instead binds those to real host imports.
+//!   * [`jspb`] — a powerbox whose capabilities the **JS embedder** defines: named grants bound to
+//!     real wasm imports, so a host function supplies each capability's semantics.
 //!
 //! Status of the last run is read separately via [`temen_status`] (a single `i64` return can't
 //! disambiguate an error from a guest result of the same value).
@@ -24,8 +25,6 @@
 
 use std::alloc::Layout;
 
-#[cfg(feature = "live")]
-use temen_interp::HostProc;
 use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
@@ -12935,127 +12934,6 @@ block 0 (v0: i64) {
             _ => -1,
         },
         _ => -1,
-    }
-}
-
-// ---- live host imports: bind capabilities to real host functions ----------------------------
-//
-// Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead
-// bridges guest capabilities to **real wasm imports**, so a guest's writes reach the live host
-// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_proc`
-// (iface 13) — the designed extension point: a closure supplies the capability's semantics, here by
-// calling out to the imported host function. The guest sees only a masked, type-checked handle.
-
-#[cfg(feature = "live")]
-pub mod live {
-    use super::*;
-
-    // The host functions the embedder must supply (module `temen_host`). `host_write` receives a
-    // pointer into *this module's* linear memory (the bytes the guest wrote, copied out of its
-    // window into a Rust buffer that lives on the wasm heap), so JS reads them as
-    // `new Uint8Array(memory.buffer, ptr, len)`. `host_now_ns` returns real host time.
-    #[link(wasm_import_module = "temen_host")]
-    extern "C" {
-        /// `host_write(stream, ptr, len)` — `stream` 0 = stdout, 1 = stderr.
-        fn host_write(stream: i32, ptr: *const u8, len: usize);
-        /// `host_now_ns() -> i64` — host wall/monotonic clock, nanoseconds.
-        fn host_now_ns() -> i64;
-    }
-
-    const EFAULT: i64 = -14;
-    const EINVAL: i64 = -22;
-
-    /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
-    /// `(console, clock)` capabilities (both iface `HOST_PROC` = 13) bridged to the imports above.
-    /// The guest calls `call.cap 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
-    /// live, and `call.cap 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
-    /// `i64` result; sets [`LAST_STATUS`].
-    #[no_mangle]
-    pub extern "C" fn temen_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let set = |s: i32| unsafe { LAST_STATUS = s };
-        let m = match temen_encode::decode_module(bytes) {
-            Ok(m) => m,
-            Err(_) => {
-                set(STATUS_DECODE_ERR);
-                return 0;
-            }
-        };
-        let mut host = Host::new();
-        // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
-        let console: HostProc = Box::new(|op, args, mem, _| {
-            if op != 1 {
-                return Ok(vec![EINVAL]);
-            }
-            let (Some(&stream), Some(&ptr), Some(&n)) = (args.first(), args.get(1), args.get(2))
-            else {
-                return Ok(vec![EINVAL]);
-            };
-            let Some(m) = mem else {
-                return Ok(vec![EFAULT]);
-            };
-            match m.read_bytes(ptr as u64, n as u64) {
-                // The copied bytes live on this module's wasm heap; hand their pointer to the host.
-                Some(buf) => {
-                    unsafe { host_write(stream as i32, buf.as_ptr(), buf.len()) };
-                    Ok(vec![n])
-                }
-                None => Ok(vec![EFAULT]),
-            }
-        });
-        // clock (param 2): op 0 = now() → real host time.
-        let clock: HostProc = Box::new(|op, _args, _mem, _| {
-            if op != 0 {
-                return Ok(vec![EINVAL]);
-            }
-            Ok(vec![unsafe { host_now_ns() }])
-        });
-        let arity = m.funcs.first().map_or(0, |f| f.params.len());
-        let mut slots: Vec<Value> = Vec::new();
-        if arity >= 1 {
-            slots.push(Value::I32(host.grant_host_proc(console)));
-        }
-        if arity >= 2 {
-            slots.push(Value::I32(host.grant_host_proc(clock)));
-        }
-        // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
-        // `self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
-        for (name, slot) in ["console", "clock"].iter().zip(&slots) {
-            if let Value::I32(handle) = slot {
-                host.register_cap_name(name, *handle);
-            }
-        }
-        let mut fuel = u64::MAX;
-        match bytecode::compile_and_run_with_host(&m, 0, &slots, &mut fuel, &mut host) {
-            None => {
-                set(STATUS_UNSUPPORTED);
-                0
-            }
-            Some(Err(Trap::Exit(code))) => {
-                set(STATUS_EXIT);
-                unsafe { EXIT_CODE = code };
-                0
-            }
-            Some(Err(_)) => {
-                set(STATUS_TRAP);
-                0
-            }
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => {
-                    set(STATUS_OK);
-                    *x
-                }
-                Some(Value::I32(x)) => {
-                    set(STATUS_OK);
-                    *x as i64
-                }
-                _ => {
-                    set(STATUS_BAD_RESULT);
-                    0
-                }
-            },
-        }
     }
 }
 
