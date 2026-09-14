@@ -12192,17 +12192,39 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §14 transparency: the detached window equals the module's
                             // declared memory (a module with no memory can't spawn).
                             let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
-                            // #1289 R1 — a **durable** domain may now spawn a detached child (the
-                            // spawn gate no longer refuses on `durable`): freeze authority is a
-                            // per-grant capability, not a placement rule, so a durable parent and a
-                            // detached child coexist. Safety moves to the *freeze*: a parent that
-                            // freezes while a detached child is live fails closed (`detached_live_refused`
-                            // below) rather than silently dropping the child's separate window — until
-                            // the per-child-artifact capture (the detached-durable freeze slices) lands.
+                            // #1412 — a **durable** domain refuses op 15, matching the resumable
+                            // engine (`bytecode.rs` `event_instantiate_detached`) and the native thunk
+                            // (`instantiator_rt.rs`). This is an **interim** gate, and it reverses.
+                            //
+                            // #1289 R1 lifted this gate here, and only here, on 2026-09-08 — one day
+                            // after #1299 added it to the resumable engine "like the other two
+                            // engines". R1 is right about the end state (freeze authority is a
+                            // per-grant capability, not a placement rule), but the compensating
+                            // safety it moved to — `detached_live_refused` at the freeze — exists
+                            // only on this path, and it fails with `Trap::ThreadFault`. So the tree
+                            // had the oracle admitting what two engines refused (INVARIANTS #9), and
+                            // its one coherent path ended a durable run in a **trap** on a platform
+                            // lifecycle action the guest cannot see coming (INVARIANTS #5: "a
+                            // lifecycle event is never a domain-killing surprise").
+                            //
+                            // Owner decision 2026-09-14: the end state is to **admit the spawn and
+                            // capture the child**, gated on the parent actually holding freeze
+                            // authority over it — R1's endpoint, and what PROCESS.md O14 already
+                            // names ("refuse unless a freeze-authority holder is registered"). That
+                            // needs two things that do not exist yet: freeze authority represented
+                            // in code at all (today it is implicit in nesting; `freeze_authority` is
+                            // doc-only), and the per-child-artifact capture (#1361). Until both land,
+                            // agreeing with the other two engines is the honest resting state: it is
+                            // fail-closed, it restores #9, and it makes `detached_live_refused`
+                            // unreachable so no durable run can be killed by a freeze.
+                            //
+                            // Re-lift this together with that capture, not before.
+                            let durable = host.lock_unpoisoned().is_durable();
                             let admitted = ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && payload_ok
+                                && !durable
                                 && host.lock_unpoisoned().budget_mem_take(budget, child_size);
                             if !admitted {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));

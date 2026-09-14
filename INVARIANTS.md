@@ -291,6 +291,21 @@ must restore a child's `Attestation`, O14's remaining plumbing), **not** a place
 this invariant would forbid; it becomes "refuse unless a freeze-authority holder is registered for this
 child" once that lands.
 
+**Amendment — R1's spawn lift is deferred until the capture exists (2026-09-14, #1412):** R1's *end
+state* stands and is unchanged: freeze authority is a per-grant capability, placement is orthogonal to
+durability, and a durable parent will spawn detached children whose freeze **captures** them. What is
+withdrawn is the slice-1 lift of the op-15 `!durable` gate, which ran ahead of two things it depends on.
+It was applied to the tree-walk oracle alone, leaving the resumable engine and the native thunk refusing
+what the oracle admitted — a live invariant-9 divergence that stood six days unwitnessed. And the
+safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap::ThreadFault`: a
+platform lifecycle action the guest cannot see coming, killing the domain, which invariant 5 forbids in
+terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
+three engines is therefore the resting state until (a) freeze authority is **represented in code** —
+today it is implicit in nesting and `freeze_authority` is doc-only (PROCESS.md O14) — and (b) the
+per-child-artifact capture lands (#1361). Then the gate comes out everywhere at once and the rule is
+R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
+incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
+
 **Accepted exceptions** — a *genuine impossibility* on some axis, each carrying the owner's dated
 approval; adding one always requires owner sign-off:
 
