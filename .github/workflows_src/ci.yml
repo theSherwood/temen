@@ -317,7 +317,7 @@ jobs:
       - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=300 -rss_limit_mb=4096
       # `cargo fuzz` writes new interesting inputs into the corpus dir in place, so this saves what
       # the run just learned. `always()` so a run that ends on a genuine find still banks the corpus
-      # that got there — the crashing input itself lands in `fuzz/artifacts/`, uploaded below.
+      # that got there.
       # A find's reproducer needs no upload step: libFuzzer prints the crashing input to the job log
       # as `Base64: ...` alongside the stack trace, and the corpus saved below carries the inputs that
       # led there. (An `actions/upload-artifact` step would be nicer, but the repo pins every action by
