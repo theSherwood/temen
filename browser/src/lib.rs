@@ -4083,6 +4083,14 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             include_str!("../playground-include/__pg_stdlib_impl.h"),
         ),
         (
+            "include/__pg_string_impl.h",
+            include_str!("../playground-include/__pg_string_impl.h"),
+        ),
+        (
+            "include/__pg_math_impl.h",
+            include_str!("../playground-include/__pg_math_impl.h"),
+        ),
+        (
             "include/string.h",
             include_str!("../playground-include/string.h"),
         ),

@@ -4,164 +4,48 @@
 // Pure-computation <string.h> for the playground (no authority) — all guest C, compiled in on use.
 typedef unsigned long size_t;
 
-static inline size_t strlen(const char *s) {
-  size_t n = 0;
-  while (s[n]) n++;
-  return n;
-}
-static inline int strcmp(const char *a, const char *b) {
-  while (*a && *a == *b) { a++; b++; }
-  return (unsigned char)*a - (unsigned char)*b;
-}
-static inline int strncmp(const char *a, const char *b, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    if (a[i] != b[i]) return (unsigned char)a[i] - (unsigned char)b[i];
-    if (!a[i]) break;
-  }
-  return 0;
-}
-static inline char *strcpy(char *d, const char *s) {
-  char *r = d;
-  while ((*d++ = *s++)) {}
-  return r;
-}
-static inline char *strncpy(char *d, const char *s, size_t n) {
-  size_t i = 0;
-  for (; i < n && s[i]; i++) d[i] = s[i];
-  for (; i < n; i++) d[i] = 0;
-  return d;
-}
-static inline char *strcat(char *d, const char *s) {
-  char *r = d;
-  while (*d) d++;
-  while ((*d++ = *s++)) {}
-  return r;
-}
-static inline char *strchr(const char *s, int c) {
-  for (; *s; s++) if (*s == (char)c) return (char *)s;
-  return (char)c ? 0 : (char *)s;
-}
-static inline char *strrchr(const char *s, int c) {
-  const char *last = 0;
-  for (; *s; s++) if (*s == (char)c) last = s;
-  return (char *)last;
-}
-static inline char *strstr(const char *hay, const char *needle) {
-  if (!*needle) return (char *)hay;
-  for (; *hay; hay++) {
-    const char *h = hay, *n = needle;
-    while (*h && *n && *h == *n) { h++; n++; }
-    if (!*n) return (char *)hay;
-  }
-  return 0;
-}
-static inline void *memcpy(void *d, const void *s, size_t n) {
-  char *dd = d;
-  const char *ss = s;
-  for (size_t i = 0; i < n; i++) dd[i] = ss[i];
-  return d;
-}
-static inline void *memmove(void *d, const void *s, size_t n) {
-  char *dd = d;
-  const char *ss = s;
-  if (dd < ss) for (size_t i = 0; i < n; i++) dd[i] = ss[i];
-  else for (size_t i = n; i > 0; i--) dd[i - 1] = ss[i - 1];
-  return d;
-}
-static inline void *memset(void *d, int c, size_t n) {
-  char *dd = d;
-  for (size_t i = 0; i < n; i++) dd[i] = (char)c;
-  return d;
-}
-static inline int memcmp(const void *a, const void *b, size_t n) {
-  const unsigned char *aa = a, *bb = b;
-  for (size_t i = 0; i < n; i++) if (aa[i] != bb[i]) return aa[i] - bb[i];
-  return 0;
-}
-static inline void *memchr(const void *s, int c, size_t n) {
-  const unsigned char *p = s;
-  for (size_t i = 0; i < n; i++) if (p[i] == (unsigned char)c) return (void *)(p + i);
-  return 0;
-}
+#include <__pg_linkage.h>
 
-static inline char *strncat(char *d, const char *s, size_t n) {
-  char *r = d;
-  while (*d) d++;
-  size_t i = 0;
-  for (; i < n && s[i]; i++) d[i] = s[i];
-  d[i] = 0;
-  return r;
-}
-// Length of the initial span of `s` consisting entirely of bytes in / not in `set`.
-static inline size_t strspn(const char *s, const char *set) {
-  size_t i = 0;
-  for (; s[i]; i++) {
-    const char *p = set;
-    while (*p && *p != s[i]) p++;
-    if (!*p) break;
-  }
-  return i;
-}
-static inline size_t strcspn(const char *s, const char *set) {
-  size_t i = 0;
-  for (; s[i]; i++) {
-    const char *p = set;
-    while (*p && *p != s[i]) p++;
-    if (*p) break;
-  }
-  return i;
-}
-static inline char *strpbrk(const char *s, const char *set) {
-  for (; *s; s++) {
-    const char *p = set;
-    while (*p) if (*p++ == *s) return (char *)s;
-  }
-  return 0;
-}
-// `strtok` with the standard static-cursor state (single-threaded demo — fine here).
-static char *__pg_strtok_save;
-static inline char *strtok(char *s, const char *delim) {
-  if (!s) s = __pg_strtok_save;
-  if (!s) return 0;
-  s += strspn(s, delim); // skip leading delimiters
-  if (!*s) { __pg_strtok_save = 0; return 0; }
-  char *tok = s;
-  s += strcspn(s, delim);
-  if (*s) { *s = 0; __pg_strtok_save = s + 1; } else { __pg_strtok_save = 0; }
-  return tok;
-}
-static inline int __pg_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
-static inline int strcasecmp(const char *a, const char *b) {
-  while (*a && __pg_lower((unsigned char)*a) == __pg_lower((unsigned char)*b)) { a++; b++; }
-  return __pg_lower((unsigned char)*a) - __pg_lower((unsigned char)*b);
-}
-static inline int strncasecmp(const char *a, const char *b, size_t n) {
-  for (size_t i = 0; i < n; i++) {
-    int ca = __pg_lower((unsigned char)a[i]), cb = __pg_lower((unsigned char)b[i]);
-    if (ca != cb) return ca - cb;
-    if (!a[i]) break;
-  }
-  return 0;
-}
+// ---- prototypes (a program unit, #1392) --------------------------------------------------
+// Same split as <stdio.h>: a translation unit compiled decls-only (`-include __pg_decls_only.h`)
+// sees these prototypes and links against the prebuilt libc unit that carries the bodies once,
+// instead of recompiling `strlen`/`memcpy`/`strtok` into every program. The bodies are compiled in
+// by default, where `__PG_FN` makes them `static inline` so an unused one is dead-stripped — hence
+// the guard, which would otherwise make every one of them a root.
+#ifdef __PG_LIBC_DECLS_ONLY
+size_t strlen(const char *s);
+int strcmp(const char *a, const char *b);
+int strncmp(const char *a, const char *b, size_t n);
+char *strcpy(char *d, const char *s);
+char *strncpy(char *d, const char *s, size_t n);
+char *strcat(char *d, const char *s);
+char *strchr(const char *s, int c);
+char *strrchr(const char *s, int c);
+char *strstr(const char *hay, const char *needle);
+void *memcpy(void *d, const void *s, size_t n);
+void *memmove(void *d, const void *s, size_t n);
+void *memset(void *d, int c, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+void *memchr(const void *s, int c, size_t n);
+char *strncat(char *d, const char *s, size_t n);
+size_t strspn(const char *s, const char *set);
+size_t strcspn(const char *s, const char *set);
+char *strpbrk(const char *s, const char *set);
+char *strtok(char *s, const char *delim);
+int __pg_lower(int c);
+int strcasecmp(const char *a, const char *b);
+int strncasecmp(const char *a, const char *b, size_t n);
+char *strerror(int e);
+char *strdup(const char *s);
+char *strndup(const char *s, size_t n);
+#endif /* __PG_LIBC_DECLS_ONLY */
 
-// `strerror` — the sandbox libc has no failing syscalls, so a single generic message suffices (a
-// program that prints strerror(errno) still compiles and runs; errno is never actually set).
-static inline char *strerror(int e) { (void)e; return (char *)"error"; }
-
-// `strdup`/`strndup` allocate through the playground `<stdlib.h>` bump allocator.
-#include <stdlib.h>
-static inline char *strdup(const char *s) {
-  size_t n = strlen(s) + 1;
-  char *p = (char *)malloc(n);
-  if (p) memcpy(p, s, n);
-  return p;
-}
-static inline char *strndup(const char *s, size_t n) {
-  size_t l = 0;
-  while (l < n && s[l]) l++;
-  char *p = (char *)malloc(l + 1);
-  if (p) { memcpy(p, s, l); p[l] = 0; }
-  return p;
-}
+// ---- bodies -----------------------------------------------------------------------------
+// In their own file, not behind an `#ifdef` here: chibicc tokenizes a header in full before the
+// preprocessor drops the skipped groups, so text left in place would still be *tokenized* by a
+// decls-only compile. A separate file is never opened at all.
+#ifndef __PG_LIBC_DECLS_ONLY
+#include <__pg_string_impl.h>
+#endif
 
 #endif

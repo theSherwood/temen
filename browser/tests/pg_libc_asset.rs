@@ -62,8 +62,10 @@ fn the_committed_unit_decodes_and_publishes_the_libc() {
         eprintln!("SKIP: pg_libc.temeno not built");
         return;
     };
+    // One name from each seeded header the unit carries: <stdio.h>, <stdlib.h>, <string.h>, <math.h>.
     for name in [
-        "printf", "fprintf", "puts", "snprintf", "malloc", "qsort", "strtod",
+        "printf", "fprintf", "puts", "snprintf", "malloc", "qsort", "strtod", "strlen", "memcpy",
+        "strtok", "strdup", "sqrt", "pow", "sin", "fabs",
     ] {
         assert!(
             lib.exports.iter().any(|e| e.name == name),
@@ -82,11 +84,18 @@ fn the_committed_unit_decodes_and_publishes_the_libc() {
         .debug_info
         .as_ref()
         .expect("built with -g, so a debug session can step into the libc");
-    assert!(
-        di.files.iter().any(|f| f.contains("__pg_stdio_impl.h")),
-        "the bodies' own file is where a step into `printf` lands; got {:?}",
-        di.files
-    );
+    for f in [
+        "__pg_stdio_impl.h",
+        "__pg_stdlib_impl.h",
+        "__pg_string_impl.h",
+        "__pg_math_impl.h",
+    ] {
+        assert!(
+            di.files.iter().any(|n| n.contains(f)),
+            "{f} is where a step into its functions lands; got {:?}",
+            di.files
+        );
+    }
 }
 
 /// End to end, the way the card runs: a freshly compiled program unit links against the **committed**
@@ -99,12 +108,17 @@ fn a_program_unit_links_against_the_committed_asset_and_runs() {
         program_unit(
             r#"#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <math.h>
 int main(void) {
   printf("printf %d\n", 42);
   fprintf(stdout, "fprintf %s\n", "shared-stdout");
   char *buf = malloc(32);
   snprintf(buf, 32, "snprintf %.2f", 1.5);
   puts(buf);
+  char *dup = strdup("strdup");
+  printf("%s len=%d\n", dup, (int)strlen(dup));
+  printf("sqrt=%g pow=%g\n", sqrt(169.0), pow(2.0, 10.0));
   return 0;
 }
 "#,
@@ -122,7 +136,7 @@ int main(void) {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "printf 42\nfprintf shared-stdout\nsnprintf 1.50\n"
+        "printf 42\nfprintf shared-stdout\nsnprintf 1.50\nstrdup len=6\nsqrt=13 pow=1024\n"
     );
 }
 
