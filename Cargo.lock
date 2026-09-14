@@ -793,6 +793,7 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-text",
  "temen-verify",
  "temen-wasm-jit",
 ]

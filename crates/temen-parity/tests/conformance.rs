@@ -48,6 +48,12 @@ fn expected(status: Status) -> Option<Got> {
         Status::Full => Some(Got::Supported),
         Status::Declines | Status::NotYet => Some(Got::Declined),
         Status::Conditional => None,
+        // The op × backend matrix classifies every cell — `Unaudited` belongs to the frontier matrix
+        // (`frontier.rs`), which is still being filled in. Reaching it here means an op row lost its
+        // classification, which `render_markdown`'s own assertion also catches.
+        Status::Unaudited => panic!(
+            "an op × backend cell is Unaudited — every op must be classified for every backend"
+        ),
     }
 }
 

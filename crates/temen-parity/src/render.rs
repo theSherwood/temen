@@ -35,6 +35,7 @@ pub fn render_markdown() -> String {
     let mut declines = 0usize;
     let mut notyet = 0usize;
     let mut cond = 0usize;
+    let mut unaudited = 0usize;
     for op in &ops {
         for b in [Backend::Cranelift, Backend::WasmJit] {
             match op.cells()[b as usize].status {
@@ -42,6 +43,10 @@ pub fn render_markdown() -> String {
                 Status::Declines => declines += 1,
                 Status::NotYet => notyet += 1,
                 Status::Conditional => cond += 1,
+                // The op × backend axis has no unaudited cells — every op is classified for every
+                // backend, which is the whole point of an exhaustive classifier. Counted rather than
+                // ignored so that claim is checked by the summary line rather than assumed.
+                Status::Unaudited => unaudited += 1,
             }
         }
     }
@@ -53,6 +58,10 @@ pub fn render_markdown() -> String {
         notyet, Status::NotYet.glyph(),
         cond, Status::Conditional.glyph(),
     ));
+    assert_eq!(
+        unaudited, 0,
+        "the op × backend matrix must classify every cell — `Unaudited` belongs to the frontier          matrix, which is still being filled in"
+    );
 
     // One table per family, in first-seen order.
     let mut families: Vec<&'static str> = Vec::new();
@@ -117,15 +126,16 @@ pub fn render_json() -> String {
     }
     s.push_str("],\n");
     s.push_str("  \"statuses\": {\n");
-    for (i, st) in [
+    // One list, so adding a status cannot leave the JSON map and the trailing-comma logic out of
+    // step (the index was hard-coded to 3 before `Unaudited` existed).
+    const ALL_STATUSES: [Status; 5] = [
         Status::Full,
         Status::Declines,
         Status::NotYet,
         Status::Conditional,
-    ]
-    .iter()
-    .enumerate()
-    {
+        Status::Unaudited,
+    ];
+    for (i, st) in ALL_STATUSES.iter().enumerate() {
         s.push_str(&format!(
             "    \"{}\": {{ \"glyph\": \"{}\", \"label\": \"{}\" }}{}\n",
             st.id(),
@@ -135,8 +145,9 @@ pub fn render_json() -> String {
                 Status::Declines => "Declines (parity not expected)",
                 Status::NotYet => "Not yet (parity not achieved)",
                 Status::Conditional => "Conditional",
+                Status::Unaudited => "Unaudited (nobody has established this cell)",
             },
-            if i == 3 { "" } else { "," }
+            if i + 1 == ALL_STATUSES.len() { "" } else { "," }
         ));
     }
     s.push_str("  },\n");
@@ -192,4 +203,129 @@ fn json_str(out: &mut String, v: &str) {
         }
     }
     out.push('"');
+}
+
+/// Render the capability × axis frontier matrix (`FRONTIER.md`) — INVARIANTS #14's other six axes.
+///
+/// Same two-renderings-one-manifest shape as the op matrix: this reads
+/// [`crate::frontier::capability_axes`] and owns no classification of its own.
+pub fn render_frontier_markdown() -> String {
+    use crate::frontier::{capability_axes, Axis, Capability};
+    let mut s = String::new();
+
+    s.push_str("# Capability × axis frontier matrix\n\n");
+    s.push_str(
+        "**Generated — do not edit by hand.** Regenerate with `cargo run -p temen-parity`. The \
+         classification lives in `crates/temen-parity/src/frontier.rs`; this file is its \
+         human-readable view.\n\n",
+    );
+    s.push_str(
+        "INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. \
+         `OPS_PARITY.md` machine-checks one of them at op granularity; this matrix is the machine \
+         for the rest (#1413). Rows are powerbox capability kinds; columns are the seven axes.\n\n",
+    );
+
+    // Coverage first: the honest headline is how much of this matrix is actually known.
+    let (mut audited, mut total) = (0usize, 0usize);
+    for c in Capability::ALL {
+        for cell in capability_axes(c) {
+            total += 1;
+            if cell.status != Status::Unaudited {
+                audited += 1;
+            }
+        }
+    }
+    s.push_str(&format!(
+        "**{audited} of {total} cells audited** ({} capabilities × {} axes). An {} cell is not a \
+         passing cell — it means nobody has established what it is. Two axes are checked against \
+         live predicates by `tests/frontier_conformance.rs`; the rest state the manifest's belief \
+         and nothing more.\n\n",
+        Capability::ALL.len(),
+        Axis::ALL.len(),
+        Status::Unaudited.glyph(),
+    ));
+
+    s.push_str("## Legend\n\n");
+    for (st, label) in [
+        (Status::Full, "**Full** — the capability holds on this axis"),
+        (
+            Status::Declines,
+            "**Declines** — it deliberately does not, and the note says why",
+        ),
+        (
+            Status::NotYet,
+            "**Not yet** — a real gap with a tracked plan",
+        ),
+        (
+            Status::Conditional,
+            "**Conditional** — holds where the note's condition does",
+        ),
+        (
+            Status::Unaudited,
+            "**Unaudited** — nobody has established this cell",
+        ),
+    ] {
+        s.push_str(&format!("- {} {label}\n", st.glyph()));
+    }
+    s.push('\n');
+
+    s.push_str("## Axes\n\n");
+    for a in Axis::ALL {
+        s.push_str(&format!(
+            "- **{}** — {}{}\n",
+            a.short(),
+            a.question(),
+            if a.is_conformed() {
+                " *(conformance-tested)*"
+            } else {
+                ""
+            },
+        ));
+    }
+    s.push('\n');
+
+    s.push_str("## Matrix\n\n| capability |");
+    for a in Axis::ALL {
+        s.push_str(&format!(" {} |", a.short()));
+    }
+    s.push_str("\n|----|");
+    for _ in Axis::ALL {
+        s.push_str(":----:|");
+    }
+    s.push('\n');
+    for c in Capability::ALL {
+        s.push_str(&format!("| `{}` |", c.name()));
+        for cell in capability_axes(c) {
+            s.push_str(&format!(" {} |", cell.status.glyph()));
+        }
+        s.push('\n');
+    }
+    s.push('\n');
+
+    // Notes, once each, under the row they belong to — the table stays scannable and the reasoning
+    // stays attached.
+    s.push_str("## Notes\n\n");
+    for c in Capability::ALL {
+        let cells = capability_axes(c);
+        let mut any = false;
+        for (a, cell) in Axis::ALL.iter().zip(cells.iter()) {
+            if cell.note.is_empty() {
+                continue;
+            }
+            if !any {
+                s.push_str(&format!("**`{}`**\n", c.name()));
+                any = true;
+            }
+            s.push_str(&format!(
+                "- *{}* {} — {}\n",
+                a.short(),
+                cell.status.glyph(),
+                cell.note
+            ));
+        }
+        if any {
+            s.push('\n');
+        }
+    }
+    s
 }

@@ -5,7 +5,8 @@
     "full": { "glyph": "✅", "label": "Full" },
     "declines": { "glyph": "⛔", "label": "Declines (parity not expected)" },
     "notyet": { "glyph": "🚧", "label": "Not yet (parity not achieved)" },
-    "conditional": { "glyph": "🔶", "label": "Conditional" }
+    "conditional": { "glyph": "🔶", "label": "Conditional" },
+    "unaudited": { "glyph": "❔", "label": "Unaudited (nobody has established this cell)" }
   },
   "ops": [
     { "op": "i32.const", "family": "scalar integer", "cells": ["full", "full", "full", "full"], "notes": [] },
