@@ -4191,6 +4191,107 @@ pub struct ResolvedCap {
     pub op: u32,
 }
 
+/// The reference **powerbox ABI**: the standard `name → (type_id, op)` binding an import name
+/// resolves to when a host binds a manifest module's slots (IMPORTS.md §2.1). One definition, shared
+/// by every host that offers the §3e powerbox — the native runner, the browser cdylib and the
+/// debugger used to keep hand-written twins of this table, and a divergence between them meant the
+/// *same guest* bound different capabilities per host (#912; the class INVARIANTS #9 bans).
+///
+/// Names are the bare operation names (no `__vm_` prefix); the capability **handle** is chosen by
+/// the host from what it actually granted ([`PowerboxHandles::bind`]), never by this policy — so two
+/// names can share an interface and differ only by which handle their slots bind (`write`/`read` are
+/// both `Stream`, bound to stdout vs stdin). This is the vocabulary the bundled toolchain agrees on;
+/// a *different* host binds these (or entirely new) names to its own capabilities through the §7
+/// late binding instead.
+pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
+    let (type_id, op): (u32, u32) = match name {
+        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint. `write` and `stderr` are
+        // both write (op 1); the binding uses the name to pick stdout vs the stderr handle.
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
+        "stderr" => (cap_id::STREAM, 1),
+        // Exit (noreturn).
+        "exit" => (cap_id::EXIT, 0),
+        // Memory management (§3e/§4).
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
+        // AddressSpace / SharedRegion aliasing (§13/§14).
+        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
+        "vm_region_map" => (cap_id::SHARED_REGION, 0),
+        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
+        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
+        // Guest-driven JIT (§22).
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
+        _ => return None,
+    };
+    Some(ResolvedCap { type_id, op })
+}
+
+/// The handles a host granted for the canonical powerbox, in [`POWERBOX_CAP_NAMES`] order. The five
+/// of the §3e prefix are mandatory (`temen_interp::Host::grant_powerbox_prefix` grants exactly
+/// those); `jit` and `stderr` are `None` for a host that does not grant them, and an import naming
+/// one it did not grant is left **unbound** — fail-closed at dispatch, never silently bound to the
+/// wrong endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PowerboxHandles {
+    pub stdout: i32,
+    pub stdin: i32,
+    pub exit: i32,
+    pub memory: i32,
+    pub addrspace: i32,
+    pub jit: Option<i32>,
+    pub stderr: Option<i32>,
+}
+
+impl PowerboxHandles {
+    /// The §3e prefix alone (`[stdout, stdin, exit, memory, addrspace]`, the grant order of
+    /// `POWERBOX_CAP_NAMES[..5]`), with no `jit`/`stderr`.
+    pub fn prefix([stdout, stdin, exit, memory, addrspace]: [i32; 5]) -> PowerboxHandles {
+        PowerboxHandles {
+            stdout,
+            stdin,
+            exit,
+            memory,
+            addrspace,
+            jit: None,
+            stderr: None,
+        }
+    }
+
+    /// Bind one manifest import: the capability `name` denotes **and** the handle this host granted
+    /// for it. `None` ⇒ leave the slot unbound (a dispatch through it is a fail-closed `CapFault`):
+    /// an unknown name, a dynamic-mode-only interface (`SharedRegion` is minted at runtime, never a
+    /// manifest slot), or a capability this host chose not to grant.
+    pub fn bind(&self, name: &str) -> Option<(ResolvedCap, i32)> {
+        let cap = default_cap_resolver(name)?;
+        // `write` and `stderr` are both `Stream` write (op 1), so op alone cannot break the tie —
+        // only the name can.
+        let handle = if name == "stderr" {
+            self.stderr?
+        } else {
+            match (cap.type_id, cap.op) {
+                (cap_id::STREAM, 1) => self.stdout,
+                (cap_id::STREAM, _) => self.stdin,
+                (cap_id::EXIT, _) => self.exit,
+                // One kind post-§4 (op-keyed like Stream): the vm_map family (ops 0–3) binds the
+                // whole-window grant; sub/region_create bind the sized one.
+                (cap_id::ADDRESS_SPACE, 0..=3) => self.memory,
+                (cap_id::ADDRESS_SPACE, _) => self.addrspace,
+                (cap_id::JIT, _) => self.jit?,
+                _ => return None,
+            }
+        };
+        Some((cap, handle))
+    }
+}
+
 /// What an import **name** binds to when [`resolve_imports_with`] lowers it — **link-time symbol
 /// resolution** (IMPORTS.md §2.5: the linker legitimately produces new module bytes; the runtime
 /// never rewrites — a manifest module's imports bind to slots at instantiation instead). The §7
@@ -5113,6 +5214,146 @@ fn offset_func_indices(m: &mut Module, offset: u32) {
             n.func += offset;
         }
     }
+}
+
+/// What [`stub_unreachable_funcs`] did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StubbedFuncs {
+    /// How many function bodies were replaced by a trap (`0` ⇒ the module is unchanged).
+    pub stubbed: usize,
+}
+
+/// Why [`stub_unreachable_funcs`] declined.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum GcError {
+    /// The module's data image has funcidxs baked into bytes ([`Module::data_funcrefs`]), which this
+    /// pass cannot see — the linker resolved and cleared them, so a function reachable *only* from a
+    /// static initializer would look unreachable and be stubbed out from under its caller. Declines,
+    /// changing nothing. (A [`link`]ed module always has an empty list, so check the **units**, as
+    /// the linker's consumers do.)
+    DataFuncrefs,
+    /// A root, or a call target, was out of range — the verifier's job, not this pass's.
+    BadRoot(FuncIdx),
+}
+
+/// **Replace the body of every function nothing can reach with a trap** — link-time dead-code
+/// elimination (#1407).
+///
+/// [`link`] merges whole modules: every function of a library unit lands in the linked program
+/// whether or not anything reaches it. A program that calls only `printf` still carries the seeded
+/// libc's `<string.h>` and the whole series-based libm — weight every launch pays to verify and
+/// bytecode-compile. This is the reachability walk that empties them: the cross-unit twin of what
+/// chibicc's own `mark_live` does *within* a translation unit.
+///
+/// # Why it stubs instead of removing
+///
+/// **Function indices are observable.** `call.indirect` masks an `i32` into the domain's dispatch
+/// table, whose slot `i` *is* funcidx `i` ([`DomainTable::new`]'s natural prefix), padded to a power
+/// of two. A `funcref` is "just the function index as an `i32`" and deliberately forgeable (§3c), so
+/// an index can arrive from arithmetic or a literal, not only from [`Inst::RefFunc`]. Removing
+/// functions would renumber the table *and shrink the mask*: an index that selected one function
+/// would select another. Safety would survive — the slot's signature re-check and the trapping
+/// padding are what make a forged index inert — but **behaviour would not**, and a program whose
+/// indirect call silently retargets is exactly the failure this pass must not introduce.
+///
+/// Keeping every index and emptying the dead bodies preserves the table exactly: a `ref.func`-derived
+/// call lands where it always did, and a forged index that happens to select an unreachable function
+/// now traps rather than executing code nothing could reach — strictly safer than before. It also
+/// means there is no renumbering at all: no index map, nothing for a caller to remap, and no way for
+/// an unhandled funcidx-bearing form to cause a silent miscompile.
+///
+/// The saving is the bodies, which is where the cost was: verify and bytecode-compile walk a
+/// one-block trap instead of a function.
+///
+/// # Roots and edges
+///
+/// Roots are the module's addressable surface — every [`Module::exports`] entry and every
+/// [`ImplExport`] op — plus `extra_roots`, for a funcidx the caller invokes directly (the entry it is
+/// about to hand [`synth_manifest_start`], say). Edges are followed from a live body: [`Inst::Call`],
+/// [`Inst::RefFunc`], [`Inst::ThreadSpawn`] and [`Terminator::ReturnCall`] — the same set
+/// [`offset_func_indices`] rewrites, and the two must stay in step. A [`Inst::CallImport`] names an
+/// import slot, not a function, so it is not an edge; a [`Inst::CallIndirect`] names no function at
+/// all, which is the whole reason indices are preserved.
+pub fn stub_unreachable_funcs(
+    m: &mut Module,
+    extra_roots: &[FuncIdx],
+) -> Result<StubbedFuncs, GcError> {
+    let n = m.funcs.len();
+    if !m.data_funcrefs.is_empty() {
+        return Err(GcError::DataFuncrefs);
+    }
+    // --- mark ---------------------------------------------------------------------------------
+    let mut live = alloc::vec![false; n];
+    let mut work: Vec<FuncIdx> = Vec::new();
+    let push = |f: FuncIdx, live: &mut [bool], work: &mut Vec<FuncIdx>| -> Result<(), GcError> {
+        let i = f as usize;
+        if i >= live.len() {
+            return Err(GcError::BadRoot(f));
+        }
+        if !live[i] {
+            live[i] = true;
+            work.push(f);
+        }
+        Ok(())
+    };
+    for e in &m.exports {
+        push(e.func, &mut live, &mut work)?;
+    }
+    for e in &m.impl_exports {
+        for &f in &e.ops {
+            push(f, &mut live, &mut work)?;
+        }
+    }
+    for &f in extra_roots {
+        push(f, &mut live, &mut work)?;
+    }
+    while let Some(f) = work.pop() {
+        let mut edges: Vec<FuncIdx> = Vec::new();
+        for b in &m.funcs[f as usize].blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Call { func, .. }
+                    | Inst::RefFunc { func }
+                    | Inst::ThreadSpawn { func, .. } => edges.push(*func),
+                    _ => {}
+                }
+            }
+            if let Terminator::ReturnCall { func, .. } = &b.term {
+                edges.push(*func);
+            }
+        }
+        for e in edges {
+            push(e, &mut live, &mut work)?;
+        }
+    }
+    // --- stub ---------------------------------------------------------------------------------
+    // The signature stays (the table's slot check reads it); the body becomes one diverging block, so
+    // the only way to arrive is a forged index, and arriving traps.
+    let mut stubbed = 0;
+    for (i, f) in m.funcs.iter_mut().enumerate() {
+        if live[i] {
+            continue;
+        }
+        f.blocks = alloc::vec![Block {
+            params: f.params.clone(),
+            insts: Vec::new(),
+            term: Terminator::Unreachable,
+        }];
+        stubbed += 1;
+    }
+    if stubbed == 0 {
+        return Ok(StubbedFuncs { stubbed: 0 });
+    }
+    // A stubbed function's debug info describes instructions that no longer exist: a stepper would
+    // resolve a stop inside it to a stale line, and a variable to a stale slot. Drop it. Indices do
+    // not move, so nothing else is rewritten — the surviving entries are already correct.
+    if let Some(di) = &mut m.debug_info {
+        di.locs.retain(|l| live[l.func as usize]);
+        di.vars
+            .retain(|v| v.func == GLOBAL_SCOPE || live[v.func as usize]);
+        di.func_names.retain(|nm| live[nm.func as usize]);
+    }
+    Ok(StubbedFuncs { stubbed })
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`

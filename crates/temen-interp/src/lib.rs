@@ -18538,43 +18538,6 @@ pub struct BoundImport {
     pub rebindable: bool,
 }
 
-/// The canonical **import name → `(type_id, op)`** map (IMPORTS.md §7): what a bare operation name
-/// like `write` or `vm_jit_compile` means as a capability call. One table, because two positions read
-/// it and neither may drift from the other (invariant 15): the embedder's reference resolver
-/// (`temen_run::default_cap_resolver`, which binds a *root*'s manifest) and
-/// [`Host::bind_child_manifest`] (which binds a §14 *child*'s, over a subset it names as data).
-///
-/// The name never selects the **handle** — that is chosen by interface when the slot is bound, so
-/// `write` and `stderr` share `(Stream, 1)` and differ only in which granted stream their slot binds.
-pub fn import_cap_by_name(name: &str) -> Option<(u32, u32)> {
-    Some(match name {
-        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint.
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "stderr" => (cap_id::STREAM, 1),
-        // Exit (noreturn).
-        "exit" => (cap_id::EXIT, 0),
-        // Memory management (§3e/§4).
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        // AddressSpace / SharedRegion aliasing (§13/§14).
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        "vm_region_map" => (cap_id::SHARED_REGION, 0),
-        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
-        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // Guest-driven JIT (§22).
-        "vm_jit_compile" => (cap_id::JIT, 0),
-        "vm_jit_compile_linked" => (cap_id::JIT, 5),
-        "vm_jit_invoke2" => (cap_id::JIT, 1),
-        "vm_jit_release" => (cap_id::JIT, 2),
-        "vm_jit_install" => (cap_id::JIT, 3),
-        "vm_jit_uninstall" => (cap_id::JIT, 4),
-        _ => return None,
-    })
-}
-
 impl BoundImport {
     /// A bound `required`-mode entry (the phase-1 shape): immutable for the instance's lifetime.
     pub fn required(type_id: u32, op: u32, handle: i32) -> BoundImport {
@@ -19202,9 +19165,9 @@ impl Host {
             return Ok(());
         }
         // Which import names a §14 child may bind, as **data** over the one shared name→cap table
-        // ([`import_cap_by_name`], invariant 15) rather than a second copy of it. This list is the
-        // confinement-relevant half and is meant to be read at a glance; the `(type_id, op)` each
-        // name resolves to is not restated here.
+        // ([`temen_ir::default_cap_resolver`], invariant 15) rather than a second copy of it. This
+        // list is the confinement-relevant half and is meant to be read at a glance; the
+        // `(type_id, op)` each name resolves to is not restated here.
         //
         // `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`: an allocating §14 child (a real compiler
         // phase's `malloc`) binds these to the child's own auto-granted `AddressSpace` (`first_of`
@@ -19234,8 +19197,9 @@ impl Host {
         let policy = |name: &str| {
             CHILD_BINDABLE
                 .contains(&name)
-                .then(|| import_cap_by_name(name))
+                .then(|| temen_ir::default_cap_resolver(name))
                 .flatten()
+                .map(|c| (c.type_id, c.op))
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {
             (0..CAP).find_map(|slot| {
@@ -20763,6 +20727,29 @@ impl Host {
     }
     pub fn grant_exit(&mut self) -> i32 {
         self.grant(cap_id::EXIT, Binding::Exit)
+    }
+    /// Grant the **§3e powerbox prefix** — `[stdout, stdin, exit, memory, addrspace]`, the grant
+    /// order of `temen_ir::POWERBOX_CAP_NAMES[..5]` — and register each under its canonical name so a
+    /// guest can also re-find it with `self.resolve` (F7). `win` is the module's declared window
+    /// size, which bounds the sized `AddressSpace` grant (`0` for a module with no memory).
+    ///
+    /// This is the sequence every host offering the powerbox performs before binding a manifest
+    /// module's slots ([`temen_ir::PowerboxHandles::bind`]) — one definition rather than one per host
+    /// (#912): the grant *order* is guest-visible ABI, because `self.count`/`self.get` enumerate
+    /// handles in it. A host adds its own capabilities after this prefix, leaving these indices
+    /// stable.
+    pub fn grant_powerbox_prefix(&mut self, win: u64) -> [i32; 5] {
+        let handles = [
+            self.grant_stream(StreamRole::Out),
+            self.grant_stream(StreamRole::In),
+            self.grant_exit(),
+            self.grant_memory(),
+            self.grant_address_space(0, win),
+        ];
+        for (name, handle) in temen_ir::POWERBOX_CAP_NAMES.iter().zip(&handles) {
+            self.register_cap_name(name, *handle);
+        }
+        handles
     }
     pub fn grant_clock(&mut self) -> i32 {
         self.grant(cap_id::CLOCK, Binding::Clock)

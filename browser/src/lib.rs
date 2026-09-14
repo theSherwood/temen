@@ -11,7 +11,8 @@
 //!     (compute-only), and returns its first `i64` result. **Fail-closed:** a module the engine
 //!     can't compile yields `STATUS_UNSUPPORTED` rather than any tree-walker fallback.
 //!   * [`temen_run_pb`] — the **powerbox**: streams/clock/exit, I/O marshalled through allocations.
-//!     `temen_run_live` (feature `live`) instead binds those to real host imports.
+//!   * [`jspb`] — a powerbox whose capabilities the **JS embedder** defines: named grants bound to
+//!     real wasm imports, so a host function supplies each capability's semantics.
 //!
 //! Status of the last run is read separately via [`temen_status`] (a single `i64` return can't
 //! disambiguate an error from a guest result of the same value).
@@ -24,8 +25,6 @@
 
 use std::alloc::Layout;
 
-#[cfg(feature = "live")]
-use temen_interp::HostProc;
 use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
@@ -2951,45 +2950,6 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     }
 }
 
-/// The canonical names of the **on-ramp** powerbox prefix, in grant order — the fixed §3e `VM_CAP_*`
-/// vocabulary the LLVM on-ramp's synthesized `_start` expects (and `temen-run` grants). This differs
-/// from [`POWERBOX_CAP_NAMES`] after slot 3: the hand-written browser corpus uses `(stderr, clock)`
-/// at slots 4/5, but an on-ramp guest wants `(memory, addrspace)` there — `memory` is what `malloc`
-/// grows the heap through, so Lua/SQLite need it. See `LLVM.md` §N (the powerbox on-ramp).
-const ONRAMP_CAP_NAMES: [&str; 5] = ["stdout", "stdin", "exit", "memory", "addrspace"];
-
-/// The reference host's §7 capability-import name policy — a browser-side twin of `temen-run`'s
-/// `default_cap_resolver`. The on-ramp emits `call.sym "<name>"` for each libc→capability shim
-/// (`write`/`read`/`exit`/`vm_map`/…); this lowers each name to the `(type_id, op)` its `call.cap`
-/// runs, so the resolved module verifies and runs. The **handle** (which stream/region) is supplied
-/// by the powerbox stash, not this map — `write`/`read` share `Stream`, differing only by handle.
-pub(crate) fn onramp_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
-    use temen_interp::cap_id;
-    let (type_id, op): (u32, u32) = match name {
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "exit" => (cap_id::EXIT, 0),
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        "vm_region_map" => (cap_id::SHARED_REGION, 0),
-        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
-        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // Guest-driven JIT (§22) — the macro-staging on-ramp grants the Jit cap; mirrors
-        // temen-run's default_cap_resolver so a compiler-guest's `__vm_jit_*` builtins bind.
-        "vm_jit_compile" => (cap_id::JIT, 0),
-        "vm_jit_compile_linked" => (cap_id::JIT, 5),
-        "vm_jit_invoke2" => (cap_id::JIT, 1),
-        "vm_jit_release" => (cap_id::JIT, 2),
-        "vm_jit_install" => (cap_id::JIT, 3),
-        "vm_jit_uninstall" => (cap_id::JIT, 4),
-        _ => return None,
-    };
-    Some(temen_ir::ResolvedCap { type_id, op })
-}
-
 /// Gate an on-ramp module (IMPORTS.md phase 4): the runtime never rewrites. A module that declares
 /// imports must carry the **powerbox entry shape** — a paramless func 0 exported as `_start`
 /// (`temen-run`'s `is_named_powerbox_entry`) — so its manifest slots can bind at instantiation
@@ -3047,16 +3007,10 @@ fn grant_onramp_caps(
     MouseQueue,
 ) {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-    let handles: [i32; 5] = [
-        host.grant_stream(StreamRole::Out),
-        host.grant_stream(StreamRole::In),
-        host.grant_exit(),
-        host.grant_memory(),
-        host.grant_address_space(0, win),
-    ];
-    for (name, handle) in ONRAMP_CAP_NAMES.iter().zip(&handles) {
-        host.register_cap_name(name, *handle);
-    }
+    // The §3e prefix + its canonical-name registration — the shared sequence every powerbox host
+    // performs (#912), so an on-ramp guest sees the same handles in the same order the CLI and the
+    // debugger give it. This host's own capabilities (`Jit`, `vm_fs`, the graphical ones) follow.
+    let mut granted = temen_ir::PowerboxHandles::prefix(host.grant_powerbox_prefix(win));
     // §22 guest-driven JIT: grant the `Jit` cap **iff** the guest declares a `__vm_jit_*` import
     // (principle of least authority — a plain on-ramp guest gets no Jit). The JACL self-hosted
     // compiler uses it to expand macros in-guest. Match temen-run's powerbox grant so a self-hosted
@@ -3064,18 +3018,16 @@ fn grant_onramp_caps(
     // into the host program's ~800 functions by index) and fiber hosting (a staged macro runs on the
     // compiler's scheduler root, which suspends). `browser_jit_validator` verifies every submitted
     // unit — the security hinge, so this stays "as secure as wasm".
-    let jit_h: Option<i32> = if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
+    if m.imports.iter().any(|im| im.name.starts_with("vm_jit_")) {
         let h = host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), ONRAMP_JIT_TABLE_LOG2);
         host.set_jit_validator(browser_jit_validator);
         host.set_jit_hosts_fibers(true);
         // #1234: name it too, so a §14 child can be spawned with `jit` re-granted by name (the
         // Forth kernel's `sandbox` nests a copy of itself, which needs a Jit to compile its words).
-        // temen-run's powerbox registers the same name via `canonical_cap_name`.
+        // temen-run's powerbox registers the same name from `canonical_cap_name`.
         host.register_cap_name("jit", h);
-        Some(h)
-    } else {
-        None
-    };
+        granted.jit = Some(h);
+    }
     // #1323 (c_interpret #16, file I/O): a guest that imports `vm_fs` (the chibicc `__vm_fs` builtin →
     // `call.sym "vm_fs"`) gets a private, in-memory **read-write** scratch filesystem — the existing
     // `temen-fs` memfs, the same backend Postgres/chibicc use. `__vm_fs` is "a flat call.sym (base op
@@ -3121,24 +3073,16 @@ fn grant_onramp_caps(
                         None => temen_interp::BoundImport::rebindable(0, 0, None),
                     };
                 }
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => handles[0],
-                    (cap_id::STREAM, _) => handles[1],
-                    (cap_id::EXIT, _) => handles[2],
-                    // One kind post-§4 (op-keyed like Stream): vm_map family → the
-                    // whole-window grant, sub/region_create → the sized one.
-                    (cap_id::ADDRESS_SPACE, 0..=3) => handles[3],
-                    (cap_id::ADDRESS_SPACE, _) => handles[4],
-                    (cap_id::JIT, _) => match jit_h {
-                        Some(h) => h,
-                        None => return temen_interp::BoundImport::rebindable(0, 0, None),
-                    },
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                // The shared powerbox ABI (#912): the name's capability and the handle this run
+                // granted for it. A name this host did not grant (`stderr`, or `Jit` on a guest that
+                // declares no `vm_jit_*` import) or a dynamic-only interface leaves its slot
+                // unbound — fail-closed at dispatch.
+                match granted.bind(&im.name) {
+                    Some((cap, handle)) => {
+                        temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                    }
+                    None => temen_interp::BoundImport::rebindable(0, 0, None),
+                }
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -3849,22 +3793,26 @@ fn pg_setup(
     // granted handles (`Stream` disambiguated by op). A name outside this headless powerbox (e.g.
     // the dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
     if !m.imports.is_empty() {
-        use temen_interp::cap_id;
+        // The shared powerbox ABI (#912). This headless powerbox grants no *sized* address space, so
+        // the whole-window `memory` grant serves both address-space roles; `Jit`/`stderr` are not
+        // granted at all, and an import naming one leaves its slot unbound (fail-closed at dispatch).
+        let granted = temen_ir::PowerboxHandles {
+            stdout: out,
+            stdin: inp,
+            exit,
+            memory,
+            addrspace: memory,
+            jit: None,
+            stderr: None,
+        };
         let bindings = m
             .imports
             .iter()
-            .map(|im| {
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => out,
-                    (cap_id::STREAM, _) => inp,
-                    (cap_id::EXIT, _) => exit,
-                    (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            .map(|im| match granted.bind(&im.name) {
+                Some((cap, handle)) => {
+                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                }
+                None => temen_interp::BoundImport::rebindable(0, 0, None),
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -8857,6 +8805,145 @@ pub extern "C" fn temen_link_text_lib(
     }
 }
 
+/// Resolve a host-passed list of resident-library handles to borrowed link units (#1408). `None` if
+/// any handle is unknown or closed — fail-closed, so a stale handle can never silently link against
+/// whatever now occupies that slot.
+fn resident_units(handles: &[i32]) -> Option<Vec<temen_ir::LinkUnitRef<'static>>> {
+    // SAFETY: single-threaded wasm; the resident libraries are read (never mutated) for the link, and
+    // the table lives for the instance (a `static mut`).
+    let libs = unsafe { &*core::ptr::addr_of!(LINK_LIBS) };
+    let mut out = Vec::with_capacity(handles.len());
+    for &h in handles {
+        let lib = usize::try_from(h)
+            .ok()
+            .and_then(|i| libs.get(i))
+            .and_then(Option::as_ref)?;
+        out.push(temen_ir::LinkUnitRef {
+            module: &lib.module,
+            exports: &lib.exports,
+            data_exports: &lib.data_exports,
+        });
+    }
+    Some(out)
+}
+
+/// The handle list a `*_libs` entry was handed: `count` `i32`s at `ptr`. An empty list is legal — a
+/// program with no libraries links fine — and so is a null pointer with count 0.
+fn handle_slice(ptr: *const i32, count: usize) -> &'static [i32] {
+    if ptr.is_null() || count == 0 {
+        &[]
+    } else {
+        // SAFETY: the host passes a live `temen_alloc`ation of `count` i32s it just filled.
+        unsafe { core::slice::from_raw_parts(ptr, count) }
+    }
+}
+
+/// [`temen_link_run_lib`] against **several** resident libraries (#1408): `handles` is `handles_len`
+/// `i32`s in linking order, the program linked last. [`temen_link_lib_open`] could always keep many
+/// libraries resident, but the single-handle entries could only ever link one — the case #1373
+/// anticipated (a frontend with a program runtime *and* a macro-staging runtime), and the case a host
+/// wants for a prebuilt libc alongside a prebuilt graphics unit. Same accessors and return convention
+/// as [`temen_link_run_lib`]; an unknown or closed handle anywhere in the list declines the whole call
+/// ([`STATUS_UNSUPPORTED`]).
+#[no_mangle]
+pub extern "C" fn temen_link_run_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
+    let Some(units) = resident_units(handle_slice(handles_ptr, handles_len)) else {
+        unsafe { LAST_STATUS = STATUS_UNSUPPORTED };
+        return 0;
+    };
+    link_run_against_multi(
+        &units, prog_ptr, prog_len, entry_ptr, entry_len, stdin_ptr, stdin_len,
+    )
+}
+
+/// [`temen_link_text_lib`] against several resident libraries (#1408) — see [`temen_link_run_libs`]
+/// for the handle list.
+#[no_mangle]
+pub extern "C" fn temen_link_text_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    link_lib_stash(
+        handle_slice(handles_ptr, handles_len),
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        |m| temen_text::print_module(m).into_bytes(),
+    )
+}
+
+/// [`temen_link_encode_lib`] against several resident libraries (#1408) — see
+/// [`temen_link_run_libs`] for the handle list.
+#[no_mangle]
+pub extern "C" fn temen_link_encode_libs(
+    handles_ptr: *const i32,
+    handles_len: usize,
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+) -> i32 {
+    link_lib_stash(
+        handle_slice(handles_ptr, handles_len),
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        temen_encode::encode_module,
+    )
+}
+
+/// The shared body of the link-and-stash entries: resolve the handles, load the program unit, link,
+/// and stash `render`'s bytes on [`temen_stdout_ptr`]/[`temen_stdout_len`]. `0` on success, else a
+/// negative `STATUS_*`.
+fn link_lib_stash(
+    handles: &[i32],
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    render: impl FnOnce(&temen_ir::Module) -> Vec<u8>,
+) -> i32 {
+    let set = |s: i32| unsafe { LAST_STATUS = s };
+    let fail = |s: i32| {
+        set(s);
+        -s
+    };
+    let Ok(entry) = core::str::from_utf8(link_slice(entry_ptr, entry_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    let Some(units) = resident_units(handles) else {
+        return fail(STATUS_UNSUPPORTED);
+    };
+    let Some(program) = link_load_unit(link_slice(prog_ptr, prog_len)) else {
+        return fail(STATUS_DECODE_ERR);
+    };
+    match link_program_multi(&units, &program, entry) {
+        Ok(m) => {
+            let bytes = render(&m);
+            // SAFETY: single-threaded wasm; the slot is read back only via the export accessors.
+            unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+            set(STATUS_OK);
+            0
+        }
+        Err(status) => fail(status),
+    }
+}
+
 /// [`temen_link_text_lib`]'s **binary** twin: link the program unit against the resident library
 /// `handle` and stash the linked module's `temen-encode` bytes (`temen_stdout_ptr`/`_len`), ready to run
 /// on either tier — `temen_run`/`moduleInterp` or the wasm-JIT. This is what the chibicc card uses
@@ -8936,22 +9023,51 @@ pub fn link_program(
     program: &temen_ir::Module,
     entry: &str,
 ) -> Result<temen_ir::Module, i32> {
+    link_program_multi(&[lib], program, entry)
+}
+
+/// [`link_program`] against **several** libraries at once (#1408) — the units are laid out in the
+/// order given, with the program last, so a later library may resolve against an earlier one. One
+/// library is the common case and has its own name above.
+pub fn link_program_multi(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    program: &temen_ir::Module,
+    entry: &str,
+) -> Result<temen_ir::Module, i32> {
     let mut prog_exports = link_lib_exports(program);
     prog_exports.retain(|(n, _)| n != "_start");
     if !prog_exports.iter().any(|(n, _)| n == entry) {
         prog_exports.push((entry.to_string(), 0));
     }
     let prog_data = link_unit_data_exports(program);
-    let linked = temen_ir::link_with_manifest_ref(&[
-        lib,
-        temen_ir::LinkUnitRef {
-            module: program,
-            exports: &prog_exports,
-            data_exports: &prog_data,
-        },
-    ])
-    .map_err(|_| STATUS_UNSUPPORTED)?;
+    let mut units: Vec<temen_ir::LinkUnitRef<'_>> = libs.to_vec();
+    units.push(temen_ir::LinkUnitRef {
+        module: program,
+        exports: &prog_exports,
+        data_exports: &prog_data,
+    });
+    let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
     let entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
+    // **Drop what nothing reaches** (#1407). The link merges whole modules, so a program that calls
+    // `printf` also carries the prebuilt libc's `<string.h>` and the whole series-based libm — dead
+    // weight every launch pays to verify and bytecode-compile.
+    //
+    // The library's exports have to go first, or there is nothing to collect: `link` publishes *every*
+    // unit's exports in the merged table, so all 119 libc names would be roots. They existed to
+    // *resolve* the program's calls, and that is done — a linked executable does not re-export its
+    // libc. What stays is the program unit's own surface (`prog_exports`, which includes `entry`),
+    // exactly what a host can still address by name afterwards.
+    //
+    // Skipped when either unit baked a funcidx into its data image (`data.funcref`): the linker has
+    // already resolved and cleared those, so a function reachable *only* from a static initializer
+    // would look unreachable and be emptied out from under its caller. chibicc emits none; a nim-style
+    // unit can, and simply keeps every body — slower, correct.
+    if libs.iter().all(|u| u.module.data_funcrefs.is_empty()) && program.data_funcrefs.is_empty() {
+        linked
+            .exports
+            .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
+        let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
+    }
     let module =
         temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;
     // Verify before handing it on: a program that references an undefined proc links to an
@@ -9004,6 +9120,28 @@ fn link_run_against(
     stdin_ptr: *const u8,
     stdin_len: usize,
 ) -> i64 {
+    link_run_against_multi(
+        &[lib],
+        prog_ptr,
+        prog_len,
+        entry_ptr,
+        entry_len,
+        stdin_ptr,
+        stdin_len,
+    )
+}
+
+/// [`link_run_against`] over several library units (#1408) — the shared body; one library is the
+/// common case and has its own name above.
+fn link_run_against_multi(
+    libs: &[temen_ir::LinkUnitRef<'_>],
+    prog_ptr: *const u8,
+    prog_len: usize,
+    entry_ptr: *const u8,
+    entry_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i64 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
     let entry_name = match core::str::from_utf8(link_slice(entry_ptr, entry_len)) {
         Ok(s) => s,
@@ -9020,7 +9158,7 @@ fn link_run_against(
             return 0;
         }
     };
-    let module = match link_program(lib, &program, entry_name) {
+    let module = match link_program_multi(libs, &program, entry_name) {
         Ok(m) => m,
         Err(status) => {
             set(status);
@@ -12939,127 +13077,6 @@ block 0 (v0: i64) {
             _ => -1,
         },
         _ => -1,
-    }
-}
-
-// ---- live host imports: bind capabilities to real host functions ----------------------------
-//
-// Everything above keeps the cdylib import-free by buffering I/O. This (feature-gated) entry instead
-// bridges guest capabilities to **real wasm imports**, so a guest's writes reach the live host
-// console *as they happen* and the clock reads real host time. The seam is `Host::grant_host_proc`
-// (iface 13) — the designed extension point: a closure supplies the capability's semantics, here by
-// calling out to the imported host function. The guest sees only a masked, type-checked handle.
-
-#[cfg(feature = "live")]
-pub mod live {
-    use super::*;
-
-    // The host functions the embedder must supply (module `temen_host`). `host_write` receives a
-    // pointer into *this module's* linear memory (the bytes the guest wrote, copied out of its
-    // window into a Rust buffer that lives on the wasm heap), so JS reads them as
-    // `new Uint8Array(memory.buffer, ptr, len)`. `host_now_ns` returns real host time.
-    #[link(wasm_import_module = "temen_host")]
-    extern "C" {
-        /// `host_write(stream, ptr, len)` — `stream` 0 = stdout, 1 = stderr.
-        fn host_write(stream: i32, ptr: *const u8, len: usize);
-        /// `host_now_ns() -> i64` — host wall/monotonic clock, nanoseconds.
-        fn host_now_ns() -> i64;
-    }
-
-    const EFAULT: i64 = -14;
-    const EINVAL: i64 = -22;
-
-    /// Decode the module at `[mod_ptr, mod_len)` and run function 0 with a **host-backed** powerbox:
-    /// `(console, clock)` capabilities (both iface `HOST_PROC` = 13) bridged to the imports above.
-    /// The guest calls `call.cap 13 1 (i64,i64,i64) -> (i64) v<console>(stream, ptr, len)` to write
-    /// live, and `call.cap 13 0 () -> (i64) v<clock>()` to read the host clock. Returns the guest's
-    /// `i64` result; sets [`LAST_STATUS`].
-    #[no_mangle]
-    pub extern "C" fn temen_run_live(mod_ptr: *const u8, mod_len: usize) -> i64 {
-        // SAFETY: the host guarantees `[mod_ptr, mod_len)` is a live `temen_alloc`ation it just filled.
-        let bytes = unsafe { core::slice::from_raw_parts(mod_ptr, mod_len) };
-        let set = |s: i32| unsafe { LAST_STATUS = s };
-        let m = match temen_encode::decode_module(bytes) {
-            Ok(m) => m,
-            Err(_) => {
-                set(STATUS_DECODE_ERR);
-                return 0;
-            }
-        };
-        let mut host = Host::new();
-        // console (param 1): op 1 = write(stream, ptr, len) → reads the guest window, forwards live.
-        let console: HostProc = Box::new(|op, args, mem, _| {
-            if op != 1 {
-                return Ok(vec![EINVAL]);
-            }
-            let (Some(&stream), Some(&ptr), Some(&n)) = (args.first(), args.get(1), args.get(2))
-            else {
-                return Ok(vec![EINVAL]);
-            };
-            let Some(m) = mem else {
-                return Ok(vec![EFAULT]);
-            };
-            match m.read_bytes(ptr as u64, n as u64) {
-                // The copied bytes live on this module's wasm heap; hand their pointer to the host.
-                Some(buf) => {
-                    unsafe { host_write(stream as i32, buf.as_ptr(), buf.len()) };
-                    Ok(vec![n])
-                }
-                None => Ok(vec![EFAULT]),
-            }
-        });
-        // clock (param 2): op 0 = now() → real host time.
-        let clock: HostProc = Box::new(|op, _args, _mem, _| {
-            if op != 0 {
-                return Ok(vec![EINVAL]);
-            }
-            Ok(vec![unsafe { host_now_ns() }])
-        });
-        let arity = m.funcs.first().map_or(0, |f| f.params.len());
-        let mut slots: Vec<Value> = Vec::new();
-        if arity >= 1 {
-            slots.push(Value::I32(host.grant_host_proc(console)));
-        }
-        if arity >= 2 {
-            slots.push(Value::I32(host.grant_host_proc(clock)));
-        }
-        // §7 register the live caps under canonical names (F7/F9, PR #118) so the guest can
-        // `self.resolve`/`label` them at runtime, matching the fixed-powerbox path.
-        for (name, slot) in ["console", "clock"].iter().zip(&slots) {
-            if let Value::I32(handle) = slot {
-                host.register_cap_name(name, *handle);
-            }
-        }
-        let mut fuel = u64::MAX;
-        match bytecode::compile_and_run_with_host(&m, 0, &slots, &mut fuel, &mut host) {
-            None => {
-                set(STATUS_UNSUPPORTED);
-                0
-            }
-            Some(Err(Trap::Exit(code))) => {
-                set(STATUS_EXIT);
-                unsafe { EXIT_CODE = code };
-                0
-            }
-            Some(Err(_)) => {
-                set(STATUS_TRAP);
-                0
-            }
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => {
-                    set(STATUS_OK);
-                    *x
-                }
-                Some(Value::I32(x)) => {
-                    set(STATUS_OK);
-                    *x as i64
-                }
-                _ => {
-                    set(STATUS_BAD_RESULT);
-                    0
-                }
-            },
-        }
     }
 }
 

@@ -18,7 +18,7 @@ use temen_interp::{
 };
 use temen_ir::Module;
 
-use crate::{onramp_cap_resolver, onramp_check, pg_args_blob};
+use crate::{onramp_check, pg_args_blob};
 
 // ---- nimony's module-stem hash (gear2/modnames.nim + lib/tinyhashes.nim), reproduced exactly -------
 
@@ -158,6 +158,33 @@ pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
                 if !segs.is_empty() {
                     out.push(format!("{importer_dir}/{}.nim", segs.join("/")));
                 }
+            } else {
+                // A **plain-identifier import** — `import hashes, assertions` (nim's comma
+                // multi-import), encoded `(import hashes assertions)` with no `infix`/`prefix`/
+                // `bracket`. Each bare operand is a module resolved relative to the importer's dir
+                // (nim searches the importing module's own directory first), so `hashes` imported
+                // from `/lib/std/tables.nim` is `/lib/std/hashes.nim`. Without this the crawl found
+                // such a module to have **zero deps**, never crawled its imports, and nimsem then
+                // *silently* failed to sem-check it (`r == 0`, no `.s.nif`) — `std/tables` opens
+                // `import hashes, assertions` on its first line (#1424). A `fromimport`
+                // (`from m import a, b`) names its module in the FIRST operand only; the rest are
+                // symbols, not modules.
+                let inner = block
+                    .trim_start_matches('(')
+                    .trim_start_matches(kw)
+                    .trim_end_matches(')');
+                let ids: Vec<&str> = inner
+                    .split_whitespace()
+                    .filter(|t| !t.starts_with('(') && !t.is_empty())
+                    .collect();
+                let take = if kw == "fromimport" {
+                    1.min(ids.len())
+                } else {
+                    ids.len()
+                };
+                for id in &ids[..take] {
+                    out.push(format!("{importer_dir}/{id}.nim"));
+                }
             }
         }
     }
@@ -207,22 +234,27 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
     // Manifest slot bindings for the on-ramp powerbox imports (stdout/stdin/exit/memory) — fs/exec are
     // reached by name (`self.resolve`) instead, so they're not bound here.
     if !m.imports.is_empty() {
-        use temen_interp::cap_id;
+        // The shared powerbox ABI (#912). Like the Postgres powerbox, this one grants no *sized*
+        // address space, so the whole-window `memory` grant serves both address-space roles; an
+        // import naming a capability granted here by name only (`fs`/`exec`) — or not at all —
+        // leaves its slot unbound, fail-closed at dispatch.
+        let granted = temen_ir::PowerboxHandles {
+            stdout: out,
+            stdin: inp,
+            exit,
+            memory,
+            addrspace: memory,
+            jit: None,
+            stderr: None,
+        };
         let bindings = m
             .imports
             .iter()
-            .map(|im| {
-                let Some(cap) = onramp_cap_resolver(&im.name) else {
-                    return temen_interp::BoundImport::rebindable(0, 0, None);
-                };
-                let handle = match (cap.type_id, cap.op) {
-                    (cap_id::STREAM, 1) => out,
-                    (cap_id::STREAM, _) => inp,
-                    (cap_id::EXIT, _) => exit,
-                    (cap_id::ADDRESS_SPACE, _) => memory,
-                    _ => return temen_interp::BoundImport::rebindable(0, 0, None),
-                };
-                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+            .map(|im| match granted.bind(&im.name) {
+                Some((cap, handle)) => {
+                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
+                }
+                None => temen_interp::BoundImport::rebindable(0, 0, None),
             })
             .collect();
         host.set_import_bindings(bindings);
@@ -744,7 +776,10 @@ fn compile_nim_ce_impl(
         let exec = make_exec(nifler_m.clone(), nifler_ce_m.clone(), factory.clone());
         let (o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
-            return Err(format!("nimsem failed on {stem} (code {code}){}", diag_tail(&o)));
+            return Err(format!(
+                "nimsem failed on {stem} (code {code}){}",
+                diag_tail(&o)
+            ));
         }
         if read(&handle, &format!("nimcache/{stem}.s.nif")).is_none() {
             return Err(format!("nimsem produced no {stem}.s.nif"));
@@ -786,7 +821,10 @@ fn compile_nim_ce_impl(
                 };
                 let (o, code) = run_phase(&hexer_m, &argv, (factory)(), None);
                 if code != 0 && code != 5 {
-                    return Err(format!("hexer failed on {stem} (code {code}){}", diag_tail(&o)));
+                    return Err(format!(
+                        "hexer failed on {stem} (code {code}){}",
+                        diag_tail(&o)
+                    ));
                 }
                 read(&handle, &key).ok_or(format!("hexer produced no {key}"))?
             }
@@ -866,6 +904,31 @@ mod tests {
         // A `when`-guarded import is skipped (platform-specific).
         assert!(
             parse_imports("(stmts (import (when (infix / std posix))))", "/lib/std").is_empty()
+        );
+    }
+
+    /// #1424 — a **plain-identifier comma import** (`import hashes, assertions`, encoded
+    /// `(import hashes assertions)`) resolves each bare operand relative to the importer's dir. This
+    /// is `std/tables`' first line; without it the crawl saw `tables` with zero deps, never crawled
+    /// `hashes`/`assertions`, and nimsem then silently failed to sem-check `tables`.
+    #[test]
+    fn parse_imports_handles_plain_comma_import() {
+        assert_eq!(
+            parse_imports("(stmts (import hashes assertions))", "/lib/std"),
+            vec![
+                "/lib/std/hashes.nim".to_string(),
+                "/lib/std/assertions.nim".to_string(),
+            ],
+        );
+        // Single plain import.
+        assert_eq!(
+            parse_imports("(stmts (import hashes))", "/lib/std"),
+            vec!["/lib/std/hashes.nim".to_string()],
+        );
+        // `from m import a, b` — only the module `m` is a dependency, not the symbols.
+        assert_eq!(
+            parse_imports("(stmts (fromimport hashes a b))", "/lib/std"),
+            vec!["/lib/std/hashes.nim".to_string()],
         );
     }
 

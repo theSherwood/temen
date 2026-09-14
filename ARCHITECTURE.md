@@ -25,12 +25,13 @@ from the rows that have them.
 | `temen-text` | Text format ⇄ IR (dev/debug; 1:1 with binary) (§3a) | — |
 | `temen-wasm` | **Core-wasm → IR transpiler** — a second frontend (untrusted, re-verified); stack→SSA reconstruction (`WASM.md`) | — |
 | `temen-llvm` | **LLVM-bitcode → IR translator** — the AOT LLVM on-ramp (untrusted, re-verified); dominance-SSA → block-args (§20a, D54; `LLVM.md`) | — |
+| `temen-leng` | **Leng-NIF → IR translator** — the nimony/Nim on-ramp, the fourth frontend (untrusted, re-verified) (`NIM.md` Phase 2) | — |
 | `temen-peval` | **Partial evaluator** — semantics-preserving IR→IR optimizer + the first Futamura projection (§20c) | — |
 | `temen-durable` | IR→IR **freeze/thaw** transform for durable domains (tooling-tier, +0 TCB; §21, D60; `DURABILITY.md`) | — |
 | `temen-snapshot` | Durable-domain **snapshot artifact codec** (window image + handle table + identity gate; §21; `DURABILITY.md`) | — |
 | `temen-dap` | Interpreter-backed **Debug Adapter Protocol** server (breakpoints/stepping/locals; §19; `DEBUGGING.md`) | — |
-| `temen-wasmjit` | **Temen IR → WebAssembly emitter** — the browser wasm-JIT tier; carries the §4 masking lowering *in emitted wasm* + cap-call outlining (`BROWSER.md`) | escape-TCB |
 | `temen-spec` | The **executable ISA spec** (`SPEC.md`): one machine-readable op table (typing + reference semantics) — the `spec_*` conformance/fuzz oracle the backends and `temen-verify` are checked against (§18) | — (spec oracle) |
+| `temen-parity` | The **op × backend parity matrix** (`OPS_PARITY.md`): an exhaustive, wildcard-free classifier over every `Inst`/`Terminator` × the four backends, pinned by a conformance test so a backend that contradicts the manifest fails CI (INVARIANTS #9/#14) | — (parity oracle) |
 | `temen-opt` | Generic closed-module **IR→IR optimizer** (SSA construct/destruct, SCCP; `OPT.md`, §20a) — the pass library `temen-peval` builds on | — |
 | `temen-exec` | Deterministic **`exec` capability** backend + the wasm-safe exec-cap wire protocol (`EXEC.md`) | — (host cap) |
 | `temen-fs` | In-memory **`fs` capability** backend + the fs-cap wire protocol | — (host cap) |
@@ -39,12 +40,21 @@ from the rows that have them.
 | `temen-webgpu` | Headless **WebGPU compute** capability — host holds a real GPU via `wgpu` (`LLVM.md`; workspace-excluded) | — |
 | `temen` | Umbrella: pipeline (`assemble`/`load`/`run`) + tests + bench | — |
 | `temen-run` | Embedding runtime + **`temen-run` CLI**: instantiate with the powerbox, run on the JIT | — |
-| `browser/` | The **browser platform**: the bytecode interpreter (backend 2) compiled to **wasm64** to run Temen guests client-side, hosting the **wasm-JIT** (backend 4) for hot compute (`BROWSER.md`). Not a separate backend — backend 2 on a wasm host | — |
+| `browser/` | The **browser platform**: the bytecode interpreter (backend 2) compiled to **wasm64** to run Temen guests client-side, hosting the **wasm-JIT** (backend 4) for hot compute (`BROWSER.md`). Not a separate backend — backend 2 on a wasm host — but it **mints the guest window** on this target (20 `unsafe { Region::shared(win_ptr, win_size) }` sites carve a window out of the cdylib's own linear memory), so the confinement backing on the web is established *here* | escape-TCB‡ |
 | `fuzz/` | cargo-fuzz targets (nightly); mirror the stable smoke fuzz | — |
 
 †`temen-jit` is escape-TCB but, by design (§1), shares Wasmtime's codegen — so unlike
 the other TCB crates it *does* take a dependency (Cranelift). The dependency-free rule
 covers only the small audit-critical crates (`temen-ir`/`temen-mask`/`temen-encode`/`temen-verify`).
+
+‡`browser/` is escape-TCB **by what it does, not by what it contains**: it holds no lowering and no
+verifier, but it is where a guest window comes into existence on the web target, and the window's
+backing is a slice of the cdylib's *own* linear memory — so a mistake here puts the engine's memory
+behind the guest's window. #1191 (a guest reading host bytes past its backing) reproduced through
+exactly this seam. It carries none of the discipline the other escape-TCB rows do: not workspace
+member, not dependency-free, ~550 `unsafe` occurrences across 14.3k lines with no `forbid`/`deny`,
+and no fuzz target of its own. Closing that gap is tracked, not claimed — treat the row as a
+statement of *where the boundary is*, not of how well it is currently defended.
 
 The escape-TCB crates are deliberately **dependency-free** (small, fast to compile,
 auditable). The host is Rust; the frontend (`frontend/chibicc`) is C; codegen lowers to

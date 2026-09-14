@@ -7436,10 +7436,13 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
-            // §5 `instantiate_detached` (op 15): not driven by the debugger path (no window minting).
-            Outcome::InstantiateDetached { .. } => {
+            // §5 `instantiate_detached` (op 15): the debugger path mints no windows, so it declines
+            // exactly as the cooperative driver does (#1415). This was `Trap::Malformed`, which ended
+            // the debuggee — the worst place to kill a domain for an op the guest may well handle on
+            // its own error path. Declining keeps the session alive and steppable.
+            Outcome::InstantiateDetached { dst, .. } => {
                 *turn += 1;
-                dbg_complete(tasks, ti, Err(Trap::Malformed));
+                tasks[ti].vt.active.decline_unsupported(dst);
             }
             // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
             Outcome::InstantiateModule {
@@ -12745,12 +12748,9 @@ impl CoopSched {
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
                 // §5 `instantiate_detached` (op 15, #1286): the cooperative scheduler hosts no fresh
-                // window yet — refuse probeably (`-EINVAL`), as the JIT tiers do, never a trap.
+                // window yet — decline probeably, never a trap ([`Vm::decline_unsupported`]).
                 Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
-                    tasks[ti]
-                        .vt
-                        .active
-                        .set(dst, Reg::from_i32(super::EINVAL as i32));
+                    tasks[ti].vt.active.decline_unsupported(dst);
                 }
                 Ok(VcpuStop::InstantiateModule {
                     ibase,
@@ -14875,8 +14875,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
-            // §5 `instantiate_detached` (op 15): the OS-thread parallel driver mints no windows.
-            Ok(VcpuStop::InstantiateDetached { .. }) => return (Err(Trap::Malformed), mem),
+            // §5 `instantiate_detached` (op 15): the OS-thread parallel driver mints no windows, so
+            // it declines exactly as the cooperative driver does (#1415). This was `Trap::Malformed`
+            // — a domain-killing trap for a verified module, which invariant 5 reserves for forgery.
+            Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
+                vt.active.decline_unsupported(dst);
+            }
             // §14 `Instantiator.instantiate_module` (THREADS.md 4c-domain) — a **separate-module**
             // confined child: the host (which holds the powerbox) is locked to resolve + clone the
             // granted `Module`, it is compiled to bytecode and **pushed to the shared source** (so it
@@ -15278,6 +15282,30 @@ impl Vm {
     /// last `resume` persisted, so this targets the same window the op's `dst` was resolved against.
     fn set(&mut self, slot: u32, v: Reg) {
         self.regs[self.base + slot as usize] = v;
+    }
+
+    /// Decline an event **this driver** does not service — the one definition every run loop uses
+    /// (#1415).
+    ///
+    /// A driver that cannot host an op has not been handed a malformed module: the module verified,
+    /// the op is real, and the guest did nothing wrong — this particular run loop simply mints no
+    /// windows (or no threads, or no children). That is a value on the caller's own error path
+    /// (INVARIANTS #5: "errors are values; traps are for forgery"), never a trap. Trapping here
+    /// kills the domain for a condition the guest could have probed and fallen back from, and names
+    /// a module defect that does not exist.
+    ///
+    /// Routed through one function so the coop driver, the OS-thread parallel driver and the
+    /// debugger path cannot drift apart on *how* they decline (INVARIANTS #9 "one shared predicate,
+    /// one definition"; #15 "one path per behaviour") — op 15 had three different answers across
+    /// them before this landed.
+    ///
+    /// The errno is `-EINVAL` because that is what the coop driver and the JIT tiers already
+    /// returned; converging on the incumbent keeps every currently-passing guest unchanged. Whether
+    /// "this driver cannot service the op" deserves its own errno (`-ENOSYS`) so a guest can tell it
+    /// apart from a genuine argument refusal is an open question on #1415 — a behaviour change, so
+    /// it is deliberately not bundled here.
+    fn decline_unsupported(&mut self, dst: u32) {
+        self.set(dst, Reg::from_i32(super::EINVAL as i32));
     }
 
     /// The [`crate::IrPc`] of the op the cursor is on, or `None` if that op is a terminator (which the

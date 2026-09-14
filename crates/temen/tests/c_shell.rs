@@ -290,14 +290,18 @@ fn run_shell_ex(
     // Interpreter: the shell loops to EOF and returns 0 (or `exit`s, a `Trap::Exit`). The reserved
     // window backs the command carve op 13 spawns into.
     let mut fuel = 200_000_000u64;
-    match run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &init, 0, &mut ih).0 {
-        Ok(_) | Err(Trap::Exit(_)) => {}
+    // How the interp arm ended, kept for the differential message below: a dropped-output flake reads
+    // very differently depending on whether the shell returned normally or `exit`ed early, and the
+    // assertion used to discard it (#1430).
+    let iend = match run_capture_reserved_with_host(&m, 0, &[], &mut fuel, &init, 0, &mut ih).0 {
+        Ok(_) => "returned".to_string(),
+        Err(Trap::Exit(c)) => format!("exit({c})"),
         Err(e) => panic!(
             "interp trapped: {e:?}\n--- stdout so far ---\n{}\n--- IR (head) ---\n{}",
             String::from_utf8_lossy(&iposix.stdout()),
             &ir[..ir.len().min(400)]
         ),
-    }
+    };
     // JIT — given the module resolver + named-grant hooks op 13 needs.
     let (jout, _) = compile_and_run_capture_reserved_with_host_ex(
         &m,
@@ -321,10 +325,18 @@ fn run_shell_ex(
     // (op 11 + `SharedRegion` + futex) run single-thread/clockless here; its output must match interp,
     // making the differential interp==JIT==bytecode across the whole shell surface.
     let bout = shell_bytecode_stdout(&m, &cmd_mods, win, stdin, env, files, args);
+    // Name both sides explicitly, and render them as text. `assert_eq!` labels its arguments `left`
+    // and `right`, and the old message ("bytecode … must match interp") did not say which was which —
+    // #1430 read the raw `left: [97, 10, 98, 10] / right: []` the wrong way round and spent its whole
+    // analysis on the coop engine, when the empty side was the OS-threaded interp (the #1022 defect).
+    // A differential assert that can be misread costs more than the characters it saves.
     assert_eq!(
         bout,
         iposix.stdout(),
-        "bytecode (browser engine) output must match interp"
+        "ring/spawn differential mismatch — left is the BYTECODE coop engine, right is the \
+         OS-threaded INTERP (which ended {iend}).\n  bytecode: {:?}\n  interp:   {:?}",
+        String::from_utf8_lossy(&bout),
+        String::from_utf8_lossy(&iposix.stdout()),
     );
 
     (iposix.stdout(), jposix.stdout())
