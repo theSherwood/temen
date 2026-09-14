@@ -103,18 +103,11 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
 
 /// The production granted-spawn hook table (temen-run's child build/bind/release/mint/thunk/serve), the
 /// same one the JIT granted-spawn suites and `rust_guest_op13` install.
-fn grant_hooks() -> GrantChildHooks {
-    GrantChildHooks {
-        build: temen_run::grant_child_build,
-        build_named: temen_run::grant_named_child_build,
-        build_detached: temen_run::grant_detached_child_build,
-        budget_mem_take: temen_run::budget_mem_take,
-        bind_imports: temen_run::child_bind_imports,
-        release: temen_run::grant_child_release,
-        mint: temen_run::child_offer_mint,
-        thunk: temen_run::cap_thunk_locked,
-        register_serve: temen_run::child_register_serve,
-    }
+/// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
+/// the parent pointer it decodes are chosen together (this used to hand-roll both, and nothing
+/// checked that the pointer matched the ctx the run baked).
+fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
+    temen_run::production_grant_hooks(temen_run::CapCtx::Raw(host))
 }
 
 #[test]
@@ -170,7 +163,7 @@ fn nifler_child_runs_on_the_jit_byte_identical() {
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
         Some(temen_run::module_resolver),
-        Some(grant_hooks()),
+        Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit run");
     let status = match jo {

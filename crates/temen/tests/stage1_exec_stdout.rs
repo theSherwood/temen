@@ -206,7 +206,7 @@ fn run_jit(cmd: &temen_ir::Module, argv: &[&[u8]], wide: bool) -> (JitOutcome, V
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut core::ffi::c_void,
         Some(temen_run::module_resolver),
-        Some(grant_hooks()),
+        Some(grant_hooks(&mut host as *mut Host)),
     )
     .expect("jit");
     (jo, host.stdout_bytes())

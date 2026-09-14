@@ -357,6 +357,11 @@ pub(crate) struct Nursery {
     /// granted child's module address on its shared powerbox so the locked thunk's serve arm
     /// can resolve + invoke handlers.
     grant_register_serve: std::sync::atomic::AtomicUsize,
+    /// #1234 — the parent host pointer the registered hook family decodes
+    /// ([`crate::GrantChildHooks::parent_ctx`]), stored with the family rather than re-read from
+    /// `cap_ctx`: the run may have baked either shape there, and only the hooks' own registration
+    /// knows which one this family expects. `0` when no hooks are registered.
+    grant_parent_ctx: std::sync::atomic::AtomicUsize,
     /// #964: the run's NULL guard (`0` = unguarded), set once at run entry via
     /// [`Nursery::set_null_guard`] (same interior-mutability contract as `set_durable`). A carve
     /// overlapping `[0, guard)` of the window is refused `-EINVAL` — the host seeds/copies a
@@ -412,6 +417,7 @@ impl Nursery {
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
+            grant_parent_ctx: std::sync::atomic::AtomicUsize::new(0),
             grant_register_serve: std::sync::atomic::AtomicUsize::new(0),
             grant_mint: std::sync::atomic::AtomicUsize::new(0),
             grant_thunk: std::sync::atomic::AtomicUsize::new(0),
@@ -436,7 +442,7 @@ impl Nursery {
     }
 
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t, rs, bd, mt) = match hooks {
+        let (b, bn, r, bi, m, t, rs, bd, mt, pc) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
@@ -447,8 +453,9 @@ impl Nursery {
                 h.register_serve as usize,
                 h.build_detached as usize,
                 h.budget_mem_take as usize,
+                h.parent_ctx as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
@@ -459,6 +466,15 @@ impl Nursery {
         self.grant_bind_imports.store(bi, Ordering::Release);
         self.grant_mint.store(m, Ordering::Release);
         self.grant_thunk.store(t, Ordering::Release);
+        self.grant_parent_ctx.store(pc, Ordering::Release);
+    }
+
+    /// #1234 — the parent host pointer to hand a §14 child hook: the one **registered with the
+    /// hook family**, never the run's `cap_ctx`. `cap_ctx` is correct for `self.cap_thunk` (they
+    /// are baked together and the thunk decodes its own shape); a hook decodes the pointer itself,
+    /// so it must be given the shape its own family was built for.
+    fn grant_ctx(&self) -> *mut core::ffi::c_void {
+        self.grant_parent_ctx.load(Ordering::Acquire) as *mut core::ffi::c_void
     }
 
     /// Derive and allocate a child's counted-fuel cell, exactly as the interpreter derives `child_fuel`
@@ -1032,7 +1048,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         jit_table_log2: 0,
     };
     if build(
-        rt.cap_ctx,
+        rt.grant_ctx(),
         mem_base as *mut u8,
         mem_size,
         grants_ptr as u64,
@@ -1058,7 +1074,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 && grants_n > 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.cap_ctx, gc.ctx, -1) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, -1) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
@@ -1190,7 +1206,14 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
             spawn: -1,
         };
         // Peek first (validate + mem-quota gate, budget intact on refusal)…
-        match taker((*rt).cap_ctx, budget, child_size, 0, &mut taken, trap_out) {
+        match taker(
+            (*rt).grant_ctx(),
+            budget,
+            child_size,
+            0,
+            &mut taken,
+            trap_out,
+        ) {
             1 => {}
             2 => return EINVAL as i32,
             _ => return 0, // CapFault set
@@ -1205,7 +1228,14 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         // peek's (same size/entry/carve math), so a post-drain refusal is unreachable in
         // practice; a same-domain sibling racing `split` between peek and drain gets
         // either-or (its own doing — the armed fuel is the peeked value).
-        match taker((*rt).cap_ctx, budget, child_size, 1, &mut taken, trap_out) {
+        match taker(
+            (*rt).grant_ctx(),
+            budget,
+            child_size,
+            1,
+            &mut taken,
+            trap_out,
+        ) {
             1 => {}
             2 => return EINVAL as i32,
             _ => return 0,
@@ -1366,7 +1396,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         jit_table_log2: 0,
     };
     if build(
-        rt.cap_ctx,
+        rt.grant_ctx(),
         mem_base as *mut u8,
         mem_size,
         grants_ptr as u64,
@@ -1388,7 +1418,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         // §3.3 withhold: a `required` import with nothing to bind fails the spawn closed —
         // probeable `-EINVAL`, before compiling or running any child code (the interpreter's
         // inline spawn takes the same early exit).
-        if bind(rt.cap_ctx, gc.ctx, module) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
@@ -1647,7 +1677,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         return EINVAL as i32;
     }
     // Admission = the budget's quota take (the commit; every refusal above charged nothing).
-    if take(rt.cap_ctx, budget as i32, child_size) == 0 {
+    if take(rt.grant_ctx(), budget as i32, child_size) == 0 {
         return EINVAL as i32;
     }
     let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
@@ -1660,7 +1690,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         jit_table_log2: 0,
     };
     if build(
-        rt.cap_ctx,
+        rt.grant_ctx(),
         mem_base as *mut u8,
         mem_size,
         grants_ptr as u64,
@@ -1675,7 +1705,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     let bind_addr = rt.grant_bind_imports.load(Ordering::Acquire);
     if bind_addr != 0 {
         let bind: crate::ChildManifestBinder = core::mem::transmute(bind_addr);
-        if bind(rt.cap_ctx, gc.ctx, module) != 0 {
+        if bind(rt.grant_ctx(), gc.ctx, module) != 0 {
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
@@ -1769,7 +1799,7 @@ pub(crate) unsafe extern "C" fn child_offer(
         return EINVAL;
     }
     let mint: crate::ChildOfferMint = core::mem::transmute(mint_addr);
-    mint(rt.cap_ctx, retained as *mut core::ffi::c_void, export)
+    mint(rt.grant_ctx(), retained as *mut core::ffi::c_void, export)
 }
 
 pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i64 {
