@@ -34,6 +34,11 @@ mod nimc;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 
+// A powerbox whose capabilities are **defined in JS** (`temen_jspb_*`): the page names them, the
+// module's import manifest binds them, one wasm import services every call. Built on both targets —
+// natively the JS side is a test hook, so the binding path is testable off-browser (`tests/jspb.rs`).
+pub mod jspb;
+
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
 
 /// In-wasm roundtrip probe: parse → **encode** → **decode** → run, entirely inside the sandbox, so

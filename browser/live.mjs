@@ -28,6 +28,9 @@ const imports = {
     host_now_ns: () => CLOCK_NS,
     // The `webgpu` capability's host seam — unused by this demo (no GPU surface), so a no-op stub.
     webgpu_op: () => -1n,
+    // The JS-defined powerbox's seam (`temen_jspb_*`) — unused here; this demo binds the older
+    // fixed `(console, clock)` host imports instead.
+    js_cap_call: () => -38n,
   },
 };
 

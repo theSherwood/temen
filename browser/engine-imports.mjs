@@ -17,7 +17,21 @@ export function engineImports(memory) {
   const noForeign = () => { throw new Error('foreign memory access in a harness without foreign-mem.js'); };
   const foreign = Object.fromEntries(
     ['foreign_read', 'foreign_write', 'foreign_fill', 'foreign_copy', 'foreign_atomic', 'foreign_grow', 'foreign_mint'].map((n) => [n, noForeign]));
-  const imports = { temen_host: { ...foreign, webgpu_op: () => -1n, stdout_chunk: () => {} } };
+  // `js_cap_call` is the JS-defined powerbox's seam (`web/powerbox.js`): one guest capability call,
+  // dispatched to the function the page bound to that slot. Delegated to the same `globalThis` hook
+  // the playground uses (`web/par.js`), so a harness that imports `powerbox.js` drives the real seam;
+  // with no servicer installed a call is -ENOSYS, exactly as the engine documents.
+  const imports = {
+    temen_host: {
+      ...foreign,
+      webgpu_op: () => -1n,
+      stdout_chunk: () => {},
+      js_cap_call: (slot, op, argsPtr, nArgs, mem) => {
+        const h = globalThis.__temen_js_cap_call;
+        return h ? BigInt(h(Number(slot), Number(op), argsPtr, nArgs, mem)) : -38n;
+      },
+    },
+  };
   if (memory) imports.env = { memory };
   return imports;
 }

@@ -13,6 +13,7 @@ import { createDapClient } from './dap.js';
 import { initWebGPU, teardownWebGPU, webgpuAvailable } from './webgpu.js';
 import { createEditor, setVimAll, refreshAll } from './editor.js';
 import { formatPgOutput } from './pg-format.js';
+import { definePowerbox } from './powerbox.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -183,6 +184,61 @@ block 0 (vsp: i64, vh: i64) {
 }
 `,
   },
+  'JS powerbox (capabilities defined in JavaScript)': {
+    kind: 'jspb',
+    editable: true,
+    desc: 'Everywhere else on this page a guest’s capabilities are implemented Rust-side. Here the ' +
+      'page defines them: the JavaScript below <em>is</em> the powerbox — one function per capability ' +
+      'the guest imports, bound by name when the module is instantiated. The guest logs a line, has the ' +
+      'host uppercase a string inside its own window (proving the host can write back, bounds-checked), ' +
+      'and reads the host clock. Edit either pane and Run; give the guest an import the JS doesn’t ' +
+      'define and the run is refused before a single guest op executes.',
+    src: `; Every capability this guest calls is implemented in JavaScript, bound by name at instantiation.
+memory 16
+data 16384 "hello from the guest\\n"
+data 16448 "the host is javascript\\n"
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  ; js.log(ptr, len) -> bytes written
+  v0 = i32.const 0
+  v1 = i64.const 16384
+  v2 = i64.const 21
+  v3 = call.sym "js.log" (i64, i64) -> (i64) v0 (v1, v2)
+  ; js.upper(ptr, len) uppercases those bytes inside the guest's OWN window ...
+  v4 = i32.const 0
+  v5 = i64.const 16448
+  v6 = i64.const 23
+  v7 = call.sym "js.upper" (i64, i64) -> (i64) v4 (v5, v6)
+  ; ... and the guest logs them back, so the host's write is visible from inside
+  v8 = i32.const 0
+  v9 = call.sym "js.log" (i64, i64) -> (i64) v8 (v5, v6)
+  ; js.now() -> the host clock, returned as the guest's result
+  v10 = i32.const 0
+  v11 = call.sym "js.now" () -> (i64) v10 ()
+  return v11
+  }
+}
+`,
+    js: `// The powerbox: one entry per capability the guest imports. A handler gets the call's
+// i64 args (BigInt) and \`mem\`, a bounds-checked view of the guest's window that is live
+// for this call only. Return a number or BigInt (negative = an errno the guest can test).
+({
+  'js.log': (args, mem) => {
+    print(mem.str(args[0], args[1]));   // into this card's output pane
+    return args[1];                     // bytes written
+  },
+
+  'js.upper': (args, mem) => {
+    const s = mem.str(args[0], args[1]);
+    return mem.write(args[0], s.toUpperCase()) ? 0 : -14;  // -EFAULT if it didn't fit
+  },
+
+  'js.now': () => BigInt(Date.now()),
+})
+`,
+  },
+
   jit: {
     mode: 'jit',
     desc: '§22 guest-JIT: 8 worker vCPUs each install a host-compiled unit into the SHARED Domain ' +
@@ -4005,6 +4061,97 @@ function endDebug(c, message) {
   if (message) setState(c, 'done', message);
 }
 
+// Parse + verify a card's Temen text **inside the sandbox** (`temen_parse`) and return the encoded
+// module bytes, or `null` after putting the card into its error state (the message is pinned on the
+// offending line). Shared by the Worker-driven text runner and the JS-powerbox one below.
+function parseGuest(c, rec, src) {
+  const srcBytes = new TextEncoder().encode(src);
+  if (srcBytes.length === 0) {
+    setState(c, 'error', 'parse error: empty source');
+    runEnd(rec, { ok: false });
+    return null;
+  }
+  const u8 = () => new Uint8Array(eng.memory.buffer);
+  const tParse = performance.now();
+  const p = eng.ex.temen_alloc(srcBytes.length);
+  u8().set(srcBytes, p);
+  const ok = eng.ex.temen_parse(p, srcBytes.length);
+  eng.ex.temen_dealloc(p, srcBytes.length);
+  const out = u8().slice(eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
+  if (ok !== 1) {
+    const msg = new TextDecoder().decode(out);
+    setState(c, 'error', msg);
+    c.editor.markError(msg); // pin the offending line in the editor when we can locate it
+    runNote(rec, { parseError: msg });
+    runEnd(rec, { ok: false });
+    return null;
+  }
+  runStage(rec, 'parse', performance.now() - tParse);
+  logTo(c, `parsed: ${srcBytes.length}B text → ${out.length}B module`);
+  runNote(rec, { srcBytes: srcBytes.length, moduleBytes: out.length });
+  return out;
+}
+
+// A powerbox defined **in the page** (`web/powerbox.js`): the JS pane is the host. The guest still
+// parses, verifies and runs inside the sandbox; what is new is where its capabilities come from —
+// the page names them, the module's import manifest binds them, and each call is serviced by the JS
+// function of that name. Main-thread and single-vCPU by construction: a JS capability can only be
+// serviced where its function lives, so there are no Workers on this path.
+async function runJsPowerbox(c) {
+  const rec = runStart(c, { tier: 'interpreter', mode: 'js-powerbox' });
+  setState(c, 'running', 'parsing…');
+  c.el.result.textContent = '';
+  c.el.stdout.textContent = '';
+  const guest = parseGuest(c, rec, c.editor.getValue());
+  if (!guest) return;
+
+  // The pane evaluates to `{ name: handler }` — the whole powerbox, one function per capability.
+  // `print` is the only thing the page lends it: this card's output pane.
+  let caps;
+  try {
+    const print = (text) => { c.el.stdout.textContent += text; };
+    caps = new Function('print', `"use strict"; return (${c.jsEditor.getValue()});`)(print);
+    if (!caps || typeof caps !== 'object') throw new Error('the powerbox must be an object of capabilities');
+  } catch (e) {
+    setState(c, 'error', `powerbox error: ${e.message}`);
+    logTo(c, `powerbox error: ${e.message}`);
+    runNote(rec, { powerboxError: e.message });
+    runEnd(rec, { ok: false });
+    return;
+  }
+  const names = Object.keys(caps);
+  logTo(c, `powerbox: [${names.join(', ')}]`);
+
+  c.el.run.disabled = true;
+  setState(c, 'running', 'running…');
+  const t0 = performance.now();
+  let out;
+  try {
+    out = definePowerbox(eng, caps).run(guest);
+  } catch (e) {
+    setState(c, 'error', `run error: ${e.message}`);
+    logTo(c, `run error: ${e.message}`);
+    runEnd(rec, { ok: false });
+    return;
+  } finally {
+    c.el.run.disabled = broken;
+  }
+  const ms = runStage(rec, 'run:interpreter', performance.now() - t0).toFixed(0);
+  if (out.status !== 0) {
+    // A refusal (an import no handler defines) and a trap both land here, with the engine's message.
+    const msg = out.error || `run failed: status ${out.status}`;
+    setState(c, 'error', msg);
+    logTo(c, msg);
+    runNote(rec, { runError: msg });
+    runEnd(rec, { ok: false, status: out.status });
+    return;
+  }
+  c.el.result.textContent = `${out.value}`;
+  setState(c, 'done', `done: ${names.length} JS capabilit${names.length === 1 ? 'y' : 'ies'} · ${ms}ms`);
+  logTo(c, `run → ${out.value} in ${ms}ms`);
+  runEnd(rec, { ok: true, status: out.status, result: `${out.value}` });
+}
+
 // Temen **text** guests: parse+verify inside the sandbox (`temen_parse`), then run across Workers under the
 // card's selected powerbox recipe.
 async function runText(c) {
@@ -4018,34 +4165,8 @@ async function runText(c) {
   c.el.stdout.textContent = '';
   c.el.canvas.hidden = true;
 
-  const u8 = () => new Uint8Array(eng.memory.buffer);
-  const srcBytes = new TextEncoder().encode(src);
-  let guest;
-  if (srcBytes.length === 0) {
-    setState(c, 'error', 'parse error: empty source');
-    runEnd(rec, { ok: false });
-    return;
-  }
-  {
-    const tParse = performance.now();
-    const p = eng.ex.temen_alloc(srcBytes.length);
-    u8().set(srcBytes, p);
-    const ok = eng.ex.temen_parse(p, srcBytes.length);
-    eng.ex.temen_dealloc(p, srcBytes.length);
-    const out = u8().slice(eng.ex.temen_parse_ptr(), eng.ex.temen_parse_ptr() + eng.ex.temen_parse_len());
-    if (ok !== 1) {
-      const msg = new TextDecoder().decode(out);
-      setState(c, 'error', msg);
-      c.editor.markError(msg); // pin the offending line in the editor when we can locate it
-      runNote(rec, { parseError: msg });
-      runEnd(rec, { ok: false });
-      return;
-    }
-    guest = out;
-    runStage(rec, 'parse', performance.now() - tParse);
-  }
-  logTo(c, `parsed: ${srcBytes.length}B text → ${guest.length}B module`);
-  runNote(rec, { srcBytes: srcBytes.length, moduleBytes: guest.length });
+  const guest = parseGuest(c, rec, src);
+  if (!guest) return;
 
   aborter = new AbortController();
   c.el.run.disabled = true;
@@ -4115,6 +4236,7 @@ async function runDemo(c) {
   if (ex.kind === 'bash') return runBash(c);
   if (ex.kind === 'bash-i' || ex.kind === 'bash-i-coop') return runBashInteractive(c);
   if (ex.kind === 'module') return runModule(c);
+  if (ex.kind === 'jspb') return runJsPowerbox(c);
   return runText(c);
 }
 
@@ -4258,7 +4380,23 @@ function buildCard(name, ex) {
         if (dapCard === c) dapSyncBreakpoints(c);
       });
     }
-  } else {
+  }
+  // A card that defines its powerbox in JS (`kind: 'jspb'`) gets a second editor: the guest above, the
+  // JavaScript that implements the capabilities it imports here. Both are editable and both persist.
+  let jsEditor = null;
+  if (ex.js) {
+    section.appendChild(el('p', 'desc', 'the powerbox — one JavaScript function per capability the guest imports:'));
+    const ta = el('textarea');
+    ta.value = ex.js;
+    const wrap = el('div', 'editor');
+    wrap.appendChild(ta);
+    section.appendChild(wrap);
+    jsEditor = createEditor(ta, 'js');
+    const saved = loadSaved(id + ':js');
+    if (saved != null && saved !== ex.js) jsEditor.setValue(saved);
+    jsEditor.onChange(() => saveSrc(id + ':js', jsEditor.getValue(), ex.js));
+  }
+  if (!editable) {
     section.appendChild(el('pre', 'note',
       ex.kind === 'bash-i' || ex.kind === 'bash-i-coop'
         ? `Real GNU bash, interactive (${ex.url}). Click Run to start the session, then type at the prompt in the input below — every key goes to the terminal (readline line editing, arrows, Ctrl+C / Ctrl+D / Ctrl+Z). Stop tears the session down.`
@@ -4472,7 +4610,7 @@ function buildCard(name, ex) {
   }
 
   const c = {
-    name, ex, editor, id,
+    name, ex, editor, jsEditor, id,
     el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
   };
   // `pickFile` cards: a file input + the canvas as a drop target. The picked file replaces the card's
@@ -4525,6 +4663,7 @@ function buildCard(name, ex) {
     editor.setValue(dflt);
     clearSaved(id);
     editor.clearError();
+    if (jsEditor) { jsEditor.setValue(ex.js); clearSaved(id + ':js'); }
     setState(c, 'ready', 'reset to the original source');
   });
   if (shareBtn) shareBtn.addEventListener('click', () => shareCard(c));
