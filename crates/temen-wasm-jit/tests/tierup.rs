@@ -406,3 +406,323 @@ fn widened_cross_tier_uncascades_the_caller() {
         "#888 widened cross-tier: f1 now emits (f2 is a marshallable cross-tier callee)"
     );
 }
+
+/// #1370 — the counterpart to [`widened_cross_tier_uncascades_the_caller`]: the #888 widening must
+/// **not** reach a callee the bounce cannot complete.
+///
+/// The B2 cross-tier set admits any `marshallable_sig` non-subset function because its host services
+/// `env.call_interp` over the run's live window/powerbox — which covers memory and cap calls, the
+/// axes #887 widened for. It does not cover the **§12 scheduling** axis: a bounce is a synchronous
+/// nested drive (`temen-interp`'s `drive_nested`), and that loop has no arm for `thread.*` or
+/// `memory.wait`/`notify`, so the first such op traps `CapFault` and the whole run declines to the
+/// interpreter — even though the identical call made *inline* runs fine. That breaks the tier-up
+/// contract that eligibility is "a pure acceleration, never a correctness gate".
+///
+/// This is the JACL shape: `f1` is `__jacl_entry` (a small all-i64 body whose only work is a direct
+/// call), `f2` is `jacl_sched_run_main` (the language runtime's scheduler, futex-bearing). Before the
+/// fix `f2` was a widened leaf, so `f1` stayed emitted and every run of it trapped. The gate excludes
+/// `f2` from the leaf set instead, and the fixpoint cascades `f1` off the emitted set — the region is
+/// never emitted into a bounce that cannot complete.
+const FUTEX_CALLEE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 1
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  vcnt = i32.const 1
+  vwk = atomic.notify vaddr vcnt
+  return v0
+  }
+}
+"#;
+
+#[test]
+fn futex_callee_is_not_a_widened_cross_tier_leaf() {
+    let m = build(FUTEX_CALLEE);
+    // Sanity: f2 really is the futex-bearing callee this gate is about.
+    assert!(
+        m.funcs[2].uses_futex(),
+        "f2 must carry the futex ops for this test to mean anything"
+    );
+    // The local table never admitted it (`interp_leaf` excludes `uses_concurrency`) — unchanged.
+    let (_, local) = compile_module_tierup(&m, false).expect("local tier-up emit");
+    assert_eq!(
+        local,
+        vec![false, false, false],
+        "local table: f1 cascades off (f2 isn't a strict interp_leaf)"
+    );
+    // B2 must now agree: f2 is not bounce-serviceable, so f1 cascades off rather than being emitted
+    // into a bounce that CapFaults. Before #1370 this was `[false, true, false]`.
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    assert_eq!(
+        widened,
+        vec![false, false, false],
+        "#1370: a futex-bearing callee must not be a widened cross-tier leaf, so its caller cascades off"
+    );
+}
+
+/// The gate is **surgical**, not a blanket retreat from #888: swapping the futex callee's body for a
+/// `call.cap` (the memory/cap axis the widening was actually for) leaves `f1` emitted. Without this,
+/// a regression that widened the gate to all of [`Func::uses_concurrency`] — or reverted #888
+/// outright — would still satisfy the test above.
+#[test]
+fn the_futex_gate_does_not_narrow_the_888_widening() {
+    let futex = build(FUTEX_CALLEE);
+    let cap = build(CASCADE);
+    // Identical shape (f0 interp-driven root, f1 pure compute calling f2); the ONLY difference is
+    // what f2 does — futex ops vs a `call.cap`.
+    let (_, futex_widened) = compile_module_tierup_b2(&futex, false, 10).expect("B2 emit");
+    let (_, cap_widened) = compile_module_tierup_b2(&cap, false, 10).expect("B2 emit");
+    assert_eq!(
+        futex_widened,
+        vec![false, false, false],
+        "futex callee: f1 cascades off"
+    );
+    assert_eq!(
+        cap_widened,
+        vec![false, true, false],
+        "cap callee: f1 still emits — the #888 widening is intact"
+    );
+}
+
+/// #1370, transitivity: inside a bounce every callee runs on the same nested drive, so it is not
+/// enough for the leaf's own body to be clean. Here `f2` (the candidate leaf) is pure arithmetic and
+/// only its *callee* `f3` touches the futex — before the closure was taken, `f2` was admitted as a
+/// leaf and `f1` stayed emitted, so the bounce still trapped one frame deeper.
+const FUTEX_TRANSITIVE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 7
+  vsum = i64.add v0 vk
+  vr = call 3 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 1
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  return v0
+  }
+}
+"#;
+
+#[test]
+fn a_futex_reaching_callee_closure_is_not_a_leaf() {
+    let m = build(FUTEX_TRANSITIVE);
+    // f2's own body is clean — only f3 carries the futex. The closure is what disqualifies it.
+    assert!(!m.funcs[2].uses_futex(), "f2's own body must be clean");
+    assert!(m.funcs[3].uses_futex(), "f3 carries the futex");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    assert_eq!(
+        widened,
+        vec![false, false, false, false],
+        "#1370: an unserviceable op anywhere in the callee closure disqualifies the leaf, and the \
+         emit fixpoint cascades its callers off"
+    );
+}
+
+/// #1370, the `suspend` seed. `drive_nested` services `cont.new`/`cont.resume` — whoever runs them
+/// owns both sides — but its `FiberSuspend` arm needs a resumer on the chain, and a bounce entry has
+/// none. So a `suspend`-bearing callee is unserviceable for the same reason a futex one is, while a
+/// callee that merely drives its *own* fiber to completion stays a perfectly good leaf.
+const SUSPEND_CALLEE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vs = suspend v0
+  return vs
+  }
+}
+"#;
+
+#[test]
+fn a_suspending_callee_is_not_a_widened_cross_tier_leaf() {
+    let m = build(SUSPEND_CALLEE);
+    assert!(m.funcs[2].uses_suspend(), "f2 must carry the suspend");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    assert_eq!(
+        widened,
+        vec![false, false, false],
+        "#1370: a `suspend`-bearing callee CapFaults on the bounce's empty resume chain, so it must \
+         not be a leaf"
+    );
+}
+
+/// #1370, the indirect clause — the gate's most conservative rule, pinned in both directions.
+///
+/// A `call.dyn` inside a bounce resolves through the shared reserved table and can land on **any**
+/// slot, so once the module contains an unserviceable op an indirect-calling candidate might reach
+/// it. That is the same fail-closed posture `analyze_from` takes for indirect reachability. The
+/// second half is what keeps the rule honest: with no unserviceable op anywhere, an indirect-calling
+/// callee is still a perfectly good leaf, so the #888 widening is untouched on the C-family cards
+/// (single-threaded guests carry no futex/thread/`suspend` op at all).
+const INDIRECT_DISPATCH: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vi = i32.wrap_i64 v0
+  vr = call.dyn (i64) -> (i64) vi (v0)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vaddr = i64.const 16384
+  vexp = i32.const 1
+  vto = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vto
+  return v0
+  }
+}
+"#;
+
+/// The same module with the futex body (f3) replaced by pure arithmetic — nothing unserviceable
+/// anywhere, so the indirect clause must stay dormant.
+const INDIRECT_DISPATCH_CLEAN: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vi = i32.wrap_i64 v0
+  vr = call.dyn (i64) -> (i64) vi (v0)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 2
+  vr = i64.mul v0 vk
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
+    // With a futex op in the module, the indirect-dispatching callee f2 could reach it → not a leaf,
+    // so f1 cascades off.
+    let dirty = build(INDIRECT_DISPATCH);
+    let (_, widened) = compile_module_tierup_b2(&dirty, false, 10).expect("B2 tier-up emit");
+    assert!(
+        !widened[1],
+        "an indirect callee may dispatch to the futex function, so its caller must cascade off: \
+         {widened:?}"
+    );
+
+    // Same module, nothing unserviceable: the indirect clause is dormant and f1 still emits.
+    let clean = build(INDIRECT_DISPATCH_CLEAN);
+    let (_, widened_clean) = compile_module_tierup_b2(&clean, false, 10).expect("B2 tier-up emit");
+    assert!(
+        widened_clean[1],
+        "with no unserviceable op anywhere the indirect clause must not fire — the #888 widening \
+         stands: {widened_clean:?}"
+    );
+}

@@ -1418,6 +1418,72 @@ fn func_uses_indirect(f: &Func) -> bool {
     })
 }
 
+/// Per function: can a cross-tier bounce *into* it be completed by the nested drive that services
+/// `env.call_interp` (`temen-interp`'s `drive_nested`)? — #1370.
+///
+/// A bounce is a **synchronous** nested drive: one `Vm` plus its fibers, run to completion while the
+/// emitted frame that called it is still on the stack. `drive_nested` therefore has arms for exactly
+/// the outcomes that can finish without a scheduler — `Done`/`Suspended`/`CapPending`, the fiber ops
+/// (`ContNew`/`ContResume`/`FiberSuspend`), and the §22 `Jit*` ops — and traps `CapFault` on anything
+/// else. Three op families cannot be served, and each is a *seed* below:
+///
+/// * **threads** (`thread.spawn`/`join`) — no peer vCPU exists inside a bounce;
+/// * **futex** (`memory.wait`/`notify`) — a wait that matches can never be woken (every party that
+///   could store is either parked here or blocked behind this bounce), and a notify cannot reach the
+///   outer driver's waiters, which would be a lost wakeup rather than a trap;
+/// * **`suspend`** — `drive_nested`'s `FiberSuspend` arm needs a resumer on its chain, and the chain
+///   is empty at a bounce entry, so it `CapFault`s. `cont.new`/`cont.resume` are *not* seeds: they
+///   are self-contained (the drive owns both sides) and gating them would drop working coverage.
+///
+/// The property is **transitive**: inside a bounce every callee runs on the same nested drive, so a
+/// leaf is admissible only if its whole callee closure is. The fixpoint below propagates the seeds
+/// backwards over direct call edges. A `call.dyn` can dispatch to any table slot, so once anything in
+/// the module is unserviceable an indirect-calling function is conservatively unserviceable too —
+/// the same fail-closed posture [`analyze_from`] takes for indirect reachability.
+///
+/// This gate matters only in the shared-reserved-table (B2) leaf set below, which admits any
+/// [`marshallable_sig`] non-subset function. The strict [`interp_leaf`] set used with a local table
+/// already excludes all of this via [`Func::uses_concurrency`]. Without it, a language runtime's
+/// scheduler (the canonical shape — JACL's `jacl_sched_run_main`) becomes a cross-tier leaf, its
+/// caller stays emitted, and the first futex op inside the bounce traps the whole run to the
+/// interpreter. That breaks the tier-up contract that eligibility is "a pure acceleration, never a
+/// correctness gate": the same call made *inline* completes fine. Marking the callee unserviceable
+/// instead lets the emit fixpoint cascade its callers off, so a region is never emitted into a bounce
+/// that cannot complete — and the rest of the module still tiers up.
+///
+/// **Keep the seeds in lockstep with `drive_nested`'s match arms.** Widening that loop to service an
+/// op (e.g. over #1359's yielding bounce) is what earns dropping a seed here — not the reverse.
+fn bounce_serviceable(m: &Module) -> Vec<bool> {
+    let n = m.funcs.len();
+    let mut bad: Vec<bool> = m
+        .funcs
+        .iter()
+        .map(|f| f.uses_threads() || f.uses_futex() || f.uses_suspend())
+        .collect();
+    // Monotone (only sets), so it converges in ≤ n passes.
+    loop {
+        let mut changed = false;
+        let any_bad = bad.iter().any(|&b| b);
+        for i in 0..n {
+            if bad[i] {
+                continue;
+            }
+            let reaches_bad = (any_bad && func_uses_indirect(&m.funcs[i]))
+                || func_callees(&m.funcs[i])
+                    .iter()
+                    .any(|&c| (c as usize) < n && bad[c as usize]);
+            if reaches_bad {
+                bad[i] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    bad.into_iter().map(|b| !b).collect()
+}
+
 /// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
 fn interp_leaf(f: &Func) -> bool {
     if !marshallable_sig(f) || f.uses_concurrency() {
@@ -3026,11 +3092,14 @@ fn compile_module_tierup_inner(
     //     calls, and cap-call. Widening here collapses the fixpoint cascade below: an in-subset
     //     function that calls a memory/cap helper stays emitted instead of being dropped
     //     (#887 measured this as ~30% → ~90% static coverage on the C-family cards).
+    // #1370: the widened set admits any marshallable non-subset function, but a bounce into one that
+    // (transitively) uses threads/futex/`suspend` cannot complete — see [`bounce_serviceable`].
+    let serviceable = bounce_serviceable(m);
     let leaf: Vec<bool> = (0..n)
         .map(|i| {
             !in_subset[i]
                 && if reserved_table_log2.is_some() {
-                    marshallable_sig(&m.funcs[i])
+                    marshallable_sig(&m.funcs[i]) && serviceable[i]
                 } else {
                     interp_leaf(&m.funcs[i])
                 }
