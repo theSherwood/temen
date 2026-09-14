@@ -129,6 +129,27 @@ fn importc_name(pragmas: Option<&Node>) -> Option<String> {
     None
 }
 
+/// The **seed value for an `importc` *global***, by C name — the data twin of the `importc` *proc*
+/// leaves `temen_leng`'s `COMPUTE_LEAVES` binds. An `importc` gvar has no definition anywhere in the
+/// compiled program (that is what `importc` means); nimony's C backend gets one from libc or from
+/// the generated `main`'s prologue. Leng lowers it to an ordinary zero-initialized global instead, so
+/// unless it is seeded here it is a null pointer forever.
+///
+/// `nimEnviron` is the only one today: `std/envvars`' `getEnvVarsC` walks it until it reads NULL, so
+/// a null pointer faults on the first load against the #1094 guard rather than reporting "no
+/// variables" — taking `getEnv`/`existsEnv`, and every module that reaches them, down with it
+/// (#1422). Seeding it with the address of the empty `envp` vector `_start` builds
+/// ([`temen_ir::POWERBOX_EMPTY_ENVP`]) makes the scan terminate immediately: the sandbox's
+/// environment is empty, which is exactly what it is.
+fn importc_global_seed(cname: &str) -> Option<[u8; 8]> {
+    match cname {
+        "nimEnviron" => {
+            Some((temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP).to_le_bytes())
+        }
+        _ => None,
+    }
+}
+
 /// True if a node is a NIF string literal (a quote-delimited atom, e.g. a `LongString`'s `data`).
 fn is_string_literal(node: &Node) -> bool {
     matches!(node.as_atom(), Some(a) if a.starts_with('"') && a.ends_with('"') && a.len() >= 2)
@@ -685,6 +706,15 @@ impl Translator {
                         };
                         self.tls_vars.insert(name, (off, desc));
                         continue;
+                    }
+                    // An `importc` gvar (`nimEnviron`) has no definition to link against — seed it
+                    // with the value the powerbox runtime stands behind it (see
+                    // [`importc_global_seed`]) rather than leaving the null the window is zeroed to.
+                    if let Some(bytes) = importc_name(a.get(1))
+                        .as_deref()
+                        .and_then(importc_global_seed)
+                    {
+                        self.data_inits.push((off, bytes.to_vec()));
                     }
                     // A non-zero scalar initializer becomes a `data` segment at the global's offset
                     // (the window is otherwise zero).

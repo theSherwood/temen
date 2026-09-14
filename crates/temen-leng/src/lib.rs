@@ -347,14 +347,26 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 /// ceiling *is* that window top. [`seed_powerbox_heap`] bakes both words into the linked module's
 /// data image (post-link, where the window is known); see it for the #1051/#1054/#1060 rationale.
 fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
+    // `argc = 0`, and `argv`/`envp` point at **one-entry NULL-terminated vectors** rather than being
+    // NULL themselves (#1422): `_start` writes the terminator into the reserved page-0 scratch at
+    // [`temen_ir::POWERBOX_EMPTY_ARGV`]/[`POWERBOX_EMPTY_ENVP`] and hands `main` their addresses.
+    // Passing 0 is what a C `main` is never given, and nim's `getEnvVarsC` walks `nimEnviron` until
+    // it reads NULL — so a null `envp` faulted on the very first load against the #1094 guard,
+    // taking every module that reaches `std/envvars` (`os`, `paths`, `strtabs`, `appdirs`, …) down
+    // with it. One store each, paid once per run.
+    let argv = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ARGV;
+    let envp = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP;
     let text = format!(
         "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
          func () -> (i32) {{\n\
          block 0 () {{\n\
          \x20 v0 = data.top\n\
          \x20 v1 = i32.const 0\n\
-         \x20 v2 = i64.const 0\n\
-         \x20 v3 = i64.const 0\n\
+         \x20 vz = i64.const 0\n\
+         \x20 v2 = i64.const {argv}\n\
+         \x20 i64.store v2 vz\n\
+         \x20 v3 = i64.const {envp}\n\
+         \x20 i64.store v3 vz\n\
          \x20 v4 = call.import 0 (v0, v1, v2, v3)\n\
          \x20 return v4\n\
          \x20 }}\n\
@@ -731,6 +743,52 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     ("wait4", 23),
     ("execve", 24),
     ("clock_gettime", 25),
+    // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
+    // `memfiles`/`osproc`/`terminal`/`rawthreads` declare (#1422). Same posture as the six above and
+    // for the same reason: a playground guest is granted no ambient filesystem, environment, process
+    // table, or OS threads, so every one of these is a **fail-closed stub** — the metadata and
+    // mutation calls report failure, `getcwd`/`c_getenv` report "absent" (a null pointer, i.e. an
+    // empty environment and no current directory), and `nanosleep` succeeds immediately.
+    //
+    // The point is *linkability*, not emulation: a program that only uses the pure half of these
+    // modules — `paths`/`pathnorm` string manipulation, a `strtabs` table, `os`'s path helpers — now
+    // links and runs, where before the whole module failed to link and nothing in it was reachable.
+    // A program that genuinely touches the filesystem gets nim's ordinary error path (an `OSError`,
+    // an empty result) instead of a link failure. Serving any of these for real is a capability the
+    // host grants, not a default of the nim bottom edge.
+    ("stat", 26),
+    ("lstat", 27),
+    ("fstat", 28),
+    ("mkdir", 29),
+    ("rmdir", 30),
+    ("unlink", 31),
+    ("chdir", 32),
+    ("getcwd", 33),
+    ("readlink", 34),
+    ("ftruncate", 35),
+    ("munmap", 36),
+    ("c_rename", 37),
+    ("c_getenv", 38),
+    ("c_setenv", 39),
+    ("c_unsetenv", 40),
+    ("fork", 41),
+    ("exitnow", 42),
+    ("pipe", 43),
+    ("dup2", 44),
+    ("setpgid", 45),
+    ("kill", 46),
+    ("nanosleep", 47),
+    ("sysconf", 48),
+    ("nativeIoctl", 49),
+    ("pthread_attr_init", 50),
+    ("pthread_attr_setstacksize", 51),
+    ("pthread_attr_destroy", 52),
+    ("pthread_create", 53),
+    ("pthread_join", 54),
+    ("cpusetZero", 55),
+    ("cpusetIncl", 56),
+    ("setAffinity", 57),
+    ("syscall", 58),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the

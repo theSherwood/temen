@@ -2944,8 +2944,8 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.stdout_bytes(),
+        stderr: host.stderr_bytes(),
         framebuffer: None, // the browser-corpus powerbox grants no `display` cap
     }
 }
@@ -3387,8 +3387,8 @@ pub fn onramp_exec_with_tee(
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.stdout_bytes(),
+        stderr: host.stderr_bytes(),
         framebuffer,
     }
 }
@@ -3944,8 +3944,8 @@ pub fn onramp_fs_exec(
         status,
         value,
         exit_code,
-        stdout: host.stdout,
-        stderr: host.stderr,
+        stdout: host.stdout_bytes(),
+        stderr: host.stderr_bytes(),
         framebuffer: None,
     }
 }
@@ -4008,8 +4008,8 @@ pub fn onramp_fs_exec_readback(
             status,
             value,
             exit_code,
-            stdout: host.stdout,
-            stderr: host.stderr,
+            stdout: host.stdout_bytes(),
+            stderr: host.stderr_bytes(),
             framebuffer: None,
         },
         produced,
@@ -6876,11 +6876,16 @@ impl JitOnrampRun {
 
     /// The captured streams / exit — read after the emitted `f0` returns or unwinds (same contract as
     /// [`onramp_exec`]). `value` is `f0`'s return (meaningful when it returned rather than `exit`ed).
-    pub fn stdout(&self) -> &[u8] {
-        &self.host.stdout
+    ///
+    /// Both read through [`Host::stdout_bytes`]/[`Host::stderr_bytes`] rather than the raw `stdout`
+    /// field: once a sink is promoted (a child host shares this one's stdio) the field stops receiving
+    /// writes and the accessor is the only thing that sees them. Reading the field is a second route
+    /// through one behaviour, and the route that silently returns nothing (#1360).
+    pub fn stdout(&self) -> Vec<u8> {
+        self.host.stdout_bytes()
     }
-    pub fn stderr(&self) -> &[u8] {
-        &self.host.stderr
+    pub fn stderr(&self) -> Vec<u8> {
+        self.host.stderr_bytes()
     }
     /// The run's **primary output**: the retained memfs file for a file-output phase guest (nifler's
     /// `.p.nif`, [`fs_readback`](Self::fs_readback)), else `stdout`. `temen_onramp_jit_run_finish` hands
@@ -6896,7 +6901,7 @@ impl JitOnrampRun {
                     .map(|(_, v)| v)
                     .unwrap_or_default()
             }
-            None => self.host.stdout.clone(),
+            None => self.host.stdout_bytes(),
         }
     }
 
@@ -7559,8 +7564,8 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     set(status);
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout_bytes());
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr_bytes());
         EXIT_CODE = exit_code;
     }
     value
@@ -14771,8 +14776,8 @@ pub extern "C" fn temen_detached_oracle_run(
     };
     // SAFETY: single-threaded wasm; the capture slots are read back only via the export accessors.
     unsafe {
-        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout);
-        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr);
+        stash(&mut *core::ptr::addr_of_mut!(OUT), host.stdout_bytes());
+        stash(&mut *core::ptr::addr_of_mut!(ERR), host.stderr_bytes());
         EXIT_CODE = code;
         RUN_VALUE = value;
     }

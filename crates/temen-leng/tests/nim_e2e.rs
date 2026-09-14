@@ -1205,6 +1205,162 @@ fn totality_sweep_760() {
     eprintln!("===== end sweep =====\n");
 }
 
+/// **#1422 — `std/os` path handling runs.** The whole `os` module used to fail to *link*: its posix
+/// bottom edge (`stat`/`getcwd`/`c_getenv`/`fork`/…) had no provider, so even the **pure** half —
+/// string-only path manipulation that touches no filesystem at all — was unreachable. With the
+/// fail-closed posix stubs it links, and the path helpers give byte-identical answers to native
+/// nimony (they are pure string functions; nothing here consults a real filesystem).
+#[test]
+fn real_os_path_helpers_run() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/os\n",
+        "\n",
+        "let j = joinPath(\"a/b\", \"c.txt\")\n",
+        "let p = parentDir(\"a/b/c.txt\")\n",
+        "let f = extractFilename(\"a/b/c.txt\")\n",
+        "let e = changeFileExt(\"a/b/c.txt\", \"nif\")\n",
+        "write(stdout, j & \"|\" & p & \"|\" & f & \"|\" & e)\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_os_path_helpers_run (no toolchain / libc asset)");
+        return;
+    };
+    // Native `nimony c --run` prints exactly this.
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "a/b/c.txt|a/b|c.txt|a/b/c.nif"
+    );
+}
+
+/// **#1422 — `std/strtabs` runs.** `strtabs` reaches the posix edge only through `os`'s environment
+/// helpers; the table itself is pure. Previously unlinkable for that reason alone.
+#[test]
+fn real_strtabs_runs() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strtabs\n",
+        "\n",
+        "var t = newStringTable(modeCaseSensitive)\n",
+        "t[\"a\"] = \"1\"\n",
+        "t[\"b\"] = \"2\"\n",
+        "write(stdout, t.getOrDefault(\"a\") & \"|\" & t.getOrDefault(\"b\") & \"|\" & $t.len & \"|\" & $t.hasKey(\"c\"))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_strtabs_runs (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "1|2|2|false");
+}
+
+/// **#1422 — `std/envvars` runs, and the sandbox's empty environment is *indistinguishable* from a
+/// host where the variable is simply unset.** `c_getenv` stubs to a null pointer, so `getEnv` yields
+/// `""` and `existsEnv` yields `false` — byte-identical to native nimony for an unset name. The guest
+/// is told "absent", never handed the host's environment.
+#[test]
+fn real_envvars_report_an_empty_environment() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/envvars\n",
+        "\n",
+        "write(stdout, \"[\" & getEnv(\"TEMEN_NO_SUCH_VAR_12345\") & \"]|\" & $existsEnv(\"TEMEN_NO_SUCH_VAR_12345\"))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_envvars_report_an_empty_environment (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "[]|false");
+}
+
+/// **#1422 stage-3 runnability sweep.** The `#760` sweep above answers "does it *translate*?"; this
+/// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
+/// [`STD_MODULES_ALL`] it compiles a driver that imports the module, links it through the real
+/// `link_nim_powerbox` **with the guest libc**, and checks the result verifies and asks for nothing
+/// beyond the one `write` stream cap. A module that links with an extra manifest entry has an
+/// unbound bottom-edge leaf: it would fail to instantiate in the playground, so it is not runnable.
+///
+/// This is a **diagnostic, not a gate** — it drives the whole nimony toolchain once per module
+/// (~20 minutes for the full list), so it is gated on `NIM_RUN_SWEEP=1` and stays out of CI. What
+/// gates in CI is the handful of `real_*_runs` tests above: each one actually *runs* a program from
+/// one of these modules and diffs the output against the native-nimony oracle, which is a stronger
+/// claim than "it linked" and costs seconds. Run the sweep when you change the bottom edge, to see
+/// what moved. `NIM_RUN_SWEEP_STRICT=1` narrows it to [`STD_MODULES`] and asserts instead of
+/// reporting, for a bisect.
+#[test]
+fn runnability_sweep() {
+    if std::env::var("NIM_RUN_SWEEP").is_err() {
+        eprintln!("SKIP runnability_sweep (set NIM_RUN_SWEEP=1 to run)");
+        return;
+    }
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP runnability_sweep (no nimony toolchain)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP runnability_sweep (no guest libc asset)");
+        return;
+    };
+    let strict = std::env::var("NIM_RUN_SWEEP_STRICT").is_ok();
+    let mods: &[&str] = if strict { STD_MODULES } else { STD_MODULES_ALL };
+    let mut runnable: Vec<&str> = Vec::new();
+    let mut unrunnable: Vec<(&str, String)> = Vec::new();
+    let mut nim_fail: Vec<(&str, String)> = Vec::new();
+    for (i, m) in mods.iter().enumerate() {
+        eprintln!("[{}/{}] std/{m} …", i + 1, mods.len());
+        let src = format!("import std/syncio\nimport std/{m}\n\nwrite(stdout, \"ok\")\n");
+        let leng = match try_compile_to_leng(&path, m, &src) {
+            Ok(v) => v,
+            Err(e) => {
+                nim_fail.push((m, e));
+                continue;
+            }
+        };
+        let units: Vec<temen_leng::WholeModule> = leng
+            .iter()
+            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+            .collect();
+        match temen_leng::link_nim_powerbox(&units, Some(&libc)) {
+            Err(e) => unrunnable.push((m, format!("link: {e}"))),
+            Ok(module) => match temen_verify::verify_module(&module) {
+                Err(e) => unrunnable.push((m, format!("verify: {e:?}"))),
+                Ok(()) => {
+                    let extra: Vec<&str> = module
+                        .imports
+                        .iter()
+                        .map(|i| i.name.as_str())
+                        .filter(|n| *n != "write")
+                        .collect();
+                    if extra.is_empty() {
+                        runnable.push(m);
+                    } else {
+                        unrunnable.push((m, format!("unbound leaves: {}", extra.join(", "))));
+                    }
+                }
+            },
+        }
+    }
+    eprintln!(
+        "\n===== #1422 runnability sweep: {} runnable / {} unrunnable / {} nimony-fail =====",
+        runnable.len(),
+        unrunnable.len(),
+        nim_fail.len()
+    );
+    for (m, why) in &nim_fail {
+        eprintln!("  [nimony] std/{m}: {why}");
+    }
+    for (m, why) in &unrunnable {
+        eprintln!("  [unrunnable] std/{m}: {why}");
+    }
+    eprintln!("  runnable: {}", runnable.join(" "));
+    eprintln!("===== end runnability sweep =====\n");
+    if strict {
+        assert!(
+            unrunnable.is_empty(),
+            "modules that compile but cannot run: {unrunnable:?}"
+        );
+    }
+}
+
 /// Feature-probe programs — one construct family each, to surface translator gaps without needing a
 /// whole stdlib module. Kept small and self-contained.
 const FEATURE_PROBES: &[(&str, &str)] = &[
@@ -1220,6 +1376,73 @@ const FEATURE_PROBES: &[(&str, &str)] = &[
 
 /// Stdlib modules the sweep exercises via `import std/<m>` drivers (NIM_SWEEP_STD=1). A spread across
 /// strings, containers, numerics, and parsing — the constructs a real program (and nimony itself) hit.
+/// **Every** `std/` module in the vendored nimony stdlib — the denominator the stage-3 runnability
+/// sweep reports against. [`STD_MODULES`] is the subset we hold green; this is the full surface, so
+/// the sweep's "unrunnable"/"nimony-fail" lists say what is left rather than silently omitting it.
+const STD_MODULES_ALL: &[&str] = &[
+    "algorithm",
+    "appdirs",
+    "assertions",
+    "atomics",
+    "base64",
+    "bitops",
+    "cmdline",
+    "complex",
+    "cpuinfo",
+    "deques",
+    "dirs",
+    "editdistance",
+    "encodings",
+    "envvars",
+    "fenv",
+    "formatfloat",
+    "hashes",
+    "heapqueue",
+    "intsets",
+    "ioring",
+    "json",
+    "lexbase",
+    "locks",
+    "math",
+    "md5",
+    "memfiles",
+    "monotimes",
+    "options",
+    "os",
+    "oserrors",
+    "osproc",
+    "parsejson",
+    "parseopt",
+    "parseutils",
+    "pathnorm",
+    "paths",
+    "random",
+    "rationals",
+    "rawthreads",
+    "result",
+    "rlocks",
+    "sequtils",
+    "sets",
+    "setutils",
+    "sha1",
+    "smartcli",
+    "streams",
+    "strtabs",
+    "strutils",
+    "sugar",
+    "syncio",
+    "tables",
+    "terminal",
+    "threadpool",
+    "ticketlocks",
+    "times",
+    "typetraits",
+    "unicode",
+    "varints",
+    "widestrs",
+    "wordwrap",
+];
+
 const STD_MODULES: &[&str] = &[
     "strutils",
     "sequtils",
