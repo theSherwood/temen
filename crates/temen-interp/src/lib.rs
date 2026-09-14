@@ -18513,6 +18513,43 @@ pub struct BoundImport {
     pub rebindable: bool,
 }
 
+/// The canonical **import name → `(type_id, op)`** map (IMPORTS.md §7): what a bare operation name
+/// like `write` or `vm_jit_compile` means as a capability call. One table, because two positions read
+/// it and neither may drift from the other (invariant 15): the embedder's reference resolver
+/// (`temen_run::default_cap_resolver`, which binds a *root*'s manifest) and
+/// [`Host::bind_child_manifest`] (which binds a §14 *child*'s, over a subset it names as data).
+///
+/// The name never selects the **handle** — that is chosen by interface when the slot is bound, so
+/// `write` and `stderr` share `(Stream, 1)` and differ only in which granted stream their slot binds.
+pub fn import_cap_by_name(name: &str) -> Option<(u32, u32)> {
+    Some(match name {
+        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint.
+        "write" => (cap_id::STREAM, 1),
+        "read" => (cap_id::STREAM, 0),
+        "stderr" => (cap_id::STREAM, 1),
+        // Exit (noreturn).
+        "exit" => (cap_id::EXIT, 0),
+        // Memory management (§3e/§4).
+        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
+        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
+        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
+        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
+        // AddressSpace / SharedRegion aliasing (§13/§14).
+        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
+        "vm_region_map" => (cap_id::SHARED_REGION, 0),
+        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
+        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
+        // Guest-driven JIT (§22).
+        "vm_jit_compile" => (cap_id::JIT, 0),
+        "vm_jit_compile_linked" => (cap_id::JIT, 5),
+        "vm_jit_invoke2" => (cap_id::JIT, 1),
+        "vm_jit_release" => (cap_id::JIT, 2),
+        "vm_jit_install" => (cap_id::JIT, 3),
+        "vm_jit_uninstall" => (cap_id::JIT, 4),
+        _ => return None,
+    })
+}
+
 impl BoundImport {
     /// A bound `required`-mode entry (the phase-1 shape): immutable for the instance's lifetime.
     pub fn required(type_id: u32, op: u32, handle: i32) -> BoundImport {
@@ -19123,21 +19160,41 @@ impl Host {
         if imports.is_empty() {
             return Ok(());
         }
-        let policy = |name: &str| match name {
-            "write" => Some((cap_id::STREAM, 1u32)),
-            "read" => Some((cap_id::STREAM, 0u32)),
-            "exit" => Some((cap_id::EXIT, 0u32)),
-            // §3e/§4 memory management (`vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size` = ops 0/1/2/3 on
-            // the `AddressSpace` cap — the same map the reference resolver uses, `temen-run` §7). An
-            // allocating §14 child (a real compiler phase's `malloc`) binds these to the child's own
-            // auto-granted `AddressSpace` (`first_of` below), whose range is exactly `[0, child_size)` —
-            // so a child grows its heap only inside its carve (confinement, §2, unchanged), rather than
-            // `CapFault`ing on its first `malloc`.
-            "vm_map" => Some((cap_id::ADDRESS_SPACE, 0u32)),
-            "vm_unmap" => Some((cap_id::ADDRESS_SPACE, 1u32)),
-            "vm_protect" => Some((cap_id::ADDRESS_SPACE, 2u32)),
-            "vm_page_size" => Some((cap_id::ADDRESS_SPACE, 3u32)),
-            _ => None,
+        // Which import names a §14 child may bind, as **data** over the one shared name→cap table
+        // ([`import_cap_by_name`], invariant 15) rather than a second copy of it. This list is the
+        // confinement-relevant half and is meant to be read at a glance; the `(type_id, op)` each
+        // name resolves to is not restated here.
+        //
+        // `vm_map`/`vm_unmap`/`vm_protect`/`vm_page_size`: an allocating §14 child (a real compiler
+        // phase's `malloc`) binds these to the child's own auto-granted `AddressSpace` (`first_of`
+        // below), whose range is exactly `[0, child_size)` — so a child grows its heap only inside
+        // its own window (confinement, §2, unchanged) rather than `CapFault`ing on its first
+        // `malloc`.
+        //
+        // `vm_jit_*` (#1234): a child holding a **granted** `Jit` binds the §22 driver ops, so a
+        // guest that compiles code can spawn a confined copy of itself that can too — the Forth
+        // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
+        // is what confers the authority; this list only lets the child's manifest *reach* it.
+        const CHILD_BINDABLE: &[&str] = &[
+            "write",
+            "read",
+            "exit",
+            "vm_map",
+            "vm_unmap",
+            "vm_protect",
+            "vm_page_size",
+            "vm_jit_compile",
+            "vm_jit_compile_linked",
+            "vm_jit_invoke2",
+            "vm_jit_release",
+            "vm_jit_install",
+            "vm_jit_uninstall",
+        ];
+        let policy = |name: &str| {
+            CHILD_BINDABLE
+                .contains(&name)
+                .then(|| import_cap_by_name(name))
+                .flatten()
         };
         let first_of = |h: &Host, tid: u32| -> Option<i32> {
             (0..CAP).find_map(|slot| {

@@ -3703,35 +3703,10 @@ pub fn demote_exports(module: &mut Module, keep: &[&str]) -> usize {
 /// interface and differ only by which handle their slots bind (e.g. `write`/`read` are both
 /// `Stream`, bound to stdout vs stdin).
 pub fn default_cap_resolver(name: &str) -> Option<temen_ir::ResolvedCap> {
-    use temen_interp::cap_id;
-    let (type_id, op): (u32, u32) = match name {
-        // Stream — the *handle* (stdout/stdin/stderr) selects the endpoint. `write` and `stderr` are
-        // both write (op 1); the manifest binding uses the name to pick stdout vs the stderr handle.
-        "write" => (cap_id::STREAM, 1),
-        "read" => (cap_id::STREAM, 0),
-        "stderr" => (cap_id::STREAM, 1),
-        // Exit (noreturn).
-        "exit" => (cap_id::EXIT, 0),
-        // Memory management (§3e/§4).
-        "vm_map" => (cap_id::ADDRESS_SPACE, 0),
-        "vm_unmap" => (cap_id::ADDRESS_SPACE, 1),
-        "vm_protect" => (cap_id::ADDRESS_SPACE, 2),
-        "vm_page_size" => (cap_id::ADDRESS_SPACE, 3),
-        // AddressSpace / SharedRegion aliasing (§13/§14).
-        "vm_region_create" => (cap_id::ADDRESS_SPACE, 5),
-        "vm_region_map" => (cap_id::SHARED_REGION, 0),
-        "vm_region_unmap" => (cap_id::SHARED_REGION, 1),
-        "vm_region_page_size" => (cap_id::SHARED_REGION, 3),
-        // Guest-driven JIT (§22).
-        "vm_jit_compile" => (cap_id::JIT, 0),
-        "vm_jit_compile_linked" => (cap_id::JIT, 5),
-        "vm_jit_invoke2" => (cap_id::JIT, 1),
-        "vm_jit_release" => (cap_id::JIT, 2),
-        "vm_jit_install" => (cap_id::JIT, 3),
-        "vm_jit_uninstall" => (cap_id::JIT, 4),
-        _ => return None,
-    };
-    Some(temen_ir::ResolvedCap { type_id, op })
+    // The map itself lives in `temen-interp` — one table shared with `Host::bind_child_manifest`,
+    // which binds a §14 child's manifest over a subset of it (invariant 15).
+    temen_interp::import_cap_by_name(name)
+        .map(|(type_id, op)| temen_ir::ResolvedCap { type_id, op })
 }
 
 fn typed(t: ValType, v: i64) -> Value {
@@ -4324,6 +4299,25 @@ fn value_slot(v: Value) -> i64 {
 /// identically see matching handle values (the differential paths rely on this). (The mock
 /// `Blocking` cap left this set with CONSOLIDATION §5a — test harnesses that exercise the
 /// offload pool grant it themselves and register the `"blocking"` name.)
+/// The canonical §7 name for the capability an import of this name binds — the inverse of the
+/// vocabulary in [`POWERBOX_CAP_NAMES`]. `None` for an import with no canonical counterpart.
+fn canonical_cap_name(import: &str) -> Option<&'static str> {
+    Some(match import {
+        "write" => "stdout",
+        "read" => "stdin",
+        "stderr" => "stderr",
+        "exit" => "exit",
+        "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" => "addrspace",
+        "vm_jit_compile"
+        | "vm_jit_compile_linked"
+        | "vm_jit_invoke2"
+        | "vm_jit_release"
+        | "vm_jit_install"
+        | "vm_jit_uninstall" => "jit",
+        _ => return None,
+    })
+}
+
 fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // Guest-minted §13/§14 regions need an OS-shared-memory backing so the JIT can `map` them; the
     // `Jit` cap needs the canonical blob validator. Both are inert if never used.
@@ -6028,6 +6022,17 @@ impl Instance {
                     }
                     let handle = (cap.grant)(h, win);
                     h.register_cap_name(name, handle);
+                    // §7 F7: also register the **canonical** name for this interface, so a guest can
+                    // name its own capabilities without knowing what it happened to call its imports.
+                    // A guest delegating a cap into a §14 child (#1234) needs exactly this: grant
+                    // lists name caps canonically (`"stdout"`), while a manifest guest's own grants
+                    // are otherwise only reachable as `"write"`. First registration wins, so an
+                    // explicit `"stderr"` import never displaces `"stdout"`.
+                    if let Some(canon) = canonical_cap_name(name) {
+                        if h.resolve_cap_name(canon).is_none() {
+                            h.register_cap_name(canon, handle);
+                        }
+                    }
                     bindings.push(if rebindable {
                         temen_interp::BoundImport::rebindable(cap.type_id, cap.op, Some(handle))
                     } else {
