@@ -222,7 +222,7 @@ fn run_nested_paged(m0: &temen_ir::Module, tail: &[i64]) -> (Outcome, Vec<u8>, u
                 caller.data_mut().bounces += 1;
                 // SAFETY: see `Driver::vcpu` — one bounce at a time, single-threaded.
                 let vcpu = unsafe { &mut *(caller.data().vcpu as *mut bytecode::Vcpu<'_>) };
-                let n = match vcpu.bounce_call(func as u32, &mut io) {
+                let n = match vcpu.bounce_call(func as u32, &mut io, None) {
                     Ok(n) => n,
                     Err(t) => {
                         caller.data_mut().trap = match t {

@@ -614,7 +614,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
         temen_par_jit_argv_len, temen_par_jit_argv_ptr, temen_par_jit_code,
         temen_par_jit_code_wasm_len, temen_par_jit_param_types_ptr, temen_par_jit_result_types_len,
         temen_par_jit_result_types_ptr, temen_par_jit_set_b2, temen_par_jit_set_codegen,
-        temen_par_jit_slot_code, temen_par_jit_table_log2, temen_par_nfuncs,
+        temen_par_jit_slot_unit, temen_par_jit_table_log2, temen_par_nfuncs,
         temen_par_powerbox_jit_runtime, temen_par_shim_wasm_len, temen_wasmjit_len,
         temen_wasmjit_ptr, PAR_JIT_INVOKE,
     };
@@ -744,7 +744,7 @@ fn lk_run(codegen: bool, emitted_callee: bool) -> (i64, u32, u32) {
                             }
                         }
                     } else {
-                        assert_eq!(temen_par_jit_slot_code(slot), -1, "nothing installed");
+                        assert_eq!(temen_par_jit_slot_unit(slot), -1, "nothing installed");
                         None
                     };
                     let fr = match entry {
@@ -854,4 +854,107 @@ fn par_linked_unit_dispatches_program_functions_through_the_b2_mirror() {
             "bounce iff `F` is interpreter-resident"
         );
     }
+}
+
+// ---- #1339: the slot mirror survives the guest's `Jit.release` -----------------------------------
+
+/// #1339 — **the parallel driver's slot mirror is keyed on the unit, not the code handle.**
+///
+/// `compile → install → release` is the ordinary §22 pattern: the unit stays installed in the shared
+/// dispatch table, and the guest drops the code handle it no longer needs (Forth's outer interpreter
+/// does exactly this for every colon definition). The mirror a Worker rebuilds its
+/// `WebAssembly.Table` from used to record the **handle**, and the wasm fetch resolved through it —
+/// so the moment the guest released, the fetch came back `0` for a live installed unit and the
+/// Worker nulled its slot, trapping the next emitted `call.dyn` (`IndirectCallToNull`). The
+/// cooperative driver had the same bug and was fixed in #1233; this is the parallel twin.
+///
+/// The guest compiles `f(x) = x + K` from the host-staged blob, installs it (taking slot 1 — the
+/// first padding slot past its own single function), releases the handle, then `call.dyn`s the slot.
+/// Asserts the dispatch still computes, and then — the regression proper — that **after the release**
+/// the mirror still names the unit and the driver can still fetch its emitted wasm by slot: the two
+/// reads `worker.js::jitSyncTable` makes to fill that slot.
+#[test]
+fn par_installed_unit_survives_the_release_of_its_code_handle() {
+    // The par §22 statics (the powerbox, the slot mirror, the prefix shims) are process-global, so
+    // this shares `JIT_STATE_LOCK` with the other single-run test in this binary (#1182).
+    let _jit = JIT_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use temen_browser::{
+        temen_par_compile_jit, temen_par_ev_a, temen_par_jit_slot_unit, temen_par_jit_table_gen,
+        temen_par_jit_unit_wasm_by_slot_len, temen_par_powerbox_jit_runtime, temen_par_root,
+        temen_par_run, PAR_DONE,
+    };
+
+    const K: i64 = 7;
+    const X: i64 = 35;
+    const BLOB_OFF: usize = 0x6000; // where the host stages the unit blob (as `lk_run` does)
+
+    let unit = {
+        let src = format!(
+            "memory 16\nfunc (i64) -> (i64) {{\nblock 0 (v0: i64) {{\n  vk = i64.const {K}\n  vs = i64.add v0 vk\n  return vs\n  }}\n}}\n"
+        );
+        let m = temen_text::parse_module(&src).expect("unit parse");
+        temen_verify::verify_module(&m).expect("unit verify");
+        temen_encode::encode_module(&m)
+    };
+    // One function ⇒ the natural prefix is 1 ⇒ `install` takes slot 1 (the first padding slot). The
+    // guest hard-codes that for its `call.dyn` and returns the slot so the test pins it too.
+    let guest_src = format!(
+        r#"memory 16
+func (i32) -> (i64) {{
+block 0 (v0: i32) {{
+  vbp = i64.const {BLOB_OFF}
+  vbl = i64.const {}
+  vcode = call.cap 11 0 (i64, i64) -> (i64) v0 (vbp, vbl)
+  vslot = call.cap 11 3 (i64) -> (i64) v0 (vcode)
+  vrel = call.cap 11 2 (i64) -> (i64) v0 (vcode)
+  vs1 = i32.const 1
+  vx = i64.const {X}
+  vres = call.dyn (i64) -> (i64) vs1 (vx)
+  vchk = i64.add vslot vrel
+  vsum = i64.add vres vchk
+  return vsum
+  }}
+}}
+"#,
+        unit.len()
+    );
+    let guest = temen_text::parse_module(&guest_src).expect("guest parse");
+    temen_verify::verify_module(&guest).expect("guest verify");
+    let guest_bytes = temen_encode::encode_module(&guest);
+
+    assert_eq!(
+        temen_par_powerbox_jit_runtime(guest_bytes.as_ptr(), guest_bytes.len()),
+        1,
+        "runtime-compile powerbox"
+    );
+    let gen0 = temen_par_jit_table_gen();
+    let prog = temen_par_compile_jit(guest_bytes.as_ptr(), guest_bytes.len());
+    assert!(!prog.is_null(), "guest compiles");
+
+    // Stage the unit blob where the guest reads it — the host seeds the window, as `lk_run` does.
+    let mut win = vec![0u8; 1 << 16];
+    win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
+    let v = temen_par_root(prog, win.as_mut_ptr(), win.len(), 0);
+    assert!(!v.is_null(), "root vCPU builds");
+    assert_eq!(temen_par_run(v), PAR_DONE, "the guest runs to completion");
+    // `vres` (= X + K) + `vslot` (1, the first padding slot) + `vrel` (0, release ok).
+    assert_eq!(
+        temen_par_ev_a(v),
+        X + K + 1,
+        "the installed unit dispatches through its slot after the handle was released"
+    );
+
+    assert!(
+        temen_par_jit_slot_unit(1) >= 0,
+        "the slot mirror must still name the installed unit after `release`"
+    );
+    assert!(
+        temen_par_jit_unit_wasm_by_slot_len(1) > 0,
+        "the driver must still fetch the installed unit's emitted wasm after `release`"
+    );
+    assert_ne!(
+        temen_par_jit_table_gen(),
+        gen0,
+        "the install must advance the mirror generation so a Worker rebuilds"
+    );
 }

@@ -21,13 +21,12 @@ use temen_browser::{
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_code, temen_coop_slot_unit, temen_coop_table_gen, temen_coop_table_log2,
-    temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len,
-    temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
-    temen_onramp_set_grant_instantiator, temen_run_value, temen_status, temen_stdout_len,
-    temen_stdout_ptr, temen_warm_close, temen_warm_coop_open, temen_warm_coop_prepare,
-    temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP,
-    COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    temen_coop_slot_unit, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
+    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
+    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator, temen_run_value,
+    temen_status, temen_stdout_len, temen_stdout_ptr, temen_warm_close, temen_warm_coop_open,
+    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
+    COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -702,7 +701,7 @@ struct DriverData {
     unit_insts: HashMap<UnitKey, Instance>,
     /// Bounce shims keyed by `(slot, occupant code)` (`-2` = a program-function slot) so an
     /// uninstall/reinstall regenerates against the new occupant's signature.
-    shims: HashMap<(u32, i32), Func>,
+    shims: HashMap<(u32, i64), Func>,
     /// #1009: the dispatch-table generation the shared table was last synced at (mirrors the JS
     /// driver's cache so an install re-syncs and a no-install run syncs once). `-1` = never.
     synced_gen: i64,
@@ -857,7 +856,7 @@ fn instantiate_in(mut ctx: impl AsContextMut<Data = DriverData>, wasm: &[u8]) ->
 }
 
 /// Get-or-build the bounce shim for `slot` (occupant `code`, `-2` = program function).
-fn shim_in(mut ctx: impl AsContextMut<Data = DriverData>, slot: u32, code: i32) -> Option<Func> {
+fn shim_in(mut ctx: impl AsContextMut<Data = DriverData>, slot: u32, code: i64) -> Option<Func> {
     if let Some(f) = ctx.as_context().data().shims.get(&(slot, code)) {
         return Some(*f);
     }
@@ -898,15 +897,15 @@ fn sync_table_in(mut ctx: impl AsContextMut<Data = DriverData>) -> bool {
                 None => shim_in(&mut ctx, slot as u32, -2),
             }
         } else {
-            let code = temen_coop_slot_code(slot as u32);
-            if code < 0 {
+            let uid = temen_coop_slot_unit(slot as u32);
+            if uid < 0 {
                 None
             } else {
                 // #1233: the unit is keyed and fetched by its `(domain, unit)` identity — by the time
                 // of a later rebuild the guest has typically `release`d the code handle (compile →
                 // install → release), which would make a by-handle fetch come back empty and null
                 // the slot under a live installed unit.
-                let key = UnitKey::Unit(temen_coop_slot_unit(slot as u32));
+                let key = UnitKey::Unit(uid);
                 let cached = ctx.as_context().data().unit_insts.get(&key).copied();
                 let inst = match cached {
                     Some(i) => Some(i),
@@ -925,7 +924,9 @@ fn sync_table_in(mut ctx: impl AsContextMut<Data = DriverData>) -> bool {
                 };
                 match inst {
                     Some(i) => i.get_func(&ctx, "f0"),
-                    None => shim_in(&mut ctx, slot as u32, code),
+                    // Interpreter-only unit ⇒ a bounce shim, keyed (like the unit cache) on the
+                    // identity rather than the guest-revocable handle (#1339).
+                    None => shim_in(&mut ctx, slot as u32, uid),
                 }
             }
         };

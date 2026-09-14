@@ -439,8 +439,9 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     }
     return f;
   };
-  // `key`: a surfaced JIT_INVOKE's code handle (a Number), or an installed slot's `(domain, unit)`
-  // identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one cache.
+  // `key`: a surfaced JIT_INVOKE's code handle (a Number — live for that invoke), or an installed
+  // slot's `(domain, unit)` identity (`temen_coop_slot_unit`, a BigInt) — distinct key types, one
+  // cache. An installed slot is never keyed by handle: the guest revokes it right after `install`.
   // #1378 again, on the unit path: a guest-compiled §22 unit (a JACL macro body: ~1.1 KB) went through
   // the ASYNC compile queue, and V8 parks that behind its background work on the just-compiled emitted
   // module — measured 2.9 s / 3.7 s for the tour's two macro invokes on the first two warm-coop runs,
@@ -485,14 +486,14 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       if (slot < nfuncs) {
         entry = emitted['f' + slot] ?? await shimForFast(slot, -2);
       } else {
-        const code = ex.temen_coop_slot_code(slot);
-        if (code >= 0) {
-          const uid = ex.temen_coop_slot_unit(slot);
+        const uid = ex.temen_coop_slot_unit(slot);
+        if (uid >= 0n) {
           const cached = jitUnits.get(uid);
           if (cached !== undefined) entry = cached['f0'];
           else {
             const bytes = slotUnitBytes(slot);
-            entry = bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, code);
+            entry =
+              bytes !== null ? (await unitFor(uid, bytes))['f0'] : await shimForFast(slot, uid);
           }
         }
       }
@@ -508,9 +509,8 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
       if (slot < nfuncs) {
         entry = emitted['f' + slot] ?? shimForSync(slot, -2);
       } else {
-        const code = ex.temen_coop_slot_code(slot);
-        if (code >= 0) {
-          const uid = ex.temen_coop_slot_unit(slot);
+        const uid = ex.temen_coop_slot_unit(slot);
+        if (uid >= 0n) {
           const cached = jitUnits.get(uid);
           if (cached !== undefined) entry = cached['f0'];
           else {
@@ -518,8 +518,8 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
             if (bytes !== null) {
               // Over the sync compile budget ⇒ a shim now; `syncTable` upgrades it at the next event.
               try { const u = instantiateUnitSync(bytes); jitUnits.set(uid, u); entry = u['f0']; }
-              catch { entry = shimForSync(slot, code); }
-            } else entry = shimForSync(slot, code);
+              catch { entry = shimForSync(slot, uid); }
+            } else entry = shimForSync(slot, uid);
           }
         }
       }
