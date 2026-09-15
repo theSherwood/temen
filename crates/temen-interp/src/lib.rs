@@ -17483,12 +17483,23 @@ struct HostProcEntry {
     /// provider holds state the guest can observe — an `fs` server's per-`open` cursors — so the
     /// freeze captures it and the registrar re-seeds a fresh closure with it at thaw.
     state: Option<HostProcStateCapture>,
+    /// #1458 — how this capability puts a captured state back **into the live handler**
+    /// ([`Host::set_cap_state_restore`]). The freeze/thaw path doesn't need this — there the
+    /// registrar mints a fresh closure seeded from the bytes — but an *in-session* rewind does: the
+    /// closures are still live and the caller wants them reset in place, not replaced. One state
+    /// definition per capability, two ways to put it back.
+    restore: Option<HostProcStateRestore>,
 }
 
 /// #1455 — a host capability's own state serializer: called at freeze, its bytes handed back to the
 /// embedder's registrar at thaw. Opaque to the VM, which never interprets them; the provider that
 /// wrote them is the one that reads them.
 pub type HostProcStateCapture = Box<dyn Fn() -> Vec<u8> + Send>;
+
+/// #1458 — a host capability's state **deserializer**, for putting a captured state back into a
+/// still-live handler (the in-session rewind counterpart of [`HostProcStateCapture`]). Opaque to the
+/// VM: these are the same bytes the capture wrote, handed back to the provider that wrote them.
+pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 
 /// #1455 — the embedder's thaw-side re-granter for named host capabilities
 /// ([`Host::set_named_cap_registrar`]): given the name a capability was registered under and the
@@ -19145,6 +19156,7 @@ impl Host {
                     // would capture the wrong domain's. A forked twin that wants to be freezable
                     // re-registers one.
                     state: None,
+                    restore: None,
                 }
             })
             .collect();
@@ -20034,6 +20046,48 @@ impl Host {
         }
     }
 
+    /// #1458 — declare how the host capability at `handle` puts a captured state back into its
+    /// **still-live** handler, the in-session counterpart of
+    /// [`set_cap_state_capture`](Host::set_cap_state_capture).
+    ///
+    /// Freeze/thaw does not need this: there the registrar mints a fresh closure seeded from the
+    /// bytes. An in-session rewind does — a reactor scrubbing back to an earlier frame still holds
+    /// the same `fs` server and the same input queues, and wants them *reset*, not replaced. Pairing
+    /// the two means a capability's state is defined **once**, by the provider that owns it, and both
+    /// paths use that definition instead of each hand-rolling what "the cap's state" means.
+    pub fn set_cap_state_restore(&mut self, handle: i32, restore: HostProcStateRestore) {
+        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
+            if let Some(e) = self.host_procs.get_mut(idx as usize) {
+                e.restore = Some(restore);
+            }
+        }
+    }
+
+    /// #1458 — capture every host capability's declared state, positionally over `host_procs`
+    /// (`None` where a capability declared none). The in-session half of a moment: pair with
+    /// [`restore_cap_states`](Host::restore_cap_states) to rewind the capabilities alongside the
+    /// window, without re-granting anything.
+    ///
+    /// This is the same per-capability state [`capture_durable_named`](Host::capture_durable_named)
+    /// puts in an artifact — one definition, read two ways.
+    pub fn capture_cap_states(&self) -> Vec<Option<Vec<u8>>> {
+        self.host_procs
+            .iter()
+            .map(|e| e.state.as_ref().map(|f| f()))
+            .collect()
+    }
+
+    /// Put a [`capture_cap_states`](Host::capture_cap_states) back into the live handlers. Entries
+    /// are positional; a capability that declared no restore (or an index past the table) is skipped,
+    /// so a moment taken before a later grant restores what it can rather than failing.
+    pub fn restore_cap_states(&mut self, states: &[Option<Vec<u8>>]) {
+        for (e, state) in self.host_procs.iter().zip(states) {
+            if let (Some(restore), Some(bytes)) = (&e.restore, state) {
+                restore(bytes);
+            }
+        }
+    }
+
     /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
     /// `cap.self`-resolve `name` to this handle at runtime. The powerbox layer (`temen_run`) calls this
     /// for each granted handle; an embedder may add its own names. First registration of a name wins.
@@ -20592,11 +20646,11 @@ impl Host {
         };
         named
             .into_iter()
-            .zip(self.host_procs.iter())
-            .map(|(name, entry)| {
+            .zip(self.capture_cap_states())
+            .map(|(name, state)| {
                 name.map(|name| DurableNamedCap {
                     name: name.to_string(),
-                    state: entry.state.as_ref().map(|f| f()).unwrap_or_default(),
+                    state: state.unwrap_or_default(),
                 })
             })
             .collect()
@@ -20647,6 +20701,7 @@ impl Host {
                 mints: false,
                 vtable: None,
                 state: None,
+                restore: None,
             });
         }
         self.named_cap_registrar = registrar;
@@ -21094,6 +21149,7 @@ impl Host {
             mints: false,
             vtable: None,
             state: None,
+            restore: None,
         })
     }
 
@@ -21113,6 +21169,7 @@ impl Host {
             mints: false,
             vtable: None,
             state: None,
+            restore: None,
         })
     }
 
@@ -21167,6 +21224,7 @@ impl Host {
             mints: false,
             vtable: None,
             state: None,
+            restore: None,
         })
     }
 
@@ -21183,6 +21241,7 @@ impl Host {
             mints: true,
             vtable: None,
             state: None,
+            restore: None,
         })
     }
 

@@ -3061,42 +3061,39 @@ impl OnrampCaps {
             .unwrap()
             .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
     }
+}
 
-    /// Capture the capability-side half of a [`ReactorMoment`] — the guest-affecting state these
-    /// capabilities hold that the window image does **not** carry.
-    ///
-    /// What is captured and why: the undrained `keyboard`/`mouse` queues (input the host has accepted
-    /// but the guest has not polled yet — a rewind that dropped them would replay different input than
-    /// it recorded), and the `fs` cursors (an `fs` read is a `seek` then a `read` on these).
-    ///
-    /// **Not** the presented frame. That is output: no guest reads it back, so it is no part of putting
-    /// the guest back where it was. A driver that restores a moment and runs no frames (a scrub landing
-    /// exactly on a keyframe) still has a picture to draw — the one it drew at that frame — and caching
-    /// that beside the moment is the driver's business, not the guest's state. `web/play.js` does
-    /// exactly that; putting it here would instead cost a framebuffer copy on every frame, armed or not,
-    /// which is the sort of always-on observation cost INVARIANTS #9(b) exists to refuse.
-    fn capture(&self) -> CapMoment {
-        CapMoment {
-            keys: self.keys.lock().unwrap().iter().copied().collect(),
-            mouse: self.mouse.lock().unwrap().iter().copied().collect(),
-            fs_cursors: self
-                .fs_cursors
-                .as_ref()
-                .map(|c| c.lock().unwrap().clone())
-                .unwrap_or_default(),
-        }
-    }
+// The capability-side half of a moment is **each capability's own state**, declared once by the
+// provider that owns it (`Host::set_cap_state_capture`/`_restore`) and read two ways: an in-session
+// rewind puts it straight back into the live handler, and a freeze writes it into the artifact's
+// named-capability section (#1455). Before that pairing existed, a moment hand-rolled its own idea of
+// "the cap state" — which would have become a second, drifting definition the moment a reactor could
+// also be frozen.
+//
+// What each capability declares, and why:
+//   * `keyboard` / `mouse` — the **undrained** queue. Input the host has accepted but the guest has
+//     not polled yet; a rewind that dropped it would replay a different input stream than it recorded.
+//   * `fs` — the per-`open` cursors. An `fs` read is a `seek` then a `read` on these, so a guest
+//     restored without them resumes with its open file silently rewound.
+//   * `display` — nothing. The presented frame is *output*: no guest reads it back, so it is no part
+//     of putting the guest back where it was. (A driver that restores and runs no frames still needs a
+//     picture to draw; `web/play.js` caches one beside each keyframe. Capturing it here would instead
+//     cost a framebuffer copy on every frame, armed or not — the always-on observation cost
+//     INVARIANTS #9(b) exists to refuse.)
 
-    /// Reinstate a [`capture`](Self::capture): the queues become exactly what they held at the moment
-    /// (input the host has enqueued *since* is dropped — it belongs to the timeline being abandoned),
-    /// and the `fs` cursors go back to their captured positions.
-    fn restore(&self, m: &CapMoment) {
-        *self.keys.lock().unwrap() = m.keys.iter().copied().collect();
-        *self.mouse.lock().unwrap() = m.mouse.iter().copied().collect();
-        if let Some(c) = &self.fs_cursors {
-            c.lock().unwrap().clone_from(&m.fs_cursors);
-        }
-    }
+/// Serialize a queue of `i64`-packed events (the `keyboard`/`mouse` state form): little-endian, in
+/// queue order. Paired with [`decode_events`].
+fn encode_events<T: Copy + Into<i64>>(q: &std::collections::VecDeque<T>) -> Vec<u8> {
+    q.iter().flat_map(|&e| e.into().to_le_bytes()).collect()
+}
+
+/// Rebuild an event queue from [`encode_events`]. A trailing partial word is ignored — the bytes come
+/// from an artifact, so a truncated one restores the events it can rather than panicking.
+fn decode_events(bytes: &[u8]) -> Vec<i64> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }
 
 /// Image a reactor window that is a bare [`Region`](temen_interp::Region) rather than a live engine
@@ -3112,13 +3109,11 @@ fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout>
     temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), &[])
 }
 
-/// The capability-side half of a [`ReactorMoment`] (see [`OnrampCaps::capture`]).
-#[derive(Clone)]
-struct CapMoment {
-    keys: Vec<i32>,
-    mouse: Vec<i64>,
-    fs_cursors: Vec<u64>,
-}
+/// The capability-side half of a [`ReactorMoment`]: each host capability's own declared state,
+/// positional over the host's capability table (see the note above [`encode_events`]). Exactly what
+/// `Host::capture_cap_states` yields and `restore_cap_states` takes back — and the same bytes a
+/// freeze writes into the artifact's named-capability section, so the two paths cannot drift.
+type CapMoment = Vec<Option<Vec<u8>>>;
 
 /// A **moment** of a reactor: everything needed to put the guest back exactly where it was at a frame
 /// boundary — the window image (bytes + page-protection map) plus the capability state above.
@@ -3287,32 +3282,46 @@ fn grant_onramp_caps(
     let keys: KeyQueue =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     {
-        let keys = std::sync::Arc::clone(&keys);
+        let polled = std::sync::Arc::clone(&keys);
         let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
             if op != 0 {
                 return Ok(vec![-1]); // only poll(0) is defined
             }
-            Ok(vec![keys
+            Ok(vec![polled
                 .lock()
                 .unwrap()
                 .pop_front()
                 .map_or(-1, |e| e as i64)])
         }));
         host.register_cap_name("keyboard", handle);
+        let (c, r) = (std::sync::Arc::clone(&keys), std::sync::Arc::clone(&keys));
+        host.set_cap_state_capture(handle, Box::new(move || encode_events(&c.lock().unwrap())));
+        host.set_cap_state_restore(
+            handle,
+            Box::new(move |b| {
+                *r.lock().unwrap() = decode_events(b).into_iter().map(|v| v as i32).collect()
+            }),
+        );
     }
     // `mouse` — the pointer waist (the Uxn card's Varvara Mouse device): the keyboard's twin, `poll()`
     // dequeues one packed pointer/wheel event (see [`MouseQueue`]), or `-1` if empty.
     let mouse: MouseQueue =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
     {
-        let mouse = std::sync::Arc::clone(&mouse);
+        let polled = std::sync::Arc::clone(&mouse);
         let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
             if op != 0 {
                 return Ok(vec![-1]); // only poll(0) is defined
             }
-            Ok(vec![mouse.lock().unwrap().pop_front().unwrap_or(-1)])
+            Ok(vec![polled.lock().unwrap().pop_front().unwrap_or(-1)])
         }));
         host.register_cap_name("mouse", handle);
+        let (c, r) = (std::sync::Arc::clone(&mouse), std::sync::Arc::clone(&mouse));
+        host.set_cap_state_capture(handle, Box::new(move || encode_events(&c.lock().unwrap())));
+        host.set_cap_state_restore(
+            handle,
+            Box::new(move |b| *r.lock().unwrap() = decode_events(b).into_iter().collect()),
+        );
     }
     // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via the
     // `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0) and asks the
@@ -3362,8 +3371,9 @@ fn grant_onramp_caps(
         // guest state, so a reactor moment captures and restores them with the window (`ReactorMoment`).
         let cursors: FsCursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         fs_cursors = Some(std::sync::Arc::clone(&cursors));
+        let served = std::sync::Arc::clone(&cursors);
         let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
-            let mut cursors = cursors.lock().unwrap();
+            let mut cursors = served.lock().unwrap();
             match op {
                 0 => {
                     let requested = mem
@@ -3408,6 +3418,29 @@ fn grant_onramp_caps(
             }
         }));
         host.register_cap_name("fs", handle);
+        let (c, r) = (
+            std::sync::Arc::clone(&cursors),
+            std::sync::Arc::clone(&cursors),
+        );
+        host.set_cap_state_capture(
+            handle,
+            Box::new(move || {
+                c.lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            }),
+        );
+        host.set_cap_state_restore(
+            handle,
+            Box::new(move |b| {
+                *r.lock().unwrap() = b
+                    .chunks_exact(8)
+                    .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                    .collect()
+            }),
+        );
     }
     // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
     // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
@@ -5688,7 +5721,7 @@ impl OnrampReactor {
     pub fn moment(&self) -> Option<ReactorMoment> {
         Some(ReactorMoment {
             layout: self.inst.window_layout()?,
-            caps: self.caps.capture(),
+            caps: self.host.capture_cap_states(),
         })
     }
 
@@ -5703,7 +5736,7 @@ impl OnrampReactor {
         if !self.inst.restore_window(&moment.layout) {
             return false;
         }
-        self.caps.restore(&moment.caps);
+        self.host.restore_cap_states(&moment.caps);
         true
     }
 }
@@ -5875,7 +5908,7 @@ impl SharedOnrampReactor {
     pub fn moment(&self) -> Option<ReactorMoment> {
         Some(ReactorMoment {
             layout: self.reactor.window_layout()?,
-            caps: self.caps.capture(),
+            caps: self.host.lock().unwrap().capture_cap_states(),
         })
     }
 
@@ -5890,7 +5923,7 @@ impl SharedOnrampReactor {
         if !self.reactor.restore_window(&moment.layout) {
             return false;
         }
-        self.caps.restore(&moment.caps);
+        self.host.lock().unwrap().restore_cap_states(&moment.caps);
         true
     }
 }
@@ -6138,7 +6171,7 @@ impl JitOnrampReactor {
     pub fn moment(&self) -> Option<ReactorMoment> {
         Some(ReactorMoment {
             layout: region_layout(&self.back)?,
-            caps: self.caps.capture(),
+            caps: self.host.capture_cap_states(),
         })
     }
 
@@ -6156,7 +6189,7 @@ impl JitOnrampReactor {
             return false;
         }
         self.back.write_from(0, moment.layout.bytes());
-        self.caps.restore(&moment.caps);
+        self.host.restore_cap_states(&moment.caps);
         true
     }
 }
