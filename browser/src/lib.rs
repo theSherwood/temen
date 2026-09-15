@@ -3020,6 +3020,126 @@ type KeyQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i32>>
 /// empty.
 type MouseQueue = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i64>>>;
 
+/// The `fs` capability's per-`open` byte cursors, shared between the capability closure and whoever
+/// granted it. Shared (rather than owned by the closure) because it is **host-side guest state**: a
+/// reactor moment must capture and restore it alongside the window, or a rewound guest reads its file
+/// from a cursor the moment never had. See [`ReactorMoment`].
+type FsCursors = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
+
+/// The host-side halves of the on-ramp powerbox's **stateful** capabilities, handed back to whoever
+/// granted them: the presented-frame cell (`display`), the input queues (`keyboard`/`mouse`), and the
+/// `fs` server's cursors. A reactor holds these next to its window because together they are its whole
+/// state — the window image carries the guest's memory, and this carries the rest.
+struct OnrampCaps {
+    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
+    keys: KeyQueue,
+    mouse: MouseQueue,
+    /// `Some` iff an `fs` file was served.
+    fs_cursors: Option<FsCursors>,
+}
+
+impl OnrampCaps {
+    /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
+    fn take_frame(&self) -> Option<Frame> {
+        self.frame.lock().unwrap().take()
+    }
+
+    /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
+    /// `pressed` is 1 (down) / 0 (up); `keycode` is the platform key id (e.g. a JS `keyCode`).
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        self.keys
+            .lock()
+            .unwrap()
+            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+    }
+
+    /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
+    /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        self.mouse
+            .lock()
+            .unwrap()
+            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+    }
+
+    /// Capture the capability-side half of a [`ReactorMoment`] — the guest-affecting state these
+    /// capabilities hold that the window image does **not** carry.
+    ///
+    /// What is captured and why: the undrained `keyboard`/`mouse` queues (input the host has accepted
+    /// but the guest has not polled yet — a rewind that dropped them would replay different input than
+    /// it recorded), and the `fs` cursors (an `fs` read is a `seek` then a `read` on these). What is
+    /// deliberately *not* captured: the presented-frame cell, which is output — the next `tick`
+    /// overwrites it, and nothing the guest does depends on it.
+    fn capture(&self) -> CapMoment {
+        CapMoment {
+            keys: self.keys.lock().unwrap().iter().copied().collect(),
+            mouse: self.mouse.lock().unwrap().iter().copied().collect(),
+            fs_cursors: self
+                .fs_cursors
+                .as_ref()
+                .map(|c| c.lock().unwrap().clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Reinstate a [`capture`](Self::capture): the queues become exactly what they held at the moment
+    /// (input the host has enqueued *since* is dropped — it belongs to the timeline being abandoned),
+    /// and the `fs` cursors go back to their captured positions.
+    fn restore(&self, m: &CapMoment) {
+        *self.keys.lock().unwrap() = m.keys.iter().copied().collect();
+        *self.mouse.lock().unwrap() = m.mouse.iter().copied().collect();
+        if let Some(c) = &self.fs_cursors {
+            c.lock().unwrap().clone_from(&m.fs_cursors);
+        }
+    }
+}
+
+/// Image a reactor window that is a bare [`Region`](temen_interp::Region) rather than a live engine
+/// window — the wasm-JIT reactor, whose window lives in the host's linear memory and is handed to
+/// emitted code directly. There is no page map to carry: that reactor runs its cross-tier bounces over
+/// a fresh window each time (`run_over`), so page state never persists between frames and the bytes
+/// are the whole of it. `None` if the region has no flat address (a `Paged` fallback backing, which
+/// this tier never uses — it could not hand emitted code a base at all).
+fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout> {
+    back.raw_base()?; // the tier's own precondition, restated: a window emitted code can address
+    let mut bytes = vec![0u8; back.len() as usize];
+    back.read_into(0, &mut bytes);
+    temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), &[])
+}
+
+/// The capability-side half of a [`ReactorMoment`] (see [`OnrampCaps::capture`]).
+#[derive(Clone)]
+struct CapMoment {
+    keys: Vec<i32>,
+    mouse: Vec<i64>,
+    fs_cursors: Vec<u64>,
+}
+
+/// A **moment** of a reactor: everything needed to put the guest back exactly where it was at a frame
+/// boundary — the window image (bytes + page-protection map) plus the capability state above.
+///
+/// There is no continuation here, and that is the point. A reactor's `tick` returns to the host every
+/// frame, so between frames there is no guest stack, no shadow stack and no handle table to serialize:
+/// a moment is one window image and a few host-side words. That is why this costs a memcpy rather than
+/// the `temen-durable` instrumentation an arbitrary-safepoint freeze needs (DURABILITY.md §2), and why
+/// it works identically on every tier — the interpreter reactors and the wasm-JIT one alike.
+///
+/// Restoring a moment gives **rewind**; keeping several gives a keyframe ladder; re-running the guest
+/// forward over recorded input gives the frames between two keyframes. A moment restored into a fresh
+/// reactor is a save-state; restored twice, a branch.
+pub struct ReactorMoment {
+    layout: temen_interp::MemLayout,
+    caps: CapMoment,
+}
+
+impl ReactorMoment {
+    /// The window image's byte length — what holding this moment costs (the capability half is a
+    /// handful of words). A ladder sizes its ring against this.
+    pub fn byte_len(&self) -> usize {
+        self.layout.byte_len()
+    }
+}
+
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
 /// plus the by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =
@@ -3038,11 +3158,7 @@ fn grant_onramp_caps(
     host: &mut Host,
     m: &temen_ir::Module,
     fs: Option<(String, Vec<u8>)>,
-) -> (
-    std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    KeyQueue,
-    MouseQueue,
-) {
+) -> OnrampCaps {
     let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     // §3.5: register the running module's self-referential surface, as `temen-run`'s `grant_caps`
     // does — "the one place every run path registers the running module". Without it `self.type_id`,
@@ -3235,49 +3351,56 @@ fn grant_onramp_caps(
     // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT), 1 read(fd,buf,len)
     // →n, 3 seek(fd,whence,off)→pos (whence 0=SET/1=CUR/2=END), 2 write(fd,…)→len (discard-accept),
     // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
+    let mut fs_cursors = None;
     if let Some((name, data)) = fs {
-        let mut cursors: Vec<u64> = Vec::new();
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| match op {
-            0 => {
-                let requested = mem
-                    .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
-                    .unwrap_or_default();
-                if String::from_utf8_lossy(&requested).contains(name.as_str()) {
-                    cursors.push(0);
-                    Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
-                } else {
-                    Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
-                }
-            }
-            1 => {
-                let (buf, want) = (args[1] as u64, args[2] as u64);
-                let Some(&cur) = cursors.get(args[0] as usize) else {
-                    return Ok(vec![-1]);
-                };
-                let end = (cur + want).min(data.len() as u64);
-                if end > cur {
-                    if let Some(mem) = mem {
-                        let _ = mem.write_bytes(buf, &data[cur as usize..end as usize]);
+        // The cursors are **shared** with the granter, not owned by the closure: they are host-side
+        // guest state, so a reactor moment captures and restores them with the window (`ReactorMoment`).
+        let cursors: FsCursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        fs_cursors = Some(std::sync::Arc::clone(&cursors));
+        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
+            let mut cursors = cursors.lock().unwrap();
+            match op {
+                0 => {
+                    let requested = mem
+                        .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
+                        .unwrap_or_default();
+                    if String::from_utf8_lossy(&requested).contains(name.as_str()) {
+                        cursors.push(0);
+                        Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
+                    } else {
+                        Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
                     }
                 }
-                cursors[args[0] as usize] = end;
-                Ok(vec![(end - cur) as i64])
+                1 => {
+                    let (buf, want) = (args[1] as u64, args[2] as u64);
+                    let Some(&cur) = cursors.get(args[0] as usize) else {
+                        return Ok(vec![-1]);
+                    };
+                    let end = (cur + want).min(data.len() as u64);
+                    if end > cur {
+                        if let Some(mem) = mem {
+                            let _ = mem.write_bytes(buf, &data[cur as usize..end as usize]);
+                        }
+                    }
+                    cursors[args[0] as usize] = end;
+                    Ok(vec![(end - cur) as i64])
+                }
+                3 => {
+                    let (whence, off) = (args[1], args[2]);
+                    let Some(cur) = cursors.get(args[0] as usize).copied() else {
+                        return Ok(vec![-1]);
+                    };
+                    let base = match whence {
+                        1 => cur as i64,
+                        2 => data.len() as i64,
+                        _ => 0,
+                    };
+                    cursors[args[0] as usize] = (base + off).max(0) as u64;
+                    Ok(vec![cursors[args[0] as usize] as i64])
+                }
+                2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
+                _ => Ok(vec![0]),                                 // close et al.
             }
-            3 => {
-                let (whence, off) = (args[1], args[2]);
-                let Some(cur) = cursors.get(args[0] as usize).copied() else {
-                    return Ok(vec![-1]);
-                };
-                let base = match whence {
-                    1 => cur as i64,
-                    2 => data.len() as i64,
-                    _ => 0,
-                };
-                cursors[args[0] as usize] = (base + off).max(0) as u64;
-                Ok(vec![cursors[args[0] as usize] as i64])
-            }
-            2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
-            _ => Ok(vec![0]),                                 // close et al.
         }));
         host.register_cap_name("fs", handle);
     }
@@ -3295,7 +3418,12 @@ fn grant_onramp_caps(
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
     }
-    (frame, keys, mouse)
+    OnrampCaps {
+        frame,
+        keys,
+        mouse,
+        fs_cursors,
+    }
 }
 
 /// #816/#1234: whether [`grant_onramp_caps`] grants the `"instantiator"` capability. Default
@@ -3356,7 +3484,7 @@ pub fn onramp_exec_with_tee(
     // Grant the powerbox prefix + the `display`/`keyboard` graphical caps (shared with the reactor). A
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
-    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, m, None);
+    let frame = grant_onramp_caps(&mut host, m, None).frame;
     let mut fuel = u64::MAX;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
@@ -4808,7 +4936,11 @@ pub unsafe extern "C" fn temen_run_nifler_crawl_fs(
     // The run's outcome was previously discarded and `STATUS_OK` returned unconditionally. A crawl that
     // parsed nothing is a failure the caller must be able to see.
     if !produced {
-        let status = if trapped { STATUS_TRAP } else { STATUS_UNSUPPORTED };
+        let status = if trapped {
+            STATUS_TRAP
+        } else {
+            STATUS_UNSUPPORTED
+        };
         set(status);
         return -status;
     }
@@ -5444,9 +5576,9 @@ pub struct OnrampReactor {
     /// The reactor calling convention's data-stack base (`powerbox_entry_sp`), passed to each `tick`.
     entry_sp: u64,
     tick: temen_ir::FuncIdx,
-    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    keys: KeyQueue,
-    mouse: MouseQueue,
+    /// The stateful host capabilities this reactor granted — the half of its state that is not the
+    /// window (see [`OnrampCaps`]).
+    caps: OnrampCaps,
     /// The `Debug` string of the last frame's trap (diagnostic; `None` until a `tick` traps).
     last_trap: Option<String>,
 }
@@ -5483,7 +5615,7 @@ impl OnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (frame, keys, mouse) = grant_onramp_caps(&mut host, m, fs);
+        let caps = grant_onramp_caps(&mut host, m, fs);
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once on the live window with no args (phase 4: the manifest slot
         // bindings deliver the capabilities) to run the C initializer. The window (globals/BSS/heap)
@@ -5498,9 +5630,7 @@ impl OnrampReactor {
             host,
             entry_sp,
             tick,
-            frame,
-            keys,
-            mouse,
+            caps,
             last_trap: None,
         })
     }
@@ -5532,25 +5662,44 @@ impl OnrampReactor {
 
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
     pub fn take_frame(&self) -> Option<Frame> {
-        self.frame.lock().unwrap().take()
+        self.caps.take_frame()
     }
 
     /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
     /// `pressed` is 1 (down) / 0 (up); `keycode` is the platform key id (e.g. a JS `keyCode`).
     pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.keys
-            .lock()
-            .unwrap()
-            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+        self.caps.push_key(keycode, pressed);
     }
 
     /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
     /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
     pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.mouse
-            .lock()
-            .unwrap()
-            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+        self.caps.push_mouse(kind, payload);
+    }
+
+    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
+    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
+    pub fn moment(&self) -> Option<ReactorMoment> {
+        Some(ReactorMoment {
+            layout: self.inst.window_layout()?,
+            caps: self.caps.capture(),
+        })
+    }
+
+    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
+    /// next [`frame`](Self::frame) runs as the frame that followed the one the moment was taken at.
+    /// `false` if this reactor has no window to restore into (a memory-less module).
+    ///
+    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
+    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
+    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
+    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+        if !self.inst.restore_window(&moment.layout) {
+            return false;
+        }
+        self.caps.restore(&moment.caps);
+        true
     }
 }
 
@@ -5579,9 +5728,9 @@ pub struct SharedOnrampReactor {
     _back: std::sync::Arc<temen_interp::Region>,
     entry_sp: u64,
     tick: temen_ir::FuncIdx,
-    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    keys: KeyQueue,
-    mouse: MouseQueue,
+    /// The stateful host capabilities this reactor granted — the half of its state that is not the
+    /// window (see [`OnrampCaps`]).
+    caps: OnrampCaps,
     last_trap: Option<String>,
 }
 
@@ -5647,7 +5796,7 @@ impl SharedOnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
         let mut host = Host::new();
-        let (frame, keys, mouse) = grant_onramp_caps(&mut host, m, fs);
+        let caps = grant_onramp_caps(&mut host, m, fs);
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
         // slot bindings deliver the capabilities) to run the C initializer, seeding +
         // data-initialising the window (the once). The window then persists in the shared backing
@@ -5662,9 +5811,7 @@ impl SharedOnrampReactor {
             _back: back,
             entry_sp,
             tick,
-            frame,
-            keys,
-            mouse,
+            caps,
             last_trap: None,
         })
     }
@@ -5703,24 +5850,43 @@ impl SharedOnrampReactor {
 
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
     pub fn take_frame(&self) -> Option<Frame> {
-        self.frame.lock().unwrap().take()
+        self.caps.take_frame()
     }
 
     /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
     pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.keys
-            .lock()
-            .unwrap()
-            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+        self.caps.push_key(keycode, pressed);
     }
 
     /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
     /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
     pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.mouse
-            .lock()
-            .unwrap()
-            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+        self.caps.push_mouse(kind, payload);
+    }
+
+    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
+    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
+    pub fn moment(&self) -> Option<ReactorMoment> {
+        Some(ReactorMoment {
+            layout: self.reactor.window_layout()?,
+            caps: self.caps.capture(),
+        })
+    }
+
+    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
+    /// next [`frame`](Self::frame) runs as the frame that followed the one the moment was taken at.
+    /// `false` if this reactor has no window to restore into (a memory-less module).
+    ///
+    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
+    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
+    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
+    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+        if !self.reactor.restore_window(&moment.layout) {
+            return false;
+        }
+        self.caps.restore(&moment.caps);
+        true
     }
 }
 
@@ -5761,9 +5927,9 @@ pub struct JitOnrampReactor {
     /// bitmap (`emitted[i]` ⇒ `f{i}` runs on wasm; the rest bounce through `run_cross_tier`).
     emitted_wasm: Vec<u8>,
     emitted: Vec<bool>,
-    frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
-    keys: KeyQueue,
-    mouse: MouseQueue,
+    /// The stateful host capabilities this reactor granted — the half of its state that is not the
+    /// window (see [`OnrampCaps`]).
+    caps: OnrampCaps,
     last_trap: Option<String>,
 }
 
@@ -5841,7 +6007,7 @@ impl JitOnrampReactor {
         let tick = module.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(&module);
         let mut host = Host::new();
-        let (frame, keys, mouse) = grant_onramp_caps(&mut host, &module, fs);
+        let caps = grant_onramp_caps(&mut host, &module, fs);
         // Compile the module **once** — reused for the entry and every per-frame cross-tier bounce.
         let program = bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?;
         // Run the entry (func 0) once over the shared window with no args (phase 4: the manifest
@@ -5878,9 +6044,7 @@ impl JitOnrampReactor {
             tick,
             emitted_wasm,
             emitted,
-            frame,
-            keys,
-            mouse,
+            caps,
             last_trap: None,
         })
     }
@@ -5949,24 +6113,46 @@ impl JitOnrampReactor {
 
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
     pub fn take_frame(&self) -> Option<Frame> {
-        self.frame.lock().unwrap().take()
+        self.caps.take_frame()
     }
 
     /// Enqueue a key event for the guest to `poll` through the `keyboard` capability next frame.
     pub fn push_key(&self, keycode: i32, pressed: i32) {
-        self.keys
-            .lock()
-            .unwrap()
-            .push_back(((pressed & 1) << 16) | (keycode & 0xffff));
+        self.caps.push_key(keycode, pressed);
     }
 
     /// Enqueue a mouse event for the guest to `poll` through the `mouse` capability next frame:
     /// `kind` 0 = pointer, 1 = wheel; `payload` per [`MouseQueue`] (taken as an unsigned 32-bit word).
     pub fn push_mouse(&self, kind: i32, payload: i32) {
-        self.mouse
-            .lock()
-            .unwrap()
-            .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+        self.caps.push_mouse(kind, payload);
+    }
+
+    /// Capture a [`ReactorMoment`] — this reactor's whole state at the current frame boundary, so a
+    /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
+    /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
+    pub fn moment(&self) -> Option<ReactorMoment> {
+        Some(ReactorMoment {
+            layout: region_layout(&self.back)?,
+            caps: self.caps.capture(),
+        })
+    }
+
+    /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
+    /// next frame runs as the frame that followed the one the moment was taken at. `false` — nothing
+    /// written — if the image is not this window's size, which means it was captured from a different
+    /// reactor: a partial overwrite would leave the tail of the window holding *this* run's bytes under
+    /// *that* run's guest, so it refuses instead (INVARIANTS #9c).
+    ///
+    /// Restoring **abandons** the timeline the reactor was on: input enqueued since the moment is
+    /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
+    /// the guest forward over the input it recorded, rather than keeping a moment per frame.
+    pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
+        if moment.layout.byte_len() as u64 != self.back.len() {
+            return false;
+        }
+        self.back.write_from(0, moment.layout.bytes());
+        self.caps.restore(&moment.caps);
+        true
     }
 }
 
@@ -6555,7 +6741,7 @@ impl JitOnrampRun {
                 // The powerbox prefix (stdout/stdin/exit/…) bound to the manifest slots and registered
                 // by name; `display` too (unused by a pure compute guest, present for parity with
                 // `onramp_exec`). No `fs` (input comes from stdin).
-                let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
+                let frame = grant_onramp_caps(&mut host, &module, None).frame;
                 (host, Vec::new(), frame, None, 0, 0)
             }
             RunInput::Fs {
@@ -6580,7 +6766,7 @@ impl JitOnrampRun {
                 // one thing a detached child cannot receive in-band (#1285).
                 let mut host = Host::new();
                 host.stdin = stdin;
-                let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
+                let frame = grant_onramp_caps(&mut host, &module, None).frame;
                 let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
                 (host, args_init_mem(&refs), frame, None, 0, 0)
             }
@@ -6708,7 +6894,7 @@ impl JitOnrampRun {
         // The powerbox the interpreter warm path grants (`temen_warm_eval`) — a fresh host is re-granted per
         // Run via [`reset_warm`]; this one seeds `open`, replaced before the first drive.
         let mut host = Host::new();
-        let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &module, None);
+        let frame = grant_onramp_caps(&mut host, &module, None).frame;
         // Compiled once — reused for every cross-tier bounce (`write`/`read`/`exit` off the emitted eval).
         let program = std::sync::Arc::new(
             bytecode::SharedProgram::compile(&module).ok_or(STATUS_UNSUPPORTED)?,
@@ -6782,7 +6968,7 @@ impl JitOnrampRun {
         if let Some(t) = stream_tee() {
             host.set_stdout_tee(t);
         }
-        let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &self.module, None);
+        let frame = grant_onramp_caps(&mut host, &self.module, None).frame;
         self.host = host;
         self.frame = frame;
         self.exit_code = 0;
@@ -7997,7 +8183,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         // SAFETY: the host guarantees `[stdin_ptr, stdin_len)` is a live `temen_alloc`ation it filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &wc.m, None);
+    let frame = grant_onramp_caps(&mut host, &wc.m, None).frame;
     // The B2 table/unit-emitter arming, exactly as `temen_coop_open` (the emit was made with the
     // same `table_log2`/window, so the engine table and the emitted mask agree).
     if wc.all_shimmable {
@@ -13680,7 +13866,7 @@ pub extern "C" fn temen_coop_open(
         // SAFETY: the host guarantees the stdin range is a live `temen_alloc`ation it just filled.
         unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec()
     };
-    let (frame, _keys, _mouse) = grant_onramp_caps(&mut host, &m, None);
+    let frame = grant_onramp_caps(&mut host, &m, None).frame;
     // #926 slice 2f: a B2 main module masks `call.dyn` against `1 << table_log2` (#1009 M1: the
     // guest's effective size), so the engine's dispatch table must be the same size — a natural-size
     // table would number install slots and wrap wild indices differently (#846/#880). `CoopRun` builds
@@ -14902,7 +15088,7 @@ pub extern "C" fn temen_detached_oracle_run(
         // SAFETY: same host guarantee for the stdin range.
         host.stdin = unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }.to_vec();
     }
-    let (_frame, _keys, _mouse) = grant_onramp_caps(&mut host, &m, None);
+    let _ = grant_onramp_caps(&mut host, &m, None);
     let argv = argv_from_payload(args_ptr, args_len);
     let refs: Vec<&[u8]> = argv.iter().map(|a| a.as_slice()).collect();
     let init_mem = args_init_mem(&refs);
