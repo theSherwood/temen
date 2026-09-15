@@ -1565,3 +1565,167 @@ fn real_unsigned_32bit_halves_match_native() {
         "1262746869|2177807148|24104250456395667|41571600951734964|41571600957347172"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The nim differential corpus.
+// ---------------------------------------------------------------------------
+
+/// Run `src` with the **native** toolchain (`nimony c --isMain --run`) and return what it printed —
+/// the oracle. `Err` carries the compiler's own diagnostic, so a corpus program outside nimony's
+/// subset says so rather than looking like a Temen failure.
+fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("temen_nim_diff_n_{}_{name}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("prog.nim"), src).map_err(|e| e.to_string())?;
+    let out = Command::new("nimony")
+        .args(["c", "--isMain", "--run", "prog.nim"])
+        .current_dir(&dir)
+        .env("PATH", nim_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_dir_all(&dir);
+    if !out.status.success() {
+        return Err(format!(
+            "native nimony: {}",
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .rev()
+                .take(3)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Run `src` on **Temen**: the real toolchain to Leng, `link_nim_powerbox` against the guest libc,
+/// then `_start` under the standard powerbox. Returns what the program printed. Every failure mode
+/// (nimony, link, verify, trap) comes back as `Err` with its reason, so the differential reports
+/// *where* a program diverged rather than panicking on the first one.
+fn temen_output(nim_path: &str, libc: &[u8], name: &str, src: &str) -> Result<String, String> {
+    let mods = try_compile_to_leng(nim_path, name, src)?;
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m = temen_leng::link_nim_powerbox(&units, Some(libc)).map_err(|e| format!("link: {e}"))?;
+    temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
+    let extra: Vec<&str> = m
+        .imports
+        .iter()
+        .map(|i| i.name.as_str())
+        .filter(|n| *n != "write")
+        .collect();
+    if !extra.is_empty() {
+        // An unbound bottom-edge leaf. The program would trap at run with nothing to say, so name it
+        // here — this is how the missing half of libm surfaced (#1375).
+        return Err(format!("unbound leaves: {}", extra.join(", ")));
+    }
+    let run = temen_run::run_powerbox(&m, &[]).map_err(|e| format!("run: {e}"))?;
+    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+}
+
+/// **The nim differential corpus** — every `tests/nim_diff/*.nim` compiled and run twice, on Temen and
+/// on native nimony, with the two outputs diffed byte for byte.
+///
+/// This exists because the wrong-answer bugs keep being found by accident. `$3.14` printing
+/// `17.966570549813729` (#1472) sat in `main` behind a suite that only ever asserted `formatFloat`;
+/// half of libm was unbound (#1375) behind a test that happened to call only the trigonometric
+/// functions. Both compiled, verified, and ran — they just produced the wrong bytes, which no
+/// link-level or feature-envelope check can see.
+///
+/// The oracle is the native toolchain rather than a transcribed constant, so **adding a case is
+/// adding a file**: no expected value to work out by hand, and no risk of baking in a wrong one.
+/// Keep each program deterministic (no clock, no addresses, no iteration order that nim does not
+/// pin) and inside nimony's subset.
+#[test]
+fn nim_differential_corpus() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_differential_corpus (no nimony toolchain)");
+        return;
+    };
+    let Some(libc) = guest_libc() else {
+        eprintln!("SKIP nim_differential_corpus (no guest libc asset)");
+        return;
+    };
+    let dir = std::path::Path::new("tests/nim_diff");
+    let cases = nim_cases(dir);
+    assert!(!cases.is_empty(), "no corpus programs in {dir:?}");
+    // `known_gaps/` holds programs that are *expected* to diverge, each naming its issue. They are
+    // still run: a gap that quietly starts working should be promoted and its issue closed, so that
+    // is reported as a failure too. A directory is the whole expectation mechanism — no per-case
+    // enum to keep in sync.
+    let gap_dir = dir.join("known_gaps");
+    let gaps = nim_cases(&gap_dir);
+
+    let mut failures: Vec<String> = Vec::new();
+    for case in &cases {
+        let name = case.file_stem().unwrap().to_string_lossy().to_string();
+        let src = std::fs::read_to_string(case).expect("read case");
+        let want = match native_output(&path, &name, &src) {
+            Ok(s) => s,
+            // Outside nimony's own subset: the corpus program is wrong, not Temen. Say so loudly —
+            // a case that never runs natively silently tests nothing.
+            Err(e) => {
+                failures.push(format!("{name}: does not run under native nimony — {e}"));
+                continue;
+            }
+        };
+        match temen_output(&path, &libc, &name, &src) {
+            Ok(got) if got == want => eprintln!("  {name}: ok ({:?})", elide(&got)),
+            Ok(got) => failures.push(format!(
+                "{name}: OUTPUT DIFFERS\n       temen: {:?}\n      native: {:?}",
+                elide(&got),
+                elide(&want)
+            )),
+            Err(e) => failures.push(format!("{name}: {e}  (native prints {:?})", elide(&want))),
+        }
+    }
+    for case in &gaps {
+        let name = case.file_stem().unwrap().to_string_lossy().to_string();
+        let src = std::fs::read_to_string(case).expect("read case");
+        let Ok(want) = native_output(&path, &name, &src) else {
+            failures.push(format!(
+                "known_gaps/{name}: does not run under native nimony either"
+            ));
+            continue;
+        };
+        match temen_output(&path, &libc, &name, &src) {
+            Ok(got) if got == want => failures.push(format!(
+                "known_gaps/{name}: NOW MATCHES native — the gap is fixed. Move it into \
+                 tests/nim_diff/ and close the issue named in its header."
+            )),
+            Ok(_) | Err(_) => eprintln!("  known_gaps/{name}: still diverges (expected)"),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} corpus programs diverged from native nimony:\n  - {}",
+        failures.len(),
+        cases.len() + gaps.len(),
+        failures.join("\n  - ")
+    );
+}
+
+/// The `.nim` programs in `dir`, sorted, or empty if the directory is absent.
+fn nim_cases(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut v: Vec<std::path::PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("nim"))
+        .collect();
+    v.sort();
+    v
+}
+
+/// Trim a long output for a readable failure message, keeping both ends.
+fn elide(s: &str) -> String {
+    if s.len() <= 160 {
+        return s.to_string();
+    }
+    format!("{}…{}", &s[..100], &s[s.len() - 40..])
+}
