@@ -279,19 +279,31 @@ fn main() {
   * `ONE OP AT A TIME` is the same engine and host with `budget = 1`, and nothing else in the loop:
     no breakpoint probe, no `cur_ir_pc`, no scheduler. It costs **5-8.5x** on its own. That is the
     price of returning from `resume` after every single guest op.
-  * `DAP continue, nothing armed` costs **~2.9x more again** on top of that — the scheduler turn,
-    `apply_due_writes_sched`, the pc mapping and the access/trace hooks.
+  * `DAP continue, nothing armed` costs **~2.9x more again** on top of that — the debug driver's
+    per-op work around the advance.
 
-So the session's 15-25x is roughly `op-at-a-time driving` x `scheduler turn`, and **neither layer is
-switched on by arming anything**. INTERP_PERF.md Phase 3 measured removing the per-op budget+fuel
-machinery *inside* a bulk resume at 2-3%; this is a different cost, and much larger.
+So the session's 15-25x is roughly `op-at-a-time driving` x `per-op debug work`, and **neither layer
+is switched on by arming anything**. INTERP_PERF.md Phase 3 measured removing the per-op budget+fuel
+machinery *inside* a bulk resume at 2-3%; this is a different, much larger cost.
 
-Why that matters for the design: `budget = 1` is load-bearing only when a seam is *armed*. With
-nothing armed, the finest granularity anything actually needs is `CHECKPOINT_STRIDE` = **1024 ops**
-(temen-dap's time-travel ladder lands on those boundaries). So the driver is running 1024x finer than
-its coarsest constraint, and a coarser turn -- bigger budget, same loop, still landing on every
-stride boundary -- would preserve the clock, the ladder and determinism while recovering most of
-this. That is a parameter of the existing driver, not a second driver, which is the cheaper answer to
-c_interpret#26's fork than making the release runner resumable."
+WHY A COARSER TURN IS NOT A ONE-LINE CHANGE — three things that had to be checked, two of which
+corrected an earlier reading of mine:
+
+  1. The loop a single-vCPU `continue` runs is `DebugRun::run_to`, reached from the DAP backend as
+     `run.run_to(&self.breakpoints, ..)`. The scheduler's `drive()` is the **threaded** path, and a
+     guest like the ones here never enters it.
+  2. The live `continue` lays **no checkpoints** — `maybe_checkpoint` is called only from
+     `drive_single_to`, the replay/seek path, and the time-travel ladder is populated lazily on a
+     seek. So `CHECKPOINT_STRIDE` does *not* bound how much a live run may advance per turn.
+  3. What does bound it is the **op clock**. `run_to` does `op_clock += 1` per advance, and seek /
+     step-back / history are all keyed on that clock, so a chunked advance must know exactly how many
+     ops it ran. It cannot: fuel is *safepoint-anchored* (charged at entries and back edges, not per
+     op), and `Vm::resume` takes `budget` **by value**, returning only an `Outcome`. Learning the
+     count means changing that signature — the engine's hottest function, 22 call sites — or
+     threading an op counter through it.
+
+That is the real cost of closing this gap, and it is bigger than 'pass a larger budget'. The ceiling
+is still worth it (15-25x down to ~1x whenever nothing is armed), but it is an engine change, not a
+driver tweak."
     );
 }
