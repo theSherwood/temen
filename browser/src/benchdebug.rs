@@ -95,6 +95,44 @@ block 3 (vacc: i64) {{
     )
 }
 
+/// The **decisive isolation**: the same engine and the same host, driven bulk versus one op at a
+/// time, with no scheduler and no debug bookkeeping in between.
+///
+/// `compile_and_run_with_host` runs to completion. `compile_and_run_with_host_traced` is documented as
+/// driving *"one op at a time … `budget = 1` is bit-identical to run-to-completion"*, and its loop is
+/// nothing but `vm.resume(…, 1)` — no breakpoint probe, no `cur_ir_pc`, no turn record. So the gap
+/// between these two rows is the cost of **op-at-a-time driving alone**, and the gap between the
+/// traced row and the DAP rows is what the scheduler and debug bookkeeping add on top.
+///
+/// The guest here makes no capability calls, so a bare `Host` is enough for both — which keeps the
+/// comparison honest (the same host either way).
+fn time_bulk_vs_stepped(m: &temen_ir::Module) -> (f64, f64, i64, i64) {
+    let run = |stepped: bool| -> (f64, i64) {
+        let mut host = temen_interp::Host::new();
+        let mut fuel = u64::MAX;
+        let t = Instant::now();
+        let got = if stepped {
+            temen_interp::bytecode::compile_and_run_with_host_traced(m, 0, &[], &mut fuel, &mut host)
+                .map(|(r, _, _)| r)
+        } else {
+            temen_interp::bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host)
+        };
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let v = match got {
+            Some(Ok(vals)) => match vals.first() {
+                Some(temen_interp::Value::I64(x)) => *x,
+                Some(temen_interp::Value::I32(x)) => *x as i64,
+                _ => i64::MIN,
+            },
+            _ => i64::MIN,
+        };
+        (ms, v)
+    };
+    let (bulk_ms, bulk_v) = run(false);
+    let (step_ms, step_v) = run(true);
+    (bulk_ms, step_ms, bulk_v, step_v)
+}
+
 /// The release path: `onramp_exec`, exactly what `temen_run_onramp` calls.
 fn time_release(m: &temen_ir::Module) -> (f64, i64) {
     let t = Instant::now();
@@ -202,6 +240,22 @@ fn main() {
             "{:<46} {:>10.1}  {:>10}",
             "onramp_exec (release runner)", release_ms, "1.0x"
         );
+
+        // Same engine, same host: bulk vs one op at a time, nothing else in the loop.
+        let (bulk_ms, step_ms, bulk_v, step_v) = time_bulk_vs_stepped(&m);
+        assert_eq!(bulk_v, expect, "{what}: the bulk run computed the wrong sum");
+        assert_eq!(
+            step_v, expect,
+            "{what}: the op-at-a-time run computed the wrong sum"
+        );
+        println!(
+            "{:<46} {:>10.1}  {:>9.1}x",
+            "  bare host, run to completion", bulk_ms, bulk_ms / release_ms
+        );
+        println!(
+            "{:<46} {:>10.1}  {:>9.1}x",
+            "  bare host, ONE OP AT A TIME (budget=1)", step_ms, step_ms / release_ms
+        );
         for (label, mem_model, bp) in [
             ("DAP continue, nothing armed", false, None),
             ("DAP continue, mem model on", true, None),
@@ -218,12 +272,26 @@ fn main() {
     }
 
     println!(
-        "\nHow to read it:
-  * `nothing armed` vs release is the session's **floor** — a `continue` with nothing to check.
-  * `1 breakpoint` minus `nothing armed` is what **arming** costs. `drive()` probes
-    `breakpoints.contains(&pc)` every op with no `is_empty()` guard, so a small delta means the
-    probe is not the cost and the unconditional per-op `cur_ir_pc` mapping is.
-  * `mem model` minus `nothing armed` is what c_interpret arms on every launch. Read it off the
-    **second** guest; the first has no memory accesses for it to track."
+        "\nThe attribution, from the rows above:
+
+  * `run to completion` on a bare host matches `onramp_exec` — so the powerbox is not a factor and
+    the release runner is just a bulk run.
+  * `ONE OP AT A TIME` is the same engine and host with `budget = 1`, and nothing else in the loop:
+    no breakpoint probe, no `cur_ir_pc`, no scheduler. It costs **5-8.5x** on its own. That is the
+    price of returning from `resume` after every single guest op.
+  * `DAP continue, nothing armed` costs **~2.9x more again** on top of that — the scheduler turn,
+    `apply_due_writes_sched`, the pc mapping and the access/trace hooks.
+
+So the session's 15-25x is roughly `op-at-a-time driving` x `scheduler turn`, and **neither layer is
+switched on by arming anything**. INTERP_PERF.md Phase 3 measured removing the per-op budget+fuel
+machinery *inside* a bulk resume at 2-3%; this is a different cost, and much larger.
+
+Why that matters for the design: `budget = 1` is load-bearing only when a seam is *armed*. With
+nothing armed, the finest granularity anything actually needs is `CHECKPOINT_STRIDE` = **1024 ops**
+(temen-dap's time-travel ladder lands on those boundaries). So the driver is running 1024x finer than
+its coarsest constraint, and a coarser turn -- bigger budget, same loop, still landing on every
+stride boundary -- would preserve the clock, the ladder and determinism while recovering most of
+this. That is a parameter of the existing driver, not a second driver, which is the cheaper answer to
+c_interpret#26's fork than making the release runner resumable."
     );
 }
