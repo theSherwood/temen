@@ -212,7 +212,21 @@ fn jit_parse(nifler: &temen_ir::Module, src: &str) -> Vec<u8> {
     run.output()
 }
 
+/// **Ignored: wasmi cannot translate this nifler's `_start`; V8 can.** The rebuilt asset (#1364)
+/// carries nine days of nimony front-end growth, and one function in it now exceeds wasmi's
+/// per-function register budget — `WModule::new` fails with "translation requires more registers for
+/// a function than available" before a single instruction runs. It is a limit of the *test harness's*
+/// engine, not of the emit: the emitted wasm is valid, and V8 runs it byte-identically to the
+/// interpreter (measured, on the rebuilt asset). The same split already ignores the Lua and SQLite
+/// cases in `jit_module.rs`.
+///
+/// The coverage is not dropped, it moves: `browser-nifler-crawl-jit-test.mjs` runs the same
+/// differential — emitted-wasm nifler vs `temen_run_nifler_crawl_fs`, both products byte-compared —
+/// in real Chromium, and is now wired into the `real-browser` CI job.
+///
+/// Un-ignore if wasmi's budget ever grows past this program; nothing else here needs changing.
 #[test]
+#[ignore = "wasmi can't translate nifler's grown _start (register budget); V8 does — see browser-nifler-crawl-jit-test.mjs"]
 fn nifler_jit_emits_identical_pnif() {
     let Some(nifler) = nifler_temen() else {
         eprintln!("SKIP: browser/web/assets/nifler.temen.gz absent or gzip unavailable");

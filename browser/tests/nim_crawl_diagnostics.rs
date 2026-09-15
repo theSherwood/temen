@@ -114,22 +114,19 @@ fn an_unparsable_source_reports_a_reason() {
     );
 }
 
-/// **The gate that would have caught the stale asset** (#1364) — `#[ignore]`d until the shipped
-/// `nifler.temen.gz` is rebuilt, because it fails today and the rebuild needs a Nim 2.3.x toolchain
-/// that neither this sandbox nor the per-PR CI has (`build_nifler_temen.sh` SKIPs without it).
+/// **The committed `nifler.temen.gz` must parse the float literals the stdlib actually contains**
+/// (#1364). This is the coherence check between the shipped asset and `nifler_shim.c`: the asset is
+/// a *build artifact of that shim*, and nothing else notices when it goes stale.
 ///
-/// The shipped nifler predates the `strtod` shim (`nifler_shim.c`, 2026-09-11): that commit rebuilt
-/// `nimsem`/`hexer`/`nimsem_ce`/`hexer_ce` but **not** `nifler`/`nifler_ce` — and nifler is the one
-/// phase that actually lexes float literals out of source. So a literal that misses
-/// `parseBiggestFloat`'s fast path reaches the still-stubbed `c_strtod` and traps `Unreachable`.
+/// It went stale once already, for nine days. The `strtod` shim (`nifler_shim.c`, 2026-09-11) rebuilt
+/// `nimsem`/`hexer`/`nimsem_ce`/`hexer_ce` but **not** `nifler` — the one phase that lexes float
+/// literals out of source. Every literal missing `parseBiggestFloat`'s fast path reached the
+/// still-stubbed `c_strtod` and trapped `Unreachable`, so `import std/math` (or anything reaching
+/// `std/fenv`) could not be crawled at all and those Runs fell back to the multi-minute tree-walker.
 ///
-/// Concretely, `import std/math` (or anything reaching `std/fenv`) cannot be crawled in the
-/// playground, which is why those Runs fall back to the multi-minute tree-walker.
-///
-/// Un-ignore once `ONLY=nifler bash scripts/rebuild-assets.sh` has been run with Nim 2.3.x on PATH
-/// and the regenerated `nifler.temen.gz` / `nifler_ce.temen.gz` committed.
+/// If this fails, the asset needs regenerating — not the test relaxing:
+/// `TEMEN_NIFLER_EMIT_ASSET=1 bash crates/temen-run/demos/nifler_temen/build_nifler_temen.sh`.
 #[test]
-#[ignore = "shipped nifler.temen.gz predates the strtod shim; rebuild with Nim 2.3.x first (#1364)"]
 fn shipped_nifler_parses_the_float_literals_the_stdlib_uses() {
     let Some(nifler) = asset("nifler.temen.gz") else {
         eprintln!("SKIP (no nifler asset)");
