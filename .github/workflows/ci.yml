@@ -1124,6 +1124,13 @@ jobs:
           # No assets — parses in-page via temen_parse; benign resource 404s (deploy-built cards) don't gate it.
           node browser-durable-persist-reload-test.mjs
           node browser-play-editor-test.mjs
+          # #1457 (the #1454 moment design): the playground's reactor **scrub bar** — time travel over a
+          # running guest. Drives the real page: the keyframe ladder builds as the run goes, input is
+          # taped, the DOM controls seek through the engine's moments reproducibly, Resume abandons the
+          # scrubbed-past future, the keyframe ring stays bounded, and Stop tears down a *paused* reactor.
+          # Uses the committed `bounce.temen` — no built asset. (Replay fidelity itself is gated on both
+          # tiers by the Rust `reactor_moment`/`jit_reactor_moment` suites, not here.)
+          node browser-play-scrub-test.mjs
           # #1392 — the chibicc card's separate-compilation path in the *wasm* cdylib: the committed
           # prebuilt libc unit (`web/assets/pg_libc.temeno`) goes resident, the user's C compiles as a
           # small program unit against libc declarations only, `temen_link_encode_lib` links it straight
