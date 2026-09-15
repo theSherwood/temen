@@ -84,7 +84,34 @@ temen-parity = { path = "crates/temen-parity" }
 # `jit_threads` — the empirical net for the §23 3c argument — finally run per-PR in a build where the
 # optimizer is allowed to misbehave. Before this they only ever ran at `opt-level = 0`, which is why
 # the bug sat unseen. Do not lower this to dodge a failure in that pair: a failure there is real.
-[profile.dev]
+# `cargo test` builds its WHOLE graph with the `test` profile — dependencies included, not just the
+# 519 test targets (verified: with `[profile.test] opt-level = 0`, rustc gets no `-C opt-level` for
+# `temen-interp`). So the knob has to be per-package here, not a blanket level: optimize the engines
+# that actually execute guest work, and leave the test binaries — harness glue that only calls into
+# them — at the default, because compiling 519 of those optimized is what ate the win.
+[profile.test.package.temen-interp]
+opt-level = 2
+[profile.test.package.temen-jit]
+opt-level = 2
+[profile.test.package.temen-leng]
+opt-level = 2
+[profile.test.package.temen-opt]
+opt-level = 2
+[profile.test.package.temen-peval]
+opt-level = 2
+[profile.test.package.temen-verify]
+opt-level = 2
+[profile.test.package.temen-encode]
+opt-level = 2
+[profile.test.package.temen-ir]
+opt-level = 2
+[profile.test.package.temen-mem]
+opt-level = 2
+[profile.test.package.temen-mask]
+opt-level = 2
+[profile.test.package.temen-wasm]
+opt-level = 2
+[profile.test.package.temen-wasm-jit]
 opt-level = 2
 
 [profile.release]
