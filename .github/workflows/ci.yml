@@ -1058,6 +1058,13 @@ jobs:
           # interpreter oracle (top-level nifler on the tree-walker). nimc.rs phase-1 nifler crawl, nested +
           # JIT'd. Uses the committed nifler_ce.temen.gz + web/assets/nifler.temen.gz; reuses the threads module.
           node browser-op13jit-nifler-test.mjs
+          # #1364: the emitted-wasm nifler crawl step vs the interpreter, both products byte-compared.
+          # This is the V8 home of a differential that used to live in `tests/nifler_jit.rs` on wasmi —
+          # the rebuilt nifler asset carries enough front-end growth that one function now exceeds
+          # wasmi's per-function register budget, so wasmi refuses the module outright while V8 runs it
+          # fine (the same split already ignores Lua/SQLite in `jit_module.rs`). The Rust test is
+          # `#[ignore]`d pointing here; without this line the coverage would simply be gone.
+          node browser-nifler-crawl-jit-test.mjs
           # #1025 3a.3 (real hexer): the phase-agnostic op-13 tier-up (`temen_op13jit_phase_open_argv`) on the
           # second front-end phase — a driver marshals {fs,stdout,exit} to hexer_ce (child-entry), seeds the
           # committed semchecked system module (`.s.nif` + `.s.idx.nif`), and JS runs hexer_ce's `_start` on
