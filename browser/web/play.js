@@ -3278,6 +3278,16 @@ let activeReactorCard = null;
 // user Stop (which cancels the loop out-of-band) can still emit the console summary the loop's own
 // terminal path would. `finalizeReactor` is the single close-out; it no-ops once consumed.
 let reactorRun = null; // { rec, t0, frames } while a reactor is live (else null)
+// The live loop body, so a run paused for scrubbing can be resumed (`resumeReactorLoop`). Null when no
+// reactor is open; the loop itself re-arms `reactorRAF` each frame.
+let reactorLoop = null;
+
+// Re-arm a reactor loop that `scrubPause` stopped. A no-op when nothing is paused (or already running),
+// so a double-click on Resume cannot schedule the loop twice.
+function resumeReactorLoop() {
+  if (reactorLoop && reactorRAF === null) reactorRAF = requestAnimationFrame(reactorLoop);
+  scrubRender();
+}
 function finalizeReactor(how) {
   if (!reactorRun) return;
   const { rec, t0, frames } = reactorRun;
@@ -3289,11 +3299,208 @@ function finalizeReactor(how) {
   runEnd(rec, { ok: how.ok !== false, status: how.status });
 }
 
+// ---- time travel: the keyframe ladder + input tape behind the scrub bar (#1457) -----------------
+//
+// The engine ships the *mechanism* — take a moment of the reactor (a window image + the host-side
+// capability state), restore it, free it — and holds the images in its own memory, where a 16 MiB Doom
+// keyframe costs one memcpy and never crosses the FFI. The *policy* lives here, because this is where
+// the frame loop and the input events are: how often to lay a keyframe down, how many to keep, and
+// what the guest was fed on each frame.
+//
+// Scrubbing back to frame `t` is then: restore the newest keyframe at or before `t`, then re-run the
+// guest forward to `t`, feeding it the taped input for each frame. The guest is deterministic given
+// its input (its clock is virtual, its randomness guest-side), so the frames that come back are the
+// frames that were there — the property `browser/tests/reactor_moment.rs` gates.
+//
+// Keyframe stride is a wall-clock/memory trade: at stride 30 a scrub lands within 30 frames of re-run
+// (a few ms on the emitted tier), and the ring holds ~16 s of a 60 fps run at 16 MiB a keyframe.
+const SCRUB_STRIDE = 30; // frames between keyframes
+const SCRUB_KEYFRAMES = 8; // ring size — the oldest is freed as a new one lands
+// …and a byte ceiling, because a keyframe's cost is the guest's window: a bounce keyframe is a few KiB,
+// a Doom one is 16 MiB. Holding eight of *those* is 128 MiB of engine memory for a scroll bar, so the
+// ring shortens itself on a heavy guest instead of the count alone deciding.
+const SCRUB_BUDGET_BYTES = 96 * 1024 * 1024;
+let scrub = null; // the live run's ladder + tape (see `scrubOpen`), else null
+
+// The tier shim: the same three engine calls on whichever reactor is live, so everything below is
+// written once (INVARIANTS #15) rather than branched per tier.
+function scrubEngine() {
+  return jitReactor
+    ? {
+      take: () => eng.ex.temen_onramp_jit_moment_take(),
+      restore: (slot) => eng.ex.temen_onramp_jit_moment_restore(slot),
+      frame: () => jitReactor.frame(),
+      key: (k, p) => eng.ex.temen_onramp_jit_key(k, p),
+    }
+    : {
+      take: () => eng.ex.temen_onramp_moment_take(),
+      restore: (slot) => eng.ex.temen_onramp_moment_restore(slot),
+      frame: () => eng.ex.temen_onramp_frame(),
+      key: (k, p) => eng.ex.temen_onramp_key(k, p),
+    };
+}
+
+// Start recording for a freshly opened reactor. `tick` counts frames the guest has completed, so the
+// state at tick 0 is "opened, before the first frame" — which is the first keyframe.
+function scrubOpen(c) {
+  scrub = { card: c, tick: 0, tape: new Map(), keys: [], viewing: null };
+  scrubKeyframe();
+  scrubRender();
+}
+
+// Drop the ladder and hand every held image back to the engine. Moments belong to the window they were
+// taken from, so a closing reactor's are worthless to the next one.
+function scrubClose() {
+  if (!scrub) return;
+  eng.ex.temen_onramp_moment_clear();
+  scrub = null;
+  scrubRender();
+}
+
+// Lay a keyframe down at the current tick, evicting the oldest past the ring size. A refused capture
+// (`-1` — no reactor, or a window the engine can't image) simply leaves the ladder as it was: the scrub
+// range shrinks to what is actually held rather than promising a frame it cannot reach.
+function scrubKeyframe() {
+  const slot = scrubEngine().take();
+  if (slot < 0) return;
+  // Cache the picture beside the moment. The engine's moment is *guest state*, and the presented frame
+  // is output — no guest reads it back — so it is not in there (and keeping it there would cost a
+  // framebuffer copy every frame rather than every keyframe). But a scrub that lands exactly on a
+  // keyframe re-runs **zero** frames, so nothing repaints the canvas: without this the viewer would be
+  // left looking at a frame from the timeline they just left. One copy per keyframe, next to a window
+  // image that is orders of magnitude bigger.
+  scrub.keys.push({ tick: scrub.tick, slot, bytes: eng.ex.temen_onramp_moment_bytes(slot), pic: scrubPicture() });
+  let held = scrub.keys.reduce((n, k) => n + k.bytes, 0);
+  // Evict oldest-first past either bound, but never below one keyframe — a ladder with nothing in it
+  // cannot seek anywhere, and the newest is the one a scrub is most likely to want.
+  while (scrub.keys.length > 1 && (scrub.keys.length > SCRUB_KEYFRAMES || held > SCRUB_BUDGET_BYTES)) {
+    const evicted = scrub.keys.shift();
+    held -= evicted.bytes;
+    eng.ex.temen_onramp_moment_free(evicted.slot);
+  }
+}
+
+// The framebuffer as it stands right now — `{w, h, rgba}`, copied out of the engine's capture slots
+// (a live view would alias memory the next frame overwrites). `null` before the guest presents anything.
+function scrubPicture() {
+  const w = eng.ex.temen_framebuffer_width();
+  const h = eng.ex.temen_framebuffer_height();
+  if (!w || !h) return null;
+  const p = eng.ex.temen_framebuffer_ptr();
+  const n = eng.ex.temen_framebuffer_len();
+  return { w, h, rgba: new Uint8Array(eng.memory.buffer).slice(p, p + n) };
+}
+
+// Called after every frame the live loop runs: advance the tick, lay a keyframe on the stride, and
+// repaint the row — the range's upper bound *is* the live frame count, so it has to track it or a drag
+// can only reach as far as the run had got when the row was last painted.
+function scrubAfterFrame() {
+  if (!scrub) return;
+  scrub.tick++;
+  if (scrub.tick % SCRUB_STRIDE === 0) scrubKeyframe();
+  scrubRender();
+}
+
+// The oldest frame the ladder can still reach (the earliest keyframe it holds).
+function scrubOldest() {
+  return scrub && scrub.keys.length ? scrub.keys[0].tick : 0;
+}
+
+// Seek to frame `target`: restore the newest keyframe at or before it, then re-run forward feeding the
+// taped input. Returns the frame actually landed on (clamped to what the ladder holds), or `null` if
+// there is nothing to seek in. The guest presents a frame per re-run tick; only the last is drawn, so a
+// scrub shows the frame the user asked for rather than flickering through the ones before it.
+function scrubSeek(target) {
+  if (!scrub || !scrub.keys.length) return null;
+  const e = scrubEngine();
+  target = Math.max(scrubOldest(), Math.min(target, scrub.tick));
+  let kf = scrub.keys[0];
+  for (const k of scrub.keys) if (k.tick <= target) kf = k;
+  if (e.restore(kf.slot) !== 0) return null;
+  let ran = 0;
+  for (let t = kf.tick; t < target; t++) {
+    // The input the guest was handed *for* frame t+1 — enqueued after frame t finished.
+    for (const ev of scrub.tape.get(t + 1) || []) e.key(ev.k, ev.p);
+    if (e.frame() !== 0) break; // the guest exited/trapped here on the recorded run too
+    ran++;
+  }
+  scrub.viewing = target;
+  // Landed exactly on the keyframe: no frame ran, so the engine's framebuffer still holds a picture
+  // from wherever we came from — draw the one cached with the moment instead.
+  if (ran === 0 && kf.pic) presentFrameData(scrub.card, kf.pic.w, kf.pic.h, kf.pic.rgba);
+  else presentFrame(scrub.card, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
+  scrubRender();
+  return target;
+}
+
+// Resume live play from the frame currently being viewed. The recorded future is **abandoned**: the
+// user is about to play differently, so the tape and the keyframes past this point are dropped rather
+// than left to contradict what happens next.
+function scrubResumeFrom(tick) {
+  if (!scrub) return;
+  for (const t of [...scrub.tape.keys()]) if (t > tick) scrub.tape.delete(t);
+  while (scrub.keys.length && scrub.keys[scrub.keys.length - 1].tick > tick) {
+    eng.ex.temen_onramp_moment_free(scrub.keys.pop().slot);
+  }
+  scrub.tick = tick;
+  scrub.viewing = null;
+  scrubRender();
+}
+
+// Test/telemetry hook (harmless): the live ladder + tape, so a headless driver can assert on the frame
+// count, what the ring still holds, and what the guest was fed — none of which is visible in the DOM.
+globalThis.__scrubState = () => scrub && {
+  tick: scrub.tick,
+  viewing: scrub.viewing,
+  keyframes: scrub.keys.map((k) => k.tick),
+  taped: [...scrub.tape.keys()].sort((a, b) => a - b),
+};
+
+// Paint the scrub row from the live state: range bounds, the frame label, and which controls apply.
+function scrubRender() {
+  const c = scrub && scrub.card;
+  for (const card of cards) {
+    const row = card.el.scrub;
+    if (!row) continue;
+    const live = card === c;
+    row.wrap.hidden = !live;
+    if (!live) continue;
+    const oldest = scrubOldest();
+    row.range.min = String(oldest);
+    row.range.max = String(scrub.tick);
+    const at = scrub.viewing == null ? scrub.tick : scrub.viewing;
+    row.range.value = String(at);
+    row.label.textContent = scrub.viewing == null
+      ? `frame ${scrub.tick} · live`
+      : `frame ${at} / ${scrub.tick} · paused (${oldest}–${scrub.tick} held)`;
+    row.resume.disabled = scrub.viewing == null;
+  }
+}
+
+// Pause the live loop so the user can scrub. Cancels the pending rAF but keeps the reactor open.
+function scrubPause() {
+  if (reactorRAF !== null) {
+    cancelAnimationFrame(reactorRAF);
+    reactorRAF = null;
+  }
+  if (scrub && scrub.viewing == null) scrub.viewing = scrub.tick;
+  scrubRender();
+}
+
 // Feed one key event to the running reactor guest through the `keyboard` capability (JS keyCode +
 // pressed flag). Shared by the physical-keyboard handler and the on-screen touch dpad; a no-op when no
 // reactor loop is running, and routed to whichever tier (interpreter / wasm-JIT) is live.
+//
+// Also **taped**: the guest drains the queue on its next frame, so the event belongs to `tick + 1`.
+// That tape is what makes a scrub faithful — re-running from a keyframe with no input would replay a
+// guest nobody was steering.
 function sendReactorKey(keyCode, pressed) {
   if (reactorRAF === null) return;
+  if (scrub) {
+    const t = scrub.tick + 1;
+    if (!scrub.tape.has(t)) scrub.tape.set(t, []);
+    scrub.tape.get(t).push({ k: keyCode, p: pressed });
+  }
   if (jitReactor) eng.ex.temen_onramp_jit_key(keyCode, pressed);
   else eng.ex.temen_onramp_key(keyCode, pressed);
 }
@@ -3308,13 +3515,20 @@ function sendReactorMouse(kind, payload) {
 }
 
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
+// "Running" is not the same as "open": a reactor **paused for scrubbing** has no pending rAF but is
+// very much still open, so what to tear down is keyed on `activeReactorCard`, not on the loop.
 function stopReactor() {
   teardownWebGPU(); // drop any GPU device + the servicer (no-op for non-webgpu reactors)
   if (activeReactorCard) activeReactorCard.el.gpucanvas.hidden = true;
-  if (reactorRAF === null) { finalizeReactor({ ended: 'stopped', ok: true }); activeReactorCard = null; return; }
-  cancelAnimationFrame(reactorRAF);
-  reactorRAF = null;
+  const open = activeReactorCard !== null;
+  if (reactorRAF !== null) {
+    cancelAnimationFrame(reactorRAF);
+    reactorRAF = null;
+  }
+  reactorLoop = null;
+  scrubClose(); // hand every held keyframe back before the window they image goes away
   finalizeReactor({ ended: 'stopped', ok: true }); // a live loop was cancelled by the user / a superseding Run
+  if (!open) { activeReactorCard = null; return; }
   if (jitReactor) {
     jitReactor.close();
     jitReactor = null;
@@ -3425,8 +3639,11 @@ async function runReactor(c) {
   let fpsT0 = t0;
   // Publish the live loop's stats so a user Stop (out-of-band cancel) can still emit the console summary.
   reactorRun = { rec, t0, frames: 0 };
+  // Start the keyframe ladder + input tape, so the run can be scrubbed back through (#1457).
+  scrubOpen(c);
   const loop = () => {
-    const status = jitReactor ? jitReactor.frame() : eng.ex.temen_onramp_frame();
+    const status = scrubEngine().frame();
+    scrubAfterFrame();
     presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
     // The tick's stdout (a guest's console output; the Uxntal card's assembly error) — appended live.
     const outLen = eng.ex.temen_stdout_len();
@@ -3457,6 +3674,8 @@ async function runReactor(c) {
           new Uint8Array(eng.memory.buffer).slice(eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + n));
       }
     }
+    reactorLoop = null;
+    scrubClose(); // the guest is gone; its keyframes image a window that no longer exists
     if (jitReactor) {
       jitReactor.close();
       jitReactor = null;
@@ -3473,6 +3692,7 @@ async function runReactor(c) {
     logTo(c, `reactor stopped (${tier}): status ${status}${trapDetail ? ` ${trapDetail}` : ''} after ${frames} frames in ${secs}s`);
     finalizeReactor({ ended: status === 5 ? 'exit' : 'trap', ok: status === 5, status, trap: trapDetail || undefined });
   };
+  reactorLoop = loop;
   reactorRAF = requestAnimationFrame(loop);
 }
 
@@ -4279,7 +4499,9 @@ function stopDemo(c) {
     setState(c, 'stopped', 'session closed — Run reopens your saved database (`\\reset` for a clean one)');
     return;
   }
-  if (reactorRAF !== null) {
+  // A reactor is this card's to stop whenever one is **open** — which is not the same as "a frame
+  // callback is pending": a run paused for scrubbing has no rAF and is still very much open.
+  if (activeReactorCard !== null || reactorRAF !== null) {
     stopReactor();
     c.el.run.disabled = broken;
     c.el.stop.disabled = true;
@@ -4540,6 +4762,42 @@ function buildCard(name, ex) {
     section.appendChild(term);
   }
 
+  // Reactor cards get a **scrub bar**: the run's keyframe ladder made steerable (#1457). Hidden until
+  // this card's reactor is the live one. Dragging the range pauses the loop and seeks — restore the
+  // newest keyframe at or before the target, then re-run forward over the taped input; Resume plays on
+  // from wherever you stopped, abandoning the future you scrubbed past.
+  let scrubRow = null;
+  if (ex.kind === 'reactor') {
+    const wrap = el('div', 'scrub');
+    wrap.hidden = true;
+    const back = el('button', 'scrub-step scrub-back', '◀');
+    back.title = 'Step back one frame';
+    const fwd = el('button', 'scrub-step scrub-fwd', '▶');
+    fwd.title = 'Step forward one frame';
+    const range = el('input', 'scrub-range');
+    range.type = 'range';
+    range.min = '0';
+    range.max = '0';
+    range.value = '0';
+    range.title = 'Scrub through the frames the ladder still holds';
+    const label = el('span', 'scrub-label', 'frame 0');
+    const resume = el('button', 'scrub-resume', 'Resume');
+    resume.title = 'Play on from this frame (the frames after it are abandoned)';
+    resume.disabled = true;
+    wrap.append(back, range, fwd, label, resume);
+    section.appendChild(wrap);
+    scrubRow = { wrap, range, label, resume, back, fwd };
+    const seekTo = (t) => { scrubPause(); scrubSeek(t); };
+    range.addEventListener('input', () => seekTo(Number(range.value)));
+    back.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrub.tick) : 0) - 1));
+    fwd.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrub.tick) : 0) + 1));
+    resume.addEventListener('click', () => {
+      if (!scrub || scrub.viewing == null) return;
+      scrubResumeFrom(scrub.viewing);
+      resumeReactorLoop();
+    });
+  }
+
   const out = el('div', 'output');
   const result = el('pre', 'result');
   const canvas = el('canvas', 'canvas');
@@ -4628,7 +4886,7 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, jsEditor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, scrub: scrubRow, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
   };
   // `pickFile` cards: a file input + the canvas as a drop target. The picked file replaces the card's
   // served file (`c.userFile`, under the same guest-visible name) for every later Run; a running loop
