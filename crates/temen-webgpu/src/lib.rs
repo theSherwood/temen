@@ -29,7 +29,7 @@
 //! A buffer is bound at `@binding(0)` (and `@binding(1)` when `buf1_id >= 0`) of `@group(0)`; the
 //! shader entry point is `main`; the workgroup count is `(groups_x, 1, 1)`.
 
-use temen_interp::{GuestMem, Trap};
+use temen_interp::{GuestMem, RegionMinter, Trap};
 use temen_run::HostCap;
 
 /// The lazily-initialized GPU context (device + queue), shared for a run's lifetime.
@@ -242,8 +242,11 @@ pub fn webgpu_cap() -> HostCap {
         Box::new(
             move |op: u32,
                   args: &[i64],
-                  mem: Option<&mut dyn GuestMem>|
-                  -> Result<Vec<i64>, Trap> { Ok(vec![st.handle(op, args, mem)]) },
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn RegionMinter>|
+                  -> Result<Vec<i64>, Trap> {
+                Ok(vec![st.handle(op, args, mem)])
+            },
         )
     })
 }
