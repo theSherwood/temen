@@ -286,3 +286,148 @@ fn undrained_input_rides_the_moment() {
         "the queued steer changed the future, so the queue capture is load-bearing"
     );
 }
+
+// ---- #1458: a reactor freezes to a §12 artifact and thaws ------------------------------------
+//
+// A moment lives in this process; an **artifact** does not. It is the same state — window image, page
+// map, capability state — written into the durability codec's container, so it can be persisted,
+// reloaded into a fresh instance, and played on: a save-state.
+//
+// Two properties are load-bearing and neither is machinery, they are both consequences of freezing at
+// a frame boundary. There is no continuation to capture, so the module needs none of the
+// `temen-durable` instrumentation an arbitrary-safepoint freeze does. And the image is post-`_start`,
+// so a thaw does not re-run init — for Doom that is seconds of WAD parsing skipped, which is most of
+// what a save-state is for.
+
+/// The gate: freeze mid-run, thaw into a **fresh** reactor, and the frames that follow are the frames
+/// that would have followed. Same warm ≡ cold shape as the in-process rewind, across a serialization.
+#[test]
+fn a_reactor_freezes_to_an_artifact_and_thaws_playing() {
+    let m = temen_encode::decode_module(BOUNCE).expect("decode bounce.temen");
+    let mut live = OnrampReactor::open(&m).expect("open");
+    let _ = run_scripted(&mut live, 0, 9);
+
+    let artifact = live
+        .freeze(&m)
+        .expect("a reactor at a frame boundary is freezable");
+    let expected = run_scripted(&mut live, 9, 7);
+
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, None).expect("thaw");
+    assert_eq!(
+        expected,
+        run_scripted(&mut thawed, 9, 7),
+        "a thawed reactor plays on exactly where the frozen one did"
+    );
+
+    // And the artifact is reusable — a save-state is loaded more than once.
+    let mut again = OnrampReactor::thaw(&artifact, &m, None).expect("thaw again");
+    assert_eq!(expected, run_scripted(&mut again, 9, 7));
+}
+
+/// The Doom-shaped case, as a save-state: `life` keeps its grids in a **malloc heap above the mapped
+/// window**, so its state is in `vm_map`-grown reserved-tail pages. Those ride the artifact only if
+/// the codec's page map marks them committed — a thaw that brought them back unmapped would fault on
+/// the first tick.
+#[test]
+fn a_grown_heap_rides_the_artifact() {
+    let m = temen_encode::decode_module(LIFE).expect("decode life.temen");
+    let mut live = OnrampReactor::open(&m).expect("open");
+    let _ = run_scripted(&mut live, 0, 7);
+
+    let artifact = live.freeze(&m).expect("freeze a grown window");
+    let expected = run_scripted(&mut live, 7, 5);
+
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, None).expect("thaw");
+    assert_eq!(
+        expected,
+        run_scripted(&mut thawed, 7, 5),
+        "the grown heap came back committed and the frames that follow are the same"
+    );
+}
+
+/// The `fs` capability's cursors ride the artifact, through the capability's own declared state
+/// (#1455). This is the case a window-only save-state gets wrong: the guest's memory comes back but
+/// its open file is at whatever offset a freshly-granted server starts at.
+#[test]
+fn a_thawed_reactor_keeps_its_fs_cursors() {
+    let blob: Vec<u8> = (0..=255u8).collect();
+    let m = temen_encode::decode_module(FSREAD).expect("decode fsread.temen");
+    let mut live = OnrampReactor::open_with_fs(&m, "data.bin".to_string(), blob.clone())
+        .expect("open the fsread reactor");
+    let before = frame_hash(&live.step());
+
+    let artifact = live.freeze(&m).expect("freeze a cap-using reactor");
+    // The capability table is what used to make this impossible: `display` + `keyboard` + `fs` are all
+    // host capabilities, and before #1455 any one of them refused the freeze outright.
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, Some(("data.bin".to_string(), blob)))
+        .expect("thaw re-grants display/keyboard/fs by name");
+    assert_eq!(
+        before,
+        frame_hash(&thawed.step()),
+        "the thawed guest renders the same file view"
+    );
+}
+
+/// Input the guest has been handed but not yet drained rides the artifact too — the same property the
+/// in-process moment has, across a serialization.
+#[test]
+fn a_thawed_reactor_keeps_undrained_input() {
+    let m = temen_encode::decode_module(BOUNCE).expect("decode bounce.temen");
+    let mut live = OnrampReactor::open(&m).expect("open");
+    let _ = run_scripted(&mut live, 0, 3);
+    live.push_key(LEFT, 1); // queued, not yet polled
+
+    let artifact = live.freeze(&m).expect("freeze");
+    let steered: Vec<u64> = (0..5).map(|_| frame_hash(&live.step())).collect();
+
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, None).expect("thaw");
+    assert_eq!(
+        steered,
+        (0..5)
+            .map(|_| frame_hash(&thawed.step()))
+            .collect::<Vec<_>>(),
+        "the undrained keypress rode the artifact"
+    );
+}
+
+/// The digest binding: an artifact is bound to the module it was frozen over, so a save-state cannot
+/// be loaded under a different guest's code.
+#[test]
+fn a_save_state_refuses_a_different_module() {
+    let bounce = temen_encode::decode_module(BOUNCE).expect("decode");
+    let life = temen_encode::decode_module(LIFE).expect("decode");
+    let mut r = OnrampReactor::open(&bounce).expect("open");
+    let _ = run_scripted(&mut r, 0, 3);
+    let artifact = r.freeze(&bounce).expect("freeze");
+
+    assert!(
+        OnrampReactor::thaw(&artifact, &life, None).is_err(),
+        "one guest's save-state must not restore under another's code"
+    );
+}
+
+/// A thawed reactor is itself freezable — the state hooks are re-declared after the thaw re-grants the
+/// handlers, so a save-state can be taken, loaded, and taken again rather than degrading after one
+/// round trip. The second freeze is taken with input queued but undrained, so a thaw that had lost
+/// the hooks (an empty state riding the second artifact) is observable: the queued press steers the
+/// live reactor and not the twice-thawed one.
+#[test]
+fn a_thawed_reactor_can_be_frozen_again() {
+    let m = temen_encode::decode_module(BOUNCE).expect("decode bounce.temen");
+    let mut live = OnrampReactor::open(&m).expect("open");
+    let _ = run_scripted(&mut live, 0, 5);
+    let first = live.freeze(&m).expect("freeze");
+
+    let mut thawed = OnrampReactor::thaw(&first, &m, None).expect("thaw");
+    let expected = run_scripted(&mut thawed, 5, 4);
+    thawed.push_key(LEFT, 1); // queued, not yet polled — rides the second artifact only via the hooks
+    let second = thawed.freeze(&m).expect("a thawed reactor freezes again");
+
+    let mut twice = OnrampReactor::thaw(&second, &m, None).expect("thaw the second artifact");
+    assert_eq!(
+        run_scripted(&mut twice, 9, 4),
+        run_scripted(&mut thawed, 9, 4),
+        "the second round trip is as faithful as the first"
+    );
+    assert!(!expected.is_empty());
+}

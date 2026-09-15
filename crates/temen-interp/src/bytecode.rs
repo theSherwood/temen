@@ -2750,6 +2750,11 @@ impl Reactor {
     pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
         restore_window_of(self.mem.as_mut(), layout)
     }
+
+    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
+    pub fn window_reserved_log2(&self) -> Option<u8> {
+        window_reserved_log2_of(self.mem.as_ref())
+    }
 }
 
 /// Capture a reactor's window, or `None` when there is nothing faithfully capturable: a memory-less
@@ -2760,6 +2765,14 @@ impl Reactor {
 fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
     let m = mem?;
     m.layout_snapshot_safe().then(|| m.layout_snapshot())
+}
+
+/// A reactor window's **reservation** as a log2 — the mask domain the guest grew within, which a §12
+/// artifact records alongside the committed image so a thaw restores a window that can grow as far
+/// again. `None` for a memory-less module.
+fn window_reserved_log2_of(mem: Option<&Mem>) -> Option<u8> {
+    let (_, _, reserved, _) = mem?.map_info();
+    Some(reserved.trailing_zeros() as u8)
 }
 
 /// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]).
@@ -2928,6 +2941,11 @@ impl VcpuReactor {
     /// a memory-less module (nothing to restore into).
     pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
         restore_window_of(self.mem.as_mut(), layout)
+    }
+
+    /// This window's reservation as a log2 — see [`window_reserved_log2_of`].
+    pub fn window_reserved_log2(&self) -> Option<u8> {
+        window_reserved_log2_of(self.mem.as_ref())
     }
 }
 
