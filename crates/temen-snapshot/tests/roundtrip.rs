@@ -94,6 +94,9 @@ fn instrument(src: &str) -> Module {
     inst
 }
 
+/// What a registrar was asked for: `(name, captured state)` per call.
+type CapLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
 #[test]
 fn freeze_serialize_restore_thaw_through_the_codec() {
     let inst = instrument(SRC);
@@ -1468,5 +1471,103 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
         thawed,
         Ok(vec![Value::I64(107)]),
         "the thawed supervisor called echo(7) through the re-linked cap and got 107"
+    );
+}
+
+// ---- #1455: named host capabilities through the real artifact -------------------------------
+//
+// Before this, a live `HostProc` refused the freeze outright — so a playground reactor, or any other
+// guest holding a `display`/`keyboard`/`fs` capability, could never be frozen at all. A registered
+// **name** is what makes one durable: the artifact carries the name plus whatever state the provider
+// serialized, and the thawing embedder's registrar decides what to grant back.
+
+/// A named, stateful host capability survives freeze → serialize → restore: the name and the
+/// provider's bytes reach the registrar, and the guest's handle value still resolves afterwards.
+#[test]
+fn a_named_host_cap_round_trips_through_the_codec() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    host.register_cap_name("fs", h);
+    host.set_cap_state_capture(h, Box::new(|| b"cursor=7".to_vec()));
+
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("a named host capability is freezable");
+
+    let seen: CapLog = Default::default();
+    let log = std::sync::Arc::clone(&seen);
+    let mut thost = Host::new();
+    thost.set_named_cap_registrar(Box::new(move |name, state| {
+        log.lock().unwrap().push((name.to_string(), state.to_vec()));
+        Some(Box::new(|_op, _args, _mem, _| Ok(vec![99])))
+    }));
+    restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `fs`");
+
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[("fs".to_string(), b"cursor=7".to_vec())],
+        "the registrar was handed the captured name and the provider's state"
+    );
+    assert_eq!(
+        thost.cap_dispatch_slots(temen_interp::cap_id::HOST_PROC, 0, h, &[], None),
+        Ok(vec![99]),
+        "the guest-held handle value still reaches the re-granted capability"
+    );
+}
+
+/// The authority seam, through the artifact: a restoring host that does not serve the name grants
+/// nothing and the restore fails, naming what it refused. An artifact asks; it never confers.
+#[test]
+fn restore_refuses_an_artifact_naming_a_cap_the_embedder_does_not_serve() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    host.register_cap_name("fs", h);
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    let mut bare = Host::new(); // no registrar
+    match restore(&artifact, &inst, &mut bare) {
+        Err(RestoreError::NamedCapRefused(name)) => assert_eq!(name, "fs"),
+        other => panic!("expected a NamedCapRefused refusal, got {other:?}"),
+    }
+}
+
+/// An unnamed host capability is still non-durable — the refusal that made this issue necessary is
+/// unchanged for a capability with no reconstruction rule.
+#[test]
+fn freeze_still_refuses_an_unnamed_host_cap() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // never named
+    let win = init_durable_window(WINDOW);
+    match freeze(&inst, &win, &host) {
+        Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
+        other => panic!("expected NonDurableHandle refusal, got {other:?}"),
+    }
+}
+
+/// A domain with no named capability emits no Section 7 — an artifact without one keeps the previous
+/// section layout, so the new section costs nothing to every guest that does not use it.
+#[test]
+fn a_cap_free_domain_elides_the_named_section() {
+    let inst = instrument(SRC);
+    let mut plain = Host::new();
+    plain.grant_clock();
+    let win = init_durable_window(WINDOW);
+    let without = freeze(&inst, &win, &plain).expect("freeze");
+
+    let mut with = Host::new();
+    with.grant_clock();
+    let h = with.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    with.register_cap_name("fs", h);
+    let named = freeze(&inst, &win, &with).expect("freeze");
+
+    assert!(
+        named.len() > without.len(),
+        "the named section is emitted only when there is one to carry"
     );
 }
