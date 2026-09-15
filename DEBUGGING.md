@@ -770,7 +770,15 @@ structure is rebuilt by `fresh_single_root`, so neither needs to be `Clone`. Cap
 **root-only, non-fiber, non-durable, no-installed-units, simple-memory** subset where `frames` + window
 bytes fully determine the continuation (and the host carries no §13/§14/§22 residue a restore would
 drop) — `VCpu::checkpointable` + `Host::checkpoint_safe`; anything richer turns checkpointing off and
-falls back to the (correct) replay-from-0. *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
+falls back to the (correct) replay-from-0. **A guest holding a host capability is in the subset
+(#1455):** a `HostProc` used to veto the whole run, which self-disabled the ladder for every guest that
+does file I/O or drives a device; one carrying a registered **name** is now admitted (an unnamed one
+still vetoes, fail-closed), because every `HOST_PROC` crossing is taped — a replay serves it rather than
+re-entering the closure — and the checkpoint carries both the capability's own declared state and the
+count of crossings consumed so far. *Oracles:*
+`dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability` (a `vm_fs`
+write loop under the real DAP powerbox) and `bytecode_debug_cap_checkpoint.rs` (the named/unnamed
+split, and a stateful capability restored against a live host). *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
 (ladder populated, so `seek` restores) is asserted state-identical — result, paused location, clock,
 and window bytes — to a **cold** one (replays from 0) across checkpoint-stride boundaries, a backward
 sweep, and one-at-a-time `step_back`. *Still open:* **multithreaded** (`turn`-coordinate) checkpoints,

@@ -1257,6 +1257,11 @@ impl Debuggee for BytecodeBackend {
                 }
             }
             self.engine = Engine::Threaded(Box::new(run));
+            // A `seek` past the furthest point reached so far runs new ground **live**, recording cap
+            // crossings a later reverse seek would otherwise have to re-run live against a rebuilt
+            // powerbox. Absorb them here, exactly as every forward advance does — a host capability's
+            // closure is gone on a rebuild, so only the tape reproduces it (`is_recorded_input`).
+            self.capture_tape();
             return self.step_stop();
         }
         let Some(mut run) = self.fresh_single() else {
@@ -1277,6 +1282,7 @@ impl Debuggee for BytecodeBackend {
         }
         self.drive_single_to(&mut run, t, &mut fuel);
         self.engine = Engine::Single(Box::new(run));
+        self.capture_tape(); // see the threaded arm above — a forward seek records new cap crossings
         self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
                               // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
                               // here makes progress instead of immediately re-reporting this stop.

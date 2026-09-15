@@ -744,6 +744,11 @@ struct HostReplaySubstate {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     clock_ns: i64,
+    /// How many capability crossings the run had consumed at the checkpoint ([`Host::cap_consumed`]) —
+    /// where a replay resumed from here must pick the tape up. Not the raw `cap_replay` position: a
+    /// checkpoint laid down while the run was *recording* (the first `seek`, whose tape is still empty)
+    /// has a replay position of 0 and N records behind it, and restoring 0 would re-serve the run's
+    /// first crossing to a guest N crossings in.
     cap_cursor: usize,
     cap_record: Vec<CapRecord>,
     /// §3.6 serve state — the domain's inbound dispatch queue, its settled completion cells, and its
@@ -760,6 +765,15 @@ struct HostReplaySubstate {
     /// The memory growth-cap accounting at the checkpoint (slice 5) — without it, a restore
     /// would zero the count and the limit would go lenient after a seek.
     mem_mapped_bytes: u64,
+    /// #1455 — each host capability's **own** declared state, positional over `host_procs`
+    /// ([`Host::capture_cap_states`]). A checkpoint restores into a run whose powerbox was rebuilt from
+    /// scratch, so a capability carrying guest-observable state of its own (an `fs` server's per-`open`
+    /// cursors) would otherwise come back at its *initial* state under a guest at logical time `c`.
+    /// This is the identical capture/restore pair a §12 freeze writes into the artifact's named-cap
+    /// section — one definition of "the cap state", read two ways (INVARIANTS #13), so the ladder and
+    /// the artifact cannot drift apart. `None` for a provider that declared none, which is the common
+    /// case (`display` is pure output; `keyboard` is a queue the guest refills).
+    cap_states: Vec<Option<Vec<u8>>>,
 }
 
 /// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
@@ -18569,6 +18583,15 @@ pub struct Host {
     /// W1 replay: when `Some`, serve nondeterministic-input `call.cap`s from this tape (cursor) in
     /// order instead of the live host, so a fresh-powerbox re-execution reproduces the guest's inputs.
     cap_replay: Option<(Arc<[CapRecord]>, usize)>,
+    /// How many capability crossings this run has **consumed** so far — the number of tape entries a
+    /// replay must skip to stand where this host stands. It counts both routes a crossing can take
+    /// (served from `cap_replay`, or run live and appended to `cap_record`), which is why it is its own
+    /// counter rather than either of theirs: after a checkpoint restore the replay cursor already
+    /// includes the records the checkpoint carried, so adding the two would double-count. A checkpoint
+    /// stores this and a restore puts the replay cursor back on it — without that, a checkpoint taken
+    /// while *recording* (the first `seek`, whose tape is still empty) restores as cursor 0 and the
+    /// next cap call re-serves the run's **first** crossing.
+    cap_consumed: usize,
     /// This domain runs a **durable** (freeze/thaw-instrumented) module: `drive` propagates it to
     /// every vCPU so the runtime maintains the per-context shadow-SP swap (D-fiber-cont option A,
     /// DURABILITY.md §12.8). `false` (the default) ⇒ an ordinary run that never touches the
@@ -18980,6 +19003,7 @@ impl Host {
             jit_hosts_durable: false,
             cap_record: None,
             cap_replay: None,
+            cap_consumed: 0,
             durable: false,
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
@@ -19919,6 +19943,7 @@ impl Host {
     /// — used by re-execution / time-travel so it sees identical inputs without a live powerbox.
     fn replay_caps(&mut self, tape: Arc<[CapRecord]>) {
         self.cap_replay = Some((tape, 0));
+        self.cap_consumed = 0; // arming a tape restarts this host's crossing count with it
     }
 
     /// Seed this host to **replay** capability inputs from `tape` (from the start) instead of driving the
@@ -19946,11 +19971,36 @@ impl Host {
     /// coroutine/child (which needs a module grant to spawn) stays checkpointable, its pushed source units
     /// captured in the run snapshot. (The DAP backend grants no modules, so this only affects a direct
     /// embedder driving `snapshot`/`restore` itself, which rebuilds its own powerbox.)
+    ///
+    /// **Named host capabilities are admitted (#1455).** A host-fn used to disqualify the whole run,
+    /// which self-disabled the ladder for *every* interesting guest — a debugged C program that does
+    /// file I/O holds `vm_fs`; a playground reactor holds `display`/`keyboard`/`fs` — leaving them on
+    /// O(t) replay-from-0. Two things make one restorable, and they are the same two the freeze path
+    /// ([`Host::capture_durable_handles`]) relies on:
+    ///
+    /// * **Its crossings are taped.** [`is_recorded_input`] records every `HOST_PROC` call, so a replay
+    ///   serves them from the tape and never re-enters the closure — the seam that already made
+    ///   replay-from-0 work for these guests, now reused from a checkpoint instead of from zero.
+    /// * **It is named.** A registered name ([`Host::register_cap_name`]) is the reconstruction rule: the
+    ///   powerbox minted it through its deterministic by-name sequence, so a rebuilt run grants the same
+    ///   set in the same order — handle values in restored frames stay valid, and the positional
+    ///   cap-state vector in [`HostReplaySubstate`] lines up. An **unnamed** host-fn is an opaque closure
+    ///   with no such rule and still disqualifies the run, exactly as before (fail-closed).
     fn checkpoint_safe(&self) -> bool {
         self.regions.is_empty()
             && self.blockings.is_empty()
-            && self.host_procs.is_empty()
+            && self.every_host_proc_named()
             && self.jit_tables.is_empty()
+    }
+
+    /// Whether every **live** host capability carries a registered name — the same reconstruction rule
+    /// [`Host::capture_durable_handles`] demands of a `Binding::HostProc`, read here for the checkpoint
+    /// ladder. A dead slot is irrelevant: nothing can dispatch through it, and the positional cap-state
+    /// vector covers it either way.
+    fn every_host_proc_named(&self) -> bool {
+        self.table.iter().enumerate().all(|(slot, s)| {
+            !matches!(s.entry, Some(Binding::HostProc(_))) || self.cap_name_of_slot(slot).is_some()
+        })
     }
 
     /// Snapshot the run-mutable substate a time-travel **checkpoint** (W1) must restore so resuming a
@@ -19968,11 +20018,12 @@ impl Host {
             stdout: self.stdout.clone(),
             stderr: self.stderr.clone(),
             clock_ns: self.clock_ns,
-            cap_cursor: self.cap_replay.as_ref().map(|(_, c)| *c).unwrap_or(0),
+            cap_cursor: self.cap_consumed,
             cap_record: self.cap_record.clone().unwrap_or_default(),
             svc_queue,
             svc_results,
             svc_next_ticket,
+            cap_states: self.capture_cap_states(),
             mem_mapped_bytes: self.mem_mapped_bytes,
         }
     }
@@ -19986,6 +20037,7 @@ impl Host {
         self.stdout = s.stdout.clone();
         self.stderr = s.stderr.clone();
         self.clock_ns = s.clock_ns;
+        self.cap_consumed = s.cap_cursor;
         if let Some(slot) = self.cap_replay.as_mut() {
             slot.1 = s.cap_cursor;
         }
@@ -19999,6 +20051,10 @@ impl Host {
             s.svc_next_ticket,
         );
         self.mem_mapped_bytes = s.mem_mapped_bytes;
+        // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
+        // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
+        // as a fresh powerbox minted them.
+        self.restore_cap_states(&s.cap_states);
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard
@@ -20302,6 +20358,7 @@ impl Host {
     pub fn tape_cap_record(&mut self, rec: CapRecord) {
         if let Some(r) = &mut self.cap_record {
             r.push(rec);
+            self.cap_consumed += 1;
         }
     }
 
@@ -23647,6 +23704,7 @@ impl Host {
                         m.write_bytes(*ptr, bytes);
                     }
                 }
+                self.cap_consumed += 1;
                 return rec.result;
             }
             // Record: run live through a `RecordingMem` so any guest-window writes are captured,
@@ -23697,6 +23755,7 @@ impl Host {
                         result: result.clone(),
                         mem_writes,
                     });
+                    self.cap_consumed += 1;
                 }
             }
             return result;

@@ -974,10 +974,34 @@ Two halves make it honest:
   `RestoreError::NamedCapRefused(name)` — before any handle is pinned. A forged `Named { idx }` naming
   an absent entry is rejected at the same boundary as a forged JIT index.
 
-*Still refusing: the **checkpoint ladder**.* `Host::checkpoint_safe` also requires
-`host_procs.is_empty()`, so debug-tier time travel still self-disables for a cap-using guest and falls
-back to replay-from-clock-0 (correct, just O(t)). That lift needs its own consumer — the DAP backend
-must supply a registrar for the powerbox it granted — and is tracked on #1455.
+*The **checkpoint ladder** now admits them too (2026-09-15, the #1455 ladder half).*
+`Host::checkpoint_safe` required `host_procs.is_empty()`, so debug-tier time travel self-disabled for
+every cap-using guest — a debugged C program that does file I/O holds `vm_fs`; a playground reactor
+holds `display`/`keyboard`/`fs` — and fell back to replay-from-clock-0 (correct, just O(t)). It now
+admits a host capability on the same terms the freeze does: **it carries a registered name**. An
+unnamed one is still an opaque closure with no reconstruction rule and still disqualifies the run.
+
+It needed no registrar, and that is the part worth recording. The ladder does not *re-grant* a
+capability — the DAP backend rebuilds the whole run under its own freshly granted powerbox and then
+restores a continuation into it, so what a checkpoint must reproduce is not the capability but the
+*crossings*. Those were already taped: `is_recorded_input` records every `HOST_PROC` call, which is
+exactly why replay-from-0 worked for these guests before. Two things were missing:
+
+- `HostReplaySubstate` now carries each capability's **own** declared state
+  (`Host::capture_cap_states`/`restore_cap_states` — the identical pair a §12 freeze writes into the
+  named-cap section, so the ladder and the artifact cannot drift), for the embedder that drives
+  `DebugRun::snapshot`/`restore` against a live host rather than through the tape.
+- `Host` counts **consumed** crossings (`cap_consumed`) instead of deriving the checkpoint's tape cursor
+  from the raw `cap_replay` position. A checkpoint laid down while the run was *recording* — the first
+  `seek`, whose tape is still empty — had a replay position of `0` with N records behind it, so a later
+  restore re-served the run's **first** crossing to a guest N crossings in.
+
+*Known gap, unchanged by this and pre-existing:* the DAP rebuild re-grants a *fresh* provider, so a
+capability's own host-side store (a `vm_fs` memfs's files) is empty in the rebuilt run; within the tape
+that is invisible (crossings are replayed, never re-entered), but a run continued past the tape's
+furthest point reads from a fresh store. Closing it means `temen-fs` serializing a `MemFsState` — files,
+dirs, and the open table's cursors — through the same capture/restore pair, which is its own slice with
+its own gates; a partial capture would be the fiction INVARIANTS #9c forbids.
 
 **Generation/slot pinning.** Restore must reinstate the **same `(slot, generation)`**
 so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`
