@@ -371,13 +371,21 @@ jobs:
         run: cargo run --release -- --check baseline.txt --tol 0.4
 
   excluded-crates-compile:
-    name: excluded crates compile (bench · fuzz)
-    # `bench/` and `fuzz/` are workspace-EXCLUDED (they pull in Wasmtime / libfuzzer-sys), so the
-    # always-on `check` job never builds them. An API change in a workspace crate then breaks them
-    # silently and only reddens a NIGHTLY job — the `align` and `cm.run(...)` signature drifts both
-    # slipped through to nightly exactly this way. This lightweight per-PR lane `cargo check`s both so
-    # that drift fails fast on the PR instead of at 07:00 UTC. `check` (no link, no run) keeps it
-    # cheap; it is a compile gate, not a fuzz/bench run — the nightly jobs still do the real work.
+    name: excluded crates compile (every workspace-excluded crate)
+    # The crates the root manifest `exclude`s are invisible to every `--workspace` command, so an API
+    # change in a workspace crate breaks them silently. This lane compiles them on the PR instead.
+    #
+    # It used to name `bench` and `fuzz` explicitly, and so covered only those two — while the exclude
+    # list also holds `crates/temen-llvm` and `crates/temen-webgpu`. Both then rotted exactly the way
+    # this job's original comment predicted: `temen-webgpu` stopped compiling on 2026-08-26 (#1116,
+    # when `HostProc` gained its `RegionMinter` parameter) and nothing noticed for three weeks, and a
+    # `temen-llvm` break reached CI because a contributor's clean `cargo check --workspace` could not
+    # see it. So the list is no longer restated here: `scripts/ci/check-excluded.sh` reads it from
+    # `Cargo.toml`, which makes coverage complete by construction — a crate added to `exclude` is
+    # covered without anyone remembering this job exists. The pre-push hook runs the same script.
+    #
+    # `check` (no link, no run) keeps it cheap; it is a compile gate, not a fuzz/bench run — the
+    # nightly jobs still do the real work.
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -396,15 +404,20 @@ jobs:
           workspaces: |
             bench
             fuzz
-      # bench builds on the pinned stable (like its nightly `rustbench`/`bench regression` jobs).
-      - name: cargo check bench (stable)
-        working-directory: bench
-        run: cargo +${{ env.RUST_STABLE }} check --bins --lib
-      # fuzz is a cargo-fuzz crate, but a plain `cargo check` type-checks every target against the
-      # workspace crates without needing cargo-fuzz or the libFuzzer link — enough to catch API drift.
-      - name: cargo check fuzz targets (nightly)
-        working-directory: fuzz
-        run: cargo +nightly-2026-07-01 check
+            crates/temen-llvm
+            crates/temen-webgpu
+      # One step for every excluded crate, on the pinned stable — except `fuzz`, which is a cargo-fuzz
+      # crate and gets the same dated nightly its own `fuzz` job builds with, so this check reflects
+      # what that job actually compiles (and cannot spuriously break on a channel roll). A plain
+      # `cargo check` type-checks every target against the workspace crates without needing cargo-fuzz
+      # or the libFuzzer link — enough to catch API drift.
+      - name: cargo check every workspace-excluded crate
+        env:
+          # Pin explicitly rather than inheriting: installing two toolchains above leaves *nightly*
+          # as the runner default, which is not what the stable crates should build with.
+          TEMEN_CHECK_TOOLCHAIN: ${{ env.RUST_STABLE }}
+          TEMEN_CHECK_TOOLCHAIN_fuzz: nightly-2026-07-01
+        run: scripts/ci/check-excluded.sh
 
   loom:
     name: loom (parallel scheduler model check)
