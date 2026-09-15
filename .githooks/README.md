@@ -30,3 +30,16 @@ TEMEN_HOOK_SKIP_TESTS=1 git push  # run fmt + clippy + build, skip the slower te
 ```
 
 The hook also auto-skips branch-deletion pushes (nothing to build).
+
+## What `--workspace` misses
+
+The hook's `cargo fmt/clippy/build/test --workspace` steps do **not** cover the crates the root
+`Cargo.toml` `exclude`s (`crates/temen-llvm`, `crates/temen-webgpu`, `fuzz`, `bench`) — they are
+separate workspace roots, so every `--workspace` command skips them silently. That is a real hole,
+not a theoretical one: `temen-webgpu` stopped compiling when `HostProc` gained a parameter and no
+job noticed for three weeks.
+
+`scripts/ci/check-excluded.sh` closes it, and the hook runs it. It reads the exclude list from
+`Cargo.toml` rather than restating it, so a crate added to that list is covered automatically. The
+`excluded crates compile` CI job runs the same script, pinning per-crate toolchains via
+`TEMEN_CHECK_TOOLCHAIN` / `TEMEN_CHECK_TOOLCHAIN_<dir>`.

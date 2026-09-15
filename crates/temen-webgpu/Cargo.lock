@@ -1239,6 +1239,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "2.0.119"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "target-lexicon"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
+
+[[package]]
 name = "temen-durable"
 version = "0.0.0"
 dependencies = [
@@ -1257,6 +1274,7 @@ name = "temen-exec"
 version = "0.0.0"
 dependencies = [
  "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]
@@ -1271,7 +1289,9 @@ dependencies = [
 name = "temen-fs"
 version = "0.0.0"
 dependencies = [
+ "temen-encode",
  "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]
@@ -1399,23 +1419,6 @@ dependencies = [
  "temen-verify",
  "wgpu",
 ]
-
-[[package]]
-name = "syn"
-version = "2.0.119"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "872831b642d1a07999a962a351ed35b955ea2cfc8f3862091e2a240a84f17297"
-dependencies = [
- "proc-macro2",
- "quote",
- "unicode-ident",
-]
-
-[[package]]
-name = "target-lexicon"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
 name = "termcolor"

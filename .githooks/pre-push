@@ -13,6 +13,9 @@
 # Escape hatches:
 #   TEMEN_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
 #   TEMEN_HOOK_SKIP_TESTS=1  git push   # run fmt+clippy+build, skip the (slower) test step
+#
+# Note the `--workspace` flags below do NOT cover the crates the root manifest `exclude`s
+# (`temen-llvm`, `temen-webgpu`, `fuzz`, `bench`); `scripts/ci/check-excluded.sh` is what covers those.
 set -euo pipefail
 
 if [ "${TEMEN_HOOK_SKIP:-0}" = "1" ]; then
@@ -48,6 +51,11 @@ echo "pre-push: running the fast CI subset (set TEMEN_HOOK_SKIP=1 to bypass)…"
 run cargo fmt --all --check
 run cargo clippy --workspace --all-targets -- -D warnings
 run cargo build --workspace
+# The four crates the workspace `exclude`s are invisible to every `--workspace` command above, so a
+# change to a shared signature can compile clean here and still break them (that is how a
+# `temen-llvm` break reached CI, and how `temen-webgpu` sat un-compilable for three weeks). Checked
+# through the same script CI runs, reading the exclude list from `Cargo.toml` so it cannot drift.
+run bash scripts/ci/check-excluded.sh
 if [ "${TEMEN_HOOK_SKIP_TESTS:-0}" = "1" ]; then
   echo "pre-push: TEMEN_HOOK_SKIP_TESTS=1 — skipping tests."
 else
