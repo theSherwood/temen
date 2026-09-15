@@ -916,6 +916,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Instantiator { base, size }` | base, size | `grant_instantiator` |
 | `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
+| `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so
@@ -927,6 +928,36 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is
 the Slice-3 follow-on.)*
+
+**Named host capabilities — `HostProc` left the non-durable set (#1455, v21).** A `HostProc` is an
+embedder closure: its code address is process-local and its captured state is the provider's, so
+neither rides an artifact — which is why *any* live one used to refuse the freeze outright, i.e. every
+capability-using guest (a playground reactor holds `display` + `keyboard` + `fs`; that is the whole
+class). What **can** ride is the name the grant was registered under
+(`Host::register_cap_name`), because the reference powerboxes grant deterministically by name — so the
+name is a real reconstruction rule, not a label. A named `HostProc` therefore captures as
+`Named { idx }` (the `host_procs` index, exactly as `JitTable` carries a domain index), with the name
+and the provider's own serialized state riding **Section 7**, rebuilt positionally so the index
+re-resolves. An **unnamed** one is unchanged: no reconstruction rule, so it still refuses
+(`NonDurableKind::HostProc`) and still drains.
+
+Two halves make it honest:
+
+- **Provider state** — `Host::set_cap_state_capture(handle, f)` declares how a capability serializes
+  what the *guest can observe* about it: an `fs` server's per-`open` cursors are read back by the
+  guest's next `read`, so a thaw that forgot them resumes a guest whose open file silently rewound.
+  Opt-in, because `display` (pure output) and `keyboard` (a queue the guest refills) need nothing.
+- **The registrar** — `Host::set_named_cap_registrar` is what the thaw consults, and it is the
+  **authority seam**. An artifact *names* a capability; it never carries one. The restoring embedder
+  returns a handler or refuses, so a restore can only ever grant what that host would have granted a
+  fresh run (INVARIANTS #3). No registrar, or a name it does not serve, fails the restore closed with
+  `RestoreError::NamedCapRefused(name)` — before any handle is pinned. A forged `Named { idx }` naming
+  an absent entry is rejected at the same boundary as a forged JIT index.
+
+*Still refusing: the **checkpoint ladder**.* `Host::checkpoint_safe` also requires
+`host_procs.is_empty()`, so debug-tier time travel still self-disables for a cap-using guest and falls
+back to replay-from-clock-0 (correct, just O(t)). That lift needs its own consumer — the DAP backend
+must supply a registrar for the powerbox it granted — and is tracked on #1455.
 
 **Generation/slot pinning.** Restore must reinstate the **same `(slot, generation)`**
 so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`

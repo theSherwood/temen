@@ -16768,6 +16768,37 @@ pub enum DurableBinding {
         domain: u32,
         unit: u32,
     },
+    /// #1455 — an embedder host capability ([`Binding::HostProc`]) that carries a registered
+    /// **name**, so a thaw can re-grant it. A host-proc is a closure: its code address is
+    /// process-local and its captured state is the provider's, so neither can ride an artifact.
+    /// What *can* is the name the grant was registered under — and the reference powerboxes grant
+    /// deterministically by name, so the name is a real reconstruction rule, not a label.
+    ///
+    /// The payload is the `host_procs` **index**, exactly as [`JitTable`](Self::JitTable) carries a
+    /// domain index: the name and the provider's captured state are not value-typed enough for this
+    /// `Copy` binding, so they travel in a parallel section
+    /// ([`Host::capture_durable_named`]) and the thaw rebuilds that table positionally, which is
+    /// what makes this index re-resolve.
+    ///
+    /// Authority is unchanged by this: a name is not authority. The thaw re-grants only what the
+    /// **restoring embedder's** registrar chooses to hand out, so a moment can never carry a
+    /// capability into a host that would not have granted it fresh (INVARIANTS #3).
+    Named {
+        idx: u32,
+    },
+}
+
+/// #1455 — one named host capability captured for restore, parallel to the `host_procs` table (see
+/// [`DurableBinding::Named`]). `None` at an index no live handle names: the entry is unreachable, so
+/// there is nothing to re-grant and the thaw skips it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurableNamedCap {
+    /// The name the grant was registered under ([`Host::register_cap_name`]) — the whole of what the
+    /// thaw has to go on.
+    pub name: String,
+    /// The provider's own state at freeze ([`Host::set_cap_state_capture`]), or empty when the
+    /// capability declared none. Opaque bytes: written by the provider, read back by the registrar.
+    pub state: Vec<u8>,
 }
 
 /// One live, re-grantable handle-table entry captured for snapshot/restore (DURABILITY.md
@@ -17446,6 +17477,34 @@ struct HostProcEntry {
     /// checked at bind (the POSIX.md §4 ABI pin, machine-checked). `None` = an opaque handler
     /// (no in-loop manifest binding; the embedder's `set_import_bindings` remains its only route).
     vtable: Option<HostFnVtable>,
+    /// #1455 — how this capability serializes **its own** host-side state for a freeze
+    /// ([`Host::set_cap_state_capture`]). `None` = stateless: a thaw's fresh grant is as good as the
+    /// old one (`display` presents, `keyboard` polls a queue the guest refills). `Some` = the
+    /// provider holds state the guest can observe — an `fs` server's per-`open` cursors — so the
+    /// freeze captures it and the registrar re-seeds a fresh closure with it at thaw.
+    state: Option<HostProcStateCapture>,
+}
+
+/// #1455 — a host capability's own state serializer: called at freeze, its bytes handed back to the
+/// embedder's registrar at thaw. Opaque to the VM, which never interprets them; the provider that
+/// wrote them is the one that reads them.
+pub type HostProcStateCapture = Box<dyn Fn() -> Vec<u8> + Send>;
+
+/// #1455 — the embedder's thaw-side re-granter for named host capabilities
+/// ([`Host::set_named_cap_registrar`]): given the name a capability was registered under and the
+/// state its provider captured at freeze, return the handler to install, or `None` to refuse.
+///
+/// Refusing is a real answer, not an error path to route around: this is the seam that keeps an
+/// artifact from conferring authority. The restoring embedder grants what it would have granted a
+/// fresh run, and an artifact naming something it does not serve simply fails to thaw.
+pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Send>;
+
+/// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
+/// does not serve `name` — or there was no registrar at all. Fail-closed, and named, so an embedder
+/// can tell "I forgot to register `fs`" from "this artifact wants something I do not provide".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NamedCapRestoreError {
+    pub name: String,
 }
 
 /// #801 — a host-served provider's published op list: parallel `names`/`sigs`, indexed by op
@@ -18533,6 +18592,10 @@ pub struct Host {
     /// (`temen_run`); empty for a bare `Host` (resolution then finds nothing — fail-closed). First match
     /// wins on a duplicate name. A side table only — it never affects handle values or grant order.
     cap_names: Vec<(String, i32)>,
+    /// #1455 — the embedder's thaw-side re-granter for named host capabilities, consulted by
+    /// [`Host::restore_durable_named`]. `None` on every host that is not restoring one (which is
+    /// every host in a normal run), and never consulted outside a restore.
+    named_cap_registrar: Option<NamedCapRegistrar>,
     /// §7 / IMPORTS.md phase 1: the **import-binding table** — entry `i` is the instantiation-time
     /// resolution of the module's import `i` ([`Host::set_import_bindings`]). Read by the
     /// [`temen_ir::CAP_IMPORT_TYPE_ID`] translation in [`Host::cap_dispatch_slots`], the one shared
@@ -18913,6 +18976,7 @@ impl Host {
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
+            named_cap_registrar: None,
             import_bindings: Vec::new(),
         }
     }
@@ -19075,6 +19139,12 @@ impl Host {
                     // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
                     // command and have its manifest bind against the twin's own personality.
                     vtable: e.vtable.clone(),
+                    // #1455 — the state serializer does NOT ride the fork: the twin's handler is a
+                    // fresh closure the provider's factory minted over whatever state it chose to
+                    // give the twin, so the parent's serializer (closed over the *parent's* state)
+                    // would capture the wrong domain's. A forked twin that wants to be freezable
+                    // re-registers one.
+                    state: None,
                 }
             })
             .collect();
@@ -19942,6 +20012,28 @@ impl Host {
         self.handoff
     }
 
+    /// #1455 — declare how the host capability at `handle` serializes **its own** state, so a freeze
+    /// can capture it and a thaw's registrar can re-seed a fresh handler with it. No-op for a handle
+    /// that is not a live `HostProc`.
+    ///
+    /// Only a provider holding guest-observable state needs this: an `fs` server's per-`open` cursors
+    /// are read back by the guest's next `read`, so a thaw that forgot them would resume a guest whose
+    /// open file had silently rewound. A `display` that only presents, or a `keyboard` whose queue the
+    /// guest refills, needs nothing — a fresh grant is as good as the old one, which is why this is
+    /// opt-in rather than a required part of every grant.
+    ///
+    /// The bytes are opaque to the VM: the provider writes them and the same provider reads them back
+    /// in the registrar. Pair with [`register_cap_name`](Host::register_cap_name) — a capability is
+    /// durable because it has a **name** the thawing embedder can re-grant, and this only says what to
+    /// carry across with it.
+    pub fn set_cap_state_capture(&mut self, handle: i32, capture: HostProcStateCapture) {
+        if let Ok(Binding::HostProc(idx)) = self.resolve(handle, cap_id::HOST_PROC) {
+            if let Some(e) = self.host_procs.get_mut(idx as usize) {
+                e.state = Some(capture);
+            }
+        }
+    }
+
     /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
     /// `cap.self`-resolve `name` to this handle at runtime. The powerbox layer (`temen_run`) calls this
     /// for each granted handle; an embedder may add its own names. First registration of a name wins.
@@ -20321,9 +20413,13 @@ impl Host {
                 // rebuilt positionally on thaw, so the binding's index re-resolves.
                 Binding::JitTable(idx) => DurableBinding::JitTable { idx },
                 Binding::JitCode { domain, unit } => DurableBinding::JitCode { domain, unit },
-                Binding::HostProc(_) => {
-                    return Err(self.non_durable(slot, NonDurableKind::HostProc))
-                }
+                // #1455: a host capability is durable iff it carries a registered **name** — the
+                // reconstruction rule a thaw's registrar can act on. An unnamed one is still an
+                // opaque closure with nothing to re-grant it by, so it refuses exactly as before.
+                Binding::HostProc(idx) => match self.cap_name_of_slot(slot) {
+                    Some(_) => DurableBinding::Named { idx },
+                    None => return Err(self.non_durable(slot, NonDurableKind::HostProc)),
+                },
                 Binding::Offer(_) => return Err(self.non_durable(slot, NonDurableKind::Offer)),
                 Binding::LiveImpl(idx) => {
                     // §13.4 slice 4d: a `child_offer` mint over a §14 child (a recorded join
@@ -20451,9 +20547,123 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1455: re-pin the named capability at its captured index. The handler behind it was
+                // re-granted by `restore_durable_named` (positionally, before this), so the index
+                // resolves — and a name the registrar declined never reaches here, because that
+                // restore fails closed before any handle is pinned.
+                DurableBinding::Named { idx } => Binding::HostProc(idx),
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// The name registered for the grant living at `slot`, if any — the reverse of
+    /// [`resolve_cap_name`](Host::resolve_cap_name), keyed on the slot rather than the whole handle
+    /// so a stale generation in the directory cannot mask a live grant's name.
+    fn cap_name_of_slot(&self, slot: usize) -> Option<&str> {
+        self.cap_names
+            .iter()
+            .find(|(_, h)| (*h as u32 as usize) & (CAP - 1) == slot)
+            .map(|(n, _)| n.as_str())
+    }
+
+    /// #1455 — capture the named host capabilities' out-of-line state for a snapshot, the parallel
+    /// half of [`DurableBinding::Named`] (and the exact shape [`Self::capture_durable_jit`] uses for
+    /// §22 domains). Positional over `host_procs`, dead entries included, so a captured binding's
+    /// index re-resolves against the table [`Self::restore_durable_named`] rebuilds.
+    ///
+    /// Each live, named entry contributes its name plus whatever its provider declared as state
+    /// ([`Self::set_cap_state_capture`]); an entry no name reaches is `None` — nothing to re-grant,
+    /// and no live handle can be naming it, because [`Self::capture_durable_handles`] refuses such a
+    /// slot outright.
+    pub fn capture_durable_named(&self) -> Vec<Option<DurableNamedCap>> {
+        let named: Vec<Option<&str>> = {
+            let mut v = vec![None; self.host_procs.len()];
+            for (slot, s) in self.table.iter().enumerate() {
+                if let Some(Binding::HostProc(idx)) = s.entry {
+                    if let Some(n) = self.cap_name_of_slot(slot) {
+                        if let Some(e) = v.get_mut(idx as usize) {
+                            *e = Some(n);
+                        }
+                    }
+                }
+            }
+            v
+        };
+        named
+            .into_iter()
+            .zip(self.host_procs.iter())
+            .map(|(name, entry)| {
+                name.map(|name| DurableNamedCap {
+                    name: name.to_string(),
+                    state: entry.state.as_ref().map(|f| f()).unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
+    /// #1455 — rebuild the named host capabilities from a captured set, the counterpart of
+    /// [`Self::capture_durable_named`] and the step that must run **before**
+    /// [`Self::restore_durable_handles`] (which re-pins `Named { idx }` bindings against the table
+    /// this builds).
+    ///
+    /// Each captured entry is handed to the embedder's registrar
+    /// ([`Self::set_named_cap_registrar`]) as `(name, state)`; the registrar returns the handler to
+    /// install — a fresh closure of the embedder's own making, re-seeded from `state` if it cares.
+    /// Entries are rebuilt **positionally** (a `None`, or a name the registrar declines, leaves a
+    /// placeholder that traps if ever dispatched), so indices re-resolve exactly.
+    ///
+    /// Fail-closed, and this is the security-relevant part: with no registrar set, or for a name the
+    /// registrar does not know, nothing is granted and the restore reports the offending name. An
+    /// artifact therefore cannot conjure a capability — it can only ask, and the restoring embedder
+    /// decides (INVARIANTS #3).
+    pub fn restore_durable_named(
+        &mut self,
+        caps: &[Option<DurableNamedCap>],
+    ) -> Result<(), NamedCapRestoreError> {
+        let mut registrar = self.named_cap_registrar.take();
+        let mut out = Vec::with_capacity(caps.len());
+        let mut refused = None;
+        for cap in caps {
+            let handler = match cap {
+                // An index no live handle named: keep the slot so later indices line up, but install
+                // a handler that traps rather than one that silently answers.
+                None => None,
+                Some(c) => match registrar.as_mut().and_then(|r| r(&c.name, &c.state)) {
+                    Some(h) => Some(h),
+                    None => {
+                        refused.get_or_insert_with(|| c.name.clone());
+                        None
+                    }
+                },
+            };
+            out.push(HostProcEntry {
+                handler: ProcHandler::Sync(
+                    handler.unwrap_or_else(|| {
+                        Box::new(|_op, _args, _mem, _minter| Err(Trap::CapFault))
+                    }),
+                ),
+                fork: None,
+                mints: false,
+                vtable: None,
+                state: None,
+            });
+        }
+        self.named_cap_registrar = registrar;
+        match refused {
+            Some(name) => Err(NamedCapRestoreError { name }),
+            None => {
+                self.host_procs = out;
+                Ok(())
+            }
+        }
+    }
+
+    /// #1455 — install the registrar a thaw consults to re-grant named host capabilities
+    /// ([`Self::restore_durable_named`]). Called on the **fresh** host before a restore, by the
+    /// embedder that would have granted those capabilities in the first place.
+    pub fn set_named_cap_registrar(&mut self, registrar: NamedCapRegistrar) {
+        self.named_cap_registrar = Some(registrar);
     }
 
     /// Capture the §22 guest-JIT domains' out-of-line state for a snapshot (DURABILITY.md §12.5
@@ -20883,6 +21093,7 @@ impl Host {
             fork: None,
             mints: false,
             vtable: None,
+            state: None,
         })
     }
 
@@ -20901,6 +21112,7 @@ impl Host {
             fork: None,
             mints: false,
             vtable: None,
+            state: None,
         })
     }
 
@@ -20954,6 +21166,7 @@ impl Host {
             fork: Some(fork),
             mints: false,
             vtable: None,
+            state: None,
         })
     }
 
@@ -20969,6 +21182,7 @@ impl Host {
             fork: None,
             mints: true,
             vtable: None,
+            state: None,
         })
     }
 

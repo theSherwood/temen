@@ -41,9 +41,9 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    Attestation, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, FrozenChildState,
-    FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole, SvcDispatch,
-    SHADOW_BASE,
+    Attestation, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap,
+    FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole,
+    SvcDispatch, SHADOW_BASE,
 };
 use temen_ir::Module;
 
@@ -160,7 +160,14 @@ use temen_ir::Module;
 /// section to the host and otherwise leaves it as the embedder configured it. This is the prerequisite for a
 /// detached child (which may be ancestor-freezable — `freeze_exposed=true` — and so non-default) to freeze as
 /// its own root-shaped artifact and thaw with its exposure intact (INVARIANTS.md #1289 R1).
-const FORMAT_VERSION: u16 = 20;
+/// v21 (#1455, named host capabilities): a `HostProc` grant that carries a registered **name** is now
+/// durable — captured as the `B_NAMED` binding (its `host_procs` index) plus a new Section 7
+/// (`TAG_NAMED`, after the attestation) holding, positionally, each entry's name and the state its
+/// provider chose to serialize. The thaw hands those to the restoring embedder's registrar, which
+/// returns the handler to install or refuses. Before this, *any* live host capability made the freeze
+/// refuse outright (`NonDurableKind::HostProc`), which is to say every capability-using guest. Emitted
+/// only when the domain holds a named host capability, so an artifact without one keeps the v20 layout.
+const FORMAT_VERSION: u16 = 21;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -184,6 +191,10 @@ const TAG_JIT: u64 = 5;
 /// Attestation (#1289 R1, O14, v20) — the domain's platform-vouched `tier`/`window_exposed`/`freeze_exposed`.
 /// Emitted only when non-default (see `FORMAT_VERSION`), so a plain-root artifact keeps the pre-attest layout.
 const TAG_ATTEST: u64 = 6;
+/// Named host capabilities (#1455, v21) — positional over `host_procs`: each entry's registered name
+/// and the state its provider captured. The handle table (Section 3) carries the `B_NAMED` *bindings*
+/// (indices); this carries what those indices name. Emitted only when the domain holds one.
+const TAG_NAMED: u64 = 7;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
 const B_STREAM: u8 = 0;
@@ -198,6 +209,9 @@ const B_LIVE_IMPL: u8 = 7;
 /// §22 guest-JIT bindings (Slice 2). Index-only payloads — the domain's units ride [`TAG_JIT`].
 const B_JIT_TABLE: u8 = 8;
 const B_JIT_CODE: u8 = 9;
+/// A named embedder host capability (#1455). Index-only payload — the name and the provider's
+/// captured state ride [`TAG_NAMED`], exactly as a §22 domain's units ride [`TAG_JIT`].
+const B_NAMED: u8 = 10;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -265,6 +279,14 @@ pub enum RestoreError {
     /// (Slice 2). The artifact is untrusted, so its units must clear the verifier again before
     /// their funcs become invocable — a failure is fail-closed (no domains reconstructed).
     JitReconstruct,
+    /// #1455 — the restoring embedder would not re-grant a named host capability the artifact asks
+    /// for (no registrar, or one that does not serve this name). Carries the name, so an embedder can
+    /// tell a forgotten registration from an artifact wanting something it does not provide.
+    ///
+    /// This is the authority seam, and it fails closed by construction: an artifact names a
+    /// capability, it never carries one. What gets granted is whatever the restoring host chooses to
+    /// grant, exactly as on a fresh run (INVARIANTS #3).
+    NamedCapRefused(String),
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -570,6 +592,67 @@ pub fn freeze_with_prots(
         });
     }
 
+    // Section 7 — Named host capabilities (#1455, v21): positionally over `host_procs`, each entry's
+    // registered name and the state its provider captured. The handle table (Section 3) carries the
+    // `B_NAMED` bindings (indices); this carries what they name, rebuilt positionally on thaw so the
+    // indices re-resolve — the same shape Section 5 uses for §22 domains. Elided when the domain holds
+    // no named capability, so an artifact without one keeps the pre-named section layout.
+    let named = host.capture_durable_named();
+    if named.iter().any(|c| c.is_some()) {
+        section(&mut out, TAG_NAMED, |b| write_named(b, &named));
+    }
+
+    Ok(out)
+}
+
+/// Serialize the named host capabilities (Section 7, v21). Canonical: the entry count, then one
+/// record per `host_procs` index in order — a presence byte, and when present the name and the
+/// provider's captured state, each length-prefixed. The positional shape is the point: it is what
+/// makes a `B_NAMED` binding's index re-resolve after the thaw rebuilds the table.
+fn write_named(b: &mut Vec<u8>, named: &[Option<DurableNamedCap>]) {
+    write_uleb(b, named.len() as u64);
+    for cap in named {
+        match cap {
+            None => b.push(0),
+            Some(c) => {
+                b.push(1);
+                write_uleb(b, c.name.len() as u64);
+                b.extend_from_slice(c.name.as_bytes());
+                write_uleb(b, c.state.len() as u64);
+                b.extend_from_slice(&c.state);
+            }
+        }
+    }
+}
+
+/// Decode Section 7 ([`write_named`]). A name that is not valid UTF-8, or a truncated record, is
+/// `Malformed` — the artifact is untrusted, so the name the registrar will be asked for must be a
+/// real string before it is handed over.
+fn decode_named(body: Option<&[u8]>) -> Result<Vec<Option<DurableNamedCap>>, RestoreError> {
+    let Some(body) = body else {
+        return Ok(Vec::new());
+    };
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    let mut out = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        match r.u8()? {
+            0 => out.push(None),
+            1 => {
+                let name_len = r.uleb()? as usize;
+                let name = core::str::from_utf8(r.take(name_len)?)
+                    .map_err(|_| RestoreError::Malformed)?
+                    .to_string();
+                let state_len = r.uleb()? as usize;
+                let state = r.take(state_len)?.to_vec();
+                out.push(Some(DurableNamedCap { name, state }));
+            }
+            _ => return Err(RestoreError::Malformed),
+        }
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed); // canonical: no trailing bytes
+    }
     Ok(out)
 }
 
@@ -646,6 +729,7 @@ pub fn restore_with_prots(
     let mut serve_body = None;
     let mut jit_body = None;
     let mut attest_body = None;
+    let mut named_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -658,6 +742,7 @@ pub fn restore_with_prots(
             TAG_SERVE => serve_body = Some(body),
             TAG_JIT => jit_body = Some(body),
             TAG_ATTEST => attest_body = Some(body),
+            TAG_NAMED => named_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -773,18 +858,30 @@ pub fn restore_with_prots(
     // `jit_tables` out of bounds. Absent section ⇒ no JIT granted (any JIT binding then fails the
     // bounds check). ----
     let (jit_table_log2, jit) = decode_jit(jit_body)?;
+    // #1455: the same treatment for named host capabilities — decode Section 7, bounds-check every
+    // `B_NAMED` index against it, then re-grant through the embedder's registrar *before* the handle
+    // table is pinned. A forged index that names no captured entry is rejected here rather than
+    // reaching `host_procs` out of bounds at the guest's first `call.cap`.
+    let named = decode_named(named_body)?;
     for h in &handles {
         let ok = match h.binding {
             DurableBinding::JitTable { idx } => (idx as usize) < jit.len(),
             DurableBinding::JitCode { domain, unit } => jit
                 .get(domain as usize)
                 .is_some_and(|d| (unit as usize) < d.units.len()),
+            // A `B_NAMED` binding must name a *present* entry: a `None` slot is one no live handle
+            // named at freeze, so a handle pointing at it is a forgery.
+            DurableBinding::Named { idx } => named
+                .get(idx as usize)
+                .is_some_and(|c: &Option<DurableNamedCap>| c.is_some()),
             _ => true,
         };
         if !ok {
             return Err(RestoreError::JitReconstruct);
         }
     }
+    host.restore_durable_named(&named)
+        .map_err(|e| RestoreError::NamedCapRefused(e.name))?;
     host.restore_durable_jit(&jit)
         .map_err(|_| RestoreError::JitReconstruct)?;
     // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
@@ -1235,6 +1332,10 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
         }
+        DurableBinding::Named { idx } => {
+            b.push(B_NAMED);
+            write_uleb(b, idx as u64);
+        }
         DurableBinding::JitCode { domain, unit } => {
             b.push(B_JIT_CODE);
             write_uleb(b, domain as u64);
@@ -1267,6 +1368,9 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_LIVE_IMPL => DurableBinding::LiveImpl {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_NAMED => DurableBinding::Named {
+            idx: r.uleb()? as u32,
         },
         B_JIT_TABLE => DurableBinding::JitTable {
             idx: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,

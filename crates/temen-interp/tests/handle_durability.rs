@@ -16,6 +16,9 @@ use temen_interp::{cap_id, DurableBinding, DurableHandle, Host, NonDurableKind, 
 
 /// Grant a spread of durable bindings, capture, restore into a fresh table, and confirm the
 /// captured set is byte-for-byte identical — slot, generation, type_id, and binding all pinned.
+/// What a registrar was asked for: `(name, captured state)` per call.
+type CapLog = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
+
 #[test]
 fn durable_handles_round_trip_through_capture_restore() {
     let mut a = Host::new();
@@ -196,4 +199,129 @@ fn empty_table_captures_empty_and_capacity_is_table_size() {
         Vec::<DurableHandle>::new()
     );
     assert_eq!(Host::handle_capacity(), 256);
+}
+
+// ---- #1455: named host capabilities ---------------------------------------------------------
+//
+// A `HostProc` is an opaque closure: its code address is process-local and its captured state is the
+// provider's, so neither can ride an artifact — which is why *any* live one used to make the whole
+// freeze refuse, i.e. every capability-using guest. What can ride is the **name** the grant was
+// registered under, because the reference powerboxes grant deterministically by name. These pin that
+// the name is what makes the difference, that the provider's own state travels with it, and — the
+// part that matters for authority — that the thawing embedder, not the artifact, decides what gets
+// granted.
+
+/// A capability with a registered name captures as `Named`; the same capability without one still
+/// refuses. The name is the whole of the difference.
+#[test]
+fn a_named_host_cap_is_durable_and_an_unnamed_one_is_not() {
+    let mut named = Host::new();
+    let h = named.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![7])));
+    named.register_cap_name("fs", h);
+    let captured = named
+        .capture_durable_handles()
+        .expect("a named host capability is durable");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].binding, DurableBinding::Named { idx: 0 });
+
+    let mut unnamed = Host::new();
+    unnamed.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![7])));
+    let err = unnamed
+        .capture_durable_handles()
+        .expect_err("an unnamed host capability has no reconstruction rule");
+    assert_eq!(err.kind, NonDurableKind::HostProc);
+}
+
+/// The out-of-line half: the name and the provider's own state, positional over `host_procs` so a
+/// captured `Named { idx }` re-resolves. A capability that declared no state captures an empty one.
+#[test]
+fn capture_named_carries_the_providers_state() {
+    let cursors = std::sync::Arc::new(std::sync::Mutex::new(vec![3u8, 1, 4]));
+    let mut a = Host::new();
+
+    let stateless = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    a.register_cap_name("display", stateless);
+
+    let stateful = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
+    a.register_cap_name("fs", stateful);
+    let c = std::sync::Arc::clone(&cursors);
+    a.set_cap_state_capture(stateful, Box::new(move || c.lock().unwrap().clone()));
+
+    // State is read at capture time, not at registration time.
+    cursors.lock().unwrap().push(1);
+
+    let named = a.capture_durable_named();
+    assert_eq!(named.len(), 2, "positional over host_procs");
+    assert_eq!(named[0].as_ref().unwrap().name, "display");
+    assert!(named[0].as_ref().unwrap().state.is_empty(), "stateless");
+    assert_eq!(named[1].as_ref().unwrap().name, "fs");
+    assert_eq!(named[1].as_ref().unwrap().state, vec![3, 1, 4, 1]);
+}
+
+/// The full re-grant: a fresh host with a registrar rebuilds the capabilities by name, re-seeded from
+/// the captured state, and the restored handle still resolves *and dispatches* to them.
+#[test]
+fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
+    let mut a = Host::new();
+    let h = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![1])));
+    a.register_cap_name("fs", h);
+    a.set_cap_state_capture(h, Box::new(|| vec![42]));
+
+    let handles = a.capture_durable_handles().expect("named ⇒ durable");
+    let named = a.capture_durable_named();
+
+    let mut b = Host::new();
+    let seen: CapLog = Default::default();
+    let log = std::sync::Arc::clone(&seen);
+    b.set_named_cap_registrar(Box::new(move |name, state| {
+        log.lock().unwrap().push((name.to_string(), state.to_vec()));
+        // Re-seed the fresh handler from the captured state — this is the provider reading back
+        // exactly the bytes it wrote at freeze.
+        let answer = state.first().copied().unwrap_or(0) as i64;
+        Some(Box::new(move |_op: u32, _args: &[i64], _mem, _| {
+            Ok(vec![answer])
+        }))
+    }));
+    b.restore_durable_named(&named)
+        .expect("the registrar serves `fs`");
+    b.restore_durable_handles(&handles);
+
+    assert_eq!(
+        &*seen.lock().unwrap(),
+        &[("fs".to_string(), vec![42u8])],
+        "the registrar saw the captured name and state"
+    );
+    // The guest's handle value survives the restore and reaches the re-granted handler.
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::HOST_PROC, 0, h, &[], None),
+        Ok(vec![42]),
+        "the re-granted capability answers on the pinned handle"
+    );
+}
+
+/// **The authority seam.** An artifact names a capability; it never carries one. A restoring host
+/// whose registrar does not serve the name grants nothing and says which name it refused — so a
+/// moment cannot smuggle authority into a host that would not have granted it fresh (INVARIANTS #3).
+#[test]
+fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
+    let mut a = Host::new();
+    let h = a.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![1])));
+    a.register_cap_name("fs", h);
+    let named = a.capture_durable_named();
+
+    // No registrar at all: nothing is granted.
+    let mut bare = Host::new();
+    assert_eq!(
+        bare.restore_durable_named(&named).unwrap_err().name,
+        "fs",
+        "a host with no registrar refuses, naming what it could not serve"
+    );
+
+    // A registrar that serves a *different* name refuses this one rather than substituting.
+    let mut picky = Host::new();
+    picky.set_named_cap_registrar(Box::new(|name, _state| {
+        (name == "display")
+            .then(|| -> temen_interp::HostProc { Box::new(|_op, _args, _mem, _| Ok(vec![0])) })
+    }));
+    assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");
 }
