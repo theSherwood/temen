@@ -1510,3 +1510,58 @@ fn real_math_powers_roots_and_rounding_run() {
         "1.414214|1024.000000|2.718282|4.605170|2.000000|3.000000|1.000000|2.000000|5.000000|0.785398|3.000000"
     );
 }
+
+/// **#1472 — `$` on a float.** `$3.14` printed `17.966570549813729`: `system/formatfloat`'s
+/// Schubfach dtoa is built on `uint64(sfHi32(x)) * cp`, and every `(u 32)` with bit 31 set was
+/// **sign**-extended into its 64-bit context, so the whole digit generation ran on garbage. Values
+/// whose shortest form falls out of the dtoa's special cases (`0.5`, `2.0`, `100.0`) stayed correct
+/// and hid it — which is why a suite full of `formatFloat` assertions never noticed.
+///
+/// The widening fix is unit-tested toolchain-free in `tests/integer.rs`
+/// (`unsigned_widening_zero_extends`); this is the end-to-end proof, against the native oracle.
+#[test]
+fn real_dollar_float_matches_native() {
+    let vals = [
+        "0.5", "1.5", "2.0", "3.0", "1.25", "0.1", "3.14", "10.0", "100.0", "0.25", "7.5", "1e10",
+    ];
+    let mut src = String::from("import std/syncio\n\n");
+    for v in &vals {
+        src.push_str(&format!("write(stdout, ${v})\nwrite(stdout, \"|\")\n"));
+    }
+    let Some(out) = run_libc_program(&src) else {
+        eprintln!("SKIP real_dollar_float_matches_native (no toolchain / libc asset)");
+        return;
+    };
+    // `nimony c --run` prints exactly this.
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "0.5|1.5|2.0|3.0|1.25|0.1|3.14|10.0|100.0|0.25|7.5|10000000000.0|"
+    );
+}
+
+/// **#1472, the arithmetic underneath.** 64-bit work built on `uint32` halves — the shape
+/// `roundToOdd` uses, and the one that corrupted the dtoa. Every value is diffed against native
+/// nimony; before the fix, `hi32` and everything derived from it came back negative.
+#[test]
+fn real_unsigned_32bit_halves_match_native() {
+    let src = concat!(
+        "import std/syncio\n\n",
+        "proc lo32(x: uint64): uint32 = cast[uint32](x)\n",
+        "proc hi32(x: uint64): uint32 = cast[uint32](x shr 32)\n",
+        "let g: uint64 = 0x81CEB32C4B43FCF5'u64\n",
+        "let cp: uint32 = 0x1234567'u32\n",
+        "let b01: uint64 = uint64(lo32(g)) * cp\n",
+        "let b11: uint64 = uint64(hi32(g)) * cp\n",
+        "let hi: uint64 = b11 + hi32(b01)\n",
+        "write(stdout, $int(lo32(g)) & \"|\" & $int(hi32(g)) & \"|\" & $int(b01) & \"|\" &\n",
+        "              $int(b11) & \"|\" & $int(hi))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_unsigned_32bit_halves_match_native (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "1262746869|2177807148|24104250456395667|41571600951734964|41571600957347172"
+    );
+}

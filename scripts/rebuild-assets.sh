@@ -237,10 +237,14 @@ if want nim_driver_guest; then
   # pipeline, same gate shape (`nim_link_fs_asset`), so it is rebuilt here beside `nim_link` — it is
   # coupled to exactly the same leng changes, and leaving it out of this script meant a leng change
   # silently left it stale while its byte-identical gate went red.
+  # NOT `validate`d here: that runs `prep_temen`, which asserts a module declaring imports is a named
+  # **powerbox entry** — and this one is `--child-entry`, so func 0 is the child ABI and the assert
+  # legitimately fires. Its gate is the op-13 test (`tests/nim_link_fs_asset.rs`), exactly as the
+  # builder's own last line says. Decode is still checked, so a truncated gzip cannot pass silently.
   if bash crates/temen-run/demos/nim_frontend/build_nim_link_fs.sh >/dev/null 2>&1 \
      && gunzip -c "$FX/nim-link-fs.temen.gz" > /tmp/rebuild_nim_link_fs.temen 2>/dev/null \
-     && validate /tmp/rebuild_nim_link_fs.temen; then
-    note "nim_link_fs ✓ (nim-link-fs.temen.gz)"
+     && [ -s /tmp/rebuild_nim_link_fs.temen ]; then
+    note "nim_link_fs ✓ (nim-link-fs.temen.gz — gated by tests/nim_link_fs_asset.rs)"
   else
     note "nim_link_fs SKIP/✗ (rustc + rust-src + llvm-link/opt — see build_nim_link_fs.sh)"
   fi
