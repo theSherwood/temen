@@ -64,6 +64,29 @@ temen-spec = { path = "crates/temen-spec" }
 temen-wasm-jit = { path = "crates/temen-wasm-jit" }
 temen-parity = { path = "crates/temen-parity" }
 
+# CI wall clock + the local pre-push hook: this tree's tests are **execution** bound, not compile
+# bound. A `cargo test --workspace` run spends its time with guests *running* inside the engines
+# (`temen-interp`'s tree-walker above all), so building those engines unoptimized charges an
+# order-of-magnitude tax on every test. Measured on `temen-run`'s `nimlink_asset` — the dominant test
+# in the `build · test · fmt · clippy` job — **599s -> 58s**.
+#
+# It has to be `[profile.dev]`, not `[profile.dev.package."*"]`: the `"*"` glob is dependencies only
+# and explicitly excludes workspace members, which is exactly where the hot code lives here.
+# (`temen-llvm` and `browser` are separate workspaces, so over there the engines *are* dependencies
+# and they use the glob — same rule, spelled the way each workspace's graph requires.)
+#
+# The cost is the crate you are editing rebuilding optimized: a from-scratch `temen-interp` goes
+# 13s -> 40s. Incremental edits are unchanged (~1-2s). `debug-assertions` and overflow checks are
+# independent of `opt-level` — they stay on, so every assert the §9 oracle relies on still fires.
+#
+# This also **is** the regression guard for #1466. Optimized codegen is what let LLVM hoist a
+# thread-pointer resolution above a fiber stack switch; with this profile, `fiber_fuzz` and
+# `jit_threads` — the empirical net for the §23 3c argument — finally run per-PR in a build where the
+# optimizer is allowed to misbehave. Before this they only ever ran at `opt-level = 0`, which is why
+# the bug sat unseen. Do not lower this to dodge a failure in that pair: a failure there is real.
+[profile.dev]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"

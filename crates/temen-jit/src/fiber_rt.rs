@@ -32,6 +32,25 @@
 //! fiber touches (`CURRENT_RT` for yielder pairing, the §5 guard recovery) is re-read **after**
 //! every switch-in, never carried across a suspension; each vCPU thread arms its own guard, so a
 //! fault in a migrated fiber unwinds the *resuming* thread's recovery (detect-and-kill, as ever).
+//!
+//! **That re-read is a machine-code requirement, not just a source-level one (#1466).** LLVM has no
+//! notion of "the OS thread may change here": it treats the thread pointer as invariant across an
+//! ordinary call, so it is free to resolve a thread-local's address *once*, park it in a
+//! callee-saved register across the switch, and serve the post-switch "re-read" from the
+//! *suspending* thread's block. It does exactly that at `opt-level >= 1` — every switch-bearing
+//! function here compiled down to a single thread-pointer resolution hoisted above the switch, and
+//! `fiber_fuzz` + `jit_threads` aborted on a null `CURRENT_RT`. The tree was green only because the
+//! dev profile happened to be `opt-level = 0`, which emits one resolution per access.
+//!
+//! So every per-thread accessor reachable **on a fiber control stack** — [`current`],
+//! [`crate::durable_shadow::get`]/[`crate::durable_shadow::seed`] — is `#[inline(never)]`, which
+//! forces the address to be materialised inside the callee, on whichever thread is actually
+//! running. Those attributes are load-bearing correctness, not perf hints; the module-level rule is
+//! that per-thread state on a fiber stack is reached *only* through such an accessor, never through
+//! a value or address carried across a suspension point. The exposure is specifically code that can
+//! execute on a fiber's own stack ([`fiber_suspend`], [`fiber_event_park`], the [`make_fiber`] body,
+//! and [`fiber_resume`] when a fiber resumes a fiber) — a vCPU-stack frame such as the §5
+//! `run_guarded` bracket never migrates and is unaffected.
 //! This composition (verified protocol + real switch) cannot be model-checked — it is covered by
 //! the **empirical net**: the randomized-migration interp↔JIT differential (`fiber_fuzz`), a
 //! runtime single-owner assert at the resume seam ([`FiberSlot::running_on`]), guard-paged stacks,
@@ -67,6 +86,15 @@ pub(crate) fn set_current(rt: *mut FiberRuntime) -> *mut FiberRuntime {
     CURRENT_RT.with(|c| c.replace(rt))
 }
 
+/// The running computation's fiber runtime, resolved **on the thread that is running right now**.
+///
+/// `#[inline(never)]` is load-bearing correctness, not a perf hint (#1466). Inlined, LLVM hoists the
+/// thread-pointer resolution above an intervening stack switch and serves a post-switch caller from
+/// the *suspending* thread's TLS block — see the module header. Keeping the resolution inside this
+/// frame is what makes "re-read after every switch-in" true of the machine code and not just the
+/// source. Do not remove it, and do not hand callers a `*mut FiberRuntime` across a suspension
+/// point: every use on a fiber stack calls this again.
+#[inline(never)]
 fn current() -> *mut FiberRuntime {
     CURRENT_RT.with(|c| c.get())
 }

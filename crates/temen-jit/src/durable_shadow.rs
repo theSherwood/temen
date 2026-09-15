@@ -28,12 +28,24 @@ thread_local! {
 
 /// Seed/reset the current OS thread's durable shadow-SP word address. Called when the runtime makes a
 /// context active: the root entry, each inline child, and both edges of a fiber resume swap.
+///
+/// `#[inline(never)]` is load-bearing correctness (#1466), for the same reason as
+/// [`crate::fiber_rt`]'s `current`: the **exit** edge of the resume swap runs after a stack switch
+/// (`fiber_rt::fiber_resume`, which is itself on a fiber stack whenever a fiber resumes a fiber), so
+/// an inlined copy would let LLVM reuse the thread-pointer it resolved for the *entry* edge and seed
+/// the suspending thread's slot instead. That miswrite is silent — unlike `CURRENT_RT` there is no
+/// null to trip over — so this held only by the accident of not being inlined.
+#[inline(never)]
 pub(crate) fn seed(base: u64) {
     DURABLE_SHADOW_BASE.with(|c| c.set(base));
 }
 
 /// `durable.shadow_base` thunk — the current context's shadow-region base. A pure thread-local read;
 /// it cannot fault, so it takes no window/trap context (unlike the `call.cap`/`gc.roots` thunks).
+///
+/// `#[inline(never)]`: same reason as [`seed`] (#1466). It is also handed to JIT-emitted code as a
+/// raw function pointer, so it must keep a callable body regardless.
+#[inline(never)]
 pub(crate) extern "C" fn get() -> u64 {
     DURABLE_SHADOW_BASE.with(|c| c.get())
 }
