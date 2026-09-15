@@ -112,8 +112,14 @@ fn time_bulk_vs_stepped(m: &temen_ir::Module) -> (f64, f64, i64, i64) {
         let mut fuel = u64::MAX;
         let t = Instant::now();
         let got = if stepped {
-            temen_interp::bytecode::compile_and_run_with_host_traced(m, 0, &[], &mut fuel, &mut host)
-                .map(|(r, _, _)| r)
+            temen_interp::bytecode::compile_and_run_with_host_traced(
+                m,
+                0,
+                &[],
+                &mut fuel,
+                &mut host,
+            )
+            .map(|(r, _, _)| r)
         } else {
             temen_interp::bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host)
         };
@@ -221,7 +227,10 @@ fn main() {
 
     let guests = [
         ("register-only loop (no memory traffic)", guest(N)),
-        ("same loop, one store + one load per iteration", guest_mem(N)),
+        (
+            "same loop, one store + one load per iteration",
+            guest_mem(N),
+        ),
     ];
 
     for (what, ir) in &guests {
@@ -232,7 +241,10 @@ fn main() {
         let _ = time_debug(ir, false, None);
 
         let (release_ms, value) = time_release(&m);
-        assert_eq!(value, expect, "{what}: the release run computed the wrong sum");
+        assert_eq!(
+            value, expect,
+            "{what}: the release run computed the wrong sum"
+        );
 
         println!("\n=== {what} — sum 0..{N} ===");
         println!("{:<46} {:>10}  {:>10}", "driver", "ms", "vs release");
@@ -243,18 +255,25 @@ fn main() {
 
         // Same engine, same host: bulk vs one op at a time, nothing else in the loop.
         let (bulk_ms, step_ms, bulk_v, step_v) = time_bulk_vs_stepped(&m);
-        assert_eq!(bulk_v, expect, "{what}: the bulk run computed the wrong sum");
+        assert_eq!(
+            bulk_v, expect,
+            "{what}: the bulk run computed the wrong sum"
+        );
         assert_eq!(
             step_v, expect,
             "{what}: the op-at-a-time run computed the wrong sum"
         );
         println!(
             "{:<46} {:>10.1}  {:>9.1}x",
-            "  bare host, run to completion", bulk_ms, bulk_ms / release_ms
+            "  bare host, run to completion",
+            bulk_ms,
+            bulk_ms / release_ms
         );
         println!(
             "{:<46} {:>10.1}  {:>9.1}x",
-            "  bare host, ONE OP AT A TIME (budget=1)", step_ms, step_ms / release_ms
+            "  bare host, ONE OP AT A TIME (budget=1)",
+            step_ms,
+            step_ms / release_ms
         );
         for (label, mem_model, bp) in [
             ("DAP continue, nothing armed", false, None),

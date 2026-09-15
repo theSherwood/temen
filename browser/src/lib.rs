@@ -3030,15 +3030,36 @@ type FsCursors = std::sync::Arc<std::sync::Mutex<Vec<u64>>>;
 /// granted them: the presented-frame cell (`display`), the input queues (`keyboard`/`mouse`), and the
 /// `fs` server's cursors. A reactor holds these next to its window because together they are its whole
 /// state — the window image carries the guest's memory, and this carries the rest.
+///
+/// Every field is an `Arc`, so a clone *shares* the cells rather than copying them — which is what
+/// lets the state hooks and a thaw registrar close over the same capabilities the reactor is holding.
+#[derive(Clone)]
 struct OnrampCaps {
     frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>>,
     keys: KeyQueue,
     mouse: MouseQueue,
-    /// `Some` iff an `fs` file was served.
-    fs_cursors: Option<FsCursors>,
+    /// The served file and its per-`open` cursors — `Some` iff a file was served. The bytes are
+    /// `Arc`ed because every handler this mints closes over them, and a thaw mints a second one.
+    fs: Option<(String, std::sync::Arc<Vec<u8>>, FsCursors)>,
 }
 
 impl OnrampCaps {
+    /// The cells a reactor's capabilities read and write, with `fs` serving one read-only file.
+    fn new(fs: Option<(String, Vec<u8>)>) -> OnrampCaps {
+        OnrampCaps {
+            frame: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            keys: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            mouse: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            fs: fs.map(|(name, data)| {
+                (
+                    name,
+                    std::sync::Arc::new(data),
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                )
+            }),
+        }
+    }
+
     /// Take the frame the last `tick` presented through `display` (`None` if it presented none).
     fn take_frame(&self) -> Option<Frame> {
         self.frame.lock().unwrap().take()
@@ -3060,6 +3081,203 @@ impl OnrampCaps {
             .lock()
             .unwrap()
             .push_back(((kind as i64 & 1) << 32) | (payload as u32 as i64));
+    }
+
+    /// **The** definition of what each on-ramp capability does: the handler for `name`, over *these*
+    /// cells, or `None` for a name this powerbox does not serve.
+    ///
+    /// One definition, two callers (#1455): [`grant`](Self::grant) uses it to build a fresh powerbox,
+    /// and a thaw uses it as the **registrar** — which is what makes "the reference powerboxes grant
+    /// deterministically by name" a real reconstruction rule rather than a hopeful one. A restored
+    /// reactor's `fs` is the same server over the same file, because there is only one place that
+    /// server is written.
+    fn handler(&self, name: &str) -> Option<temen_interp::HostProc> {
+        match name {
+            // `display` — the framebuffer output waist (Doom slice 1): `present(ptr, w, h)` copies
+            // `w*h*4` RGBA bytes out of the window into the frame cell.
+            "display" => {
+                let frame = std::sync::Arc::clone(&self.frame);
+                Some(Box::new(
+                    move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                        if op != 0 {
+                            return Ok(vec![-1]); // only present(0) is defined
+                        }
+                        let ptr = args.first().copied().unwrap_or(0);
+                        let w = args.get(1).copied().unwrap_or(0);
+                        let h = args.get(2).copied().unwrap_or(0);
+                        // Bound the dimensions so a bad (or hostile) call can't ask us to read/allocate wildly.
+                        if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
+                            return Ok(vec![-1]);
+                        }
+                        let n = (w as u64) * (h as u64) * 4;
+                        match mem.and_then(|m| m.read_bytes(ptr as u64, n)) {
+                            Some(rgba) => {
+                                *frame.lock().unwrap() = Some(Frame {
+                                    width: w as u32,
+                                    height: h as u32,
+                                    rgba,
+                                });
+                                Ok(vec![0])
+                            }
+                            None => Ok(vec![-1]), // ptr/len outside the window
+                        }
+                    },
+                ))
+            }
+            // `keyboard` — the input waist (Doom slice 2): `poll()` dequeues one packed event, or `-1`.
+            "keyboard" => {
+                let q = std::sync::Arc::clone(&self.keys);
+                Some(Box::new(move |op, _args: &[i64], _mem, _| {
+                    if op != 0 {
+                        return Ok(vec![-1]); // only poll(0) is defined
+                    }
+                    Ok(vec![q.lock().unwrap().pop_front().map_or(-1, |e| e as i64)])
+                }))
+            }
+            // `mouse` — the pointer waist (the Uxn card's Varvara Mouse device): the keyboard's twin.
+            "mouse" => {
+                let q = std::sync::Arc::clone(&self.mouse);
+                Some(Box::new(move |op, _args: &[i64], _mem, _| {
+                    if op != 0 {
+                        return Ok(vec![-1]); // only poll(0) is defined
+                    }
+                    Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
+                }))
+            }
+            // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). The op protocol
+            // mirrors the native `doom_diff` differential's in-memory WAD server (and the reused
+            // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT),
+            // 1 read(fd,buf,len)→n, 3 seek(fd,whence,off)→pos (whence 0=SET/1=CUR/2=END),
+            // 2 write(fd,…)→len (discard-accept), 4 close→0. `fd` indexes a per-open cursor, so a
+            // guest that opens the file more than once is fine.
+            "fs" => {
+                let (name, data, cursors) = self.fs.as_ref()?;
+                let (name, data, cursors) = (
+                    name.clone(),
+                    std::sync::Arc::clone(data),
+                    std::sync::Arc::clone(cursors),
+                );
+                Some(Box::new(
+                    move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                        let mut cursors = cursors.lock().unwrap();
+                        match op {
+                            0 => {
+                                let requested = mem
+                                    .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
+                                    .unwrap_or_default();
+                                if String::from_utf8_lossy(&requested).contains(name.as_str()) {
+                                    cursors.push(0);
+                                    Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
+                                } else {
+                                    Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
+                                }
+                            }
+                            1 => {
+                                let (buf, want) = (args[1] as u64, args[2] as u64);
+                                let Some(&cur) = cursors.get(args[0] as usize) else {
+                                    return Ok(vec![-1]);
+                                };
+                                let end = (cur + want).min(data.len() as u64);
+                                if end > cur {
+                                    if let Some(mem) = mem {
+                                        let _ =
+                                            mem.write_bytes(buf, &data[cur as usize..end as usize]);
+                                    }
+                                }
+                                cursors[args[0] as usize] = end;
+                                Ok(vec![(end - cur) as i64])
+                            }
+                            3 => {
+                                let (whence, off) = (args[1], args[2]);
+                                let Some(cur) = cursors.get(args[0] as usize).copied() else {
+                                    return Ok(vec![-1]);
+                                };
+                                let base = match whence {
+                                    1 => cur as i64,
+                                    2 => data.len() as i64,
+                                    _ => 0,
+                                };
+                                cursors[args[0] as usize] = (base + off).max(0) as u64;
+                                Ok(vec![cursors[args[0] as usize] as i64])
+                            }
+                            2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
+                            _ => Ok(vec![0]),                                 // close et al.
+                        }
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `name`'s guest-observable state, as the provider that owns it chooses to serialize it — see
+    /// the note above [`encode_events`] for what each capability declares and why `display` declares
+    /// nothing. The one definition; [`declare_state`](Self::declare_state) registers it with the host
+    /// and a thaw's registrar re-seeds through it.
+    fn get_state(&self, name: &str) -> Option<Vec<u8>> {
+        match name {
+            "keyboard" => Some(encode_events(&self.keys.lock().unwrap())),
+            "mouse" => Some(encode_events(&self.mouse.lock().unwrap())),
+            "fs" => self.fs.as_ref().map(|(_, _, c)| {
+                c.lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            }),
+            _ => None,
+        }
+    }
+
+    /// Put a [`get_state`](Self::get_state) back into the cells — the read half's exact inverse.
+    /// Bytes may come from an artifact, so every decode tolerates a short or ragged input rather than
+    /// panicking: a truncated queue restores the events it can.
+    fn set_state(&self, name: &str, bytes: &[u8]) {
+        match name {
+            "keyboard" => {
+                *self.keys.lock().unwrap() =
+                    decode_events(bytes).into_iter().map(|v| v as i32).collect()
+            }
+            "mouse" => *self.mouse.lock().unwrap() = decode_events(bytes).into_iter().collect(),
+            "fs" => {
+                if let Some((_, _, c)) = self.fs.as_ref() {
+                    *c.lock().unwrap() = bytes
+                        .chunks_exact(8)
+                        .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                        .collect();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Register `name`'s state hooks on the handle it was granted at (#1455/#1458), so a freeze
+    /// captures it and an in-session rewind puts it back — both through
+    /// [`get_state`](Self::get_state)/[`set_state`](Self::set_state).
+    ///
+    /// Called both when granting fresh and **after a thaw**: `restore_durable_named` re-grants the
+    /// handler but not the hooks, so a thawed reactor would otherwise be un-re-freezable — its `fs`
+    /// cursors would silently stop riding the next artifact.
+    fn declare_state(&self, host: &mut Host, name: &str, handle: i32) {
+        if self.get_state(name).is_none() {
+            return; // a capability with nothing the guest can observe about it
+        }
+        let (c, r) = (self.clone(), self.clone());
+        let (cn, rn) = (name.to_string(), name.to_string());
+        host.set_cap_state_capture(
+            handle,
+            Box::new(move || c.get_state(&cn).unwrap_or_default()),
+        );
+        host.set_cap_state_restore(handle, Box::new(move |b| r.set_state(&rn, b)));
+    }
+
+    /// Grant `name` onto `host` — handler, canonical name, and state hooks — returning its handle.
+    /// `None` for a name this powerbox does not serve (an `fs` with no file, say).
+    fn grant(&self, host: &mut Host, name: &str) -> Option<i32> {
+        let handle = host.grant_host_proc(self.handler(name)?);
+        host.register_cap_name(name, handle);
+        self.declare_state(host, name, handle);
+        Some(handle)
     }
 }
 
@@ -3093,6 +3311,51 @@ fn decode_events(bytes: &[u8]) -> Vec<i64> {
     bytes
         .chunks_exact(8)
         .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// The §12 codec's **dense** per-page protection map, from a window layout's sparse one: one entry per
+/// codec page (a fixed 4 KiB), defaulting to `Rw`.
+///
+/// The layout's own page may be coarser than the codec's — a native host with 16 KiB pages, say — so
+/// each entry is expanded across **every** codec page it covers. Marking only the first would leave the
+/// rest of a protected host page writable on restore.
+fn dense_prots(layout: &temen_interp::MemLayout) -> Vec<temen_snapshot::PageProt> {
+    let npages = layout.byte_len() / temen_snapshot::PAGE;
+    let mut dense = vec![temen_snapshot::PageProt::Rw; npages];
+    let span = (layout.page_size() as usize)
+        .div_ceil(temen_snapshot::PAGE)
+        .max(1);
+    for (off, kind) in layout.prot_entries() {
+        let first = off as usize / temen_snapshot::PAGE;
+        let prot = match kind {
+            0 => temen_snapshot::PageProt::Ro,
+            2 => temen_snapshot::PageProt::Unmapped,
+            _ => temen_snapshot::PageProt::Rw, // 1 = Rw (3 = Backed never captured)
+        };
+        let last = (first + span).min(npages);
+        if first < last {
+            dense[first..last].fill(prot);
+        }
+    }
+    dense
+}
+
+/// The inverse: the codec's dense map back into the `map_info` `(byte_offset, kind)` entries
+/// [`temen_interp::MemLayout::from_parts`] takes. Only deviations from the `Rw` default are carried —
+/// the layout's own sparse form.
+fn prot_entries(dense: &[temen_snapshot::PageProt]) -> Vec<(u64, u8)> {
+    dense
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let kind = match p {
+                temen_snapshot::PageProt::Rw => return None, // the region default
+                temen_snapshot::PageProt::Ro => 0u8,
+                temen_snapshot::PageProt::Unmapped => 2,
+            };
+            Some(((i * temen_snapshot::PAGE) as u64, kind))
+        })
         .collect()
 }
 
@@ -3247,87 +3510,18 @@ fn grant_onramp_caps(
             .collect();
         host.set_import_bindings(bindings);
     }
-    // `display` — the framebuffer output waist (Doom slice 1). `present(ptr, w, h)` copies the frame out.
-    let frame: std::sync::Arc<std::sync::Mutex<Option<Frame>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    {
-        let frame = std::sync::Arc::clone(&frame);
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
-            if op != 0 {
-                return Ok(vec![-1]); // only present(0) is defined
-            }
-            let ptr = args.first().copied().unwrap_or(0);
-            let w = args.get(1).copied().unwrap_or(0);
-            let h = args.get(2).copied().unwrap_or(0);
-            // Bound the dimensions so a bad (or hostile) call can't ask us to read/allocate wildly.
-            if !(1..=8192).contains(&w) || !(1..=8192).contains(&h) {
-                return Ok(vec![-1]);
-            }
-            let n = (w as u64) * (h as u64) * 4;
-            match mem.and_then(|m| m.read_bytes(ptr as u64, n)) {
-                Some(rgba) => {
-                    *frame.lock().unwrap() = Some(Frame {
-                        width: w as u32,
-                        height: h as u32,
-                        rgba,
-                    });
-                    Ok(vec![0])
-                }
-                None => Ok(vec![-1]), // ptr/len outside the window
-            }
-        }));
-        host.register_cap_name("display", handle);
-    }
-    // `keyboard` — the input waist (Doom slice 2). `poll()` dequeues one packed event, or `-1` if empty.
-    let keys: KeyQueue =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    {
-        let polled = std::sync::Arc::clone(&keys);
-        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
-            if op != 0 {
-                return Ok(vec![-1]); // only poll(0) is defined
-            }
-            Ok(vec![polled
-                .lock()
-                .unwrap()
-                .pop_front()
-                .map_or(-1, |e| e as i64)])
-        }));
-        host.register_cap_name("keyboard", handle);
-        let (c, r) = (std::sync::Arc::clone(&keys), std::sync::Arc::clone(&keys));
-        host.set_cap_state_capture(handle, Box::new(move || encode_events(&c.lock().unwrap())));
-        host.set_cap_state_restore(
-            handle,
-            Box::new(move |b| {
-                *r.lock().unwrap() = decode_events(b).into_iter().map(|v| v as i32).collect()
-            }),
-        );
-    }
-    // `mouse` — the pointer waist (the Uxn card's Varvara Mouse device): the keyboard's twin, `poll()`
-    // dequeues one packed pointer/wheel event (see [`MouseQueue`]), or `-1` if empty.
-    let mouse: MouseQueue =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
-    {
-        let polled = std::sync::Arc::clone(&mouse);
-        let handle = host.grant_host_proc(Box::new(move |op, _args, _mem, _| {
-            if op != 0 {
-                return Ok(vec![-1]); // only poll(0) is defined
-            }
-            Ok(vec![polled.lock().unwrap().pop_front().unwrap_or(-1)])
-        }));
-        host.register_cap_name("mouse", handle);
-        let (c, r) = (std::sync::Arc::clone(&mouse), std::sync::Arc::clone(&mouse));
-        host.set_cap_state_capture(handle, Box::new(move || encode_events(&c.lock().unwrap())));
-        host.set_cap_state_restore(
-            handle,
-            Box::new(move |b| *r.lock().unwrap() = decode_events(b).into_iter().collect()),
-        );
+    // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
+    // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
+    let caps = OnrampCaps::new(fs);
+    for name in ["display", "keyboard", "mouse"] {
+        caps.grant(host, name);
     }
     // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via the
     // `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0) and asks the
     // host to present a frame each tick (op 1); the parallel pixel work runs on the GPU and only tiny
     // scalars + the shader source cross the boundary — the guest never holds a GPU pointer (§2a). Only
     // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
+    // Stateless and wasm-only, so it stays here rather than in the shared factory.
     #[cfg(target_arch = "wasm32")]
     {
         let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
@@ -3360,88 +3554,8 @@ fn grant_onramp_caps(
         host.register_cap_name("webgpu", handle);
     }
     // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). Granted only when the host
-    // supplies one file; a guest that resolves no `fs` cap (bounce/life) is unaffected. The op
-    // protocol mirrors the native `doom_diff` differential's in-memory WAD server (and the reused
-    // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT), 1 read(fd,buf,len)
-    // →n, 3 seek(fd,whence,off)→pos (whence 0=SET/1=CUR/2=END), 2 write(fd,…)→len (discard-accept),
-    // 4 close→0. `fd` indexes a per-open cursor, so a guest that opens the file more than once is fine.
-    let mut fs_cursors = None;
-    if let Some((name, data)) = fs {
-        // The cursors are **shared** with the granter, not owned by the closure: they are host-side
-        // guest state, so a reactor moment captures and restores them with the window (`ReactorMoment`).
-        let cursors: FsCursors = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        fs_cursors = Some(std::sync::Arc::clone(&cursors));
-        let served = std::sync::Arc::clone(&cursors);
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
-            let mut cursors = served.lock().unwrap();
-            match op {
-                0 => {
-                    let requested = mem
-                        .and_then(|m| m.read_bytes(args[0] as u64, args[1] as u64))
-                        .unwrap_or_default();
-                    if String::from_utf8_lossy(&requested).contains(name.as_str()) {
-                        cursors.push(0);
-                        Ok(vec![(cursors.len() - 1) as i64]) // fd = index into `cursors`
-                    } else {
-                        Ok(vec![-2]) // ENOENT → the guest's fopen returns NULL (defaults/skips)
-                    }
-                }
-                1 => {
-                    let (buf, want) = (args[1] as u64, args[2] as u64);
-                    let Some(&cur) = cursors.get(args[0] as usize) else {
-                        return Ok(vec![-1]);
-                    };
-                    let end = (cur + want).min(data.len() as u64);
-                    if end > cur {
-                        if let Some(mem) = mem {
-                            let _ = mem.write_bytes(buf, &data[cur as usize..end as usize]);
-                        }
-                    }
-                    cursors[args[0] as usize] = end;
-                    Ok(vec![(end - cur) as i64])
-                }
-                3 => {
-                    let (whence, off) = (args[1], args[2]);
-                    let Some(cur) = cursors.get(args[0] as usize).copied() else {
-                        return Ok(vec![-1]);
-                    };
-                    let base = match whence {
-                        1 => cur as i64,
-                        2 => data.len() as i64,
-                        _ => 0,
-                    };
-                    cursors[args[0] as usize] = (base + off).max(0) as u64;
-                    Ok(vec![cursors[args[0] as usize] as i64])
-                }
-                2 => Ok(vec![args.get(2).copied().unwrap_or(0)]), // write: discard-accept
-                _ => Ok(vec![0]),                                 // close et al.
-            }
-        }));
-        host.register_cap_name("fs", handle);
-        let (c, r) = (
-            std::sync::Arc::clone(&cursors),
-            std::sync::Arc::clone(&cursors),
-        );
-        host.set_cap_state_capture(
-            handle,
-            Box::new(move || {
-                c.lock()
-                    .unwrap()
-                    .iter()
-                    .flat_map(|v| v.to_le_bytes())
-                    .collect()
-            }),
-        );
-        host.set_cap_state_restore(
-            handle,
-            Box::new(move |b| {
-                *r.lock().unwrap() = b
-                    .chunks_exact(8)
-                    .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
-                    .collect()
-            }),
-        );
-    }
+    // supplies one file; a guest that resolves no `fs` cap (bounce/life) is unaffected.
+    caps.grant(host, "fs");
     // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
     // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
     // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
@@ -3456,12 +3570,7 @@ fn grant_onramp_caps(
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
     }
-    OnrampCaps {
-        frame,
-        keys,
-        mouse,
-        fs_cursors,
-    }
+    caps
 }
 
 /// #816/#1234: whether [`grant_onramp_caps`] grants the `"instantiator"` capability. Default
@@ -5662,6 +5771,100 @@ impl OnrampReactor {
         match inst.call(0, &[], &mut fuel, &mut host) {
             Ok(_) => {}
             Err(_) => return Err(STATUS_TRAP),
+        }
+        Ok(OnrampReactor {
+            inst,
+            host,
+            entry_sp,
+            tick,
+            caps,
+            last_trap: None,
+        })
+    }
+
+    /// Freeze this reactor into a **§12 artifact** — a save-state (#1458). Everything the guest is,
+    /// at this frame boundary, in the one container the durability codec already speaks: the window
+    /// image and its page map, the handle table, and each capability's own state (#1455).
+    ///
+    /// Two things make a reactor freeze cheap, and both are properties of *where* it is frozen rather
+    /// than of any machinery:
+    ///
+    /// * **No continuation.** `tick` returns to the host every frame, so at a boundary there is no
+    ///   guest stack and no shadow stack — the artifact's control section is simply empty, and the
+    ///   module needs none of the `temen-durable` instrumentation an arbitrary-safepoint freeze does.
+    /// * **No re-init on the way back.** The image is post-`_start`, so [`thaw`](Self::thaw)
+    ///   deliberately does not re-run the entry. For Doom that is seconds of WAD parsing and renderer
+    ///   setup skipped — most of the point of a save-state.
+    ///
+    /// `module` must be the module this reactor was opened over: the artifact binds its digest, so a
+    /// thaw against a different one refuses (`ModuleMismatch`) rather than restoring one guest's
+    /// memory under another's code.
+    pub fn freeze(
+        &self,
+        module: &temen_ir::Module,
+    ) -> Result<Vec<u8>, temen_snapshot::FreezeError> {
+        let layout = self
+            .inst
+            .window_layout()
+            .ok_or(temen_snapshot::FreezeError::WindowGeometry(0))?;
+        let reserved_log2 = self.inst.window_reserved_log2().unwrap_or(0);
+        let prots = dense_prots(&layout);
+        temen_snapshot::freeze_with_prots(module, layout.bytes(), &prots, reserved_log2, &self.host)
+    }
+
+    /// Rebuild a reactor from a [`freeze`](Self::freeze) artifact: the guest resumes at the frame it
+    /// was frozen on, and the next [`frame`](Self::frame) is the frame that would have come next.
+    ///
+    /// `fs` re-serves the file the artifact's guest had open (the same WAD, say). The capabilities are
+    /// re-granted **by name** through [`OnrampCaps::handler`] — the same definitions a fresh open
+    /// uses — with each one's captured state seeded back in, which is the whole of #1455's registrar
+    /// contract: the artifact asks for `fs` by name, and this host decides what `fs` means.
+    ///
+    /// `_start` is **not** re-run: the window image already holds the post-init guest.
+    pub fn thaw(
+        artifact: &[u8],
+        m: &temen_ir::Module,
+        fs: Option<(String, Vec<u8>)>,
+    ) -> Result<OnrampReactor, i32> {
+        onramp_check(m).map_err(|_| STATUS_UNSUPPORTED)?;
+        let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
+        let entry_sp = temen_ir::powerbox_entry_sp(m);
+
+        // A fresh host carrying only what is *not* in the artifact: the module's own self-referential
+        // surface and its import bindings. Every capability comes back through the registrar below,
+        // re-pinned at the slot and generation the guest still holds.
+        // The one grant path, exactly as a fresh open takes it: the module's self-referential surface,
+        // its import bindings, the §3e prefix, and the capabilities. The artifact then re-pins that
+        // same table over the top — same grants in the same order, so the same slots and generations,
+        // which is what keeps a guest-held handle value valid across the save.
+        let mut host = Host::new();
+        let caps = grant_onramp_caps(&mut host, m, fs);
+        let registrar = caps.clone();
+        host.set_named_cap_registrar(Box::new(move |name, state| {
+            let handler = registrar.handler(name)?;
+            registrar.set_state(name, state); // re-seed before the guest can call it
+            Some(handler)
+        }));
+
+        let (bytes, prots, _reserved) = temen_snapshot::restore_with_prots(artifact, m, &mut host)
+            .map_err(|_| STATUS_UNSUPPORTED)?;
+        // The registrar re-granted the handlers but not their state *hooks* — re-declare them, or this
+        // reactor could never be frozen again.
+        for name in ["display", "keyboard", "mouse", "fs"] {
+            if let Some(h) = host.resolve_cap_name(name) {
+                caps.declare_state(&mut host, name, h);
+            }
+        }
+
+        let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
+        let layout = temen_interp::MemLayout::from_parts(
+            bytes,
+            temen_snapshot::PAGE as u64,
+            &prot_entries(&prots),
+        )
+        .ok_or(STATUS_UNSUPPORTED)?;
+        if !inst.restore_window(&layout) {
+            return Err(STATUS_UNSUPPORTED);
         }
         Ok(OnrampReactor {
             inst,

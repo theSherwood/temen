@@ -24979,6 +24979,10 @@ pub struct MemLayout {
     /// The guest-visible page-protection entries (window-relative page index ⇒ state) — every
     /// `Rw`/`Ro`/`Unmapped` deviation from the region default, reinstalled verbatim.
     prot: Vec<(u64, PageProt)>,
+    /// The page size those indices are in — the capturing window's protection granularity, which is
+    /// not always the reader's (the §12 codec's page is a fixed 4 KiB; a native host's can be 16 KiB).
+    /// Carried so a consumer converts against the right unit instead of assuming its own.
+    page: u64,
 }
 
 impl MemLayout {
@@ -24990,6 +24994,9 @@ impl MemLayout {
     /// shared region, so an image cannot reproduce it ([`Mem::layout_snapshot_safe`]) — and so is an
     /// unknown kind, both as `None` rather than a silently dropped protection.
     pub fn from_parts(bytes: Vec<u8>, page: u64, prot: &[(u64, u8)]) -> Option<MemLayout> {
+        if page == 0 {
+            return None;
+        }
         let prot = prot
             .iter()
             .map(|&(off, kind)| {
@@ -25002,7 +25009,33 @@ impl MemLayout {
                 Some((off / page, p))
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(MemLayout { bytes, prot })
+        Some(MemLayout { bytes, prot, page })
+    }
+
+    /// The captured page-protection entries in the [`Mem::map_info`] encoding —
+    /// `(page_base_byte_offset, kind)`, kind `0 = Ro`, `1 = Rw`, `2 = Unmapped` — and the page size
+    /// they are in ([`page_size`](Self::page_size)). The inverse of
+    /// [`from_parts`](Self::from_parts), for a consumer that must re-express them in *its* page unit
+    /// (the §12 codec's dense 4 KiB map, say).
+    pub fn prot_entries(&self) -> Vec<(u64, u8)> {
+        self.prot
+            .iter()
+            .map(|&(pg, p)| {
+                let kind = match p {
+                    PageProt::Ro => 0u8,
+                    PageProt::Rw => 1,
+                    PageProt::Unmapped => 2,
+                    PageProt::Backed { .. } => 3, // never captured; see the type docs
+                };
+                (pg * self.page, kind)
+            })
+            .collect()
+    }
+
+    /// The protection granularity [`prot_entries`](Self::prot_entries) is expressed in — each entry
+    /// covers this many bytes.
+    pub fn page_size(&self) -> u64 {
+        self.page
     }
 
     /// The captured window bytes `[0, len)`.
@@ -26629,6 +26662,7 @@ impl Mem {
         MemLayout {
             bytes,
             prot: space.prot.iter().map(|(&pg, &p)| (pg, p)).collect(),
+            page: self.page,
         }
     }
 
