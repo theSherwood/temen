@@ -244,3 +244,40 @@ fn a_window_layout_round_trips_with_a_hole_under_the_high_water() {
     );
     assert_eq!(restored.bytes(), layout.bytes(), "the image survives");
 }
+
+/// A **4 GiB mask domain** (`reserved_log2 == 32`) round-trips — the ordinary reservation an on-ramp
+/// guest's window lives in, and the one an engine hosted on a 32-bit target has to be able to write.
+///
+/// The reservation is a guest address-space quantity: bounding it by the *host's* pointer width made
+/// this exact case freeze fine on a 64-bit host and refuse (`WindowGeometry`) on wasm32, which is where
+/// the browser engine runs — so the playground's interpreter-tier save-state could not be taken at all
+/// while the emitted tier's could. Nothing above `mapped` has to fit a host `usize`.
+#[test]
+fn a_four_gib_reservation_round_trips() {
+    let m = module();
+    let window = vec![0xabu8; WINDOW];
+    let prots = vec![PageProt::Rw; NPAGES];
+    let artifact = freeze_with_prots(&m, &window, &prots, 32, &host_with_durable_handles())
+        .expect("a 4 GiB reservation is an ordinary mask domain, not a geometry error");
+    let mut host = host_with_durable_handles();
+    let (bytes, _prots, reserved_log2) =
+        restore_with_prots(&artifact, &m, &mut host).expect("restore");
+    assert_eq!(
+        reserved_log2, 32,
+        "the reservation rides the artifact intact"
+    );
+    assert_eq!(bytes, window);
+}
+
+/// …and the boundary still holds: a reservation that does not fit a `u64` at all is refused, as is a
+/// committed extent past the reservation (`freeze_rejects_a_committed_extent_past_the_reservation`).
+#[test]
+fn freeze_rejects_a_reservation_past_u64() {
+    let m = module();
+    let window = vec![0u8; WINDOW];
+    let prots = vec![PageProt::Rw; NPAGES];
+    assert!(matches!(
+        freeze_with_prots(&m, &window, &prots, 64, &host_with_durable_handles()),
+        Err(FreezeError::WindowGeometry(_))
+    ));
+}

@@ -21,7 +21,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use temen_browser::{Frame, JitOnrampReactor, ReactorMoment};
+use temen_browser::{Frame, JitOnrampReactor, JitStart, ReactorMoment};
 use temen_interp::Value;
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -52,6 +52,15 @@ struct JitDriver {
 
 impl JitDriver {
     fn open(fixture: &[u8]) -> JitDriver {
+        JitDriver::start(fixture, JitStart::Entry)
+    }
+
+    /// The same driver over a reactor thawed from a §12 save-state instead of booted (#1458).
+    fn thaw(fixture: &[u8], artifact: &[u8]) -> JitDriver {
+        JitDriver::start(fixture, JitStart::Thaw(artifact))
+    }
+
+    fn start(fixture: &[u8], start: JitStart<'_>) -> JitDriver {
         let m = temen_encode::decode_module(fixture).expect("decode fixture");
         let engine = Engine::default();
         let total_bytes = WIN_BASE as u64 + WIN_SIZE;
@@ -69,7 +78,7 @@ impl JitDriver {
         // SAFETY: `memory` is fixed-size (min == max), so its data pointer is stable for the run; the
         // window `[win_ptr, WIN_SIZE)` lives inside it and is used solely as this reactor's window.
         let reactor = unsafe {
-            JitOnrampReactor::open_shared_jit(&m, win_ptr, WIN_SIZE, WIN_LOG2, false, None)
+            JitOnrampReactor::open_shared_jit(&m, win_ptr, WIN_SIZE, WIN_LOG2, false, None, start)
         }
         .expect("the fixture's tick is wasm-JIT-emittable");
 
@@ -268,5 +277,137 @@ fn jit_moment_carries_queued_input() {
         steered,
         (0..4).map(|_| d.step()).collect::<Vec<_>>(),
         "the undrained keypress rides the moment on the emitted tier"
+    );
+}
+
+// ---- save-states on the emitted tier (#1458) -----------------------------------------------------
+//
+// A moment lives in engine memory; a save-state has to leave, so it is frozen to a §12 artifact and
+// thawed back into a **fresh** reactor. The interpreter's half is gated in `reactor_moment.rs`; these
+// are the same properties with every frame produced by emitted wasm, because a save-state the playable
+// tier cannot take is not the feature (INVARIANTS #14).
+
+/// Freeze a running JIT reactor, thaw a new one from the artifact, and the frames it goes on to
+/// present are the frames the original would have — without `_start` ever running again.
+fn a_jit_reactor_freezes_and_thaws_playing(fixture: &[u8]) {
+    let m = temen_encode::decode_module(fixture).expect("decode fixture");
+    let mut d = JitDriver::open(fixture);
+    for _ in 0..5 {
+        d.step();
+    }
+    let artifact = d
+        .reactor()
+        .freeze(&m)
+        .expect("freeze the emitted-tier window");
+    let recorded: Vec<u64> = (0..8).map(|_| d.step()).collect();
+
+    let mut thawed = JitDriver::thaw(fixture, &artifact);
+    let replayed: Vec<u64> = (0..8).map(|_| thawed.step()).collect();
+    assert_eq!(
+        recorded, replayed,
+        "a thawed wasm-JIT reactor resumes the frozen instant frame for frame"
+    );
+    assert!(
+        recorded
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "the fixture animates, so the gate is not vacuous"
+    );
+}
+
+#[test]
+fn a_jit_reactor_freezes_to_an_artifact_and_thaws_playing() {
+    a_jit_reactor_freezes_and_thaws_playing(include_bytes!("fixtures/bounce.temen"));
+}
+
+/// The grown-heap case: `life`'s grids sit in a malloc heap above the declared window, so the artifact
+/// has to carry the emitted tier's whole 16 MiB reservation's committed extent, not the declared prefix.
+#[test]
+fn a_jit_grown_heap_rides_the_artifact() {
+    a_jit_reactor_freezes_and_thaws_playing(include_bytes!("fixtures/life.temen"));
+}
+
+/// Input queued but not yet drained rides the artifact, as it rides a moment: the queue is capability
+/// state, and #1455's named re-grant seeds it back into the capability the thaw's host mints.
+#[test]
+fn a_thawed_jit_reactor_keeps_undrained_input() {
+    let fixture = include_bytes!("fixtures/bounce.temen");
+    let m = temen_encode::decode_module(fixture).expect("decode fixture");
+    let mut d = JitDriver::open(fixture);
+    for _ in 0..3 {
+        d.step();
+    }
+    d.reactor().push_key(LEFT, 1);
+    let artifact = d.reactor().freeze(&m).expect("freeze");
+    let steered: Vec<u64> = (0..4).map(|_| d.step()).collect();
+
+    let mut thawed = JitDriver::thaw(fixture, &artifact);
+    assert_eq!(
+        steered,
+        (0..4).map(|_| thawed.step()).collect::<Vec<_>>(),
+        "the undrained keypress rides the artifact onto the emitted tier"
+    );
+}
+
+/// The artifact binds the module it was frozen over, so a thaw against a different guest refuses
+/// rather than opening one guest's memory under another's code (INVARIANTS #9c).
+#[test]
+fn a_jit_save_state_refuses_a_different_module() {
+    let bounce = include_bytes!("fixtures/bounce.temen");
+    let m = temen_encode::decode_module(bounce).expect("decode fixture");
+    let mut d = JitDriver::open(bounce);
+    d.step();
+    let artifact = d.reactor().freeze(&m).expect("freeze");
+
+    let life = temen_encode::decode_module(include_bytes!("fixtures/life.temen")).expect("decode");
+    let mut backing = vec![0u8; WIN_SIZE as usize].into_boxed_slice();
+    let ptr = backing.as_mut_ptr();
+    // SAFETY: `backing` outlives the call; the window is used solely as this reactor's window.
+    let refused = unsafe {
+        JitOnrampReactor::open_shared_jit(
+            &life,
+            ptr,
+            WIN_SIZE,
+            WIN_LOG2,
+            false,
+            None,
+            JitStart::Thaw(&artifact),
+        )
+    };
+    assert!(
+        refused.is_err(),
+        "a bounce save-state must not thaw under life's code"
+    );
+}
+
+/// A thawed reactor is an ordinary reactor: it can be frozen again, so save-states chain rather than
+/// being a one-way door out of a run.
+#[test]
+fn a_thawed_jit_reactor_can_be_frozen_again() {
+    let fixture = include_bytes!("fixtures/bounce.temen");
+    let m = temen_encode::decode_module(fixture).expect("decode fixture");
+    let mut d = JitDriver::open(fixture);
+    for _ in 0..4 {
+        d.step();
+    }
+    let first = d.reactor().freeze(&m).expect("freeze");
+
+    let mut thawed = JitDriver::thaw(fixture, &first);
+    for _ in 0..3 {
+        thawed.step();
+    }
+    let second = thawed
+        .reactor()
+        .freeze(&m)
+        .expect("re-freeze a thawed reactor");
+    let recorded: Vec<u64> = (0..5).map(|_| thawed.step()).collect();
+
+    let mut again = JitDriver::thaw(fixture, &second);
+    assert_eq!(
+        recorded,
+        (0..5).map(|_| again.step()).collect::<Vec<_>>(),
+        "a save-state taken from a thawed reactor is as good as the first"
     );
 }

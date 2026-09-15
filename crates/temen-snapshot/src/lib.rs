@@ -387,9 +387,15 @@ pub fn freeze_with_prots(
 ) -> Result<Vec<u8>, FreezeError> {
     // The committed extent is page-granular (a `vm_map` grows whole pages) and must fit the mask
     // domain it grew within. Unlike v17 it need not be a power of two — a grown high-water rarely is.
+    //
+    // The reservation is a **guest** address-space quantity, so it is bounded by `u64`, not by the
+    // host's pointer width: a guest reserving the usual 4 GiB mask domain has `reserved_log2 == 32`,
+    // which a `usize::BITS` bound would reject on a 32-bit host (wasm32 — the browser engine) while
+    // accepting it on a 64-bit one. Only the *committed* extent has to fit the host's `usize`, and
+    // `window.len()` already is one.
     if window.len() < PAGE
         || !window.len().is_multiple_of(PAGE)
-        || reserved_log2 as u32 >= usize::BITS
+        || reserved_log2 as u32 >= u64::BITS
         || (window.len() as u64) > 1u64 << reserved_log2
     {
         return Err(FreezeError::WindowGeometry(window.len()));
@@ -821,18 +827,24 @@ pub fn restore_with_prots(
     // The reservation must cover at least the declared window (a smaller one is corrupt), and the
     // committed extent sits between the declared window and the reservation. A flat v17-shaped window
     // (`mapped == 1 << reserved_log2 == 1 << size_log2`) still satisfies it exactly.
-    if page_size != PAGE || reserved_log2 as u32 >= usize::BITS {
+    //
+    // The chain is arithmetic in `u64` for the same reason the freeze side is: `reserved_log2` and
+    // `size_log2` are guest address-space quantities, and a 4 GiB reservation (`reserved_log2 == 32`)
+    // is ordinary. Only `mapped` — the image this host is about to allocate — must fit a `usize`, and
+    // it is read as one.
+    if page_size != PAGE || reserved_log2 as u32 >= u64::BITS {
         return Err(RestoreError::GeometryMismatch);
     }
-    let reserved = 1usize << reserved_log2;
-    if mapped == 0 || !mapped.is_multiple_of(PAGE) || mapped > reserved {
+    let reserved = 1u64 << reserved_log2;
+    if mapped == 0 || !mapped.is_multiple_of(PAGE) || mapped as u64 > reserved {
         return Err(RestoreError::GeometryMismatch);
     }
     if let Some(mem) = &module.memory {
-        let declared = 1usize
-            .checked_shl(mem.size_log2 as u32)
-            .ok_or(RestoreError::GeometryMismatch)?;
-        if (mem.size_log2 as u32) >= usize::BITS || declared > mapped {
+        if (mem.size_log2 as u32) >= u64::BITS {
+            return Err(RestoreError::GeometryMismatch);
+        }
+        let declared = 1u64 << mem.size_log2;
+        if declared > mapped as u64 {
             return Err(RestoreError::GeometryMismatch);
         }
     }
