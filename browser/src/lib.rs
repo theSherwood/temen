@@ -3067,9 +3067,14 @@ impl OnrampCaps {
     ///
     /// What is captured and why: the undrained `keyboard`/`mouse` queues (input the host has accepted
     /// but the guest has not polled yet — a rewind that dropped them would replay different input than
-    /// it recorded), and the `fs` cursors (an `fs` read is a `seek` then a `read` on these). What is
-    /// deliberately *not* captured: the presented-frame cell, which is output — the next `tick`
-    /// overwrites it, and nothing the guest does depends on it.
+    /// it recorded), and the `fs` cursors (an `fs` read is a `seek` then a `read` on these).
+    ///
+    /// **Not** the presented frame. That is output: no guest reads it back, so it is no part of putting
+    /// the guest back where it was. A driver that restores a moment and runs no frames (a scrub landing
+    /// exactly on a keyframe) still has a picture to draw — the one it drew at that frame — and caching
+    /// that beside the moment is the driver's business, not the guest's state. `web/play.js` does
+    /// exactly that; putting it here would instead cost a framebuffer copy on every frame, armed or not,
+    /// which is the sort of always-on observation cost INVARIANTS #9(b) exists to refuse.
     fn capture(&self) -> CapMoment {
         CapMoment {
             keys: self.keys.lock().unwrap().iter().copied().collect(),
@@ -9707,6 +9712,140 @@ pub extern "C" fn temen_onramp_mouse(kind: i32, payload: i32) {
 pub extern "C" fn temen_onramp_close() {
     // SAFETY: single-threaded wasm; exclusive access to drop the reactor.
     unsafe { *core::ptr::addr_of_mut!(REACTOR) = None };
+}
+
+// ---- reactor moments: the keyframe store behind the page's scrub bar (#1457) ---------------------
+//
+// A [`ReactorMoment`] is a whole window image (16 MiB for the Doom reactor), so it stays **here**, in
+// the engine's own memory: the page holds an `i32` slot and never sees the bytes. Copying an image
+// across the FFI to hold it in JS would double the cost of every keyframe for nothing.
+//
+// Policy — how often to lay one down, how many to keep, what to do with them — is deliberately *not*
+// here. The page drives the frame loop and sees every input event, so it owns the ladder (keyframe
+// stride, ring size, eviction) and the input tape; this side ships the mechanism: take, restore, free.
+// That split is why the same four exports serve a scrub bar, a save-state, and a branch.
+
+/// The live moment slots (single-threaded wasm ⇒ a plain static). A freed slot is `None` and is
+/// reused by the next take, so a ladder that evicts as it goes does not grow this vector.
+static mut MOMENTS: Vec<Option<ReactorMoment>> = Vec::new();
+
+/// Store `moment` in a free slot (or a fresh one) and return its index; `-1` if there was nothing to
+/// capture — no reactor open, or a window that cannot be faithfully imaged.
+fn moment_store(moment: Option<ReactorMoment>) -> i32 {
+    let Some(moment) = moment else { return -1 };
+    // SAFETY: single-threaded wasm; the slot table is touched only by these accessors.
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(MOMENTS) };
+    let slot = match slots.iter().position(|s| s.is_none()) {
+        Some(i) => i,
+        None => {
+            slots.push(None);
+            slots.len() - 1
+        }
+    };
+    slots[slot] = Some(moment);
+    slot as i32
+}
+
+/// Run `f` against the moment in `slot`. `-1` for an empty or out-of-range slot, else `f`'s verdict as
+/// `0` (applied) / `-1` (refused) — a restore refuses rather than half-applying (INVARIANTS #9c).
+fn moment_with(slot: i32, f: impl FnOnce(&ReactorMoment) -> bool) -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the slot table for this call.
+    let slots = unsafe { &*core::ptr::addr_of!(MOMENTS) };
+    let Some(m) = usize::try_from(slot)
+        .ok()
+        .and_then(|i| slots.get(i))
+        .and_then(|s| s.as_ref())
+    else {
+        return -1;
+    };
+    if f(m) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Capture a **moment** of the open interpreter reactor — the window image plus the host-side
+/// capability state at this frame boundary — and return the slot holding it, or `-1` if there is no
+/// open reactor (or its window cannot be imaged). Restore it with [`temen_onramp_moment_restore`];
+/// release it with [`temen_onramp_moment_free`].
+#[no_mangle]
+pub extern "C" fn temen_onramp_moment_take() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let m = unsafe { (*core::ptr::addr_of!(REACTOR)).as_ref() }.and_then(|r| r.moment());
+    moment_store(m)
+}
+
+/// Put the open interpreter reactor back at the moment in `slot`, so the next
+/// [`temen_onramp_frame`] runs as the frame that followed it. `0` on success; `-1` if the slot is
+/// empty or no reactor is open. The moment stays in its slot — a ladder seeks back to the same
+/// keyframe repeatedly.
+#[no_mangle]
+pub extern "C" fn temen_onramp_moment_restore(slot: i32) -> i32 {
+    moment_with(slot, |m| {
+        // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
+        match unsafe { (*core::ptr::addr_of_mut!(REACTOR)).as_mut() } {
+            Some(r) => r.restore(m),
+            None => false,
+        }
+    })
+}
+
+/// Capture a moment of the open **wasm-JIT** reactor — the same capability on the emitted tier
+/// (INVARIANTS #14), taken between frames exactly as on the interpreter.
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_moment_take() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the reactor.
+    let m = unsafe { (*core::ptr::addr_of!(JIT_REACTOR)).as_ref() }.and_then(|r| r.moment());
+    moment_store(m)
+}
+
+/// Restore the open wasm-JIT reactor to the moment in `slot` (the twin of
+/// [`temen_onramp_moment_restore`]).
+#[no_mangle]
+pub extern "C" fn temen_onramp_jit_moment_restore(slot: i32) -> i32 {
+    moment_with(slot, |m| {
+        // SAFETY: single-threaded wasm; exclusive access to the reactor for this call.
+        match unsafe { (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() } {
+            Some(r) => r.restore(m),
+            None => false,
+        }
+    })
+}
+
+/// The window-image size of the moment in `slot`, or `0` for an empty slot — what holding it costs,
+/// so the page can size its keyframe ring against a memory budget rather than a guessed frame count.
+#[no_mangle]
+pub extern "C" fn temen_onramp_moment_bytes(slot: i32) -> usize {
+    // SAFETY: single-threaded wasm; shared read of the slot table.
+    let slots = unsafe { &*core::ptr::addr_of!(MOMENTS) };
+    usize::try_from(slot)
+        .ok()
+        .and_then(|i| slots.get(i))
+        .and_then(|s| s.as_ref())
+        .map_or(0, |m| m.byte_len())
+}
+
+/// Release the moment in `slot`, freeing its window image for reuse. Idempotent; an out-of-range slot
+/// is ignored. Both tiers' moments live in the one table, so this frees either.
+#[no_mangle]
+pub extern "C" fn temen_onramp_moment_free(slot: i32) {
+    // SAFETY: single-threaded wasm; exclusive access to the slot table for this call.
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(MOMENTS) };
+    if let Some(s) = usize::try_from(slot).ok().and_then(|i| slots.get_mut(i)) {
+        *s = None;
+    }
+}
+
+/// Release **every** held moment (the page calls this when a reactor closes — the moments belong to
+/// that guest's window and mean nothing to the next one). Keeps the slot vector for reuse.
+#[no_mangle]
+pub extern "C" fn temen_onramp_moment_clear() {
+    // SAFETY: single-threaded wasm; exclusive access to the slot table for this call.
+    let slots = unsafe { &mut *core::ptr::addr_of_mut!(MOMENTS) };
+    for s in slots.iter_mut() {
+        *s = None;
+    }
 }
 
 /// Diagnostic: stash the open reactor's last-trap `Debug` string into [`OUT`] and return its length
