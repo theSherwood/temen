@@ -74,6 +74,20 @@ native stack as bytes (dies on relocation/recompile — §2). A built-in schedul
 M:N runtime (orthogonal; honours D22/D56 — the VM ships *mechanism, not a
 scheduler*).
 
+**Clarification — a reactor *moment* is not a counter-example to the first non-goal (2026-09-15,
+#1457).** A reactor moment (`temen-browser`'s `ReactorMoment`) captures an **un-instrumented**
+guest — a Doom/bounce/life reactor pays none of §2's transform cost — which reads like the
+non-goal above until you see what it does *not* capture: a continuation. A reactor's `tick`
+returns to the host every frame, so at a frame boundary there is no guest stack, no shadow stack
+and no in-flight call; the window image (`MemLayout` — bytes + page-protection map) plus the
+host-side capability state (undrained input queues, `fs` cursors) is the whole of the guest's
+state. So the non-goal stands exactly as written: what a non-durable domain cannot do is be
+frozen **mid-execution**, because that is what the transform buys. Capturing one *between*
+executions costs nothing and always could. The two are the same mechanism at different stop
+points — one `Moment` type parameterized by its continuation — which is the convergence #1454
+scopes and #1460 lands; a moment is likewise not portable across a process the way a §12
+artifact is, because its powerbox is re-granted rather than serialized (that gap is #1455).
+
 ---
 
 ## 2. Mechanism — IR-level freeze/thaw (the codec)

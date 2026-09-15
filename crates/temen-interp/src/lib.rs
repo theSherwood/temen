@@ -24685,19 +24685,63 @@ pub fn host_region_granularity() -> u64 {
 /// primitive behind aliasing / the magic-ring-buffer trick. Crucially the access path
 /// ([`Mem::byte`]/[`Mem::set_byte`]) just redirects where a page's bytes live; loads/stores stay
 /// ordinary masked accesses (zero overhead), exactly as §13 specifies.
-/// A time-travel checkpoint of a window's full guest-visible memory state — the committed byte range
-/// plus the page-protection map — for restoring a **page-mapping** root window (one that has `map`/
-/// `unmap`/`protect`ed or grown its layout). Captured by [`Mem::layout_snapshot`], reinstalled by
+/// A capture of a window's full guest-visible memory state — the committed byte range plus the
+/// page-protection map — for restoring a **page-mapping** root window (one that has `map`/`unmap`/
+/// `protect`ed or grown its layout). Captured by [`Mem::layout_snapshot`], reinstalled by
 /// [`Mem::restore_layout`]. Carries no `Backed` entries: §13 region aliasing is excluded from the
-/// checkpointable subset (see [`Mem::layout_snapshot_safe`]).
+/// capturable subset (see [`Mem::layout_snapshot_safe`]).
+///
+/// **This is the one window-image form.** The time-travel checkpoint ladder, the reactor moment
+/// (`temen-browser`'s `ReactorMoment`), and the §12 snapshot codec's window section all describe the
+/// same datum — bytes plus a protection map — so they carry it as this type rather than as a private
+/// pair of fields each (INVARIANTS #13/#15). A holder that has no live [`Mem`] (a reactor between
+/// frames, whose window is a bare `Region`; a run driver carrying the page list a previous run handed
+/// back) builds one with [`MemLayout::from_parts`], which speaks the [`Mem::map_info`] page encoding
+/// every FFI and run entry already uses.
 #[derive(Clone)]
-struct MemLayout {
+pub struct MemLayout {
     /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
     /// uncommitted pages read zero).
     bytes: Vec<u8>,
     /// The guest-visible page-protection entries (window-relative page index ⇒ state) — every
     /// `Rw`/`Ro`/`Unmapped` deviation from the region default, reinstalled verbatim.
     prot: Vec<(u64, PageProt)>,
+}
+
+impl MemLayout {
+    /// Build a layout from a raw window image plus a page list in the [`Mem::map_info`] encoding —
+    /// the entry for a holder that has no live [`Mem`] to capture from (a reactor between frames,
+    /// whose window is a bare `Region`, or a run driver carrying the `prots` a previous run returned).
+    /// `prot` entries are `(page_base_byte_offset, kind)` with kind `0 = Ro`, `1 = Rw`, `2 = Unmapped`;
+    /// `page` is the run's page size. A `3` (§13 `Backed`) entry is **rejected** — its bytes live in a
+    /// shared region, so an image cannot reproduce it ([`Mem::layout_snapshot_safe`]) — and so is an
+    /// unknown kind, both as `None` rather than a silently dropped protection.
+    pub fn from_parts(bytes: Vec<u8>, page: u64, prot: &[(u64, u8)]) -> Option<MemLayout> {
+        let prot = prot
+            .iter()
+            .map(|&(off, kind)| {
+                let p = match kind {
+                    0 => PageProt::Ro,
+                    1 => PageProt::Rw,
+                    2 => PageProt::Unmapped,
+                    _ => return None, // 3 = Backed, or a kind this encoding never had
+                };
+                Some((off / page, p))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(MemLayout { bytes, prot })
+    }
+
+    /// The captured window bytes `[0, len)`.
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The captured image's byte length — what holding this layout costs (the protection map is a
+    /// handful of entries beside it), and the window extent a restore will overwrite.
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26294,8 +26338,23 @@ impl Mem {
             high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
         }
         high = high.min(self.window.reserved());
+        // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
+        // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
+        // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
+        // PER BYTE. This is what makes a moment of a multi-MiB window (a reactor keyframe) a memcpy
+        // rather than millions of calls; `layout_snapshot_safe` excludes the region case anyway, so the
+        // per-byte arm is the unreachable-in-practice mirror of `byte`'s own slow path. Offset `0`, not
+        // `window.base()`, exactly as the per-byte arm's `self.byte(i)` indexes: this capture is
+        // root-only (see the doc above), where the two agree.
+        let bytes = if !self.has_regions.load(Ordering::Relaxed) {
+            let mut out = vec![0u8; high as usize];
+            self.back.read_into(0, &mut out);
+            out
+        } else {
+            (0..high).map(|i| self.byte(i)).collect()
+        };
         MemLayout {
-            bytes: (0..high).map(|i| self.byte(i)).collect(),
+            bytes,
             prot: space.prot.iter().map(|(&pg, &p)| (pg, p)).collect(),
         }
     }
@@ -26305,10 +26364,24 @@ impl Mem {
     /// Bytes first so a `Ro`/grown page has its contents before the protection is applied. The fresh
     /// window has no regions, so this reproduces the guest-visible state exactly.
     fn restore_layout(&mut self, layout: &MemLayout) {
-        for (i, &b) in layout.bytes.iter().enumerate() {
-            self.set_byte(i as u64, b);
+        // Bulk fast path, the mirror of the capture above (and of `seed`): no §13 region ⇒ no page is
+        // `Backed`, so the image writes straight through to `back` in one pass. Same root-only offset
+        // convention as `layout_snapshot`.
+        if !self.has_regions.load(Ordering::Relaxed) {
+            self.back.write_from(0, &layout.bytes);
+        } else {
+            for (i, &b) in layout.bytes.iter().enumerate() {
+                self.set_byte(i as u64, b);
+            }
         }
-        if !layout.prot.is_empty() {
+        // Install the captured map, *replacing* whatever this window carries. The guard is only the
+        // fast-path one: a window with no explicit protections restoring an image that has none stays
+        // off `prot_dirty` (the lock-free `check_prot` path). Whenever either side has entries the map
+        // is assigned outright — restoring into a **live** window (a reactor rewinding to an earlier
+        // moment) must drop the pages the guest has `map`-grown since, or they would survive as
+        // addressable memory the moment never had. A fresh window (the checkpoint ladder's target) has
+        // an empty map, so this is unchanged there.
+        if !layout.prot.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
             space.prot = layout.prot.iter().copied().collect();
         }

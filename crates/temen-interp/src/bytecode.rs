@@ -52,7 +52,7 @@ use temen_ir::{
 use super::{
     bin32, bin64, cast, cmp32, cmp64, fbin32, fbin64, fcmp32, fcmp64, fto_i, fun32, fun64, i_to_f,
     intun32, intun64, slot_to_val, step, trunc_trap, val_to_slot, GuestMem, Host, LockUnpoisoned,
-    Mem, Reg, Trap, Value, VarValue, DEFAULT_RESERVED_LOG2,
+    Mem, MemLayout, Reg, Trap, Value, VarValue, DEFAULT_RESERVED_LOG2,
 };
 
 // ---- Per-function call profiler (opt-in `callprof` feature; tier-up break-even measurement) -------
@@ -2737,6 +2737,40 @@ impl Reactor {
         let dom = Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0));
         run(dom, func, args, fuel, &mut self.mem, host)
     }
+
+    /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
+    /// keyframe: time travel, a save-state, a branch point). See [`VcpuReactor::window_layout`] for
+    /// why a reactor moment needs no continuation; the two reactors delegate to the one capture.
+    pub fn window_layout(&self) -> Option<MemLayout> {
+        window_layout_of(self.mem.as_ref())
+    }
+
+    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window. `false` for a
+    /// memory-less module (nothing to restore into).
+    pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
+        restore_window_of(self.mem.as_mut(), layout)
+    }
+}
+
+/// Capture a reactor's window, or `None` when there is nothing faithfully capturable: a memory-less
+/// module, or a window that has aliased a §13 `SharedRegion` — an image cannot reproduce a live alias
+/// into shared backing, so the capture **refuses** rather than handing back a fiction that would
+/// restore as detached bytes (INVARIANTS #9c; the same `layout_snapshot_safe` gate the checkpoint
+/// ladder uses).
+fn window_layout_of(mem: Option<&Mem>) -> Option<MemLayout> {
+    let m = mem?;
+    m.layout_snapshot_safe().then(|| m.layout_snapshot())
+}
+
+/// Reinstate `layout` into a reactor's live window (the write half of [`window_layout_of`]).
+fn restore_window_of(mem: Option<&mut Mem>, layout: &MemLayout) -> bool {
+    match mem {
+        Some(m) => {
+            m.restore_layout(layout);
+            true
+        }
+        None => false,
+    }
 }
 
 /// A persistent single-vCPU reactor driven through the **resumable [`Vcpu`]** — the vehicle the
@@ -2873,6 +2907,27 @@ impl VcpuReactor {
         }
         self.mem = reclaimed;
         result
+    }
+
+    /// Capture the live window as a [`MemLayout`] — the memory half of a **moment** (a reactor
+    /// keyframe: time travel, a save-state, a branch point).
+    ///
+    /// A reactor moment needs **no continuation**. `tick` returns to the host every frame, so between
+    /// frames there is no guest stack to capture, no shadow stack to unwind, and no handle table to
+    /// serialize: the window — plus whatever host-side capability state the embedder holds alongside
+    /// it — *is* the state. That is why this costs one image copy and no `temen-durable`
+    /// instrumentation, unlike a freeze at an arbitrary safepoint (DURABILITY.md §2).
+    ///
+    /// `None` when there is nothing faithfully capturable — see [`window_layout_of`].
+    pub fn window_layout(&self) -> Option<MemLayout> {
+        window_layout_of(self.mem.as_ref())
+    }
+
+    /// Reinstate a [`window_layout`](Self::window_layout) capture into the live window — the window
+    /// this reactor keeps across frames, so the next `frame` runs over the restored state. `false` for
+    /// a memory-less module (nothing to restore into).
+    pub fn restore_window(&mut self, layout: &MemLayout) -> bool {
+        restore_window_of(self.mem.as_mut(), layout)
     }
 }
 
