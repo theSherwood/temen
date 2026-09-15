@@ -1074,6 +1074,13 @@ jobs:
           # Uses the committed `bounce.temen` — no built asset. (Replay fidelity itself is gated on both
           # tiers by the Rust `reactor_moment`/`jit_reactor_moment` suites, not here.)
           node browser-play-scrub-test.mjs
+          # #1458 (the #1454 moment design): the playground's reactor **save-states** — a running guest
+          # frozen to a §12 artifact, persisted in IndexedDB, and thawed back. Drives the real page on
+          # **both tiers**: save at an exact scrub frame, Stop, reload the page, Load, and the thawed
+          # guest's frames must equal the original's pixel for pixel (a thaw skips `_start`). Also gates
+          # that a save comes back on the tier it was taken on, whatever the wasm-JIT toggle says. Uses
+          # the committed `bounce.temen` — no built asset.
+          node browser-play-savestate-test.mjs
           # #1392 — the chibicc card's separate-compilation path in the *wasm* cdylib: the committed
           # prebuilt libc unit (`web/assets/pg_libc.temeno`) goes resident, the user's C compiles as a
           # small program unit against libc declarations only, `temen_link_encode_lib` links it straight

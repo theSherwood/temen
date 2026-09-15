@@ -3038,6 +3038,55 @@ function readPgStdout() {
   return formatPgOutput(readEngineStdout());
 }
 
+// ---- IndexedDB: one byte-blob store, two features -------------------------------------------------
+// Two things on this page outlive a reload — the Postgres data dir and a reactor save-state — and both
+// want the same three operations over the same kind of value: get / put / delete a byte blob under a
+// string key. So this is one helper parameterized by (database, store) rather than a copy per feature
+// (INVARIANTS #15). Reads are best-effort (no IndexedDB in private mode ⇒ `null`, i.e. "nothing saved");
+// writes surface their error, because a save the user asked for silently not happening is a lie.
+function idbOpen(dbName, store) {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(dbName, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(store);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbGet(dbName, store, key) {
+  try {
+    const db = await idbOpen(dbName, store);
+    return await new Promise((resolve, reject) => {
+      const r = db.transaction(store, 'readonly').objectStore(store).get(key);
+      r.onsuccess = () => resolve(r.result || null);
+      r.onerror = () => reject(r.error);
+    });
+  } catch {
+    return null;
+  }
+}
+async function idbPut(dbName, store, key, bytes) {
+  const db = await idbOpen(dbName, store);
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).put(bytes, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+async function idbDel(dbName, store, key) {
+  try {
+    const db = await idbOpen(dbName, store);
+    await new Promise((resolve) => {
+      const tx = db.transaction(store, 'readwrite');
+      tx.objectStore(store).delete(key);
+      tx.oncomplete = resolve;
+      tx.onerror = resolve;
+    });
+  } catch {
+    /* nothing to clear */
+  }
+}
+
 // ---- persistent Postgres storage (IndexedDB) -----------------------------------------------------
 // The live backend's data dir is an in-memory `mem_fs`; on its own it evaporates when the page unloads.
 // After each query we snapshot that fs (`temen_pg_snapshot` → an `temen_fs` data image) and stash the image
@@ -3048,48 +3097,9 @@ function readPgStdout() {
 const PG_DB = 'temen-pg';
 const PG_STORE = 'sessions';
 const pgKey = (c) => c.ex.url;
-function pgIdb() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(PG_DB, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(PG_STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error);
-  });
-}
-async function pgLoad(key) {
-  try {
-    const db = await pgIdb();
-    return await new Promise((resolve, reject) => {
-      const r = db.transaction(PG_STORE, 'readonly').objectStore(PG_STORE).get(key);
-      r.onsuccess = () => resolve(r.result || null);
-      r.onerror = () => reject(r.error);
-    });
-  } catch {
-    return null; // no IndexedDB (private mode, etc.) ⇒ fall back to the pristine image
-  }
-}
-async function pgSave(key, bytes) {
-  const db = await pgIdb();
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(PG_STORE, 'readwrite');
-    tx.objectStore(PG_STORE).put(bytes, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error);
-  });
-}
-async function pgClear(key) {
-  try {
-    const db = await pgIdb();
-    await new Promise((resolve) => {
-      const tx = db.transaction(PG_STORE, 'readwrite');
-      tx.objectStore(PG_STORE).delete(key);
-      tx.oncomplete = resolve;
-      tx.onerror = resolve;
-    });
-  } catch {
-    /* nothing to clear */
-  }
-}
+const pgLoad = (key) => idbGet(PG_DB, PG_STORE, key);
+const pgSave = (key, bytes) => idbPut(PG_DB, PG_STORE, key, bytes);
+const pgClear = (key) => idbDel(PG_DB, PG_STORE, key);
 // Snapshot the live session's data dir and persist it, **coalescing** concurrent saves: at most one IDB
 // write is in flight; a query that lands mid-write just marks the card dirty and re-saves once it drains
 // (so a burst of queries collapses to one trailing write of the latest state). The snapshot bytes are
@@ -3514,6 +3524,149 @@ function sendReactorMouse(kind, payload) {
   else eng.ex.temen_onramp_mouse(kind, payload | 0);
 }
 
+// ---- save-states: the same instant, written down (#1458) ------------------------------------------
+//
+// A scrub keyframe and a save-state are the same instant of the same guest, read two ways. A keyframe
+// never leaves the engine, so it stays there as a raw window image; a save-state has to *leave* — into
+// IndexedDB, and back after a reload — so it crosses the FFI as a §12 artifact, the container the
+// durability codec already speaks.
+//
+// Two properties make this cheap, and both come from *where* a reactor is frozen rather than from any
+// new machinery: at a frame boundary there is no guest stack to serialize, and the image is already
+// post-`_start`, so loading skips the boot the guest would otherwise redo (for Doom, seconds of WAD
+// parsing). The capabilities are re-granted **by name** on the way back in — the artifact names `fs`,
+// this host decides what `fs` is (INVARIANTS #3) — so the saved bytes are data, never authority.
+const SAVE_DB = 'temen-savestate';
+const SAVE_STORE = 'reactors';
+// Keyed per module URL, like the Postgres image: a save belongs to the guest it was taken from, and the
+// artifact's module digest enforces that anyway (a mismatched thaw refuses rather than restoring a
+// fiction). One slot per demo — a Doom save-state is tens of MiB, so a ladder of them is a later call.
+const saveKey = (c) => c.ex.url;
+
+// Artifact sizes span four orders of magnitude here — a bounce save-state is a few KiB, a Doom one tens
+// of MiB — so the row says which, rather than printing a seven-digit byte count.
+function fmtBytes(n) {
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${n} B`;
+}
+
+// Freeze the live reactor over `bytes` (the module it was opened over — the artifact binds its digest),
+// on whichever tier is running. Returns the artifact, or null if the engine refused. The bytes are
+// copied straight out of the cdylib-managed buffer; a view would alias memory the next freeze reclaims.
+function freezeReactor(bytes) {
+  const p = eng.ex.temen_alloc(bytes.length);
+  new Uint8Array(eng.memory.buffer).set(bytes, p);
+  const n = jitReactor ? eng.ex.temen_onramp_jit_freeze(p, bytes.length) : eng.ex.temen_onramp_freeze(p, bytes.length);
+  eng.ex.temen_dealloc(p, bytes.length);
+  if (!n) return null;
+  const a = eng.ex.temen_onramp_artifact_ptr();
+  return new Uint8Array(eng.memory.buffer).slice(a, a + n);
+}
+
+// Open the interpreter reactor from `artifact` instead of from `_start` — the twin of
+// `openInterpReactor`, same module and same served file, so the guest comes back with the same `fs`
+// under it. Returns the thaw status (0 = ok).
+function thawInterpReactor(artifact, bytes, file) {
+  const nameBytes = file ? new TextEncoder().encode(file.name) : new Uint8Array(0);
+  const data = file ? file.data : new Uint8Array(0);
+  const artP = eng.ex.temen_alloc(artifact.length);
+  const modP = eng.ex.temen_alloc(bytes.length);
+  const nameP = eng.ex.temen_alloc(nameBytes.length);
+  const dataP = eng.ex.temen_alloc(data.length);
+  const view = new Uint8Array(eng.memory.buffer);
+  view.set(artifact, artP);
+  view.set(bytes, modP);
+  if (nameBytes.length) view.set(nameBytes, nameP);
+  if (data.length) view.set(data, dataP);
+  const status = eng.ex.temen_onramp_thaw(
+    artP, artifact.length, modP, bytes.length, nameP, nameBytes.length, dataP, data.length);
+  eng.ex.temen_dealloc(artP, artifact.length);
+  eng.ex.temen_dealloc(modP, bytes.length);
+  eng.ex.temen_dealloc(nameP, nameBytes.length);
+  eng.ex.temen_dealloc(dataP, data.length);
+  return status;
+}
+
+// Freeze whatever this card's reactor is right now — live or paused mid-scrub, both are frame
+// boundaries — and persist it. The module bytes come from the run itself (`c.reactorBytes`), so a save
+// cannot be taken against a module the guest wasn't opened over.
+async function saveStateWrite(c) {
+  if (c !== activeReactorCard) return;
+  const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
+  const artifact = c.reactorBytes && freezeReactor(c.reactorBytes);
+  if (!artifact) {
+    // The engine stashes *why* it refused (the `FreezeError`) where a stdout delta would go.
+    const n = eng.ex.temen_stdout_len();
+    const why = n > 0
+      ? new TextDecoder().decode(new Uint8Array(eng.memory.buffer).slice(eng.ex.temen_stdout_ptr(), eng.ex.temen_stdout_ptr() + n))
+      : `status ${eng.ex.temen_status()}`;
+    logTo(c, `save-state: freeze refused (${why})`);
+    saveStateRender(c);
+    return;
+  }
+  // The frame the artifact *is* — which is where the scrub is looking when one is paused mid-ladder,
+  // not how far the run had got before it was paused.
+  const at = scrub ? (scrub.viewing ?? scrub.tick) : 0;
+  // The tier rides along because a window image is only meaningful in a window its own size, and the
+  // two tiers reserve different ones: a JIT save-state thawed on the interpreter would be refused. The
+  // page remembers which tier took it and loads it back there, rather than letting the toggle decide.
+  const record = { artifact, tier, at };
+  try {
+    await idbPut(SAVE_DB, SAVE_STORE, saveKey(c), record);
+    c.saveState = { bytes: artifact.length, at, tier };
+    logTo(c, `save-state written: ${fmtBytes(artifact.length)} artifact (frame ${at}, ${tier})`);
+  } catch (e) {
+    logTo(c, `save-state: could not persist (${e && e.message}) — the artifact was frozen but not stored`);
+  }
+  saveStateRender(c);
+}
+
+// Load this card's saved state: stop whatever is running and re-open the reactor from the artifact
+// rather than from `_start`. The run path is the same one Run takes — same fetch, same `fs` file, same
+// frame loop, same scrub ladder — parameterized by where the first window comes from.
+async function saveStateLoad(c) {
+  const rec = await idbGet(SAVE_DB, SAVE_STORE, saveKey(c));
+  if (!rec) {
+    logTo(c, 'save-state: nothing saved for this demo');
+    saveStateRender(c);
+    return;
+  }
+  await runReactor(c, { thaw: new Uint8Array(rec.artifact), tier: rec.tier });
+}
+
+// Forget this card's save-state.
+async function saveStateClear(c) {
+  await idbDel(SAVE_DB, SAVE_STORE, saveKey(c));
+  c.saveState = null;
+  logTo(c, 'save-state cleared');
+  saveStateRender(c);
+}
+
+// Ask IndexedDB whether this card has a save-state, so Load is offered on a cold page too — the whole
+// point of persisting it is that it survives the reload.
+async function saveStateProbe(c) {
+  const rec = await idbGet(SAVE_DB, SAVE_STORE, saveKey(c));
+  c.saveState = rec && rec.artifact
+    ? { bytes: rec.artifact.byteLength ?? rec.artifact.length, at: rec.at ?? null, tier: rec.tier }
+    : null;
+  saveStateRender(c);
+}
+
+// Paint the save row: Save applies to a live interpreter reactor on this card, Load/Clear to a stored
+// artifact. Called whenever either of those can have changed.
+function saveStateRender(c) {
+  const row = c && c.el.save;
+  if (!row) return;
+  row.save.disabled = c !== activeReactorCard || !c.reactorBytes;
+  row.load.disabled = !c.saveState;
+  row.clear.disabled = !c.saveState;
+  row.label.textContent = c.saveState
+    ? `saved: ${fmtBytes(c.saveState.bytes)}${c.saveState.at == null ? '' : ` · frame ${c.saveState.at}`}`
+      + `${c.saveState.tier ? ` · ${c.saveState.tier}` : ''}`
+    : 'no saved state';
+}
+
 // Cancel any running reactor loop and free the guest instance. Safe to call when none is running.
 // "Running" is not the same as "open": a reactor **paused for scrubbing** has no pending rAF but is
 // very much still open, so what to tear down is keyed on `activeReactorCard`, not on the loop.
@@ -3535,11 +3688,27 @@ function stopReactor() {
   } else {
     eng.ex.temen_onramp_close();
   }
-  activeReactorCard = null;
+  closeReactorCard();
 }
 
-async function runReactor(c) {
+// Let go of the card the reactor belonged to. The module bytes go with it: they exist only to freeze a
+// save-state against, and with no reactor open there is nothing to freeze.
+function closeReactorCard() {
+  const c = activeReactorCard;
+  activeReactorCard = null;
+  if (!c) return;
+  c.reactorBytes = null;
+  saveStateRender(c);
+}
+
+// Run this card's reactor. `opts.thaw` is a save-state artifact: the guest is rebuilt from it instead
+// of from `_start`, and everything else about the run — the fetch, the served file, the frame loop, the
+// scrub ladder — is identical. One run path with the first window as its parameter, not a second one
+// (INVARIANTS #15). `opts.tier` ('interpreter' | 'wasm-JIT') pins the tier a thaw comes back on,
+// overriding the toggle: a window image only fits the window it was taken from.
+async function runReactor(c, opts = {}) {
   const ex = c.ex;
+  const thaw = opts.thaw || null;
   stopReactor();
   activeReactorCard = c;
   setState(c, 'running', 'fetching module…');
@@ -3548,7 +3717,8 @@ async function runReactor(c) {
   c.el.canvas.hidden = true;
   // The "wasm-JIT" toggle runs an emittable reactor's whole tick() on emitted wasm (near-native) rather
   // than the interpreter. Only offered for JIT-capable examples (Doom); falls back if the emit fails.
-  const useJit = !!(ex.jit && c.el.jit && c.el.jit.checked);
+  // A thaw comes back on the tier its artifact was frozen on — see `opts.tier`.
+  const useJit = thaw ? opts.tier === 'wasm-JIT' : !!(ex.jit && c.el.jit && c.el.jit.checked);
   const rec = runStart(c, { tier: useJit ? 'wasm-JIT' : 'interpreter' });
   let bytes;
   try {
@@ -3602,31 +3772,48 @@ async function runReactor(c) {
     logTo(c, `fetched ${ex.file}: ${file.data.length}B file (served through the fs capability as ${file.name})`);
   }
   setState(c, 'running',
-    ex.file ? `booting… (${file.name} read through fs at _start — Doom builds its renderer here, a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
-      : 'running…');
+    thaw ? 'loading save-state… (_start is skipped — the guest is already booted)'
+      : ex.file ? `booting… (${file.name} read through fs at _start — Doom builds its renderer here, a few seconds)${useJit ? ' [wasm-JIT]' : ''}`
+        : 'running…');
   const tOpen = performance.now();
   if (useJit) {
     try {
-      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data);
-      logTo(c, `wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
+      jitReactor = await openJitReactor(eng.ex, eng.memory, bytes, file && file.name, file && file.data, thaw);
+      logTo(c, thaw
+        ? `wasm-JIT reactor thawed from a ${fmtBytes(thaw.length)} save-state: ${ex.url} — resuming on emitted wasm`
+        : `wasm-JIT reactor opened: ${ex.url} (${bytes.length}B) — tick() runs on emitted wasm`);
     } catch (e) {
       jitReactor = null;
       logTo(c, `wasm-JIT reactor unavailable (${e.message}); falling back to the interpreter`);
       runNote(rec, { jitFallbackReason: e.message });
+      // A thaw that fell back has nothing to fall back *to*: the interpreter would boot a fresh guest
+      // under a Load button, which is not what was asked for. Refuse rather than quietly start over.
+      if (thaw) {
+        setState(c, 'error', 'save-state could not be loaded on the wasm-JIT tier it was taken on');
+        closeReactorCard();
+        runEnd(rec, { ok: false });
+        return;
+      }
     }
   }
   if (!jitReactor) {
-    const opened = openInterpReactor(bytes, file);
+    const opened = thaw ? thawInterpReactor(thaw, bytes, file) : openInterpReactor(bytes, file);
     if (opened !== 0) {
-      setState(c, 'error', `reactor open failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
-      logTo(c, `temen_onramp_open failed: ${opened}`);
-      activeReactorCard = null;
-      runNote(rec, { openStatus: eng.ex.temen_status() });
+      setState(c, 'error', `reactor ${thaw ? 'thaw' : 'open'} failed: status ${eng.ex.temen_status()} (2=unsupported 3=trap)`);
+      logTo(c, `temen_onramp_${thaw ? 'thaw' : 'open'} failed: ${opened}`);
+      closeReactorCard();
+      runNote(rec, { openStatus: eng.ex.temen_status(), thawed: !!thaw });
       runEnd(rec, { ok: false });
       return;
     }
-    logTo(c, `reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
+    logTo(c, thaw
+      ? `reactor thawed from a ${fmtBytes(thaw.length)} save-state: ${ex.url} — resuming where it was frozen`
+      : `reactor opened: ${ex.url} (${bytes.length}B) — arrow keys steer, Stop ends`);
   }
+  // Hold the module (and its served file) beside the run: a save-state freezes against exactly the
+  // module the guest was opened over, and this is where that is known.
+  c.reactorBytes = bytes;
+  saveStateRender(c);
   const tier = jitReactor ? 'wasm-JIT' : 'interpreter';
   runStage(rec, `open:${tier}`, performance.now() - tOpen);
   runTier(rec, tier);
@@ -3682,7 +3869,7 @@ async function runReactor(c) {
     } else {
       eng.ex.temen_onramp_close();
     }
-    activeReactorCard = null;
+    closeReactorCard();
     c.el.run.disabled = broken;
     c.el.stop.disabled = true;
     const secs = ((performance.now() - t0) / 1000).toFixed(1);
@@ -4724,7 +4911,7 @@ function buildCard(name, ex) {
     l.title = isModule
       ? 'Run the whole guest (_start) on emitted wasm (wasm-JIT tier) instead of the interpreter'
       : 'Run the reactor’s tick() on emitted wasm (wasm-JIT tier) instead of the interpreter';
-    jit = el('input');
+    jit = el('input', 'jit-toggle');
     jit.type = 'checkbox';
     // Default the wasm-JIT tier ON for every jit card — including warm-snapshot cards (QuickJS/Tcl),
     // which now default to the accelerated warm cascade warm+JIT → warm-coop → warm-interp (#816): init
@@ -4796,6 +4983,30 @@ function buildCard(name, ex) {
       scrubResumeFrom(scrub.viewing);
       resumeReactorLoop();
     });
+  }
+
+  // …and a **save-state** row (#1458): freeze this guest to a §12 artifact in IndexedDB and come back
+  // to it later — after a Stop, after a reload, after closing the tab. Unlike the scrub row this one is
+  // always visible, because Load is exactly what you want on a cold page where nothing is running.
+  let saveRow = null;
+  if (ex.kind === 'reactor') {
+    const wrap = el('div', 'savestate');
+    const save = el('button', 'save-btn save-write', 'Save state');
+    save.title = 'Freeze this guest where it stands (works while scrubbed back, too)';
+    save.disabled = true;
+    const load = el('button', 'save-btn save-load', 'Load state');
+    load.title = 'Resume from the saved state — _start is skipped, the guest is already booted';
+    load.disabled = true;
+    const clear = el('button', 'save-btn save-clear', 'Clear');
+    clear.title = 'Forget the saved state';
+    clear.disabled = true;
+    const label = el('span', 'save-label', 'no saved state');
+    wrap.append(save, load, clear, label);
+    section.appendChild(wrap);
+    saveRow = { wrap, save, load, clear, label };
+    save.addEventListener('click', () => saveStateWrite(c));
+    load.addEventListener('click', () => saveStateLoad(c));
+    clear.addEventListener('click', () => saveStateClear(c));
   }
 
   const out = el('div', 'output');
@@ -4886,7 +5097,7 @@ function buildCard(name, ex) {
 
   const c = {
     name, ex, editor, jsEditor, id,
-    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, scrub: scrubRow, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
+    el: { section, state, result, stdout, log: logEl, canvas, gpucanvas, scrub: scrubRow, save: saveRow, run: runBtn, stop: stopBtn, mode: modeSel, tu: tuSel, jit, gflag, prove: proveBtn, reset: resetBtn, share: shareBtn, debug: debugBtn, dbg, dbgVars, term },
   };
   // `pickFile` cards: a file input + the canvas as a drop target. The picked file replaces the card's
   // served file (`c.userFile`, under the same guest-visible name) for every later Run; a running loop
@@ -4942,6 +5153,9 @@ function buildCard(name, ex) {
     setState(c, 'ready', 'reset to the original source');
   });
   if (shareBtn) shareBtn.addEventListener('click', () => shareCard(c));
+  // Offer Load on a cold page: whether this demo has a save-state is a question for IndexedDB, and the
+  // answer is what the row shows before anything has run.
+  if (saveRow) saveStateProbe(c);
   return c;
 }
 

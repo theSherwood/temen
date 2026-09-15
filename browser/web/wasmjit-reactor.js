@@ -18,12 +18,39 @@ const DEFAULT_FUEL = 1n << 52n; // huge per-frame dispatcher-fuel budget (only a
 // failure (the caller falls back to the interpreter reactor). `frame()` runs one `tick` and returns the
 // status (0 = keep going, 5 = the guest exited, else a trap) after stashing the presented frame into
 // the `temen_framebuffer_*` slots.
-export async function openJitReactor(ex, memory, moduleBytes, wadName, wad) {
+//
+// `artifact` (a §12 save-state from `temen_onramp_jit_freeze`, #1458) replaces the boot: the cdylib
+// restores that window image instead of running `_start`, and everything after — the emitted bytes, the
+// ABI reads, the instantiate, the frame loop — is identical. One open path with its first window as a
+// parameter, not a second driver.
+export async function openJitReactor(ex, memory, moduleBytes, wadName, wad, artifact = null) {
   const u8 = () => new Uint8Array(memory.buffer);
-  // Hand the module (+ optional WAD) to the cdylib: it decodes, runs `_start`, and emits the whole
-  // `tick`. Without a WAD, the plain `temen_onramp_jit_open` (no `fs` cap) is the open path.
+  // Hand the module (+ optional WAD) to the cdylib: it decodes, runs `_start` (or restores `artifact`),
+  // and emits the whole `tick`. Without a WAD, the plain `temen_onramp_jit_open` (no `fs` cap) is the
+  // open path; a thaw always goes through the one `temen_onramp_jit_thaw` ABI, whose `name_len == 0`
+  // says "no fs".
   let opened;
-  if (wad) {
+  if (artifact) {
+    const nameBytes = wad ? new TextEncoder().encode(wadName) : new Uint8Array(0);
+    const data = wad || new Uint8Array(0);
+    const artP = Number(ex.temen_alloc(artifact.length));
+    const modP = Number(ex.temen_alloc(moduleBytes.length));
+    const nameP = Number(ex.temen_alloc(nameBytes.length));
+    const dataP = Number(ex.temen_alloc(data.length));
+    {
+      const v = u8();
+      v.set(artifact, artP);
+      v.set(moduleBytes, modP);
+      if (nameBytes.length) v.set(nameBytes, nameP);
+      if (data.length) v.set(data, dataP);
+    }
+    opened = ex.temen_onramp_jit_thaw(
+      artP, artifact.length, modP, moduleBytes.length, nameP, nameBytes.length, dataP, data.length);
+    ex.temen_dealloc(artP, artifact.length);
+    ex.temen_dealloc(modP, moduleBytes.length);
+    ex.temen_dealloc(nameP, nameBytes.length);
+    ex.temen_dealloc(dataP, data.length);
+  } else if (wad) {
     const modP = Number(ex.temen_alloc(moduleBytes.length));
     const nameBytes = new TextEncoder().encode(wadName);
     const nameP = Number(ex.temen_alloc(nameBytes.length));
@@ -45,7 +72,7 @@ export async function openJitReactor(ex, memory, moduleBytes, wadName, wad) {
     ex.temen_dealloc(modP, moduleBytes.length);
   }
   if (opened !== 0) {
-    throw new Error(`JIT reactor open failed: status ${ex.temen_status()} (2=tick not emittable, 3=trap)`);
+    throw new Error(`JIT reactor ${artifact ? 'thaw' : 'open'} failed: status ${ex.temen_status()} (2=tick not emittable / artifact not this window, 3=trap)`);
   }
 
   // Copy the emitted `tick` wasm out of linear memory (a later temen_alloc could move the stash), and

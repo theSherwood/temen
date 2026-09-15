@@ -88,6 +88,26 @@ points — one `Moment` type parameterized by its continuation — which is the 
 scopes and #1460 lands; a moment is likewise not portable across a process the way a §12
 artifact is, because its powerbox is re-granted rather than serialized (that gap is #1455).
 
+**Follow-on — the moment as a §12 artifact (2026-09-15, #1458).** With #1455 landed, that last gap is
+closed: a reactor freezes to an ordinary §12 artifact (`OnrampReactor::freeze` /
+`JitOnrampReactor::freeze`, both `freeze_layout` over the same `MemLayout` a moment captures) and thaws
+into a fresh reactor whose capabilities are re-granted **by name** through the registrar. Two
+properties come from *where* it is frozen rather than from any machinery: the control section is empty
+(no continuation at a frame boundary, so no `temen-durable` instrumentation), and the image is
+post-`_start`, so a thaw deliberately does not re-run the entry — for Doom that is seconds of WAD
+parsing skipped, which is most of what a save-state is for. Both tiers freeze, because a save-state the
+playable (emitted) tier cannot take is not the feature (INVARIANTS #14); the artifact is tier-local in
+practice only because the two reserve different window sizes, and a mismatched image is refused rather
+than splatted over a prefix. Gated by `browser/tests/reactor_moment.rs`,
+`browser/tests/jit_reactor_moment.rs`, and the page-level `browser-play-savestate-test.mjs`.
+
+*Geometry footnote.* The §12 container's reservation checks were bounded by the **host's** pointer
+width (`usize::BITS`). The mask domain is a guest address-space quantity, so an ordinary 4 GiB
+reservation (`reserved_log2 == 32`) froze fine on a 64-bit host and refused with `WindowGeometry` on
+wasm32 — where the browser engine runs. The chain is now `u64` arithmetic throughout; only the
+committed extent, which this host is about to allocate, has to fit a `usize`
+(`crates/temen-snapshot/tests/prots.rs::a_four_gib_reservation_round_trips`).
+
 ---
 
 ## 2. Mechanism — IR-level freeze/thaw (the codec)

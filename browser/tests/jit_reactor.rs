@@ -89,6 +89,7 @@ fn jit_frames(m: &temen_ir::Module, wad: &[u8]) -> Vec<(u64, bool)> {
             WIN_LOG2,
             false,
             Some(("doom1.wad".into(), wad.to_vec())),
+            temen_browser::JitStart::Entry,
         )
     }
     .expect("open JIT Doom reactor");
