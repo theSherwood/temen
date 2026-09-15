@@ -345,6 +345,10 @@ pub(crate) struct Translator {
     /// Mutable module globals (`gvar`) → (fixed window offset, type). Zero-initialized (the window
     /// starts zeroed); non-zero initializers are a later slice.
     globals: HashMap<String, (u64, TyDesc)>,
+    /// Names of globals whose Leng type is **unsigned** (`(u N)`). The per-proc `unsigned` set covers
+    /// params and locals only; without this a `(u 32)` *global* with bit 31 set sign-extended on its
+    /// way into a 64-bit context, exactly as params did before #1472.
+    unsigned_globals: HashSet<String>,
     /// Scalar integer `const`s, inlined at use.
     consts: HashMap<String, i64>,
     /// **External scalar-int `const`s** — another unit's top-level `const` folded to an integer, under
@@ -490,6 +494,7 @@ impl Translator {
             globals_top: 16,
             link_mode: false,
             globals: HashMap::default(),
+            unsigned_globals: HashSet::default(),
             consts: HashMap::default(),
             ext_consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
@@ -800,6 +805,9 @@ impl Translator {
                         }
                     }
                     let sz = self.sizeof(&desc);
+                    if ty_is_unsigned(&a[2]) {
+                        self.unsigned_globals.insert(name.clone());
+                    }
                     self.globals.insert(name, (off, desc));
                     off += sz.max(8);
                 }
@@ -2912,7 +2920,7 @@ impl<'a> FuncGen<'a> {
         })?;
         let want = self.slots[i].1;
         let vid = if v.ty != want {
-            self.convert(v, want).id
+            self.convert(v, want, false).id
         } else {
             v.id
         };
@@ -2962,7 +2970,7 @@ impl<'a> FuncGen<'a> {
     fn write_local(&mut self, name: &str, v: Val) -> Result<(), LengError> {
         if let Some((off, TyDesc::Narrow { bytes, .. })) = self.mem.get(name).cloned() {
             let val = if v.ty != ValType::I32 {
-                self.convert(v, ValType::I32)
+                self.convert(v, ValType::I32, false)
             } else {
                 v
             };
@@ -2981,7 +2989,11 @@ impl<'a> FuncGen<'a> {
             .cloned()
             .and_then(|(off, d)| d.scalar_ty().map(|t| (off, t)))
         {
-            let val = if v.ty != ty { self.convert(v, ty) } else { v };
+            let val = if v.ty != ty {
+                self.convert(v, ty, false)
+            } else {
+                v
+            };
             let sp = self.cur[0];
             self.used_memory = true;
             self.cur_buf.push_str(&format!(
@@ -4016,7 +4028,7 @@ impl<'a> FuncGen<'a> {
         let disc32 = if disc.ty == ValType::I32 {
             disc
         } else {
-            self.convert(disc, ValType::I32)
+            self.convert(disc, ValType::I32, false)
         };
         let loc = self.emit_const(ValType::I32, lo);
         let nidx = self.fresh();
@@ -4105,7 +4117,7 @@ impl<'a> FuncGen<'a> {
                     .push_str(&format!("  v{id} = i64.ne v{} v{}\n", v.id, z.id));
                 id
             }
-            _ => self.convert(v, ValType::I32).id,
+            _ => self.convert(v, ValType::I32, false).id,
         }
     }
 
@@ -4216,16 +4228,18 @@ impl<'a> FuncGen<'a> {
                     // Value-preserving numeric conversion (int width, int↔float, f32↔f64).
                     let a = e.args();
                     let ty = val_ty(&a[0])?;
+                    let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
-                    Ok(self.convert(x, ty))
+                    Ok(self.convert(x, ty, u))
                 }
                 Some("cast") => {
                     // A C-style cast — for the scalar/pointer subset, a width reinterpretation
                     // (pointer↔pointer and same-width are no-ops; i32↔i64 extend/wrap).
                     let a = e.args();
                     let ty = val_ty(&a[0])?;
+                    let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
-                    Ok(self.convert(x, ty))
+                    Ok(self.convert(x, ty, u))
                 }
                 Some("par") => self.expr(&e.args()[0]),
                 // Literals: booleans are `i32` 0/1; `nil` is a null `i64` pointer.
@@ -4334,7 +4348,8 @@ impl<'a> FuncGen<'a> {
             self.expr(e)?
         };
         Ok(if v.ty != want {
-            self.convert(v, want)
+            let u = self.operand_unsigned(e);
+            self.convert(v, want, u)
         } else {
             v
         })
@@ -4500,7 +4515,7 @@ impl<'a> FuncGen<'a> {
     /// carried type node is `(u N)`.
     fn operand_unsigned(&self, node: &Node) -> bool {
         if let Some(sym) = node.as_atom() {
-            return self.unsigned.contains(sym);
+            return self.unsigned.contains(sym) || self.t.unsigned_globals.contains(sym);
         }
         match node.tag() {
             // `(suf <lit> "u32")` — a suffixed unsigned literal.
@@ -4688,7 +4703,7 @@ impl<'a> FuncGen<'a> {
             if ca.len() >= 2 {
                 if let Ok(TyDesc::FnPtr(sig)) = self.t.tydesc(&ca[0]) {
                     let v = self.expr(&ca[1])?;
-                    let idx = self.convert(v, ValType::I32);
+                    let idx = self.convert(v, ValType::I32, false);
                     return Ok(Some((idx.id, *sig)));
                 }
             }
@@ -4966,10 +4981,13 @@ impl<'a> FuncGen<'a> {
             let variadic = &args[fixed_end..];
             let buf = self.alloc_temp((variadic.len() as u64) * 8);
             for (i, arg) in variadic.iter().enumerate() {
+                let u = self.operand_unsigned(arg);
                 let v = self.expr(arg)?;
                 let (sty, sval) = match v.ty {
-                    ValType::F32 | ValType::F64 => (ValType::F64, self.convert(v, ValType::F64)),
-                    _ => (ValType::I64, self.convert(v, ValType::I64)),
+                    ValType::F32 | ValType::F64 => {
+                        (ValType::F64, self.convert(v, ValType::F64, false))
+                    }
+                    _ => (ValType::I64, self.convert(v, ValType::I64, u)),
                 };
                 let slot = self.add_const_off(buf, (i * 8) as u64);
                 self.cur_buf
@@ -5004,7 +5022,7 @@ impl<'a> FuncGen<'a> {
                 // result used in an `i64` context, say). A statement-position call (`ret` None)
                 // leaves the produced value unused.
                 match ret {
-                    Some(want) if want != rty => Ok(self.convert(v, want)),
+                    Some(want) if want != rty => Ok(self.convert(v, want, false)),
                     _ => Ok(v),
                 }
             }
@@ -5148,13 +5166,26 @@ impl<'a> FuncGen<'a> {
     }
 
     /// Scalar numeric conversion: integer widths, int↔float (signed trunc/convert), and f32↔f64.
-    fn convert(&mut self, v: Val, to: ValType) -> Val {
+    ///
+    /// `src_unsigned` is the **source**'s signedness, and matters for exactly one pair — widening
+    /// `i32` → `i64`, where it picks zero- over sign-extension (#1472). Narrowing and the float
+    /// conversions are signedness-free, so the call sites that only ever narrow, or that coerce a
+    /// value their producer already widened correctly, pass `false`. Callers with the source
+    /// *expression* in hand (`conv`/`cast`, `expr_typed`, varargs marshalling) pass
+    /// [`operand_unsigned`](Self::operand_unsigned) — the same predicate `compare` uses to choose
+    /// `lt_u`/`le_u`, for the same underlying reason.
+    fn convert(&mut self, v: Val, to: ValType, src_unsigned: bool) -> Val {
         use ValType::{F32, F64, I32, I64};
         if v.ty == to {
             return v;
         }
         let id = self.fresh();
         let insn = match (v.ty, to) {
+            // **Widening is the one case signedness decides** (#1472). A `(u 32)` with bit 31 set is
+            // `>= 2^31`; sign-extending it into 64 bits turns it negative, and every later operation
+            // inherits that. `src_unsigned` comes from [`operand_unsigned`] — the same predicate
+            // comparisons already use to pick `lt_u`/`le_u`, for the same reason.
+            (I32, I64) if src_unsigned => format!("i64.extend_i32_u v{}", v.id),
             (I32, I64) => format!("i64.extend_i32_s v{}", v.id),
             (I64, I32) => format!("i32.wrap_i64 v{}", v.id),
             // int → float (value-preserving, signed).

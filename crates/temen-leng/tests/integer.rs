@@ -244,3 +244,32 @@ fn overflow_keeping_arithmetic() {
     assert_eq!(run_i64(leng, 0, &[3, 4]), 7);
     assert_eq!(run_i64(leng, 0, &[100, 23]), 123);
 }
+
+/// **#1472 — widening an *unsigned* value must zero-extend, not sign-extend.** `uint32(0x81CEB32C)`
+/// has bit 31 set; `int(x)` / `uint64(x)` on it must give `2177807148`, not the sign-extended
+/// `-2117160148`. `convert` emitted `i64.extend_i32_s` unconditionally, so every `(u 32)` value with
+/// the high bit set was corrupted the moment it reached a 64-bit context.
+///
+/// That is why `$3.14` printed `17.966570549813729`: `system/formatfloat`'s Schubfach dtoa is built
+/// on `uint64(sfHi32(x)) * cp` and friends, so its whole digit generation ran on sign-extended
+/// garbage — while values whose shortest form comes out of the dtoa's special cases (`0.5`, `2.0`,
+/// `100.0`) stayed correct and hid it.
+#[test]
+fn unsigned_widening_zero_extends() {
+    // f(x: uint32): int = int(x)
+    let leng = "(stmts (proc :f.0 (params (param :x.0 . (u +32))) (i +64) .
+   (stmts . (ret (conv (i +64) x.0)))))";
+    assert_eq!(run_i64(leng, 0, &[0x81CEB32C]), 2177807148);
+    // A high-bit-clear value is unaffected either way — the case that always worked.
+    assert_eq!(run_i64(leng, 0, &[0x0001B32C]), 111404);
+}
+
+/// The signed twin: `(i 32)` must still sign-extend. `int32(-1)` is `-1` in a 64-bit context, not
+/// `4294967295` — the fix for [`unsigned_widening_zero_extends`] must not flip this.
+#[test]
+fn signed_widening_still_sign_extends() {
+    let leng = "(stmts (proc :f.0 (params (param :x.0 . (i +32))) (i +64) .
+   (stmts . (ret (conv (i +64) x.0)))))";
+    assert_eq!(run_i64(leng, 0, &[-1]), -1);
+    assert_eq!(run_i64(leng, 0, &[0x7FFFFFFF]), 2147483647);
+}
