@@ -325,3 +325,35 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     }));
     assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");
 }
+
+/// #1458: the restored table is **exactly** the captured set. An embedder that grants its powerbox
+/// fresh and then restores an artifact over it (a reactor thaw) must not resurrect a capability the
+/// guest had dropped before the freeze — the artifact does not carry it, so the slot comes back
+/// closed, and the guest's stale handle value stays dead.
+#[test]
+fn restore_closes_the_slots_the_capture_does_not_carry() {
+    let mut a = Host::new();
+    a.grant_clock();
+    let out = a.grant_stream(StreamRole::Out);
+    let exit = a.grant_exit();
+    a.close(exit); // the guest dropped it before the freeze
+    let captured = a.capture_durable_handles().unwrap();
+    assert_eq!(captured.len(), 2);
+
+    // The thawing embedder grants the same powerbox fresh — `exit` included, at the same slot.
+    let mut b = Host::new();
+    b.grant_clock();
+    assert_eq!(b.grant_stream(StreamRole::Out), out);
+    assert_eq!(b.grant_exit(), exit);
+    b.restore_durable_handles(&captured);
+    assert_eq!(
+        b.capture_durable_handles().unwrap(),
+        captured,
+        "the restored table carries what the artifact carries and nothing else"
+    );
+    assert!(
+        !b.handle_live(exit),
+        "the dropped capability is not resurrected by the fresh grant"
+    );
+    assert!(b.handle_live(out));
+}

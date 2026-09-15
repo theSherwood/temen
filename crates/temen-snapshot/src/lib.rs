@@ -41,9 +41,9 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    Attestation, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap,
-    FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host, NonDurableHandle, StreamRole,
-    SvcDispatch, SHADOW_BASE,
+    Attestation, CapturedProt, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit,
+    DurableNamedCap, FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
+    NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
 };
 use temen_ir::Module;
 
@@ -340,6 +340,31 @@ pub fn freeze(module: &Module, window: &[u8], host: &Host) -> Result<Vec<u8>, Fr
         reserved_log2,
         host,
     )
+}
+
+/// [`freeze_with_prots`] over the one window-image form ([`MemLayout`], the capture a reactor or
+/// the checkpoint ladder already holds): the image is its bytes, the protection map its
+/// [`dense_prots`](MemLayout::dense_prots) — so a caller never re-derives the codec's page map by
+/// hand. `reserved_log2` is the window's reservation, as for [`freeze_with_prots`].
+pub fn freeze_layout(
+    module: &Module,
+    layout: &MemLayout,
+    reserved_log2: u8,
+    host: &Host,
+) -> Result<Vec<u8>, FreezeError> {
+    let prots: Vec<PageProt> = layout
+        .dense_prots()
+        .into_iter()
+        .map(|p| match p {
+            CapturedProt::Rw => PageProt::Rw,
+            CapturedProt::Ro => PageProt::Ro,
+            CapturedProt::Unmapped => PageProt::Unmapped,
+            // A `MemLayout` carries no §13 alias by construction (`Mem::layout_snapshot_safe`,
+            // `MemLayout::from_parts`), so this arm is unreachable rather than a silent `Rw`.
+            CapturedProt::Backed => unreachable!("a MemLayout never carries a Backed page"),
+        })
+        .collect();
+    freeze_with_prots(module, layout.bytes(), &prots, reserved_log2, host)
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
@@ -694,6 +719,28 @@ fn write_jit(b: &mut Vec<u8>, table_log2: u8, jit: &[DurableJitTable]) {
 /// [`restore_with_prots`] when the window has `Ro`/`Unmapped` pages to re-establish.
 pub fn restore(artifact: &[u8], module: &Module, host: &mut Host) -> Result<Vec<u8>, RestoreError> {
     restore_with_prots(artifact, module, host).map(|(window, ..)| window)
+}
+
+/// [`restore_with_prots`] into the one window-image form: the restored image and page map as a
+/// [`MemLayout`] ready for a reactor's `restore_window`, plus the reservation the artifact recorded.
+/// The committed prefix is `module`'s declared memory — the window a fresh instance of `module`
+/// opens with, which the geometry check inside guarantees the image covers.
+pub fn restore_layout(
+    artifact: &[u8],
+    module: &Module,
+    host: &mut Host,
+) -> Result<(MemLayout, u8), RestoreError> {
+    let (bytes, prots, reserved_log2) = restore_with_prots(artifact, module, host)?;
+    let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+    let prots: Vec<CapturedProt> = prots
+        .iter()
+        .map(|p| match p {
+            PageProt::Rw => CapturedProt::Rw,
+            PageProt::Ro => CapturedProt::Ro,
+            PageProt::Unmapped => CapturedProt::Unmapped,
+        })
+        .collect();
+    Ok((MemLayout::from_dense(bytes, &prots, mapped), reserved_log2))
 }
 
 /// [`restore`] that also recovers the per-page protection map (§12.3) and the mask-domain

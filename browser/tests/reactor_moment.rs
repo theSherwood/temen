@@ -324,6 +324,27 @@ fn a_reactor_freezes_to_an_artifact_and_thaws_playing() {
     assert_eq!(expected, run_scripted(&mut again, 9, 7));
 }
 
+/// The Doom-shaped case, as a save-state: `life` keeps its grids in a **malloc heap above the mapped
+/// window**, so its state is in `vm_map`-grown reserved-tail pages. Those ride the artifact only if
+/// the codec's page map marks them committed — a thaw that brought them back unmapped would fault on
+/// the first tick.
+#[test]
+fn a_grown_heap_rides_the_artifact() {
+    let m = temen_encode::decode_module(LIFE).expect("decode life.temen");
+    let mut live = OnrampReactor::open(&m).expect("open");
+    let _ = run_scripted(&mut live, 0, 7);
+
+    let artifact = live.freeze(&m).expect("freeze a grown window");
+    let expected = run_scripted(&mut live, 7, 5);
+
+    let mut thawed = OnrampReactor::thaw(&artifact, &m, None).expect("thaw");
+    assert_eq!(
+        expected,
+        run_scripted(&mut thawed, 7, 5),
+        "the grown heap came back committed and the frames that follow are the same"
+    );
+}
+
 /// The `fs` capability's cursors ride the artifact, through the capability's own declared state
 /// (#1455). This is the case a window-only save-state gets wrong: the guest's memory comes back but
 /// its open file is at whatever offset a freshly-granted server starts at.
@@ -387,7 +408,9 @@ fn a_save_state_refuses_a_different_module() {
 
 /// A thawed reactor is itself freezable — the state hooks are re-declared after the thaw re-grants the
 /// handlers, so a save-state can be taken, loaded, and taken again rather than degrading after one
-/// round trip.
+/// round trip. The second freeze is taken with input queued but undrained, so a thaw that had lost
+/// the hooks (an empty state riding the second artifact) is observable: the queued press steers the
+/// live reactor and not the twice-thawed one.
 #[test]
 fn a_thawed_reactor_can_be_frozen_again() {
     let m = temen_encode::decode_module(BOUNCE).expect("decode bounce.temen");
@@ -397,6 +420,7 @@ fn a_thawed_reactor_can_be_frozen_again() {
 
     let mut thawed = OnrampReactor::thaw(&first, &m, None).expect("thaw");
     let expected = run_scripted(&mut thawed, 5, 4);
+    thawed.push_key(LEFT, 1); // queued, not yet polled — rides the second artifact only via the hooks
     let second = thawed.freeze(&m).expect("a thawed reactor freezes again");
 
     let mut twice = OnrampReactor::thaw(&second, &m, None).expect("thaw the second artifact");

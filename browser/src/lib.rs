@@ -3144,6 +3144,45 @@ impl OnrampCaps {
                     Ok(vec![q.lock().unwrap().pop_front().unwrap_or(-1)])
                 }))
             }
+            // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via
+            // the `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0)
+            // and asks the host to present a frame each tick (op 1); the parallel pixel work runs on
+            // the GPU and only tiny scalars + the shader source cross the boundary — the guest never
+            // holds a GPU pointer (§2a). Only granted in the wasm build (native has no GPU import); a
+            // guest resolves `-1` and skips elsewhere. Stateless — nothing to declare — but it lives
+            // here with the rest so a thaw's registrar can re-grant it: a browser artifact names it.
+            #[cfg(target_arch = "wasm32")]
+            "webgpu" => Some(Box::new(
+                move |op, args: &[i64], mem: Option<&mut dyn temen_interp::GuestMem>, _| {
+                    match op {
+                        // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
+                        0 => {
+                            let ptr = args.first().copied().unwrap_or(0);
+                            let len = args.get(1).copied().unwrap_or(0);
+                            if !(0..=1 << 20).contains(&len) {
+                                return Ok(vec![-1]);
+                            }
+                            let Some(wgsl) = mem.and_then(|m| m.read_bytes(ptr as u64, len as u64))
+                            else {
+                                return Ok(vec![-1]);
+                            };
+                            // SAFETY: wasm-only import; `wgsl` outlives the synchronous call.
+                            let r =
+                                unsafe { webgpu::webgpu_op(0, 0, 0, 0, wgsl.as_ptr(), wgsl.len()) };
+                            Ok(vec![r])
+                        }
+                        // present(frame, w, h) → 0
+                        1 => {
+                            let a = args.first().copied().unwrap_or(0);
+                            let b = args.get(1).copied().unwrap_or(0);
+                            let c = args.get(2).copied().unwrap_or(0);
+                            let r = unsafe { webgpu::webgpu_op(1, a, b, c, core::ptr::null(), 0) };
+                            Ok(vec![r])
+                        }
+                        _ => Ok(vec![-1]),
+                    }
+                },
+            )),
             // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). The op protocol
             // mirrors the native `doom_diff` differential's in-memory WAD server (and the reused
             // `lua_files_stdio.c` FILE shim): 0 open(nameptr,namelen,flags)→fd|-2(ENOENT),
@@ -3314,51 +3353,6 @@ fn decode_events(bytes: &[u8]) -> Vec<i64> {
         .collect()
 }
 
-/// The §12 codec's **dense** per-page protection map, from a window layout's sparse one: one entry per
-/// codec page (a fixed 4 KiB), defaulting to `Rw`.
-///
-/// The layout's own page may be coarser than the codec's — a native host with 16 KiB pages, say — so
-/// each entry is expanded across **every** codec page it covers. Marking only the first would leave the
-/// rest of a protected host page writable on restore.
-fn dense_prots(layout: &temen_interp::MemLayout) -> Vec<temen_snapshot::PageProt> {
-    let npages = layout.byte_len() / temen_snapshot::PAGE;
-    let mut dense = vec![temen_snapshot::PageProt::Rw; npages];
-    let span = (layout.page_size() as usize)
-        .div_ceil(temen_snapshot::PAGE)
-        .max(1);
-    for (off, kind) in layout.prot_entries() {
-        let first = off as usize / temen_snapshot::PAGE;
-        let prot = match kind {
-            0 => temen_snapshot::PageProt::Ro,
-            2 => temen_snapshot::PageProt::Unmapped,
-            _ => temen_snapshot::PageProt::Rw, // 1 = Rw (3 = Backed never captured)
-        };
-        let last = (first + span).min(npages);
-        if first < last {
-            dense[first..last].fill(prot);
-        }
-    }
-    dense
-}
-
-/// The inverse: the codec's dense map back into the `map_info` `(byte_offset, kind)` entries
-/// [`temen_interp::MemLayout::from_parts`] takes. Only deviations from the `Rw` default are carried —
-/// the layout's own sparse form.
-fn prot_entries(dense: &[temen_snapshot::PageProt]) -> Vec<(u64, u8)> {
-    dense
-        .iter()
-        .enumerate()
-        .filter_map(|(i, p)| {
-            let kind = match p {
-                temen_snapshot::PageProt::Rw => return None, // the region default
-                temen_snapshot::PageProt::Ro => 0u8,
-                temen_snapshot::PageProt::Unmapped => 2,
-            };
-            Some(((i * temen_snapshot::PAGE) as u64, kind))
-        })
-        .collect()
-}
-
 /// Image a reactor window that is a bare [`Region`](temen_interp::Region) rather than a live engine
 /// window — the wasm-JIT reactor, whose window lives in the host's linear memory and is handed to
 /// emitted code directly. There is no page map to carry: that reactor runs its cross-tier bounces over
@@ -3369,7 +3363,8 @@ fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout>
     back.raw_base()?; // the tier's own precondition, restated: a window emitted code can address
     let mut bytes = vec![0u8; back.len() as usize];
     back.read_into(0, &mut bytes);
-    temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), &[])
+    let mapped = bytes.len() as u64; // a bare region is committed end to end
+    temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), mapped, &[])
 }
 
 /// The capability-side half of a [`ReactorMoment`]: each host capability's own declared state,
@@ -3513,45 +3508,8 @@ fn grant_onramp_caps(
     // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
     // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
     let caps = OnrampCaps::new(fs);
-    for name in ["display", "keyboard", "mouse"] {
+    for name in ["display", "keyboard", "mouse", "webgpu"] {
         caps.grant(host, name);
-    }
-    // `webgpu` — a GPU render surface, serviced (in the browser) against `navigator.gpu` via the
-    // `webgpu_op` host import (`src/webgpu.rs`). The guest ships a WGSL shader once (op 0) and asks the
-    // host to present a frame each tick (op 1); the parallel pixel work runs on the GPU and only tiny
-    // scalars + the shader source cross the boundary — the guest never holds a GPU pointer (§2a). Only
-    // granted in the wasm build (native has no GPU import); a guest resolves `-1` and skips elsewhere.
-    // Stateless and wasm-only, so it stays here rather than in the shared factory.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
-            match op {
-                // set_shader(wgsl_ptr, wgsl_len) → 0 (compiled) / -1 (bad ptr or compile error)
-                0 => {
-                    let ptr = args.first().copied().unwrap_or(0);
-                    let len = args.get(1).copied().unwrap_or(0);
-                    if !(0..=1 << 20).contains(&len) {
-                        return Ok(vec![-1]);
-                    }
-                    let Some(wgsl) = mem.and_then(|m| m.read_bytes(ptr as u64, len as u64)) else {
-                        return Ok(vec![-1]);
-                    };
-                    // SAFETY: wasm-only import; `wgsl` outlives the synchronous call.
-                    let r = unsafe { webgpu::webgpu_op(0, 0, 0, 0, wgsl.as_ptr(), wgsl.len()) };
-                    Ok(vec![r])
-                }
-                // present(frame, w, h) → 0
-                1 => {
-                    let a = args.first().copied().unwrap_or(0);
-                    let b = args.get(1).copied().unwrap_or(0);
-                    let c = args.get(2).copied().unwrap_or(0);
-                    let r = unsafe { webgpu::webgpu_op(1, a, b, c, core::ptr::null(), 0) };
-                    Ok(vec![r])
-                }
-                _ => Ok(vec![-1]),
-            }
-        }));
-        host.register_cap_name("webgpu", handle);
     }
     // `fs` — a read-only in-memory file (Doom slice 4: the WAD read path). Granted only when the host
     // supplies one file; a guest that resolves no `fs` cap (bounce/life) is unaffected.
@@ -5808,8 +5766,7 @@ impl OnrampReactor {
             .window_layout()
             .ok_or(temen_snapshot::FreezeError::WindowGeometry(0))?;
         let reserved_log2 = self.inst.window_reserved_log2().unwrap_or(0);
-        let prots = dense_prots(&layout);
-        temen_snapshot::freeze_with_prots(module, layout.bytes(), &prots, reserved_log2, &self.host)
+        temen_snapshot::freeze_layout(module, &layout, reserved_log2, &self.host)
     }
 
     /// Rebuild a reactor from a [`freeze`](Self::freeze) artifact: the guest resumes at the frame it
@@ -5830,13 +5787,11 @@ impl OnrampReactor {
         let tick = m.resolve_export("tick").ok_or(STATUS_UNSUPPORTED)?;
         let entry_sp = temen_ir::powerbox_entry_sp(m);
 
-        // A fresh host carrying only what is *not* in the artifact: the module's own self-referential
-        // surface and its import bindings. Every capability comes back through the registrar below,
-        // re-pinned at the slot and generation the guest still holds.
         // The one grant path, exactly as a fresh open takes it: the module's self-referential surface,
-        // its import bindings, the §3e prefix, and the capabilities. The artifact then re-pins that
-        // same table over the top — same grants in the same order, so the same slots and generations,
-        // which is what keeps a guest-held handle value valid across the save.
+        // its import bindings, the §3e prefix, and the capabilities. The artifact then replaces that
+        // table with its own — same grants in the same order, so the same slots and generations,
+        // which is what keeps a guest-held handle value valid across the save; a capability the guest
+        // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
         let caps = grant_onramp_caps(&mut host, m, fs);
         let registrar = caps.clone();
@@ -5846,7 +5801,7 @@ impl OnrampReactor {
             Some(handler)
         }));
 
-        let (bytes, prots, _reserved) = temen_snapshot::restore_with_prots(artifact, m, &mut host)
+        let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
             .map_err(|_| STATUS_UNSUPPORTED)?;
         // The registrar re-granted the handlers but not their state *hooks* — re-declare them, or this
         // reactor could never be frozen again.
@@ -5857,12 +5812,6 @@ impl OnrampReactor {
         }
 
         let mut inst = bytecode::Reactor::open(m).ok_or(STATUS_UNSUPPORTED)?;
-        let layout = temen_interp::MemLayout::from_parts(
-            bytes,
-            temen_snapshot::PAGE as u64,
-            &prot_entries(&prots),
-        )
-        .ok_or(STATUS_UNSUPPORTED)?;
         if !inst.restore_window(&layout) {
             return Err(STATUS_UNSUPPORTED);
         }

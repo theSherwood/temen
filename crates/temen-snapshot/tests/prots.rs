@@ -4,7 +4,10 @@
 
 use temen_interp::{Host, StreamRole};
 use temen_ir::{Memory, Module};
-use temen_snapshot::{freeze, freeze_with_prots, restore_with_prots, FreezeError, PageProt};
+use temen_snapshot::{
+    freeze, freeze_layout, freeze_with_prots, restore_layout, restore_with_prots, FreezeError,
+    PageProt,
+};
 
 const SIZE_LOG2: u8 = 17; // 128 KiB
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -193,4 +196,51 @@ fn flat_freeze_equals_an_all_rw_prot_map() {
         freeze(&m, &window, &host).expect("flat"),
         freeze_with_prots(&m, &window, &all_rw, SIZE_LOG2, &host).expect("explicit"),
     );
+}
+
+/// #1458: the window-image form round-trips through the codec **as itself**. A reactor's capture is
+/// a `MemLayout` — a grown high-water with uncommitted holes under it, in the capturing host's page
+/// unit — and `freeze_layout`/`restore_layout` carry it without the caller re-deriving the codec's
+/// dense map: a hole below the high-water comes back a hole, a grown page comes back committed.
+#[test]
+fn a_window_layout_round_trips_with_a_hole_under_the_high_water() {
+    use temen_interp::{CapturedProt, MemLayout};
+    let m = module();
+    let host = host_with_durable_handles();
+
+    // 192 KiB image over the 128 KiB declared window: page 5 `Ro`; above the window, page 40 and
+    // page 47 `vm_map`-grown (the high-water) with holes around them.
+    let mut bytes = vec![0u8; 48 * PAGE];
+    bytes[40 * PAGE] = 0x42;
+    let layout = MemLayout::from_parts(
+        bytes,
+        PAGE as u64,
+        WINDOW as u64,
+        &[
+            (5 * PAGE as u64, 0),
+            (40 * PAGE as u64, 1),
+            (47 * PAGE as u64, 1),
+        ],
+    )
+    .expect("a valid page list");
+    let mut want = vec![CapturedProt::Rw; 48];
+    want[5] = CapturedProt::Ro;
+    want[32..40].fill(CapturedProt::Unmapped);
+    want[41..47].fill(CapturedProt::Unmapped);
+    assert_eq!(
+        layout.dense_prots(),
+        want,
+        "absent above the window is a hole"
+    );
+
+    let art = freeze_layout(&m, &layout, RESERVED_LOG2, &host).expect("freeze the layout");
+    let mut rhost = Host::new();
+    let (restored, reserved) = restore_layout(&art, &m, &mut rhost).expect("restore the layout");
+    assert_eq!(reserved, RESERVED_LOG2);
+    assert_eq!(
+        restored.dense_prots(),
+        want,
+        "the page map survives, holes included"
+    );
+    assert_eq!(restored.bytes(), layout.bytes(), "the image survives");
 }
