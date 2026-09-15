@@ -80,6 +80,21 @@ float tanhf(float x);
 float asinhf(float x);
 float acoshf(float x);
 float atanhf(float x);
+float sqrtf(float x);
+float expf(float x);
+float logf(float x);
+float log10f(float x);
+float log2f(float x);
+float cbrtf(float x);
+float floorf(float x);
+float ceilf(float x);
+float roundf(float x);
+float truncf(float x);
+float powf(float x, float y);
+float fmodf(float x, float y);
+float hypotf(float x, float y);
+float atan2f(float y, float x);
+float copysignf(float x, float y);
 #endif /* __PG_LIBC_DECLS_ONLY */
 
 // ---- bodies -----------------------------------------------------------------------------

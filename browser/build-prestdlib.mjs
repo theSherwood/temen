@@ -45,8 +45,21 @@ const captured = await page.evaluate(async () => {
   const [stdlib, nifler, niflerCe, nimsemCe, hexerCe] = await Promise.all([
     fetchGz('./assets/nim_stdlib.img.gz'), fetchGz('./assets/nifler.temen.gz'),
     fetchGz('./assets/nifler_ce.temen.gz'), fetchGz('./assets/nimsem_ce.temen.gz'), fetchGz('./assets/hexer_ce.temen.gz')]);
-  // A tiny program that pulls in the common stdlib closure (system is implicit; syncio for write/stdout).
-  const src = new TextEncoder().encode('import std/syncio\n\nwrite(stdout, "hi\\n")\n');
+  // A program that pulls in the **common stdlib closure**, so a Run only ever compiles the user's own
+  // modules. `system` is implicit and `syncio` gives write/stdout; the rest are the modules a
+  // playground program actually reaches for, and each one not in here costs its full
+  // crawl+nimsem+hexer on EVERY Run (measured on the shipped card: hello 5.8 s when fully packed, vs
+  // strutils 21.4 s / math 21.6 s / a five-import program 31.0 s when not). Only modules that both
+  // compile and *run* are worth packing — see `temen-leng`'s `runnability_sweep` for that list (#1422).
+  //
+  // Imports alone are enough: the capture keeps every module the closure produces except the `Main`
+  // role, so nothing here needs to be referenced to be packed.
+  const PACK_MODULES = [
+    'syncio', 'strutils', 'sequtils', 'tables', 'sets', 'hashes', 'algorithm',
+    'math', 'options', 'deques', 'parseutils', 'bitops', 'intsets',
+  ];
+  const src = new TextEncoder().encode(
+    PACK_MODULES.map((m) => `import std/${m}\n`).join('') + '\nwrite(stdout, "hi\\n")\n');
   // Wire-coupling key over the inputs that determine the artifacts — the worker recomputes it and ignores
   // a pack whose key doesn't match its loaded assets (a stale pack is skipped, never silently misused).
   const prestdlibKey = (bufs) => {
@@ -60,7 +73,11 @@ const captured = await page.evaluate(async () => {
     }
     return h >>> 0;
   };
-  const key = prestdlibKey([stdlib, niflerCe, nimsemCe, hexerCe]);
+  // `nifler` (the TOP-LEVEL one) belongs in this key: since #1364 moved the import crawl onto it, it is
+  // the phase that produces the `.p.nif`/`.p.deps.nif` this pack ships. It was missing, so rebuilding
+  // that asset left the committed pack claiming a coherence it no longer had — the same shape of bug
+  // that let a stale nifler ship for nine days.
+  const key = prestdlibKey([stdlib, nifler, niflerCe, nimsemCe, hexerCe]);
   const eng = await par.loadEngine();
   const info = await jitNimWholeCardOp13(eng.ex, eng.memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, '/prog.nim', src, 'prestdlib-build');
   if (info.error) return { error: info.error };

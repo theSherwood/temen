@@ -193,5 +193,23 @@ __PG_FN float tanhf(float x) { return (float)tanh((double)x); }
 __PG_FN float asinhf(float x) { return (float)asinh((double)x); }
 __PG_FN float acoshf(float x) { return (float)acosh((double)x); }
 __PG_FN float atanhf(float x) { return (float)atanh((double)x); }
+// Powers, roots, logs and rounding — the same narrowing, for the half of `std/math` that is not
+// trigonometry. These were the gap behind `$sqrt(4.0)` trapping in the playground: nim imports the
+// `…f` spelling whenever `std/math` is imported, so a missing one is an unbound leaf.
+__PG_FN float sqrtf(float x) { return (float)sqrt((double)x); }
+__PG_FN float expf(float x) { return (float)exp((double)x); }
+__PG_FN float logf(float x) { return (float)log((double)x); }
+__PG_FN float log10f(float x) { return (float)log10((double)x); }
+__PG_FN float log2f(float x) { return (float)log2((double)x); }
+__PG_FN float cbrtf(float x) { return (float)cbrt((double)x); }
+__PG_FN float floorf(float x) { return (float)floor((double)x); }
+__PG_FN float ceilf(float x) { return (float)ceil((double)x); }
+__PG_FN float roundf(float x) { return (float)round((double)x); }
+__PG_FN float truncf(float x) { return (float)trunc((double)x); }
+__PG_FN float powf(float x, float y) { return (float)pow((double)x, (double)y); }
+__PG_FN float fmodf(float x, float y) { return (float)fmod((double)x, (double)y); }
+__PG_FN float hypotf(float x, float y) { return (float)hypot((double)x, (double)y); }
+__PG_FN float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
+__PG_FN float copysignf(float x, float y) { return (float)copysign((double)x, (double)y); }
 
 #endif

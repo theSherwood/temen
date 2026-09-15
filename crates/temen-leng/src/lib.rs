@@ -809,11 +809,78 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
 /// shim. This table is the single authority: it decides both what is frame-marked and what is bound,
 /// so the two can never disagree (a name the libc turns out not to export is simply left unbound).
 const LIBC_SERVED: &[&str] = &[
-    "snprintf", "strtod",
-    // libm, float64 and the float32 (`…f`) overloads nim declares alongside them.
-    "sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-    "sinf", "cosf", "tanf", "asinf", "acosf", "atanf", "sinhf", "coshf", "tanhf", "asinhf",
-    "acoshf", "atanhf",
+    "snprintf",
+    "strtod",
+    // **libm.** This list must match what `browser/playground-include/__pg_math_impl.h` actually
+    // defines — a name missing here is not a compile error, it is a leaf left unbound at link, and the
+    // program traps at *run* with nothing to say. That is how `$sqrt(4.0)` shipped broken: the first
+    // version of this table held only the trigonometric family, because the test written alongside it
+    // happened to call only those. Anything added to the guest libc belongs here in the same commit.
+    //
+    // Powers, roots, logs, rounding — the half of `std/math` a program actually reaches for.
+    "sqrt",
+    "exp",
+    "pow",
+    "log",
+    "log10",
+    "log2",
+    "cbrt",
+    "hypot",
+    "fmod",
+    "floor",
+    "ceil",
+    "round",
+    "trunc",
+    "fabs",
+    "fmax",
+    "fmin",
+    "copysign",
+    "frexp",
+    "ldexp",
+    "modf",
+    // Trigonometric and hyperbolic, float64.
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "sinh",
+    "cosh",
+    "tanh",
+    "asinh",
+    "acosh",
+    "atanh",
+    // The float32 (`…f`) overloads nim declares alongside each of the above.
+    "sqrtf",
+    "expf",
+    "powf",
+    "logf",
+    "log10f",
+    "log2f",
+    "cbrtf",
+    "hypotf",
+    "fmodf",
+    "floorf",
+    "ceilf",
+    "roundf",
+    "truncf",
+    "fabsf",
+    "copysignf",
+    "atan2f",
+    "sinf",
+    "cosf",
+    "tanf",
+    "asinf",
+    "acosf",
+    "atanf",
+    "sinhf",
+    "coshf",
+    "tanhf",
+    "asinhf",
+    "acoshf",
+    "atanhf",
 ];
 
 /// True if the prebuilt guest libc serves the bottom-edge leaf whose `importc` C name is `c_name`.

@@ -284,7 +284,9 @@ self.onmessage = async (e) => {
       preStdlib = null;
       const parsed = msg.preStdlib && msg.preStdlib.length ? parsePrestdlib(msg.preStdlib) : null;
       if (parsed) {
-        const want = prestdlibKey([nimAssets.stdlib, nimAssets.niflerCe, nimAssets.nimsemCe, nimAssets.hexerCe]);
+        // `nifler` included (#1364): the crawl runs on the top-level nifler, so it determines the
+        // `.p.nif` products in the pack. Must match `build-prestdlib.mjs`'s input list exactly.
+        const want = prestdlibKey([nimAssets.stdlib, nimAssets.nifler, nimAssets.niflerCe, nimAssets.nimsemCe, nimAssets.hexerCe]);
         if (parsed.key === want) preStdlib = parsed.mods;
       }
       self.postMessage({ type: 'reply', id: msg.id, ok: true });
