@@ -48,3 +48,23 @@ temen-leng = { path = "../temen-leng", default-features = false }
 [[bin]]
 name = "temen-llvm-translate"
 path = "src/bin/translate.rs"
+
+# CI wall clock: this crate's suite is the longest job in the tree, and it is **test-execution**
+# bound, not compile bound — ~30 min of the ~32 min `cargo test` is guests *running* (the
+# `rust_driver_*` drivers put real nimsem/hexer through the tree-walker; the `lua_*` battery puts
+# the Lua VM through it). All of that work happens inside the path dependencies, so building them
+# unoptimized is paying a ~7x interpreter tax on every test. Measured on `tests/lua_math.rs`:
+# 60.4s -> 8.6s for +77s of one-time dependency compile (which `Swatinem/rust-cache` then keeps).
+#
+# `"*"` is dependencies only — never the crate being built — so the edit-compile loop on
+# `temen-llvm` itself is untouched. `debug-assertions` and overflow checks are *not* affected by
+# `opt-level`: they stay on, so every assert the §9 oracle relies on still fires. Whole-suite
+# check after the change: 99/99 green, in-test time 29.6 min -> 8.6 min (the latter measured on a
+# box slower than the CI runner).
+#
+# NOT yet applied to the ROOT workspace, where the same win is waiting on #1466: there
+# the engines are workspace *members*, so it needs `[profile.dev]` (the `"*"` glob excludes members
+# by design), and building `temen-jit` optimized makes `fiber_fuzz`'s cross-thread migration test
+# fail deterministically — a latent TLS-caching bug the unoptimized build has been hiding.
+[profile.dev.package."*"]
+opt-level = 2

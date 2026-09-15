@@ -92,3 +92,12 @@ panic = "abort"
 # The native wasm-JIT reactor differential (`tests/jit_reactor.rs`) runs the emitted `tick` on `wasmi`
 # (playing the browser's JS host) against the interpreter reactor oracle. Matches temen-wasmjit's dev-dep.
 wasmi = { version = "0.47", features = ["simd"] }
+
+# Same rule as `crates/temen-llvm` (see that manifest for the measurement): this crate's host-side
+# Rust gates — `browser-host-guests`, `browser-jit-host-gates` and the `gencorpus` run inside
+# `real-browser` — all *execute* guests through the engines, and the engines are path dependencies
+# here, so the `"*"` glob reaches them. The wasm artifact itself is built `--release` and is
+# unaffected either way. `debug-assertions` and overflow checks are independent of `opt-level` and
+# stay on.
+[profile.dev.package."*"]
+opt-level = 2
