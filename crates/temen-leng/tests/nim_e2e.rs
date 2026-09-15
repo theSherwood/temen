@@ -1475,3 +1475,38 @@ const STD_MODULES: &[&str] = &[
     "lists",
     "packedsets",
 ];
+
+/// **#1375 — the rest of `std/math` runs, not just the trigonometric family.** `LIBC_SERVED` first
+/// listed only sin/cos/tan and their relatives, because the test written beside it
+/// ([`real_math_transcendentals_run`]) called only those. Everything else — `sqrt`, `pow`, `exp`, the
+/// logs, the rounding family, `hypot`, `arctan2`, `cbrt` — was left unbound at link, so a program
+/// calling them compiled fine and then **trapped at run**, in the playground included.
+///
+/// A name missing from `LIBC_SERVED` is not a compile error, so only a test that actually *calls*
+/// each function can catch it. Values go through `formatFloat` rather than `$`: `$` on a non-integral
+/// float is itself broken (`$3.14` prints `17.966570549813729`, on `main` and well before this work
+/// — filed separately), and this test is about libm, not about the formatter.
+#[test]
+fn real_math_powers_roots_and_rounding_run() {
+    let src = concat!(
+        "import std/syncio\n",
+        "import std/strutils\n",
+        "import std/math\n",
+        "\n",
+        "proc f(x: float): string = formatFloat(x, ffDecimal, 6)\n",
+        "\n",
+        "write(stdout, f(sqrt(2.0)) & \"|\" & f(pow(2.0, 10.0)) & \"|\" & f(exp(1.0)) & \"|\" &\n",
+        "              f(ln(100.0)) & \"|\" & f(log10(100.0)) & \"|\" & f(log2(8.0)) & \"|\" &\n",
+        "              f(floor(1.7)) & \"|\" & f(ceil(1.2)) & \"|\" & f(hypot(3.0, 4.0)) & \"|\" &\n",
+        "              f(arctan2(1.0, 1.0)) & \"|\" & f(cbrt(27.0)))\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_math_powers_roots_and_rounding_run (no toolchain / libc asset)");
+        return;
+    };
+    // `nimony c --run` prints exactly this.
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "1.414214|1024.000000|2.718282|4.605170|2.000000|3.000000|1.000000|2.000000|5.000000|0.785398|3.000000"
+    );
+}
