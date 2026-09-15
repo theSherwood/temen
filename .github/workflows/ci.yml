@@ -458,12 +458,25 @@ jobs:
         # so the peval probe can feed default-`rustc` IR straight to `llvm-link`/`opt` (no second
         # rustc toolchain); `ci_tool_canary` asserts the two agree.
         run: bash scripts/ci/install-llvm.sh
+      # This job's cost is test *execution*, not compilation — 8.7 min of it against 2.0 min of
+      # fmt+clippy+compile — and `cargo test` runs the 99 integration-test binaries one at a time, so
+      # three of the runner's four cores sat idle for most of it. See the script for the pin and the
+      # numbers.
+      - name: install cargo-nextest
+        timeout-minutes: 5
+        run: bash scripts/ci/install-nextest.sh
       - name: fmt · clippy · test
         working-directory: crates/temen-llvm
         run: |
           cargo fmt --all --check
           cargo clippy --all-targets -- -D warnings
-          cargo test
+          # One pool across every binary: measured 8.7 min -> ~3.8 min for the identical set
+          # (562 passed / 27 skipped either way). `--test-threads` is left at the default (one per
+          # core); 6 and 8 measured within noise of it, so there is nothing to tune yet.
+          cargo nextest run
+          # nextest does not run doctests. This crate has none, so the line costs nothing today —
+          # it is here so that adding one later starts running it instead of silently not.
+          cargo test --doc
 
   std-guest:
     name: rust-temen std lane (build-std · lean + threads · nightly)
