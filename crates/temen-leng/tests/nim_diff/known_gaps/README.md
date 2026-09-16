@@ -8,4 +8,4 @@ close the issue its header names.
 Every file starts with a `# KNOWN GAP — …` comment naming the issue. The directory is the whole
 expectation mechanism — there is no per-case list to keep in sync.
 
-This README only exists so the (currently empty) directory survives a checkout.
+Currently open: `subword_unsigned.nim` / `subword_signed.nim` (#1488).

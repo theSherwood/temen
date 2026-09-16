@@ -12,8 +12,11 @@ Rules for a case:
 - **Deterministic.** No clock, no addresses, no PRNG without a fixed seed, no iteration order nim does
   not itself pin. The whole value of the suite is that a diff means a real defect.
 - **Inside nimony's subset.** It is a strict subset of Nim: no `echo`, `$seq`, `toHex`; `[]` on a seq,
-  `hasKey` and `parseInt` are `.raises` and need a `try`/`except`. If the driver reports "does not run
-  under native nimony", the program is wrong, not Temen.
+  `hasKey` and `parseInt` are `.raises` and need a `try`/`except`. `ref` is **non-nullable** — nimony
+  rejects both `let c = Cell(next: nil)` ("expected non-nil value") and an uninitialized `var head:
+  Cell` ("cannot prove that head.0 has been initialized"), so a nil-terminated linked list is not
+  expressible and is not a Temen gap. If the driver reports "does not run under native nimony", the
+  program is wrong, not Temen.
 - **Print something.** A case that prints nothing compares nothing.
 - **Narrow.** One construct family per file, so a diff points at a cause.
 
