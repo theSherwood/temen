@@ -709,27 +709,49 @@ const POWERBOX_COMPUTE_SHIM: &str = include_str!("powerbox_compute_shim.temt.txt
 /// The compute-shim func index serving each pure-compute leaf (longest-prefix match — so
 /// `atomicCompareExchangeN` isn't shadowed by a shorter atomic). The func order is
 /// [`POWERBOX_COMPUTE_SHIM`]'s.
-const COMPUTE_LEAVES: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
+/// A pure-compute leaf binding: the symbol's **name prefix**, the signature it must match, and the
+/// [`POWERBOX_COMPUTE_SHIM`] func index serving it.
+///
+/// Most leaves are a unique C symbol, so [`ANY`] matches them on name alone (longest prefix wins —
+/// `atomicCompareExchangeN` isn't shadowed by a shorter atomic). The generic `builtin*` atomics
+/// (#1499) instead pin an exact signature, because one name covers several monomorphized widths.
+type ComputeLeaf = (&'static str, Option<ComputeSig>, u32);
+
+/// `(params, results)` a signature-qualified leaf must match exactly.
+type ComputeSig = (&'static [ValType], &'static [ValType]);
+
+/// Match on the name alone — the signature is not consulted.
+const ANY: Option<ComputeSig> = None;
+
+const I32: ValType = ValType::I32;
+const I64: ValType = ValType::I64;
+
+/// Pin a leaf to one exact signature (const-fn so the table stays a `const`).
+const fn sig(params: &'static [ValType], results: &'static [ValType]) -> Option<ComputeSig> {
+    Some((params, results))
+}
+
+const COMPUTE_LEAVES: &[ComputeLeaf] = &[
+    ("cExitSys", ANY, 0),
+    ("cGetpid", ANY, 1),
+    ("cKill", ANY, 2),
+    ("c_memcpy", ANY, 3),
+    ("c_memcmp", ANY, 4),
+    ("c_memset", ANY, 5),
+    ("mmap", ANY, 6),
+    ("atomicLoadN", ANY, 7),
+    ("atomicStoreN", ANY, 8),
+    ("atomicCompareExchangeN", ANY, 9),
+    ("atomicExchangeN", ANY, 10),
+    ("atomicAddFetch", ANY, 11),
+    ("atomicSubFetch", ANY, 12),
+    ("bswap64", ANY, 13),
+    ("ctz64", ANY, 14),
+    ("clz64", ANY, 15),
+    ("cWriteErr", ANY, 16),
+    ("dlopen", ANY, 17),
+    ("dlclose", ANY, 18),
+    ("dlsym", ANY, 19),
     // **POSIX leaves nim's `std/posix` declares** (pulled in by `std/times`/`std/monotimes`). A
     // sandboxed program is granted no ambient filesystem, process table, or clock, so these are
     // fail-closed stubs rather than real syscalls: `open`/`getdents64`/`wait4`/`execve` report
@@ -737,12 +759,12 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     // succeeds — a deterministic epoch, so a `times` program runs and reads a well-defined time
     // instead of being handed ambient authority (#1422). Granting a real clock is a capability
     // decision for the host, not a default of the nim bottom edge.
-    ("open", 20),
-    ("close", 21),
-    ("getdents64", 22),
-    ("wait4", 23),
-    ("execve", 24),
-    ("clock_gettime", 25),
+    ("open", ANY, 20),
+    ("close", ANY, 21),
+    ("getdents64", ANY, 22),
+    ("wait4", ANY, 23),
+    ("execve", ANY, 24),
+    ("clock_gettime", ANY, 25),
     // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
     // `memfiles`/`osproc`/`terminal`/`rawthreads` declare (#1422). Same posture as the six above and
     // for the same reason: a playground guest is granted no ambient filesystem, environment, process
@@ -756,39 +778,39 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     // A program that genuinely touches the filesystem gets nim's ordinary error path (an `OSError`,
     // an empty result) instead of a link failure. Serving any of these for real is a capability the
     // host grants, not a default of the nim bottom edge.
-    ("stat", 26),
-    ("lstat", 27),
-    ("fstat", 28),
-    ("mkdir", 29),
-    ("rmdir", 30),
-    ("unlink", 31),
-    ("chdir", 32),
-    ("getcwd", 33),
-    ("readlink", 34),
-    ("ftruncate", 35),
-    ("munmap", 36),
-    ("c_rename", 37),
-    ("c_getenv", 38),
-    ("c_setenv", 39),
-    ("c_unsetenv", 40),
-    ("fork", 41),
-    ("exitnow", 42),
-    ("pipe", 43),
-    ("dup2", 44),
-    ("setpgid", 45),
-    ("kill", 46),
-    ("nanosleep", 47),
-    ("sysconf", 48),
-    ("nativeIoctl", 49),
-    ("pthread_attr_init", 50),
-    ("pthread_attr_setstacksize", 51),
-    ("pthread_attr_destroy", 52),
-    ("pthread_create", 53),
-    ("pthread_join", 54),
-    ("cpusetZero", 55),
-    ("cpusetIncl", 56),
-    ("setAffinity", 57),
-    ("syscall", 58),
+    ("stat", ANY, 26),
+    ("lstat", ANY, 27),
+    ("fstat", ANY, 28),
+    ("mkdir", ANY, 29),
+    ("rmdir", ANY, 30),
+    ("unlink", ANY, 31),
+    ("chdir", ANY, 32),
+    ("getcwd", ANY, 33),
+    ("readlink", ANY, 34),
+    ("ftruncate", ANY, 35),
+    ("munmap", ANY, 36),
+    ("c_rename", ANY, 37),
+    ("c_getenv", ANY, 38),
+    ("c_setenv", ANY, 39),
+    ("c_unsetenv", ANY, 40),
+    ("fork", ANY, 41),
+    ("exitnow", ANY, 42),
+    ("pipe", ANY, 43),
+    ("dup2", ANY, 44),
+    ("setpgid", ANY, 45),
+    ("kill", ANY, 46),
+    ("nanosleep", ANY, 47),
+    ("sysconf", ANY, 48),
+    ("nativeIoctl", ANY, 49),
+    ("pthread_attr_init", ANY, 50),
+    ("pthread_attr_setstacksize", ANY, 51),
+    ("pthread_attr_destroy", ANY, 52),
+    ("pthread_create", ANY, 53),
+    ("pthread_join", ANY, 54),
+    ("cpusetZero", ANY, 55),
+    ("cpusetIncl", ANY, 56),
+    ("setAffinity", ANY, 57),
+    ("syscall", ANY, 58),
     // **The rest of `std/atomics`' builtin family** (#1443). The other six atomics were already here
     // under nim's `atomic*` spelling; these four are what `std/atomics` itself calls, and they were
     // the only thing left once the `cpuRelax` `{.emit.}` stopped failing the link. Same
@@ -797,10 +819,48 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     //
     // `testAndSet`/`clear` operate on C's `bool` flag object — one byte, hence `load8_u`/`store8`,
     // *not* the word-width the other atomics use.
-    ("builtinTestAndSet", 59),
-    ("builtinClear", 60),
-    ("builtinThreadFence", 61),
-    ("builtinSignalFence", 62),
+    ("builtinTestAndSet", ANY, 59),
+    ("builtinClear", ANY, 60),
+    ("builtinThreadFence", ANY, 61),
+    ("builtinSignalFence", ANY, 62), // **The generic `builtin*` atomics** (#1499). Unlike every row above, these are matched on
+    // `(name, signature)`: `std/atomics` declares them `[T: SomeInteger]`, so nimony monomorphizes
+    // one `importc` instance per width with an opaque instance hash (`builtinLoadN.0.I99n2w21.`)
+    // and the name alone cannot say which width an instance is. Binding by name is not merely
+    // imprecise, it is wrong — it silently gives an `i32` atomic the `i64` shim, which is how the
+    // probe recorded in #1499 produced `TypeMismatch { expected: I64, found: I32 }`.
+    //
+    // Only the two widths nimony actually instantiates are here. A `[T]` at `i8`/`i16` would ride
+    // `i32` slots and present this same `i32` signature, so the machine type cannot distinguish it
+    // and the `i32` shim's 4-byte access would over-read a 1-byte cell — but nimony does not
+    // instantiate those (the byte-wide atomics are `testAndSet`/`clear`, which are non-generic and
+    // served at rows 59/60 with `load8_u`/`store8`). An instance whose signature matches no row
+    // here stays **unbound** and fails the link loudly, which is the point: a missing width is a
+    // visible gap, never a silent wrong-width bind.
+    //
+    // The 64-bit `load`/`store`/`cmpxchg`/`exchange` reuse the `atomic*` funcs above — same
+    // operation, same signature, so a second copy would be a second thing to keep in step. The
+    // `fetch_*` pair cannot: `__atomic_fetch_add` returns the value **before** the add, while
+    // nim's `atomicAddFetch` (row 11) returns the value after, so rows 69/70 are their own funcs.
+    ("builtinLoadN", sig(&[I64, I32], &[I32]), 63),
+    ("builtinLoadN", sig(&[I64, I32], &[I64]), 7),
+    ("builtinStoreN", sig(&[I64, I32, I32], &[]), 64),
+    ("builtinStoreN", sig(&[I64, I64, I32], &[]), 8),
+    (
+        "builtinCompareExchangeN",
+        sig(&[I64, I64, I32, I32, I32, I32], &[I32]),
+        65,
+    ),
+    (
+        "builtinCompareExchangeN",
+        sig(&[I64, I64, I64, I32, I32, I32], &[I32]),
+        9,
+    ),
+    ("builtinExchangeN", sig(&[I64, I32, I32], &[I32]), 66),
+    ("builtinExchangeN", sig(&[I64, I64, I32], &[I64]), 10),
+    ("builtinFetchAdd", sig(&[I64, I32, I32], &[I32]), 67),
+    ("builtinFetchSub", sig(&[I64, I32, I32], &[I32]), 68),
+    ("builtinFetchAdd", sig(&[I64, I64, I32], &[I64]), 69),
+    ("builtinFetchSub", sig(&[I64, I64, I32], &[I64]), 70),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
@@ -1002,12 +1062,43 @@ func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.c
 
 /// The compute-shim func index for a bottom-edge leaf import `name`, or `None` for a name the shim
 /// doesn't serve (the true syscalls — those go to the adapter / powerbox).
-fn compute_leaf_index(name: &str) -> Option<u32> {
+/// The shim func serving a leaf, or `None` to leave it unbound.
+///
+/// `want` is the import's own signature. A row that pins a signature ([`ComputeLeaf`]) is eligible
+/// only when it matches exactly; an [`ANY`] row ignores it. Among eligible rows the longest name
+/// prefix wins, and a signature-pinned row outranks an `ANY` row of the same length so a generic
+/// family can never fall back to a name-only bind.
+///
+/// No eligible row means **unbound** — the leaf survives to fail the link by name. That is the
+/// fail-closed half of #1499: binding a generic atomic instance to a shim of the wrong width would
+/// produce a module that verifies only by accident, or reads past the end of the cell it was handed.
+fn compute_leaf_index(name: &str, want: Option<(&[ValType], &[ValType])>) -> Option<u32> {
     COMPUTE_LEAVES
         .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
+        .filter(|(p, s, _)| {
+            name.starts_with(p)
+                && match (s, want) {
+                    (None, _) => true,
+                    (Some((wp, wr)), Some((gp, gr))) => *wp == gp && *wr == gr,
+                    // A pinned row with no signature to check against must not bind.
+                    (Some(_), None) => false,
+                }
+        })
+        .max_by_key(|(p, s, _)| (p.len(), s.is_some()))
+        .map(|(_, _, i)| *i)
+}
+
+/// An import's `(params, results)`, resolved through the module's type section — the `want` side of
+/// [`compute_leaf_index`]. `None` when the import isn't a flat func (an interface import) or its
+/// type index doesn't resolve, which leaves any signature-pinned leaf unbound.
+fn import_sig<'a>(m: &'a Module, imp: &temen_ir::Import) -> Option<(&'a [ValType], &'a [ValType])> {
+    let temen_ir::ImportShape::Func(t) = imp.shape else {
+        return None;
+    };
+    match m.types.get(t as usize)? {
+        temen_ir::TypeEntry::Func(f) => Some((&f.params, &f.results)),
+        _ => None,
+    }
 }
 
 /// Link whole nimony modules into a **powerbox-runnable module** — the shape `temen_run::run_powerbox`
@@ -1074,7 +1165,7 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
         .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
     let mut compute_exports: Vec<(String, u32)> = Vec::new();
     for imp in &sys_obj.imports {
-        if let Some(i) = compute_leaf_index(&imp.name) {
+        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&sys_obj, imp)) {
             if compute_exports.iter().all(|(n, _)| n != &imp.name) {
                 compute_exports.push((imp.name.clone(), i));
             }
@@ -1098,7 +1189,7 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
     // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
     // program is linked. Both passes feed one export list, so the final compute unit serves both.
     for imp in &m1.imports {
-        if let Some(i) = compute_leaf_index(&imp.name) {
+        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&m1, imp)) {
             if compute_exports.iter().all(|(n, _)| n != &imp.name) {
                 compute_exports.push((imp.name.clone(), i));
             }
