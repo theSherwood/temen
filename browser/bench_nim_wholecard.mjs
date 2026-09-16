@@ -73,7 +73,7 @@ const res = await page.evaluate(async () => {
     const t = performance.now();
     let info = { crawled: 0, semmed: 0, hexed: 0, timings: null };
     if (tierWholeCard) {
-      info = await jitNimWholeCardOp13(ex, memory, { niflerCe, nimsemCe, hexerCe }, stdlib, '/prog.nim', source, 'bench-wholecard');
+      info = await jitNimWholeCardOp13(ex, memory, { nifler, niflerCe, nimsemCe, hexerCe }, stdlib, '/prog.nim', source, 'bench-wholecard');
     } else {
       ex.temen_nim_precrawl_reset();
     }
