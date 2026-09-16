@@ -343,6 +343,11 @@ pub(crate) struct Nursery {
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
+    /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
+    /// [`crate::PremapApply`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`).
+    grant_premap_admit: std::sync::atomic::AtomicUsize,
+    grant_premap_stage: std::sync::atomic::AtomicUsize,
+    grant_premap_apply: std::sync::atomic::AtomicUsize,
     /// §3c.2 — the installed [`crate::BudgetTaker`] (0 = none: budget records stay `-EINVAL`).
     grant_budget_take: std::sync::atomic::AtomicUsize,
     grant_release: std::sync::atomic::AtomicUsize,
@@ -419,6 +424,9 @@ impl Nursery {
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
+            grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
+            grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
+            grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_take: std::sync::atomic::AtomicUsize::new(0),
             grant_release: std::sync::atomic::AtomicUsize::new(0),
             grant_bind_imports: std::sync::atomic::AtomicUsize::new(0),
@@ -447,7 +455,7 @@ impl Nursery {
     }
 
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t, rs, bd, mt, pc) = match hooks {
+        let (b, bn, r, bi, m, t, rs, bd, mt, pc, pa, ps, pp) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
@@ -459,13 +467,19 @@ impl Nursery {
                 h.build_detached as usize,
                 h.budget_mem_take as usize,
                 h.parent_ctx as usize,
+                h.premap_admit as usize,
+                h.premap_stage as usize,
+                h.premap_apply as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_build_detached.store(bd, Ordering::Release);
         self.grant_budget_mem_take.store(mt, Ordering::Release);
+        self.grant_premap_admit.store(pa, Ordering::Release);
+        self.grant_premap_stage.store(ps, Ordering::Release);
+        self.grant_premap_apply.store(pp, Ordering::Release);
         self.grant_register_serve.store(rs, Ordering::Release);
         self.grant_release.store(r, Ordering::Release);
         self.grant_bind_imports.store(bi, Ordering::Release);
@@ -1512,6 +1526,7 @@ unsafe fn spawn_detached_child(
     mapped_log2: u8,
     reserved_log2: u8,
     seeds: Vec<(u64, Vec<u8>)>,
+    premap_apply: Option<crate::PremapApply>,
     args: Vec<i64>,
     n_results: usize,
     release: crate::GrantChildReleaser,
@@ -1563,6 +1578,13 @@ unsafe fn spawn_detached_child(
                             }
                         }
                     },
+                    // The op-15 pre-mapped region, aliased onto the fresh window by the host hook
+                    // (the child powerbox's own `map` path); none staged ⇒ nothing to do.
+                    |base, mapped, reserved| match premap_apply {
+                        // SAFETY: `ctx.0` is the child powerbox this thread owns; the window is live.
+                        Some(apply) => apply(ctx.0, base, mapped, reserved) != 0,
+                        None => true,
+                    },
                     &args,
                     n_results,
                     || release(ctx.0),
@@ -1591,7 +1613,8 @@ unsafe fn spawn_detached_child(
 }
 
 /// PROCESS.md §5 / #1287 — `instantiate_detached(budget, module, grants_ptr, grants_n, entry,
-/// size_log2, quota[, args_ptr, args_len]) -> child | -EINVAL` on the native JIT: a separate-module
+/// size_log2, quota[, args_ptr, args_len[, region, child_off]]) -> child | -EINVAL` on the native JIT:
+/// a separate-module
 /// child in a **fresh window** — `1 << size_log2` committed inside a root-sized lazy reservation, no
 /// carve, no alias — minted through the `Budget` `budget`. Admission is the interpreter's op-15
 /// arm errno-for-errno: child entry shape, the window **equals** the module's declared memory (§14
@@ -1619,6 +1642,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     fuel: i64,
     args_ptr: i64,
     args_len: i64,
+    premap_region: i64,
+    premap_off: i64,
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
@@ -1694,6 +1719,28 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     {
         return EINVAL as i32;
     }
+    // The optional pre-mapped region (`premap_region < 0` ⇒ none): admitted host-side — the
+    // interpreter's `Host::premap_admit`, a forged handle traps, bad geometry refuses — before the take.
+    let premap = (premap_region >= 0).then_some((premap_region as i32, premap_off as u64));
+    let mut premap_apply: Option<crate::PremapApply> = None;
+    if let Some((r, o)) = premap {
+        let admit_addr = rt.grant_premap_admit.load(Ordering::Acquire);
+        let stage_addr = rt.grant_premap_stage.load(Ordering::Acquire);
+        let apply_addr = rt.grant_premap_apply.load(Ordering::Acquire);
+        if admit_addr == 0 || stage_addr == 0 || apply_addr == 0 {
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
+        }
+        let admit: crate::PremapAdmit = core::mem::transmute(admit_addr);
+        match admit(rt.grant_ctx(), r, o, child_size, trap_out) {
+            1 => {}
+            0 => return EINVAL as i32,
+            _ => return 0, // forged: `*trap_out` is set
+        }
+        premap_apply = Some(core::mem::transmute::<usize, crate::PremapApply>(
+            apply_addr,
+        ));
+    }
     // Admission = the budget's quota take (the commit; every refusal above charged nothing).
     if take(rt.grant_ctx(), budget as i32, child_size) == 0 {
         return EINVAL as i32;
@@ -1727,6 +1774,18 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             release(gc.ctx);
             release(gc.retained_ctx);
             return EINVAL as i32;
+        }
+    }
+    // Stage the pre-mapped region into the built child powerbox (a re-grant, as the grant list); the
+    // alias itself is applied on the child thread once its window exists (`premap_apply` above).
+    if let Some((r, o)) = premap {
+        let stage: crate::PremapStage =
+            core::mem::transmute(rt.grant_premap_stage.load(Ordering::Acquire));
+        if stage(rt.grant_ctx(), gc.ctx, r, o) == 0 {
+            release(gc.ctx);
+            release(gc.retained_ctx);
+            *trap_out = TrapKind::CapFault as i64;
+            return 0;
         }
     }
     let child_fuel_addr = rt.arm_child_fuel(fuel);
@@ -1774,6 +1833,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         size_log2 as u8,
         temen_ir::DEFAULT_RESERVED_LOG2,
         seeds,
+        premap_apply,
         args,
         n_results,
         release,

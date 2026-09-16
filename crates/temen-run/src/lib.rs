@@ -377,33 +377,9 @@ unsafe fn cap_thunk_impl(
     pending: Option<&mut Option<u64>>,
 ) {
     let host = &mut *(ctx as *mut Host);
-    // PROCESS.md S1b/S1c — the **canonical-key futex** region recorder. The JIT futex thunk has no
-    // region map, so a §13 `map` must record which absolute pages alias which region bytes into the JIT
-    // registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The `Host` dispatch owns
-    // the backing (hence its `os_fd`), but only *this* trampoline knows the window's `mem_base`; install
-    // the recorder here, once, over this run's base (the interp needs none — it canonicalizes via its own
-    // `PageProt::Backed`). Idempotent + on the root thread's first `call.cap` (before any `map`/spawn),
-    // so no vCPU races the install. A no-op on non-JIT hosts that never `map` a region.
-    if !mem_base.is_null() && !host.has_region_hook() {
-        let base = mem_base as u64;
-        // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
-        // so a later run reusing the virtual address never inherits a stale region identity.
-        let purge = WindowRegionPurge {
-            base,
-            reserved: mem_reserved,
-        };
-        host.set_region_hook(Some(std::sync::Arc::new(
-            move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
-                let _keep = &purge; // the closure owns the teardown guard
-                match mapped {
-                    Some((region_off, backing)) => {
-                        temen_jit::region_canon_record(base + win_off, len, backing, region_off)
-                    }
-                    None => temen_jit::region_canon_forget_window(base + win_off, len),
-                }
-            },
-        )));
-    }
+    // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
+    // `call.cap` (before any `map`/spawn), so no vCPU races the install.
+    install_region_hook(host, mem_base, mem_reserved);
     // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
     // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).
     let arg_slots = if n_args == 0 {
@@ -420,11 +396,18 @@ unsafe fn cap_thunk_impl(
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
-    // #964: carry the running module's NULL guard into the window backend (recorded on the host
-    // at `set_self_module` time — the thunk has no module in reach), so `[0, guard)` is refused
-    // to page ops and reads as unmapped to borrow checks, matching the interpreter oracle.
+    // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to page
+    // ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
+    // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
+    // #13: the guard is UNCONDITIONAL, a constant of the layout, not per-run state). It used to come
+    // from `Host::null_guard()`, which only became non-zero as a side effect of `set_self_module` —
+    // so an embedder that never registered a self module (nothing else about page ops needs one) ran
+    // the JIT with guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
+    // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is `-EINVAL` on
+    // the interpreter and `0` on the JIT, the two tiers disagreeing about an invariant that is
+    // supposed to hold on all of them.
     #[cfg(any(unix, windows))]
-    wm.set_null_guard(host.null_guard());
+    wm.set_null_guard(temen_ir::module_null_guard());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -2115,6 +2098,16 @@ locked_parent_hook!(
     (budget: i32, bytes: u64) -> i32
 );
 locked_parent_hook!(
+    premap_admit_locked,
+    premap_admit,
+    (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
+);
+locked_parent_hook!(
+    premap_stage_locked,
+    premap_stage,
+    (child_ctx: *mut c_void, region: i32, child_off: u64) -> i32
+);
+locked_parent_hook!(
     child_bind_imports_locked,
     child_bind_imports,
     (child_ctx: *mut c_void, module: i64) -> i32
@@ -2205,6 +2198,17 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_take
         },
+        premap_admit: if locked {
+            premap_admit_locked
+        } else {
+            premap_admit
+        },
+        premap_stage: if locked {
+            premap_stage_locked
+        } else {
+            premap_stage
+        },
+        premap_apply,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
@@ -2722,6 +2726,110 @@ pub unsafe extern "C" fn grant_detached_child_build(
     finish_child_build(parent, built, out, trap_out)
 }
 
+/// PROCESS.md S1b/S1c — install the **canonical-key futex** region recorder on `host` over the window
+/// at `mem_base`, once (idempotent; a no-op for a null base or a host that already has one). The JIT
+/// futex thunk has no region map, so a §13 `map` must record which absolute pages alias which region
+/// bytes into the JIT registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The
+/// `Host` dispatch owns the backing (hence its `os_fd`), but only the cap trampoline — and the op-15
+/// pre-map apply, which runs before the child's first `call.cap` — know the window's base. The interp
+/// needs none: it canonicalizes via its own `PageProt::Backed`.
+fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
+    if mem_base.is_null() || host.has_region_hook() {
+        return;
+    }
+    let base = mem_base as u64;
+    // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
+    // so a later run reusing the virtual address never inherits a stale region identity.
+    let purge = WindowRegionPurge {
+        base,
+        reserved: mem_reserved,
+    };
+    host.set_region_hook(Some(std::sync::Arc::new(
+        move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
+            let _keep = &purge; // the closure owns the teardown guard
+            match mapped {
+                Some((region_off, backing)) => {
+                    temen_jit::region_canon_record(base + win_off, len, backing, region_off)
+                }
+                None => temen_jit::region_canon_forget_window(base + win_off, len),
+            }
+        },
+    )));
+}
+
+/// Op-15 **pre-map admission** on the JIT ([`temen_jit::PremapAdmit`]): the interpreter's
+/// `Host::premap_admit` — `1` admitted, `0` refused (bad geometry; the spawn answers `-EINVAL`,
+/// charging nothing), `-1` with `*trap_out = CapFault` for a forged / wrong-kind handle.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host); `trap_out` the run's trap cell.
+pub unsafe extern "C" fn premap_admit(
+    ctx: *mut c_void,
+    region: i32,
+    child_off: u64,
+    child_size: u64,
+    trap_out: *mut i64,
+) -> i32 {
+    let parent = &*(ctx as *mut Host);
+    match parent.premap_admit(region, child_off, child_size) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            *trap_out = TrapKind::CapFault as i64;
+            -1
+        }
+    }
+}
+
+/// Op-15 **pre-map staging** on the JIT ([`temen_jit::PremapStage`]): `Host::stage_premap` — re-grant
+/// the region into the built child powerbox and record the pending alias. Nonzero on success.
+///
+/// # Safety
+/// `parent_ctx` is the live `*mut Host`; `child_ctx` a child powerbox cell from
+/// [`grant_detached_child_build`].
+pub unsafe extern "C" fn premap_stage(
+    parent_ctx: *mut c_void,
+    child_ctx: *mut c_void,
+    region: i32,
+    child_off: u64,
+) -> i32 {
+    let parent = &mut *(parent_ctx as *mut Host);
+    let child_cell = &*(child_ctx as *const Mutex<Host>);
+    let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
+    i32::from(parent.stage_premap(region, child_off, &mut child))
+}
+
+/// Op-15 **pre-map apply** on the JIT ([`temen_jit::PremapApply`]), on the child thread once its window
+/// exists: `Host::apply_premap` over the child's own window view — the same `MprotectWindow` (shared
+/// page map, NULL guard) and the same futex region recorder its first `call.cap` would set up, so the
+/// pre-mapped pages are a real `MAP_SHARED` alias, canonicalized exactly like self-mapped ones. `0` ⇒
+/// the backing cannot be aliased here (a software-only region); the child never runs.
+///
+/// # Safety
+/// `child_ctx` is the child powerbox cell; `[base, base+reserved)` its live reservation.
+pub unsafe extern "C" fn premap_apply(
+    child_ctx: *mut c_void,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+) -> i32 {
+    let child_cell = &*(child_ctx as *const Mutex<Host>);
+    let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(any(unix, windows))]
+    {
+        install_region_hook(&mut child, base, reserved);
+        let pages = child.cap_window_pages(base as usize);
+        let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
+        wm.set_null_guard(temen_ir::module_null_guard());
+        i32::from(child.apply_premap(&mut wm) >= 0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (base, mapped, reserved, &mut child);
+        0
+    }
+}
+
 /// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn on the JIT
 /// ([`temen_jit::BudgetMemTaker`]): deduct `bytes` from the minter behind `minter` on the parent `Host`.
 /// `1` = admitted; `0` = forged/wrong-type handle or exhausted quota (nothing deducted) — the spawn
@@ -2942,8 +3050,26 @@ impl MprotectWindow {
         }
     }
 
-    /// #964: install the running module's NULL guard (see the `null_guard` field). No-op at `0`.
+    /// #964: install the NULL guard (see the `null_guard` field) — the twin of
+    /// [`temen_interp::Mem::seed_null_guard`], engage rule included, so the two tiers guard and
+    /// disengage over exactly the same windows. The guard engages only when it is page-exact and
+    /// fits the window; three cases leave it at `0`:
+    ///
+    /// - `guard == 0` — nothing to install.
+    /// - not a multiple of the host page (e.g. a 64 KiB-page aarch64 host against the 16 KiB guard):
+    ///   a page-map seed would swallow live scratch above the guard, so both tiers disengage and keep
+    ///   per-platform trap parity.
+    /// - larger than the window (a tiny §14 sub-window): seeding would unmap the whole carve, and
+    ///   this tier could not mirror it without protecting past the carve — so a small child stays
+    ///   usable on both tiers.
+    ///
+    /// Assigning the constant *unconditionally* here is what broke `jit_instantiate_granted`: a
+    /// granted child's carve is smaller than the guard, the interpreter left it unguarded, and this
+    /// tier refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
+        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
+            return;
+        }
         self.null_guard = guard;
     }
 

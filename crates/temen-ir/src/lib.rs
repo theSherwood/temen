@@ -4236,14 +4236,15 @@ pub enum TypeEntry {
     Func(FuncType),
     /// A capability interface: an ordered tuple of **named** ops, each referencing a
     /// [`TypeEntry::Func`] entry for its signature. Op names are required (wire v7) and are the
-    /// binding-time contract (coverage matching is name-keyed); they are **excluded from the
-    /// structural intern key** — runtime `type_id` identity stays shape-only (D59). Interfaces
-    /// never nest.
+    /// binding-time contract (coverage matching is name-keyed). They are **part of the intern
+    /// key**: runtime `type_id` identity is `(names, shape)` equality (owner decision 2026-08-25,
+    /// #1109, superseding the shape-only D59 reading), so a same-shaped interface under different
+    /// names is a distinct interface. Interfaces never nest.
     Interface(Vec<IfaceOp>),
 }
 
-/// One named op of a [`TypeEntry::Interface`]: `name` is the coverage-matching key (required,
-/// non-identity); `ty` indexes the [`TypeEntry::Func`] carrying the op's signature.
+/// One named op of a [`TypeEntry::Interface`]: `name` is the coverage-matching key and half the
+/// intern key (#1109); `ty` indexes the [`TypeEntry::Func`] carrying the op's signature.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IfaceOp {
     pub name: String,
@@ -4331,6 +4332,11 @@ pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
         "vm_jit_release" => (cap_id::JIT, 2),
         "vm_jit_install" => (cap_id::JIT, 3),
         "vm_jit_uninstall" => (cap_id::JIT, 4),
+        // Instantiator (§14) — the config-record spawn + join, as `posix_libc/spawn.c` reaches them
+        // (#1509): the helper fills the op-17 record from C and dispatches on the `Instantiator`
+        // handle it discovers by reflection.
+        "vm_instantiate_rec" => (cap_id::INSTANTIATOR, 17),
+        "vm_instantiate_join" => (cap_id::INSTANTIATOR, 1),
         _ => return None,
     };
     Some(ResolvedCap { type_id, op })

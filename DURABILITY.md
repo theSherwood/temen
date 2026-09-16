@@ -101,6 +101,95 @@ practice only because the two reserve different window sizes, and a mismatched i
 than splatted over a prefix. Gated by `browser/tests/reactor_moment.rs`,
 `browser/tests/jit_reactor_moment.rs`, and the page-level `browser-play-savestate-test.mjs`.
 
+**Follow-on — from rewind to scrub (2026-09-16, #1457 items 3–4).** A moment on its own only goes
+*back* to a point someone thought to save. `ReactorTimeline` adds the two things that make that a
+scrub: a **tick-indexed input tape** and a **keyframe ladder**, so any recorded tick is reachable —
+restore the nearest rung at or before it, re-feed the tape forward. It is written against a
+`MomentReactor` trait rather than a concrete reactor, so one ladder serves the engine-backed
+interpreter reactor, the shared-window one, and the emitted tier whose `tick` the embedder runs
+(INVARIANTS #15).
+
+*The finding worth recording: the tape records the **driver**, not the guest.* #1457's sketch pointed
+at `Host::record_caps` — the `CapTape` seam the debug checkpoint ladder rides, which tapes every
+`HOST_PROC` crossing so a replay can serve it without a live powerbox — and noted that for a reactor
+that tape would carry every `display.present` and the `mem_writes` of every `fs` read, roughly the
+whole WAD per keyframe interval. The right conclusion is stronger than "make it selective": a reactor
+needs none of it. It replays against its **live** powerbox, and everything those capabilities read
+from is already inside the moment (the input queues and `fs` cursors are captured cap state, the
+window is the image, and the on-ramp powerbox grants no wall clock and no entropy), so the guest's
+crossings **recompute** rather than needing to be served. What is genuinely outside the moment is what
+the host injects from the outside world, and that is all the tape holds. The two ladders are therefore
+not one mechanism with two tape policies: the debug ladder must tape because it rebuilds the powerbox,
+and the reactor ladder must not because it keeps one. That boundary is the claim's edge, too — a
+reactor granted a genuinely nondeterministic capability would need its crossings taped, and *then* the
+recorded-input predicate #1457 sketched is the right move.
+
+One ordering rule makes the tape and the moment compose: a keyframe is taken **before** the tick's
+input reaches the queues, so that input sits in the tape alone and a replay feeds it exactly once.
+Taken after, it would sit in both. The reactor fixtures cannot witness that through their frames —
+`bounce` and `life` drain their whole queue each tick and fold it idempotently, though the `keyboard`
+ABI explicitly allows a guest to take one event per tick, which is how Doom's `DG_GetKey` is pumped —
+so it is gated where it *is* visible: a rung, restored and frozen to a §12 artifact, must be
+byte-identical to a reactor driven the same way that was never handed that tick's input — and, since
+the ladder reached native, directly, by a hand-written guest that takes **one** event per tick
+(`crates/temen-interp/tests/native_reactor_timeline.rs`), where a doubled event shifts every later
+value.
+
+**Follow-on — one ladder, everywhere (2026-09-16, #1457 items 5–6).** The ladder shipped in
+`temen-browser`, and the playground page already had one of its own in JavaScript (#1458, when the
+engine offered only take/restore/free and policy was left to the page). Two implementations of one
+behaviour, already disagreeing on eviction and on whether the start of a run stays reachable — so this
+slice collapsed them instead of adding a third. `ReactorMoment`, `MomentReactor`, `ReactorInput` and
+`ReactorTimeline` now live in **`temen_interp::moment`**, the page drives that one through a new
+`temen_onramp_timeline_*` FFI, and `web/play.js` keeps only what is genuinely the page's: the frame
+loop, the DOM, and a cached picture beside each rung (the presented frame is *output* — no guest reads
+it back, so it is deliberately not in a moment, but a scrub landing exactly on a rung runs no frames
+and something has to repaint).
+
+Two pieces of design fell out of the move, and both are the parameterization rather than a fork
+(INVARIANTS #15):
+
+- **The timeline does not own the reactor, and "who runs the tick" is a type.** A wasm-JIT reactor's
+  `tick` is emitted wasm that the embedder compiled and calls — in the browser that is JavaScript, so
+  there is no tick for Rust to run at all. `MomentReactor` therefore covers capture/restore/input only,
+  and a reactor that *can* step itself additionally implements `SteppableReactor` and gets the
+  self-driving `frame`/`seek`. Everyone else uses `begin_tick` / their own tick / `end_tick`. The
+  alternative — one trait with a `step` the emitted tier answers with a refusal — would compile for a
+  reactor that cannot run it and fail halfway through a tick it had already opened.
+- **The ring takes a byte budget as well as a count,** because a rung costs a window image: eight rungs
+  is a few KiB for `bounce` and 128 MiB for Doom. Tick 0 is pinned inside both bounds, so the whole run
+  stays reachable; the page's old ring evicted oldest-first, which walked the left edge of the scrub
+  track forward and left the start of a run visible on the bar and unreachable by it.
+
+Native parity (#14's host-target axis) is what the crate move buys: a native embedder builds a reactor
+out of the same `bytecode::Reactor` + `Host` and gets the same ladder, gated by
+`native_reactor_timeline.rs` — a hand-granted powerbox, a hand-written guest, no cdylib. What is still
+absent natively is a *convenience driver* (`temen-run` has `Session`, which round-trips only a window
+prefix and so cannot host a grown-heap reactor at all); that is packaging, not capability, and wants a
+consumer before it is built.
+
+**Follow-on — one ladder for the debug checkpoints too (2026-09-16, #1460 first half).** #1454 was filed
+because three routes captured "a moment" and each kept its own ladder of them: the tree-walk
+`Inspector`'s `SeekCheckpoint`s, the bytecode engine's `DebugRunSnapshot`/`ScheduledSnapshot` behind
+the DAP backend, and the reactor keyframes. All three captured the same two things — a window image and
+the host's run-mutable substate — and all three implemented the same sorted, stride-gated, deduped,
+nearest-at-or-before ladder over them; two of the three were unbounded. That is now **one** type,
+`temen_interp::moment::Moment<C>` (the shared halves plus an engine-chosen continuation `C`), and
+**one** ladder, `Ladder<C>`, keyed on whatever monotonic coordinate the driver has — an op clock, a
+scheduler turn, a frame tick — which the ladder never has to interpret. The engines' snapshot types
+are aliases of it (`DebugRunSnapshot = Moment<DebugRunContinuation>` and so on); the tree-walker's
+window image moved from raw bytes onto `MemLayout` in the same change, closing the last holdout of
+#1456's "one image form".
+
+*Why this landed before #1414, and what it deliberately does not do.* #1460 was gated on the converged
+run driver on the reasoning that a ladder per driver is the thing to avoid. The reactor timeline showed
+the ladder can be **driver-agnostic** — it owns no run, runs no tick, and is bracketed by whoever does
+— so nothing about it needed the drivers to converge first; landing it earlier means the duplicates
+stop forming while #1414 waits. What *does* wait is the continuation: a frame vector, a `Vm` plus
+fibers, a task set plus child environments, or nothing at all, are one type parameter here rather than
+one enum, because collapsing them onto one restore path is the same work as collapsing the engines'
+run loops. That is #1460's second half, and it belongs inside #1414.
+
 *Geometry footnote.* The §12 container's reservation checks were bounded by the **host's** pointer
 width (`usize::BITS`). The mask domain is a guest address-space quantity, so an ordinary 4 GiB
 reservation (`reserved_log2 == 32`) froze fine on a 64-bit host and refused with `WindowGeometry` on
@@ -975,10 +1064,34 @@ Two halves make it honest:
   `RestoreError::NamedCapRefused(name)` — before any handle is pinned. A forged `Named { idx }` naming
   an absent entry is rejected at the same boundary as a forged JIT index.
 
-*Still refusing: the **checkpoint ladder**.* `Host::checkpoint_safe` also requires
-`host_procs.is_empty()`, so debug-tier time travel still self-disables for a cap-using guest and falls
-back to replay-from-clock-0 (correct, just O(t)). That lift needs its own consumer — the DAP backend
-must supply a registrar for the powerbox it granted — and is tracked on #1455.
+*The **checkpoint ladder** now admits them too (2026-09-15, the #1455 ladder half).*
+`Host::checkpoint_safe` required `host_procs.is_empty()`, so debug-tier time travel self-disabled for
+every cap-using guest — a debugged C program that does file I/O holds `vm_fs`; a playground reactor
+holds `display`/`keyboard`/`fs` — and fell back to replay-from-clock-0 (correct, just O(t)). It now
+admits a host capability on the same terms the freeze does: **it carries a registered name**. An
+unnamed one is still an opaque closure with no reconstruction rule and still disqualifies the run.
+
+It needed no registrar, and that is the part worth recording. The ladder does not *re-grant* a
+capability — the DAP backend rebuilds the whole run under its own freshly granted powerbox and then
+restores a continuation into it, so what a checkpoint must reproduce is not the capability but the
+*crossings*. Those were already taped: `is_recorded_input` records every `HOST_PROC` call, which is
+exactly why replay-from-0 worked for these guests before. Two things were missing:
+
+- `HostReplaySubstate` now carries each capability's **own** declared state
+  (`Host::capture_cap_states`/`restore_cap_states` — the identical pair a §12 freeze writes into the
+  named-cap section, so the ladder and the artifact cannot drift), for the embedder that drives
+  `DebugRun::snapshot`/`restore` against a live host rather than through the tape.
+- `Host` counts **consumed** crossings (`cap_consumed`) instead of deriving the checkpoint's tape cursor
+  from the raw `cap_replay` position. A checkpoint laid down while the run was *recording* — the first
+  `seek`, whose tape is still empty — had a replay position of `0` with N records behind it, so a later
+  restore re-served the run's **first** crossing to a guest N crossings in.
+
+*Known gap, unchanged by this and pre-existing:* the DAP rebuild re-grants a *fresh* provider, so a
+capability's own host-side store (a `vm_fs` memfs's files) is empty in the rebuilt run; within the tape
+that is invisible (crossings are replayed, never re-entered), but a run continued past the tape's
+furthest point reads from a fresh store. Closing it means `temen-fs` serializing a `MemFsState` — files,
+dirs, and the open table's cursors — through the same capture/restore pair, which is its own slice with
+its own gates; a partial capture would be the fiction INVARIANTS #9c forbids.
 
 **Generation/slot pinning.** Restore must reinstate the **same `(slot, generation)`**
 so guest-held handle values stay valid — the auto-allocating `grant`/`grant_*`

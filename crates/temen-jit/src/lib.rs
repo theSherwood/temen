@@ -773,6 +773,50 @@ pub struct BudgetTaken {
 pub type BudgetMemTaker =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i32;
 
+/// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
+/// child_off)`): may the parent's `SharedRegion` `region` be aliased whole into a child window of
+/// `child_size` bytes at `child_off`? `1` admitted, `0` refused (bad geometry — the spawn answers
+/// `-EINVAL`, charging nothing), `-1` with `*trap_out` set for a forged handle. Runs **before** the
+/// budget take. Host-side it is the interpreter's `Host::premap_admit`, so the two backends admit
+/// identically.
+///
+/// # Safety
+/// `ctx` is the run's `cap_ctx` (the parent `Host`); `trap_out` the live trap cell.
+pub type PremapAdmit = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    region: i32,
+    child_off: u64,
+    child_size: u64,
+    trap_out: *mut i64,
+) -> i32;
+
+/// Op-15 **pre-map staging**: re-grant `region` from the parent into the built child powerbox
+/// (`child_ctx`, a [`GrantChild::ctx`]) and record the pending alias at `child_off` — the interpreter's
+/// `Host::stage_premap`. Nonzero on success.
+///
+/// # Safety
+/// `ctx` is the parent host; `child_ctx` a child powerbox from a [`GrantNamedChildBuilder`].
+pub type PremapStage = unsafe extern "C" fn(
+    ctx: *mut core::ffi::c_void,
+    child_ctx: *mut core::ffi::c_void,
+    region: i32,
+    child_off: u64,
+) -> i32;
+
+/// Op-15 **pre-map apply**, on the child thread once its window exists: alias the staged region onto
+/// the window `[base, base+mapped)` (inside `reserved`) — the interpreter's `Host::apply_premap`
+/// through the host's own window backend, i.e. the same `map_region` the child's `SharedRegion.map`
+/// would take. Nonzero on success; `0` ⇒ the child never runs (a `CapFault` outcome).
+///
+/// # Safety
+/// `child_ctx` is the child powerbox; `[base, base+reserved)` its live reservation.
+pub type PremapApply = unsafe extern "C" fn(
+    child_ctx: *mut core::ffi::c_void,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+) -> i32;
+
 #[derive(Clone, Copy)]
 pub struct GrantChildHooks {
     pub build: GrantChildBuilder,
@@ -783,6 +827,11 @@ pub struct GrantChildHooks {
     pub build_detached: GrantNamedChildBuilder,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
+    /// Op-15 pre-mapped region — the three host sides of one child-side `map` (see [`PremapAdmit`],
+    /// [`PremapStage`], [`PremapApply`]).
+    pub premap_admit: PremapAdmit,
+    pub premap_stage: PremapStage,
+    pub premap_apply: PremapApply,
     pub release: GrantChildReleaser,
     /// IMPORTS.md phase 3 / S2.1: bind a spawned child module's import manifest against its freshly
     /// built powerbox (`(parent_ctx, child_ctx, module_handle)`) — the JIT-side twin of the
@@ -5596,17 +5645,22 @@ pub(crate) unsafe fn run_child_code_then(
 /// (the module's data segments + the argv payload) and never copied anywhere: no parent carve exists,
 /// so there is no copy-in and no copy-back. `vm_map` commits tail pages through the child's own
 /// `AddressSpace` (the thunks see `(mapped, reserved)`), an access past the committed extent faults on
-/// the inaccessible tail. `teardown` runs while the window is alive (as [`run_child_code_then`]).
+/// the inaccessible tail. `premap` runs after `init` with `(base, mapped, reserved)` — the op-15
+/// pre-mapped region's alias onto the fresh window; `false` means the backend could not honour a staged
+/// alias, and the child never runs (a `CapFault` outcome). `teardown` runs while the window is alive
+/// (as [`run_child_code_then`]).
 ///
 /// # Safety
 /// `code` was compiled by [`compile_child_windowed`] for exactly `(mapped_log2, reserved_log2)`;
 /// `args` matches the entry's arity.
 #[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_detached_child_then(
     code: *const CompiledModule,
     mapped_log2: u8,
     reserved_log2: u8,
     init: impl FnOnce(&mut [u8]),
+    premap: impl FnOnce(*mut u8, u64, u64) -> bool,
     args: &[i64],
     n_results: usize,
     teardown: impl FnOnce(),
@@ -5618,6 +5672,11 @@ pub(crate) unsafe fn run_detached_child_then(
     let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
     let base = window.base();
     init(window.rw_mut());
+    if !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
+        window.restore_rw();
+        teardown();
+        return (0, TrapKind::CapFault as i64);
+    }
     let mut results = vec![0i64; n_results];
     let mut trap_cell: i64 = 0;
     // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (the reservation is the
@@ -9025,7 +9084,9 @@ fn lower_instantiator(
             // spawn: no carve — the thunk mints a root-shaped window (declared size committed, a
             // lazy reservation above it), seeds the module's data + the argv payload, and runs the
             // child there. Grant records and the payload are read from THIS window (reserved-bounded,
-            // as op 13). The 7-arg form passes `(0, 0)` for the payload — no seed.
+            // as op 13). The 7-arg form passes `(0, 0)` for the payload — no seed. The optional
+            // `(region, child_off)` (args 9–10) pre-maps a `SharedRegion` into the child's window
+            // (`premap_region:i64, premap_off:i64` before `trap_out`; `-1` ⇒ none).
             let h = slot_i32(b, get(vals, handle)?);
             let win_reserved = if lower.mapped == 0 { 0 } else { lower.mask + 1 };
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
@@ -9047,9 +9108,14 @@ fn lower_instantiator(
             } else {
                 (b.ins().iconst(I64, 0), b.ins().iconst(I64, 0))
             };
+            let (premap_region, premap_off) = if args.len() >= 11 {
+                (a(b, 9)?, a(b, 10)?)
+            } else {
+                (b.ins().iconst(I64, -1), b.ins().iconst(I64, 0))
+            };
             let mut tsig = module.make_signature();
             for t in [
-                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
+                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
             ] {
                 tsig.params.push(AbiParam::new(t));
             }
@@ -9060,8 +9126,22 @@ fn lower_instantiator(
                 tref,
                 thunk,
                 &[
-                    nursery, mem_base, mem_size, h, budget, modh, grants_ptr, grants_n, entry,
-                    size_log2, fuel, args_ptr, args_len, trap_out,
+                    nursery,
+                    mem_base,
+                    mem_size,
+                    h,
+                    budget,
+                    modh,
+                    grants_ptr,
+                    grants_n,
+                    entry,
+                    size_log2,
+                    fuel,
+                    args_ptr,
+                    args_len,
+                    premap_region,
+                    premap_off,
+                    trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);

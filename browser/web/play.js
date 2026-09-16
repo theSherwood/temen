@@ -2209,17 +2209,18 @@ async function runBashInteractive(c) {
   const session = mk(coop ? 'coop' : 'session');
   const control = coop ? session : mk('control');
   c.bashWorkers = coop ? [session] : [session, control];
-  // A minimal TERMINAL model for the output pane (readline rung): the session's bytes are a
-  // terminal stream, not plain text — readline (running as `TERM=dumb`) erases with `\b \b`,
-  // returns to column 0 with `\r`, and may emit CSI sequences a real terminal would consume.
-  // Completed lines are kept verbatim; only the current line is edited: `\b` moves the cursor left,
-  // `\r` to column 0, printable bytes overwrite at the cursor, `\n` commits the line. `ESC [ … F` is
-  // parsed and dropped except `K` (clear to end of line) and `C`/`D` (cursor right/left). Without
-  // this the pane showed raw control characters after every Backspace.
-  const term = { lines: [], cur: '', col: 0, esc: '' };
-  const render = () => {
-    c.el.stdout.textContent = term.lines.join('\n') + (term.lines.length ? '\n' : '') + term.cur;
-  };
+  // A minimal TERMINAL model for the output pane (readline rung, #1496): the session's bytes are a
+  // terminal stream, not plain text. Readline runs against the personality's fixed termcap entry
+  // (`temen_posix::TERMCAP_ENTRY` — 80×24, NO auto-margin), so it edits with `\b`, returns to
+  // column 0 with `\r`, wraps a long line at 79 columns and moves DOWN with `\n\r`, UP with
+  // `ESC [ A`, right with `ESC [ C`, and clears to the end of the line with `ESC [ K`. The
+  // bracketed-paste toggles (`ESC [ ? 2004 h/l`) and any other CSI are parsed and dropped. The pane
+  // is a grid of rows with a cursor: printable bytes overwrite at the cursor, `\n` moves to the next
+  // row (created at the bottom — command output arrives with bare `\n`s, so the pane behaves as an
+  // ONLCR terminal), and every row stays editable so a wrapped readline line is redrawn in place
+  // after a cursor-up. Without this the pane showed raw control characters after every Backspace.
+  const term = { rows: [''], row: 0, col: 0, esc: '' };
+  const render = () => { c.el.stdout.textContent = term.rows.join('\n'); };
   const append = (text) => {
     for (const ch of text) {
       if (term.esc) {
@@ -2227,19 +2228,26 @@ async function runBashInteractive(c) {
         if (term.esc.length === 2 && ch !== '[') term.esc = ''; // ESC x — a 2-byte sequence, dropped
         else if (term.esc.length > 2 && /[@-~]/.test(ch)) {
           const n = parseInt(term.esc.slice(2, -1), 10) || 1;
-          if (ch === 'K') term.cur = term.cur.slice(0, term.col);
-          else if (ch === 'C') term.col = Math.min(term.cur.length, term.col + n);
+          const line = term.rows[term.row];
+          if (ch === 'K') term.rows[term.row] = line.slice(0, term.col);
+          else if (ch === 'C') term.col = Math.min(line.length, term.col + n);
           else if (ch === 'D') term.col = Math.max(0, term.col - n);
+          else if (ch === 'A') term.row = Math.max(0, term.row - n);
+          else if (ch === 'B') term.row = Math.min(term.rows.length - 1, term.row + n);
           term.esc = '';
         }
         continue;
       }
       if (ch === '\x1b') term.esc = ch;
-      else if (ch === '\n') { term.lines.push(term.cur); term.cur = ''; term.col = 0; }
-      else if (ch === '\r') term.col = 0;
+      else if (ch === '\n') {
+        term.row += 1;
+        term.col = 0;
+        if (term.row === term.rows.length) term.rows.push('');
+      } else if (ch === '\r') term.col = 0;
       else if (ch === '\b') term.col = Math.max(0, term.col - 1);
       else if (ch >= ' ' || ch === '\t') {
-        term.cur = term.cur.slice(0, term.col) + ch + term.cur.slice(term.col + 1);
+        const line = term.rows[term.row].padEnd(term.col);
+        term.rows[term.row] = line.slice(0, term.col) + ch + line.slice(term.col + 1);
         term.col += 1;
       }
       // other control bytes (BEL, …) are dropped
@@ -3309,85 +3317,70 @@ function finalizeReactor(how) {
   runEnd(rec, { ok: how.ok !== false, status: how.status });
 }
 
-// ---- time travel: the keyframe ladder + input tape behind the scrub bar (#1457) -----------------
+// ---- time travel: the scrub bar over the engine's timeline (#1457) ------------------------------
 //
-// The engine ships the *mechanism* — take a moment of the reactor (a window image + the host-side
-// capability state), restore it, free it — and holds the images in its own memory, where a 16 MiB Doom
-// keyframe costs one memcpy and never crosses the FFI. The *policy* lives here, because this is where
-// the frame loop and the input events are: how often to lay a keyframe down, how many to keep, and
-// what the guest was fed on each frame.
+// The keyframe ladder and the input tape live in the **engine** (`temen_interp::moment`), not here.
+// They used to live here, because when the save-state FFI landed the engine shipped only
+// take/restore/free — but items 3-4 put a ladder in the engine for every reactor there is (including
+// native, which this file can never serve), and two ladders is two things to keep correct. They had
+// already drifted on eviction policy. One ladder, parameterized (INVARIANTS #15, #13).
 //
-// Scrubbing back to frame `t` is then: restore the newest keyframe at or before `t`, then re-run the
-// guest forward to `t`, feeding it the taped input for each frame. The guest is deterministic given
-// its input (its clock is virtual, its randomness guest-side), so the frames that come back are the
-// frames that were there — the property `browser/tests/reactor_moment.rs` gates.
+// What is left here is what is genuinely the page's: the frame loop, the DOM, and a cached picture
+// beside each keyframe. That last one is not guest state — the presented frame is *output*, no guest
+// reads it back, so it is deliberately not in a moment — but a scrub that lands exactly on a keyframe
+// re-runs zero frames, so nothing repaints the canvas and the viewer would be left looking at a frame
+// from the timeline they just left. One copy per keyframe, beside a window image orders of magnitude
+// bigger.
 //
-// Keyframe stride is a wall-clock/memory trade: at stride 30 a scrub lands within 30 frames of re-run
-// (a few ms on the emitted tier), and the ring holds ~16 s of a 60 fps run at 16 MiB a keyframe.
+// The engine exports only the **split** tick: `begin_tick` (take a keyframe if due, hand the guest its
+// input), then whatever this page uses to run a tick, then `end_tick`. That is not a concession, it is
+// the only thing that can work on the emitted tier, where the tick is wasm this page compiled and
+// calls itself.
 const SCRUB_STRIDE = 30; // frames between keyframes
-const SCRUB_KEYFRAMES = 8; // ring size — the oldest is freed as a new one lands
+const SCRUB_KEYFRAMES = 8; // ring size
 // …and a byte ceiling, because a keyframe's cost is the guest's window: a bounce keyframe is a few KiB,
 // a Doom one is 16 MiB. Holding eight of *those* is 128 MiB of engine memory for a scroll bar, so the
 // ring shortens itself on a heavy guest instead of the count alone deciding.
 const SCRUB_BUDGET_BYTES = 96 * 1024 * 1024;
-let scrub = null; // the live run's ladder + tape (see `scrubOpen`), else null
+let scrub = null; // the page half of a live recording (see `scrubOpen`), else null
 
-// The tier shim: the same three engine calls on whichever reactor is live, so everything below is
-// written once (INVARIANTS #15) rather than branched per tier.
+// The tier shim: how to run one tick on whichever reactor is live, so everything below is written once
+// (INVARIANTS #15) rather than branched per tier. Note there is no take/restore here any more — the
+// engine's timeline reaches whichever reactor is open by itself.
 function scrubEngine() {
-  return jitReactor
-    ? {
-      take: () => eng.ex.temen_onramp_jit_moment_take(),
-      restore: (slot) => eng.ex.temen_onramp_jit_moment_restore(slot),
-      frame: () => jitReactor.frame(),
-      key: (k, p) => eng.ex.temen_onramp_jit_key(k, p),
-    }
-    : {
-      take: () => eng.ex.temen_onramp_moment_take(),
-      restore: (slot) => eng.ex.temen_onramp_moment_restore(slot),
-      frame: () => eng.ex.temen_onramp_frame(),
-      key: (k, p) => eng.ex.temen_onramp_key(k, p),
-    };
+  return jitReactor ? { frame: () => jitReactor.frame() } : { frame: () => eng.ex.temen_onramp_frame() };
 }
 
-// Start recording for a freshly opened reactor. `tick` counts frames the guest has completed, so the
-// state at tick 0 is "opened, before the first frame" — which is the first keyframe.
+// Start recording a freshly opened reactor. `tick` counts frames the guest has completed, so the state
+// at tick 0 is "opened, before the first frame" — which is the first keyframe, and the engine takes it
+// when the first tick opens.
 function scrubOpen(c) {
-  scrub = { card: c, tick: 0, tape: new Map(), keys: [], viewing: null };
-  scrubKeyframe();
+  eng.ex.temen_onramp_timeline_open(SCRUB_STRIDE, SCRUB_KEYFRAMES, SCRUB_BUDGET_BYTES);
+  // `stale` guards the picture cache: the presented framebuffer is *output* and deliberately not part
+  // of a moment, so immediately after a restore it still holds a frame from the timeline we just left.
+  // Caching that as a rung's picture would poison the rung a later seek lands on.
+  scrub = { card: c, viewing: null, pics: new Map(), stale: false };
   scrubRender();
 }
 
-// Drop the ladder and hand every held image back to the engine. Moments belong to the window they were
-// taken from, so a closing reactor's are worthless to the next one.
+// Drop the recording and every held image. Moments belong to the window they were taken from, so a
+// closing reactor's are worthless to the next one.
 function scrubClose() {
   if (!scrub) return;
-  eng.ex.temen_onramp_moment_clear();
+  eng.ex.temen_onramp_timeline_close();
   scrub = null;
   scrubRender();
 }
 
-// Lay a keyframe down at the current tick, evicting the oldest past the ring size. A refused capture
-// (`-1` — no reactor, or a window the engine can't image) simply leaves the ladder as it was: the scrub
-// range shrinks to what is actually held rather than promising a frame it cannot reach.
-function scrubKeyframe() {
-  const slot = scrubEngine().take();
-  if (slot < 0) return;
-  // Cache the picture beside the moment. The engine's moment is *guest state*, and the presented frame
-  // is output — no guest reads it back — so it is not in there (and keeping it there would cost a
-  // framebuffer copy every frame rather than every keyframe). But a scrub that lands exactly on a
-  // keyframe re-runs **zero** frames, so nothing repaints the canvas: without this the viewer would be
-  // left looking at a frame from the timeline they just left. One copy per keyframe, next to a window
-  // image that is orders of magnitude bigger.
-  scrub.keys.push({ tick: scrub.tick, slot, bytes: eng.ex.temen_onramp_moment_bytes(slot), pic: scrubPicture() });
-  let held = scrub.keys.reduce((n, k) => n + k.bytes, 0);
-  // Evict oldest-first past either bound, but never below one keyframe — a ladder with nothing in it
-  // cannot seek anywhere, and the newest is the one a scrub is most likely to want.
-  while (scrub.keys.length > 1 && (scrub.keys.length > SCRUB_KEYFRAMES || held > SCRUB_BUDGET_BYTES)) {
-    const evicted = scrub.keys.shift();
-    held -= evicted.bytes;
-    eng.ex.temen_onramp_moment_free(evicted.slot);
-  }
+// Where the run stands and how far the recording goes, straight from the engine — the page keeps no
+// copy of either, so there is nothing to leave stale when a branch truncates the tape.
+function scrubTick() { return eng.ex.temen_onramp_timeline_tick(); }
+function scrubLen() { return eng.ex.temen_onramp_timeline_len(); }
+
+// The ticks the engine currently holds keyframes at, ascending.
+function scrubKeyframes() {
+  const n = eng.ex.temen_onramp_timeline_keyframe_count();
+  return Array.from({ length: n }, (_, i) => eng.ex.temen_onramp_timeline_keyframe_at(i));
 }
 
 // The framebuffer as it stands right now — `{w, h, rgba}`, copied out of the engine's capture slots
@@ -3401,69 +3394,121 @@ function scrubPicture() {
   return { w, h, rgba: new Uint8Array(eng.memory.buffer).slice(p, p + n) };
 }
 
-// Called after every frame the live loop runs: advance the tick, lay a keyframe on the stride, and
-// repaint the row — the range's upper bound *is* the live frame count, so it has to track it or a drag
-// can only reach as far as the run had got when the row was last painted.
+// Open the tick the loop (or a seek) is about to run: the engine takes a keyframe if one is due and
+// hands the guest this tick's input — the input pushed since the last frame at the live end, or the
+// input it recorded for this tick when replaying.
+//
+// The picture cache is maintained *here*, and it has to be: the engine takes its keyframe for tick `t`
+// inside this call, and the framebuffer at this instant holds frame `t-1` — which is exactly the
+// picture to show when a scrub lands on that rung. (Caching it after the tick instead looks equivalent
+// and is not: the ladder has not been updated yet, so the prune below would drop the entry it had just
+// made, and every zero-replay landing would then draw whatever frame happened to be on the canvas.)
+function scrubBeginTick() {
+  if (!scrub) return;
+  const at = scrubTick();
+  eng.ex.temen_onramp_timeline_begin_tick();
+  if (at % SCRUB_STRIDE === 0 && !scrub.stale) {
+    const pic = scrubPicture();
+    if (pic) scrub.pics.set(at, pic);
+    // The engine's ladder is current now, so drop pictures for rungs its ring has evicted.
+    const held = new Set(scrubKeyframes());
+    for (const t of [...scrub.pics.keys()]) if (!held.has(t)) scrub.pics.delete(t);
+  }
+}
+
+// Close the tick that just ran. A tick has now presented into the framebuffer, so it describes *this*
+// timeline again and the picture cache can trust it.
+function scrubEndTick() {
+  if (!scrub) return;
+  eng.ex.temen_onramp_timeline_end_tick();
+  scrub.stale = false;
+}
+
+// Called after every frame the live loop runs: close the tick and repaint the row — the range's upper
+// bound *is* the live frame count, so it has to track it or a drag can only reach as far as the run had
+// got when the row was last painted.
 function scrubAfterFrame() {
   if (!scrub) return;
-  scrub.tick++;
-  if (scrub.tick % SCRUB_STRIDE === 0) scrubKeyframe();
+  scrubEndTick();
   scrubRender();
 }
 
-// The oldest frame the ladder can still reach (the earliest keyframe it holds).
+// The oldest frame the scrub bar can reach. The engine pins tick 0 in its ring, so this is always 0 and
+// the whole run stays draggable — a ring that could evict the start would leave a stretch of the track
+// the viewer can see and cannot reach.
 function scrubOldest() {
-  return scrub && scrub.keys.length ? scrub.keys[0].tick : 0;
+  return 0;
 }
 
-// Seek to frame `target`: restore the newest keyframe at or before it, then re-run forward feeding the
-// taped input. Returns the frame actually landed on (clamped to what the ladder holds), or `null` if
-// there is nothing to seek in. The guest presents a frame per re-run tick; only the last is drawn, so a
-// scrub shows the frame the user asked for rather than flickering through the ones before it.
+// Seek to frame `target`: the engine restores the nearest keyframe at or before it, then this page
+// re-runs forward to `target` — feeding each tick through `begin_tick`, which replays the taped input.
+// Returns the frame landed on, or `null` if there is nothing to seek in. The guest presents a frame per
+// re-run tick; only the last is drawn, so a scrub shows the frame the user asked for rather than
+// flickering through the ones before it.
 function scrubSeek(target) {
-  if (!scrub || !scrub.keys.length) return null;
+  if (!scrub) return null;
   const e = scrubEngine();
-  target = Math.max(scrubOldest(), Math.min(target, scrub.tick));
-  let kf = scrub.keys[0];
-  for (const k of scrub.keys) if (k.tick <= target) kf = k;
-  if (e.restore(kf.slot) !== 0) return null;
+  target = Math.max(0, Math.min(target, scrubLen()));
+  if (eng.ex.temen_onramp_timeline_seek_begin(target) !== 0) return null;
+  scrub.stale = true; // whatever is in the framebuffer belongs to the timeline we just left
   let ran = 0;
-  for (let t = kf.tick; t < target; t++) {
-    // The input the guest was handed *for* frame t+1 — enqueued after frame t finished.
-    for (const ev of scrub.tape.get(t + 1) || []) e.key(ev.k, ev.p);
+  while (scrubTick() < target) {
+    scrubBeginTick();
     if (e.frame() !== 0) break; // the guest exited/trapped here on the recorded run too
+    scrubEndTick();
     ran++;
   }
   scrub.viewing = target;
-  // Landed exactly on the keyframe: no frame ran, so the engine's framebuffer still holds a picture
-  // from wherever we came from — draw the one cached with the moment instead.
-  if (ran === 0 && kf.pic) presentFrameData(scrub.card, kf.pic.w, kf.pic.h, kf.pic.rgba);
-  else presentFrame(scrub.card, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
+  const pic = scrub.pics.get(target);
+  const live = () => presentFrame(scrub.card, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
+  if (ran > 0) {
+    live(); // the frames just re-run left frame `target - 1` in the framebuffer, which is this one
+  } else if (pic) {
+    // Landed exactly on a keyframe, so no frame ran and the framebuffer still holds a picture from the
+    // timeline we just left — draw the one cached with that rung instead.
+    presentFrameData(scrub.card, pic.w, pic.h, pic.rgba);
+  } else if (target > 0) {
+    // A rung with no cached picture (its entry was evicted). Regenerate the frame rather than leaving a
+    // stale one on screen, by backing up one tick and running it: a canvas showing the frame the viewer
+    // did *not* ask for is the kind of fiction INVARIANTS #9c refuses.
+    if (eng.ex.temen_onramp_timeline_seek_begin(target - 1) === 0) {
+      scrub.stale = true;
+      while (scrubTick() < target) {
+        scrubBeginTick();
+        if (e.frame() !== 0) break;
+        scrubEndTick();
+      }
+      live();
+    }
+  }
+  // target 0 with no picture: the guest has presented nothing yet, so there is nothing to draw.
   scrubRender();
   return target;
 }
 
-// Resume live play from the frame currently being viewed. The recorded future is **abandoned**: the
-// user is about to play differently, so the tape and the keyframes past this point are dropped rather
-// than left to contradict what happens next.
+// Resume live play from the frame currently being viewed. The recorded future is **abandoned** — the
+// button says so — which the engine does on `truncate`: tape and keyframes past this point go, because
+// the user is about to play differently. (New input would do it by itself; asking outright is what
+// makes Resume mean what its label says even if the user then touches nothing.)
 function scrubResumeFrom(tick) {
   if (!scrub) return;
-  for (const t of [...scrub.tape.keys()]) if (t > tick) scrub.tape.delete(t);
-  while (scrub.keys.length && scrub.keys[scrub.keys.length - 1].tick > tick) {
-    eng.ex.temen_onramp_moment_free(scrub.keys.pop().slot);
-  }
-  scrub.tick = tick;
+  eng.ex.temen_onramp_timeline_truncate();
   scrub.viewing = null;
+  for (const t of [...scrub.pics.keys()]) if (t > tick) scrub.pics.delete(t);
   scrubRender();
 }
 
-// Test/telemetry hook (harmless): the live ladder + tape, so a headless driver can assert on the frame
+// Test/telemetry hook (harmless): the live recording, so a headless driver can assert on the frame
 // count, what the ring still holds, and what the guest was fed — none of which is visible in the DOM.
+// Every field is read from the engine, which is the only place any of it lives.
 globalThis.__scrubState = () => scrub && {
-  tick: scrub.tick,
+  tick: scrubTick(),
   viewing: scrub.viewing,
-  keyframes: scrub.keys.map((k) => k.tick),
-  taped: [...scrub.tape.keys()].sort((a, b) => a - b),
+  keyframes: scrubKeyframes(),
+  taped: Array.from(
+    { length: eng.ex.temen_onramp_timeline_taped_count() },
+    (_, i) => eng.ex.temen_onramp_timeline_taped_at(i),
+  ),
 };
 
 // Paint the scrub row from the live state: range bounds, the frame label, and which controls apply.
@@ -3476,13 +3521,16 @@ function scrubRender() {
     row.wrap.hidden = !live;
     if (!live) continue;
     const oldest = scrubOldest();
+    // The engine's `tick` is the *position* (a seek moves it) and `len` the high-water, so the range's
+    // upper bound is the recording's length rather than wherever the guest currently stands.
+    const len = scrubLen();
     row.range.min = String(oldest);
-    row.range.max = String(scrub.tick);
-    const at = scrub.viewing == null ? scrub.tick : scrub.viewing;
+    row.range.max = String(len);
+    const at = scrub.viewing == null ? scrubTick() : scrub.viewing;
     row.range.value = String(at);
     row.label.textContent = scrub.viewing == null
-      ? `frame ${scrub.tick} · live`
-      : `frame ${at} / ${scrub.tick} · paused (${oldest}–${scrub.tick} held)`;
+      ? `frame ${len} · live`
+      : `frame ${at} / ${len} · paused (${oldest}–${len} held)`;
     row.resume.disabled = scrub.viewing == null;
   }
 }
@@ -3493,7 +3541,7 @@ function scrubPause() {
     cancelAnimationFrame(reactorRAF);
     reactorRAF = null;
   }
-  if (scrub && scrub.viewing == null) scrub.viewing = scrub.tick;
+  if (scrub && scrub.viewing == null) scrub.viewing = scrubTick();
   scrubRender();
 }
 
@@ -3506,12 +3554,11 @@ function scrubPause() {
 // guest nobody was steering.
 function sendReactorKey(keyCode, pressed) {
   if (reactorRAF === null) return;
-  if (scrub) {
-    const t = scrub.tick + 1;
-    if (!scrub.tape.has(t)) scrub.tape.set(t, []);
-    scrub.tape.get(t).push({ k: keyCode, p: pressed });
-  }
-  if (jitReactor) eng.ex.temen_onramp_jit_key(keyCode, pressed);
+  // Offered to the timeline, which tapes it and hands it to the guest when the next tick opens —
+  // the same instant the direct call would have, since the guest polls its queue inside the tick.
+  // Routed direct only when nothing is recording, so it is never delivered twice.
+  if (scrub) eng.ex.temen_onramp_timeline_key(keyCode, pressed);
+  else if (jitReactor) eng.ex.temen_onramp_jit_key(keyCode, pressed);
   else eng.ex.temen_onramp_key(keyCode, pressed);
 }
 
@@ -3607,7 +3654,7 @@ async function saveStateWrite(c) {
   }
   // The frame the artifact *is* — which is where the scrub is looking when one is paused mid-ladder,
   // not how far the run had got before it was paused.
-  const at = scrub ? (scrub.viewing ?? scrub.tick) : 0;
+  const at = scrub ? (scrub.viewing ?? scrubTick()) : 0;
   // The tier rides along because a window image is only meaningful in a window its own size, and the
   // two tiers reserve different ones: a JIT save-state thawed on the interpreter would be refused. The
   // page remembers which tier took it and loads it back there, rather than letting the toggle decide.
@@ -3829,6 +3876,7 @@ async function runReactor(c, opts = {}) {
   // Start the keyframe ladder + input tape, so the run can be scrubbed back through (#1457).
   scrubOpen(c);
   const loop = () => {
+    scrubBeginTick(); // the engine takes a keyframe if one is due and feeds this tick's input
     const status = scrubEngine().frame();
     scrubAfterFrame();
     presentFrame(c, eng.ex.temen_framebuffer_width(), eng.ex.temen_framebuffer_height());
@@ -4976,8 +5024,8 @@ function buildCard(name, ex) {
     scrubRow = { wrap, range, label, resume, back, fwd };
     const seekTo = (t) => { scrubPause(); scrubSeek(t); };
     range.addEventListener('input', () => seekTo(Number(range.value)));
-    back.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrub.tick) : 0) - 1));
-    fwd.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrub.tick) : 0) + 1));
+    back.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrubTick()) : 0) - 1));
+    fwd.addEventListener('click', () => seekTo((scrub ? (scrub.viewing ?? scrubTick()) : 0) + 1));
     resume.addEventListener('click', () => {
       if (!scrub || scrub.viewing == null) return;
       scrubResumeFrom(scrub.viewing);

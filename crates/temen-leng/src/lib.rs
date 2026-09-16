@@ -789,6 +789,18 @@ const COMPUTE_LEAVES: &[(&str, u32)] = &[
     ("cpusetIncl", 56),
     ("setAffinity", 57),
     ("syscall", 58),
+    // **The rest of `std/atomics`' builtin family** (#1443). The other six atomics were already here
+    // under nim's `atomic*` spelling; these four are what `std/atomics` itself calls, and they were
+    // the only thing left once the `cpuRelax` `{.emit.}` stopped failing the link. Same
+    // single-vCPU-guest posture as their neighbours (§3d): with one vCPU an atomic is just the
+    // load/modify/store, and a fence has nothing to order against.
+    //
+    // `testAndSet`/`clear` operate on C's `bool` flag object — one byte, hence `load8_u`/`store8`,
+    // *not* the word-width the other atomics use.
+    ("builtinTestAndSet", 59),
+    ("builtinClear", 60),
+    ("builtinThreadFence", 61),
+    ("builtinSignalFence", 62),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the

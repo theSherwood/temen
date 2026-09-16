@@ -188,7 +188,7 @@ fn schema_returns_canonical_names_and_wire_type_bytes() {
             temen_ir::CAP_SELF_TYPE_ID,
             18,
             0,
-            &[cap_id::EXIT as i64, 0, 0],
+            &[cap_id::INSTANTIATOR as i64, 0, 0],
             Some(&mut mem),
         )
         .expect("no schema is probeable")[0];

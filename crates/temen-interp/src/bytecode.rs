@@ -509,7 +509,9 @@ enum Op {
     /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
     /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
     /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
-    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve").
+    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve"); the
+    /// further optional `(region, child_off)` pre-maps a `SharedRegion` whole into the child's window
+    /// at `child_off` before it starts (the 11-arg form).
     InstantiateDetached {
         handle: u32,
         budget: u32,
@@ -519,6 +521,7 @@ enum Op {
         size_log2: u32,
         quota: u32,
         args: Option<(u32, u32)>,
+        premap: Option<(u32, u32)>,
         dst: u32,
     },
     /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
@@ -1774,6 +1777,7 @@ fn compile_inst(
                     size_log2: g(args[5]),
                     quota: g(args[6]),
                     args: (args.len() >= 9).then(|| (g(args[7]), g(args[8]))),
+                    premap: (args.len() >= 11).then(|| (g(args[9]), g(args[10]))),
                     dst,
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
@@ -3080,7 +3084,10 @@ pub enum VcpuEvent {
     /// starter caps span the reservation, as a root's do, so `vm_map` grows it — the tree-walker's
     /// op-15 arm grants the same), and
     /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
-    /// carve.
+    /// carve. A spawn with a grant list and/or a pre-mapped region stashes the child powerbox
+    /// ([`Vcpu::take_granted_host`] is `Some`); the pre-map rides it and the child constructor applies
+    /// it, so a driver needs no extra step — a driver whose emitted tier cannot honour a §13 alias
+    /// checks `Host::has_premap` and runs such a child on the interpreter.
     InstantiateDetached {
         module: u32,
         entry: u32,
@@ -3626,6 +3633,11 @@ impl<'p> Vcpu<'p> {
         // compare is unconditional). `seed_null_guard` skips a carve smaller than the guard, so a tiny
         // sub-window (a 1-KiB grandchild) stays fully usable.
         mm.seed_null_guard(temen_ir::module_null_guard());
+        // Op-15 pre-map: the region staged into this powerbox is aliased onto the fresh window before
+        // the child starts, through its own `map` path. Nothing staged ⇒ no-op.
+        if host.apply_premap(&mut mm) < 0 {
+            return Err(Trap::Malformed);
+        }
         let mem = Some(mm);
         let mut vt = VTask::new(&cunit, entry as usize, &args)?;
         vt.active.module = module as usize;
@@ -4058,6 +4070,7 @@ impl<'p> Vcpu<'p> {
                     dst,
                     grants,
                     args,
+                    premap,
                 }) => {
                     let glist = match grants {
                         Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
@@ -4067,14 +4080,30 @@ impl<'p> Vcpu<'p> {
                         None => None,
                     };
                     match self.event_instantiate_detached(
-                        budget, mh, entry, size_log2, quota, args, dst,
+                        budget, mh, entry, size_log2, quota, args, premap, dst,
                     ) {
                         Ok(Some(ev)) => {
-                            if let Some(list) = glist {
-                                match self.regrant_list_into_child(&list) {
-                                    Ok(h) => self.pending_granted_host = Some(h),
+                            // A grant list and/or a pre-mapped region ride the stashed child powerbox
+                            // (the driver builds the child over it; the constructor applies the map).
+                            if glist.is_some() || premap.is_some() {
+                                let mut child = match self
+                                    .regrant_list_into_child(glist.as_deref().unwrap_or(&[]))
+                                {
+                                    Ok(h) => h,
                                     Err(t) => return VcpuEvent::Trapped(t),
+                                };
+                                if let Some((r, o)) = premap {
+                                    let staged = match self.shared_host {
+                                        Some(m) => {
+                                            m.lock_unpoisoned().stage_premap(r, o, &mut child)
+                                        }
+                                        None => self.host.stage_premap(r, o, &mut child),
+                                    };
+                                    if !staged {
+                                        return VcpuEvent::Trapped(Trap::CapFault);
+                                    }
                                 }
+                                self.pending_granted_host = Some(child);
                             }
                             return ev;
                         }
@@ -4309,6 +4338,7 @@ impl<'p> Vcpu<'p> {
         size_log2: i64,
         quota: i64,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
         let (cfuncs, cmem_log2, cimports, ctypes, cdata, cshadow) = match self.shared_host {
@@ -4361,6 +4391,14 @@ impl<'p> Vcpu<'p> {
         };
         let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
         let payload_ok = payload.len() as u64 <= args_room;
+        // The pre-mapped region's geometry (a forged handle traps, as the tree-walker's arm).
+        let premap_ok = match premap {
+            Some((r, o)) => match self.shared_host {
+                Some(m) => m.lock_unpoisoned().premap_admit(r, o, child_size)?,
+                None => self.host.premap_admit(r, o, child_size)?,
+            },
+            None => true,
+        };
         // A **durable** domain refuses op 15 outright (PROCESS.md §5): a detached window is outside
         // the subtree snapshot, and a child no freeze can see is worse than a probeable `-EINVAL`.
         // The tree-walker and the native thunk gate the same way; this arm must too (#1299) — and
@@ -4369,7 +4407,7 @@ impl<'p> Vcpu<'p> {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
         };
-        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || durable {
+        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || durable {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
@@ -5171,13 +5209,13 @@ impl ModuleDebug {
     }
 }
 
-/// A single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
-/// [`DebugRun`]'s root continuation at logical time [`clock`](DebugRunSnapshot::clock), so a reverse
-/// `seek`/`step_back` on the DAP backend can restart a replay here instead of from clock 0 — bounding
-/// the replay to the checkpoint stride. The bytecode counterpart of the tree-walker's `SeekCheckpoint`.
-/// Opaque to the backend, which only stores it in a ladder and hands it back to [`DebugRun::restore`].
-pub struct DebugRunSnapshot {
-    clock: u64,
+/// The bytecode engine's half of a single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the
+/// re-executable continuation of a [`DebugRun`], so a reverse `seek`/`step_back` on the DAP backend
+/// can restart a replay here instead of from clock 0 — bounding the replay to the checkpoint stride.
+/// The window image and the host substate are the [`Moment`](super::moment::Moment)'s own halves,
+/// shared with every other engine's checkpoint; the clock is the ladder's key. Opaque to the backend,
+/// which only stores the moment in a ladder and hands it back to [`DebugRun::restore`].
+pub struct DebugRunContinuation {
     /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
     active: Vm,
     /// The active continuation id — `ROOT_FIBER` or the handle of the fiber currently running.
@@ -5191,22 +5229,12 @@ pub struct DebugRunSnapshot {
     /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
     /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    /// The root window's full memory state — committed bytes **and** page-protection map
-    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore; `None` for a
-    /// memoryless run. Capturing the protection map (not just the prefix bytes) is what admits a
-    /// **page-mapping** root (`map`/`unmap`/`protect`/grow). Fibers and same-module coroutines share this
-    /// one window (coroutines via a `nested_view` over the same backing), so their bytes ride here too.
-    mem: Option<super::MemLayout>,
-    /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
-    host: super::HostReplaySubstate,
 }
 
-impl DebugRunSnapshot {
-    /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
-    pub fn clock(&self) -> u64 {
-        self.clock
-    }
-}
+/// A single-vCPU checkpoint: [`DebugRunContinuation`] plus the shared window image (committed bytes
+/// **and** page-protection map — capturing the map is what admits a **page-mapping** root; fibers and
+/// same-module coroutines share this one window, so their bytes ride in it) and the host substate.
+pub type DebugRunSnapshot = super::moment::Moment<DebugRunContinuation>;
 
 /// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
 /// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
@@ -6353,16 +6381,17 @@ impl DebugRun {
         if !self.checkpointable() {
             return None;
         }
-        Some(DebugRunSnapshot {
-            clock: self.op_clock,
-            active: self.vt.active.clone(),
-            active_id: self.vt.active_id,
-            chain: self.vt.chain.clone(),
-            fibers: self.fibers.clone(),
-            extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
-            host: self.host.replay_substate(),
-        })
+        Some(super::moment::Moment::new(
+            self.mem.as_ref().map(|m| m.layout_snapshot()),
+            &self.host,
+            DebugRunContinuation {
+                active: self.vt.active.clone(),
+                active_id: self.vt.active_id,
+                chain: self.vt.chain.clone(),
+                fibers: self.fibers.clone(),
+                extra_units: self.source.extra_units(),
+            },
+        ))
     }
 
     /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
@@ -6372,19 +6401,21 @@ impl DebugRun {
     /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
     /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
     /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
-    pub fn restore(&mut self, snap: &DebugRunSnapshot) {
-        self.vt.active = snap.active.clone();
-        self.vt.active_id = snap.active_id;
-        self.vt.chain = snap.chain.clone();
-        self.fibers = snap.fibers.clone();
+    /// `clock` is the logical time the snapshot was taken at — the ladder's key, handed back with it.
+    pub fn restore(&mut self, clock: u64, snap: &DebugRunSnapshot) {
+        let c = snap.continuation();
+        self.vt.active = c.active.clone();
+        self.vt.active_id = c.active_id;
+        self.vt.chain = c.chain.clone();
+        self.fibers = c.fibers.clone();
         // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
         // indices resolve against the source).
-        self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+        self.source.reset_extra(&c.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
             m.restore_layout(layout);
         }
-        self.host.restore_replay_substate(&snap.host);
-        self.op_clock = snap.clock;
+        snap.restore_host(&mut self.host);
+        self.op_clock = clock;
         self.done = None;
         self.at_bp = false;
         self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
@@ -7086,10 +7117,11 @@ struct DbgTaskSnapshot {
 /// [`ScheduledDebugRun::checkpointable`]: no §12 fibers, no §14 coroutines/`instantiate` children, a
 /// pristine shared window, a restorable host) — where the per-task active `Vm`s + the shared window
 /// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
-/// counterpart of [`DebugRunSnapshot`]. Opaque to the DAP backend, which stores it in a ladder and hands
-/// it back to [`ScheduledDebugRun::restore`].
-pub struct ScheduledSnapshot {
-    turn: u64,
+/// counterpart of [`DebugRunContinuation`]. Opaque to the DAP backend, which stores the moment in a
+/// ladder keyed on the global turn and hands it back to [`ScheduledDebugRun::restore`].
+pub struct ScheduledContinuation {
+    /// The scheduled-mode op clock (visible ops across all vCPUs) — continuation state, unlike the
+    /// turn, which is the ladder's key.
     clock: u64,
     tasks: Vec<DbgTaskSnapshot>,
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
@@ -7102,12 +7134,11 @@ pub struct ScheduledSnapshot {
     /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
     /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    /// The run window's full memory state — committed bytes **and** page-protection map
-    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore. All tasks share this
-    /// one window; capturing its protection map admits a **page-mapping** run (`map`/`unmap`/`protect`/grow).
-    mem: Option<super::MemLayout>,
-    host: super::HostReplaySubstate,
 }
+
+/// A multi-vCPU checkpoint: [`ScheduledContinuation`] plus the shared window image (all tasks share the
+/// one window; capturing its protection map admits a **page-mapping** run) and the host substate.
+pub type ScheduledSnapshot = super::moment::Moment<ScheduledContinuation>;
 
 /// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`]. Like a coroutine
 /// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
@@ -7131,13 +7162,6 @@ struct EnvSnapshot {
     /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
     /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
     prot: Vec<(u64, super::PageProt)>,
-}
-
-impl ScheduledSnapshot {
-    /// The global turn this checkpoint was taken at — the ladder key the backend searches.
-    pub fn turn(&self) -> u64 {
-        self.turn
-    }
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -8835,8 +8859,7 @@ impl ScheduledDebugRun {
         if !self.checkpointable() {
             return None;
         }
-        Some(ScheduledSnapshot {
-            turn: self.turn,
+        let continuation = ScheduledContinuation {
             clock: self.clock,
             tasks: self
                 .tasks
@@ -8869,9 +8892,12 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
-            host: self.host.replay_substate(),
-        })
+        };
+        Some(super::moment::Moment::new(
+            self.mem.as_ref().map(|m| m.layout_snapshot()),
+            &self.host,
+            continuation,
+        ))
     }
 
     /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
@@ -8881,12 +8907,14 @@ impl ScheduledDebugRun {
     /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
     /// it). A separate-module coroutine/child's pushed source units are re-pushed first (so its `module`
     /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
-    pub fn restore(&mut self, snap: &ScheduledSnapshot) {
-        self.fibers = snap.fibers.clone();
+    /// `turn` is the global turn the snapshot was taken at — the ladder's key, handed back with it.
+    pub fn restore(&mut self, turn: u64, snap: &ScheduledSnapshot) {
+        let c = snap.continuation();
+        self.fibers = c.fibers.clone();
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
-        self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+        self.source.reset_extra(&c.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
             m.restore_layout(layout);
         }
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
@@ -8894,12 +8922,12 @@ impl ScheduledDebugRun {
         // backing region — are already correct); each table is rebuilt over the child's own module.
         let shared_mem = self.mem.as_ref();
         let source = &*self.source;
-        self.extra_envs = snap
+        self.extra_envs = c
             .extra_envs
             .iter()
             .map(|es| rebuild_env(es, shared_mem, source))
             .collect();
-        self.tasks = snap
+        self.tasks = c
             .tasks
             .iter()
             .map(|ts| {
@@ -8925,9 +8953,9 @@ impl ScheduledDebugRun {
                 }
             })
             .collect();
-        self.host.restore_replay_substate(&snap.host);
-        self.turn = snap.turn;
-        self.clock = snap.clock;
+        snap.restore_host(&mut self.host);
+        self.turn = turn;
+        self.clock = c.clock;
         self.stopped = None;
         self.focus = 0;
         self.last_watch = None;
@@ -9464,7 +9492,8 @@ enum Outcome {
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
     /// host-minted window. `budget` is the `Budget` handle (admission = quota take), `grants`
-    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window.
+    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window,
+    /// `premap` the optional `(region, child_off)` pre-mapped `SharedRegion`.
     InstantiateDetached {
         budget: i32,
         mh: i32,
@@ -9474,6 +9503,7 @@ enum Outcome {
         dst: u32,
         grants: Option<(u64, u64)>,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
     },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
@@ -10392,6 +10422,7 @@ enum VcpuStop {
         dst: u32,
         grants: Option<(u64, u64)>,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
     },
     Wait {
         base: u64,
@@ -10910,6 +10941,7 @@ fn step_vcpu(
                 dst,
                 grants,
                 args,
+                premap,
             } => {
                 return Ok(VcpuStop::InstantiateDetached {
                     budget,
@@ -10920,6 +10952,7 @@ fn step_vcpu(
                     dst,
                     grants,
                     args,
+                    premap,
                 })
             }
             Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
@@ -16942,6 +16975,7 @@ impl Vm {
                     size_log2,
                     quota,
                     args,
+                    premap,
                     dst,
                 } => {
                     let ih = r!(*handle).i32();
@@ -16955,6 +16989,7 @@ impl Vm {
                         .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
                         .filter(|(_, n)| *n != 0);
                     let args = args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64));
+                    let premap = premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
@@ -16969,6 +17004,7 @@ impl Vm {
                         dst,
                         grants,
                         args,
+                        premap,
                     });
                 }
                 // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from

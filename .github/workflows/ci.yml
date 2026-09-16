@@ -76,7 +76,6 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo build --workspace
       # ISSUES.md I30 durable mitigation (three sightings: a rust-lld SIGBUS, then two runner
       # losses ~50 s into this step on 2026-07-23): the test build's parallel LINK phase is the
       # memory peak — several temen-jit test binaries (each pulling the large Cranelift + Wasmtime
@@ -94,31 +93,6 @@ jobs:
         run: bash scripts/ci/apt-prep.sh gcc-mingw-w64-x86-64
       - run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
       - run: cargo clippy --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
-
-  # Guard against the I26/I42/I49 class: a play.js demo card referencing an asset that isn't shipped
-  # (neither committed under browser/web/assets/ nor declared deploy-built) → the card 404s. Cheap,
-  # no toolchain (Node is preinstalled) — the required set is derived from web/play.js, so new cards
-  # are covered automatically. The complementary "is every required asset actually assembled into the
-  # published site" check runs at deploy time in pages.yml (--site mode).
-  playground-assets:
-    name: playground assets accounted for
-    runs-on: ubuntu-latest
-    # Every job carries a `timeout-minutes` (the rule #788 and #906 each paid for once: a wedged lane
-    # otherwise burns the 6-hour default before anyone sees it). These are ANTI-WEDGE CEILINGS, not
-    # budgets — each is 4-10x the duration the job actually takes, so only a stall can hit one. Raise
-    # any of them freely if a healthy run ever gets close; that is not the signal they exist for.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - run: node browser/check-play-assets.mjs
-
-  # Tier-2 end-to-end: build the real nimony toolchain and run `crates/temen-leng/tests/nim_e2e.rs`,
-  # which compiles small **Nim source** programs through `nimony c` (→ nifler → nimony → hexer) and
-  # runs them on both Temen engines. Nothing mid-pipeline is committed — the toolchain regenerates the
-  # `.x.nif` each run, so the tests can't rot against a stale snapshot. Without this job the same
-  # tests still run in `check` but *skip* (no toolchain); here they actually execute.
-  # NOTE (owner): actions pinned by SHA per repo convention EXCEPT `alaviss/setup-nim` (no vetted SHA
-  # to hand) — pin it when you copy this over. The nimony build is heavy (~10-15 min cold); the cache
   # makes warm runs cheap.
   nim-e2e:
     name: nim end-to-end (real toolchain → temen)
@@ -164,33 +138,53 @@ jobs:
         with:
           path: nim
           version: devel
+      # provision-nimony.sh now SKIPS its ~4-min build when the restored `nimony/bin` compiles a
+      # probe, so this key has to track the vendored frontend: serving a toolchain built from a
+      # different nimony commit than the checkout's `lib/` would be a silent stale-toolchain bug,
+      # where before the worst case was only wasted time. `HEAD:<path>` reads the gitlink — the exact
+      # pinned commit — so a submodule bump invalidates the cache by construction, rather than by
+      # someone remembering to edit the hand-written `096de9a` that used to sit here.
+      - name: Pin the nimony cache to the vendored commits
+        id: nimony-rev
+        run: echo "sha=$(git rev-parse HEAD:nimony)-$(git rev-parse HEAD:nativenif)" >> "$GITHUB_OUTPUT"
       - name: Cache nimony toolchain build
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: |
             nimony/bin
             ~/.cache/nim
-          key: nimony-${{ runner.os }}-096de9a-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
-          restore-keys: nimony-${{ runner.os }}-096de9a-
+          # No `restore-keys`: a prefix fallback restores a toolchain built by a DIFFERENT script
+          # revision (an `NIM_SRC_REV` bump, say), which is precisely the staleness the skip now
+          # makes consequential. Exact key or rebuild.
+          key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
       - name: Build nimony toolchain
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
         run: cargo test -p temen-leng --test nim_e2e -- --nocapture
       - name: Nim language conformance matrix (#956)
         run: cargo test -p temen-leng --test nim_conformance -- --nocapture
-
-  # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so agent-authored
-  # workflow changes are staged in `.github/workflows_src/` and the owner copies them over
-  # (`cp .github/workflows_src/*.yml .github/workflows/`). This guard reds the run when the two drift —
-  # a staged change hasn't been applied, or one dir was edited without the other — so pending workflow
-  # changes can't be silently forgotten. (This job lives in the copied-over `.github/workflows/ci.yml`,
-  # so it can only start catching drift once the two are first brought into sync.)
-  workflows-in-sync:
-    name: workflows_src == workflows
+  # Three mechanical consistency gates that share a runner. Each was its own job; each ran in ~6
+  # SECONDS and then held one of the account's ~20 concurrency slots, which is the thing actually
+  # rationed once every job is fast (measured on run 4303: longest job 10.5 min, but jobs waited up
+  # to 9.6 min for a runner). Folding them returns two slots per run at no loss of coverage.
+  #
+  # `if: '!cancelled()'` on the later steps is what keeps this from being a downgrade: a job stops at
+  # its first failed step, so without it a PR breaking two of these would see one, fix it, and meet
+  # the next on the following run. All three report every time, exactly as three jobs did.
+  repo-consistency:
+    name: repo consistency (workflows · fuzz matrix · playground assets)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Anti-wedge ceiling, not a budget — see the note on `check`. The sum of three ~6-second checks.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      # The CI token can't push `.github/workflows/` (needs the `workflow` OAuth scope), so
+      # agent-authored workflow changes are staged in `.github/workflows_src/` and the owner copies
+      # them over (`cp .github/workflows_src/*.yml .github/workflows/`). This guard reds the run when
+      # the two drift — a staged change hasn't been applied, or one dir was edited without the other —
+      # so pending workflow changes can't be silently forgotten. (It lives in the copied-over
+      # `.github/workflows/ci.yml`, so it can only catch drift once the two are first in sync.)
       - name: .github/workflows_src/*.yml must match .github/workflows/*.yml
         run: |
           set -u
@@ -219,17 +213,20 @@ jobs:
           if [ "$fail" -eq 0 ]; then echo "workflows_src/ and workflows/ are in sync."; fi
           exit "$fail"
 
-  fuzz-matrix-in-sync:
-    name: fuzz targets wired
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # A fuzz target file with no [[bin]] never builds; one with no matrix row builds but never runs —
-    # zero coverage, silently (the exact hole the fuzz job's "keep this list in lockstep" comment
-    # warns about). Gate it mechanically, the same way `workflows-in-sync` gates the mirror.
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # A fuzz target file with no [[bin]] never builds; one with no matrix row builds but never runs —
+      # zero coverage, silently (the exact hole the fuzz job's "keep this list in lockstep" comment
+      # warns about). Gate it mechanically, the same way the mirror check above gates workflows_src.
       - name: fuzz_targets/*.rs == fuzz/Cargo.toml [[bin]] == ci.yml fuzz matrix
+        if: '!cancelled()'
         run: ./scripts/ci/check-fuzz-matrix.sh
+
+      # No toolchain needed (Node is preinstalled) — the required set is derived from web/play.js, so
+      # new cards are covered automatically. The complementary "is every required asset actually
+      # assembled into the published site" check runs at deploy time in pages.yml (--site mode).
+      - name: playground assets accounted for
+        if: '!cancelled()'
+        run: node browser/check-play-assets.mjs
+
 
   cross-os:
     name: build · test (${{ matrix.os }})
@@ -253,8 +250,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with: { toolchain: "${{ env.RUST_STABLE }}" }
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      # `run:` defaults to PowerShell on windows-latest, and this is a bash script — so it names its
+      # shell. The cargo steps below are shell-agnostic and don't need it.
+      - name: install cargo-nextest (pinned + checksummed per platform)
+        shell: bash
+        run: scripts/ci/install-nextest.sh
+      # One pool across every test binary instead of one binary at a time — the same change #1482
+      # made for temen-llvm. Measured on this workspace (Linux, 4 cores, warm binaries, the same
+      # count either way): `cargo test --workspace` 350s -> `cargo nextest run` 189s, 2796 passed /
+      # 27 skipped. These runners are where it should pay best: no `-j` cap, and the test phase is
+      # ~2-3 min of each job.
+      - run: cargo nextest run --workspace
+      # nextest does not run doctests. This workspace has exactly ONE today (0.23s), so the step is
+      # nearly free — it is here so that adding a second starts running it rather than silently not.
+      - run: cargo test --workspace --doc
 
   fuzz:
     name: cargo-fuzz (all targets)
@@ -798,6 +807,12 @@ jobs:
     # contract of #1392 — the seeded libc's three-way linkage split (`__pg_linkage.h`), the
     # cross-unit data symbols `fprintf(stdout, …)` resolves through, and the merged debug info a
     # debug session steps on. It runs ~60 s; a header edit that breaks any of those fails the PR.
+    # `reactor_moment` / `jit_reactor_moment` gate the #1454 moment family — capture/restore, the
+    # §12 save-state round trip, and the #1457 input tape + keyframe ladder — on all three reactors,
+    # the emitted (wasm-JIT) tier included via `wasmi`. They belong here rather than in `browser-real`
+    # for the same reason `pg_libc_asset` does: their fixtures (`tests/fixtures/{bounce,life,fsread}.temen`)
+    # are committed, so nothing is staged, and the pair runs in ~3 s. A comment further down this file
+    # already calls them the gate for the reactor tiers; until now no job ran them.
     # `pg_libc_asset` gates the committed prebuilt libc unit (`web/assets/pg_libc.temeno`) the card
     # links against: it is doubly wire-coupled (built by the committed `chibicc.temen`, and itself an
     # encoded unit), so an IR / encoder / wire change must regenerate it via `scripts/rebuild-assets.sh`
@@ -828,6 +843,7 @@ jobs:
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
             --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
+            --test reactor_moment --test jit_reactor_moment \
             --test chibicc_link_libc --test pg_libc_asset --test jspb \
             --test module_imports
 

@@ -26,9 +26,10 @@
 //! (server level).
 
 use temen_interp::bytecode::{
-    self, AccessSinkFn, DebugRun, DebugRunSnapshot, SchedBreak, SchedStop, ScheduledDebugRun,
-    ScheduledSnapshot, ScheduledWrite, ValueWatchTarget,
+    self, AccessSinkFn, DebugRun, DebugRunContinuation, SchedBreak, SchedStop,
+    ScheduledContinuation, ScheduledDebugRun, ScheduledWrite, ValueWatchTarget,
 };
+use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
 
 use crate::json::Json;
@@ -586,12 +587,13 @@ pub struct BytecodeBackend {
     /// ascending op clocks (kept sorted) so a reverse `seek`/`step_back` restarts from the nearest one
     /// (`clock <= t`) instead of clock 0, bounding the replay to [`CHECKPOINT_STRIDE`]. Populated lazily
     /// as `seek` drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s
-    /// ladder.
-    checkpoints: Vec<DebugRunSnapshot>,
+    /// ladder. One `Ladder` (unbounded) keyed on the op clock; the ladder itself is the same type the
+    /// tree-walker and the reactor timeline use (`temen_interp::moment`, #1460).
+    checkpoints: Ladder<DebugRunContinuation>,
     /// Multi-vCPU checkpoint ladder (same role as `checkpoints`, keyed on the global scheduler `turn`)
     /// for a threaded session's `ScheduledDebugRun`. Only one of the two ladders is ever populated —
     /// a session is single-vCPU xor threaded for its whole life.
-    sched_checkpoints: Vec<ScheduledSnapshot>,
+    sched_checkpoints: Ladder<ScheduledContinuation>,
     /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
     /// boundary falls outside the [`DebugRun::snapshot`] / [`ScheduledDebugRun::snapshot`] subset (a
     /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable
@@ -735,8 +737,8 @@ impl BytecodeBackend {
             mem_limit,
             tape,
             rev_trace: None,
-            checkpoints: Vec::new(),
-            sched_checkpoints: Vec::new(),
+            checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
+            sched_checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
             checkpointing: true,
             access_sink: None,
             sched_trace: false,
@@ -839,14 +841,8 @@ impl BytecodeBackend {
             self.checkpoints.clear();
             return;
         };
-        let clock = snap.clock();
-        if self.checkpoints.iter().any(|c| c.clock() == clock) {
-            return;
-        }
-        // Keep the ladder sorted by clock (boundaries usually append in order, but a fresh replay-from-0
-        // can fill a gap below an existing entry).
-        let at = self.checkpoints.partition_point(|c| c.clock() < clock);
-        self.checkpoints.insert(at, snap);
+        // Sorted insert, deduped, is the ladder's own contract now.
+        self.checkpoints.take(run.op_clock(), snap);
     }
 
     /// Scheduled-engine counterpart of [`drive_single_to`](BytecodeBackend::drive_single_to): drive a
@@ -881,12 +877,7 @@ impl BytecodeBackend {
             self.sched_checkpoints.clear();
             return;
         };
-        let turn = snap.turn();
-        if self.sched_checkpoints.iter().any(|c| c.turn() == turn) {
-            return;
-        }
-        let at = self.sched_checkpoints.partition_point(|c| c.turn() < turn);
-        self.sched_checkpoints.insert(at, snap);
+        self.sched_checkpoints.take(run.op_turn(), snap);
     }
 
     /// Push the recorded writes into the live engine (slice 8) — its cursor lands past entries at
@@ -1245,8 +1236,8 @@ impl Debuggee for BytecodeBackend {
             // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
             // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
             if self.checkpointing {
-                if let Some(cp) = self.sched_checkpoints.iter().rev().find(|c| c.turn() <= t) {
-                    run.restore(cp);
+                if let Some((turn, cp)) = self.sched_checkpoints.nearest_at_or_before(t) {
+                    run.restore(turn, cp);
                 }
             }
             self.drive_scheduled_to(&mut run, t, &mut fuel);
@@ -1257,6 +1248,11 @@ impl Debuggee for BytecodeBackend {
                 }
             }
             self.engine = Engine::Threaded(Box::new(run));
+            // A `seek` past the furthest point reached so far runs new ground **live**, recording cap
+            // crossings a later reverse seek would otherwise have to re-run live against a rebuilt
+            // powerbox. Absorb them here, exactly as every forward advance does — a host capability's
+            // closure is gone on a rebuild, so only the tape reproduces it (`is_recorded_input`).
+            self.capture_tape();
             return self.step_stop();
         }
         let Some(mut run) = self.fresh_single() else {
@@ -1271,12 +1267,13 @@ impl Debuggee for BytecodeBackend {
         // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
         // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
         if self.checkpointing {
-            if let Some(cp) = self.checkpoints.iter().rev().find(|c| c.clock() <= t) {
-                run.restore(cp);
+            if let Some((clock, cp)) = self.checkpoints.nearest_at_or_before(t) {
+                run.restore(clock, cp);
             }
         }
         self.drive_single_to(&mut run, t, &mut fuel);
         self.engine = Engine::Single(Box::new(run));
+        self.capture_tape(); // see the threaded arm above — a forward seek records new cap crossings
         self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
                               // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
                               // here makes progress instead of immediately re-reporting this stop.

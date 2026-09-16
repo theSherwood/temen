@@ -55,6 +55,39 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// `{.emit.}` bodies that are **pure hints with no semantics**, lowered to nothing (#1443). Exact,
+/// whitespace-normalized matches — see `FuncGen::emit_stmt` for why this is a list and not a pattern.
+const EMIT_NOPS: &[&str] = &[
+    // `std/atomics` `cpuRelax()` — the x86 `PAUSE` / ARM `YIELD` spin-wait hint.
+    r#"asm volatile("pause");"#,
+    r#"asm volatile("yield");"#,
+];
+
+/// Decode a NIF string atom — strip the surrounding quotes and undo the `\HH` byte escapes the
+/// format uses for anything outside its bare-token alphabet (`\22` is `"`, `\28`/`\29` are the
+/// parens). Lossy on non-UTF-8, which is fine: the callers compare or display the result.
+fn nif_unquote(raw: &str) -> String {
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(raw);
+    let b = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&inner[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The RTTI type-header field every `RootObj`-derived object carries at offset 0: an 8-byte pointer
 /// to the object's `Rtti` (vtable / type descriptor). nimony spells the field `vt.00` and accesses
 /// it as `(dot (deref x) vt.00 <inheritance-level>)`; `temen-leng` synthesizes it under this exact name
@@ -1138,6 +1171,27 @@ impl Translator {
                 bytes[off..off + ebytes.len()].copy_from_slice(&ebytes);
                 relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
                 funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
+            } else if ka[1].tag() == Some("oconstr") {
+                // A **nested aggregate field** — most often a `string`, which nimony lowers to an SSO
+                // object: `(kv name (oconstr string (kv bytes <packed>) (kv more (nil))))`. Same
+                // treatment as the inline-array arm above: materialize it recursively at the field's
+                // offset and shift its relocations. Without this arm any object holding a string fell
+                // to the placeholder path, so a module-level `let s = Shape(name: "sq", area: 16)`
+                // failed the whole link with "non-scalar-int global initializer" (#1444).
+                let Some((ebytes, _, erelocs, efrelocs)) = self.const_aggregate_bytes(&ka[1])?
+                else {
+                    return Ok(None);
+                };
+                if bytes.len() < off + ebytes.len() {
+                    bytes.resize(off + ebytes.len(), 0);
+                }
+                bytes[off..off + ebytes.len()].copy_from_slice(&ebytes);
+                relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
+                funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
+            } else if ka[1].tag() == Some("nil") {
+                // An explicit null pointer field — an SSO string's `more` when the text fits inline.
+                // The blob is already zeroed, so this is a no-op; it exists to stop `(nil)` falling
+                // through to the placeholder path and discarding the whole aggregate.
             } else if matches!(peel_cast(&ka[1]).as_atom(), Some(s) if self.proc_names.contains(s))
             {
                 // A **funcref pointer field** — a bare/`cast`-wrapped proc symbol in a pointer slot.
@@ -1348,7 +1402,7 @@ impl Translator {
             // A sub-word integer (`u8`/`i8`/`u16`/`i16`, `char`) is a `Narrow` scalar — loaded and
             // stored at its true width, not widened to a 4/8-byte access.
             Some("i" | "u" | "c") => {
-                let (vt, signed) = int_ty_signed(node)?;
+                let (vt, signed, _) = int_ty_signed(node)?;
                 match vt {
                     ValType::I32 => {
                         let bytes = int_bits(
@@ -3038,6 +3092,15 @@ impl<'a> FuncGen<'a> {
                         return Ok((v.id, desc));
                     }
                 }
+                // A **pointer-typed local** used where an object is expected — C's `p->f`, which
+                // hexer writes as `(dot p f 0)` with no `deref` in the generated `=copy`/`=destroy`
+                // hooks of a variant object. Its slot value *is* the address, pointing at the
+                // pointee: the same rule as the aggregate param above, one indirection further out.
+                if let Some(TyDesc::Ptr(pointee)) = self.local_desc.get(name).cloned() {
+                    if let Some(v) = self.lookup(name) {
+                        return Ok((v.id, *pointee));
+                    }
+                }
                 // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
                 // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
                 // and `indirect_callee` recover the `call.dyn` signature.
@@ -3049,7 +3112,9 @@ impl<'a> FuncGen<'a> {
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
                 // scalar; the linker binds it, and an unresolved name is a fail-closed link error.
                 // (A runnable module has nothing to bind to, so it stays the error below.)
-                if self.t.link_mode {
+                // A name this proc *declares* is never that: silently aliasing a local to a foreign
+                // symbol is a miscompile, so it falls to the error below instead (#1480).
+                if self.t.link_mode && !self.local_desc.contains_key(name) {
                     let addr = self.emit_data_sym(name, 0);
                     return Ok((addr, TyDesc::Scalar(ValType::I64)));
                 }
@@ -3312,7 +3377,11 @@ impl<'a> FuncGen<'a> {
                 )));
             }
         }
-        Err(LengError::Unsupported("`dot` on a non-object".into()))
+        // Name the field and the base's descriptor: "`dot` on a non-object" alone gives whoever hits
+        // this nothing to search for, and the base is exactly what went wrong.
+        Err(LengError::Unsupported(format!(
+            "`dot` field `{fname}` on a non-object base ({bdesc:?})"
+        )))
     }
 
     /// Element `(size, type)` of an array descriptor.
@@ -3710,11 +3779,54 @@ impl<'a> FuncGen<'a> {
             Some("lab") => self.lab_stmt(s),
             Some("break") => self.loop_jump(false, "break"),
             Some("continue") => self.loop_jump(true, "continue"),
+            Some("emit") => self.emit_stmt(s),
             other => Err(LengError::Unsupported(format!(
                 "statement `{}`",
                 other.unwrap_or("<headless>")
             ))),
         }
+    }
+
+    /// `(emit "<raw C>")` — nim's `{.emit.}`, which splices raw C into the generated source.
+    ///
+    /// There is no C front-end on this path and inventing one would be a second route through code
+    /// generation (the prime directive), so the general case fails closed. But **one** emit body was
+    /// blocking six stdlib modules (#1443): `cpuRelax`'s spin-wait hint,
+    ///
+    /// ```c
+    /// asm volatile("pause");   // amd64/i386
+    /// asm volatile("yield");   // arm64/arm
+    /// ```
+    ///
+    /// `std/atomics` is the only module in the vendored stdlib with a C-reaching `emit` at all, and
+    /// `ticketlocks`/`threadpool`/`ioring` import it directly while `locks`/`rlocks` reach it
+    /// transitively — so this single hint is the whole of the reported `emit` gap.
+    ///
+    /// A `PAUSE`/`YIELD` is a **hint with no architectural effect**: it asks the core to back off
+    /// inside a spin loop. Dropping it cannot change what a program computes, and on a confined
+    /// single-vCPU guest there is nothing to back off for. So it lowers to nothing.
+    ///
+    /// The allow-list is deliberately exact rather than a pattern. Silently dropping *arbitrary*
+    /// inline asm would be a correctness hole wearing a compatibility hat: the next emit to appear
+    /// might have real semantics, and we would not find out. Anything unrecognized still fails the
+    /// link — now quoting the body, so the next one takes a minute to triage instead of an hour
+    /// (the old message was a bare "statement `emit`", which said nothing about *which* emit).
+    fn emit_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let raw = s
+            .args()
+            .first()
+            .and_then(|n| n.as_atom())
+            .ok_or_else(|| LengError::Malformed("`emit` without a body".into()))?;
+        let body = nif_unquote(raw);
+        let norm: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if EMIT_NOPS.contains(&norm.as_str()) {
+            return Ok(());
+        }
+        let shown: String = body.chars().take(120).collect();
+        Err(LengError::Unsupported(format!(
+            "`emit` of raw C: `{shown}` (no C front-end on this path; if it is a pure hint with no \
+             semantics, add it to EMIT_NOPS)"
+        )))
     }
 
     /// `(if (elif Cond Body)+ (else Body)?)` → a chain of `br_if`s over blocks.
@@ -4188,7 +4300,7 @@ impl<'a> FuncGen<'a> {
                             "bitnot needs Type and one operand".into(),
                         ));
                     }
-                    let (ty, _) = self.arith_ty(&a[0])?;
+                    let (ty, _, _) = self.arith_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
                     let ones = self.emit_const(ty, -1);
                     Ok(self.emit_bin("xor", ty, x, ones))
@@ -4362,10 +4474,12 @@ impl<'a> FuncGen<'a> {
     /// which nimony emits as `(add EnumT x (conv EnumT 1))`) lowers instead of fail-closing on the
     /// named type. A named type temen-leng holds as a non-integer (aggregate/pointer/funcref) still fails
     /// closed — arithmetic on it is a real type error.
-    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool), LengError> {
+    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool, u32), LengError> {
         if node.tag().is_none() && node.as_atom().is_some() {
             return match self.t.tydesc(node)? {
-                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => Ok((vt, false)),
+                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => {
+                    Ok((vt, false, if vt == ValType::I64 { 64 } else { 32 }))
+                }
                 TyDesc::Narrow { bytes, signed } => Ok((
                     if bytes > 4 {
                         ValType::I64
@@ -4373,6 +4487,7 @@ impl<'a> FuncGen<'a> {
                         ValType::I32
                     },
                     signed,
+                    bytes as u32 * 8,
                 )),
                 other => Err(LengError::Unsupported(format!(
                     "arithmetic on non-integer named type `{}` ({other:?})",
@@ -4409,7 +4524,7 @@ impl<'a> FuncGen<'a> {
             };
             return Ok(self.emit_bin(name, ty, l, r));
         }
-        let (ty, signed) = self.arith_ty(&a[0])?;
+        let (ty, signed, bits) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4432,7 +4547,55 @@ impl<'a> FuncGen<'a> {
             }
             _ => unreachable!(),
         };
-        Ok(self.emit_bin(name, ty, l, r))
+        let v = self.emit_bin(name, ty, l, r);
+        Ok(self.narrow_result(v, bits, signed))
+    }
+
+    /// Wrap an integer result to the **declared width** its op node carries (#1488).
+    ///
+    /// hexer types the operation, not just its operands: `255'u8 + 1'u8` arrives as
+    /// `(add (u 8) b (suf 1u "u8"))`. `arith_ty` maps `(u 8)` onto the `i32` machine slot that holds
+    /// it, and before this the width was simply dropped — so the add wrapped at 32 bits and produced
+    /// 256 where nim produces 0. Narrowing **here**, at the operation, is what makes the value
+    /// correct wherever it goes next: hexer feeds these straight into a `conv` or a call argument
+    /// far more often than it stores them in a sub-word local, so narrowing at the assignment
+    /// instead would have missed the common shape entirely.
+    ///
+    /// This keeps every sub-word integer **canonical** — already truncated and correctly extended —
+    /// which is the invariant the rest of the lowering needs: `div_u`/`rem_u`/`shr_u` are only right
+    /// on a zero-extended operand, `div_s`/`shr_s` only on a sign-extended one, and comparisons only
+    /// on both. The other producers already hold it up (`i32.load8_u`/`load16_s` extend on the way
+    /// in, constants are in range, and a callee's params come from narrowed arguments), so the
+    /// property is inductive once the operators maintain it.
+    ///
+    /// A no-op at full width — 32-bit and 64-bit ops are already wrapped by the machine op, which is
+    /// exactly why they were the widths that looked correct.
+    fn narrow_result(&mut self, v: Val, bits: u32, signed: bool) -> Val {
+        let slot = if v.ty == ValType::I64 { 64 } else { 32 };
+        if bits >= slot {
+            return v;
+        }
+        let sh = (slot - bits) as i64;
+        if signed {
+            // No `extend8_s`/`extend16_s` in this IR: shift the sign bit up to the top and back down
+            // arithmetically, which sign-extends whatever width `bits` is.
+            let k = self.emit_const(v.ty, sh);
+            let up = self.emit_bin_ids("shl", v.ty, v.id, k.id);
+            let out = self.emit_bin_ids("shr_s", v.ty, up, k.id);
+            Val { id: out, ty: v.ty }
+        } else {
+            let mask = self.emit_const(v.ty, ((1u128 << bits) - 1) as i64);
+            let out = self.emit_bin_ids("and", v.ty, v.id, mask.id);
+            Val { id: out, ty: v.ty }
+        }
+    }
+
+    /// `v = <ty>.<op> l r` over raw value ids (the [`emit_bin`] shape without the [`Val`] wrappers).
+    fn emit_bin_ids(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.{op} v{l} v{r}\n", prefix(ty)));
+        id
     }
 
     /// `(bitand|bitor|bitxor|shl|shr|ashr Type Expr Expr)` — bitwise/shift, same `(Type a b)` shape
@@ -4445,7 +4608,7 @@ impl<'a> FuncGen<'a> {
                 "`{op}` needs Type and two operands"
             )));
         }
-        let (ty, signed) = self.arith_ty(&a[0])?;
+        let (ty, signed, bits) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4458,7 +4621,8 @@ impl<'a> FuncGen<'a> {
             "ashr" => "shr_s",
             _ => unreachable!(),
         };
-        Ok(self.emit_bin(name, ty, l, r))
+        let v = self.emit_bin(name, ty, l, r);
+        Ok(self.narrow_result(v, bits, signed))
     }
 
     /// `(eq|neq|lt|le Expr Expr)` — no explicit type (Leng grammar); infer from the left operand.
@@ -4918,6 +5082,43 @@ impl<'a> FuncGen<'a> {
         Ok(spid)
     }
 
+    /// Marshal one argument of a **cross-module (import) call**, shared by [`call_import`] and its
+    /// sret twin [`call_import_sret`]. Returns the `(value id, type)` to pass.
+    ///
+    /// Aggregates go by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)` literal,
+    /// e.g. a `string` argument) is built into a temp, an aggregate **lvalue** rides its own address
+    /// (#760). A scalar goes by value, coerced to the callee's declared param type when the linker
+    /// pooled one (`want`, from [`ext_proc_params`]) — so a narrow value passed to a wider param is
+    /// widened, and a wide one passed to a narrow param is truncated, at the call site. Without that
+    /// the import's signature is inferred from the *arg* types and the mismatch only surfaces
+    /// post-link as a verify `TypeMismatch` (#1400/#1404).
+    ///
+    /// This exists as one function because it previously existed as two. #1400 added the `want`
+    /// coercion to the non-sret loop and left the sret copy untouched, so every cross-module call to
+    /// an **aggregate-returning** proc still inferred its signature from the call site. `std/macros`
+    /// and `std/nifply` both failed to verify on exactly that (#1498): `nifreader.openFromBuffer`
+    /// calls `vfs.initBlob`, whose defaulted `cleanup: proc {.nimcall.}` is an `i32` funcref, and
+    /// hexer expands the default to a bare `(nil)` — lowered as a pointer-width `i64` null with
+    /// nothing to narrow it. Two copies of a rule means one of them is a latent bug.
+    fn marshal_import_arg(
+        &mut self,
+        arg: &Node,
+        want: Option<ValType>,
+    ) -> Result<(u32, ValType), LengError> {
+        if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+            return Ok((addr, ValType::I64));
+        }
+        if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            let (addr, _) = self.lvalue_addr(arg)?;
+            return Ok((addr, ValType::I64));
+        }
+        let v = match want {
+            Some(w) => self.expr_typed(arg, w)?,
+            None => self.expr(arg)?,
+        };
+        Ok((v.id, v.ty))
+    }
+
     /// Lower a cross-module call to a declared Temen `import` + `call.import`. Param types come from
     /// the args; the return arity from the call position (a stmt-call is treated as void). The
     /// runtime binds the import by name at instantiation — the frontend only makes it well-typed.
@@ -4953,23 +5154,10 @@ impl<'a> FuncGen<'a> {
         // Cloned up front so the per-arg `expr_typed` can borrow `self` mutably.
         let param_tys = self.t.ext_proc_params.get(name).cloned();
         for (i, arg) in args[..fixed_end].iter().enumerate() {
-            // Aggregate args pass by address (matching by-address params); scalars by value.
-            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
-                let (addr, _) = self.lvalue_addr(arg)?;
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(want) = param_tys.as_ref().and_then(|p| p.get(i)).copied() {
-                let v = self.expr_typed(arg, want)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            } else {
-                let v = self.expr(arg)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            }
+            let want = param_tys.as_ref().and_then(|p| p.get(i)).copied();
+            let (id, ty) = self.marshal_import_arg(arg, want)?;
+            argvals.push(id);
+            argtys.push(ty);
         }
         if varargs_fixed.is_some() {
             // Marshal the variadic tail into consecutive 8-byte slots of a fresh data-stack buffer
@@ -5059,24 +5247,14 @@ impl<'a> FuncGen<'a> {
         }
         argvals.push(dest_addr);
         argtys.push(ValType::I64); // the sret pointer
-        for arg in args {
-            // Aggregate args pass by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)`
-            // literal, e.g. a `string` argument) is constructed into a temp, an aggregate **lvalue**
-            // (a var) rides its own address. Scalars go by value. This mirrors [`call_import`] (the
-            // non-sret twin); without the rvalue case an aggregate-literal arg to an aggregate-returning
-            // cross-module call (`s = f(a, "lit")`) fell through to `expr` and failed closed (#760).
-            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
-                let (addr, _) = self.lvalue_addr(arg)?;
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else {
-                let v = self.expr(arg)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            }
+                                   // The callee's declared param types index the **source** args — `$sp`/`$sret` are prepended
+                                   // above and are not among them — so `args[i]` pairs with `param_tys[i]` directly.
+        let param_tys = self.t.ext_proc_params.get(name).cloned();
+        for (i, arg) in args.iter().enumerate() {
+            let want = param_tys.as_ref().and_then(|p| p.get(i)).copied();
+            let (id, ty) = self.marshal_import_arg(arg, want)?;
+            argvals.push(id);
+            argtys.push(ty);
         }
         let slot = self.t.register_import(name, &argtys, None)?; // void: writes via the sret pointer
         let arglist = argvals
@@ -5374,7 +5552,7 @@ fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
 
 /// Parse an integer Leng type `(i N)`/`(u N)`/`(c N)`/`(bool)` to a ValType; error on non-int.
 fn int_ty(node: &Node) -> Result<ValType, LengError> {
-    int_ty_signed(node).map(|(t, _)| t)
+    int_ty_signed(node).map(|(t, _, _)| t)
 }
 
 /// As [`int_ty`], also returning whether the type is signed (`i`/`c`) vs unsigned (`u`/`bool`).
@@ -5386,7 +5564,7 @@ fn ty_is_unsigned(node: &Node) -> bool {
     node.tag() == Some("u")
 }
 
-fn int_ty_signed(node: &Node) -> Result<(ValType, bool), LengError> {
+fn int_ty_signed(node: &Node) -> Result<(ValType, bool, u32), LengError> {
     match node.tag() {
         Some(k @ ("i" | "u" | "c")) => {
             let bits = node
@@ -5400,9 +5578,17 @@ fn int_ty_signed(node: &Node) -> Result<(ValType, bool), LengError> {
             } else {
                 ValType::I32
             };
-            Ok((vt, k != "u"))
+            // `c` is nim's `char`: an **unsigned** 0..255 byte, like `u`, not a signed `i`. Getting
+            // this wrong sign-extends every byte with the high bit set, so `ord(s[i])` on a UTF-8
+            // continuation byte read -61 instead of 195 and every `>= 0x80` lead-byte test in
+            // `std/unicode` went false — `runeLen` counted bytes, `toUpper` skipped multi-byte runes,
+            // `validateUtf8` rejected valid input. A *masking* test still passed (`-61 and 0xC0` is
+            // `0xC0`), which is why this survived: only the comparisons were wrong.
+            Ok((vt, k == "i", width))
         }
-        Some("bool") => Ok((ValType::I32, false)),
+        // `bool` is already canonical 0/1 and is not an arithmetic width — report the slot width so
+        // nothing tries to narrow it.
+        Some("bool") => Ok((ValType::I32, false, 32)),
         Some(other) => Err(LengError::Unsupported(format!(
             "type `{other}` (only integer/bool types are supported)"
         ))),
