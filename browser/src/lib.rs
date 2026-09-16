@@ -3564,14 +3564,12 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
-        // The by-name spawn set, only for a guest that spawns detached: a `Module` and a
-        // `Budget` are non-durable, so granting them everywhere would make every reactor that
-        // saves a warm snapshot unfreezable.
+        // The by-name spawn set, only for a guest that spawns detached: a `Module` grant is
+        // non-durable, so granting it everywhere would make every reactor that saves a warm
+        // snapshot unfreezable.
         if temen_ir::spawns_detached(m) {
             host.grant_detached_spawn_caps(win);
         }
-        granted.instantiator = Some(handle);
-        granted.budget = host.resolve_cap_name("budget");
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
     // included); the grant order itself is unchanged, so every handle keeps its value.
@@ -4166,8 +4164,6 @@ fn pg_setup(
             addrspace: memory,
             jit: None,
             stderr: None,
-            instantiator: None,
-            budget: None,
         };
         let bindings = m
             .imports
@@ -4392,6 +4388,12 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
         (
             "include/stdio.h",
             include_str!("../playground-include/stdio.h"),
+        ),
+        // #1509: the §14 spawn helper (`vm_spawn`/`vm_join`/`vm_cap_of`) as `<temen/spawn.h>` — the
+        // tree's `posix_libc/spawn.c` verbatim (one source), for the attenuation card.
+        (
+            "include/temen/spawn.h",
+            include_str!("../../crates/temen-run/demos/posix_libc/spawn.c"),
         ),
         (
             "include/__pg_decls_only.h",
@@ -4637,9 +4639,12 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
     if !dirs.iter().any(|d| d == "include") {
         dirs.push("include".to_string());
     }
-    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs), so register `include/sys`.
-    if !dirs.iter().any(|d| d == "include/sys") {
-        dirs.push("include/sys".to_string());
+    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs) and `temen/spawn.h`, so
+    // register both subdirectories.
+    for sub in ["include/sys", "include/temen"] {
+        if !dirs.iter().any(|d| d == sub) {
+            dirs.push(sub.to_string());
+        }
     }
     // Split the editor buffer into a **multi-file** project: the compile targets `/in.c` (the text
     // before the first marker), and each `//// file: NAME` marker seeds a sibling file the entry can

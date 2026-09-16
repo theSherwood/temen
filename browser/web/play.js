@@ -386,6 +386,119 @@ block 0 (v0: i64) {
 `,
   },
 
+  '§14 attenuation: two children, two powerboxes (Temen)': {
+    kind: 'module',
+    editable: true,
+    lang: 'temen',
+    mode: 'io',
+    desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
+      'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
+      'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
+      '`instantiator` and `stdout` by name, fills the op-17 spawn record (entry = the child function, a ' +
+      '64 KiB carve of its window, no fuel cap) and a 16-byte grant record, and spawns child A with ' +
+      '`{"stdout" → its stdout}` and child B with an empty list. Each child `self.resolve`s `"stdout"`: A ' +
+      'finds a re-grant of the parent\'s stream and prints through it; B finds nothing and returns 0. ' +
+      'Result 10 (= A·10 + B), stdout "granted" once. Edit the grant count (`vn1`/`vn0`) or the carve to ' +
+      'explore; runs on the bytecode engine with in-process confined children.',
+    src: `; Two children, two powerboxes — attenuation is the grant list (#1509).
+memory 20
+data 16384 "instantiator"
+data 16400 "stdout"
+data 16408 "granted\\n"
+export 0 func "_start" 0    ; the powerbox entry shape: both reference hosts grant the named powerbox
+
+; parent: spawn the child (func 1) twice — A with {"stdout"}, B with nothing — return A*10 + B
+func () -> (i64) {
+block 0 () {
+  vnp = i64.const 16384
+  vnl = i64.const 12
+  vinst = self.resolve vnp vnl          ; this domain's Instantiator, by name
+  vop = i64.const 16400
+  vol = i64.const 6
+  vout = self.resolve vop vol           ; this domain's stdout, by name
+  ; the grant record at 17472: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
+  vg0 = i64.const 17472
+  vopn = i32.const 16400
+  i32.store vg0 vopn
+  vg1 = i64.const 17476
+  vln = i32.const 6
+  i32.store vg1 vln
+  vg2 = i64.const 17480
+  i32.store vg2 vout
+  vg3 = i64.const 17484
+  vz = i32.const 0
+  i32.store vg3 vz
+  ; the spawn record at 17408 (temen_ir::SpawnRec): version 0 | entry 1, carve off/size_log2 16,
+  ; pager none, module -1 (self) | budget 0, quota 0, grants_ptr 17472, grants_n
+  vr0 = i64.const 17408
+  vf0 = i64.const 4294967296            ; version 0, entry 1
+  i64.store vr0 vf0
+  vr2 = i64.const 17424
+  vf2 = i64.const -4294967280           ; size_log2 16, pager u32::MAX
+  i64.store vr2 vf2
+  vr3 = i64.const 17432
+  vf3 = i64.const 4294967295            ; module -1 (self), budget 0
+  i64.store vr3 vf3
+  vr4 = i64.const 17440
+  vq = i64.const 0
+  i64.store vr4 vq                      ; quota 0
+  vr5 = i64.const 17448
+  i64.store vr5 vg0                     ; grants_ptr
+  ; child A: carve [64K, 128K), one grant
+  vr1 = i64.const 17416
+  voffa = i64.const 65536
+  i64.store vr1 voffa
+  vr6 = i64.const 17456
+  vn1 = i64.const 1
+  i64.store vr6 vn1
+  vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vra = call.cap 6 1 (i32) -> (i64) vinst (vha)
+  ; child B: carve [128K, 192K), no grants
+  voffb = i64.const 131072
+  i64.store vr1 voffb
+  vn0 = i64.const 0
+  i64.store vr6 vn0
+  vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vrb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vten = i64.const 10
+  vm = i64.mul vra vten
+  vsum = i64.add vm vrb
+  return vsum
+  }
+}
+
+; child: its carve starts zeroed (a same-module child gets no data image), so it writes the two
+; strings it needs itself, then resolves "stdout" — a re-grant if the parent listed it — and
+; prints through it, else returns 0
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vop = i64.const 16400
+  vname = i64.const 128047728850035        ; "stdout" packed little-endian
+  i64.store vop vname
+  vtx = i64.const 16408
+  vtext = i64.const 748834988792836711    ; "granted\\n"
+  i64.store vtx vtext
+  vol = i64.const 6
+  vh = self.resolve vop vol
+  vz = i32.const 0
+  vmiss = i32.lt_s vh vz
+  br_if vmiss 1() 2(vh)
+}
+block 1 () {
+  vzero = i64.const 0
+  return vzero
+}
+block 2 (vh2: i32) {
+  vtx2 = i64.const 16408
+  vlen = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh2 (vtx2, vlen)
+  vone = i64.const 1
+  return vone
+  }
+}
+`,
+  },
+
   detached: {
     mode: 'onramp',
     desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
@@ -1077,10 +1190,67 @@ int main(void) {
 }
 `,
   },
+  '§14 attenuation from C (chibicc + <temen/spawn.h>)': {
+    kind: 'chibicc',
+    jit: true,
+    editable: true,
+    lang: 'c',
+    url: './assets/chibicc.temen',
+    mode: 'io',
+    desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
+      '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
+      'record into one call — `vm_spawn(module, entry, carve, size_log2, quota, grants, n, scratch)` — ' +
+      'so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns `child` (a ' +
+      'function of this same program, by funcref) twice into two 64 KiB carves: A with `{"stdout"}`, B ' +
+      'with none. A resolves the re-granted stream and prints "granted"; B finds nothing. main() prints ' +
+      'both results and returns A·10 + B = 10. A same-module child starts in a zeroed carve and receives ' +
+      'its starter handles where a C function expects its data-stack pointer, so `child` is written ' +
+      '**stackless** (no address-taken locals, no string literals, VM builtins only).',
+    src: `// Two children, two powerboxes — attenuation is the grant list (#1509).
+#include <stdio.h>
+#include <temen/spawn.h>
+
+long __vm_resolve(const char *name, long len);
+long __vm_write(int h, void *buf, long len);
+
+/* The child entry, spawned into a 64 KiB carve of this window (seen by the child as its own
+   window at 0, zeroed — no data image). Stackless on purpose: a same-module child entry gets its
+   two starter handles where a C function expects its data-stack pointer, so no address-taken
+   locals, no string literals (they live in the parent's data image) and no calls into C here —
+   only VM builtins over two strings it writes itself, just above the NULL guard. */
+long child(long addrspace) {
+  *(long *)16384 = 128047728850035L;            /* "stdout" packed little-endian */
+  *(long *)16400 = 748834988792836711L;         /* "granted\\n" */
+  long h = __vm_resolve((char *)16384, 6);      /* re-granted, or not */
+  if (h < 0) return 0;
+  __vm_write((int)h, (char *)16400, 8);         /* through the re-grant */
+  return 1;
+}
+
+static char pool[3 * 65536]; /* room for two 64 KiB-aligned 64 KiB carves */
+static long scratch[16];     /* the spawn record + one grant record (8-byte aligned) */
+
+int main(void) {
+  int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
+  long ca = ((long)pool + 65535) & ~65535L;
+  long cb = ca + 65536;
+  vm_grant g[1];
+  g[0].name = "stdout";
+  g[0].handle = out;
+  long a = vm_spawn(-1, (long)child, ca, 16, 0, g, 1, scratch);   /* A: stdout re-granted */
+  long ra = vm_join(a);
+  long b = vm_spawn(-1, (long)child, cb, 16, 0, g, 0, scratch);   /* B: empty grant list */
+  long rb = vm_join(b);
+  printf("child A (granted stdout) returned %ld\\n", ra);
+  printf("child B (no grants)      returned %ld\\n", rb);
+  return (int)(ra * 10 + rb);
+}
+`,
+  },
+
   'detached child over a pre-mapped region (chibicc → Temen)': {
     kind: 'chibicc',
     jit: false, // the parent spawns + joins a §5 detached child: interpreter-serviced, no wasm-JIT tier
-    wholeProgram: true, // `extern` capability calls are a whole-program construct (see runChibicc)
     editable: true,
     lang: 'c',
     url: './assets/chibicc.temen',
@@ -1091,10 +1261,10 @@ int main(void) {
       'window at the same offset. The child squares the numbers in place through plain pointer access — ' +
       'it holds no handle and calls no capability — and after `join` the parent prints the results it ' +
       'reads back through its own mapping. Everything the parent needs comes by name from the ' +
-      'powerbox (`__vm_resolve`: `instantiator`, `budget`, `module`) plus the `<temen.h>` region builtins; ' +
-      'the spawn and join are ordinary `extern`s the host binds by name. Compiled by chibicc in your ' +
-      'browser (whole-program: a capability `extern` is not a link symbol, so the libc is compiled in) ' +
-      'and run on the bytecode engine.',
+      'powerbox (`__vm_resolve`: `instantiator`, `budget`, `module`) plus the `<temen.h>` builtins — ' +
+      'the region ops, `__vm_budget_read`, and the spawn/join themselves, each a static `call.cap` on the ' +
+      'handle it names. Compiled by chibicc in your browser, linked against the prebuilt libc, run on ' +
+      'the bytecode engine.',
     src: `// A detached child that shares memory with its parent: the op-15 pre-mapped SharedRegion.
 //
 // The parent mints a SharedRegion, maps it into its own window, fills it with numbers, and spawns
@@ -1112,13 +1282,6 @@ int main(void) {
 // never \`_start\` or the libc — so that page is free, whatever window chibicc sized.
 #define CHILD_OFF 65536
 
-// The host binds these by name (temen_ir::default_cap_resolver); the first argument is the handle.
-extern long vm_budget_read(int budget, long field);
-extern long vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
-                                    long entry, long size_log2, long quota, long args_ptr, long args_len,
-                                    long region, long child_off);
-extern long vm_instantiate_join(int inst, long child);
-
 // The child entry. A detached child receives capability handles, not a data stack, so it keeps to
 // register locals and the pre-mapped pages.
 long child(long unused) {
@@ -1133,20 +1296,20 @@ int main(void) {
   int module = (int)__vm_resolve("module", 6);       // this program, as a spawnable Module
   // The allowance is one window's worth of detached memory — this program's own size — and a
   // child's window must equal the program's declared memory, so the budget says how big both are.
-  long win = vm_budget_read(budget, 1); // field 1 = memory, in bytes
+  long win = __vm_budget_read(budget, 1); // field 1 = memory, in bytes
   int lg = 0;
   while ((1L << lg) < win) lg++;
   int region = (int)__vm_region_create(REGION_LEN);
   long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
   __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
   for (int i = 0; i < N; i++) p[i] = i + 1;
-  long h = vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, 0, region,
-                                   CHILD_OFF);
+  long h = __vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, 0, region,
+                                     CHILD_OFF);
   if (h < 0) {
     printf("spawn refused: %ld\\n", h);
     return 1;
   }
-  long r = vm_instantiate_join(inst, h);
+  long r = __vm_instantiate_join(inst, h);
   printf("child returned %ld; the region now holds:", r);
   for (int i = 0; i < N; i++) printf(" %ld", p[i]);
   printf("\\n");
@@ -2494,19 +2657,30 @@ async function runModule(c) {
   const jitTier = snapshotClient ? 'wasm-JIT (streamed)' : 'wasm-JIT';
   const rec = runStart(c, { tier: useJit ? jitTier : interpTier });
   let bytes;
-  try {
-    bytes = await fetchTimed(rec, c, ex.url);
-  } catch (e) {
-    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
-    logTo(c, `fetch failed: ${e.message}`);
-    runNote(rec, { fetchError: e.message });
-    runEnd(rec, { ok: false });
-    return;
+  if (!ex.url) {
+    // A text-source module card (#1509, the attenuation demo): the editor holds the Temen program
+    // itself, parsed like a text card and then run through this path's on-ramp powerbox (stdout /
+    // stdin / exit / memory / addrspace + a named `instantiator`) on the bytecode engine — the
+    // recipe a `.temen` asset gets, minus the fetch.
+    setState(c, 'running', 'parsing…');
+    bytes = parseGuest(c, rec, c.editor.getValue());
+    if (!bytes) return;
+  } else {
+    try {
+      bytes = await fetchTimed(rec, c, ex.url);
+    } catch (e) {
+      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+      logTo(c, `fetch failed: ${e.message}`);
+      runNote(rec, { fetchError: e.message });
+      runEnd(rec, { ok: false });
+      return;
+    }
+    logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
   }
-  logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
-  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua).
+  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua); a
+  // text-source module's editor *is* the program, so it feeds no stdin.
   let stdinBytes = null;
-  if (ex.editable) {
+  if (ex.editable && ex.url) {
     const enc = new TextEncoder().encode(c.editor.getValue());
     if (enc.length > 0) stdinBytes = enc;
   }
@@ -2751,10 +2925,7 @@ async function runChibicc(c) {
   // Separate compilation (#1392): with the prebuilt libc unit resident, compile the user's TU as a
   // *program unit* against libc declarations only and link — instead of compiling the libc in.
   const libH = await openPgLibc(rec, c);
-  // A card can opt out of separate compilation (`wholeProgram`): chibicc lowers an undefined `extern`
-  // to a **capability** import only in whole-program mode — in a program unit it is a link symbol
-  // (`--emit-object`), so a C program that reaches a capability by name compiles the libc in.
-  const sep = libH >= 0 && !ex.wholeProgram;
+  const sep = libH >= 0;
   const flags = gOn | (sep ? 2 /* CHIBICC_PROGRAM_UNIT */ : 0);
   runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn, prebuiltLibc: sep });
   const tCompile = performance.now();

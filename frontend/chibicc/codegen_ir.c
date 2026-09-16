@@ -1490,6 +1490,57 @@ static int gen_builtin_exec_module(Node *node) {
   return r;
 }
 
+// #1509 — `__vm_instantiate_rec(inst, rec_ptr)` / `__vm_instantiate_join(inst, child)`: the §14
+// config-record spawn (`Instantiator` op 17) and `join` (op 1), lowered as a *static* `call.cap` on the
+// caller's `Instantiator` handle — the same shape as `__vm_exec_module` above, and for the same reason: an
+// executor op reaches its seam only through a static `call.cap` (a manifest-bound `call.sym` dispatches
+// generically and cannot spawn). `posix_libc/spawn.c` wraps them: `vm_spawn` fills the record and its
+// grant list, `vm_join` collects the child. The handle is the i32 the guest discovered by reflection
+// (`__vm_cap_at`); the record pointer / child handle widen to i64; the i32 child handle / i64 join result
+// come back as the `long` the C prototype declares (both backends coerce the declared width).
+static int gen_builtin_instantiator(Node *node, int op, const char *who) {
+  Node *a = node->args;
+  if (!a || !a->next || a->next->next)
+    error_tok(node->tok, "codegen_ir: %s(inst, arg) expects 2 arguments", who);
+  int h = gen_expr(a); // i32 Instantiator handle
+  int x = widen_i64(gen_expr(a->next), a->next->ty);
+  int r = nv++;
+  cg("  v%d = call.cap 6 %d (i64) -> (i64) v%d (v%d)\n", r, op, h, x);
+  return r;
+}
+
+// A static `call.cap <iface> <op>` on the caller's handle with `n` i64 operation args — the general
+// form `gen_builtin_instantiator` is the 1-arg case of. `__vm_instantiate_detached(inst, budget,
+// module, grants_ptr, grants_n, entry, size_log2, quota, args_ptr, args_len, region, child_off)` is
+// `Instantiator` op 15 (the §5 detached spawn, 11-arg pre-mapped form) — an executor op, so it must
+// be a static `call.cap` for the same reason as the record spawn above; `__vm_budget_read(budget,
+// field)` is `Budget` op 1 (iface 14): how much of a quota field remains (0 fuel, 1 mem, 2 spawn).
+// Every operation arg widens to the host-ABI i64; the result is the `long` the prototype declares.
+static int gen_builtin_cap_call(Node *node, int iface, int op, int n, const char *who) {
+  Node *a = node->args;
+  if (!a)
+    error_tok(node->tok, "codegen_ir: %s expects a handle and %d arguments", who, n);
+  int h = gen_expr(a); // i32 capability handle
+  int argv[16];
+  int k = 0;
+  for (Node *p = a->next; p; p = p->next) {
+    if (k == n)
+      error_tok(node->tok, "codegen_ir: %s expects %d arguments after the handle", who, n);
+    argv[k++] = widen_i64(gen_expr(p), p->ty);
+  }
+  if (k != n)
+    error_tok(node->tok, "codegen_ir: %s expects %d arguments after the handle", who, n);
+  int r = nv++;
+  cg("  v%d = call.cap %d %d (", r, iface, op);
+  for (int i = 0; i < n; i++)
+    cg("%si64", i ? ", " : "");
+  cg(") -> (i64) v%d (", h);
+  for (int i = 0; i < n; i++)
+    cg("%sv%d", i ? ", " : "", argv[i]);
+  cg(")\n");
+  return r;
+}
+
 // FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
 // `call.cap 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
 // end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
@@ -1968,6 +2019,14 @@ static int gen_expr(Node *node) {
           return gen_builtin_resolve(node);
         if (!strcmp(fname, "__vm_exec_module"))
           return gen_builtin_exec_module(node);
+        if (!strcmp(fname, "__vm_instantiate_rec"))
+          return gen_builtin_instantiator(node, 17, "__vm_instantiate_rec");
+        if (!strcmp(fname, "__vm_instantiate_join"))
+          return gen_builtin_instantiator(node, 1, "__vm_instantiate_join");
+        if (!strcmp(fname, "__vm_instantiate_detached"))
+          return gen_builtin_cap_call(node, 6, 15, 11, "__vm_instantiate_detached");
+        if (!strcmp(fname, "__vm_budget_read"))
+          return gen_builtin_cap_call(node, 14, 1, 1, "__vm_budget_read");
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))

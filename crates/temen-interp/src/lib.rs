@@ -11267,40 +11267,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }};
             }
-            // §5/§14 (IMPORTS.md phase 3): a `call.sym` whose manifest binding is an `Instantiator`
-            // op this eval loop services (`join`, `instantiate_detached`) cannot take the generic
-            // host dispatch — the Host never routes an Instantiator there. Re-dispatch it as the
-            // static `call.cap` it is — the same arm below, so the two spellings cannot diverge
-            // (the Jit driver ops take the same road, above) — on the **binding's** handle: the
-            // granted handle rides the binding and the call site's operand is vestigial (a linked
-            // object unit emits a placeholder there), so it is carried beside the synthesized
-            // instruction rather than read from a register.
-            let synth_cap;
-            let mut synth_handle: Option<i32> = None;
-            let inst = match inst {
-                Inst::CallSym {
-                    import, sig, args, ..
-                } if matches!(
-                    host.lock_unpoisoned().import_binding(*import),
-                    Some(b) if b.type_id == cap_id::INSTANTIATOR && matches!(b.op, 1 | 15)
-                ) =>
-                {
-                    let b = host
-                        .lock_unpoisoned()
-                        .import_binding(*import)
-                        .ok_or(Trap::CapFault)?;
-                    synth_handle = Some(b.handle);
-                    synth_cap = Inst::CapCall {
-                        type_id: cap_id::INSTANTIATOR,
-                        op: b.op,
-                        sig: *sig,
-                        handle: u32::MAX,
-                        args: args.clone(),
-                    };
-                    &synth_cap
-                }
-                _ => inst,
-            };
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
                 // are appended to this frame's `vals` when it returns (see `Return`).
@@ -11354,10 +11320,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = match synth_handle {
-                        Some(h) => h, // an import-bound call: the binding's handle (see above)
-                        None => get_i32(&frames[top].vals, *handle)?,
-                    };
+                    let h = get_i32(&frames[top].vals, *handle)?;
                     let (ibase, isize) = {
                         let hg = host.lock_unpoisoned();
                         hg.resolve_instantiator(h)?
@@ -12289,9 +12252,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             //
                             // Re-lift this together with that capture, not before.
                             let durable = host.lock_unpoisoned().is_durable();
+                            // #1501 — §4's other half, mirrored from the nested arm: *a durable
+                            // domain admits only freezable modules*. An un-instrumented child could
+                            // never drain-then-unwind, so once the gate above lifts this is what
+                            // keeps a durable parent's detached child capturable at all. Inert
+                            // behind the `!durable` gate today; load-bearing the moment it comes out.
+                            let mod_durable_ok = !durable || cm.durable;
                             let admitted = ok_entry
                                 && child_size != 0
                                 && mod_ok
+                                && mod_durable_ok
                                 && payload_ok
                                 && premap_ok
                                 && !durable
@@ -12309,6 +12279,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
                                 let mut ch = Host::new();
+                                // §4: *a durable domain may only spawn durable children* — the
+                                // detached child inherits the bit exactly as a nested one does (the
+                                // nested arm above), so its own spawns/fibers reserve shadow state
+                                // and its own instantiates re-apply the admission rule. #1501: this
+                                // was the half the detached arm never had. Inert behind the
+                                // `!durable` gate; without it a re-lift spawns a child no freeze
+                                // could ever capture.
+                                ch.set_durable(durable);
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
                                     hg.detached_child_attestation()
@@ -12498,6 +12476,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             cdt,
                                         );
                                         child.memop = memop;
+                                        // §4 / #1501: the vCPU's durable bit too, as the nested arm
+                                        // sets it — the shadow-SP bookkeeping keys on this, not the
+                                        // host's.
+                                        child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         Box::new(child)
                                     });
@@ -16773,14 +16755,18 @@ enum Binding {
 /// a fresh child entry (never raising a total — attenuation, D19); `read` reports a field. Charging a
 /// domain's live consumption against its budget is the follow-up (the `create(module, window, budget)`
 /// accounting) — this type is the passable, splittable object the accounting will draw down.
+///
+/// **Public since #1502**: this is also what a `Budget` handle carries across a freeze
+/// ([`DurableBinding::Budget`]) and what the thaw hook ([`Host::set_budget_thaw_hook`]) sees and
+/// returns — one type for the live table, the artifact, and the hook, never a second form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct BudgetState {
-    fuel: i64,
-    mem: i64,
-    spawn: i64,
+pub struct BudgetState {
+    pub fuel: i64,
+    pub mem: i64,
+    pub spawn: i64,
     /// #989 — remaining host-served **channel memory** (bytes), the 4th splittable dimension. `-1` =
     /// unbounded. Stamped onto a §14 child's [`Host::channel_cap`] at spawn.
-    channel: i64,
+    pub channel: i64,
 }
 
 /// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `self.attest`. The
@@ -16890,6 +16876,13 @@ pub enum DurableBinding {
     Named {
         idx: u32,
     },
+    /// #1502 — a `Budget` handle's **remaining** quotas at freeze. Value-typed (four `i64`s, no
+    /// parent link: the top-up cascade is guest-driven, INVARIANTS #3 R2), so it rides the artifact
+    /// like `AddressSpace` and is re-minted into `Host::budgets` on thaw. Carrying the *remaining*
+    /// rather than re-granting fresh is what keeps #3's conservation across the boundary: a thawed
+    /// parent cannot re-spend what it already minted. The thaw may **attenuate** it, never raise it
+    /// ([`Host::set_budget_thaw_hook`]).
+    Budget(BudgetState),
 }
 
 /// #1455 — one named host capability captured for restore, parallel to the `host_procs` table (see
@@ -16982,7 +16975,7 @@ pub enum NonDurableKind {
     ModuleLoader,
     Blocking,
     HostProc,
-    Budget,
+    // Budget: retired (#1502) — durable, value-typed, carried as `DurableBinding::Budget`.
     Pipe,
     /// A wired interface offer (IMPORTS.md §3.2) — carries an out-of-line reference to the
     /// offering domain's functions, so it must be re-wired after restore, not snapshotted.
@@ -17620,6 +17613,25 @@ pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Se
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NamedCapRestoreError {
     pub name: String,
+}
+
+/// #1502 — the thaw-side **budget hook**: given a carried `Budget`'s remaining quotas, what the
+/// restoring embedder wants the thawed domain to hold instead. Returning the input re-grants it
+/// verbatim; returning less **attenuates** it (a re-hosted domain under a tighter ceiling); returning
+/// `None` refuses the restore. Returning *more* on any bounded field, or lifting a bounded field to
+/// unbounded, is refused at the boundary — a restore can only grant what this host would have
+/// granted a fresh run, and *less* is what a fresh run under a tighter ceiling would have granted
+/// (INVARIANTS #3). Absent hook ⇒ the carried state verbatim: the default is conservation.
+pub type BudgetThawHook = Box<dyn FnMut(BudgetState) -> Option<BudgetState> + Send>;
+
+/// Why a thaw could not re-grant a carried `Budget` (#1502): the hook declined (`offered: None`) or
+/// offered more than was carried. Names the slot and both states, so an embedder can tell "I refused
+/// on purpose" from "my hook has a sign error".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct BudgetThawRefused {
+    pub slot: u32,
+    pub carried: BudgetState,
+    pub offered: Option<BudgetState>,
 }
 
 /// #801 — a host-served provider's published op list: parallel `names`/`sigs`, indexed by op
@@ -18596,10 +18608,6 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
-    /// #964: the running module's NULL guard (`0` = unguarded), recorded by
-    /// [`Host::set_self_module`] so the JIT cap path's window backend can enforce the reserved
-    /// region without the module in reach.
-    null_guard: u64,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
@@ -18726,6 +18734,10 @@ pub struct Host {
     /// [`Host::restore_durable_named`]. `None` on every host that is not restoring one (which is
     /// every host in a normal run), and never consulted outside a restore.
     named_cap_registrar: Option<NamedCapRegistrar>,
+    /// #1502 — the embedder's thaw-side attenuator for carried `Budget`s, consulted by
+    /// [`Host::attenuate_budgets_for_thaw`]. `None` (the default) means the carried quotas are
+    /// re-granted verbatim; never consulted outside a restore.
+    budget_thaw_hook: Option<BudgetThawHook>,
     /// §7 / IMPORTS.md phase 1: the **import-binding table** — entry `i` is the instantiation-time
     /// resolution of the module's import `i` ([`Host::set_import_bindings`]). Read by the
     /// [`temen_ir::CAP_IMPORT_TYPE_ID`] translation in [`Host::cap_dispatch_slots`], the one shared
@@ -19085,7 +19097,6 @@ impl Host {
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
             cap_pages: None,
-            null_guard: 0,
             quota: Quota::default(),
             jit_tables: Vec::new(),
             jit_validator: None,
@@ -19109,6 +19120,7 @@ impl Host {
             frozen_root_sp: None,
             cap_names: Vec::new(),
             named_cap_registrar: None,
+            budget_thaw_hook: None,
             import_bindings: Vec::new(),
         }
     }
@@ -20645,7 +20657,10 @@ impl Host {
                         None => return Err(self.non_durable(slot, NonDurableKind::LiveImpl)),
                     }
                 }
-                Binding::Budget(_) => return Err(self.non_durable(slot, NonDurableKind::Budget)),
+                // #1502: a Budget's whole state is its remaining-quota vector — value-typed, so it
+                // rides verbatim. The index is valid by construction (`budgets` only grows, and every
+                // `Binding::Budget` is minted from a push), so this is a lookup, not a check.
+                Binding::Budget(i) => DurableBinding::Budget(self.budgets[i as usize]),
                 Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
             };
             out.push(DurableHandle {
@@ -20692,7 +20707,10 @@ impl Host {
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
-                | Binding::JitCode { .. } => continue,
+                | Binding::JitCode { .. }
+                // #1502: a Budget is durable (value-typed remaining quotas) — a drain keeps it, the
+                // complement of `capture` above.
+                | Binding::Budget(_) => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
                 Binding::Module(_) => NonDurableKind::Module,
                 Binding::ModuleLoader => NonDurableKind::ModuleLoader,
@@ -20700,7 +20718,6 @@ impl Host {
                 Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
-                Binding::Budget(_) => NonDurableKind::Budget,
                 Binding::PipeEnd { .. } => NonDurableKind::Pipe,
             };
             drained.push(NonDurableHandle {
@@ -20767,6 +20784,15 @@ impl Host {
                 // resolves — and a name the registrar declined never reaches here, because that
                 // restore fails closed before any handle is pinned.
                 DurableBinding::Named { idx } => Binding::HostProc(idx),
+                // #1502: re-mint the carried remaining quotas as a fresh `budgets` entry and bind the
+                // captured slot to it — the guest's handle value resolves to exactly what it had left
+                // at freeze. Any attenuation the embedder asked for has already been applied to the
+                // carried state by `attenuate_budgets_for_thaw`, which the snapshot restore runs first.
+                DurableBinding::Budget(state) => {
+                    let idx = self.budgets.len() as u32;
+                    self.budgets.push(state);
+                    Binding::Budget(idx)
+                }
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
@@ -20880,6 +20906,66 @@ impl Host {
     /// embedder that would have granted those capabilities in the first place.
     pub fn set_named_cap_registrar(&mut self, registrar: NamedCapRegistrar) {
         self.named_cap_registrar = Some(registrar);
+    }
+
+    /// #1502 — install the hook a thaw consults for each carried `Budget`
+    /// ([`Self::attenuate_budgets_for_thaw`]). Called on the **fresh** host before a restore, by the
+    /// embedder that decides what a re-hosted domain may hold.
+    pub fn set_budget_thaw_hook(&mut self, hook: BudgetThawHook) {
+        self.budget_thaw_hook = Some(hook);
+    }
+
+    /// #1502 — the budget half of the authority seam, run by the snapshot restore **before** the
+    /// handle table is pinned (as `restore_durable_named` is for named capabilities): every
+    /// `DurableBinding::Budget` in `handles` is offered to the hook, and rewritten in place to what it
+    /// returns. Fail-closed and attenuate-only: the hook may return the carried state or less on
+    /// every field (a bounded field may shrink, an unbounded one may become bounded); a refusal
+    /// (`None`), a raise, or lifting a bounded field to unbounded refuses the whole restore, naming
+    /// the slot. No hook ⇒ every budget is re-granted verbatim, so conservation is the default.
+    pub fn attenuate_budgets_for_thaw(
+        &mut self,
+        handles: &mut [DurableHandle],
+    ) -> Result<(), BudgetThawRefused> {
+        let Some(mut hook) = self.budget_thaw_hook.take() else {
+            return Ok(());
+        };
+        // `-1` = unbounded. An unbounded carried field admits anything well-formed (still unbounded,
+        // or any bounded amount); a bounded one admits only `0..=carried`.
+        fn attenuates(carried: i64, offered: i64) -> bool {
+            if carried < 0 {
+                offered >= -1
+            } else {
+                (0..=carried).contains(&offered)
+            }
+        }
+        let mut refused = None;
+        for h in handles.iter_mut() {
+            let DurableBinding::Budget(carried) = h.binding else {
+                continue;
+            };
+            let offered = hook(carried);
+            let ok = offered.is_some_and(|o| {
+                attenuates(carried.fuel, o.fuel)
+                    && attenuates(carried.mem, o.mem)
+                    && attenuates(carried.spawn, o.spawn)
+                    && attenuates(carried.channel, o.channel)
+            });
+            match (ok, offered) {
+                (true, Some(o)) => h.binding = DurableBinding::Budget(o),
+                _ => {
+                    refused.get_or_insert(BudgetThawRefused {
+                        slot: h.slot,
+                        carried,
+                        offered,
+                    });
+                }
+            }
+        }
+        self.budget_thaw_hook = Some(hook);
+        match refused {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Capture the §22 guest-JIT domains' out-of-line state for a snapshot (DURABILITY.md §12.5
@@ -21566,17 +21652,7 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
-        // #964/#1094: every module's window reserves `[0, guard)` (the unconditional guard). Recording
-        // it here — the one place every run path registers the running module — lets the native JIT's
-        // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
-        // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
-        self.null_guard = temen_ir::module_null_guard();
         self.self_module = Some(Arc::clone(m));
-    }
-
-    /// #964: the running module's NULL guard (`0` = unguarded) — see [`Host::set_self_module`].
-    pub fn null_guard(&self) -> u64 {
-        self.null_guard
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
@@ -22220,8 +22296,8 @@ impl Host {
     /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
     /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
     /// them beside `"instantiator"` — one frontier (INVARIANTS #14) — to a guest that can spawn
-    /// detached ([`temen_ir::spawns_detached`]): least authority, and both handles are non-durable,
-    /// so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
+    /// detached ([`temen_ir::spawns_detached`]): least authority, and a `Module` grant is
+    /// non-durable, so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
     /// stays a subset of the guest's own reach: the child runs this guest's code, on this budget.
     ///
     /// Requires [`Host::set_self_module`] first (both powerboxes register the running module before
@@ -23540,7 +23616,15 @@ impl Host {
         reservation: u64,
     ) -> Option<(Host, i32, i32)> {
         let attestation = self.detached_child_attestation();
-        self.spawn_child_powerbox(grants, reservation, attestation)
+        // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
+        // op-15 arm sets it (this builder is the native path's twin of that arm).
+        // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
+        // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
+        // this builder's to decide.
+        let durable = self.durable;
+        let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
+        ch.set_durable(durable);
+        Some((ch, cinst, cas))
     }
 
     fn spawn_child_powerbox(
