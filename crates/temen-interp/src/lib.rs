@@ -19703,13 +19703,25 @@ impl Host {
             })
     }
 
-    pub fn set_import_bindings(&mut self, bindings: Vec<BoundImport>) {
+    pub fn set_import_bindings(&mut self, mut bindings: Vec<BoundImport>) {
         debug_assert!(
             bindings
                 .iter()
                 .all(|b| b.type_id != temen_ir::CAP_IMPORT_TYPE_ID),
             "an import binding can never target the import-dispatch pseudo-type_id"
         );
+        // A binding to an op its interface does not have — a host's `(type_id, op)` choice, the one
+        // route to an unknown built-in op that is not the guest's own program (#1515). Decided by
+        // the interface's seeded shape, like the dispatch-time check, and at this one sink rather
+        // than in each constructor: the slot becomes **unbound**, so a call through it gets the
+        // same fail-closed `CapFault` an never-attached rebindable slot gets. No new mechanism.
+        for b in &mut bindings {
+            if let Some(shape) = builtin_iface_shape(b.type_id) {
+                if b.op as usize >= shape.len() {
+                    b.bound = false;
+                }
+            }
+        }
         self.import_remaps = vec![None; bindings.len()];
         self.import_reqs = vec![None; bindings.len()];
         self.import_bindings = bindings;
