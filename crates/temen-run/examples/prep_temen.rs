@@ -40,8 +40,15 @@ fn main() {
 
     // Phase 4: the runtime never rewrites — a powerbox entry keeps its manifest and the runtime
     // binds slots at instantiation, so there is no resolve phase left to measure.
+    // A §14 child-entry module (`--child-entry`: `_start` takes its starter cap and returns an
+    // i64 status) binds the same way when op-13-spawned, so it passes this gate too.
+    let child_entry = module.funcs.first().is_some_and(|f| !f.params.is_empty())
+        && module
+            .exports
+            .iter()
+            .any(|e| e.name == "_start" && e.func == 0);
     assert!(
-        module.imports.is_empty() || temen_run::is_named_powerbox_entry(&module),
+        module.imports.is_empty() || temen_run::is_named_powerbox_entry(&module) || child_entry,
         "module declares imports but has no powerbox entry (IMPORTS.md phase 4)"
     );
 
