@@ -168,6 +168,28 @@ absent natively is a *convenience driver* (`temen-run` has `Session`, which roun
 prefix and so cannot host a grown-heap reactor at all); that is packaging, not capability, and wants a
 consumer before it is built.
 
+**Follow-on — one ladder for the debug checkpoints too (2026-09-16, #1460 first half).** #1454 was filed
+because three routes captured "a moment" and each kept its own ladder of them: the tree-walk
+`Inspector`'s `SeekCheckpoint`s, the bytecode engine's `DebugRunSnapshot`/`ScheduledSnapshot` behind
+the DAP backend, and the reactor keyframes. All three captured the same two things — a window image and
+the host's run-mutable substate — and all three implemented the same sorted, stride-gated, deduped,
+nearest-at-or-before ladder over them; two of the three were unbounded. That is now **one** type,
+`temen_interp::moment::Moment<C>` (the shared halves plus an engine-chosen continuation `C`), and
+**one** ladder, `Ladder<C>`, keyed on whatever monotonic coordinate the driver has — an op clock, a
+scheduler turn, a frame tick — which the ladder never has to interpret. The engines' snapshot types
+are aliases of it (`DebugRunSnapshot = Moment<DebugRunContinuation>` and so on); the tree-walker's
+window image moved from raw bytes onto `MemLayout` in the same change, closing the last holdout of
+#1456's "one image form".
+
+*Why this landed before #1414, and what it deliberately does not do.* #1460 was gated on the converged
+run driver on the reasoning that a ladder per driver is the thing to avoid. The reactor timeline showed
+the ladder can be **driver-agnostic** — it owns no run, runs no tick, and is bracketed by whoever does
+— so nothing about it needed the drivers to converge first; landing it earlier means the duplicates
+stop forming while #1414 waits. What *does* wait is the continuation: a frame vector, a `Vm` plus
+fibers, a task set plus child environments, or nothing at all, are one type parameter here rather than
+one enum, because collapsing them onto one restore path is the same work as collapsing the engines'
+run loops. That is #1460's second half, and it belongs inside #1414.
+
 *Geometry footnote.* The §12 container's reservation checks were bounded by the **host's** pointer
 width (`usize::BITS`). The mask domain is a guest address-space quantity, so an ordinary 4 GiB
 reservation (`reserved_log2 == 32`) froze fine on a 64-bit host and refused with `WindowGeometry` on

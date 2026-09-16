@@ -781,10 +781,17 @@ write loop under the real DAP powerbox) and `bytecode_debug_cap_checkpoint.rs` (
 split, and a stateful capability restored against a live host). *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
 (ladder populated, so `seek` restores) is asserted state-identical — result, paused location, clock,
 and window bytes — to a **cold** one (replays from 0) across checkpoint-stride boundaries, a backward
-sweep, and one-at-a-time `step_back`. *Still open:* **multithreaded** (`turn`-coordinate) checkpoints,
-dirty-page-tracked window copies (today's snapshot is the full mapped prefix), RNG via a dedicated
-iface (vs a host-fn), and capturing a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is
-the debug engine by design, so this is lower priority).
+sweep, and one-at-a-time `step_back`. The **multithreaded** (`turn`-coordinate) ladder is landed too:
+the DAP backend keeps a `sched_checkpoints` ladder keyed on the global turn, and
+`dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_{replay_from_zero,with_live_fibers,with_a_host_capability}`
+hold it to the same warm ≡ cold oracle. *Still open:* dirty-page-tracked window copies (today's
+snapshot is the full mapped prefix — #1459), RNG via a dedicated iface (vs a host-fn), and capturing
+a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is the debug engine by design, so this
+is lower priority). *The ladder itself is shared (#1460):* both this engine's `checkpoints` and the DAP
+backend's two ladders are `temen_interp::moment::Ladder<C>` over `Moment<C>` — the same type the
+playground's reactor keyframes use — keyed on the op clock or the global turn; only the continuation
+`C` is the engine's own. The tree-walk checkpoint's window is a `MemLayout` now rather than raw bytes
+(under `snapshot_safe` the two capture the same bytes; it is the one image form, #1456).
 
 ---
 

@@ -5139,13 +5139,13 @@ impl ModuleDebug {
     }
 }
 
-/// A single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the re-executable state of a
-/// [`DebugRun`]'s root continuation at logical time [`clock`](DebugRunSnapshot::clock), so a reverse
-/// `seek`/`step_back` on the DAP backend can restart a replay here instead of from clock 0 — bounding
-/// the replay to the checkpoint stride. The bytecode counterpart of the tree-walker's `SeekCheckpoint`.
-/// Opaque to the backend, which only stores it in a ladder and hands it back to [`DebugRun::restore`].
-pub struct DebugRunSnapshot {
-    clock: u64,
+/// The bytecode engine's half of a single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the
+/// re-executable continuation of a [`DebugRun`], so a reverse `seek`/`step_back` on the DAP backend
+/// can restart a replay here instead of from clock 0 — bounding the replay to the checkpoint stride.
+/// The window image and the host substate are the [`Moment`](super::moment::Moment)'s own halves,
+/// shared with every other engine's checkpoint; the clock is the ladder's key. Opaque to the backend,
+/// which only stores the moment in a ladder and hands it back to [`DebugRun::restore`].
+pub struct DebugRunContinuation {
     /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
     active: Vm,
     /// The active continuation id — `ROOT_FIBER` or the handle of the fiber currently running.
@@ -5159,22 +5159,12 @@ pub struct DebugRunSnapshot {
     /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
     /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    /// The root window's full memory state — committed bytes **and** page-protection map
-    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore; `None` for a
-    /// memoryless run. Capturing the protection map (not just the prefix bytes) is what admits a
-    /// **page-mapping** root (`map`/`unmap`/`protect`/grow). Fibers and same-module coroutines share this
-    /// one window (coroutines via a `nested_view` over the same backing), so their bytes ride here too.
-    mem: Option<super::MemLayout>,
-    /// The host's run-mutable replay substate (cap cursor, captured stdout/stderr, clock).
-    host: super::HostReplaySubstate,
 }
 
-impl DebugRunSnapshot {
-    /// The logical time (op clock) this checkpoint was taken at — the ladder key the backend searches.
-    pub fn clock(&self) -> u64 {
-        self.clock
-    }
-}
+/// A single-vCPU checkpoint: [`DebugRunContinuation`] plus the shared window image (committed bytes
+/// **and** page-protection map — capturing the map is what admits a **page-mapping** root; fibers and
+/// same-module coroutines share this one window, so their bytes ride in it) and the host substate.
+pub type DebugRunSnapshot = super::moment::Moment<DebugRunContinuation>;
 
 /// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
 /// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
@@ -6317,16 +6307,17 @@ impl DebugRun {
         if !self.checkpointable() {
             return None;
         }
-        Some(DebugRunSnapshot {
-            clock: self.op_clock,
-            active: self.vt.active.clone(),
-            active_id: self.vt.active_id,
-            chain: self.vt.chain.clone(),
-            fibers: self.fibers.clone(),
-            extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
-            host: self.host.replay_substate(),
-        })
+        Some(super::moment::Moment::new(
+            self.mem.as_ref().map(|m| m.layout_snapshot()),
+            &self.host,
+            DebugRunContinuation {
+                active: self.vt.active.clone(),
+                active_id: self.vt.active_id,
+                chain: self.vt.chain.clone(),
+                fibers: self.fibers.clone(),
+                extra_units: self.source.extra_units(),
+            },
+        ))
     }
 
     /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
@@ -6336,19 +6327,21 @@ impl DebugRun {
     /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
     /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
     /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
-    pub fn restore(&mut self, snap: &DebugRunSnapshot) {
-        self.vt.active = snap.active.clone();
-        self.vt.active_id = snap.active_id;
-        self.vt.chain = snap.chain.clone();
-        self.fibers = snap.fibers.clone();
+    /// `clock` is the logical time the snapshot was taken at — the ladder's key, handed back with it.
+    pub fn restore(&mut self, clock: u64, snap: &DebugRunSnapshot) {
+        let c = snap.continuation();
+        self.vt.active = c.active.clone();
+        self.vt.active_id = c.active_id;
+        self.vt.chain = c.chain.clone();
+        self.fibers = c.fibers.clone();
         // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
         // indices resolve against the source).
-        self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+        self.source.reset_extra(&c.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
             m.restore_layout(layout);
         }
-        self.host.restore_replay_substate(&snap.host);
-        self.op_clock = snap.clock;
+        snap.restore_host(&mut self.host);
+        self.op_clock = clock;
         self.done = None;
         self.at_bp = false;
         self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
@@ -7050,10 +7043,11 @@ struct DbgTaskSnapshot {
 /// [`ScheduledDebugRun::checkpointable`]: no §12 fibers, no §14 coroutines/`instantiate` children, a
 /// pristine shared window, a restorable host) — where the per-task active `Vm`s + the shared window
 /// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
-/// counterpart of [`DebugRunSnapshot`]. Opaque to the DAP backend, which stores it in a ladder and hands
-/// it back to [`ScheduledDebugRun::restore`].
-pub struct ScheduledSnapshot {
-    turn: u64,
+/// counterpart of [`DebugRunContinuation`]. Opaque to the DAP backend, which stores the moment in a
+/// ladder keyed on the global turn and hands it back to [`ScheduledDebugRun::restore`].
+pub struct ScheduledContinuation {
+    /// The scheduled-mode op clock (visible ops across all vCPUs) — continuation state, unlike the
+    /// turn, which is the ladder's key.
     clock: u64,
     tasks: Vec<DbgTaskSnapshot>,
     /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs — a fiber migrates,
@@ -7066,12 +7060,11 @@ pub struct ScheduledSnapshot {
     /// coroutine's pushed program), re-pushed on restore so a `module >= 1` frame resolves. Empty for a
     /// same-module-only run. Cheap `Arc` clones — the compiled units are immutable.
     extra_units: Vec<std::sync::Arc<Compiled>>,
-    /// The run window's full memory state — committed bytes **and** page-protection map
-    /// ([`Mem::layout_snapshot`]), reinstated via [`Mem::restore_layout`] on restore. All tasks share this
-    /// one window; capturing its protection map admits a **page-mapping** run (`map`/`unmap`/`protect`/grow).
-    mem: Option<super::MemLayout>,
-    host: super::HostReplaySubstate,
 }
+
+/// A multi-vCPU checkpoint: [`ScheduledContinuation`] plus the shared window image (all tasks share the
+/// one window; capturing its protection map admits a **page-mapping** run) and the host substate.
+pub type ScheduledSnapshot = super::moment::Moment<ScheduledContinuation>;
 
 /// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`]. Like a coroutine
 /// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
@@ -7095,13 +7088,6 @@ struct EnvSnapshot {
     /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
     /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
     prot: Vec<(u64, super::PageProt)>,
-}
-
-impl ScheduledSnapshot {
-    /// The global turn this checkpoint was taken at — the ladder key the backend searches.
-    pub fn turn(&self) -> u64 {
-        self.turn
-    }
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -8798,8 +8784,7 @@ impl ScheduledDebugRun {
         if !self.checkpointable() {
             return None;
         }
-        Some(ScheduledSnapshot {
-            turn: self.turn,
+        let continuation = ScheduledContinuation {
             clock: self.clock,
             tasks: self
                 .tasks
@@ -8832,9 +8817,12 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             extra_units: self.source.extra_units(),
-            mem: self.mem.as_ref().map(|m| m.layout_snapshot()),
-            host: self.host.replay_substate(),
-        })
+        };
+        Some(super::moment::Moment::new(
+            self.mem.as_ref().map(|m| m.layout_snapshot()),
+            &self.host,
+            continuation,
+        ))
     }
 
     /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
@@ -8844,12 +8832,14 @@ impl ScheduledDebugRun {
     /// host substate and both scheduler clocks, and clears the transient stop state (`locate` rederives
     /// it). A separate-module coroutine/child's pushed source units are re-pushed first (so its `module`
     /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
-    pub fn restore(&mut self, snap: &ScheduledSnapshot) {
-        self.fibers = snap.fibers.clone();
+    /// `turn` is the global turn the snapshot was taken at — the ladder's key, handed back with it.
+    pub fn restore(&mut self, turn: u64, snap: &ScheduledSnapshot) {
+        let c = snap.continuation();
+        self.fibers = c.fibers.clone();
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
-        self.source.reset_extra(&snap.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem.as_ref()) {
+        self.source.reset_extra(&c.extra_units);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
             m.restore_layout(layout);
         }
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
@@ -8857,12 +8847,12 @@ impl ScheduledDebugRun {
         // backing region — are already correct); each table is rebuilt over the child's own module.
         let shared_mem = self.mem.as_ref();
         let source = &*self.source;
-        self.extra_envs = snap
+        self.extra_envs = c
             .extra_envs
             .iter()
             .map(|es| rebuild_env(es, shared_mem, source))
             .collect();
-        self.tasks = snap
+        self.tasks = c
             .tasks
             .iter()
             .map(|ts| {
@@ -8888,9 +8878,9 @@ impl ScheduledDebugRun {
                 }
             })
             .collect();
-        self.host.restore_replay_substate(&snap.host);
-        self.turn = snap.turn;
-        self.clock = snap.clock;
+        snap.restore_host(&mut self.host);
+        self.turn = turn;
+        self.clock = c.clock;
         self.stopped = None;
         self.focus = 0;
         self.last_watch = None;

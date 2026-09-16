@@ -725,8 +725,9 @@ pub struct Inspector {
     /// Time-travel **checkpoint ladder** (W1): snapshots of the sole vCPU at ascending `clock`s,
     /// captured during single-threaded `seek` replays so a later `seek`/`step_back` restarts from the
     /// nearest one (`clock ≤ t`) instead of clock 0 — turning a backward sweep from O(t²) into
-    /// ~O(t·stride). Kept sorted by `clock`. Empty in scheduled mode or once `checkpointing` is off.
-    checkpoints: Vec<SeekCheckpoint>,
+    /// ~O(t·stride). Keyed on the op clock; unbounded. Empty in scheduled mode or once `checkpointing`
+    /// is off.
+    checkpoints: moment::Ladder<SeekContinuation>,
     /// Whether this run is eligible for checkpointing — the single-threaded, **root-only, non-fiber,
     /// non-durable, simple-memory** subset where `frames` + window bytes fully capture the
     /// continuation. Starts `true`; the first replay that observes state outside the subset clears it
@@ -777,19 +778,15 @@ struct HostReplaySubstate {
     cap_states: Vec<Option<Vec<u8>>>,
 }
 
-/// A single-threaded time-travel **checkpoint** (W1): the full re-executable state of the sole vCPU at
-/// logical time `clock`, so [`Inspector::seek`] can restart a replay here rather than from clock 0.
-/// Captured only for the root-only / non-fiber / non-durable / simple-memory subset (see
-/// [`Inspector::checkpoint_of`]), where `frames` plus the window bytes fully determine the
-/// continuation.
-struct SeekCheckpoint {
-    clock: u64,
+/// The tree-walker's half of a single-threaded time-travel **checkpoint** (W1): the sole vCPU's call
+/// stack and fuel, so [`Inspector::seek`] can restart a replay at the checkpoint's clock rather than
+/// from clock 0. Captured only for the root-only / non-fiber / non-durable / simple-memory subset (see
+/// [`VCpu::checkpointable`]), where these plus the window image fully determine the continuation. The
+/// window image and the host substate are the [`Moment`](moment::Moment)'s own halves, shared with
+/// every other engine's checkpoint; the clock is the ladder's key, not the checkpoint's.
+struct SeekContinuation {
     frames: Vec<Frame>,
     fuel: u64,
-    /// Mapped window bytes (`Mem::snapshot`), reseeded via `Mem::seed` on restore; `None` for a
-    /// memoryless run.
-    mem: Option<Vec<u8>>,
-    host: HostReplaySubstate,
 }
 
 /// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
@@ -1043,7 +1040,7 @@ impl Inspector {
                 null_guard,
             }),
             finished: None,
-            checkpoints: Vec::new(),
+            checkpoints: moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0),
             checkpointing: true,
         }
     }
@@ -1192,7 +1189,7 @@ impl Inspector {
             finished: None,
             // Scheduled (multithreaded) seek targets the global turn coordinate and is not
             // checkpointed in this slice — checkpointing is the single-threaded path only.
-            checkpoints: Vec::new(),
+            checkpoints: moment::Ladder::new(SEEK_CHECKPOINT_STRIDE, 0, 0),
             checkpointing: false,
         }
     }
@@ -1360,7 +1357,7 @@ impl Inspector {
     fn seek_single(&mut self, init: &SeekInit, host: Arc<Mutex<Host>>, t: u64) -> Stop {
         // Nearest checkpoint at or before `t` (the ladder is kept sorted by `clock`).
         let start = if self.checkpointing {
-            self.checkpoints.iter().rev().find(|c| c.clock <= t)
+            self.checkpoints.nearest_at_or_before(t)
         } else {
             None
         };
@@ -1377,9 +1374,10 @@ impl Inspector {
             None, // the seek target is set per chunk by the drive loop below
             init.null_guard,
         );
-        if let Some(cp) = start {
-            root.restore_continuation(cp.frames.clone(), cp.fuel, cp.mem.as_deref(), cp.clock);
-            host.lock_unpoisoned().restore_replay_substate(&cp.host);
+        if let Some((clock, cp)) = start {
+            let c = cp.continuation();
+            root.restore_continuation(c.frames.clone(), c.fuel, cp.mem(), clock);
+            cp.restore_host(&mut host.lock_unpoisoned());
         }
         self.host = host;
         self.finished = None;
@@ -1444,7 +1442,10 @@ impl Inspector {
             return;
         }
         let clock = root.debug_clock();
-        let host_sub = {
+        if self.checkpoints.holds(clock) {
+            return;
+        }
+        let cp = {
             let h = self.host.lock_unpoisoned();
             // Leave the subset (and drop the ladder) if the continuation or the host has grown state a
             // checkpoint can't faithfully restore.
@@ -1454,23 +1455,20 @@ impl Inspector {
                 self.checkpoints.clear();
                 return;
             }
-            h.replay_substate()
+            // The window as a `MemLayout` (bytes + page map), the one image form (#1456). Under
+            // `snapshot_safe` — which `checkpointable` requires — the map holds only in-prefix `Rw`
+            // commits and the NULL guard, so this captures exactly the bytes `window_snapshot` did and
+            // restores them the same way; it is the same datum in the shared form.
+            moment::Moment::new(
+                root.mem.as_ref().map(|m| m.layout_snapshot()),
+                &h,
+                SeekContinuation {
+                    frames: root.frames.clone(),
+                    fuel: root.fuel,
+                },
+            )
         };
-        if self.checkpoints.iter().any(|c| c.clock == clock) {
-            return;
-        }
-        let host = host_sub;
-        let cp = SeekCheckpoint {
-            clock,
-            frames: root.frames.clone(),
-            fuel: root.fuel,
-            mem: root.mem.as_ref().map(|m| m.window_snapshot()),
-            host,
-        };
-        // Keep the ladder sorted by `clock` (boundaries are usually appended in order, but a fresh
-        // replay-from-0 can fill gaps below an existing entry).
-        let at = self.checkpoints.partition_point(|c| c.clock < clock);
-        self.checkpoints.insert(at, cp);
+        self.checkpoints.take(clock, cp);
     }
 
     /// The current call frame's pc, if any (innermost frame).
@@ -9918,13 +9916,13 @@ impl VCpu {
         &mut self,
         frames: Vec<Frame>,
         fuel: u64,
-        mem_bytes: Option<&[u8]>,
+        mem: Option<&MemLayout>,
         clock: u64,
     ) {
         self.frames = frames;
         self.fuel = fuel;
-        if let (Some(m), Some(bytes)) = (self.mem.as_mut(), mem_bytes) {
-            m.seed(bytes);
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), mem) {
+            m.restore_layout(layout);
         }
         if let Some(d) = self.debug.as_mut() {
             d.clock = clock;

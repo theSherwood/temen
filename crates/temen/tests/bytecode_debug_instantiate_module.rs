@@ -283,7 +283,7 @@ fn scheduled_instantiate_module_checkpoint_snapshot_restore_round_trips() {
             checkpointed_in_child = true;
         }
         let mut warm = module_session();
-        warm.restore(&snap);
+        warm.restore(at_c.op_turn(), &snap);
         let mut i = c;
         assert_eq!(
             sched_full_obs(&mut warm),
