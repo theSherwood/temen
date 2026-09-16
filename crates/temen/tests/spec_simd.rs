@@ -252,6 +252,7 @@ fn spec_v128_load_store_boundary_lattice() {
             }],
             memory: Some(Memory {
                 size_log2: MEM_LOG2,
+                shadow: None,
             }),
             ..Default::default()
         };
@@ -298,6 +299,7 @@ fn spec_v128_load_store_boundary_lattice() {
             }],
             memory: Some(Memory {
                 size_log2: MEM_LOG2,
+                shadow: None,
             }),
             ..Default::default()
         };

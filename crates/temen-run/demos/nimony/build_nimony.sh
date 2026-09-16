@@ -28,7 +28,7 @@ SRC="$HERE/sum_sq_nimony.nim"
 SHIM="$HERE/nimony_runtime_shim.c"
 mkdir -p "$CACHE"
 
-NIMONY="${NIMONY_BIN:-$(command -v nimony || true)}"
+NIMONY="${NIMONY_BIN:+$NIMONY_BIN/nimony}"; NIMONY="${NIMONY:-$(command -v nimony || true)}"
 if [ -z "$NIMONY" ] || [ ! -x "$NIMONY" ]; then
   echo "SKIP: nimony not found (set NIMONY_BIN; bootstrap needs Nim 2.3.x devel — NIM.md §2)"; exit 0
 fi

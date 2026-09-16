@@ -13,7 +13,10 @@ use temen_leng::{bottom_edge_index, bottom_edge_runtime};
 /// a real link the program's larger window wins by max — `temen_ir::link`).
 fn runtime() -> Module {
     let mut m = bottom_edge_runtime();
-    m.memory = Some(Memory { size_log2: 16 });
+    m.memory = Some(Memory {
+        size_log2: 16,
+        shadow: None,
+    });
     temen_verify::verify_module(&m).expect("bottom-edge runtime verifies");
     m
 }

@@ -52,7 +52,10 @@ fn inst_module(params: Vec<ValType>, op: Inst, needs_mem: bool, extra: Vec<Func>
     funcs.extend(extra);
     Module {
         funcs,
-        memory: needs_mem.then_some(Memory { size_log2: 16 }),
+        memory: needs_mem.then_some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     }
 }

@@ -1098,7 +1098,10 @@ pub fn gen_module(g: &mut Gen) -> Module {
         })
         .collect();
     let has_mem = g.boolean();
-    let memory = has_mem.then_some(Memory { size_log2: 16 });
+    let memory = has_mem.then_some(Memory {
+        size_log2: 16,
+        shadow: None,
+    });
     let funcs = (0..nfuncs)
         .map(|fi| gen_func(g, fi, &sigs, has_mem))
         .collect();

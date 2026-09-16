@@ -46,7 +46,10 @@ fn caller(callee: u32) -> Func {
 
 fn module(funcs: Vec<Func>, exports: &[(&str, u32)]) -> Module {
     Module {
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         funcs,
         exports: exports
             .iter()

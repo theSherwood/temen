@@ -17,7 +17,10 @@ use temen_ir::{
 /// guard on their own.
 fn unit_a() -> Module {
     Module {
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384,
             readonly: false,
@@ -36,7 +39,10 @@ fn unit_a() -> Module {
 /// Exercises all three cross-unit data mechanisms through the binary object form at once.
 fn unit_b() -> Module {
     Module {
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 0,
             readonly: false,

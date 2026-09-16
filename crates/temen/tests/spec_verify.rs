@@ -303,7 +303,10 @@ fn directed_rule_rejects() {
 
     // Window size must be representable.
     let mut m = module(vec![func(vec![], vec![], vec![], T::Return(vec![]))]);
-    m.memory = Some(Memory { size_log2: 64 });
+    m.memory = Some(Memory {
+        size_log2: 64,
+        shadow: None,
+    });
     reject(&m, "memory too large", |e| {
         matches!(e, VerifyError::MemorySizeTooLarge { .. })
     });
@@ -319,7 +322,10 @@ fn directed_rule_rejects() {
         matches!(e, VerifyError::DataWithoutMemory { .. })
     });
     let mut m = module(vec![func(vec![], vec![], vec![], T::Return(vec![]))]);
-    m.memory = Some(Memory { size_log2: 12 });
+    m.memory = Some(Memory {
+        size_log2: 12,
+        shadow: None,
+    });
     m.data.push(Data {
         offset: u64::MAX, // offset+len overflows — must fail closed, not wrap
         readonly: false,
@@ -495,7 +501,10 @@ fn directed_rule_rejects() {
         ],
         T::Return(vec![2]),
     )]);
-    m.memory = Some(Memory { size_log2: 12 });
+    m.memory = Some(Memory {
+        size_log2: 12,
+        shadow: None,
+    });
     reject(&m, "gc.roots unsafe mask", |e| {
         matches!(e, VerifyError::GcRootsMaskUnsafe { .. })
     });

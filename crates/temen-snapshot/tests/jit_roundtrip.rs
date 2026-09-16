@@ -26,7 +26,7 @@ fn validator(bytes: &[u8], _mem: Option<u8>, _symtab: &[u8]) -> Result<Arc<[Func
 /// holds the `Jit` cap). The units are submitted separately to `compile`.
 fn gate_module() -> Module {
     let m = temen_text::parse_module(
-        "memory 18\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  return v0\n  }\n}\n",
+        "memory 18 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  return v0\n  }\n}\n",
     )
     .expect("parse gate");
     temen_verify::verify_module(&m).expect("verify gate");
@@ -36,7 +36,7 @@ fn gate_module() -> Module {
 /// A submitted unit blob: `() -> i64` returning `n` (declares memory 18 to match the domain).
 fn unit_blob(n: i64) -> Vec<u8> {
     let src = format!(
-        "memory 18\nfunc () -> (i64) {{\nblock 0 () {{\n  v0 = i64.const {n}\n  return v0\n  }}\n}}\n"
+        "memory 18 shadow 16448 65536\nfunc () -> (i64) {{\nblock 0 () {{\n  v0 = i64.const {n}\n  return v0\n  }}\n}}\n"
     );
     let m = temen_text::parse_module(&src).expect("parse unit");
     temen_verify::verify_module(&m).expect("verify unit");

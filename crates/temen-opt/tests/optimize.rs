@@ -535,7 +535,10 @@ fn keeps_dead_load_but_drops_dead_arithmetic() {
                 term: Terminator::Return(vec![5]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
 
@@ -589,7 +592,10 @@ fn keeps_store_effect_across_renumbering() {
                 term: Terminator::Return(vec![5]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
 

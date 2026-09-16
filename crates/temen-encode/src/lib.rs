@@ -370,7 +370,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 10;
+const VERSION: u16 = 11;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -487,12 +487,21 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         VERSION,
         0,
     );
-    // Memory descriptor: presence flag, then `size_log2` if present.
+    // Memory descriptor: presence flag, then `size_log2`, then the shadow-arena flag and (if set)
+    // its `[base, end)` as two ulebs (v11: the arena is module-declared, INVARIANTS.md #16).
     match &m.memory {
         None => out.push(0),
         Some(mem) => {
             out.push(1);
             out.push(mem.size_log2);
+            match mem.shadow {
+                None => out.push(0),
+                Some(a) => {
+                    out.push(1);
+                    write_uleb(&mut out, a.base);
+                    write_uleb(&mut out, a.end);
+                }
+            }
         }
     }
     // Data segments (§3a / D40): count, then each `readonly` flag, `offset`, and length-prefixed
@@ -1870,9 +1879,18 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     let mut c = Cursor::new(payload);
     let memory = match c.byte()? {
         0 => None,
-        1 => Some(Memory {
-            size_log2: c.byte()?,
-        }),
+        1 => {
+            let size_log2 = c.byte()?;
+            let shadow = match c.byte()? {
+                0 => None,
+                1 => Some(temen_ir::durable_abi::ShadowArena {
+                    base: c.uleb()?,
+                    end: c.uleb()?,
+                }),
+                other => return Err(DecodeError::BadMemoryFlag(other)),
+            };
+            Some(Memory { size_log2, shadow })
+        }
         other => return Err(DecodeError::BadMemoryFlag(other)),
     };
     // Data segments (§3a / D40), mirroring the encoder. Grow incrementally rather than
@@ -2778,7 +2796,10 @@ mod object_tests {
     /// kinds, a data export, and a function body carrying all three link-form instructions.
     fn unit() -> Module {
         Module {
-            memory: Some(Memory { size_log2: 16 }),
+            memory: Some(Memory {
+                size_log2: 16,
+                shadow: None,
+            }),
             data: vec![Data {
                 offset: 0,
                 readonly: false,
@@ -2834,6 +2855,46 @@ mod object_tests {
         let m = unit();
         let bytes = encode_unit(&m);
         assert_eq!(decode_unit(&bytes).expect("decode_unit"), m);
+    }
+
+    /// v11: the memory descriptor carries the module-declared shadow arena, and both its presence
+    /// and its absence survive a round trip (INVARIANTS.md #16 — the declaration is the placement).
+    #[test]
+    fn memory_shadow_arena_roundtrips() {
+        use temen_ir::durable_abi::ShadowArena;
+        let base = Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            types: vec![],
+            funcs: vec![],
+            memory: None,
+            data: vec![],
+            imports: vec![],
+            exports: vec![],
+            data_exports: vec![],
+            impl_exports: vec![],
+            debug_info: None,
+        };
+        for shadow in [
+            None,
+            Some(ShadowArena {
+                base: 16448,
+                end: 65536,
+            }),
+            Some(ShadowArena {
+                base: 0x74000,
+                end: 0x80000,
+            }),
+        ] {
+            let m = Module {
+                memory: Some(Memory {
+                    size_log2: 20,
+                    shadow,
+                }),
+                ..base.clone()
+            };
+            assert_eq!(decode_module(&encode_module(&m)).expect("decode"), m);
+        }
     }
 
     #[test]

@@ -25,6 +25,12 @@ use temen_durable::{
 use temen_interp::{run, run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 const SMALL: i64 = 1_000;
@@ -85,6 +91,7 @@ fn parse(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     m
 }
@@ -125,7 +132,7 @@ fn main() {
         });
         let durable = per_iter(|n| {
             let mut fuel = u64::MAX;
-            let win = init_durable_window(WINDOW);
+            let win = init_durable_window(WINDOW, TEST_ARENA);
             let mut host = Host::new();
             host.set_durable(true);
             let r = run_capture_reserved_with_host(
@@ -153,7 +160,7 @@ fn main() {
     let half = n / 2;
 
     // Confirm the freeze lands mid-loop, and capture the snapshot the thaw will resume from.
-    let mut probe = init_durable_window(WINDOW);
+    let mut probe = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after_backedges(&mut probe, half);
     let mut fuel = u64::MAX;
     let mut host = Host::new();
@@ -171,7 +178,7 @@ fn main() {
 
     // FREEZE: run the first `half` back-edges, then unwind to the safepoint + spill into the window.
     let freeze = best(15, || {
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after_backedges(&mut win, half);
         let mut fuel = u64::MAX;
         let mut host = Host::new();
@@ -191,7 +198,7 @@ fn main() {
     // THAW: restore the snapshot on a fresh host, rewind the frame to the checkpoint, run to the end.
     let thaw = best(15, || {
         let mut img = snap.clone();
-        begin_thaw(&mut img, 0);
+        begin_thaw(&mut img, TEST_ARENA, 0);
         let mut fuel = u64::MAX;
         let mut host = Host::new();
         host.set_durable(true);

@@ -86,8 +86,11 @@ pub fn print_module(m: &Module) -> String {
         }
     }
     if let Some(mem) = &m.memory {
-        let _ = writeln!(s, "memory {}", mem.size_log2);
-        s.push('\n');
+        let _ = write!(s, "memory {}", mem.size_log2);
+        if let Some(a) = mem.shadow {
+            let _ = write!(s, " shadow {} {}", a.base, a.end);
+        }
+        s.push_str("\n\n");
     }
     // The type section (§3.5 surface), one entry per line with its checked positional label:
     // `type <idx> func (params) -> (results)` declares a signature; `type <idx> interface
@@ -1427,13 +1430,27 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 let bytes = p.parse_str()?;
                 dbg_blobs.push(ProducerBlob { producer, bytes });
             }
-            // Module-level `memory <size_log2>` declaration.
+            // Module-level `memory <size_log2> [shadow <base> <end>]` declaration — the optional
+            // tail is the durable shadow arena `[base, end)` (INVARIANTS.md #16).
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
                 let n = p.parse_int()?;
                 let size_log2 = u8::try_from(n)
                     .map_err(|_| ParseError(format!("memory size_log2 out of range: {n}")))?;
-                memory = Some(Memory { size_log2 });
+                let shadow = if matches!(p.peek(), Some(Tok::Ident(k)) if k == "shadow") {
+                    p.next()?;
+                    let base = p.parse_int()?;
+                    let end = p.parse_int()?;
+                    let (Ok(base), Ok(end)) = (u64::try_from(base), u64::try_from(end)) else {
+                        return Err(ParseError(format!(
+                            "memory shadow arena out of range: {base} {end}"
+                        )));
+                    };
+                    Some(temen_ir::durable_abi::ShadowArena { base, end })
+                } else {
+                    None
+                };
+                memory = Some(Memory { size_log2, shadow });
             }
             // §7 named import, dense indices in declaration order. v7 form:
             // `import <idx> func|interface ["ns"] "name" <typeidx> [mode]` — the shape is a
@@ -1686,6 +1703,11 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             Some(Tok::Ident(s)) if s == "memory" => {
                 p.next()?;
                 p.parse_int()?;
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "shadow") {
+                    p.next()?;
+                    p.parse_int()?;
+                    p.parse_int()?;
+                }
             }
             // §7 imports — skip in the header prescan. v7 form: `import <idx> func|interface
             // ["ns"] "name" <typeidx> [mode]`; legacy: `import <idx> "name" (sig) [mode]`.
@@ -3667,6 +3689,30 @@ block 0 (v0: i32) {
   }
 }
 ";
+
+    /// `memory N [shadow BASE END]`: the optional tail is the module-declared durable shadow arena
+    /// (INVARIANTS.md #16); it parses, prints, and re-parses identically, and its absence is `None`.
+    #[test]
+    fn memory_shadow_arena_round_trips() {
+        use temen_ir::durable_abi::ShadowArena;
+        let m = parse_module("memory 17 shadow 16448 65536\n").expect("parse");
+        assert_eq!(
+            m.memory.and_then(|x| x.shadow),
+            Some(ShadowArena {
+                base: 16448,
+                end: 65536
+            })
+        );
+        let printed = print_module(&m);
+        assert!(
+            printed.contains("memory 17 shadow 16448 65536"),
+            "{printed}"
+        );
+        assert_eq!(parse_module(&printed).expect("reparse"), m);
+        let plain = parse_module("memory 17\n").expect("parse");
+        assert_eq!(plain.memory.and_then(|x| x.shadow), None);
+        assert_eq!(parse_module(&print_module(&plain)).expect("reparse"), plain);
+    }
 
     #[test]
     fn imports_round_trip() {

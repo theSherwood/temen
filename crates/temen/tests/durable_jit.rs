@@ -3,6 +3,11 @@
 //! the interpreter-vs-JIT differential (`jit_fuzz.rs`). A failure here is a backend
 //! divergence in the durable transform's emitted IR.
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 #[path = "support/durjit.rs"]
 mod durjit;
 
@@ -43,7 +48,10 @@ block 0 (v0: i32) {
 }
 "#;
     let mut m = temen_text::parse_module(src).expect("parse indirect module");
-    m.memory = Some(temen_ir::Memory { size_log2: 18 });
+    m.memory = Some(temen_ir::Memory {
+        size_log2: 18,
+        shadow: Some(TEST_ARENA),
+    });
     durjit::check_xbackend(&m, 42);
 }
 

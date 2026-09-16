@@ -1638,6 +1638,7 @@ pub fn module_for_mem(row: &MemRow, offset: u64) -> Module {
         }],
         memory: Some(Memory {
             size_log2: MEM_LOG2,
+            shadow: None,
         }),
         ..Default::default()
     }

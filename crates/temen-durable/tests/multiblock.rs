@@ -20,6 +20,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -27,6 +33,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR must verify");
@@ -54,10 +61,10 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>, i64
 fn assert_roundtrips(src: &str, expected: i64) {
     let inst = instrument(src);
 
-    let (baseline, _, _) = run(&inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _, _) = run(&inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(baseline, vec![Value::I64(expected)], "uninterrupted run");
 
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let (_, snapshot, clock_after) = run(&inst, 42, &win);
     assert_eq!(
@@ -67,14 +74,14 @@ fn assert_roundtrips(src: &str, expected: i64) {
     );
 
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let (thawed, final_win, _) = run(&inst, clock_after, &win);
     assert_eq!(
         thawed, baseline,
         "thaw of a non-entry-block freeze equals the oracle"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw ends NORMAL"
     );

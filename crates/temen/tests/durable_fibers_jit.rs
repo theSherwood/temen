@@ -22,10 +22,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{
-    run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
-    SHADOW_BASE, SHADOW_STRIDE,
-};
+use temen_interp::{run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable, FrozenFiber as JitFrozen, JitOutcome,
 };
@@ -33,9 +30,15 @@ use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 /// A pure-arithmetic fiber module the cross-backend freeze/thaw tests share: root resumes a fiber
 /// twice (the fiber suspends once, yielding 42, then returns 7 + 100 = 107). No caps ⇒ deterministic.
-const FIBER_SRC: &str = "memory 17\n\
+const FIBER_SRC: &str = "memory 17 shadow 16448 65536\n\
     func () -> (i64) {\n\
     block 0 () {\n\
     \x20 v0 = ref.func 1\n\
@@ -71,7 +74,7 @@ fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
         .collect()
 }
 
-const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ DURABLE_RESERVE (64 KiB)
+const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ TEST_ARENA.end (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
 
 #[test]
@@ -82,7 +85,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     // §12.8 4A.5: each probe passes `durable.shadow_base` (the active context's own region base, from
     // the runtime-private register) to the host fn, which records it — directly exercising per-context
     // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
-    let src = "memory 17\n\
+    let src = "memory 17 shadow 16448 65536\n\
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
@@ -147,9 +150,9 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
 
     let seen = probes.lock().unwrap().clone();
     assert_eq!(seen.len(), 4, "four probes: root, fiber A, fiber B, root");
-    let root = SHADOW_BASE; // context 0
-    let a = SHADOW_BASE + SHADOW_STRIDE; // fiber slot 0 → context 1
-    let b = SHADOW_BASE + 2 * SHADOW_STRIDE; // fiber slot 1 → context 2
+    let root = TEST_ARENA.region_base(0); // context 0
+    let a = TEST_ARENA.region_base(1); // fiber slot 0 → context 1
+    let b = TEST_ARENA.region_base(2); // fiber slot 1 → context 2
     assert_eq!(seen[0], root, "root runs in context 0's region");
     assert_eq!(
         seen[1], a,
@@ -176,7 +179,7 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
 fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     // Pure-arithmetic fiber (no caps → deterministic): root resumes a fiber that suspends once then
     // would return 7 + 100. Freezing from the start parks the fiber after its suspend.
-    let src = "memory 17\n\
+    let src = "memory 17 shadow 16448 65536\n\
         func () -> (i64) {\n\
         block 0 () {\n\
         \x20 v0 = ref.func 1\n\
@@ -206,7 +209,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     // parked fiber into its region.
     let mut ihost = Host::new();
     ihost.set_durable(true);
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut iwin, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
@@ -218,7 +221,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
 
     // JIT freeze: the new JIT freeze driver must flatten the same fiber identically.
     let mut jhost = Host::new();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jout, jsnap, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
@@ -239,7 +242,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
 
     // The whole durable reserve (control words + both contexts' flattened shadow regions) must
     // match byte-for-byte: the interp and JIT freeze the fiber into the identical artifact.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -259,7 +262,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
     // Interp freeze → artifact_i.
     let mut ihost = Host::new();
     ihost.set_durable(true);
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut iwin, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
@@ -269,7 +272,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
 
     // JIT freeze → residue; serialize through the same codec (set the JIT residue on a host).
     let mut jhost = Host::new();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (_jout, jsnap, residue) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
@@ -328,7 +331,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
         0,
         &[],
         &mut bfuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         WINDOW_LOG2,
         &mut bhost,
     );
@@ -337,7 +340,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
     // Interp freeze → serialize.
     let mut ihost = Host::new();
     ihost.set_durable(true);
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut iwin, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
@@ -348,7 +351,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
     // Restore (re-seeds the frozen fibers into a fresh host) → bridge the residue to the JIT.
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried one frozen fiber");
 
@@ -386,7 +389,7 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
 /// memory (`transform_module_assume_confined`).
 #[test]
 fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
-    let src = "memory 17\n\
+    let src = "memory 17 shadow 16448 65536\n\
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v1 = i64.const 65536\n\
@@ -413,6 +416,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     let mut m = parse_module(src).expect("parse");
     m.memory = Some(temen_ir::Memory {
         size_log2: WINDOW_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     verify_module(&inst).expect("verify");
@@ -422,7 +426,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     ihost.set_durable(true);
     ihost.clock_ns = 42;
     let iclk = ihost.grant_clock();
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut iwin, STATE_UNWINDING);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) = run_capture_reserved_with_host(
@@ -440,7 +444,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     // Restore + bridge the residue to the JIT.
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried the active-chain fiber");
 
@@ -475,7 +479,7 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
 /// bumping its generation to 1 — then fiber B (func 1) reuses slot 0 at **generation 1**, is parked
 /// once, and would resume to completion (7 + 100). Arming the freeze at the 3rd fiber safepoint
 /// (resume A; resume B; B's suspend) lands it with B parked at generation 1.
-const RECYCLE_SRC: &str = "memory 17\n\
+const RECYCLE_SRC: &str = "memory 17 shadow 16448 65536\n\
     func () -> (i64) {\n\
     block 0 () {\n\
     \x20 v0 = ref.func 2\n\
@@ -528,7 +532,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
         0,
         &[],
         &mut bfuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         WINDOW_LOG2,
         &mut bhost,
     );
@@ -537,7 +541,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     // Interp freeze, armed to fire at the 3rd fiber safepoint (B parked, slot 0 recycled to gen 1).
     let mut ihost = Host::new();
     ihost.set_durable(true);
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut iwin, 3);
     let mut ifuel = 1_000_000u64;
     let (ires, isnap) =
@@ -553,7 +557,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
 
     // JIT freeze, identically armed: the JIT's per-thunk trigger must promote at the same safepoint.
     let mut jhost = Host::new();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut jwin, 3);
     let (jout, jsnap, jr) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
@@ -580,7 +584,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
 
     // Byte-identical durable reserve (control words + both contexts' flattened shadow regions): the
     // two backends armed-freeze the recycled fiber into the same image.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -592,7 +596,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
     let mut thost = Host::new();
     let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let seed = jit_seed(thost.frozen_fibers());
     assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");
     assert_eq!(seed[0].generation, 1, "re-seeded at generation 1");

@@ -21,6 +21,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -28,6 +34,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     // These guests deliberately store to the state word to simulate a host-requested freeze
     // at an interior point, which the R9 check would otherwise reject — so use the
@@ -66,12 +73,12 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     let freezable = instrument(freezable);
 
     // Baseline: the uninterrupted oracle run, clock from 42.
-    let (baseline, _, _) = run(&oracle, 42, &init_durable_window(WINDOW));
+    let (baseline, _, _) = run(&oracle, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(baseline, vec![Value::I64(expected)], "oracle result");
 
     // Freeze: run the self-flipping variant from a NORMAL window; it flips to UNWINDING at
     // the chosen point and unwinds there. Record how far the clock advanced.
-    let (_, snapshot, clock_after) = run(&freezable, 42, &init_durable_window(WINDOW));
+    let (_, snapshot, clock_after) = run(&freezable, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_ne!(
         read_state(&snapshot),
         STATE_NORMAL,
@@ -81,14 +88,14 @@ fn assert_resume_at_point(oracle: &str, freezable: &str, expected: i64) {
     // Thaw: restore the artifact, set REWINDING, and continue the clock from where freeze
     // left off (D-scope: the host clock is not in the artifact).
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let (thawed, final_win, _) = run(&freezable, clock_after, &win);
     assert_eq!(
         thawed, baseline,
         "thaw at the frozen resume point equals the oracle"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw ends NORMAL"
     );

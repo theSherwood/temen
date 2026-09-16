@@ -36,7 +36,7 @@ const benign = (t) => /Failed to load resource|status of 404/i.test(t);
 page.on('pageerror', (e) => errors.push(String(e)));
 page.on('console', (m) => { if (m.type() === 'error' && !benign(m.text())) errors.push(m.text()); });
 
-const GUEST_SRC = `memory 17
+const GUEST_SRC = `memory 17 shadow 16448 65536
 func (i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32) {
   voff = i64.const 131072

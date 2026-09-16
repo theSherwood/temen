@@ -29,6 +29,12 @@ use temen_interp::{
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17; // 128 KiB declared window (64 KiB durable reserve + guest-usable above it)
 const RESERVED_LOG2: u8 = 20; // 1 MiB mask domain the guest grows within
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -95,6 +101,7 @@ fn instrument(flip: bool) -> Module {
     let mut m = temen_text::parse_module(&guest_src(flip)).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("confined transform");
     temen_verify::verify_module(&inst).expect("instrumented IR must verify");
@@ -159,7 +166,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     let (baseline, _, _) = run_fresh(
         &oracle,
         FREEZE_CLOCK,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         None,
         &mut base_host,
     );
@@ -172,7 +179,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     let (froze, fsnap, fprots) = run_fresh(
         &freezable,
         FREEZE_CLOCK,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         None,
         &mut fhost,
     );
@@ -245,7 +252,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
     // re-issued, so the grown pages are present only because they rode the snapshot artifact.
     let prog = bytecode::SharedProgram::compile(&freezable).expect("compile for resume");
     let mut rwin = rwin;
-    begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
+    begin_thaw(&mut rwin, TEST_ARENA, 0); // clear the freeze word, set context 0 REWINDING
 
     // A fresh backing sized to the restored reservation, pre-filled with the restored window image
     // (grown pages included). Leaked for the run's life; `Region::shared` borrows it.

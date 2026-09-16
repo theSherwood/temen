@@ -30,7 +30,7 @@ mkdir -p "$CHAIN_CACHE"
 if ! command -v nim >/dev/null; then echo "SKIP: nim not on PATH"; exit 0; fi
 [ -f "$REPO/nimony/src/hexer/hexer.nim" ] || { echo "SKIP: nimony submodule absent"; exit 0; }
 BIN="${NIMONY_TOOLCHAIN_BIN:-$REPO/.nimtool/nimony/bin}"
-NIMONY="${NIMONY_BIN:-$(command -v nimony || echo "$BIN/nimony")}"
+NIMONY="${NIMONY_BIN:+$NIMONY_BIN/nimony}"; NIMONY="${NIMONY:-$(command -v nimony || echo "$BIN/nimony")}"
 HEXER_BIN="${HEXER_BIN:-$(command -v hexer || echo "$BIN/hexer")}"
 [ -x "$NIMONY" ] && [ -x "$HEXER_BIN" ] || { echo "SKIP: nimony/hexer binaries absent (NIM.md §2)"; exit 0; }
 [ -f "$LENG_TEMEN" ] || { echo "cannot find committed temen-leng.temen ($LENG_TEMEN)"; exit 1; }

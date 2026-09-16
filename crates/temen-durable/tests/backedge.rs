@@ -24,6 +24,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::Memory;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -56,6 +62,7 @@ fn module() -> temen_ir::Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -85,13 +92,13 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     let inst = module();
 
     // ---- Baseline: the uninterrupted run (the oracle). Clock seeded at 42. ----
-    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(baseline, Ok(vec![Value::I64(47)]), "uninterrupted: 42 + 5");
 
     // ---- Freeze: arm the back-edge countdown so the freeze lands *mid-loop* (not at the ----
     // pre-loop call.cap). The 3rd branch terminator promotes the word to UNWINDING; the next
     // header poll then unwinds, spilling the loop-carried (counter, accumulator).
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after_backedges(&mut win, 3);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert_eq!(
@@ -109,7 +116,7 @@ fn freeze_inside_a_poll_free_loop_round_trips() {
     // instead of reloaded — or the pre-loop call.cap re-issued — the seed would be 0 and the
     // result would differ. It must reproduce the oracle.
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let (thawed, _) = run(&inst, 0, &win);
     assert_eq!(
         thawed, baseline,
@@ -122,7 +129,7 @@ fn unarmed_run_of_the_loop_is_inert() {
     // With no arming the header poll is a not-taken branch: the instrumented loop behaves exactly
     // like the original and runs to completion.
     let inst = module();
-    let (r, snap) = run(&inst, 7, &init_durable_window(WINDOW));
+    let (r, snap) = run(&inst, 7, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(r, Ok(vec![Value::I64(12)]), "7 + 5, instrumentation inert");
     assert_ne!(
         read_state(&snap),
@@ -136,17 +143,17 @@ fn freeze_at_a_later_back_edge_lands_deeper_in_the_loop() {
     // Arming deeper lets the loop make more progress before the freeze — the header poll fires on
     // whichever iteration the countdown lands on, and the thaw still reproduces the oracle.
     let inst = module();
-    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
 
     for backedges in 1..=5 {
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after_backedges(&mut win, backedges);
         let (_, snapshot) = run(&inst, 42, &win);
         // Whether or not this count lands a freeze (a high count may exit the loop first), a thaw
         // of the resulting image must reproduce the oracle.
         let mut win = snapshot.clone();
         if read_state(&win) == STATE_UNWINDING {
-            begin_thaw(&mut win, 0);
+            begin_thaw(&mut win, TEST_ARENA, 0);
             let (thawed, _) = run(&inst, 0, &win);
             assert_eq!(
                 thawed, baseline,
