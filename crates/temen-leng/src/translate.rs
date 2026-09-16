@@ -1369,7 +1369,7 @@ impl Translator {
             // A sub-word integer (`u8`/`i8`/`u16`/`i16`, `char`) is a `Narrow` scalar — loaded and
             // stored at its true width, not widened to a 4/8-byte access.
             Some("i" | "u" | "c") => {
-                let (vt, signed) = int_ty_signed(node)?;
+                let (vt, signed, _) = int_ty_signed(node)?;
                 match vt {
                     ValType::I32 => {
                         let bytes = int_bits(
@@ -4224,7 +4224,7 @@ impl<'a> FuncGen<'a> {
                             "bitnot needs Type and one operand".into(),
                         ));
                     }
-                    let (ty, _) = self.arith_ty(&a[0])?;
+                    let (ty, _, _) = self.arith_ty(&a[0])?;
                     let x = self.expr_typed(&a[1], ty)?;
                     let ones = self.emit_const(ty, -1);
                     Ok(self.emit_bin("xor", ty, x, ones))
@@ -4398,10 +4398,12 @@ impl<'a> FuncGen<'a> {
     /// which nimony emits as `(add EnumT x (conv EnumT 1))`) lowers instead of fail-closing on the
     /// named type. A named type temen-leng holds as a non-integer (aggregate/pointer/funcref) still fails
     /// closed — arithmetic on it is a real type error.
-    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool), LengError> {
+    fn arith_ty(&self, node: &Node) -> Result<(ValType, bool, u32), LengError> {
         if node.tag().is_none() && node.as_atom().is_some() {
             return match self.t.tydesc(node)? {
-                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => Ok((vt, false)),
+                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => {
+                    Ok((vt, false, if vt == ValType::I64 { 64 } else { 32 }))
+                }
                 TyDesc::Narrow { bytes, signed } => Ok((
                     if bytes > 4 {
                         ValType::I64
@@ -4409,6 +4411,7 @@ impl<'a> FuncGen<'a> {
                         ValType::I32
                     },
                     signed,
+                    bytes as u32 * 8,
                 )),
                 other => Err(LengError::Unsupported(format!(
                     "arithmetic on non-integer named type `{}` ({other:?})",
@@ -4445,7 +4448,7 @@ impl<'a> FuncGen<'a> {
             };
             return Ok(self.emit_bin(name, ty, l, r));
         }
-        let (ty, signed) = self.arith_ty(&a[0])?;
+        let (ty, signed, bits) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4468,7 +4471,55 @@ impl<'a> FuncGen<'a> {
             }
             _ => unreachable!(),
         };
-        Ok(self.emit_bin(name, ty, l, r))
+        let v = self.emit_bin(name, ty, l, r);
+        Ok(self.narrow_result(v, bits, signed))
+    }
+
+    /// Wrap an integer result to the **declared width** its op node carries (#1488).
+    ///
+    /// hexer types the operation, not just its operands: `255'u8 + 1'u8` arrives as
+    /// `(add (u 8) b (suf 1u "u8"))`. `arith_ty` maps `(u 8)` onto the `i32` machine slot that holds
+    /// it, and before this the width was simply dropped — so the add wrapped at 32 bits and produced
+    /// 256 where nim produces 0. Narrowing **here**, at the operation, is what makes the value
+    /// correct wherever it goes next: hexer feeds these straight into a `conv` or a call argument
+    /// far more often than it stores them in a sub-word local, so narrowing at the assignment
+    /// instead would have missed the common shape entirely.
+    ///
+    /// This keeps every sub-word integer **canonical** — already truncated and correctly extended —
+    /// which is the invariant the rest of the lowering needs: `div_u`/`rem_u`/`shr_u` are only right
+    /// on a zero-extended operand, `div_s`/`shr_s` only on a sign-extended one, and comparisons only
+    /// on both. The other producers already hold it up (`i32.load8_u`/`load16_s` extend on the way
+    /// in, constants are in range, and a callee's params come from narrowed arguments), so the
+    /// property is inductive once the operators maintain it.
+    ///
+    /// A no-op at full width — 32-bit and 64-bit ops are already wrapped by the machine op, which is
+    /// exactly why they were the widths that looked correct.
+    fn narrow_result(&mut self, v: Val, bits: u32, signed: bool) -> Val {
+        let slot = if v.ty == ValType::I64 { 64 } else { 32 };
+        if bits >= slot {
+            return v;
+        }
+        let sh = (slot - bits) as i64;
+        if signed {
+            // No `extend8_s`/`extend16_s` in this IR: shift the sign bit up to the top and back down
+            // arithmetically, which sign-extends whatever width `bits` is.
+            let k = self.emit_const(v.ty, sh);
+            let up = self.emit_bin_ids("shl", v.ty, v.id, k.id);
+            let out = self.emit_bin_ids("shr_s", v.ty, up, k.id);
+            Val { id: out, ty: v.ty }
+        } else {
+            let mask = self.emit_const(v.ty, ((1u128 << bits) - 1) as i64);
+            let out = self.emit_bin_ids("and", v.ty, v.id, mask.id);
+            Val { id: out, ty: v.ty }
+        }
+    }
+
+    /// `v = <ty>.<op> l r` over raw value ids (the [`emit_bin`] shape without the [`Val`] wrappers).
+    fn emit_bin_ids(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
+        let id = self.fresh();
+        self.cur_buf
+            .push_str(&format!("  v{id} = {}.{op} v{l} v{r}\n", prefix(ty)));
+        id
     }
 
     /// `(bitand|bitor|bitxor|shl|shr|ashr Type Expr Expr)` — bitwise/shift, same `(Type a b)` shape
@@ -4481,7 +4532,7 @@ impl<'a> FuncGen<'a> {
                 "`{op}` needs Type and two operands"
             )));
         }
-        let (ty, signed) = self.arith_ty(&a[0])?;
+        let (ty, signed, bits) = self.arith_ty(&a[0])?;
         let l = self.expr_typed(&a[1], ty)?;
         let r = self.expr_typed(&a[2], ty)?;
         let name = match op {
@@ -4494,7 +4545,8 @@ impl<'a> FuncGen<'a> {
             "ashr" => "shr_s",
             _ => unreachable!(),
         };
-        Ok(self.emit_bin(name, ty, l, r))
+        let v = self.emit_bin(name, ty, l, r);
+        Ok(self.narrow_result(v, bits, signed))
     }
 
     /// `(eq|neq|lt|le Expr Expr)` — no explicit type (Leng grammar); infer from the left operand.
@@ -5410,7 +5462,7 @@ fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
 
 /// Parse an integer Leng type `(i N)`/`(u N)`/`(c N)`/`(bool)` to a ValType; error on non-int.
 fn int_ty(node: &Node) -> Result<ValType, LengError> {
-    int_ty_signed(node).map(|(t, _)| t)
+    int_ty_signed(node).map(|(t, _, _)| t)
 }
 
 /// As [`int_ty`], also returning whether the type is signed (`i`/`c`) vs unsigned (`u`/`bool`).
@@ -5422,7 +5474,7 @@ fn ty_is_unsigned(node: &Node) -> bool {
     node.tag() == Some("u")
 }
 
-fn int_ty_signed(node: &Node) -> Result<(ValType, bool), LengError> {
+fn int_ty_signed(node: &Node) -> Result<(ValType, bool, u32), LengError> {
     match node.tag() {
         Some(k @ ("i" | "u" | "c")) => {
             let bits = node
@@ -5436,9 +5488,11 @@ fn int_ty_signed(node: &Node) -> Result<(ValType, bool), LengError> {
             } else {
                 ValType::I32
             };
-            Ok((vt, k != "u"))
+            Ok((vt, k != "u", width))
         }
-        Some("bool") => Ok((ValType::I32, false)),
+        // `bool` is already canonical 0/1 and is not an arithmetic width — report the slot width so
+        // nothing tries to narrow it.
+        Some("bool") => Ok((ValType::I32, false, 32)),
         Some(other) => Err(LengError::Unsupported(format!(
             "type `{other}` (only integer/bool types are supported)"
         ))),
