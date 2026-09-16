@@ -274,3 +274,143 @@ fn a_durable_detached_spawn_declines_the_same_way_on_the_interpreter_and_the_nat
         );
     }
 }
+
+/// Op-15 **pre-mapped region** (the 11-arg form) on the native JIT, differential against the
+/// tree-walker: the parent mints a 64 KiB `SharedRegion`, maps it at 65536 in its own window, stores
+/// the word 41 at region byte 0 and spawns the child detached with the region pre-mapped at 65536 of
+/// ITS window. The child reads the word through the alias, writes `2 × 41` at region byte 8 and
+/// returns `41 + 1`; the parent joins and reads the child's word back through its own mapping:
+/// `1000 × 42 + 82`. On the JIT both mappings are real `MAP_SHARED` views of one memfd/section
+/// (`Host::apply_premap` over the child's `MprotectWindow`, before its first instruction); on the
+/// interpreter they are `PageProt::Backed` aliases — same bytes, same result.
+const PREMAP_CHILD: &str = r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 65536
+  vin = i64.load va
+  vtwo = i64.const 2
+  vout = i64.mul vin vtwo
+  vb = i64.const 65544
+  i64.store vb vout
+  vone = i64.const 1
+  vr = i64.add vin vone
+  return vr
+  }
+}
+"#;
+
+/// `v0` Instantiator, `v1` AddressSpace, `v2` the child `Module`, `v3` the `Budget`; `off` is the
+/// child-window offset the region is pre-mapped at (`65536` round-trips; `1 << 17` overruns the
+/// child's window and refuses `-EINVAL`, which the non-joining form returns).
+fn premap_parent(off: u64, join: bool) -> String {
+    let tail = if join {
+        "vj = call.cap 6 1 (i32) -> (i64) v0 (vc)\n  vk = i64.const 1000\n  vm = i64.mul vj vk\n  vob = i64.const 65544\n  vo = i64.load vob\n  vr = i64.add vm vo\n  return vr"
+    } else {
+        "vr = i64.extend_i32_s vc\n  return vr"
+    };
+    format!(
+        r#"memory 17
+func (i32, i32, i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {{
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) v1 (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vin = i64.const 41
+  i64.store vwo vin
+  vmh = i64.extend_i32_u v2
+  vb = i64.extend_i32_u v3
+  vz = i64.const 0
+  vlog = i64.const 17
+  vreg = i64.extend_i32_u vrh
+  voff = i64.const {off}
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, voff)
+  {tail}
+  }}
+}}
+"#
+    )
+}
+
+/// The pre-map parent's powerbox: the four handles, plus the OS shared-memory region factory the JIT's
+/// real `MAP_SHARED` aliasing needs (a software `VecBacking` cannot be `mmap`ed).
+fn premap_host(child: &temen_ir::Module) -> (Host, [i32; 4]) {
+    let mut host = Host::new();
+    host.set_region_factory(temen_run::new_shared_region);
+    let inst = host.grant_instantiator(0, 1u64 << 17);
+    let aspace = host.grant_address_space(0, 1u64 << 17);
+    let modh = host.grant_module(child);
+    let budget = host.grant_budget(0, 1i64 << 17, 0);
+    (host, [inst, aspace, modh, budget])
+}
+
+fn run_premap_jit(parent: &temen_ir::Module, child: &temen_ir::Module) -> i64 {
+    let (mut host, h) = premap_host(child);
+    let args = [h[0] as i64, h[1] as i64, h[2] as i64, h[3] as i64];
+    let (jo, _) = compile_and_run_capture_reserved_with_host_ex(
+        parent,
+        0,
+        &args,
+        &[],
+        temen_ir::DEFAULT_RESERVED_LOG2,
+        temen_run::cap_thunk,
+        &mut host as *mut Host as *mut c_void,
+        Some(temen_run::module_resolver),
+        Some(grant_hooks(&mut host as *mut Host)),
+    )
+    .expect("jit run");
+    match jo {
+        JitOutcome::Returned(ref v) => v.first().copied().unwrap_or(-1),
+        ref o => panic!("jit ended abnormally: {o:?}"),
+    }
+}
+
+fn run_premap_interp(parent: &temen_ir::Module, child: &temen_ir::Module) -> i64 {
+    let (mut host, h) = premap_host(child);
+    let mut fuel = 50_000_000u64;
+    let r = run_with_host(
+        parent,
+        0,
+        &[
+            Value::I32(h[0]),
+            Value::I32(h[1]),
+            Value::I32(h[2]),
+            Value::I32(h[3]),
+        ],
+        &mut fuel,
+        &mut host,
+    )
+    .expect("interp run");
+    match r.first() {
+        Some(Value::I64(x)) => *x,
+        other => panic!("unexpected interp result {other:?}"),
+    }
+}
+
+#[test]
+fn a_pre_mapped_region_round_trips_bulk_data_on_the_jit_as_on_the_interpreter() {
+    let parent = module(&premap_parent(65536, true));
+    let child = module(PREMAP_CHILD);
+    let interp = run_premap_interp(&parent, &child);
+    assert_eq!(interp, 42_082, "the oracle's round trip");
+    assert_eq!(
+        run_premap_jit(&parent, &child),
+        interp,
+        "the JIT matches the oracle"
+    );
+}
+
+#[test]
+fn a_pre_map_overrunning_the_child_window_refuses_probeably_on_both_backends() {
+    let parent = module(&premap_parent(1 << 17, false));
+    let child = module(PREMAP_CHILD);
+    assert_eq!(run_premap_interp(&parent, &child), -22);
+    assert_eq!(
+        run_premap_jit(&parent, &child),
+        -22,
+        "EINVAL, not a trap, on the JIT too"
+    );
+}

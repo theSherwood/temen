@@ -377,33 +377,9 @@ unsafe fn cap_thunk_impl(
     pending: Option<&mut Option<u64>>,
 ) {
     let host = &mut *(ctx as *mut Host);
-    // PROCESS.md S1b/S1c — the **canonical-key futex** region recorder. The JIT futex thunk has no
-    // region map, so a §13 `map` must record which absolute pages alias which region bytes into the JIT
-    // registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The `Host` dispatch owns
-    // the backing (hence its `os_fd`), but only *this* trampoline knows the window's `mem_base`; install
-    // the recorder here, once, over this run's base (the interp needs none — it canonicalizes via its own
-    // `PageProt::Backed`). Idempotent + on the root thread's first `call.cap` (before any `map`/spawn),
-    // so no vCPU races the install. A no-op on non-JIT hosts that never `map` a region.
-    if !mem_base.is_null() && !host.has_region_hook() {
-        let base = mem_base as u64;
-        // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
-        // so a later run reusing the virtual address never inherits a stale region identity.
-        let purge = WindowRegionPurge {
-            base,
-            reserved: mem_reserved,
-        };
-        host.set_region_hook(Some(std::sync::Arc::new(
-            move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
-                let _keep = &purge; // the closure owns the teardown guard
-                match mapped {
-                    Some((region_off, backing)) => {
-                        temen_jit::region_canon_record(base + win_off, len, backing, region_off)
-                    }
-                    None => temen_jit::region_canon_forget_window(base + win_off, len),
-                }
-            },
-        )));
-    }
+    // PROCESS.md S1b/S1c — the canonical-key futex region recorder, installed on the root thread's first
+    // `call.cap` (before any `map`/spawn), so no vCPU races the install.
+    install_region_hook(host, mem_base, mem_reserved);
     // The JIT passes a null args/results pointer when the count is 0; `from_raw_parts` requires a
     // non-null (aligned) pointer even for an empty slice, so use `&[]` in that case (UB otherwise).
     let arg_slots = if n_args == 0 {
@@ -2121,6 +2097,16 @@ locked_parent_hook!(
     (budget: i32, bytes: u64) -> i32
 );
 locked_parent_hook!(
+    premap_admit_locked,
+    premap_admit,
+    (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
+);
+locked_parent_hook!(
+    premap_stage_locked,
+    premap_stage,
+    (child_ctx: *mut c_void, region: i32, child_off: u64) -> i32
+);
+locked_parent_hook!(
     child_bind_imports_locked,
     child_bind_imports,
     (child_ctx: *mut c_void, module: i64) -> i32
@@ -2211,6 +2197,17 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_take
         },
+        premap_admit: if locked {
+            premap_admit_locked
+        } else {
+            premap_admit
+        },
+        premap_stage: if locked {
+            premap_stage_locked
+        } else {
+            premap_stage
+        },
+        premap_apply,
         release: grant_child_release,
         bind_imports: if locked {
             child_bind_imports_locked
@@ -2726,6 +2723,110 @@ pub unsafe extern "C" fn grant_detached_child_build(
     let parent = &mut *(ctx as *mut Host);
     let built = parent.spawn_detached_child(&grants, child_size);
     finish_child_build(parent, built, out, trap_out)
+}
+
+/// PROCESS.md S1b/S1c — install the **canonical-key futex** region recorder on `host` over the window
+/// at `mem_base`, once (idempotent; a no-op for a null base or a host that already has one). The JIT
+/// futex thunk has no region map, so a §13 `map` must record which absolute pages alias which region
+/// bytes into the JIT registry (`temen_jit::region_canon_record`) and `unmap` must forget them. The
+/// `Host` dispatch owns the backing (hence its `os_fd`), but only the cap trampoline — and the op-15
+/// pre-map apply, which runs before the child's first `call.cap` — know the window's base. The interp
+/// needs none: it canonicalizes via its own `PageProt::Backed`.
+fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
+    if mem_base.is_null() || host.has_region_hook() {
+        return;
+    }
+    let base = mem_base as u64;
+    // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
+    // so a later run reusing the virtual address never inherits a stale region identity.
+    let purge = WindowRegionPurge {
+        base,
+        reserved: mem_reserved,
+    };
+    host.set_region_hook(Some(std::sync::Arc::new(
+        move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
+            let _keep = &purge; // the closure owns the teardown guard
+            match mapped {
+                Some((region_off, backing)) => {
+                    temen_jit::region_canon_record(base + win_off, len, backing, region_off)
+                }
+                None => temen_jit::region_canon_forget_window(base + win_off, len),
+            }
+        },
+    )));
+}
+
+/// Op-15 **pre-map admission** on the JIT ([`temen_jit::PremapAdmit`]): the interpreter's
+/// `Host::premap_admit` — `1` admitted, `0` refused (bad geometry; the spawn answers `-EINVAL`,
+/// charging nothing), `-1` with `*trap_out = CapFault` for a forged / wrong-kind handle.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host); `trap_out` the run's trap cell.
+pub unsafe extern "C" fn premap_admit(
+    ctx: *mut c_void,
+    region: i32,
+    child_off: u64,
+    child_size: u64,
+    trap_out: *mut i64,
+) -> i32 {
+    let parent = &*(ctx as *mut Host);
+    match parent.premap_admit(region, child_off, child_size) {
+        Ok(true) => 1,
+        Ok(false) => 0,
+        Err(_) => {
+            *trap_out = TrapKind::CapFault as i64;
+            -1
+        }
+    }
+}
+
+/// Op-15 **pre-map staging** on the JIT ([`temen_jit::PremapStage`]): `Host::stage_premap` — re-grant
+/// the region into the built child powerbox and record the pending alias. Nonzero on success.
+///
+/// # Safety
+/// `parent_ctx` is the live `*mut Host`; `child_ctx` a child powerbox cell from
+/// [`grant_detached_child_build`].
+pub unsafe extern "C" fn premap_stage(
+    parent_ctx: *mut c_void,
+    child_ctx: *mut c_void,
+    region: i32,
+    child_off: u64,
+) -> i32 {
+    let parent = &mut *(parent_ctx as *mut Host);
+    let child_cell = &*(child_ctx as *const Mutex<Host>);
+    let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
+    i32::from(parent.stage_premap(region, child_off, &mut child))
+}
+
+/// Op-15 **pre-map apply** on the JIT ([`temen_jit::PremapApply`]), on the child thread once its window
+/// exists: `Host::apply_premap` over the child's own window view — the same `MprotectWindow` (shared
+/// page map, NULL guard) and the same futex region recorder its first `call.cap` would set up, so the
+/// pre-mapped pages are a real `MAP_SHARED` alias, canonicalized exactly like self-mapped ones. `0` ⇒
+/// the backing cannot be aliased here (a software-only region); the child never runs.
+///
+/// # Safety
+/// `child_ctx` is the child powerbox cell; `[base, base+reserved)` its live reservation.
+pub unsafe extern "C" fn premap_apply(
+    child_ctx: *mut c_void,
+    base: *mut u8,
+    mapped: u64,
+    reserved: u64,
+) -> i32 {
+    let child_cell = &*(child_ctx as *const Mutex<Host>);
+    let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(any(unix, windows))]
+    {
+        install_region_hook(&mut child, base, reserved);
+        let pages = child.cap_window_pages(base as usize);
+        let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
+        wm.set_null_guard(child.null_guard());
+        i32::from(child.apply_premap(&mut wm) >= 0)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (base, mapped, reserved, &mut child);
+        0
+    }
 }
 
 /// PROCESS.md §5 / #1287 — the `Budget` admission for a detached spawn on the JIT

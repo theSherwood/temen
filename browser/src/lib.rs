@@ -12363,42 +12363,51 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     None
                 };
                 let had_cache = cached.is_some();
-                let emit = match cached {
-                    Some(c) => c,
-                    None => match JitOnrampRun::emit_for_run(&d.child, true) {
-                        Ok(e) => e,
-                        Err(_) => {
-                            // #1151 decline → the interpreter twin over a private sparse backing (the
-                            // child never enters the emitted tier, so it needs no JS-owned memory): seed
-                            // the segments + payload, run it to completion, bank the result.
-                            let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
-                            let back = std::sync::Arc::new(temen_interp::Region::paged(
-                                1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
-                                temen_interp::host_page_size(),
-                            ));
-                            for seg in &d.child.data {
-                                back.write_from(seg.offset, &seg.bytes);
-                            }
-                            back.write_from(0, &init_mem);
-                            let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
-                                prog,
-                                module,
-                                entry,
-                                back,
-                                size_log2,
-                                temen_ir::DEFAULT_RESERVED_LOG2,
-                                fuel,
-                                host,
-                            ) {
-                                Ok(c) => drive_detached_leaf(c),
-                                Err(t) => Err(t),
-                            };
-                            let handle = d.children.len() as i32;
-                            d.children.push(r);
-                            d.root.deliver_handle(handle);
-                            continue;
+                // An op-15 pre-mapped region is a §13 alias the emitted tier cannot honour (its
+                // loads/stores reach the child's own `Memory`, never the region's bytes) — exactly a
+                // child that `map`s for itself (`func_uses_region_ops`), so it declines the same way:
+                // whole-child, to the interpreter twin below, whose `Mem` aliases in software.
+                let emitted = if host.has_premap() {
+                    None
+                } else {
+                    match cached {
+                        Some(c) => Some(c),
+                        None => JitOnrampRun::emit_for_run(&d.child, true).ok(),
+                    }
+                };
+                let emit = match emitted {
+                    Some(e) => e,
+                    None => {
+                        // #1151 decline → the interpreter twin over a private sparse backing (the
+                        // child never enters the emitted tier, so it needs no JS-owned memory): seed
+                        // the segments + payload, run it to completion, bank the result.
+                        let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
+                        let back = std::sync::Arc::new(temen_interp::Region::paged(
+                            1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                            temen_interp::host_page_size(),
+                        ));
+                        for seg in &d.child.data {
+                            back.write_from(seg.offset, &seg.bytes);
                         }
-                    },
+                        back.write_from(0, &init_mem);
+                        let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
+                            prog,
+                            module,
+                            entry,
+                            back,
+                            size_log2,
+                            temen_ir::DEFAULT_RESERVED_LOG2,
+                            fuel,
+                            host,
+                        ) {
+                            Ok(c) => drive_detached_leaf(c),
+                            Err(t) => Err(t),
+                        };
+                        let handle = d.children.len() as i32;
+                        d.children.push(r);
+                        d.root.deliver_handle(handle);
+                        continue;
+                    }
                 };
                 let Some(mem_id) = foreign_mem::mint(
                     DETACHED_HEADER_BYTES + child_size,

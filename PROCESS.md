@@ -486,6 +486,21 @@ object, and *who holds authority over its backing* is the whole visibility story
   `Budget` handle and the mint deducts the window size from `Budget.mem` (`Host::budget_mem_take`),
   so detached VA attenuates down the grant graph and grows by top-up (`transfer`). `cap_id` 15 is
   reserved-not-reused; the embedder grants the authority via `HostCap::detached_budget(mem)`.
+  **Pre-mapped region (the 11-arg form, 2026-09-16):** `instantiate_detached(…, args_ptr, args_len,
+  region, child_off)` aliases a `SharedRegion` of the spawner **whole, read-write, into the child's
+  window at `child_off` before it starts** — the child sees plain memory at a fixed offset (no
+  `self.resolve`, no `page_size` query, no `map`), and the parent reads the child's output back
+  through its own mapping after `join`. It is exactly "grant the region + the child `map`s it at
+  `child_off`" done by the host (`Host::premap_admit` / `stage_premap` / `apply_premap`, one path
+  through the same `map_region` the `map` op takes): the child holds the region handle (unnamed);
+  admission is the `map` op's geometry (region-granularity aligned, above the NULL guard, inside the
+  declared window) and refuses `-EINVAL` before the quota take; a wrong-kind handle traps `CapFault`.
+  Tree-walk, bytecode, and Cranelift JIT (a real `MAP_SHARED` view) carry it; on the wasm-JIT tier a
+  pre-mapped child declines to the interpreter twin, as a child that `map`s for itself does (two
+  `WebAssembly.Memory`s cannot alias). This is the bulk data plane for a child whose memory the parent
+  cannot address (§13), and the spawn-time args payload's big sibling: the payload copies ≤ 16 KiB in
+  once, the pre-map aliases any size both ways for the child's lifetime. Pinned by
+  `temen-interp/tests/detached_premap.rs` and `temen-run/tests/detached_child_jit.rs`.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.
