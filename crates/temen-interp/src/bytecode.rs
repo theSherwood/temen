@@ -5441,6 +5441,67 @@ fn value_watch_hit_before(
     None
 }
 
+/// The watch — window-range or value — the op at `pc` would trip, as the `(addr, write)` the stop
+/// reports (a value watch has no window address and reports `(0, true)`; the DAP maps the variant,
+/// not the address). `None` off module 0 (coroutine-child / invoked-unit ops over other windows are
+/// out of scope), with nothing armed (the common zero-cost case), or when nothing fires. The **one**
+/// pre-op watch scan every debug driver runs — `DebugRun::run_to`/`step_to` and
+/// `ScheduledDebugRun::drive` — so a watch kind exists on every engine and verb at once.
+#[allow(clippy::too_many_arguments)]
+fn watch_stop_before(
+    vm: &Vm,
+    mem: &Option<Mem>,
+    funcs: &[Func],
+    fn_block_base: &[Vec<u32>],
+    watchpoints: &[(u64, u64, super::WatchKind)],
+    value_watches: &mut [ValueWatchRun],
+    pc: super::IrPc,
+) -> Option<(u64, bool)> {
+    if pc.module != 0 || (watchpoints.is_empty() && value_watches.is_empty()) {
+        return None;
+    }
+    watch_hit_before(
+        vm,
+        mem,
+        funcs,
+        fn_block_base,
+        watchpoints,
+        pc.func,
+        pc.block,
+        pc.inst,
+    )
+    .or_else(|| {
+        value_watch_hit_before(vm, fn_block_base, value_watches, pc.func, pc.block, pc.inst)
+            .map(|()| (0, true))
+    })
+}
+
+/// Replace an engine's armed value watches (#1229) with `watches`: an id already armed keeps its
+/// running `last` (so re-applying the set to arm *another* watch doesn't reset a live one's
+/// baseline), while an id new to this run seeds from the target's arm-time baseline (a fresh
+/// `seek`-rebuilt run starts them all from the target baseline).
+fn merge_value_watches(
+    prev: &[ValueWatchRun],
+    watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
+) -> Vec<ValueWatchRun> {
+    watches
+        .into_iter()
+        .map(|(id, target, kind)| {
+            let last = prev
+                .iter()
+                .find(|w| w.id == id)
+                .map_or(target.last, |w| w.last);
+            ValueWatchRun {
+                id,
+                func: target.func,
+                site: target.site,
+                last,
+                kind,
+            }
+        })
+        .collect()
+}
+
 /// A debug-session **access sink** (INTERACTIVE_EMBEDDING.md slice 3): observes every module-0
 /// memory op the session is about to execute — `(clock-or-turn, task, event)`, with **raw
 /// pre-confinement addresses** (the W3 hook-pass vocabulary, [`super::MemEvent`]) — with **no
@@ -6205,30 +6266,12 @@ impl DebugRun {
 
     /// Replace the armed **value watchpoints** (#1229) — each `(id, target, kind)` makes `run_to`
     /// stop when the target variable's holding value changes. Re-applied by the DAP backend after a
-    /// `seek` rebuild; an id already armed keeps its running `last` (so re-applying to arm *another*
-    /// watch doesn't reset a live one's baseline), while an id new to this run seeds from the target's
-    /// arm-time baseline (a fresh `seek`-rebuilt run starts them all from the target baseline).
+    /// `seek` rebuild ([`merge_value_watches`] keeps a live watch's running baseline).
     pub fn set_value_watches(
         &mut self,
         watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
     ) {
-        self.value_watches = watches
-            .into_iter()
-            .map(|(id, target, kind)| {
-                let last = self
-                    .value_watches
-                    .iter()
-                    .find(|w| w.id == id)
-                    .map_or(target.last, |w| w.last);
-                ValueWatchRun {
-                    id,
-                    func: target.func,
-                    site: target.site,
-                    last,
-                    kind,
-                }
-            })
-            .collect();
+        self.value_watches = merge_value_watches(&self.value_watches, watches);
     }
 
     /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
@@ -6571,44 +6614,21 @@ impl DebugRun {
             // its ops share the parent's pc space; a breakpoint on the child's function fires here.
             let hit = {
                 let cur_vm = vt.debug_active();
-                let cur_mem = &*mem;
                 match cur_vm.cur_ir_pc(source) {
                     Some(pc) if bps.contains(&pc) => Some((pc, None)),
-                    Some(pc)
-                        if pc.module == 0
-                            && (!watchpoints.is_empty() || !value_watches.is_empty()) =>
-                    {
-                        // A window-range watch stops *before* the access; a value watch (#1229)
-                        // stops when a watched SSA-held variable's value changed. A value watch has
-                        // no window address, so it reports addr 0 (the DAP maps the variant, not the
-                        // address).
-                        if let Some(w) = watch_hit_before(
-                            cur_vm,
-                            cur_mem,
-                            funcs,
-                            fn_block_base,
-                            watchpoints,
-                            pc.func,
-                            pc.block,
-                            pc.inst,
-                        ) {
-                            Some((pc, Some(w)))
-                        } else if value_watch_hit_before(
-                            cur_vm,
-                            fn_block_base,
-                            value_watches,
-                            pc.func,
-                            pc.block,
-                            pc.inst,
-                        )
-                        .is_some()
-                        {
-                            Some((pc, Some((0, true))))
-                        } else {
-                            None
-                        }
-                    }
-                    _ => None,
+                    // A window-range watch stops *before* the access; a value watch (#1229) stops
+                    // when a watched SSA-held variable's value changed.
+                    Some(pc) => watch_stop_before(
+                        cur_vm,
+                        mem,
+                        funcs,
+                        fn_block_base,
+                        watchpoints,
+                        value_watches,
+                        pc,
+                    )
+                    .map(|w| (pc, Some(w))),
+                    None => None,
                 }
             };
             if let Some((pc, watch)) = hit {
@@ -6760,42 +6780,21 @@ impl DebugRun {
             // depth-scoped): a window-range access, or a value watch (#1229) whose SSA-held variable
             // just changed, stops the step here with the watch reason.
             if let Some(pc) = cur_vm.cur_ir_pc(source) {
-                if pc.module == 0 && (!watchpoints.is_empty() || !value_watches.is_empty()) {
-                    let w = watch_hit_before(
-                        cur_vm,
-                        mem,
-                        funcs,
-                        fn_block_base,
-                        watchpoints,
-                        pc.func,
-                        pc.block,
-                        pc.inst,
-                    )
-                    .or_else(|| {
-                        value_watch_hit_before(
-                            cur_vm,
-                            fn_block_base,
-                            value_watches,
-                            pc.func,
-                            pc.block,
-                            pc.inst,
-                        )
-                        .map(|()| (0, true))
-                    });
-                    if let Some(w) = w {
-                        *last_watch = Some(w);
-                        *at_bp = true;
-                        return Some(pc);
-                    }
+                if let Some(w) = watch_stop_before(
+                    cur_vm,
+                    mem,
+                    funcs,
+                    fn_block_base,
+                    watchpoints,
+                    value_watches,
+                    pc,
+                ) {
+                    *last_watch = Some(w);
+                    *at_bp = true;
+                    return Some(pc);
                 }
             }
-            // Cumulative across a coroutine *or* §22-invoke boundary: the child's frames sit above the
-            // parent's resume/invoke frame (`parent_depth + child stack`).
-            let depth = match &vt.active_invoke {
-                Some(iv) => iv.parent_depth + cur_vm.stack.len() + 1,
-                None => cur_vm.stack.len() + 1,
-            };
-            if max_depth.is_none_or(|m| depth <= m) {
+            if max_depth.is_none_or(|m| vt.debug_depth() <= m) {
                 if let Some(pc) = cur_vm.cur_ir_pc(source) {
                     return Some(pc);
                 }
@@ -6841,11 +6840,7 @@ impl DebugRun {
     /// step-out treat the resume boundary like an ordinary call. Equal to [`depth`](DebugRun::depth)
     /// when the parent itself is running.
     fn step_depth(&self) -> usize {
-        let d = self.reader().depth();
-        match &self.vt.active_invoke {
-            Some(iv) => iv.parent_depth + d,
-            None => d,
-        }
+        self.vt.debug_depth()
     }
 
     /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
@@ -7196,6 +7191,11 @@ pub struct ScheduledDebugRun {
     /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
     /// common case, so the per-op `access_of` computation is skipped entirely.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// Run-shared **value watchpoints** (#1229, #1517 slice 2): stop when a watched SSA-held source
+    /// variable's holding value changes, in whichever thread's top frame runs the variable's function
+    /// — cross-thread exactly like `watchpoints` (a target is `(func, site)`, not a task; the one-task
+    /// run this engine collapses `DebugRun` into reads identically). Empty in the common case.
+    value_watches: Vec<ValueWatchRun>,
     /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
     /// op with the global `turn` and the **executing task index** (the vCPU attribution host-side
     /// models key on). `None` (the default) is zero-cost; the DAP backend re-installs it on every
@@ -8355,6 +8355,7 @@ impl ScheduledDebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
+            value_watches: Vec::new(),
             access_sink: None,
             sched_trace: None,
             scheduled_writes: Vec::new(),
@@ -8379,6 +8380,25 @@ impl ScheduledDebugRun {
     /// with a matching read/write kind.
     pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
         self.watchpoints = ranges;
+    }
+
+    /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
+    /// **focused** thread's frame `depth` levels from the top — see `DebugRun::resolve_value_watch`.
+    /// The target is `(func, site, baseline)`, frame- and thread-independent, so the DAP backend
+    /// re-applies it verbatim after a `seek` rebuild.
+    pub fn resolve_value_watch(&self, depth: usize, name: &str) -> Option<ValueWatchTarget> {
+        let (func, site, last) = self.reader().value_watch_target(depth, name)?;
+        Some(ValueWatchTarget { func, site, last })
+    }
+
+    /// Replace the run-shared **value watchpoints** (#1229) — each `(id, target, kind)` makes the
+    /// schedule stop, in whichever thread, when the target variable's holding value changes. See
+    /// `DebugRun::set_value_watches`; [`merge_value_watches`] keeps a live watch's running baseline.
+    pub fn set_value_watches(
+        &mut self,
+        watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
+    ) {
+        self.value_watches = merge_value_watches(&self.value_watches, watches);
     }
 
     /// Install the run-shared per-op **access sink** ([`AccessSinkFn`]) — fired with the global
@@ -8469,6 +8489,7 @@ impl ScheduledDebugRun {
             funcs,
             breakpoints,
             watchpoints,
+            value_watches,
             access_sink,
             sched_trace,
             sched_seed,
@@ -8573,18 +8594,19 @@ impl ScheduledDebugRun {
                     };
                     match cur_vm.cur_ir_pc(source) {
                         Some(pc) if breakpoints.contains(&pc) => Some((pc, None)),
-                        Some(pc) if !watchpoints.is_empty() && pc.module == 0 => watch_hit_before(
+                        // A window-range watch (cross-thread) stops *before* the access; a value
+                        // watch (#1229) stops when a watched SSA-held variable's value changed.
+                        Some(pc) => watch_stop_before(
                             cur_vm,
                             cur_mem,
                             funcs,
                             fn_block_base,
                             watchpoints,
-                            pc.func,
-                            pc.block,
-                            pc.inst,
+                            value_watches,
+                            pc,
                         )
                         .map(|w| (pc, Some(w))),
-                        _ => None,
+                        None => None,
                     }
                 };
                 if let Some((pc, watch)) = hit {
@@ -8599,6 +8621,24 @@ impl ScheduledDebugRun {
                     *stopped = Some(ti);
                     *focus = ti;
                     return SchedStop::Break { pc, reason };
+                }
+                // The step target: the stepping thread is at an instruction at a qualifying call
+                // depth. Checked *after* the watch scan, so a watch stops a step mid-line (parity
+                // with `continue` and with `DebugRun::step_to`), and — like the scan — not for the
+                // op the thread must first step off. Depth is cumulative across a coroutine / §22
+                // invoke boundary (`VTask::debug_depth`), so a step-over of a `resume`/`invoke` runs
+                // the child to completion and a step inside its body compares child-local frames.
+                if let Some((st, max_depth)) = step {
+                    if ti == st && max_depth.is_none_or(|m| tasks[st].vt.debug_depth() <= m) {
+                        if let Some(pc) = tasks[st].vt.debug_active().cur_ir_pc(source) {
+                            *stopped = Some(st);
+                            *focus = st;
+                            return SchedStop::Break {
+                                pc,
+                                reason: SchedBreak::Step,
+                            };
+                        }
+                    }
                 }
             }
             apply_due_writes_sched(
@@ -8635,26 +8675,6 @@ impl ScheduledDebugRun {
             if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_adv.as_ref()) {
                 trace_diff(before, tasks, trace_turn, ti, trace);
             }
-            // Post-op step target: the stepping thread reached a qualifying call depth at an instruction.
-            // Depth is cumulative across a coroutine boundary (the child's frames sit above the parent's
-            // resume frame), so a step-over of a `resume` runs the child to completion and a step inside a
-            // coroutine body compares child-local frames — mirroring the single-vCPU `DebugRun::step_to`.
-            if let Some((st, max_depth)) = step {
-                if ti == st && matches!(tasks[st].state, DbgTaskState::Runnable) {
-                    let cur_vm = tasks[st].vt.debug_active();
-                    let depth = cur_vm.stack.len() + 1;
-                    if max_depth.is_none_or(|m| depth <= m) {
-                        if let Some(pc) = cur_vm.cur_ir_pc(source) {
-                            *stopped = Some(st);
-                            *focus = st;
-                            return SchedStop::Break {
-                                pc,
-                                reason: SchedBreak::Step,
-                            };
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -8679,8 +8699,7 @@ impl ScheduledDebugRun {
     /// frame while it is mid-coroutine — see [`DebugRun::step_depth`]). Used by the depth-bounded verbs so
     /// they treat a coroutine `resume` boundary like an ordinary call.
     fn step_depth(&self, s: usize) -> usize {
-        let cur_vm = self.tasks[s].vt.debug_active();
-        cur_vm.stack.len() + 1
+        self.tasks[s].vt.debug_depth()
     }
 
     /// **Step over** the next source op: run any call it makes to completion (schedule advances only if
@@ -9849,6 +9868,18 @@ impl VTask {
         match &self.active_invoke {
             Some(iv) => &iv.vm,
             None => &self.active,
+        }
+    }
+
+    /// The call depth the stepping verbs compare — **cumulative** across a §22 invoke boundary: the
+    /// invoked unit's frames sit above the caller's invoke frame (`parent_depth + unit depth`), so a
+    /// step-over of the `invoke` runs the unit to completion and a step-out of the unit lands back in
+    /// the caller, while a step *within* the unit compares unit-local frames as usual. Equal to the
+    /// active `Vm`'s own frame count when no invoke is being stepped.
+    fn debug_depth(&self) -> usize {
+        match &self.active_invoke {
+            Some(iv) => iv.parent_depth + iv.vm.stack.len() + 1,
+            None => self.active.stack.len() + 1,
         }
     }
 }

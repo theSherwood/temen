@@ -2076,3 +2076,220 @@ fn dap_over_bytecode_value_watchpoint_fires_during_step() {
         "the step-fires-watch sequence matches the tree-walker"
     );
 }
+
+/// `VALUE_WATCH_DBG` with a spawned-and-joined worker in front, so the launch lands on the
+/// **scheduled** engine (`module_spawns_threads`). `x` is the same address-less `SsaList` local:
+/// held by `va` (value 3) from inst 4, by `vc` (value 5) from inst 6. Line = inst + 2.
+const THREADED_VALUE_WATCH_DBG: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vsp = i64.const 0
+  vh = thread.spawn 1 vsp vsp
+  vj = thread.join vh
+  va = i64.const 10
+  vb = i64.const 1
+  vc = i64.add va vb
+  vd = i64.add vc vb
+  return vd
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+debug.file 0 "vw.temt"
+debug.fname 0 "main"
+debug.loc 0 0 0 0 2 3
+debug.loc 0 0 1 0 3 3
+debug.loc 0 0 2 0 4 3
+debug.loc 0 0 3 0 5 3
+debug.loc 0 0 4 0 6 3
+debug.loc 0 0 5 0 7 3
+debug.loc 0 0 6 0 8 3
+debug.loc 0 0 7 0 9 3
+debug.var 0 "x" ssalist 2 0 4 3 0 6 5 "int"
+"#;
+
+/// Launch `THREADED_VALUE_WATCH_DBG` on the scheduled bytecode engine, stop at line 6 (`x == 10`
+/// live), and arm a value data breakpoint on `x` through `dataBreakpointInfo` +
+/// `setDataBreakpoints`. Returns `(server, stopped threadId, dataId, verified)`.
+fn threaded_value_watch_armed() -> (DapServer, i64, String, bool) {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(THREADED_VALUE_WATCH_DBG)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("vw.temt"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(6))])]),
+            ),
+        ]),
+    ));
+    let cfg = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    let tid = event(&cfg, "stopped")
+        .expect("stops at line 6 on the scheduled engine")
+        .get("body")
+        .unwrap()
+        .get("threadId")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let st = s.handle(&req(
+        5,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    let frame_id = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("id")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let sc = s.handle(&req(
+        6,
+        "scopes",
+        Json::obj(vec![("frameId", Json::i(frame_id))]),
+    ));
+    let var_ref = response(&sc)
+        .get("body")
+        .unwrap()
+        .get("scopes")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("variablesReference")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    let info = s.handle(&req(
+        7,
+        "dataBreakpointInfo",
+        Json::obj(vec![
+            ("variablesReference", Json::i(var_ref)),
+            ("name", Json::s("x")),
+        ]),
+    ));
+    let data_id = response(&info)
+        .get("body")
+        .and_then(|b| b.get("dataId"))
+        .and_then(|d| d.as_str())
+        .map(str::to_owned)
+        .unwrap_or_default();
+    let arm = s.handle(&req(
+        8,
+        "setDataBreakpoints",
+        Json::obj(vec![(
+            "breakpoints",
+            Json::Arr(vec![Json::obj(vec![
+                ("dataId", Json::s(&data_id)),
+                ("accessType", Json::s("write")),
+            ])]),
+        )]),
+    ));
+    let verified = response(&arm)
+        .get("body")
+        .and_then(|b| b.get("breakpoints"))
+        .and_then(|b| b.as_array())
+        .and_then(|a| a.first())
+        .and_then(|b| b.get("verified"))
+        .cloned()
+        == Some(Json::Bool(true));
+    (s, tid, data_id, verified)
+}
+
+/// **#1517 slice 2 — a value watch on the scheduled bytecode engine over DAP.** The threaded twin of
+/// `dap_over_bytecode_value_watchpoint_matches_the_tree_walker`: `dataBreakpointInfo` mints the
+/// `val:…` id on a threaded launch (it answered "unverified" before), `setDataBreakpoints` verifies
+/// it, and Continue stops with reason "data breakpoint" at line 8 — the op after `x` becomes 11.
+#[test]
+fn dap_over_bytecode_threaded_value_watchpoint_fires_on_continue() {
+    let (mut s, tid, data_id, verified) = threaded_value_watch_armed();
+    assert!(
+        data_id.starts_with("val:"),
+        "`x` resolves to a value dataId on the scheduled engine: {data_id:?}"
+    );
+    assert!(
+        verified,
+        "the value data breakpoint verifies on the scheduled engine"
+    );
+    let cont = s.handle(&req(9, "continue", Json::obj(vec![])));
+    let stop = event(&cont, "stopped").expect("stops for the value watch");
+    assert_eq!(
+        stop.get("body").unwrap().get("reason").unwrap().as_str(),
+        Some("data breakpoint")
+    );
+    let st = s.handle(&req(
+        10,
+        "stackTrace",
+        Json::obj(vec![("threadId", Json::i(tid))]),
+    ));
+    let line = response(&st)
+        .get("body")
+        .unwrap()
+        .get("stackFrames")
+        .unwrap()
+        .as_array()
+        .unwrap()[0]
+        .get("line")
+        .unwrap()
+        .as_i64()
+        .unwrap();
+    assert_eq!(line, 8, "paused before the first op that observes x == 11");
+    // Clearing the watch lets the guest finish.
+    s.handle(&req(
+        11,
+        "setDataBreakpoints",
+        Json::obj(vec![("breakpoints", Json::Arr(vec![]))]),
+    ));
+    let cont = s.handle(&req(12, "continue", Json::obj(vec![])));
+    assert!(event(&cont, "terminated").is_some(), "the guest finishes");
+}
+
+/// **#1517 slice 2 — the value watch fires during a threaded step too.** The threaded twin of
+/// `dap_over_bytecode_value_watchpoint_fires_during_step`: with the watch armed, repeated `stepIn`s
+/// on the scheduled engine include one stop with reason "data breakpoint" (previously the scheduled
+/// step path returned at its step boundary without ever consulting a watch — range or value).
+#[test]
+fn dap_over_bytecode_threaded_value_watchpoint_fires_during_step() {
+    let (mut s, tid, _, verified) = threaded_value_watch_armed();
+    assert!(verified);
+    let mut reasons = Vec::new();
+    for seq in 9..15 {
+        let out = s.handle(&req(
+            seq,
+            "stepIn",
+            Json::obj(vec![("threadId", Json::i(tid))]),
+        ));
+        if let Some(r) = event(&out, "stopped")
+            .and_then(|e| e.get("body")?.get("reason")?.as_str().map(str::to_owned))
+        {
+            reasons.push(r);
+        }
+        if event(&out, "terminated").is_some() {
+            break;
+        }
+    }
+    assert_eq!(
+        reasons.iter().filter(|r| *r == "data breakpoint").count(),
+        1,
+        "exactly one step stops for the value watch on the scheduled engine: {reasons:?}"
+    );
+}

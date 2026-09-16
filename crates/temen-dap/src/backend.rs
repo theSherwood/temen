@@ -911,22 +911,25 @@ impl BytecodeBackend {
         matches!(self.engine, Engine::Threaded(_))
     }
 
-    /// Push the current watchpoint ranges into the live engine (after arming/clearing one, or re-arming
-    /// a fresh single-vCPU run built by `seek`). Cross-thread on the scheduled engine.
+    /// Push the current watchpoints — window ranges and #1229 value watches — into the live engine
+    /// (after arming/clearing one, or re-arming a fresh run built by `seek`; a value target is
+    /// frame-independent, so re-application is verbatim). Cross-thread on the scheduled engine.
     fn apply_watches(&mut self) {
         let ranges: Vec<_> = self
             .watch_specs
             .iter()
             .map(|(_, a, l, k)| (*a, *l, *k))
             .collect();
+        let values = self.value_specs.clone();
         match &mut self.engine {
             Engine::Single(run) => {
                 run.set_watchpoints(ranges);
-                // Value watches (#1229) ride the single-vCPU engine this slice; the target is
-                // frame-independent so re-application after a `seek` rebuild is verbatim.
-                run.set_value_watches(self.value_specs.clone());
+                run.set_value_watches(values);
             }
-            Engine::Threaded(run) => run.set_watchpoints(ranges),
+            Engine::Threaded(run) => {
+                run.set_watchpoints(ranges);
+                run.set_value_watches(values);
+            }
         }
     }
 
@@ -1321,9 +1324,8 @@ impl Debuggee for BytecodeBackend {
         }
         removed
     }
-    // Value watches (#1229): stop when an SSA-held source variable's value changes. Single-vCPU only
-    // this slice — `resolve_value_watch` yields `None` on the scheduled engine, so the arm fails
-    // cleanly (the DAP reports the data breakpoint unverified).
+    // Value watches (#1229): stop when an SSA-held source variable's value changes — resolved in the
+    // focused thread's frame, armed run-wide (cross-thread on the scheduled engine, like a range).
     fn set_value_watchpoint(
         &mut self,
         frame_from_top: usize,
@@ -1332,7 +1334,7 @@ impl Debuggee for BytecodeBackend {
     ) -> Option<WatchId> {
         let target = match &self.engine {
             Engine::Single(run) => run.resolve_value_watch(frame_from_top, name)?,
-            Engine::Threaded(_) => return None,
+            Engine::Threaded(run) => run.resolve_value_watch(frame_from_top, name)?,
         };
         let id = WatchId::from_raw(self.next_watch);
         self.next_watch += 1;
