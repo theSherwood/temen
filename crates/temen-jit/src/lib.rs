@@ -472,12 +472,6 @@ pub struct FrozenNested {
 /// page, so protecting it protects (at most) its host page — exact on a 4 KiB-page host.
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
-/// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
-/// extent. Derived from `temen_ir::durable_abi::SHADOW_BASE` (the shared durable-runtime ABI, relocated
-/// above the #1094 NULL guard) so this never drifts from `temen-interp`/`fiber_rt`. The cross-backend
-/// artifact-equality property also catches drift.
-const DURABLE_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
-
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -643,6 +637,9 @@ pub struct ResolvedModule {
     /// outlives-the-run contract as `funcs`/`data`.
     pub types: *const temen_ir::TypeEntry,
     pub n_types: usize,
+    /// The module's declared durable shadow arena (INVARIANTS.md #16) — `ShadowArena::EMPTY` when
+    /// it declared none (then a durable child of it is refused, never placed by default).
+    pub shadow: temen_ir::durable_abi::ShadowArena,
 }
 
 /// The host callback the §14 nesting runtime uses to resolve a guest's **`Module` handle** to the
@@ -2404,6 +2401,9 @@ pub struct CompiledModule {
     /// word pointing at the running context's region (swapped on every fiber switch). `false` (the
     /// default) ⇒ an ordinary run that never touches the durable reserve. Set per-run at entry.
     durable: bool,
+    /// The module-declared shadow arena (INVARIANTS.md #16) — [`ShadowArena::EMPTY`] for a module
+    /// that declared none, which a durable run refuses at entry rather than placing by default.
+    shadow: temen_ir::durable_abi::ShadowArena,
     /// §12.8 4A.5 stage (ii): engage the **concurrent** durable path — children spawned during NORMAL
     /// run as real OS threads with their own reserved shadow contexts and self-unwind concurrently on a
     /// freeze (vs. the single-worker deferred model). Set by the concurrent multi-vCPU interruptible
@@ -2437,7 +2437,7 @@ pub struct CompiledModule {
     /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
     frozen_nested_seed: Vec<FrozenNested>,
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
-    /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
+    /// artifact), set as the active word before the root rewinds. The empty root extent (`ShadowArena::frame_base(0)`) otherwise.
     thaw_root_sp: u64,
     /// Async freeze controller (Phase-4 Slice A, 4A.3): if set, the run publishes its live window base
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
@@ -2763,6 +2763,10 @@ impl CompiledModule {
         signal: Option<SignalArm>,
     ) -> Result<CompiledModule, JitError> {
         let entry = m.funcs.get(func as usize).ok_or(JitError::Malformed)?;
+        let shadow = m
+            .memory
+            .and_then(|x| x.shadow)
+            .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY);
         // The `call.dyn` function table is power-of-two padded; `table_reserve_log2`
         // (DESIGN.md §22) reserves a *larger* table than the module needs so `install` can
         // fill the padding slots without moving the Spectre-safe mask constant (which is baked
@@ -2927,6 +2931,7 @@ impl CompiledModule {
             if uses_fibers || uses_threads {
                 Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                     quota.max_fibers,
+                    shadow,
                 )))
             } else {
                 None
@@ -3034,6 +3039,7 @@ impl CompiledModule {
                     .flat_map(|e| e.ops.iter().copied())
                     .collect::<Vec<u32>>()
                     .into_boxed_slice(),
+                shadow,
             )))
         } else {
             None
@@ -3483,6 +3489,7 @@ impl CompiledModule {
             data: m.data.clone(),
             restore_prots: Vec::new(),
             durable: false,
+            shadow,
             concurrent_durable: false,
             frozen_seed: Vec::new(),
             frozen_out: Vec::new(),
@@ -3491,7 +3498,7 @@ impl CompiledModule {
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
             frozen_nested_seed: Vec::new(),
-            thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
+            thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
@@ -3966,6 +3973,7 @@ impl CompiledModule {
                         epoch,
                         0, // durable thaw re-attach: metering a frozen subtree child is a later slice
                         true, // durable
+                        (*this).shadow, // a nested durable child is same-module (§4)
                         true, // thaw: rewind from the carve's frozen continuation
                         my_task,
                         std::sync::Arc::clone(&sink),
@@ -3996,7 +4004,7 @@ impl CompiledModule {
         // §12.8 4A.5: seed the durable shadow-base register to the root's region (context 0 =
         // `DURABLE_SHADOW_BASE`), so the root's instrumented code addresses its own per-context
         // shadow-SP word.
-        durable_shadow::seed(DURABLE_SHADOW_BASE);
+        durable_shadow::seed((*this).shadow.region_base(0));
         // §12.8 4A.5 stage (ii): engage the concurrent durable path before the guarded call (where the
         // root may `thread.spawn` children) so each child reserves its own shadow context.
         #[cfg(fiber_rt)]
@@ -4060,7 +4068,7 @@ impl CompiledModule {
             // §12.8 4A.5: the root's shadow-SP word lives in its own region (context 0); children no
             // longer share it.
             (*this).frozen_root_sp_out =
-                fiber_rt::read_shadow_sp(mem_base as u64, fiber_rt::shadow_region_base(0));
+                fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0));
             // Slice 3.3: each `thread.spawn` during the freeze *deferred* its child (recording the
             // request, returning the handle) so the root could unwind first — matching the interp,
             // which enqueues a child and runs it only after the spawning vCPU yields. Now that the
@@ -4445,7 +4453,10 @@ impl CompiledModule {
         let table = match &self.fiber_table {
             Some(t) => std::sync::Arc::clone(t),
             None => {
-                let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(quota.max_fibers));
+                let t = std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
+                    quota.max_fibers,
+                    self.shadow,
+                ));
                 self.fiber_table = Some(std::sync::Arc::clone(&t));
                 t
             }
@@ -4540,6 +4551,7 @@ impl CompiledModule {
         if self.fiber_table.is_none() {
             self.fiber_table = Some(std::sync::Arc::new(fiber_rt::SharedFiberTable::new(
                 quota.max_fibers,
+                self.shadow,
             )));
         }
         // The generic call-trampoline (calls any Tail-ABI `(sp, arg) -> i64` entry from Rust). Spawned
@@ -4753,6 +4765,8 @@ pub(crate) unsafe fn compile_child_and_run(
     // remaining budget — the recursive form of the `min(quota, parent_remaining)` contract.
     fuel_addr: usize,
     durable: bool,
+    // The child module's declared shadow arena (its own window's ctx-0 words live here).
+    child_shadow: temen_ir::durable_abi::ShadowArena,
     thaw: bool,
     my_task: usize,
     nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
@@ -4800,6 +4814,7 @@ pub(crate) unsafe fn compile_child_and_run(
             std::sync::Arc::clone(&task_counter), // shared counter (subtree-wide instantiate order)
             std::sync::Arc::clone(&nested_sink), // shared sink — descendants' residue coalesces at root
             Box::new([]), // durable grandchildren are not offer targets (a later slice)
+            child_shadow,
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
         Some(n)
@@ -4838,7 +4853,8 @@ pub(crate) unsafe fn compile_child_and_run(
         0,          // durable path: no shared futex domain — child futex ops stay rejected
         child_inst,
         &[], // the durable/sync nested child is never an offer target — no serve trampolines
-        0,   // an empty powerbox holds no `Jit` — the natural table
+        0,   // an empty powerbox holds no `Jit` — the natural table,,
+        child_shadow,
     )?;
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.tramp_code;
@@ -4862,15 +4878,15 @@ pub(crate) unsafe fn compile_child_and_run(
     // state word (at `STATE_OFF`, relocated above the #1094 NULL guard) and the ctx-0 thaw word to
     // `NORMAL`, and the ctx-0 shadow-SP word (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the
     // empty frame base `shadow_frame_base(0)`. So an instrumented child's prologue sees `NORMAL` and its
-    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ `DURABLE_RESERVE`
+    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ the arena `end`
     // (64 KiB), so these offsets fit; the size guard keeps a malformed (too-small) guest-requested carve
     // from panicking the host here — such a child instead traps at runtime when its instrumented code
     // reaches past its window.
     const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
-    const CTX0_SP_OFF: usize = DURABLE_SHADOW_BASE as usize; // shadow_region_base(0)
-    const CTX0_THAW_OFF: usize = DURABLE_SHADOW_BASE as usize + 8; // thaw_state_off(0)
-    if durable && (child_size as usize) >= CTX0_THAW_OFF + 4 {
-        const CTX0_FRAME_BASE: u64 = DURABLE_SHADOW_BASE + 16; // shadow_frame_base(0)
+    let ctx0_sp_off = child_shadow.region_base(0) as usize;
+    let ctx0_thaw_off = child_shadow.thaw_state_off(0) as usize;
+    if durable && (child_size as usize) >= ctx0_thaw_off + 4 {
+        let ctx0_frame_base = child_shadow.frame_base(0);
         const STATE_REWINDING: i32 = 2;
         let w = child_window.rw_mut();
         if thaw {
@@ -4880,7 +4896,7 @@ pub(crate) unsafe fn compile_child_and_run(
             // `NORMAL`, ctx-0 thaw word → `REWINDING`, and **preserve** the SP word + shadow stack (the
             // continuation the rewind replays). The child then dispatches on the thaw word and reloads.
             w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // global state word = NORMAL
-            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
+            w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&STATE_REWINDING.to_le_bytes());
         } else {
             // §4 freeze/normal: the child inherits the **parent's** durable phase (the interp seeds
             // `child.dstate = parent.durable_state()`). Under a freeze the parent window is `UNWINDING`,
@@ -4891,8 +4907,8 @@ pub(crate) unsafe fn compile_child_and_run(
                 i32::from_le_bytes([p[0], p[1], p[2], p[3]])
             };
             w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
-            w[CTX0_THAW_OFF..CTX0_THAW_OFF + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
-            w[CTX0_SP_OFF..CTX0_SP_OFF + 8].copy_from_slice(&CTX0_FRAME_BASE.to_le_bytes());
+            w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
+            w[ctx0_sp_off..ctx0_sp_off + 8].copy_from_slice(&ctx0_frame_base.to_le_bytes());
             // ctx-0 SP
         }
     }
@@ -4930,6 +4946,7 @@ pub(crate) unsafe fn compile_child_and_run(
                     epoch_addr,
                     0, // durable thaw re-attach: metering a frozen subtree child is a later slice
                     true, // durable
+                    child_shadow, // a nested durable grandchild is same-module (§4)
                     true, // thaw
                     gc_task,
                     std::sync::Arc::clone(&nested_sink),
@@ -4957,7 +4974,7 @@ pub(crate) unsafe fn compile_child_and_run(
     // non-zero context.
     let saved_shadow = durable.then(|| {
         let s = durable_shadow::get();
-        durable_shadow::seed(DURABLE_SHADOW_BASE);
+        durable_shadow::seed(child_shadow.region_base(0));
         s
     });
     let faulted = mem::run_guarded(
@@ -5157,6 +5174,7 @@ fn compile_child(
     serve_handlers: &[u32],
     // #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
     table_reserve_log2: u8,
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Result<CompiledModule, JitError> {
     compile_child_windowed(
         funcs,
@@ -5172,6 +5190,7 @@ fn compile_child(
         inst_env,
         serve_handlers,
         table_reserve_log2,
+        shadow,
     )
 }
 
@@ -5202,6 +5221,8 @@ fn compile_child_windowed(
     inst_env: InstEnv,
     serve_handlers: &[u32],
     table_reserve_log2: u8,
+    // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Result<CompiledModule, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
@@ -5437,7 +5458,8 @@ fn compile_child_windowed(
         frozen_root_sp_out: 0,
         frozen_vcpu_seed: Vec::new(),
         frozen_nested_seed: Vec::new(),
-        thaw_root_sp: DURABLE_SHADOW_BASE + 8,
+        thaw_root_sp: shadow.frame_base(0),
+        shadow,
         freeze_ctl: None,
         fiber_rt: None,
         domain: None,
@@ -5484,6 +5506,7 @@ pub fn child_compiles() -> u64 {
 /// baked). The durable / nesting child keeps the per-call [`compile_child_and_run`] path (its baked
 /// per-child nursery makes its code un-shareable).
 #[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)] // the per-spawn child parameters, as `compile_child`
 pub(crate) fn compile_nondurable_child(
     funcs: &[Func],
     // #922 — the child module's type section, threaded to `compile_child`.
@@ -5495,6 +5518,8 @@ pub(crate) fn compile_nondurable_child(
     // this module across spawns — the caller (`instantiate`) skips the cache when this is nonzero.
     fuel_addr: usize,
     futex_sched: usize,
+    // The child module's declared shadow arena.
+    shadow: temen_ir::durable_abi::ShadowArena,
 ) -> Result<CompiledModule, JitError> {
     compile_child(
         funcs,
@@ -5508,7 +5533,8 @@ pub(crate) fn compile_nondurable_child(
         futex_sched,
         InstEnv::null(),
         &[], // a plain (ungranted) child is never an offer target — no serve trampolines
-        0,   // an empty powerbox holds no `Jit` — the natural table
+        0,   // an empty powerbox holds no `Jit` — the natural table,
+        shadow,
     )
 }
 

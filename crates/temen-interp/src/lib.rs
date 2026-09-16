@@ -240,7 +240,7 @@ pub enum Trap {
 /// under 2048 reified frames, so `coroutine.lua`'s "infinite recursion of coroutines" test
 /// raises a `pcall`-catchable "C stack overflow" on all three engines instead of the
 /// tree-walker uniquely tripping this cap (an uncatchable §5 kill) at 256. Kept comfortably
-/// below the durable shadow-reserve's frame budget (`DURABLE_RESERVE`, §12.7) so a deep
+/// below the durable shadow-reserve's frame budget (the shadow arena's `end`, §12.7) so a deep
 /// durable freeze still traps at *this* cap, never by corrupting guest memory.
 const MAX_CALL_DEPTH: u32 = 2048;
 
@@ -1064,7 +1064,7 @@ impl Inspector {
         null_guard: u64,
     ) -> Box<VCpu> {
         let mem = memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
             mm.init_data(data);
             // #964/#1094: this harness gets bare funcs/data, never the module, so the caller threads
             // the module's guard extent in — `[0, guard)` seeds `Unmapped` and a NULL deref traps on a
@@ -1215,7 +1215,7 @@ impl Inspector {
         null_guard: u64,
     ) -> SchedState {
         let mem = memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
             mm.init_data(data);
             // #964/#1059: bare funcs/data, no module marker in reach — the caller threads the extent
             // in so a scheduled attach/seek guards `[0, guard)` too (see `fresh_single_root`).
@@ -2032,7 +2032,7 @@ pub fn run_with_host_traced(
     // shares it. The window is a large reserved range (§4 default policy) with only `mapped`
     // backed, so an out-of-`mapped` access faults (detect-and-kill) instead of wrapping.
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
         mm.init_data(&m.data); // §3a/D40 data segments (copy + RO-protect)
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
@@ -2535,15 +2535,16 @@ fn drive_over_cell(
             .map(|m| m.durable_load_dstate(root.vcpu_ctx))
             .unwrap_or(STATE_NORMAL);
         // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
-        // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
+        // the window's active-SP word otherwise (a fresh/freeze run leaves it at the root region base; a
         // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
         // dispatch (slice 3.2.1).
-        let root_word = shadow_region_base(root.vcpu_ctx);
+        let arena = root.arena();
+        let root_word = arena.region_base(root.vcpu_ctx);
         root.root_shadow_sp = thaw_root_sp.unwrap_or_else(|| {
             root.mem
                 .as_ref()
                 .map(|m| m.durable_get_sp(root_word))
-                .unwrap_or_else(|| shadow_frame_base(root.vcpu_ctx))
+                .unwrap_or_else(|| arena.frame_base(root.vcpu_ctx))
         });
         // Thaw seeding (slice 3.1.5): re-create each frozen fiber in the run-shared registry, in
         // ascending slot order, so the dense handle namespace matches the freeze (the root's
@@ -2579,14 +2580,14 @@ fn drive_over_cell(
             // into its *parent child's* table, which must already exist.
             vseed.sort_by_key(|f| f.task);
             // Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
-            //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
+            //   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since
             //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
             //     post-thaw spawn lands in a genuinely-free context.
             //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze is byte-identical.
             //   • join handle — appended into the **parent's** `threads` in ascending-task (= spawn)
             //     order, so the guest's reloaded handle resolves in the table of whoever spawned it
             //     (the root for a direct child, a re-spawned child for a grandchild).
-            let mut vcpu_mask: u16 = 0;
+            let mut vcpu_mask: u64 = 0;
             // Re-spawned children held by task id so a grandchild can attach to its (already re-spawned)
             // parent; the root is mutated directly. `BTreeMap` keeps the enqueue order ascending-task.
             let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
@@ -2595,7 +2596,7 @@ fn drive_over_cell(
                 let cid = ff.task as TaskId;
                 s.next_task = s.next_task.max(cid + 1);
                 s.live += 1;
-                let ctx = ((ff.shadow_sp - SHADOW_BASE) / SHADOW_STRIDE) as usize;
+                let ctx = root.arena().ctx_of_sp(ff.shadow_sp);
                 vcpu_mask |= 1 << ctx;
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
@@ -2758,7 +2759,7 @@ fn drive_over_cell(
                 if let Some(m) = root.mem.as_mut() {
                     let _ = m.write_bytes(abs_carve + STATE_OFF, &STATE_NORMAL.to_le_bytes());
                     let _ = m.write_bytes(
-                        abs_carve + thaw_state_off(0),
+                        abs_carve + m.thaw_state_off(0),
                         &STATE_REWINDING.to_le_bytes(),
                     );
                 }
@@ -2771,12 +2772,12 @@ fn drive_over_cell(
                 let child_extent = root
                     .mem
                     .as_ref()
-                    .map(|m| m.durable_get_sp(abs_carve + shadow_region_base(0)))
-                    .unwrap_or_else(|| shadow_frame_base(0));
-                let child_mem = root
-                    .mem
-                    .as_ref()
-                    .map(|m| m.nested_view(m.window.base() + abs_carve, fnr.size_log2));
+                    .map(|m| m.durable_get_sp(abs_carve + m.shadow_region_base(0)))
+                    .unwrap_or_else(|| root.arena().frame_base(0));
+                let child_mem = root.mem.as_ref().map(|m| {
+                    // A nested durable child is same-module (§4), so its arena is this one's.
+                    m.nested_view(m.window.base() + abs_carve, fnr.size_log2, m.shadow_arena())
+                });
                 let mut ch = Host::new();
                 ch.set_durable(true);
                 // #1289 R1 / O14: re-stamp the child's §6 attestation, which the thaw otherwise
@@ -3023,7 +3024,7 @@ pub fn run_capture_reserved(
         return (Err(Trap::Malformed), Vec::new());
     }
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
         mm.seed(init_mem);
         mm.init_data(&m.data); // §3a/D40 data segments (after the escape-oracle seed)
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -3061,7 +3062,7 @@ pub fn run_capture_reserved_with_host(
         return (Err(Trap::Malformed), Vec::new());
     }
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
         mm.seed(init_mem);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -3121,7 +3122,7 @@ pub fn run_capture_reserved_with_host_prots(
         return (Err(Trap::Malformed), Vec::new(), Vec::new());
     }
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
         mm.seed(init_mem);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -3160,7 +3161,7 @@ pub fn run_capture_sub(
         return (Err(Trap::Malformed), Vec::new());
     }
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes);
+        let mut mm = Mem::sub_window(base, mc.size_log2, parent_bytes, mc.shadow);
         mm.seed_parent(init_mem); // seed the whole parent, not just the child slice
         mm.init_data_at(&m.data, base); // child-relative segments shifted into the slice
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -3193,7 +3194,7 @@ pub fn run_scheduled(
     let funcs: Arc<[Func]> = m.funcs.clone().into();
     let types: Arc<[temen_ir::TypeEntry]> = m.types.clone().into();
     let mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
@@ -3975,7 +3976,7 @@ fn run_one_schedule(
     policy: Policy,
 ) -> Result<Vec<Value>, Trap> {
     let mem = memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
         mm.init_data(data);
         // No NULL-guard seeding (#964): bare funcs/data, no module marker in reach (see
         // `fresh_single_root`).
@@ -6732,7 +6733,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             // §12.8 4A.5: at root, the active spill context is this vCPU's own; its SP word lives in *its*
             // region (`shadow_region_base(vcpu_ctx)`), not a shared offset.
             v.durable_sp_ctx = v.vcpu_ctx;
-            let root_word = shadow_region_base(v.vcpu_ctx);
+            let root_word = v.arena().region_base(v.vcpu_ctx);
             if let Some(m) = v.mem.as_mut() {
                 // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
                 // its own per-context thaw word, so its rewind can't disturb a sibling's.
@@ -6745,7 +6746,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
         // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
         // from the live words below).
         if v.durable && v.cur == ROOT_FIBER && !matches!(step, Step::Done(_)) {
-            let root_word = shadow_region_base(v.vcpu_ctx);
+            let root_word = v.arena().region_base(v.vcpu_ctx);
             if let Some(m) = v.mem.as_ref() {
                 // §12.8 concurrent-thaw stage 1: recombine the phase from the freeze (global) + thaw
                 // (per-context) words — the rewind's re-issue flipped *its own* thaw word to `NORMAL`.
@@ -6928,8 +6929,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let self_sp = v
                         .mem
                         .as_ref()
-                        .map(|m| m.durable_get_sp(shadow_region_base(v.vcpu_ctx)))
-                        .unwrap_or_else(|| shadow_frame_base(v.vcpu_ctx));
+                        .map(|m| m.durable_get_sp(m.shadow_region_base(v.vcpu_ctx)))
+                        .unwrap_or_else(|| v.arena().frame_base(v.vcpu_ctx));
                     if let Some((func, args)) = v.spawn_residue.clone() {
                         // A **spawned** vCPU (slice 3.2.1) records *itself* as residue: its continuation now
                         // lives in its own region (extent = `self_sp`); a thaw re-spawns it there.
@@ -8362,18 +8363,16 @@ impl SchedDriver {
 //
 // These describe where a **durable** (freeze/thaw-instrumented) module's per-context shadow
 // state lives in the window. They are the runtime half of a contract whose tooling half is
-// `temen-durable`: the transform emits IR that reads/writes the *active* shadow-SP word at
-// [`SHADOW_SP_OFF`]; the runtime (here) keeps that word pointing at the **currently-running
-// context's** shadow region, swapping it on every fiber switch (D-fiber-cont option A — the
-// switch knowledge lives in the runtime's resume chain, not in emitted IR). `temen-interp` is
-// TCB and must not depend on the tooling-tier `temen-durable`, so these constants are duplicated
-// and cross-checked against `temen_durable`'s in that crate's tests.
+// `temen-durable`: the transform emits IR that addresses the **currently-running context's**
+// shadow region through `durable.shadow_base` (§12.8 4A.5); the runtime (here) re-points that
+// register on every fiber switch (D-fiber-cont option A — the switch knowledge lives in the
+// runtime's resume chain, not in emitted IR). The layout constants live in `temen_ir::durable_abi`
+// (#915), so TCB `temen-interp` never depends on the tooling-tier `temen-durable`.
 //
-// Per-context layout: context `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +
-// SHADOW_STRIDE)`, all within the reserved low slice `[0, DURABLE_RESERVE)`. The root
-// computation is context 0 (so a single-context run is byte-identical to the pre-fiber layout,
-// whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
-// slot `s` is context `s + 1`.
+// Per-context layout has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503) —
+// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`, the arena being the module's own
+// declaration (`Memory::shadow`, carried by this window's `Mem`). The root computation is context 0; a `cont.new`-created
+// fiber in registry slot `s` is context `s + 1`.
 
 /// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
@@ -8415,32 +8414,22 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
 /// Must equal `temen_durable::ARM_QUIESCE_OFF`.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
-/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
-/// `temen_durable::DURABLE_RESERVE`.
-pub use temen_ir::durable_abi::DURABLE_RESERVE;
-/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
-/// `temen_durable::SHADOW_BASE`.
-pub use temen_ir::durable_abi::SHADOW_BASE;
-/// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
-/// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
-/// on each fiber switch. Must equal `temen_durable::SHADOW_SP_OFF`.
+/// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
+/// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
+/// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// Per-context shadow-stack stride: context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +
-/// SHADOW_STRIDE)`. 4 KiB per context fits ~15 contexts in the 64 KiB reserve — a provisional
+/// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
+/// SHADOW_STRIDE)`. 4 KiB per context (a 48 KiB arena holds 12) — a provisional
 /// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
 ///
-/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the global
-/// `DURABLE_RESERVE` ceiling, not at a per-region bound, so a fiber recursed deeper than
+/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the arena's
+/// `end`, not at a per-region bound, so a fiber recursed deeper than
 /// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
 /// (every test today) stay confined; making the overflow bound per-region travels with the
 /// sizing decision.
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
-
-/// The shadow-region base (window offset) of context `ctx_idx` (root = 0, fiber slot `s` =
-/// `s + 1`). The per-context partition that keeps two fibers' frozen frames from colliding.
-fn shadow_region_base(ctx_idx: usize) -> u64 {
-    SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
-}
+/// The shadow arena: where the per-context shadow regions sit (one definition of placement).
+pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
 /// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
 /// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
@@ -8455,27 +8444,6 @@ pub use temen_ir::durable_abi::SHADOW_SP_WORD_LEN;
 /// `durable.shadow_base` (like the SP word). The **freeze** word (`UNWINDING`) stays at the global
 /// [`STATE_OFF`]. Must equal `temen_durable::STATE_IN_REGION_OFF`.
 pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
-
-/// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
-/// empty (no-frames) extent of a context's shadow stack.
-fn shadow_frame_base(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + REGION_HEADER_LEN
-}
-
-/// Byte offset of context `ctx_idx`'s per-context **thaw** state word (§12.8 concurrent-thaw stage 1).
-fn thaw_state_off(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + STATE_IN_REGION_OFF
-}
-
-/// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
-/// `cont.new` checks before handing out a new fiber's region.
-fn shadow_region_fits(ctx_idx: usize) -> bool {
-    shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
-}
-
-/// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
-/// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
-const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 24`, so a slot always fits in the
@@ -8608,12 +8576,13 @@ fn shadow_switch(
         shadow_context_index(in_ctx)
     };
     let Some(m) = mem.as_mut() else { return };
+    let arena = m.shadow_arena();
     // §12.8 4A.5: each context's SP word lives in its **own** region (`shadow_region_base`); the
     // off-table root uses this vCPU's `root_ctx`, a fiber slot `s` its context `s + 1`. The save/load
     // mirror the host-side caches — with per-context words the load is a redundant equal-write (the
     // incoming region already holds its SP), retained for choreography parity with freeze/thaw.
     let region_of = |ctx: usize| {
-        shadow_region_base(if ctx == ROOT_FIBER {
+        arena.region_base(if ctx == ROOT_FIBER {
             root_ctx
         } else {
             shadow_context_index(ctx)
@@ -8659,7 +8628,7 @@ fn shadow_switch(
     // thaw driver).
     if in_ctx != ROOT_FIBER {
         let fctx = shadow_context_index(in_ctx);
-        if in_sp > shadow_frame_base(fctx) {
+        if in_sp > arena.frame_base(fctx) {
             m.durable_set_thaw_state(fctx, STATE_REWINDING);
         }
     }
@@ -8915,7 +8884,7 @@ struct RegState {
     /// grow **down** from `MAX_SHADOW_CTX` while fibers grow **up** from context 1; a child's context is
     /// *freed* (its bit cleared) when it genuinely finishes, so the bound is now *peak concurrent* vCPUs
     /// rather than the lifetime total. `MAX_SHADOW_CTX` is 15, so a `u16` holds every context bit.
-    vcpu_mask: u16,
+    vcpu_mask: u64,
 }
 
 impl FiberRegistry {
@@ -8939,7 +8908,11 @@ impl FiberRegistry {
     /// Out-of-range slots return the root base — they can only arise from a corrupt chain, which
     /// the surrounding fiber logic already treats as `Malformed`.
     fn saved_sp(&self, slot: usize) -> u64 {
-        self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
+        self.lock()
+            .shadow
+            .get(slot)
+            .copied()
+            .unwrap_or(ShadowArena::EMPTY.region_base(0))
     }
 
     /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
@@ -8960,23 +8933,16 @@ impl FiberRegistry {
     /// to claim a top-down region (`MAX_SHADOW_CTX`, `−1`, …) for a freshly spawned child. `None` if
     /// the reserve is full (the vCPU pool growing down would meet the fiber pool growing up) — a clean
     /// `ThreadFault`, never an overlap. Atomic with the fiber count under the registry lock.
-    fn reserve_vcpu_context(&self) -> Option<usize> {
+    fn reserve_vcpu_context(&self, arena: ShadowArena) -> Option<usize> {
         let mut t = self.lock();
         // Hand out the **highest free** context above the fiber pool (`fibers.len()` occupies contexts
         // `1..=fibers.len()`). Top-down keeps the vCPU pool clear of the upward-growing fibers; reusing
         // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
         let floor = t.fibers.len();
-        let mut c = MAX_SHADOW_CTX;
-        // #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
-        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as the
-        // fiber path gates `cont.new` with [`shadow_region_fits`]. (Before the guard relocation every
-        // context fit, so this loop was a no-op.)
-        while c > floor && !shadow_region_fits(c) {
-            c -= 1;
-        }
+        let mut c = arena.ctx_ceiling();
         while c > floor {
-            if t.vcpu_mask & (1 << c) == 0 {
-                t.vcpu_mask |= 1 << c;
+            if t.vcpu_mask & (1u64 << c) == 0 {
+                t.vcpu_mask |= 1u64 << c;
                 return Some(c);
             }
             c -= 1;
@@ -8988,8 +8954,8 @@ impl FiberRegistry {
     /// **genuinely finishes** (not a freeze-unwind, which keeps the region for thaw). A no-op for the
     /// root / a non-durable child (context 0).
     fn free_vcpu_context(&self, ctx: usize) {
-        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
-            self.lock().vcpu_mask &= !(1 << ctx);
+        if (1..64).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1u64 << ctx);
         }
     }
 
@@ -8997,7 +8963,7 @@ impl FiberRegistry {
     /// re-spawned children reclaim *exactly* the contexts they held at freeze (derived from their
     /// restored shadow-SPs — recycling means these need not be the top `n`), so a post-thaw spawn
     /// allocates into a genuinely-free context. Set once after re-seeding, before forward execution.
-    fn seed_vcpu_mask(&self, mask: u16) {
+    fn seed_vcpu_mask(&self, mask: u64) {
         self.lock().vcpu_mask = mask;
     }
 
@@ -9008,7 +8974,14 @@ impl FiberRegistry {
     /// does the table grow. So the table is bounded by the *peak concurrent* fiber count, not the
     /// lifetime total — and the quota / durable-reserve checks (on the grow path / the allocated
     /// context) likewise bound concurrency rather than lifetime.
-    fn create(&self, func: i32, sp: i64, max_fibers: usize, durable: bool) -> Result<i64, Trap> {
+    fn create(
+        &self,
+        func: i32,
+        sp: i64,
+        max_fibers: usize,
+        durable: bool,
+        arena: ShadowArena,
+    ) -> Result<i64, Trap> {
         let mut t = self.lock();
         let reuse = t.free.peek().map(|&Reverse(s)| s);
         // Growing (no free slot ⇒ every existing slot is live) must honor the concurrency quota.
@@ -9024,22 +8997,22 @@ impl FiberRegistry {
         // with recycling, need not be a simple count from the top).
         let lowest_vcpu = {
             if t.vcpu_mask == 0 {
-                MAX_SHADOW_CTX + 1
+                arena.ctx_ceiling() + 1
             } else {
                 t.vcpu_mask.trailing_zeros() as usize
             }
         };
-        if durable && (!shadow_region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
+        if durable && (!arena.region_fits(slot + 1) || slot + 1 >= lowest_vcpu) {
             return Err(Trap::FiberFault);
         }
         let generation = if reuse.is_some() {
             t.free.pop();
             t.fibers[slot] = RegFiber::Pending { func, sp };
-            t.shadow[slot] = shadow_frame_base(slot + 1); // reused region: empty stack at its frame base
+            t.shadow[slot] = arena.frame_base(slot + 1); // reused region: empty stack at its frame base
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
-            t.shadow.push(shadow_frame_base(slot + 1));
+            t.shadow.push(arena.frame_base(slot + 1));
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
             0
         };
@@ -9302,6 +9275,8 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
 /// into the shared spawn logic (`Arc`s — spawning shares, never copies). `None` = a
 /// same-module child (runs the parent's own program).
 struct ChildMod {
+    /// The child module's declared durable shadow arena (INVARIANTS.md #16), `None` if none.
+    shadow: Option<ShadowArena>,
     funcs: Arc<[Func]>,
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
@@ -9353,7 +9328,7 @@ struct VCpu {
     /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
     /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
     /// registry's `shadow`). The root is context 0, so this starts at [`shadow_frame_base`]`(0)` (its
-    /// in-region SP word at `SHADOW_BASE`, frames just past it).
+    /// in-region SP word at the root region base, frames just past it).
     root_shadow_sp: u64,
     /// §12.8 4A.5: the **active spill context** — whose region the running instrumented code addresses
     /// via `durable.shadow_base`. The root's `vcpu_ctx` while at root, a fiber's `slot + 1` while a
@@ -9578,6 +9553,13 @@ struct ServeRun {
 }
 
 impl VCpu {
+    /// This domain's module-declared shadow arena ([`ShadowArena::EMPTY`] before a window exists or
+    /// when the module declared none) — every placement question a vCPU asks goes through here.
+    fn arena(&self) -> ShadowArena {
+        self.mem
+            .as_ref()
+            .map_or(ShadowArena::EMPTY, |m| m.shadow_arena())
+    }
     /// A fresh vCPU whose root frame is `funcs[entry](args)`. A bad `entry` is caught by the driver's
     /// first block lookup ([`Trap::Malformed`]), so construction is infallible.
     #[allow(clippy::too_many_arguments)]
@@ -9612,7 +9594,7 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: shadow_frame_base(0),
+            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -9776,7 +9758,7 @@ impl VCpu {
             root_parked: None,
             parked_frames: 0,
             durable: false,
-            root_shadow_sp: shadow_frame_base(0),
+            root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
             durable_sp_ctx: 0,
             frozen: Vec::new(),
             spawn_residue: None,
@@ -9985,12 +9967,13 @@ impl VCpu {
         }
         // §12.8 4A.5: this vCPU's root region word (where the root's SP lives); restored at the end so
         // the window is thaw-ready (the root rewinds first).
-        let root_word = shadow_region_base(self.vcpu_ctx);
+        let arena = self.arena();
+        let root_word = arena.region_base(self.vcpu_ctx);
         let root_sp = self
             .mem
             .as_ref()
             .map(|m| m.durable_get_sp(root_word))
-            .unwrap_or_else(|| shadow_frame_base(self.vcpu_ctx));
+            .unwrap_or_else(|| arena.frame_base(self.vcpu_ctx));
         while let Some((slot, frames)) = self.registry.take_parked_for_freeze() {
             // Placeholder resume value (inert; not spilled by `Yield`).
             self.flatten_fiber_for_freeze(slot, frames, Some(Reg::from_i64(0)))?;
@@ -10047,8 +10030,9 @@ impl VCpu {
         // is the `ROOT_FIBER` sentinel), so set the active spill context explicitly.
         let fctx = shadow_context_index(slot);
         self.durable_sp_ctx = fctx;
+        let arena = self.arena();
         if let Some(m) = self.mem.as_mut() {
-            m.durable_set_sp(shadow_region_base(fctx), shadow_frame_base(fctx));
+            m.durable_set_sp(arena.region_base(fctx), arena.frame_base(fctx));
         }
         self.frames = frames;
         self.cur = ROOT_FIBER;
@@ -10059,8 +10043,8 @@ impl VCpu {
         let shadow_sp = self
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(shadow_region_base(fctx)))
-            .unwrap_or_else(|| shadow_frame_base(fctx));
+            .map(|m| m.durable_get_sp(arena.region_base(fctx)))
+            .unwrap_or_else(|| arena.frame_base(fctx));
         self.registry.set_saved_sp(slot, shadow_sp);
         self.frozen.push(FrozenFiber {
             slot,
@@ -10146,6 +10130,9 @@ fn handle_mem(
 }
 
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
+    // This domain's shadow arena is a property of its window, fixed for the run — read once so the
+    // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
+    let arena = v.arena();
     let mut budget = quantum; // instructions left before a forced `Yield` (deterministic explorer)
                               // A timed `svc.wait`'s deadline fired (I38): consumed by the rewound serve arm below, which
                               // returns its count instead of re-parking. Only ever set in the same `run_inner` call that
@@ -10721,7 +10708,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // Allocate the handler fiber slot; exhaustion is backpressure —
                                     // undo the checkout, answer -EAGAIN (never a trap).
                                     let handle_ =
-                                        match registry.create(0, 0, spawn_quota.max_fibers, false) {
+                                        match registry.create(0, 0, spawn_quota.max_fibers, false, arena) {
                                             Ok(h_) => h_,
                                             Err(_) => {
                                                 // 7.1 threaded: no checkout to undo (see above).
@@ -11362,6 +11349,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
+                                    shadow: g.shadow,
                                     memory_log2: g.memory_log2,
                                     data: g.data.clone(),
                                     durable: g.durable,
@@ -11475,6 +11463,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let g = hg.resolve_module(modh)?;
                                 Some(ChildMod {
                                     funcs: g.funcs.clone(),
+                                    shadow: g.shadow,
                                     memory_log2: g.memory_log2,
                                     data: g.data.clone(),
                                     durable: g.durable,
@@ -11507,6 +11496,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
+                                    shadow: g.shadow,
                                     memory_log2: g.memory_log2,
                                     data: g.data.clone(),
                                     durable: g.durable,
@@ -11634,9 +11624,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // nesting composes at any depth.
                                 let abs_base =
                                     mem.as_ref().map_or(0, |m| m.window.base()) + ibase + off;
-                                let child_mem = mem
-                                    .as_ref()
-                                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                                let child_shadow = child_mod.as_ref().and_then(|cm| cm.shadow);
+                                let child_mem = mem.as_ref().map(|m| {
+                                    m.nested_view(
+                                        abs_base,
+                                        size_log2 as u8,
+                                        child_shadow.unwrap_or_else(|| m.shadow_arena()),
+                                    )
+                                });
                                 // §2.2 (op 16): a demand process child starts with every page of
                                 // its carve unmapped — first touches fault to the pager binding.
                                 if pager_ref.is_some() {
@@ -12176,6 +12171,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let g = hg.resolve_module(mh)?;
                                 ChildMod {
                                     funcs: g.funcs.clone(),
+                                    shadow: g.shadow,
                                     memory_log2: g.memory_log2,
                                     data: g.data.clone(),
                                     durable: g.durable,
@@ -12271,8 +12267,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             } else {
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
-                                let mut fm =
-                                    Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
+                                let mut fm = Mem::with_reservation(
+                                    DEFAULT_RESERVED_LOG2,
+                                    size_log2 as u8,
+                                    cm.shadow,
+                                );
                                 fm.init_data(&cm.data);
                                 fm.seed_null_guard(temen_ir::module_null_guard()); // #964
                                 if let Some(p) = &payload {
@@ -12728,13 +12727,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // The handler's fiber slot — an ordinary registry fiber (recycled on
                         // finish), so the §15 quota bounds concurrent parked handlers too.
                         // Exhaustion is backpressure to the dispatch, not a trap.
-                        let handle = match registry.create(0, 0, spawn_quota.max_fibers, durable) {
-                            Ok(h_) => h_,
-                            Err(_) => {
-                                sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
-                                continue;
-                            }
-                        };
+                        let handle =
+                            match registry.create(0, 0, spawn_quota.max_fibers, durable, arena) {
+                                Ok(h_) => h_,
+                                Err(_) => {
+                                    sched.cap_reply_or_stash(d.ticket, EAGAIN, host);
+                                    continue;
+                                }
+                            };
                         // Claim it straight into `Running` (discarding the placeholder
                         // `Start`): handler first-frames are built here — their signatures
                         // are the impl_export's own, not the `(sp, arg)` fiber launch shape.
@@ -12999,6 +12999,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         let hg = host.lock_unpoisoned();
                         hg.resolve_module(mh).ok().map(|g| ChildMod {
                             funcs: g.funcs.clone(),
+                            shadow: g.shadow,
                             memory_log2: g.memory_log2,
                             data: g.data.clone(),
                             durable: g.durable,
@@ -14000,7 +14001,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 Inst::DurableShadowBase => {
                     frames[top]
                         .vals
-                        .push(Reg::from_i64(shadow_region_base(*durable_sp_ctx) as i64));
+                        .push(Reg::from_i64(arena.region_base(*durable_sp_ctx) as i64));
                 }
                 // §12 fiber create: record a `Pending` fiber in the **run-shared** registry
                 // (D57), yield its handle (the registry slot — the first handle of a run is 0 on
@@ -14010,8 +14011,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let stack_base = get_i64(&frames[top].vals, *sp)?;
                     // `durable` runs assign the new fiber a distinct shadow region (and refuse if
                     // the reserve is full); a non-durable run ignores the region bookkeeping.
-                    let handle =
-                        registry.create(funcref, stack_base, spawn_quota.max_fibers, durable)?;
+                    let handle = registry.create(
+                        funcref,
+                        stack_base,
+                        spawn_quota.max_fibers,
+                        durable,
+                        arena,
+                    )?;
                     frames[top].vals.push(Reg::from_i64(handle));
                 }
                 // §12 fiber resume: **claim** fiber `k` — any vCPU may, so a fiber suspended on
@@ -14381,7 +14387,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // Fail closed (`ThreadFault`) if the reserve is full — the vCPU pool growing down
                     // would meet the fiber pool growing up. (Non-durable runs never touch the reserve.)
                     let child_ctx = if durable {
-                        match registry.reserve_vcpu_context() {
+                        match registry.reserve_vcpu_context(arena) {
                             Some(c) => c,
                             None => return Err(Trap::ThreadFault),
                         }
@@ -14431,7 +14437,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                                  // Durable multi-vCPU (slice 3.2.2): this child owns the top-down context reserved
                                                  // above, so its shadow stack lives in its own region; it carries its own state word
                                                  // (swapped in by the runtime). Retain `(entry, [sp, arg])` so a freeze emits residue.
-                        child.root_shadow_sp = shadow_frame_base(child_ctx);
+                        child.root_shadow_sp = arena.frame_base(child_ctx);
                         child.vcpu_ctx = child_ctx; // freed back to the registry when it finishes
                         child.dstate = child_state;
                         child.parent_task = parent_id; // slice 3.4: who spawned it (nested-spawn thaw)
@@ -14824,15 +14830,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // former is `Frozen` (an instrumented fiber always unwinds at a poll before its
                     // real return, so this never mis-classifies one that should be `Done`).
                     let lctx = shadow_context_index(leaving);
-                    let region_base = shadow_region_base(lctx);
+                    let region_base = arena.region_base(lctx);
                     let shadow_sp = mem
                         .as_ref()
                         .map(|m| m.durable_get_sp(region_base))
-                        .unwrap_or_else(|| shadow_frame_base(lctx));
+                        .unwrap_or_else(|| arena.frame_base(lctx));
                     // §12.8 4A.5: an unwound fiber spilled *past* its frame base (the SP word occupies
                     // the region's first 8 bytes); an empty stack sits exactly at the frame base.
                     let freezing = durable
-                        && shadow_sp > shadow_frame_base(lctx)
+                        && shadow_sp > arena.frame_base(lctx)
                         && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
                     if freezing {
                         let (func, sp) = match popped.as_ref() {
@@ -18990,6 +18996,8 @@ const JIT_DEFAULT_MAX_BLOB_BYTES: u64 = 1 << 26; // 64 MiB of cumulative submitt
 /// are `Arc`s, so the copy is cheap): a parent hands a command module to a nested guest to `execve`.
 #[derive(Clone)]
 struct ModuleGrant {
+    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
+    shadow: Option<ShadowArena>,
     funcs: Arc<[Func]>,
     memory_log2: Option<u8>,
     data: Arc<[Data]>,
@@ -19056,7 +19064,10 @@ fn encode_jit_unit(funcs: &[Func], types: &[temen_ir::TypeEntry], mem_log2: Opti
         // FuncType interning (#922): the unit's type section must ride `unit_ir` so a restore's
         // `decode_module` + `verify_module` can resolve the interned call type indices.
         types: types.to_vec(),
-        memory: mem_log2.map(|size_log2| Memory { size_log2 }),
+        memory: mem_log2.map(|size_log2| Memory {
+            size_log2,
+            shadow: None,
+        }),
         ..Module::default()
     };
     temen_encode::encode_module(&m)
@@ -20583,7 +20594,7 @@ impl Host {
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
-        // Only a driver that surfaces the park (`Vcpu`, `DebugRun`) can ever finish this call:
+        // Only a driver that surfaces the park (`Vcpu`, `ScheduledDebugRun`) can ever finish this call:
         // decline before the submit hook runs under any other, so the embedder never records a
         // dead request.
         if !self.completions.host_completed_allowed() {
@@ -21763,7 +21774,7 @@ impl Host {
         // The provider's window, exactly as a run of `m` would build it (§3a data segments
         // included) — the exporter's own memory, not the wirer's and not any caller's.
         let mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+            let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
             mm.init_data(&m.data);
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
             mm
@@ -22251,7 +22262,8 @@ impl Host {
             .self_instance
             .get_or_insert_with(|| {
                 let mem = m.memory.map(|mc| {
-                    let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+                    let mut mm =
+                        Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
                     mm.init_data(&m.data);
                     mm.seed_null_guard(temen_ir::module_null_guard()); // #964
                     mm
@@ -22506,6 +22518,7 @@ impl Host {
         let id = self.modules.len() as u32;
         self.modules.push(ModuleGrant {
             funcs: m.funcs.clone().into(),
+            shadow: m.memory.and_then(|mc| mc.shadow),
             memory_log2: m.memory.map(|mc| mc.size_log2),
             data: m.data.clone().into(),
             exports: m.exports.clone().into(),
@@ -22591,6 +22604,7 @@ impl Host {
         usize,
         *const temen_ir::TypeEntry,
         usize,
+        ShadowArena,
     )> {
         let g = self.resolve_module(handle).ok()?;
         Some((
@@ -22603,6 +22617,7 @@ impl Host {
             // child's interned `call.dyn` type indices when it re-compiles the child.
             g.types.as_ptr(),
             g.types.len(),
+            g.shadow.unwrap_or(ShadowArena::EMPTY),
         ))
     }
 
@@ -25630,6 +25645,12 @@ struct Mem {
     /// baked guard constant sound). `0` only for a sub-window smaller than the guard. A guard fault
     /// is **fatal**, never a §14 recoverable page fault (a demand parent could not legally map it).
     null_guard: u64,
+    /// The module-declared durable **shadow arena** (INVARIANTS.md #16): where a freeze/thaw run
+    /// keeps its per-context shadow regions in this window. [`ShadowArena::EMPTY`] (zero regions)
+    /// for a module that declared none — a durable run of such a module is refused at setup, never
+    /// given a default placement. Set at construction from the module's `Memory`; every placement
+    /// question below (`shadow_region_base` …) is answered from here.
+    shadow: ShadowArena,
     /// The anonymous-page backing: a [`temen_mem::Region`] (`#![forbid(unsafe_code)]`-friendly) sized
     /// to the window's reserved extent. On unix this is one demand-zeroed `mmap` — the shareable
     /// substrate parallel vCPUs run over with real hardware atomics (§12); elsewhere a paged
@@ -25712,7 +25733,7 @@ impl Mem {
     /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,
     /// so passing `0` yields a fully-mapped window. Lazy paging means a huge mask domain (or
     /// reservation) never eagerly allocates.
-    fn with_reservation(reserved_log2: u8, mapped_log2: u8) -> Mem {
+    fn with_reservation(reserved_log2: u8, mapped_log2: u8, shadow: Option<ShadowArena>) -> Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
@@ -25728,6 +25749,7 @@ impl Mem {
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
+            shadow: shadow.unwrap_or(ShadowArena::EMPTY),
         }
     }
 
@@ -25779,7 +25801,12 @@ impl Mem {
     /// [`Region`] accessors themselves (#1191: the word/atomic fast paths were unbounded and reached
     /// host memory behind the window). A Region-backed run that needs memory past its backing is
     /// decline-and-rerun territory, never a silent host access.
-    fn with_reservation_over(reserved_log2: u8, mapped_log2: u8, back: Arc<Region>) -> Mem {
+    fn with_reservation_over(
+        reserved_log2: u8,
+        mapped_log2: u8,
+        back: Arc<Region>,
+        shadow: Option<ShadowArena>,
+    ) -> Mem {
         let reserved_log2 = reserved_log2.max(mapped_log2);
         let window = Window::with_mapped(reserved_log2, 1u64 << mapped_log2.min(63));
         let page = host_page_size();
@@ -25795,6 +25822,7 @@ impl Mem {
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
+            shadow: shadow.unwrap_or(ShadowArena::EMPTY),
         }
     }
 
@@ -25806,7 +25834,7 @@ impl Mem {
     /// the parent's other memory or outside the parent window. `base` is size-aligned by `Window::sub`;
     /// the whole slice is backed (no `map`-growth inside a child yet). The backing is sized to hold
     /// `[0, base + size)`.
-    fn sub_window(base: u64, size_log2: u8, parent_bytes: u64) -> Mem {
+    fn sub_window(base: u64, size_log2: u8, parent_bytes: u64, shadow: Option<ShadowArena>) -> Mem {
         let window = Window::sub(base, size_log2, 1u64 << size_log2.min(63));
         let page = host_page_size();
         let need = window.base().saturating_add(window.reserved());
@@ -25822,6 +25850,7 @@ impl Mem {
             fault_report: AtomicU64::new(NO_FAULT),
             writes: 0,
             null_guard: 0,
+            shadow: shadow.unwrap_or(ShadowArena::EMPTY),
         }
     }
 
@@ -25856,6 +25885,7 @@ impl Mem {
     /// Confinement (`window`/`page`) is copied (identical for every vCPU of the run).
     fn fork_for_thread(&self) -> Mem {
         Mem {
+            shadow: self.shadow,
             window: self.window,
             page: self.page,
             back: Arc::clone(&self.back),
@@ -25924,6 +25954,7 @@ impl Mem {
             reserved.trailing_zeros() as u8,
             mapped.trailing_zeros() as u8,
             Arc::new(self.twin_backing(reserved)),
+            Some(self.shadow),
         );
         twin.seed(&self.window_snapshot());
         if !prot_copy.is_empty() {
@@ -25990,8 +26021,9 @@ impl Mem {
     /// child's pages onto the parent's (a child `unmap` of *its* page 0 would hit the parent's). The
     /// domains share **bytes**, not page-protection state — cross-domain memory sharing is §13, and
     /// lazy paging is the parent fielding the child's faults (co-fiber), not a shared map.
-    fn nested_view(&self, abs_base: u64, size_log2: u8) -> Mem {
+    fn nested_view(&self, abs_base: u64, size_log2: u8, shadow: ShadowArena) -> Mem {
         let mut v = Mem {
+            shadow,
             window: Window::sub(abs_base, size_log2, 1u64 << size_log2.min(63)),
             page: self.page,
             back: Arc::clone(&self.back),
@@ -26138,6 +26170,19 @@ impl Mem {
     /// the JIT tiers' baked guard constant sound). `guard = 0` (a sub-window smaller than the guard) is
     /// a no-op — those fast paths stay lock-free. The guard is a multiple of every supported page size
     /// (16 KiB = the max host page; the browser's software page is 4 KiB), asserted here.
+    /// The module-declared shadow arena ([`ShadowArena::EMPTY`] when it declared none).
+    pub(crate) fn shadow_arena(&self) -> ShadowArena {
+        self.shadow
+    }
+    /// Context `ctx`'s shadow-region base in this window (root = 0; fiber slot `s` = `s + 1`).
+    pub(crate) fn shadow_region_base(&self, ctx: usize) -> u64 {
+        self.shadow.region_base(ctx)
+    }
+    /// Context `ctx`'s per-context **thaw** state word.
+    pub(crate) fn thaw_state_off(&self, ctx: usize) -> u64 {
+        self.shadow.thaw_state_off(ctx)
+    }
+
     pub(crate) fn seed_null_guard(&mut self, guard: u64) {
         // Page-exact or skip: on a host whose page exceeds the guard (e.g. 64 KiB aarch64), a
         // page-map seed would swallow live scratch above the guard — so the guard disengages, and
@@ -26828,13 +26873,13 @@ impl Mem {
 
     /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
     /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
-    /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
+    /// the current context's region (D-fiber-cont option A). Falls back to the root region base (`ShadowArena::region_base(0)`) if the
     /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
     fn durable_get_sp(&self, sp_word: u64) -> u64 {
         self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
-            .unwrap_or(SHADOW_BASE)
+            .unwrap_or(self.shadow.region_base(0))
     }
 
     fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {
@@ -26867,7 +26912,7 @@ impl Mem {
     /// Read context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) at
     /// [`thaw_state_off`] (§12.8 concurrent-thaw stage 1). `STATE_NORMAL` if its page is uncommitted.
     fn durable_thaw_state(&self, ctx: usize) -> i32 {
-        self.read_bytes_impl(thaw_state_off(ctx), 4)
+        self.read_bytes_impl(self.thaw_state_off(ctx), 4)
             .and_then(|b| b.try_into().ok())
             .map(i32::from_le_bytes)
             .unwrap_or(STATE_NORMAL)
@@ -26875,7 +26920,7 @@ impl Mem {
 
     /// Set context `ctx`'s per-context **thaw** state word.
     fn durable_set_thaw_state(&mut self, ctx: usize, state: i32) {
-        let _ = self.write_bytes_impl(thaw_state_off(ctx), &state.to_le_bytes());
+        let _ = self.write_bytes_impl(self.thaw_state_off(ctx), &state.to_le_bytes());
     }
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw
@@ -28443,7 +28488,7 @@ mod mem_fork_tests {
 
     #[test]
     fn fork_private_copies_bytes_but_does_not_alias() {
-        let m = Mem::with_reservation(16, 16); // a fully-mapped 64 KiB window
+        let m = Mem::with_reservation(16, 16, None); // a fully-mapped 64 KiB window
         m.set_byte(0, 0xAB);
         m.set_byte(100, 0x7F);
         let twin = m.fork_private().expect("a simple window forks");
@@ -28473,7 +28518,7 @@ mod mem_fork_tests {
     /// on-ramp program's fork with `-EAGAIN`), and not an alias.
     #[test]
     fn fork_private_copies_vm_mapped_tail_pages() {
-        let mut m = Mem::with_reservation(18, 16); // 64 KiB mapped, 256 KiB reserved
+        let mut m = Mem::with_reservation(18, 16, None); // 64 KiB mapped, 256 KiB reserved
         let page = m.page;
         assert_eq!(m.map(1 << 16, page, PROT_READ | PROT_WRITE), 0);
         m.set_byte(1 << 16, 0x5A);
@@ -28501,6 +28546,7 @@ mod mem_fork_tests {
             16,
             16,
             Arc::new(Region::owned_zeroed(1 << 16, page).expect("64 KiB allocates")),
+            None,
         );
         let b = m.twin_backing_from(Region::paged(1 << 16, page), 1 << 16);
         assert!(
@@ -28526,7 +28572,7 @@ mod mem_fork_tests {
         // Non-flat parent (forced `Paged` backing): never upgrade — the tier-up world only ever
         // forks from flat windows, and an eager buffer for a pure-interp parent is waste.
         let paged_parent =
-            Mem::with_reservation_over(16, 16, Arc::new(Region::paged(1 << 16, page)));
+            Mem::with_reservation_over(16, 16, Arc::new(Region::paged(1 << 16, page)), None);
         let b = paged_parent.twin_backing_from(Region::paged(1 << 16, page), 1 << 16);
         assert!(
             b.raw_base().is_none(),
@@ -28581,6 +28627,7 @@ mod mem_fork_tests {
             16,
             16,
             Arc::new(Region::owned_zeroed(1 << 16, host_page_size()).expect("64 KiB allocates")),
+            None,
         );
         m.set_byte(8, 0x2A);
         let twin = m.fork_private().expect("a simple window forks");
@@ -28742,7 +28789,7 @@ mod prot_tests {
 
     /// A fully-mapped 64 KiB window (`mapped == reserved`, 16 pages).
     fn mem64k() -> Mem {
-        Mem::with_reservation(0, 16)
+        Mem::with_reservation(0, 16, None)
     }
 
     #[test]
@@ -28794,7 +28841,7 @@ mod prot_tests {
     #[test]
     fn forked_vcpu_sees_post_fork_mappings() {
         // 128 KiB reserved, 64 KiB mapped ⇒ the page at 64 KiB starts in the unmapped tail.
-        let mut parent = Mem::with_reservation(17, 16);
+        let mut parent = Mem::with_reservation(17, 16, None);
         let child = parent.fork_for_thread();
         let tail = 1u64 << 16;
         // Both views fault on the tail initially (unmapped).
@@ -28822,7 +28869,7 @@ mod prot_tests {
         let size_log2 = 12u8; // 4 KiB child
         let size = 1u64 << size_log2;
         let parent = 1u64 << 17; // 128 KiB parent backing
-        let mut mem = Mem::sub_window(base, size_log2, parent);
+        let mut mem = Mem::sub_window(base, size_log2, parent, None);
 
         // A store at child offset 8 lands at absolute base+8; a far offset (size+8) now **faults**
         // (trap-confinement: no wrap), leaving the earlier write intact.
@@ -28867,16 +28914,16 @@ mod prot_tests {
     #[test]
     fn anon_futex_key_is_per_backing() {
         let off = 2048u64;
-        let a = Mem::with_reservation(20, 12);
-        let b = Mem::with_reservation(20, 12);
+        let a = Mem::with_reservation(20, 12, None);
+        let b = Mem::with_reservation(20, 12, None);
         assert_eq!(a.futex_key(off), a.futex_key(off));
         assert_ne!(
             a.futex_key(off),
             b.futex_key(off),
             "two independent windows at the same offset must not share a futex queue"
         );
-        let parent = Mem::with_reservation(20, 17);
-        let child = parent.nested_view(1 << 16, 12);
+        let parent = Mem::with_reservation(20, 17, None);
+        let child = parent.nested_view(1 << 16, 12, ShadowArena::EMPTY);
         let abs = (1u64 << 16) + 8;
         assert_eq!(
             parent.futex_key(abs),
@@ -28897,7 +28944,7 @@ mod prot_tests {
         let size_log2 = 16u8; // 64 KiB child (≥ one host page, so a whole page fits)
         let parent = 1u64 << 18; // 256 KiB parent backing
         let p = page();
-        let mut mem = Mem::sub_window(base, size_log2, parent);
+        let mut mem = Mem::sub_window(base, size_log2, parent, None);
 
         // Initially fully mapped: a store/load at child offset 0 works.
         assert!(mem.store(0, 0, StoreOp::I64, Value::I64(0xABCD)).is_ok());
@@ -28944,7 +28991,7 @@ mod prot_tests {
     /// (`64 KiB`): the tail `[64 KiB, 1 MiB)` is reserved-but-unmapped and the guest can grow into
     /// it. `Mem::with_reservation(reserved_log2=20, mapped_log2=16)`.
     fn mem_growable() -> Mem {
-        Mem::with_reservation(20, 16)
+        Mem::with_reservation(20, 16, None)
     }
 
     #[test]

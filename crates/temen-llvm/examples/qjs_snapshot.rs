@@ -170,6 +170,7 @@ fn main() {
     );
     m.memory = Some(temen_ir::Memory {
         size_log2: MAPPED_LOG2,
+        shadow: None,
     });
     let win = 1u64 << MAPPED_LOG2;
     let back_size = win as usize;

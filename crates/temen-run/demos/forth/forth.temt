@@ -84,7 +84,9 @@
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
 ;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)  75 child_start(x)  76 sandbox(p,n)
 
-memory 20
+; The durable shadow arena (INVARIANTS.md #16): 0x74000..0x80000 — 48 KiB = 12 contexts, inside the
+; `sandbox` spawn-scratch page (which uses only its first 0x78 bytes) and clear of every data segment.
+memory 20 shadow 475136 524288
 
 import 0 "write" (i64, i64) -> (i64)
 import 1 "read" (i64, i64) -> (i64)
@@ -1057,7 +1059,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=10 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=11 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1072,18 +1074,20 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  ten = i64.const 10
-  call 30 (ten)
+  eleven = i64.const 11
+  call 30 (eleven)
   call 30 (z)
   call 30 (z)
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  ; memory present, size_log2 20 (must match this kernel's window)
+  ; memory present, size_log2 20 (must match this kernel's window); no shadow arena — a unit is
+  ; not itself a freezable module (the domain's arena is this kernel's own declaration)
   one = i64.const 1
   call 30 (one)
   twenty = i64.const 20
   call 30 (twenty)
+  call 30 (z)
   ; no data, no imports, no exports
   call 30 (z)
   call 30 (z)

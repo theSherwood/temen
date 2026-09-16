@@ -206,7 +206,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![t()],
             blocks: vec![entry, header, halt, setacc, seti_input, add_i, dec_i, jnz],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: PROG_BASE,
             readonly: true,
@@ -332,7 +335,10 @@ fn build_calc_interpreter() -> Module {
             results: vec![t()],
             blocks: vec![entry, header, addb, mulb, addk, mulk, end],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         // No data segment: the program is a const-overlay (see `calc_program` / `demo_corpus`).
         ..Default::default()
     }
@@ -599,7 +605,10 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
                 binop_body(BinOp::Mul),
             ],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: PROG_BASE,
             readonly: true,
@@ -981,7 +990,10 @@ fn build_stack_interpreter_calls(program: &[(u8, i64)]) -> Module {
             },
             combine,
         ],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: PROG_BASE,
             readonly: true,
@@ -1153,7 +1165,10 @@ fn build_heap_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![t()],
             blocks: vec![entry, header, halt, seti, addin, addk, storeh, loadh],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: PROG_BASE,
             readonly: true,
@@ -1296,7 +1311,10 @@ fn build_threaded_interpreter(program: &[(u8, i64)]) -> Module {
             h_dec,
             h_add7,
         ],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: PROG_BASE,
             readonly: true,

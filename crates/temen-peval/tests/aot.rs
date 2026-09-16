@@ -118,7 +118,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![i64t()],
             blocks: vec![entry, header, halt, seti, addi, addin, muli],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,

@@ -107,12 +107,13 @@ pub use temen_ir::durable_abi::STATE_UNWINDING;
 
 // ---- Durable runtime region layout ----
 //
-// The control state + shadow stack occupy a fixed **reserved low slice** `[0,
-// DURABLE_RESERVE)` of the domain's *own* window; the guest's memory is `[DURABLE_RESERVE,
-// window)`. This is the wasm shadow-stack convention (runtime metadata + call stack below
-// `__heap_base`, the program's heap above it): the durable reserve is part of the guest's
-// memory allotment, and a cooperating toolchain bases the guest's data/heap at
-// `DURABLE_RESERVE` so the two never overlap (see `transform_module_assume_confined`).
+// The control words + shadow arena occupy a **reserved low slice** `[0, arena.end)` of the
+// domain's *own* window (the arena is the module's own declaration, `Memory::shadow`, one
+// definition of placement — #1503 / INVARIANTS.md #16); the guest's memory is `[arena.end, window)`. This is the wasm shadow-stack
+// convention (runtime metadata + call stack below `__heap_base`, the program's heap above it):
+// the reserve is part of the guest's memory allotment, and a cooperating toolchain bases the
+// guest's data/heap at the arena `end` so the two never overlap (see
+// `transform_module_assume_confined`).
 //
 // This is *placement*, not an isolation boundary: the window is per-domain and the runtime
 // masks every access into it, so a guest that writes the reserve can only corrupt its own
@@ -161,18 +162,13 @@ pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 /// Window byte offset of the `i32` state word.
 pub use temen_ir::durable_abi::STATE_OFF;
 
-/// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the
-/// state word, shadow-SP, and shadow stack; the guest's memory is `[DURABLE_RESERVE, window)`.
-/// A durable module's declared window must be at least this large (it is counted against the
-/// guest's memory budget). A policy default — embedders may standardize a different value.
-pub use temen_ir::durable_abi::DURABLE_RESERVE;
-/// Window byte offset where the shadow stack begins (grows upward, bounded by `DURABLE_RESERVE`).
-pub use temen_ir::durable_abi::SHADOW_BASE;
-/// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)`
+/// Per-context shadow-region stride: context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`
 /// (§12.8 4A.5). The transform itself never addresses a region (it emits `durable.shadow_base`-relative
 /// loads the runtime resolves), but the [`write_thaw_state`] host helper indexes a context's region.
-/// Must equal `temen-interp`/`temen-jit`'s `SHADOW_STRIDE`.
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
+/// The shadow arena — one definition of placement (see the region-layout note above) — and the end
+/// of the always-live control words below it.
+pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
@@ -193,6 +189,10 @@ pub enum TransformError {
     NoMemory,
     /// The declared window is too small to hold the durable region + a shadow frame.
     MemoryTooSmall,
+    /// A function must be instrumented but the module's `memory` declares no shadow arena
+    /// (`memory N shadow BASE END`): there is nowhere to keep shadow frames. Placement is the
+    /// module's to declare (INVARIANTS.md #16), so this fails closed rather than defaulting.
+    NoShadowArena,
     /// A `call.cap`-bearing function is outside the Phase-1 shape (not a single block,
     /// not exactly one `call.cap`, or not a `return` terminator).
     UnsupportedShape,
@@ -201,9 +201,9 @@ pub enum TransformError {
     UnsupportedInst,
     /// The module is being instrumented via the strict [`transform_module`] path but a
     /// function uses a guest linear-memory instruction (load/store/atomic), which could
-    /// alias the reserved durable region `[0, DURABLE_RESERVE)` (R9). The strict path fails
+    /// alias the reserved durable region `[0, arena.end)` (R9). The strict path fails
     /// closed for *untrusted* modules. A durable module from a cooperating toolchain that
-    /// reserves `[0, DURABLE_RESERVE)` (basing the guest's data/heap at `DURABLE_RESERVE`)
+    /// reserves `[0, arena.end)` (basing the guest's data/heap at the arena `end`)
     /// should instead use [`transform_module_assume_confined`]. (Cap-mediated window effects
     /// — e.g. a Memory capability's map/unmap — are a separate facet the embedder withholds.)
     GuestUsesMemory,
@@ -217,14 +217,14 @@ pub fn transform_module(m: &Module) -> Result<Module, TransformError> {
 }
 
 /// Like [`transform_module`], but **allows the guest to use linear memory**, on the caller's
-/// guarantee that the guest is confined to its usable region `[DURABLE_RESERVE, window)` and
-/// never touches the reserved durable slice `[0, DURABLE_RESERVE)`.
+/// guarantee that the guest is confined to its usable region `[arena.end, window)` and
+/// never touches the reserved durable slice `[0, arena.end)` (its own declared arena's end).
 ///
 /// This is the intended path for durable modules produced by a **cooperating toolchain**:
 /// just as a wasm toolchain reserves low memory for the shadow stack and bases the heap at
-/// `__heap_base`, the producer reserves `[0, DURABLE_RESERVE)` and bases the guest's
-/// data/heap at `DURABLE_RESERVE`. The reserve is budget-accounted (the declared window must
-/// be ≥ `DURABLE_RESERVE`). The contract is *not* statically enforced here — a guest that
+/// `__heap_base`, the producer reserves `[0, arena.end)` and bases the guest's data/heap at
+/// the arena `end`. The reserve is budget-accounted (the declared window must be ≥ `arena.end`).
+/// The contract is *not* statically enforced here — a guest that
 /// violates it can corrupt only its own durability, and fails safe (see the region notes) —
 /// so prefer [`transform_module`] (fails closed, no memory) for *untrusted* modules.
 pub fn transform_module_assume_confined(m: &Module) -> Result<Module, TransformError> {
@@ -251,13 +251,28 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
         return Err(TransformError::GuestUsesMemory);
     }
 
+    // The shadow arena is the module's declaration (INVARIANTS.md #16): an instrumented module must
+    // have one; a module with nothing to instrument needs none — and gets none (no default).
+    let arena = if any_instrumented {
+        let mem = m.memory.ok_or(TransformError::NoMemory)?;
+        mem.shadow.ok_or(TransformError::NoShadowArena)?
+    } else {
+        ShadowArena::EMPTY
+    };
+
     let mut out = m.clone();
     let mut max_frame = 0u64;
 
     for (i, f) in m.funcs.iter().enumerate() {
         if may_suspend[i] {
-            let (nf, frame_size) =
-                transform_func(f, &func_results, &may_suspend, &tainted_sigs, &m.types)?;
+            let (nf, frame_size) = transform_func(
+                f,
+                &func_results,
+                &may_suspend,
+                &tainted_sigs,
+                &m.types,
+                arena.end,
+            )?;
             out.funcs[i] = nf;
             max_frame = max_frame.max(frame_size);
         }
@@ -265,12 +280,12 @@ fn transform_module_inner(m: &Module, enforce_r9: bool) -> Result<Module, Transf
 
     if any_instrumented {
         let mem = out.memory.ok_or(TransformError::NoMemory)?;
-        // The reserved region `[0, DURABLE_RESERVE)` must fit in the declared window (it is
-        // part of the guest's allotment; guest memory is the remainder `[DURABLE_RESERVE,
-        // window)`), and a single shadow frame must fit in `[SHADOW_BASE, DURABLE_RESERVE)`.
+        // The reserved region `[0, arena.end)` must fit in the declared window (it is part of
+        // the guest's allotment; guest memory is the remainder `[arena.end, window)`), and a
+        // single shadow frame must fit in the arena.
         // A live call chain stacks one frame per suspended activation; the reserve bounds the
         // total depth (overflow-trapping the shadow stack is DURABILITY.md §12.7 future work).
-        if mem.size() < DURABLE_RESERVE || SHADOW_BASE + max_frame > DURABLE_RESERVE {
+        if mem.size() < arena.end || arena.base + max_frame > arena.end {
             return Err(TransformError::MemoryTooSmall);
         }
     }
@@ -766,6 +781,8 @@ fn transform_func(
     may_suspend: &[bool],
     tainted_sigs: &[temen_ir::FuncType],
     type_section: &[TypeEntry],
+    // The shadow-overflow trap line: the module's declared arena `end`.
+    arena_end: u64,
 ) -> Result<(Func, u64), TransformError> {
     // Whether a `call.dyn` of this signature could reach a may-suspend target (R8) — the same
     // by-signature rule `compute_may_suspend` used to mark this function may-suspend in the first
@@ -1190,14 +1207,14 @@ fn transform_func(
 
         // UNWIND check: a push of this frame must not run past the reserve into guest memory
         // (R9 / DURABILITY.md §12.7). The shadow stack mirrors the call stack, so this only
-        // trips for a chain deeper than `DURABLE_RESERVE` holds — a clean trap, never silent
+        // trips for a chain deeper than the arena holds — a clean trap, never silent
         // corruption. It lives on the (cold) freeze path, not the per-call path.
         let mut cb = Bb::new(pt.slot_types.clone());
         let sp_a = cb.one(Inst::DurableShadowBase);
         let sp = cb.one(load(LoadOp::I64, sp_a, 0));
         let fsz = cb.one(Inst::ConstI64(pt.frame_size as i64));
         let newsp = cb.one(ibin(IntTy::I64, BinOp::Add, sp, fsz));
-        let reserve = cb.one(Inst::ConstI64(DURABLE_RESERVE as i64));
+        let reserve = cb.one(Inst::ConstI64(arena_end as i64));
         let over = cb.one(icmp(IntTy::I64, CmpOp::GtU, newsp, reserve));
         let live: Vec<ValIdx> = (0..pt.out as u32).collect();
         unwind_blocks.push(cb.finish(Terminator::BrIf {
@@ -1428,22 +1445,22 @@ fn transform_func(
 // ---- window helpers for freeze/thaw drivers and tests ----
 
 /// A fresh durable window of `size` bytes: state = `NORMAL`, and the root context's per-context
-/// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `SHADOW_BASE` — set to its empty
-/// frame base (`SHADOW_BASE + REGION_HEADER_LEN`, just past the SP + thaw words). The legacy global
+/// shadow-SP word (§12.8 4A.5) — the first 8 bytes of its region at `arena.region_base(0)` — set to
+/// its empty frame base (`arena.frame_base(0)`, just past the SP + thaw words). The legacy global
 /// `SHADOW_SP_OFF` is unused; the per-context thaw words default to `NORMAL` (zero).
-pub fn init_durable_window(size: usize) -> Vec<u8> {
+pub fn init_durable_window(size: usize, a: ShadowArena) -> Vec<u8> {
     let mut w = vec![0u8; size];
     write_state(&mut w, STATE_NORMAL);
-    w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]
-        .copy_from_slice(&(SHADOW_BASE + REGION_HEADER_LEN).to_le_bytes());
+    let b = a.region_base(0) as usize;
+    w[b..b + 8].copy_from_slice(&a.frame_base(0).to_le_bytes());
     w
 }
 
 /// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
 /// region base plus [`STATE_IN_REGION_OFF`]. Per-context, so a thaw can set each frozen vCPU rewinding
 /// independently (vs. the global [`STATE_OFF`] freeze word).
-pub fn thaw_state_off(ctx: usize) -> u64 {
-    SHADOW_BASE + ctx as u64 * SHADOW_STRIDE + STATE_IN_REGION_OFF
+pub fn thaw_state_off(arena: ShadowArena, ctx: usize) -> u64 {
+    arena.thaw_state_off(ctx)
 }
 
 /// Overwrite the global **freeze** state word (`UNWINDING`/`ARMED`/`NORMAL`) in a window image — the
@@ -1454,8 +1471,8 @@ pub fn write_state(window: &mut [u8], state: i32) {
 
 /// Overwrite context `ctx`'s per-context **thaw** state word (`REWINDING`/`NORMAL`) — used to drive a
 /// thaw (the runtime sets each frozen context `REWINDING` before its rewinding re-entry).
-pub fn write_thaw_state(window: &mut [u8], ctx: usize, state: i32) {
-    let off = thaw_state_off(ctx) as usize;
+pub fn write_thaw_state(window: &mut [u8], arena: ShadowArena, ctx: usize, state: i32) {
+    let off = thaw_state_off(arena, ctx) as usize;
     window[off..off + 4].copy_from_slice(&state.to_le_bytes());
 }
 
@@ -1464,15 +1481,15 @@ pub fn write_thaw_state(window: &mut [u8], ctx: usize, state: i32) {
 /// freeze — leaving it would make the rewinding code's polls re-unwind) and set `ctx`'s per-context
 /// **thaw** word to `REWINDING`. Mirrors what the runtime does on a real snapshot-restore thaw (the
 /// interp's `drive` clear + per-context `REWINDING`; the JIT thaw driver).
-pub fn begin_thaw(window: &mut [u8], ctx: usize) {
+pub fn begin_thaw(window: &mut [u8], arena: ShadowArena, ctx: usize) {
     write_state(window, STATE_NORMAL);
-    write_thaw_state(window, ctx, STATE_REWINDING);
+    write_thaw_state(window, arena, ctx, STATE_REWINDING);
 }
 
 /// Read context `ctx`'s per-context **thaw** state word — after a thaw, a completed rewind reads
 /// `NORMAL` (the deepest frame's re-issue flipped it).
-pub fn read_thaw_state(window: &[u8], ctx: usize) -> i32 {
-    let off = thaw_state_off(ctx) as usize;
+pub fn read_thaw_state(window: &[u8], arena: ShadowArena, ctx: usize) -> i32 {
+    let off = thaw_state_off(arena, ctx) as usize;
     let mut b = [0u8; 4];
     b.copy_from_slice(&window[off..off + 4]);
     i32::from_le_bytes(b)
@@ -1780,12 +1797,20 @@ fn load_result_ty(op: LoadOp) -> ValType {
 
 #[cfg(test)]
 mod tests {
+    /// The arena every test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+    const TEST_ARENA: ShadowArena = ShadowArena {
+        base: 16448,
+        end: 65536,
+    };
     use super::*;
     use temen_ir::Memory;
 
     fn parse_with_mem(src: &str, size_log2: u8) -> Module {
         let mut m = temen_text::parse_module(src).expect("parse");
-        m.memory = Some(Memory { size_log2 });
+        m.memory = Some(Memory {
+            size_log2,
+            shadow: Some(TEST_ARENA),
+        });
         m
     }
 
@@ -1946,7 +1971,7 @@ mod tests {
 
     #[test]
     fn instrumented_module_with_guest_memory_op_is_rejected() {
-        // A guest store could alias the durable region at `[0, SHADOW_BASE)` → R9 fails closed.
+        // A guest store could alias the durable region below the arena → R9 fails closed.
         let m = parse_with_mem(
             "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  v3 = i64.const 7\n  i64.store v1 v3\n  return v2\n  }\n}\n",
             18,

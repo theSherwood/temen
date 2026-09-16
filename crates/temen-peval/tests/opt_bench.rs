@@ -276,7 +276,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![t()],
             blocks: vec![entry, header, halt, setacc, seti_input, add_i, dec_i, jnz],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 0,
             readonly: true,
@@ -551,7 +554,10 @@ fn mem_case() -> Module {
     };
     Module {
         funcs: vec![f],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 0,
             readonly: false,

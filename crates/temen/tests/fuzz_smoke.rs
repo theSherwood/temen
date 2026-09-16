@@ -127,7 +127,10 @@ block 0 () { v0 = i64.const 7
     // rarely constructs past the header.
     use temen::ir;
     let mut u = temen_text::parse_module(seeds[1]).expect("seed parses");
-    u.memory = Some(ir::Memory { size_log2: 16 });
+    u.memory = Some(ir::Memory {
+        size_log2: 16,
+        shadow: None,
+    });
     u.data = vec![ir::Data {
         offset: 0,
         readonly: false,

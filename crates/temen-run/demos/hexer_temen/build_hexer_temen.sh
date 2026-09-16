@@ -26,7 +26,7 @@ mkdir -p "$CACHE"
 if ! command -v nim >/dev/null; then echo "SKIP: nim not on PATH"; exit 0; fi
 [ -f "$HEXER_SRC" ] || { echo "SKIP: nimony submodule absent ($HEXER_SRC)"; exit 0; }
 BIN="${NIMONY_TOOLCHAIN_BIN:-$REPO/.nimtool/nimony/bin}"
-NIMONY="${NIMONY_BIN:-$(command -v nimony || echo "$BIN/nimony")}"
+NIMONY="${NIMONY_BIN:+$NIMONY_BIN/nimony}"; NIMONY="${NIMONY:-$(command -v nimony || echo "$BIN/nimony")}"
 HEXER_BIN="${HEXER_BIN:-$(command -v hexer || echo "$BIN/hexer")}"
 [ -x "$NIMONY" ] && [ -x "$HEXER_BIN" ] || { echo "SKIP: nimony/hexer binaries absent (set NIMONY_BIN/HEXER_BIN; NIM.md §2)"; exit 0; }
 NIMLIB="$(nim dump 2>/dev/null | grep -m1 '/lib$' || true)"

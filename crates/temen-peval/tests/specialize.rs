@@ -138,7 +138,10 @@ fn build_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![i64t()],
             blocks: vec![entry, header, halt, set, add_blk, mul_blk, addin_blk],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,
@@ -443,7 +446,10 @@ fn build_stack_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![i64t()],
             blocks: vec![entry, header, halt, push, pushin, add, mul],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,
@@ -578,7 +584,10 @@ fn renamed_cell_flows_across_a_dynamic_branch() {
                 },
             ],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&h).expect("h verifies");
@@ -666,7 +675,10 @@ fn overlay_bytes_drive_folding() {
                 term: Terminator::Return(vec![1]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         // The bytes are actually present in the window (so the unspecialized run reads them), but
         // in a *writable* segment the engine won't fold on its own.
         data: vec![Data {
@@ -785,7 +797,10 @@ fn build_float_interpreter(program: &[(u8, i64)]) -> Module {
             results: vec![f64t()],
             blocks: vec![entry, header, halt, addself, sq],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,
@@ -878,7 +893,10 @@ fn private_rename_allows_dynamic_heap_access() {
                 term: Terminator::Return(vec![5]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         // The heap cell *ptr will point at: a writable word holding 100.
         data: vec![Data {
             offset: 20480, // 4096 + the #1094 NULL guard
@@ -1382,7 +1400,10 @@ fn build_call_interpreter(program: &[(u8, i64)]) -> Module {
             helper(BinOp::Add), // func 1
             helper(BinOp::Mul), // func 2
         ],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,
@@ -1507,7 +1528,10 @@ fn narrow_constant_cells_round_trip_with_extension() {
                 term: Terminator::Return(vec![22]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -1558,7 +1582,10 @@ fn narrow_store_overwrites_overlapping_cell() {
                 term: Terminator::Return(vec![3]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&m).expect("verifies");
@@ -1603,7 +1630,10 @@ fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
                 term: Terminator::Return(vec![2]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&dyn_narrow_roundtrip).expect("verifies");
@@ -1639,7 +1669,10 @@ fn narrow_dynamic_cell_roundtrips_but_overlap_is_unsupported() {
                 term: Terminator::Return(vec![2]),
             }],
         }],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&narrow_load_of_wide_cell).expect("verifies");
@@ -2544,7 +2577,10 @@ fn indirect_call_through_constant_memory_table_inlines() {
             },
             double_func(),
         ],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![Data {
             offset: 16384, // above the #1094 NULL guard
             readonly: true,
@@ -2959,7 +2995,10 @@ fn outlining_threads_a_renamed_cell_across_a_call() {
                 }],
             },
         ],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     };
     verify_module(&m).expect("verifies");

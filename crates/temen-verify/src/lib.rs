@@ -68,6 +68,12 @@ pub enum VerifyError {
     DataWithoutMemory { seg: u32 },
     /// A `data` segment's `[offset, offset+len)` does not fit within the declared window.
     DataOutOfWindow { seg: u32 },
+    /// The declared durable shadow arena `[base, end)` is ill-formed: it must start at or above
+    /// `DURABLE_CONTROL_END` (the always-live control words), be 8-aligned, hold at least one
+    /// `SHADOW_STRIDE` region and at most [`MAX_SHADOW_CONTEXTS`], and end inside the window.
+    ShadowArenaInvalid { base: u64, end: u64 },
+    /// A `data` segment overlaps the declared shadow arena (R9: guest bytes must never alias it).
+    DataInShadowArena { seg: u32 },
     /// A `data.ptr` relocation survived into a would-be-runnable module. Unlike the code→data
     /// link forms (which trap at execution), a data-image pointer has no execution site, so its
     /// placeholder bytes would be read unpatched — fail-closed here. `link` clears these; a
@@ -166,6 +172,10 @@ pub enum VerifyError {
     ExportHandleOutOfRange { func: u32, block: u32, export: u32 },
 }
 
+/// The most shadow contexts a declared arena may hold (`(end - base) / SHADOW_STRIDE`): one
+/// machine word of allocator occupancy bits, and far above any fiber quota in the tree.
+pub const MAX_SHADOW_CONTEXTS: usize = 64;
+
 /// Verify an entire module. `Ok(())` is the only "accept".
 pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     // A declared window must have a representable size (`1 << size_log2`, with the
@@ -175,6 +185,24 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
             return Err(VerifyError::MemorySizeTooLarge {
                 size_log2: mem.size_log2,
             });
+        }
+        // The durable shadow arena (INVARIANTS.md #16): the module places it, the verifier holds
+        // it to the geometry every backend assumes. Context `i` owns `[base + i*STRIDE, +STRIDE)`,
+        // so the arena must hold a whole region; the context count is capped so an allocator's
+        // occupancy mask stays one machine word.
+        if let Some(a) = mem.shadow {
+            use temen_ir::durable_abi::{DURABLE_CONTROL_END, SHADOW_STRIDE};
+            let ok = a.base >= DURABLE_CONTROL_END
+                && a.base % 8 == 0
+                && a.end > a.base
+                && a.end <= mem.size()
+                && (1..=MAX_SHADOW_CONTEXTS as u64).contains(&((a.end - a.base) / SHADOW_STRIDE));
+            if !ok {
+                return Err(VerifyError::ShadowArenaInvalid {
+                    base: a.base,
+                    end: a.end,
+                });
+            }
         }
     }
     // Data segments must fit within the declared window `[0, size)` (§3a / D40). The runtime
@@ -195,6 +223,13 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
         };
         if out_of_window {
             return Err(VerifyError::DataOutOfWindow { seg });
+        }
+        if let Some(a) = mem.shadow {
+            // `end` is `Some` here (the overflow case returned above).
+            let e = end.unwrap_or(u64::MAX);
+            if d.offset < a.end && e > a.base {
+                return Err(VerifyError::DataInShadowArena { seg });
+            }
         }
     }
     // A runnable module carries no `data.ptr` relocations — `link` resolves them into the data
@@ -1700,5 +1735,108 @@ impl Cx<'_> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shadow_arena_tests {
+    use super::*;
+    use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, SHADOW_STRIDE};
+    use temen_ir::{Data, Memory};
+
+    fn module(size_log2: u8, shadow: Option<ShadowArena>, data: Vec<Data>) -> Module {
+        Module {
+            data_ptrs: Vec::new(),
+            data_funcrefs: Vec::new(),
+            types: vec![],
+            funcs: vec![],
+            memory: Some(Memory { size_log2, shadow }),
+            data,
+            imports: vec![],
+            exports: vec![],
+            data_exports: vec![],
+            impl_exports: vec![],
+            debug_info: None,
+        }
+    }
+
+    const ARENA: ShadowArena = ShadowArena {
+        base: 16448,
+        end: 65536,
+    };
+
+    #[test]
+    fn a_well_formed_arena_is_accepted() {
+        assert_eq!(verify_module(&module(17, Some(ARENA), vec![])), Ok(()));
+        // Data ending exactly at its base, or starting exactly at its end, is fine (half-open).
+        let data = vec![
+            Data {
+                offset: ARENA.base - 16,
+                readonly: false,
+                bytes: vec![1; 16],
+            },
+            Data {
+                offset: ARENA.end,
+                readonly: true,
+                bytes: vec![2; 16],
+            },
+        ];
+        assert_eq!(verify_module(&module(17, Some(ARENA), data)), Ok(()));
+    }
+
+    #[test]
+    fn a_data_segment_inside_the_arena_is_rejected() {
+        // R9, statically: guest bytes may never alias the arena — any overlap, at either edge.
+        for off in [ARENA.base, ARENA.base + 100, ARENA.end - 8, ARENA.base - 8] {
+            let data = vec![Data {
+                offset: off,
+                readonly: false,
+                bytes: vec![0; 16],
+            }];
+            assert_eq!(
+                verify_module(&module(17, Some(ARENA), data)),
+                Err(VerifyError::DataInShadowArena { seg: 0 }),
+                "segment at {off:#x} overlaps [{:#x}, {:#x})",
+                ARENA.base,
+                ARENA.end
+            );
+        }
+    }
+
+    #[test]
+    fn an_ill_formed_arena_is_rejected() {
+        let bad = |base: u64, end: u64| {
+            assert_eq!(
+                verify_module(&module(17, Some(ShadowArena { base, end }), vec![])),
+                Err(VerifyError::ShadowArenaInvalid { base, end }),
+                "[{base:#x}, {end:#x}) must be rejected"
+            );
+        };
+        bad(DURABLE_CONTROL_END - 8, 65536); // below the always-live control words
+        bad(DURABLE_CONTROL_END + 4, 65536); // not 8-aligned
+        bad(DURABLE_CONTROL_END, DURABLE_CONTROL_END); // zero regions
+        bad(DURABLE_CONTROL_END, DURABLE_CONTROL_END + SHADOW_STRIDE - 8); // less than one region
+        bad(DURABLE_CONTROL_END, (1 << 17) + 8); // past the window
+        bad(
+            DURABLE_CONTROL_END,
+            DURABLE_CONTROL_END + (MAX_SHADOW_CONTEXTS as u64 + 1) * SHADOW_STRIDE,
+        ); // too many contexts (in a big window below)
+    }
+
+    #[test]
+    fn the_context_cap_is_the_occupancy_word() {
+        let exact = ShadowArena {
+            base: DURABLE_CONTROL_END,
+            end: DURABLE_CONTROL_END + MAX_SHADOW_CONTEXTS as u64 * SHADOW_STRIDE,
+        };
+        assert_eq!(verify_module(&module(20, Some(exact), vec![])), Ok(()));
+        let over = ShadowArena {
+            end: exact.end + SHADOW_STRIDE,
+            ..exact
+        };
+        assert!(matches!(
+            verify_module(&module(20, Some(over), vec![])),
+            Err(VerifyError::ShadowArenaInvalid { .. })
+        ));
     }
 }

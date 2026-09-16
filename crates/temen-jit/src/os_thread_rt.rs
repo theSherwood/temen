@@ -438,6 +438,13 @@ impl Domain {
         lock(&self.fiber_table).clone()
     }
 
+    /// The module-declared shadow arena this domain places its contexts in (`EMPTY` when the module
+    /// declared none — then nothing durable can be placed and a durable run is refused upstream).
+    fn shadow(&self) -> temen_ir::durable_abi::ShadowArena {
+        self.fiber_table()
+            .map_or(temen_ir::durable_abi::ShadowArena::EMPTY, |t| t.shadow)
+    }
+
     /// A §14 **child** (its own OS thread, sharing this domain's futex) started: count it live so the
     /// wait/join deadlock detection (`live > parked`) sees it as a possible notifier — without this, a
     /// parked child would push `parked` past `live` and fail a *parent* vCPU's infinite wait closed.
@@ -692,6 +699,8 @@ extern "C" fn child_entry(
 /// child reserves its own top-down shadow context up front so it can self-unwind into it if a freeze
 /// fires mid-run. `None` on non-durable / single-worker / deferred spawns.
 struct DurableChild {
+    /// The domain's declared shadow arena — where this child's context region lives.
+    shadow: temen_ir::durable_abi::ShadowArena,
     /// Global task id (monotonic spawn order; matches the interp + the deferred path), recorded in the
     /// child's `FrozenVCpu` residue.
     task: u64,
@@ -780,7 +789,7 @@ fn run_child(a: SpawnArgs) {
     // shared word). Without the init the word would read 0 and the unwind would spill over the reserve
     // header — corrupting the state word. SAFETY: durable run ⇒ the reserve is committed RW.
     if let Some(dc) = &a.durable_child {
-        let region = fiber_rt::shadow_region_base(dc.ctx);
+        let region = dc.shadow.region_base(dc.ctx);
         crate::durable_shadow::seed(region);
         match dc.thaw_extent {
             // §12.8 concurrent-thaw stage 2: a **thaw** re-spawn rewinds from its restored extent — set
@@ -788,11 +797,11 @@ fn run_child(a: SpawnArgs) {
             // prologue dispatches into the rewind (concurrent with siblings, no shared word).
             Some(extent) => unsafe {
                 fiber_rt::write_shadow_sp(env.mem_base, region, extent);
-                fiber_rt::window_set_rewinding(env.mem_base, dc.ctx);
+                fiber_rt::window_set_rewinding(env.mem_base, dc.shadow, dc.ctx);
             },
             // A fresh spawn starts NORMAL at its entry, region empty (frame base).
             None => unsafe {
-                fiber_rt::write_shadow_sp(env.mem_base, region, fiber_rt::shadow_frame_base(dc.ctx))
+                fiber_rt::write_shadow_sp(env.mem_base, region, dc.shadow.frame_base(dc.ctx))
             },
         };
         // §12.8 4A.5 follow-up B.2: record this OS thread's spawning task, so a *nested* `thread.spawn`
@@ -887,7 +896,7 @@ fn run_child(a: SpawnArgs) {
     // and keep its context for the thaw to re-spawn it there. A genuine finish (no freeze) frees the
     // context for reuse. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
     if let Some(dc) = &a.durable_child {
-        let region = fiber_rt::shadow_region_base(dc.ctx);
+        let region = dc.shadow.region_base(dc.ctx);
         let extent = if faulted {
             0
         } else {
@@ -897,7 +906,7 @@ fn run_child(a: SpawnArgs) {
         // base — a child that ran to a genuine finish under an UNWINDING window left its region empty.
         let froze = !faulted
             && unsafe { fiber_rt::window_is_unwinding(env.mem_base) }
-            && extent > fiber_rt::shadow_frame_base(dc.ctx);
+            && extent > dc.shadow.frame_base(dc.ctx);
         if froze {
             unsafe {
                 lock(&(*a.dom).frozen_vcpus).push(crate::FrozenVCpu {
@@ -1022,6 +1031,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             t
         };
         Some(DurableChild {
+            shadow: dom.shadow(),
             task,
             parent,
             ctx,
@@ -1098,7 +1108,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
 ///
 /// # Safety
 /// As [`thread_spawn`]: `dom` is the run's live `Domain`; `code` is a guest entry trampoline;
-/// `trap_out` is the live trap cell; the durable reserve `[0, DURABLE_RESERVE)` is committed RW.
+/// `trap_out` is the live trap cell; the durable control words + shadow arena (`[0, ShadowArena::end)`) are committed RW.
 unsafe fn defer_spawn(
     dom: &Domain,
     code: u64,
@@ -1297,11 +1307,11 @@ impl Domain {
                 // §12.8 4A.5: this child's shadow-SP word lives in its **own** region (no shared word);
                 // initialise it empty (frame base) and re-point `durable.shadow_base` so the child's
                 // instrumented code addresses its own region during the unwind.
-                let child_region = fiber_rt::shadow_region_base(p.ctx);
+                let child_region = self.shadow().region_base(p.ctx);
                 fiber_rt::write_shadow_sp(
                     env.mem_base,
                     child_region,
-                    fiber_rt::shadow_frame_base(p.ctx),
+                    self.shadow().frame_base(p.ctx),
                 );
                 crate::durable_shadow::seed(child_region);
                 // Attribute any grandchild this child spawns to it (its `parent_task` + per-vCPU table).
@@ -1310,7 +1320,7 @@ impl Domain {
                 let (result, trap, faulted) =
                     self.run_child_inline(env, p.code, p.sp, p.arg, p.task as i64);
                 *lock(&self.cur_task) = 0; // back to the root between children
-                crate::durable_shadow::seed(fiber_rt::shadow_region_base(0)); // back to the root's region
+                crate::durable_shadow::seed(self.shadow().region_base(0)); // back to the root's region
 
                 // The child's flattened extent and whether it unwound under the freeze.
                 let child_sp = fiber_rt::read_shadow_sp(env.mem_base, child_region);
@@ -1415,7 +1425,7 @@ impl Domain {
                 task: v.task as u64,
                 parent: v.parent_task as u64,
                 func_idx: v.func as u32,
-                ctx: fiber_rt::shadow_context_of_sp(v.shadow_sp),
+                ctx: self.shadow().ctx_of_sp(v.shadow_sp),
                 code: (*entry).code(),
                 sp: v.args.first().copied().unwrap_or(0) as u64,
                 arg: v.args.get(1).copied().unwrap_or(0) as u64,
@@ -1431,7 +1441,7 @@ impl Domain {
         // out a context a re-attached sibling still occupies. (Completed/recycled children freed theirs, so
         // those bits stay clear — a post-thaw spawn correctly reuses them.)
         if let Some(table) = self.fiber_table() {
-            let mask: u16 = runs.iter().fold(0, |m, r| m | (1u16 << r.ctx));
+            let mask: u64 = runs.iter().fold(0, |m, r| m | (1u64 << r.ctx));
             table.seed_vcpu_mask(mask);
         }
 
@@ -1452,6 +1462,7 @@ impl Domain {
                 arg: r.arg,
                 vcpu_id: r.task as i64,
                 durable_child: Some(DurableChild {
+                    shadow: self.shadow(),
                     task: r.task,
                     parent: r.parent,
                     ctx: r.ctx,
@@ -1480,9 +1491,9 @@ impl Domain {
         // The root rewinds first on its re-entry: point the active shadow-SP at its restored extent and
         // re-arm REWINDING (the last child flipped the word to NORMAL when its rewind completed).
         // §12.8 4A.5: the root's extent goes into context 0's own region word.
-        fiber_rt::write_shadow_sp(env.mem_base, fiber_rt::shadow_region_base(0), root_sp);
-        crate::durable_shadow::seed(fiber_rt::shadow_region_base(0));
-        fiber_rt::window_set_rewinding(env.mem_base, 0); // the root's own (ctx 0) thaw word
+        fiber_rt::write_shadow_sp(env.mem_base, self.shadow().region_base(0), root_sp);
+        crate::durable_shadow::seed(self.shadow().region_base(0));
+        fiber_rt::window_set_rewinding(env.mem_base, self.shadow(), 0); // the root's own (ctx 0) thaw word
 
         *lock(&self.cur_task) = 0; // the root runs next (its joins resolve in its table)
     }

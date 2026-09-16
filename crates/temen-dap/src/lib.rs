@@ -76,8 +76,9 @@ struct Session {
     /// surface for `Inspector::set_watchpoint`, incl. the Milestone-B cross-thread case). Held so
     /// the next `setDataBreakpoints` can clear the prior set, per the protocol's replace semantics.
     data_watch_ids: Vec<WatchId>,
-    /// Multithreaded run (`attach_scheduled[_seeded]`)? Selects the time-travel coordinate: the
-    /// global scheduler `turn` when scheduled, the op `clock` single-threaded.
+    /// Scheduled run (the tree-walker's `attach_scheduled[_seeded]`; every bytecode session)? Selects
+    /// the time-travel coordinate: the global scheduler `turn` when scheduled, the op `clock`
+    /// single-threaded.
     scheduled: bool,
     /// Byte length of the guest stdout last surfaced as a DAP `output` event — so each stop emits one
     /// only when the captured output *changed*. On a reverse `seek` the output shrinks, so the event
@@ -402,12 +403,9 @@ impl DapServer {
                 fs_seed,
                 host_caps,
             ) {
-                // A `thread.spawn` module runs on the scheduled engine — its reverse coordinate is the
-                // global `turn`, so mark the session scheduled; a spawn-free one uses the op `clock`.
-                Some(b) => {
-                    let scheduled = b.is_threaded();
-                    (Box::new(b), scheduled)
-                }
+                // The bytecode engine is one debug scheduler (a spawn-free guest is a one-task
+                // schedule): its reverse coordinate is the global `turn`.
+                Some(b) => (Box::new(b), true),
                 None => return (false, Json::Null, vec![]), // outside the bytecode debug subset
             }
         } else {
@@ -476,8 +474,9 @@ impl DapServer {
                 Some(model)
             }
         };
-        // `schedTrace: true` (slice 6): arm the scheduler trace tape — a threaded bytecode
-        // session only; fail-closed elsewhere (a single vCPU has no schedule to trace).
+        // `schedTrace: true` (slice 6): arm the scheduler trace tape — any bytecode session
+        // (a spawn-free guest is a one-task schedule that traces its own turns); fail-closed on
+        // the tree-walker, which has no schedule to trace (`set_sched_trace` returns false there).
         if args.get("schedTrace").and_then(|v| v.as_bool()) == Some(true)
             && !inspector.set_sched_trace(true)
         {

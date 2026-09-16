@@ -147,6 +147,7 @@ fn build_module(win_log2: u8) -> Module {
         funcs: vec![entry, helper],
         memory: Some(Memory {
             size_log2: win_log2,
+            shadow: None,
         }),
         data: Vec::new(),
         imports: Vec::new(),

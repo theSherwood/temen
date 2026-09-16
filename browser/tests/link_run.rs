@@ -12,7 +12,7 @@ use temen_ir::{Block, Func, Inst, Memory, Module, Terminator, ValType};
 /// pointer the synthesized powerbox `_start` passes — the §3e entry shape), with a window.
 fn unit(val: i64) -> Module {
     Module {
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory { size_log2: 16, shadow: None }),
         funcs: vec![Func {
             params: vec![ValType::I64],
             results: vec![ValType::I64],

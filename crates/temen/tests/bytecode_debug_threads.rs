@@ -228,8 +228,8 @@ fn bytecode_stepping_a_stopped_thread_advances_one_op() {
     }
 }
 
-/// `module_spawns_threads` routes the DAP backend: true for a `thread.spawn` guest (→ the scheduled
-/// debugger), false for a spawn-free one (→ the reverse/watch-capable single-vCPU `DebugRun`).
+/// `module_spawns_threads`: true for a `thread.spawn` guest, false for a spawn-free one (the DAP
+/// backend keys a schedule `seed`'s admissibility on it — meaningless with one vCPU).
 #[test]
 fn module_spawns_threads_detects_the_multithreaded_case() {
     let racy = parse_module(RACY_COUNTER).unwrap();

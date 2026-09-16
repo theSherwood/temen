@@ -49,7 +49,7 @@ numbers can't be reused for something else.
 
 | kind     | name       | status      | payload / owner |
 |----------|------------|-------------|-----------------|
-| `0x0000` | `module`   | implemented | a runnable module — `temen-encode` `encode_module`/`decode_module`; today `version` = 10 |
+| `0x0000` | `module`   | implemented | a runnable module — `temen-encode` `encode_module`/`decode_module`; today `version` = 11 (v11: the memory descriptor carries the module-declared durable shadow arena) |
 | `0x0001` | `object`   | implemented | a link unit, the pre-link dialect — `encode_unit`/`decode_unit`; same `version` sequence as `module` |
 | `0x0002` | `snapshot` | implemented | a §12 durable-snapshot artifact — `temen-snapshot` (`DURABILITY.md` §12); today `version` = 18 |
 | `0x0003` | `fs-image` | implemented | a filesystem image a guest mounts — `temen-fs::encode_image`; today `version` = 1 |

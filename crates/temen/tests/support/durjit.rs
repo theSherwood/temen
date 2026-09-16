@@ -31,7 +31,7 @@ use durgen::{
 };
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
-    DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_UNWINDING,
+    STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Trap, Value,
@@ -42,6 +42,12 @@ use temen_jit::{
     FrozenFiber as JitFrozen, JitError, JitOutcome,
 };
 use temen_snapshot::{freeze, restore};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 
 fn from_slot(t: ValType, s: i64) -> Value {
     match t {
@@ -58,14 +64,16 @@ fn from_slot(t: ValType, s: i64) -> Value {
     }
 }
 
+/// The root context's shadow-SP word — the first 8 bytes of its region (§12.8 4A.5). This used to
+/// read the legacy global `SHADOW_SP_OFF`, which no backend writes, so the cross-backend shadow-region
+/// compare it feeds was over `[0, 0)`; reading the real word makes that assertion live.
 fn read_sp(w: &[u8]) -> usize {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
-    u64::from_le_bytes(b) as usize
+    let b = TEST_ARENA.region_base(0) as usize;
+    u64::from_le_bytes(w[b..b + 8].try_into().unwrap()) as usize
 }
 
 fn window_with(state: i32) -> Vec<u8> {
-    let mut w = init_durable_window(WINDOW);
+    let mut w = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut w, state);
     w
 }
@@ -231,7 +239,7 @@ pub fn check_xbackend(m: &Module, clock_v: i64) {
     // frozen point's result reloaded, not re-issued — a re-issue would consume the next tick)
     // and end NORMAL. This crosses both the backend boundary and the serialize/restore one.
     let mut thaw_win = rwin;
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let Some((j_thaw, final_j, _, _)) = jit_run(&inst, clock_after, &thaw_win) else {
         return;
     };
@@ -268,7 +276,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
             0,
             &[],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -277,7 +285,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     let (isnap, ihost, ifibers) = {
         let mut h = Host::new();
         h.set_durable(true);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, arm);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -297,7 +305,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
 
     // JIT armed freeze (skip on Unsupported / host allocation pressure, like `jit_run`).
     let mut jhost = Host::new();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut jwin, arm);
     let (jout, jsnap, jfibers) = match compile_and_run_capture_reserved_with_host_durable(
         &inst,
@@ -326,7 +334,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     );
 
     // (2) The two backends armed-freeze the recycled fiber into a byte-identical durable reserve...
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -357,7 +365,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     // handle resolves to the re-seeded fiber, which re-parks; forward execution reproduces `base`.
     let mut thost = Host::new();
     let mut thaw_win = restore(&art_i, &inst, &mut thost).expect("recycled artifact restores");
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let seed: Vec<JitFrozen> = thost
         .frozen_fibers()
         .iter()

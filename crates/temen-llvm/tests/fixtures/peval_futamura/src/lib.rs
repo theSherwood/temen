@@ -262,6 +262,7 @@ fn build_interpreter(win_log2: u8) -> Module {
         funcs: vec![interp],
         memory: Some(Memory {
             size_log2: win_log2,
+            shadow: None,
         }),
         data: Vec::new(),
         imports: Vec::new(),
