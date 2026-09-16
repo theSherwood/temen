@@ -4253,6 +4253,15 @@ pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
         "write" => (cap_id::STREAM, 1),
         "read" => (cap_id::STREAM, 0),
         "stderr" => (cap_id::STREAM, 1),
+        // The frontend's *raw*-stream builtins (`__vm_stream_write`/`__vm_stream_read` →
+        // `call.sym "stream_write"/"stream_read"`, chibicc `codegen_ir.c`). Exact aliases of
+        // `write`/`read`: same interface, same op, same stdout/stdin handle (`PowerboxHandles::bind`
+        // keys off `(type_id, op)`), so they carry no authority those two don't already have. They
+        // exist because a libc that *defines* fd-dispatching `write`/`read` shadows the fd-less
+        // builtins of those names, and then needs a distinct spelling to reach stdout/stdin without
+        // recursing into its own definition.
+        "stream_write" => (cap_id::STREAM, 1),
+        "stream_read" => (cap_id::STREAM, 0),
         // Exit (noreturn).
         "exit" => (cap_id::EXIT, 0),
         // Memory management (§3e/§4).

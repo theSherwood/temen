@@ -845,7 +845,7 @@ jobs:
             --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
             --test reactor_moment --test jit_reactor_moment \
             --test chibicc_link_libc --test pg_libc_asset --test jspb \
-            --test module_imports
+            --test module_imports --test playground_fcntl
 
   wasm64-differential:
     name: wasm64 differential (Wasmtime embedding)
