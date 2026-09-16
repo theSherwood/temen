@@ -6568,6 +6568,9 @@ pub struct JitOnrampRun {
     /// slice touches only the single-shot tier.
     grow: bool,
     prots: Option<Vec<(u64, u8)>>,
+    /// The committed prefix `prots` is relative to (the previous bounce's `MemMapInfo.1`): a grown
+    /// tail the seed folded into the prefix lives here, not in `prots` (#1540).
+    prots_mapped: u64,
     mapped: u64,
     /// #1201 — the run emits **paged** (`module_uses_unmap_protect`, see `emit_for_run`): `pagestate`
     /// is the #750 page-state table rebuilt from each bounce's live map
@@ -7189,6 +7192,7 @@ impl JitOnrampRun {
             fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
             prots: Some(Vec::new()),
+            prots_mapped: 0,
             mapped,
             paged,
             pagestate,
@@ -7285,6 +7289,7 @@ impl JitOnrampRun {
             // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
             grow: false,
             prots: Some(Vec::new()),
+            prots_mapped: 0,
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
@@ -7367,6 +7372,7 @@ impl JitOnrampRun {
                 false,
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 self.prots.as_deref(),
+                self.prots_mapped,
                 Some(&self.table), // #1296: installs persist across this run's bounces
             );
             match info {
@@ -7382,6 +7388,7 @@ impl JitOnrampRun {
                     } else {
                         self.mapped = mapped;
                     }
+                    self.prots_mapped = info.1;
                     self.prots = Some(info.3);
                 }
                 None => {
@@ -13844,8 +13851,8 @@ pub extern "C" fn temen_durable_thaw_resume(
         return 0;
     };
     temen_durable::begin_thaw(&mut rwin, arena, 0); // clear the freeze word, set context 0 REWINDING
-                                             // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
-                                             // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
+                                                    // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
+                                                    // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
     let Some(back) =
         temen_interp::Region::owned_zeroed(1u64 << rreserved, temen_snapshot::PAGE as u64)
     else {

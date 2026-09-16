@@ -2449,6 +2449,7 @@ impl SharedProgram {
             seed_data,
             reserved_log2,
             prots,
+            0,    // no carried prefix — the seed's own contiguous tail still folds
             None, // no persistent table — the install-less legacy bounce
         );
         (out, info.map(|i| i.3), mapped)
@@ -2468,6 +2469,10 @@ impl SharedProgram {
     /// §13 `Backed`-alias condition; `Some((1, 0, 0, vec![]))` for a memory-less module. The trailing
     /// `u64` is the scalar extent, as for `run_over_grown`.
     ///
+    /// `mapped` is the committed prefix the previous bounce's `MemMapInfo` reported (`.1`), carried
+    /// back so a `vm_map`-grown tail that [`Mem::seed_pages`] folded into the prefix stays committed
+    /// across bounces (#1540); `0` for a map captured from a declared-size window.
+    ///
     /// `table` is the reactor's **persistent** dispatch table ([`Self::dispatch_table`]): a §22
     /// `install` made in one bounce stays reachable from the next (#1296 — a child holding a
     /// re-granted `Jit` installs into its own table across its emitted run's bounces). `None` builds a
@@ -2483,6 +2488,7 @@ impl SharedProgram {
         seed_data: bool,
         reserved_log2: u8,
         prots: Option<&[(u64, u8)]>,
+        mapped: u64,
         table: Option<&std::sync::Arc<SharedSlots>>,
     ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
@@ -2501,7 +2507,7 @@ impl SharedProgram {
             }
             mm.seed_null_guard(self.null_guard); // #964
             if let Some(entries) = prots {
-                mm.seed_pages(entries);
+                mm.seed_pages(mapped, entries);
             }
             mm
         });
@@ -2565,7 +2571,7 @@ impl SharedProgram {
         let mut mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
             mm.seed_null_guard(self.null_guard); // #964
-            mm.seed_pages(prots);
+            mm.seed_pages(0, prots);
             mm
         });
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;

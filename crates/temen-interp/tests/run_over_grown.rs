@@ -121,6 +121,114 @@ fn seeded_extent_restores_the_grown_page() {
 }
 
 #[test]
+fn a_seeded_grown_tail_becomes_the_prefix_not_a_page_list() {
+    // #1540: the seam re-seeds the map on every cross-tier bounce, so a contiguous grown tail is
+    // folded into the window's mapped prefix instead of re-listed page by page — the probe still
+    // reads the marker (above), and the map it hands back no longer carries the tail as entries.
+    let (ran, pages) = grow_then(true);
+    assert!(ran.is_ok());
+    let pages = pages.expect("restorable");
+    assert!(
+        !pages
+            .iter()
+            .any(|&(off, kind)| kind == 1 && off >= 1 << DECLARED_LOG2),
+        "a contiguous Rw tail must be folded into the prefix (got {pages:?})"
+    );
+}
+
+#[test]
+fn the_folded_prefix_carries_across_bounces_only_when_passed_back() {
+    // The cross-tier bounce shape: the map captured after a seeded run is relative to the raised
+    // prefix (`MemMapInfo.1`), so the next re-seed must carry it — with it the marker survives a
+    // third fresh `Mem`; without it the folded tail is gone and the probe faults (the lossy shape
+    // the op-13 grow-phase pin caught).
+    let prog = build();
+    let back = backing();
+    let mut host = Host::new();
+    let asl = host.grant_memory();
+    let mut fuel = u64::MAX;
+    let (ran, info1, _) = prog.run_over_grown_info(
+        0,
+        &[Value::I32(asl), Value::I64(16384)],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        true,
+        BACKING_LOG2,
+        None,
+        0,
+        None,
+    );
+    assert_eq!(ran.expect("grow"), vec![Value::I64(0)]);
+    let info1 = info1.expect("restorable");
+    let (ran, info2, _) = prog.run_over_grown_info(
+        1,
+        &[],
+        &mut fuel,
+        back.clone(),
+        &mut host,
+        false,
+        BACKING_LOG2,
+        Some(&info1.3),
+        0,
+        None,
+    );
+    assert_eq!(ran.expect("seeded probe"), vec![Value::I64(424242)]);
+    let info2 = info2.expect("restorable");
+    assert!(
+        info2.1 > 1 << DECLARED_LOG2 && !info2.3.iter().any(|&(_, kind)| kind == 1),
+        "the tail is now the prefix (got mapped {} entries {:?})",
+        info2.1,
+        info2.3
+    );
+    for (carry, want_marker) in [(info2.1, true), (0, false)] {
+        let (ran, _, _) = prog.run_over_grown_info(
+            1,
+            &[],
+            &mut fuel,
+            back.clone(),
+            &mut host,
+            false,
+            BACKING_LOG2,
+            Some(&info2.3),
+            carry,
+            None,
+        );
+        if want_marker {
+            assert_eq!(ran.expect("carried prefix"), vec![Value::I64(424242)]);
+        } else {
+            assert!(matches!(ran, Err(Trap::MemoryFault)), "uncarried: {ran:?}");
+        }
+    }
+}
+
+#[test]
+fn a_gap_in_the_seeded_tail_is_not_folded_over() {
+    // The fold is exact: an Rw page BEYOND a hole stays an explicit entry and the hole stays a
+    // hole — a probe into it faults just as it would with no seed at all.
+    let prog = build();
+    let back = backing();
+    let mut host = Host::new();
+    let mut fuel = u64::MAX;
+    let page = temen_interp::host_page_size();
+    let beyond_hole = [((1u64 << DECLARED_LOG2) + page, 1u8)];
+    let (ran, _, _) = prog.run_over_grown(
+        1, // the probe reads 64 KiB + 16 — the first page past the prefix, which the seed skips
+        &[],
+        &mut fuel,
+        back,
+        &mut host,
+        true,
+        BACKING_LOG2,
+        Some(&beyond_hole),
+    );
+    assert!(
+        matches!(ran, Err(Trap::MemoryFault)),
+        "the hole below a seeded Rw page must still fault (got {ran:?})"
+    );
+}
+
+#[test]
 fn unseeded_probe_faults_like_a_cold_window() {
     // The pre-#816 warm-restore bug as the negative pin: without the seed, the fresh Mem's empty
     // page map treats the grown page as uncommitted reserved tail — the load faults.

@@ -26272,11 +26272,35 @@ impl Mem {
     /// `protect`ed rodata inside the prefix AND the `vm_map`-grown tail. A `Backed` (§13) entry is
     /// never fed here — the capture side rejects it (a byte restore cannot reproduce an alias).
     /// Offsets past the reservation are ignored.
-    pub(crate) fn seed_pages(&mut self, entries: &[(u64, u8)]) {
+    ///
+    /// A `vm_map`-grown tail that is **contiguous** from the mapped boundary is not re-inserted page
+    /// by page: it becomes the window's mapped prefix (`Rw` is the prefix default, so the two are the
+    /// same map). A cross-tier bounce re-seeds this map into a fresh `Mem` on **every** crossing, and a
+    /// guest whose heap grows to hundreds of MiB otherwise pays a per-page insert + collect + scan on
+    /// each of its thousands of bounces — measured at up to 8 ms per bounce, ~40 % of nimsem's
+    /// wall-clock (#1540). Anything the prefix cannot express (`Ro`, `Unmapped`, an `Rw` page beyond
+    /// a hole) stays an explicit entry, exactly as before. Entries arrive in [`Mem::map_info`]'s
+    /// ascending order; an unsorted list simply folds less.
+    ///
+    /// The fold makes the map handed back afterwards **relative to the raised prefix**: a tail folded
+    /// here is `map_info().1`, not an entry. So a caller re-seeding a *post-run* map must pass that
+    /// prefix back as `mapped` (the cross-tier bounce does); `0` means the declared window.
+    pub(crate) fn seed_pages(&mut self, mapped: u64, entries: &[(u64, u8)]) {
+        let reserved = self.window.reserved();
+        let mut high = self.window.mapped().max(mapped.min(reserved));
+        if self.window.base() == 0 {
+            for &(off, kind) in entries {
+                if kind == 1 && off == high {
+                    high = high.saturating_add(self.page).min(reserved);
+                }
+            }
+            if high > self.window.mapped() {
+                self.window = Window::with_mapped(reserved.trailing_zeros() as u8, high);
+            }
+        }
         if entries.is_empty() {
             return;
         }
-        let reserved = self.window.reserved();
         let mut space = self.space_write();
         for &(off, kind) in entries {
             if off >= reserved {
@@ -26284,6 +26308,7 @@ impl Mem {
             }
             let prot = match kind {
                 0 => PageProt::Ro,
+                1 if off < high => continue, // the prefix default — folded above
                 1 => PageProt::Rw,
                 _ => PageProt::Unmapped,
             };
