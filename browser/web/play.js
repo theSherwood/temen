@@ -2209,17 +2209,18 @@ async function runBashInteractive(c) {
   const session = mk(coop ? 'coop' : 'session');
   const control = coop ? session : mk('control');
   c.bashWorkers = coop ? [session] : [session, control];
-  // A minimal TERMINAL model for the output pane (readline rung): the session's bytes are a
-  // terminal stream, not plain text — readline (running as `TERM=dumb`) erases with `\b \b`,
-  // returns to column 0 with `\r`, and may emit CSI sequences a real terminal would consume.
-  // Completed lines are kept verbatim; only the current line is edited: `\b` moves the cursor left,
-  // `\r` to column 0, printable bytes overwrite at the cursor, `\n` commits the line. `ESC [ … F` is
-  // parsed and dropped except `K` (clear to end of line) and `C`/`D` (cursor right/left). Without
-  // this the pane showed raw control characters after every Backspace.
-  const term = { lines: [], cur: '', col: 0, esc: '' };
-  const render = () => {
-    c.el.stdout.textContent = term.lines.join('\n') + (term.lines.length ? '\n' : '') + term.cur;
-  };
+  // A minimal TERMINAL model for the output pane (readline rung, #1496): the session's bytes are a
+  // terminal stream, not plain text. Readline runs against the personality's fixed termcap entry
+  // (`temen_posix::TERMCAP_ENTRY` — 80×24, NO auto-margin), so it edits with `\b`, returns to
+  // column 0 with `\r`, wraps a long line at 79 columns and moves DOWN with `\n\r`, UP with
+  // `ESC [ A`, right with `ESC [ C`, and clears to the end of the line with `ESC [ K`. The
+  // bracketed-paste toggles (`ESC [ ? 2004 h/l`) and any other CSI are parsed and dropped. The pane
+  // is a grid of rows with a cursor: printable bytes overwrite at the cursor, `\n` moves to the next
+  // row (created at the bottom — command output arrives with bare `\n`s, so the pane behaves as an
+  // ONLCR terminal), and every row stays editable so a wrapped readline line is redrawn in place
+  // after a cursor-up. Without this the pane showed raw control characters after every Backspace.
+  const term = { rows: [''], row: 0, col: 0, esc: '' };
+  const render = () => { c.el.stdout.textContent = term.rows.join('\n'); };
   const append = (text) => {
     for (const ch of text) {
       if (term.esc) {
@@ -2227,19 +2228,26 @@ async function runBashInteractive(c) {
         if (term.esc.length === 2 && ch !== '[') term.esc = ''; // ESC x — a 2-byte sequence, dropped
         else if (term.esc.length > 2 && /[@-~]/.test(ch)) {
           const n = parseInt(term.esc.slice(2, -1), 10) || 1;
-          if (ch === 'K') term.cur = term.cur.slice(0, term.col);
-          else if (ch === 'C') term.col = Math.min(term.cur.length, term.col + n);
+          const line = term.rows[term.row];
+          if (ch === 'K') term.rows[term.row] = line.slice(0, term.col);
+          else if (ch === 'C') term.col = Math.min(line.length, term.col + n);
           else if (ch === 'D') term.col = Math.max(0, term.col - n);
+          else if (ch === 'A') term.row = Math.max(0, term.row - n);
+          else if (ch === 'B') term.row = Math.min(term.rows.length - 1, term.row + n);
           term.esc = '';
         }
         continue;
       }
       if (ch === '\x1b') term.esc = ch;
-      else if (ch === '\n') { term.lines.push(term.cur); term.cur = ''; term.col = 0; }
-      else if (ch === '\r') term.col = 0;
+      else if (ch === '\n') {
+        term.row += 1;
+        term.col = 0;
+        if (term.row === term.rows.length) term.rows.push('');
+      } else if (ch === '\r') term.col = 0;
       else if (ch === '\b') term.col = Math.max(0, term.col - 1);
       else if (ch >= ' ' || ch === '\t') {
-        term.cur = term.cur.slice(0, term.col) + ch + term.cur.slice(term.col + 1);
+        const line = term.rows[term.row].padEnd(term.col);
+        term.rows[term.row] = line.slice(0, term.col) + ch + line.slice(term.col + 1);
         term.col += 1;
       }
       // other control bytes (BEL, …) are dropped

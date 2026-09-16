@@ -716,6 +716,21 @@ struct Terminal {
     eof_armed: bool,
 }
 
+/// #1496 — the `TERM` name an interactive embedder exports alongside [`TERMCAP_ENTRY`]. Not `dumb`:
+/// readline treats that name as "no capabilities" whatever `TERMCAP` says.
+pub const TERM_NAME: &str = "temen";
+
+/// #1496 — the termcap entry describing this terminal to a termcap consumer (readline in bash),
+/// exported as the **value of `TERMCAP`**: GNU termcap takes a `TERMCAP` that does not start with
+/// `/` as the entry itself when `TERM` matches its name, so no `/etc/termcap` lives in-guest. The
+/// capabilities are exactly what [`Posix::enable_terminal`]'s 80×24 terminal and the playground's
+/// pane implement: carriage return, backspace, cursor right/up, clear-to-end-of-line. Deliberately
+/// **no `am`/`xn`** (auto-margin): readline then assumes a non-wrapping terminal, keeps its rows at
+/// 79 columns and moves down with an explicit `\n\r`, so no embedder has to emulate the autowrap
+/// glitch semantics. The oracle side of a transcript differential exports the same pair — the
+/// entry is fixed, not "real", so that comparison stays byte-for-byte.
+pub const TERMCAP_ENTRY: &str = "temen:co#80:li#24:cr=^M:le=^H:nd=\\E[C:up=\\E[A:ce=\\E[K:";
+
 impl Terminal {
     fn default_termios() -> (i64, [u8; 8]) {
         // ISIG | ICANON | ECHO; VINTR=^C VQUIT=^\ VERASE=DEL VKILL=^U VEOF=^D VSUSP=^Z.
