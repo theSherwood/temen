@@ -18,7 +18,9 @@ const PLAY_JS: &str = include_str!("../web/play.js");
 
 /// The `src` template literal of the `EXAMPLES` card keyed `key`, with the JS escapes undone.
 fn card_src(key: &str) -> String {
-    let i = PLAY_JS.find(key).unwrap_or_else(|| panic!("card {key} not in play.js"));
+    let i = PLAY_JS
+        .find(key)
+        .unwrap_or_else(|| panic!("card {key} not in play.js"));
     let j = PLAY_JS[i..].find("src: `").expect("card src") + i + 6;
     let k = PLAY_JS[j..].find("`,\n  },").expect("card src end") + j;
     PLAY_JS[j..k].replace("\\\\", "\\")
@@ -31,8 +33,16 @@ fn temen_card_grants_stdout_to_one_child_only() {
     let src = card_src("'§14 attenuation: two children, two powerboxes (Temen)'");
     let m = temen_text::parse_module(&src).unwrap_or_else(|e| panic!("parse: {e:?}"));
     let run = onramp_exec(&m, b"");
-    assert_eq!(run.status, STATUS_OK, "stderr: {}", String::from_utf8_lossy(&run.stderr));
-    assert_eq!(run.value, EXPECT_VALUE, "A (granted) = 1, B (not granted) = 0");
+    assert_eq!(
+        run.status,
+        STATUS_OK,
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.value, EXPECT_VALUE,
+        "A (granted) = 1, B (not granted) = 0"
+    );
     assert_eq!(run.stdout, b"granted\n", "only the granted child printed");
 }
 
@@ -63,10 +73,18 @@ fn c_card_grants_stdout_to_one_child_only() {
     );
     let ir = String::from_utf8(compiled.stdout).expect("IR is utf8");
     // The helper's spawn/join are static `call.cap`s on the Instantiator (interface 6).
-    assert!(ir.contains("call.cap 6 17") && ir.contains("call.cap 6 1 "), "{ir:.300}");
+    assert!(
+        ir.contains("call.cap 6 17") && ir.contains("call.cap 6 1 "),
+        "{ir:.300}"
+    );
     let m = temen_text::parse_module(&ir).unwrap_or_else(|e| panic!("parse IR: {e:?}"));
     let run = onramp_exec(&m, b"");
-    assert_eq!(run.status, STATUS_OK, "stderr: {}", String::from_utf8_lossy(&run.stderr));
+    assert_eq!(
+        run.status,
+        STATUS_OK,
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
     assert_eq!(run.value, EXPECT_VALUE);
     assert_eq!(
         String::from_utf8_lossy(&run.stdout),
