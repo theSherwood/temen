@@ -3429,6 +3429,313 @@ impl ReactorMoment {
     }
 }
 
+/// One frame's worth of driver input, as it rides a [`ReactorTimeline`]'s tape.
+///
+/// This records the `push_key` / `push_mouse` **arguments**, not the packed queue words they encode
+/// into, so the tape stays independent of that encoding — and so a replay goes back in through the
+/// same front door the live driver used rather than reaching into the queues behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReactorInput {
+    /// A key transition: `pressed` is 1 (down) / 0 (up), `keycode` the platform key id.
+    Key { keycode: i32, pressed: i32 },
+    /// A pointer event: `kind` 0 = pointer, 1 = wheel; `payload` per the mouse queue's encoding.
+    Mouse { kind: i32, payload: i32 },
+}
+
+/// What one tick produced.
+pub struct TickOutcome {
+    /// The reactor's status for the frame ([`STATUS_OK`] while it keeps going).
+    pub status: i32,
+    /// Whatever the guest wrote to stdout during the tick.
+    pub stdout: Vec<u8>,
+    /// The frame the guest presented through `display`, if it presented one.
+    pub frame: Option<Frame>,
+}
+
+/// A reactor a [`ReactorTimeline`] can drive: run one tick, take input, capture and restore a
+/// [`ReactorMoment`].
+///
+/// It is a trait because the tick is not always ours to run. The interpreter reactors step
+/// themselves, so their impls are here; the wasm-JIT reactor's `tick` is *emitted wasm*, run by the
+/// embedder that compiled it (the browser's JS host, or `wasmi` in the tests), so its impl belongs
+/// with that driver. Both shapes get the same ladder because the ladder is written against this and
+/// not against a concrete reactor (INVARIANTS #15).
+pub trait MomentReactor {
+    /// Run one tick to the next frame boundary.
+    fn step(&mut self) -> TickOutcome;
+    /// Enqueue a key event for the guest to `poll` next tick.
+    fn push_key(&self, keycode: i32, pressed: i32);
+    /// Enqueue a pointer event for the guest to `poll` next tick.
+    fn push_mouse(&self, kind: i32, payload: i32);
+    /// Capture this reactor's state at the current frame boundary, or `None` if it cannot be imaged
+    /// faithfully (see [`ReactorMoment`]).
+    fn moment(&self) -> Option<ReactorMoment>;
+    /// Put the reactor back at `m`. `false` if it has no window to restore into.
+    fn restore(&mut self, m: &ReactorMoment) -> bool;
+
+    /// Hand one recorded input back to the reactor — the replay side of the tape.
+    fn feed(&self, ev: ReactorInput) {
+        match ev {
+            ReactorInput::Key { keycode, pressed } => self.push_key(keycode, pressed),
+            ReactorInput::Mouse { kind, payload } => self.push_mouse(kind, payload),
+        }
+    }
+}
+
+impl MomentReactor for OnrampReactor {
+    fn step(&mut self) -> TickOutcome {
+        let (status, stdout) = self.frame();
+        let frame = OnrampReactor::take_frame(self);
+        TickOutcome {
+            status,
+            stdout,
+            frame,
+        }
+    }
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        OnrampReactor::push_key(self, keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        OnrampReactor::push_mouse(self, kind, payload);
+    }
+    fn moment(&self) -> Option<ReactorMoment> {
+        OnrampReactor::moment(self)
+    }
+    fn restore(&mut self, m: &ReactorMoment) -> bool {
+        OnrampReactor::restore(self, m)
+    }
+}
+
+impl MomentReactor for SharedOnrampReactor {
+    fn step(&mut self) -> TickOutcome {
+        let (status, stdout) = self.frame();
+        let frame = SharedOnrampReactor::take_frame(self);
+        TickOutcome {
+            status,
+            stdout,
+            frame,
+        }
+    }
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        SharedOnrampReactor::push_key(self, keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        SharedOnrampReactor::push_mouse(self, kind, payload);
+    }
+    fn moment(&self) -> Option<ReactorMoment> {
+        SharedOnrampReactor::moment(self)
+    }
+    fn restore(&mut self, m: &ReactorMoment) -> bool {
+        SharedOnrampReactor::restore(self, m)
+    }
+}
+
+/// A reactor plus the two things that turn a rewind into a **scrub**: a tick-indexed input tape and a
+/// keyframe ladder (#1457 items 3–4).
+///
+/// A [`ReactorMoment`] on its own only goes *back* to a point you thought to save. A timeline records
+/// what the driver fed the guest each tick, so any recorded position can be reconstructed — restore
+/// the nearest keyframe at or before it, then re-feed the tape forward. Keyframe stride trades memory
+/// for seek latency; the tape is a few words per tick either way.
+///
+/// ## Why the tape records the driver, not the guest
+///
+/// The obvious move is `Host::record_caps`, which tapes every `HOST_PROC` crossing so a replay can
+/// serve them without a live powerbox — the seam the debug checkpoint ladder rides. A reactor needs
+/// none of it, and it is worth saying why, because the cost of getting this wrong is large: for Doom
+/// that tape would carry every `display.present` and the `mem_writes` of every `fs` read, which is
+/// approximately the whole WAD, per keyframe interval.
+///
+/// The reason it is unnecessary is that a reactor replays against its **live** powerbox — the same
+/// capabilities, still granted — and everything those capabilities read from is already inside the
+/// moment: the key and mouse queues and the `fs` cursors are captured cap state, the window is the
+/// image, and the on-ramp powerbox grants no wall clock and no host RNG. So given the same starting
+/// moment and the same driver input, the guest's crossings *recompute* identically instead of needing
+/// to be served from a recording. The only thing outside the moment is what the host injects from the
+/// outside world, which is exactly what this tape holds.
+///
+/// That is also the boundary of the claim: a reactor granted a genuinely nondeterministic capability
+/// — wall clock, entropy, a socket — would need its crossings taped as well, and the honest move then
+/// is the recorded-input predicate on `record_caps` that #1457 sketched, not a second tape.
+///
+/// ## Positions
+///
+/// [`tick`](Self::tick) is where the reactor stands (frames presented so far) and
+/// [`len`](Self::len) is how far the recording goes. They are equal at the live end, where
+/// [`frame`](Self::frame) *extends* the recording with whatever input has been pushed; when `tick <
+/// len` the timeline is parked inside its own history and `frame` *replays* the recorded input for
+/// that tick instead. Pushing input while parked in the past abandons the rest of the recording —
+/// that is a branch, and the tape and keyframes past this point describe a run that will not happen.
+pub struct ReactorTimeline<R: MomentReactor> {
+    reactor: R,
+    /// Frames presented so far — the position on the timeline.
+    tick: usize,
+    /// `tape[t]` is the input the driver offered for tick `t`, in the order it offered it.
+    tape: Vec<Vec<ReactorInput>>,
+    /// Input offered for a tick that has not run yet.
+    pending: Vec<ReactorInput>,
+    /// Keyframes, ascending by tick. `keyframes[0]` is tick 0 and is never evicted, so **every**
+    /// recorded position stays reachable — at worst by replaying the whole tape. A ring that could
+    /// evict it would leave the start of a run unreachable, which for a scrub bar means a region of
+    /// the track the user can see and cannot drag to.
+    keyframes: Vec<(usize, ReactorMoment)>,
+    stride: usize,
+    ring: usize,
+}
+
+impl<R: MomentReactor> ReactorTimeline<R> {
+    /// Start recording `reactor` from its current position (tick 0).
+    ///
+    /// `stride` is how often a keyframe is taken and `ring` how many are held — the seek-latency /
+    /// memory dial. A keyframe costs a window image ([`ReactorMoment::byte_len`]), so for a 16 MiB
+    /// Doom window a ring of 4 is ~64 MiB and puts every seek within `stride` ticks of a restore.
+    /// Both are clamped to at least 1.
+    pub fn new(reactor: R, stride: usize, ring: usize) -> ReactorTimeline<R> {
+        ReactorTimeline {
+            reactor,
+            tick: 0,
+            tape: Vec::new(),
+            pending: Vec::new(),
+            keyframes: Vec::new(),
+            stride: stride.max(1),
+            ring: ring.max(1),
+        }
+    }
+
+    /// The reactor being driven — for the frame/window surface the timeline does not wrap.
+    pub fn reactor(&self) -> &R {
+        &self.reactor
+    }
+
+    /// The reactor being driven, mutably. Stepping it directly moves the guest without moving the
+    /// timeline's position, so the tape would no longer describe the run; use [`frame`](Self::frame).
+    pub fn reactor_mut(&mut self) -> &mut R {
+        &mut self.reactor
+    }
+
+    /// Where the reactor stands: the number of frames presented, so the next [`frame`](Self::frame)
+    /// produces frame `tick`.
+    pub fn tick(&self) -> usize {
+        self.tick
+    }
+
+    /// How far the recording goes — the highest tick this timeline can [`seek`](Self::seek) to.
+    pub fn len(&self) -> usize {
+        self.tape.len()
+    }
+
+    /// Whether nothing has been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        self.tape.is_empty()
+    }
+
+    /// The ticks currently held as keyframes, ascending — the ladder's rungs.
+    pub fn keyframe_ticks(&self) -> Vec<usize> {
+        self.keyframes.iter().map(|(t, _)| *t).collect()
+    }
+
+    /// What the ladder is holding, in bytes: the sum of its keyframes' window images.
+    pub fn held_bytes(&self) -> usize {
+        self.keyframes.iter().map(|(_, m)| m.byte_len()).sum()
+    }
+
+    /// Offer a key event for the next tick. Offered while parked in the past, this **branches**: the
+    /// recorded future is dropped (see the type's docs).
+    pub fn push_key(&mut self, keycode: i32, pressed: i32) {
+        self.offer(ReactorInput::Key { keycode, pressed });
+    }
+
+    /// Offer a pointer event for the next tick, branching as [`push_key`](Self::push_key) does.
+    pub fn push_mouse(&mut self, kind: i32, payload: i32) {
+        self.offer(ReactorInput::Mouse { kind, payload });
+    }
+
+    fn offer(&mut self, ev: ReactorInput) {
+        if self.tick < self.tape.len() {
+            // New input from inside the recording: from here the run diverges, so the tape beyond
+            // this point — and every keyframe past it — describes a future that will not happen.
+            self.tape.truncate(self.tick);
+            let here = self.tick;
+            self.keyframes.retain(|(t, _)| *t <= here);
+        }
+        self.pending.push(ev);
+    }
+
+    /// Run one tick, and either **extend** the recording with the input pushed since the last frame
+    /// (at the live end) or **replay** the input recorded for this tick (parked in the past).
+    pub fn frame(&mut self) -> TickOutcome {
+        self.keyframe_here();
+        if self.tick == self.tape.len() {
+            self.tape.push(std::mem::take(&mut self.pending));
+        }
+        for ev in self.tape[self.tick].clone() {
+            self.reactor.feed(ev);
+        }
+        let out = self.reactor.step();
+        self.tick += 1;
+        out
+    }
+
+    /// Move to tick `target`, replaying from the nearest keyframe at or before it. Returns `false`
+    /// for a position past the recording, or if the reactor refuses the restore.
+    ///
+    /// The frames the replay presents on the way are discarded: this positions the guest, and the
+    /// caller renders forward from there with [`frame`](Self::frame). Input pushed but not yet fed is
+    /// dropped — it was aimed at the tick being left, exactly as a [`restore`](MomentReactor::restore)
+    /// drops the queue it was sitting in.
+    ///
+    /// Seeking *forward* within the recording needs no restore at all — the replay just continues
+    /// from where the reactor already is — so dragging a scrub bar forward costs the frames crossed
+    /// rather than a rewind and a full re-run.
+    pub fn seek(&mut self, target: usize) -> bool {
+        if target > self.tape.len() {
+            return false;
+        }
+        self.pending.clear();
+        if target < self.tick {
+            let Some(i) = self.keyframes.iter().rposition(|(t, _)| *t <= target) else {
+                return false; // nothing captured at or before `target` — refuse, never guess (#9c)
+            };
+            let at = self.keyframes[i].0;
+            if !self.reactor.restore(&self.keyframes[i].1) {
+                return false;
+            }
+            self.tick = at;
+        }
+        while self.tick < target {
+            self.frame();
+        }
+        true
+    }
+
+    /// Take a keyframe if this boundary is a rung and we are not already holding one for it. A replay
+    /// re-takes a rung it crossed on the way out and has since evicted, which is what keeps the ladder
+    /// dense around wherever the driver is working.
+    fn keyframe_here(&mut self) {
+        if !self.tick.is_multiple_of(self.stride) {
+            return;
+        }
+        let Err(at) = self.keyframes.binary_search_by_key(&self.tick, |(t, _)| *t) else {
+            return; // already held for this tick
+        };
+        let Some(m) = self.reactor.moment() else {
+            return; // an uncapturable window: the ladder stays empty and `seek` refuses, rather than
+                    // holding a partial image that would restore a fiction (#9c)
+        };
+        self.keyframes.insert(at, (self.tick, m));
+        while self.keyframes.len() > self.ring {
+            // Tick 0 is pinned; of the rest, drop whichever rung is furthest from where we are, so
+            // the ladder stays dense around the working position instead of around where the run
+            // started. Dropping the *oldest* would evict a rung we just re-took while scrubbing back.
+            let here = self.tick;
+            let victim = (1..self.keyframes.len())
+                .max_by_key(|&i| self.keyframes[i].0.abs_diff(here))
+                .expect("len > ring >= 1, so there is a rung after the pinned one");
+            self.keyframes.remove(victim);
+        }
+    }
+}
+
 /// Grant the **on-ramp powerbox** onto `host` for module `m`: the §3e prefix
 /// (`stdout, stdin, exit, memory, addrspace`), each registered under its `self.resolve` name,
 /// plus the by-name graphical `HostProc` capabilities every on-ramp run carries — `display` (op 0 =

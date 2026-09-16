@@ -101,6 +101,37 @@ practice only because the two reserve different window sizes, and a mismatched i
 than splatted over a prefix. Gated by `browser/tests/reactor_moment.rs`,
 `browser/tests/jit_reactor_moment.rs`, and the page-level `browser-play-savestate-test.mjs`.
 
+**Follow-on — from rewind to scrub (2026-09-16, #1457 items 3–4).** A moment on its own only goes
+*back* to a point someone thought to save. `ReactorTimeline` adds the two things that make that a
+scrub: a **tick-indexed input tape** and a **keyframe ladder**, so any recorded tick is reachable —
+restore the nearest rung at or before it, re-feed the tape forward. It is written against a
+`MomentReactor` trait rather than a concrete reactor, so one ladder serves the engine-backed
+interpreter reactor, the shared-window one, and the emitted tier whose `tick` the embedder runs
+(INVARIANTS #15).
+
+*The finding worth recording: the tape records the **driver**, not the guest.* #1457's sketch pointed
+at `Host::record_caps` — the `CapTape` seam the debug checkpoint ladder rides, which tapes every
+`HOST_PROC` crossing so a replay can serve it without a live powerbox — and noted that for a reactor
+that tape would carry every `display.present` and the `mem_writes` of every `fs` read, roughly the
+whole WAD per keyframe interval. The right conclusion is stronger than "make it selective": a reactor
+needs none of it. It replays against its **live** powerbox, and everything those capabilities read
+from is already inside the moment (the input queues and `fs` cursors are captured cap state, the
+window is the image, and the on-ramp powerbox grants no wall clock and no entropy), so the guest's
+crossings **recompute** rather than needing to be served. What is genuinely outside the moment is what
+the host injects from the outside world, and that is all the tape holds. The two ladders are therefore
+not one mechanism with two tape policies: the debug ladder must tape because it rebuilds the powerbox,
+and the reactor ladder must not because it keeps one. That boundary is the claim's edge, too — a
+reactor granted a genuinely nondeterministic capability would need its crossings taped, and *then* the
+recorded-input predicate #1457 sketched is the right move.
+
+One ordering rule makes the tape and the moment compose: a keyframe is taken **before** the tick's
+input reaches the queues, so that input sits in the tape alone and a replay feeds it exactly once.
+Taken after, it would sit in both. The reactor fixtures cannot witness that through their frames —
+`bounce` and `life` drain their whole queue each tick and fold it idempotently, though the `keyboard`
+ABI explicitly allows a guest to take one event per tick, which is how Doom's `DG_GetKey` is pumped —
+so it is gated where it *is* visible: a rung, restored and frozen to a §12 artifact, must be
+byte-identical to a reactor driven the same way that was never handed that tick's input.
+
 *Geometry footnote.* The §12 container's reservation checks were bounded by the **host's** pointer
 width (`usize::BITS`). The mask domain is a guest address-space quantity, so an ordinary 4 GiB
 reservation (`reserved_log2 == 32`) froze fine on a 64-bit host and refused with `WindowGeometry` on
