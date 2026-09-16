@@ -5564,7 +5564,13 @@ fn int_ty_signed(node: &Node) -> Result<(ValType, bool, u32), LengError> {
             } else {
                 ValType::I32
             };
-            Ok((vt, k != "u", width))
+            // `c` is nim's `char`: an **unsigned** 0..255 byte, like `u`, not a signed `i`. Getting
+            // this wrong sign-extends every byte with the high bit set, so `ord(s[i])` on a UTF-8
+            // continuation byte read -61 instead of 195 and every `>= 0x80` lead-byte test in
+            // `std/unicode` went false — `runeLen` counted bytes, `toUpper` skipped multi-byte runes,
+            // `validateUtf8` rejected valid input. A *masking* test still passed (`-61 and 0xC0` is
+            // `0xC0`), which is why this survived: only the comparisons were wrong.
+            Ok((vt, k == "i", width))
         }
         // `bool` is already canonical 0/1 and is not an arithmetic width — report the slot width so
         // nothing tries to narrow it.
