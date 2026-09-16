@@ -341,6 +341,20 @@ try {
       : fail(`qjs isolation: define=${JSON.stringify(qd.slice(-20))} after=${JSON.stringify(qa.slice(-20))}`);
   }
 
+  // #1509 — the per-child attenuation cards. The Temen one is a text-source *module* card (no asset:
+  // the editor's program is parsed and run through the on-ramp powerbox, whose named `instantiator`
+  // the parent spawns through): result 10 = A (granted stdout) · 10 + B (no grants), "granted" once.
+  const attnName = '§14 attenuation: two children, two powerboxes (Temen)';
+  await runCard(page, attnName, 30_000);
+  const attn = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+    out: document.querySelector(`${sel} .stdout`).textContent,
+  }), card(attnName));
+  attn.state === 'done' && attn.result === '10' && attn.out === 'granted\n'
+    ? ok('attenuation (Temen): two children, only the granted one printed → 10')
+    : fail(`attenuation (Temen): ${JSON.stringify(attn)}`);
+
   // The C-compiler card mounted a C-mode editor.
   const cc = await page.evaluate((sel) => document.querySelector(`${sel} .CodeMirror`)?.CodeMirror?.getOption('mode'),
     card('C compiler (chibicc → Temen — compile & run)'));
@@ -366,6 +380,20 @@ try {
     && cco.msg.includes('wasm-JIT')
       ? ok('chibicc compiled C → Temen IR → ran it → 42 (in-browser, wasm-JIT)')
       : fail(`chibicc run: ${JSON.stringify({ state: cco.state, msg: cco.msg, result: cco.result, ir: cco.ir.slice(0, 60) })}`);
+
+    // #1509 — the C attenuation card: `<temen/spawn.h>` (seeded from posix_libc/spawn.c) spawns the
+    // same child twice with different grant lists; the program's own stdout precedes the emitted IR.
+    const attnC = '§14 attenuation from C (chibicc + <temen/spawn.h>)';
+    await runCard(page, attnC, 60_000);
+    const ac = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      result: document.querySelector(`${sel} .result`).textContent.trim(),
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(attnC));
+    ac.state === 'done' && ac.result === '10'
+    && ac.out.startsWith('granted\nchild A (granted stdout) returned 1\nchild B (no grants)      returned 0\n')
+      ? ok('attenuation (C via chibicc + <temen/spawn.h>): only the granted child printed → 10')
+      : fail(`attenuation (C): ${JSON.stringify({ state: ac.state, result: ac.result, out: ac.out.slice(0, 120) })}`);
 
     // "Prove interp ≡ JIT": compile the same C on both tiers and assert the emitted IR is byte-identical.
     await page.click(`${card(ccName)} button.prove`);

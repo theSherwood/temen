@@ -7,9 +7,10 @@
  * no new IR"). This file only removes the byte-laying: the 56-byte record (`temen_ir::SpawnRec`) and
  * the `{name_off, name_len, handle, flags}` grant records that every C consumer used to write by hand.
  *
- * Reaches the Instantiator through two named capability externs (`vm_instantiate_rec` = op 17,
- * `vm_instantiate_join` = op 1, both rows of `temen_ir::default_cap_resolver`) on the handle the
- * guest discovers itself via `cap.self` reflection — no frontend builtin, no new IR op.
+ * Reaches the Instantiator through two frontend builtins (`__vm_instantiate_rec` = op 17,
+ * `__vm_instantiate_join` = op 1 — static `call.cap`s like `__vm_exec_module`, since an executor op
+ * reaches its seam only through a static `call.cap`) on the handle the guest discovers itself via
+ * `cap.self` reflection — no new IR op.
  *
  * Record contract (little-endian, window-relative pointers; fails closed on any other version):
  *   { version: u32 = 0, entry: u32, off: u64, size_log2: u32, pager: u32 = MAX (none),
@@ -22,8 +23,8 @@
  * `static inline` so the frontend's dead-code pass drops what a program never calls.
  */
 
-long vm_instantiate_rec(int inst, long rec);   /* Instantiator op 17 -> child handle | -errno */
-long vm_instantiate_join(int inst, long child); /* Instantiator op 1 -> the child's entry result */
+long __vm_instantiate_rec(int inst, long rec);    /* Instantiator op 17 -> child handle | -errno */
+long __vm_instantiate_join(int inst, long child); /* Instantiator op 1 -> the child's entry result */
 int __vm_cap_count(void);
 int __vm_cap_at(int i, int *type_id_out);
 
@@ -85,10 +86,10 @@ static inline long vm_spawn(long module, long entry, long off, long size_log2, l
   }
   q[5] = (long)g;          /* @40 */
   q[6] = n;                /* @48 */
-  return vm_instantiate_rec(vm_instantiator_(), (long)scratch);
+  return __vm_instantiate_rec(vm_instantiator_(), (long)scratch);
 }
 
 /* vm_join(child) -> the child's entry result (its `main` return), or -errno. */
 static inline long vm_join(long child) {
-  return vm_instantiate_join(vm_instantiator_(), child);
+  return __vm_instantiate_join(vm_instantiator_(), child);
 }

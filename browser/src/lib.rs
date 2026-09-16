@@ -4375,6 +4375,12 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/stdio.h",
             include_str!("../playground-include/stdio.h"),
         ),
+        // #1509: the §14 spawn helper (`vm_spawn`/`vm_join`/`vm_cap_of`) as `<temen/spawn.h>` — the
+        // tree's `posix_libc/spawn.c` verbatim (one source), for the attenuation card.
+        (
+            "include/temen/spawn.h",
+            include_str!("../../crates/temen-run/demos/posix_libc/spawn.c"),
+        ),
         (
             "include/__pg_decls_only.h",
             include_str!("../playground-include/__pg_decls_only.h"),
@@ -4619,9 +4625,12 @@ fn chibicc_card_image(img_ptr: *const u8, img_len: usize, src: &[u8]) -> Result<
     if !dirs.iter().any(|d| d == "include") {
         dirs.push("include".to_string());
     }
-    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs), so register `include/sys`.
-    if !dirs.iter().any(|d| d == "include/sys") {
-        dirs.push("include/sys".to_string());
+    // The seeded headers include `sys/*.h` (the stage-2 system-header stubs) and `temen/spawn.h`, so
+    // register both subdirectories.
+    for sub in ["include/sys", "include/temen"] {
+        if !dirs.iter().any(|d| d == sub) {
+            dirs.push(sub.to_string());
+        }
     }
     // Split the editor buffer into a **multi-file** project: the compile targets `/in.c` (the text
     // before the first marker), and each `//// file: NAME` marker seeds a sibling file the entry can
