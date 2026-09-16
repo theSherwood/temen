@@ -189,6 +189,52 @@ fn child_jit_ops_persist_across_bounces() {
     temen_op13jit_close();
 }
 
+/// A child whose entry `thread.spawn`s: the wasm-JIT declines `thread.spawn` (OPS_PARITY.md), so the
+/// child runs inline on the interpreter, where the op-13 leaf driver does not service `Spawn` either.
+fn child_spawning() -> Vec<u8> {
+    let src = r#"memory 15
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vfive = i64.const 5
+  return vfive
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  vz = i64.const 0
+  return vz
+  }
+}
+"#;
+    let m = temen_text::parse_module(src).expect("parse spawning child");
+    temen_verify::verify_module(&m).expect("verify spawning child");
+    temen_encode::encode_module(&m)
+}
+
+/// **A child the driver cannot service is a value at the parent's `join`** (INVARIANTS #5). The
+/// leaf runner reaches `Spawn`, which it does not service; before, it banked `Err(Trap::Malformed)`
+/// and `deliver_join` turned that into the PARENT's trap — the driver died with `OP13JIT_TRAP` for a
+/// limitation of the host. Now the parent's `join` yields `-EINVAL` (the same answer a declined op
+/// gets, #1415) and the driver returns it as its result.
+#[test]
+fn a_child_the_driver_cannot_service_is_a_value_at_the_parents_join() {
+    let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    open(&child_spawning());
+    assert_eq!(
+        temen_op13jit_step(),
+        OP13JIT_DONE,
+        "the driver completes: its join got a value, not the child's decline as a trap"
+    );
+    assert_eq!(
+        temen_op13jit_result(),
+        temen_ir::errno::EINVAL,
+        "the parent's join sees -EINVAL for a child its driver declined"
+    );
+    temen_op13jit_close();
+}
+
 #[test]
 fn declined_child_jit_ops_run_inline() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
