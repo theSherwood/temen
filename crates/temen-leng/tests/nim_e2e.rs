@@ -1290,6 +1290,61 @@ fn real_envvars_report_an_empty_environment() {
     assert_eq!(String::from_utf8_lossy(&out), "[]|false");
 }
 
+/// **The epoll trio is bound, and it reports failure.** `run_libc_program` asserts the program's
+/// manifest is exactly the one `write` cap, so this first of all pins that `epoll_create1`/`_ctl`/
+/// `_wait` are no longer unbound leaves — the thing that kept `std/threadpool` and `std/parfor` from
+/// linking at all.
+///
+/// It then *calls* all three, because "it linked" is the weaker claim: a leaf bound to the wrong
+/// shim, or to one returning a plausible-looking 0, links exactly as cleanly. `-1|-1|-1` is the
+/// contract — the facility is absent, and `epoll_wait` says so rather than answering "no events
+/// ready" for an epoll set that was never created.
+#[test]
+fn real_epoll_leaves_report_failure() {
+    let src = concat!(
+        "import std/syncio\n",
+        "\n",
+        "proc epoll_create1(flags: cint): cint {.importc, header: \"<sys/epoll.h>\".}\n",
+        "proc epoll_ctl(epfd: cint; op: cint; fd: cint; event: ptr int64): cint {.importc,\n",
+        "    header: \"<sys/epoll.h>\".}\n",
+        "proc epoll_wait(epfd: cint; events: ptr int64; maxevents: cint; timeout: cint): cint {.importc,\n",
+        "    header: \"<sys/epoll.h>\".}\n",
+        "\n",
+        // nimony pointers are non-nullable (`nil` is rejected outright), so the two pointer-taking
+        // leaves get a real buffer. The stubs never read it.
+        "var ev: array[8, int64]\n",
+        "let a = epoll_create1(0.cint)\n",
+        "let b = epoll_ctl(0.cint, 1.cint, 2.cint, addr ev[0])\n",
+        "let c = epoll_wait(0.cint, addr ev[0], 1.cint, 0.cint)\n",
+        "write(stdout, $a & \"|\" & $b & \"|\" & $c)\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_epoll_leaves_report_failure (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "-1|-1|-1");
+}
+
+/// **`std/threadpool` and `std/parfor` link and run.** Both were unlinkable for one reason only —
+/// the three epoll leaves above had no provider — so nothing in either module was reachable, pure or
+/// not. Importing them is the whole test: `run_libc_program` pins the manifest to the single `write`
+/// cap, and reaching the `write` proves module-level initialization did not trap on the way.
+///
+/// This does **not** claim a working thread pool. `initPool()` is an explicit call, not a module
+/// initializer, and a program that makes it gets nim's own `assert gIoFd >= 0` — see the epoll rows
+/// in `COMPUTE_LEAVES` for why that loud failure is the intended outcome.
+#[test]
+fn real_threadpool_and_parfor_link_and_run() {
+    for module in ["threadpool", "parfor"] {
+        let src = format!("import std/syncio\nimport std/{module}\n\nwrite(stdout, \"ok\")\n");
+        let Some(out) = run_libc_program(&src) else {
+            eprintln!("SKIP real_threadpool_and_parfor_link_and_run (no toolchain / libc asset)");
+            return;
+        };
+        assert_eq!(String::from_utf8_lossy(&out), "ok", "std/{module}");
+    }
+}
+
 /// **#1422 stage-3 runnability sweep.** The `#760` sweep above answers "does it *translate*?"; this
 /// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
 /// [`discovered_std_modules`] it compiles a driver that imports the module, links it through the real
@@ -1506,6 +1561,10 @@ const STD_MODULES: &[&str] = &[
     "locks",
     "rlocks",
     "ticketlocks",
+    // Runnable since the epoll trio was bound as fail-closed stubs — the residue of #1443, whose
+    // `{.emit.}` half fixed the other four threading modules and left these two on `epoll_*`.
+    "parfor",
+    "threadpool",
     "strutils",
     "sequtils",
     "algorithm",

@@ -861,6 +861,25 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("builtinFetchSub", sig(&[I64, I32, I32], &[I32]), 68),
     ("builtinFetchAdd", sig(&[I64, I64, I32], &[I64]), 69),
     ("builtinFetchSub", sig(&[I64, I64, I32], &[I64]), 70),
+    // **The epoll trio** `std/threadpool` and `std/parfor` declare, and the last thing keeping those
+    // two modules from linking (#1443's residue: the `{.emit.}` half was fixed, this half was not).
+    // Same fail-closed posture as the posix rows above, and for the same reason — a sandboxed guest
+    // is granted no ambient I/O multiplexer.
+    //
+    // **All three report failure, including `epoll_wait`.** The tempting alternative is to have it
+    // return 0, "no events ready", which reads like the harmless-success rows (`close`, `nanosleep`).
+    // It is not the same: 0 claims a *successful poll of an epoll set*, and there is no set — the
+    // `epoll_create1` that would have made one returned -1. A poller that answers "nothing ready"
+    // forever is precisely the silent-wrong-answer shape this table exists to avoid; -1 says the
+    // facility is absent, which is true.
+    //
+    // A program that only *imports* these modules now links, which is the point. One that calls
+    // `initPool()` gets nim's own `assert gIoFd >= 0, "epoll_create1 failed"` (threadpool.nim:355) —
+    // a named, immediate failure rather than a pool that looks initialized and silently runs nothing.
+    // Its worker threads were already inert: `pthread_create` is the fail-closed stub at row 53.
+    ("epoll_create1", ANY, 71),
+    ("epoll_ctl", ANY, 72),
+    ("epoll_wait", ANY, 73),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
