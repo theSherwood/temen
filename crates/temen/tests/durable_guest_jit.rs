@@ -41,7 +41,7 @@ use temen_verify::verify_module;
 
 const SIZE_LOG2: u8 = 17; // 128 KiB ≥ the durable reserve (64 KiB)
 const WINDOW: usize = 1 << SIZE_LOG2;
-const BLOB_OFF: usize = 0x1_1000; // above DURABLE_RESERVE (64 KiB) — the guest usable region
+const BLOB_OFF: usize = 0x1_1000; // above `ShadowArena::LEGACY.end` (64 KiB) — the guest usable region
 
 /// Encode+verify a unit blob a guest submits to `Jit.compile`.
 fn blob(src: &str) -> Vec<u8> {
@@ -169,7 +169,7 @@ fn durable_run_compiles_and_invokes_agrees() {
     );
 
     // Guest `(jit) -> i64`: compile the unit staged at BLOB_OFF, then invoke it. Single block, two
-    // call.cap calls, return — in the durable transform's shape. The blob ptr is above DURABLE_RESERVE.
+    // call.cap calls, return — in the durable transform's shape. The blob ptr is above `ShadowArena::LEGACY.end`.
     let guest_src = format!(
         "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
          v1 = i64.const {off}\n  v2 = i64.const {len}\n  \

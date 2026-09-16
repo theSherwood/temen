@@ -1070,6 +1070,19 @@ including the §12.6 canonical re-serialize invariant). Remaining Phase-3 contro
 
 ### 12.7 Shadow-frame layout
 
+**Placement has one definition (2026-09-16, #1503).** Where the per-context shadow regions sit is
+`temen_ir::durable_abi::ShadowArena { base, end }`: every consumer — the transform's overflow guard
+and window seed, both interpreter tiers, the Cranelift fiber runtime, the snapshot codec — computes
+regions through its methods (`region_base`/`region_fits`/`frame_base`/`thaw_state_off`/`ctx_of_sp`/
+`ctx_ceiling`). The former `SHADOW_BASE`/`DURABLE_RESERVE` constants and the three hand-synced
+`shadow_region_base`/`MAX_SHADOW_CTX` copies that had to "MUST match" each other are gone. Today's
+placement is `ShadowArena::LEGACY` = `[guard+64, 1<<16)`, byte-identical to before (the 144-test
+durable set is the proof); the follow-up makes the arena a `Memory`-declared, verified parameter and
+deletes `LEGACY` (INVARIANTS.md #16 lands with it). Note the `+8` root-SP value quoted in the 4A.5
+"Helpers / format" entry below predates the §12.8 stage-1 thaw word: the empty root extent is
+`frame_base(0)` = base+16, and the test helpers that still said `+8` made their "a frame was pushed"
+assertions vacuous — fixed with #1503 slice A.
+
 The transform's spill/reload code and the suspended representation meet here. Two
 properties drive the whole design:
 

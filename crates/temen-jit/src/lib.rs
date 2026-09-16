@@ -473,10 +473,10 @@ pub struct FrozenNested {
 pub const DURABLE_SNAPSHOT_PAGE: usize = 4096;
 
 /// Window offset of durable shadow **context 0** (the root vCPU's region base) — an *empty* shadow-SP
-/// extent. Derived from `temen_ir::durable_abi::SHADOW_BASE` (the shared durable-runtime ABI, relocated
-/// above the #1094 NULL guard) so this never drifts from `temen-interp`/`fiber_rt`. The cross-backend
-/// artifact-equality property also catches drift.
-const DURABLE_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
+/// extent. Derived from `temen_ir::durable_abi::ShadowArena` — one definition of placement (#1503),
+/// currently `LEGACY` — so this cannot drift from `temen-interp`/`fiber_rt`. The cross-backend
+/// artifact-equality property also catches a runtime divergence.
+const DURABLE_SHADOW_BASE: u64 = temen_ir::durable_abi::ShadowArena::LEGACY.base;
 
 /// The trap kinds the JIT can raise (a subset of the interpreter's `Trap`), numbered to
 /// match the codes the lowered checks / the host thunk store into the trap cell.
@@ -2388,7 +2388,7 @@ pub struct CompiledModule {
     /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
     frozen_nested_seed: Vec<FrozenNested>,
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
-    /// artifact), set as the active word before the root rewinds. `SHADOW_BASE` (empty) otherwise.
+    /// artifact), set as the active word before the root rewinds. The empty root extent (`ShadowArena::frame_base(0)`) otherwise.
     thaw_root_sp: u64,
     /// Async freeze controller (Phase-4 Slice A, 4A.3): if set, the run publishes its live window base
     /// here before the guarded call and retires it after, so a controller thread's `request_freeze`
@@ -3442,7 +3442,7 @@ impl CompiledModule {
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
             frozen_nested_seed: Vec::new(),
-            thaw_root_sp: DURABLE_SHADOW_BASE + 8, // §12.8 4A.5: empty root extent = frame base (past the SP word)
+            thaw_root_sp: temen_ir::durable_abi::ShadowArena::LEGACY.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
             #[cfg(fiber_rt)]
             fiber_rt,
@@ -4813,7 +4813,7 @@ pub(crate) unsafe fn compile_child_and_run(
     // state word (at `STATE_OFF`, relocated above the #1094 NULL guard) and the ctx-0 thaw word to
     // `NORMAL`, and the ctx-0 shadow-SP word (at `shadow_region_base(0)` = `DURABLE_SHADOW_BASE`) to the
     // empty frame base `shadow_frame_base(0)`. So an instrumented child's prologue sees `NORMAL` and its
-    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ `DURABLE_RESERVE`
+    // shadow stack starts empty at the right offset. A valid durable child's window is ≥ the arena `end`
     // (64 KiB), so these offsets fit; the size guard keeps a malformed (too-small) guest-requested carve
     // from panicking the host here — such a child instead traps at runtime when its instrumented code
     // reaches past its window.
@@ -5388,7 +5388,7 @@ fn compile_child_windowed(
         frozen_root_sp_out: 0,
         frozen_vcpu_seed: Vec::new(),
         frozen_nested_seed: Vec::new(),
-        thaw_root_sp: DURABLE_SHADOW_BASE + 8,
+        thaw_root_sp: temen_ir::durable_abi::ShadowArena::LEGACY.frame_base(0),
         freeze_ctl: None,
         fiber_rt: None,
         domain: None,

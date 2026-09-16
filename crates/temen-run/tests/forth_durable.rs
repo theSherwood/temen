@@ -8,20 +8,20 @@
 //!
 //! What refuses is the **memory map**, and only one region of it. `transform_module` — the strict
 //! path for an untrusted module — fails closed with `GuestUsesMemory` because the kernel does guest
-//! loads/stores that could alias the reserved durable region `[0, DURABLE_RESERVE)` (R9). Its own
+//! loads/stores that could alias the reserved durable region `[0, `ShadowArena::LEGACY.end`)` (R9). Its own
 //! doc names the way out: a guest from a cooperating toolchain that *reserves* that region (basing
-//! its data and heap at `DURABLE_RESERVE`) uses `transform_module_assume_confined` instead. The
+//! its data and heap at `ShadowArena::LEGACY.end`) uses `transform_module_assume_confined` instead. The
 //! Forth kernel almost does reserve it — everything from the globals up already starts at exactly
-//! `DURABLE_RESERVE` — **except its 24 data segments, which sit at `0x8000`**, inside the region the
+//! `ShadowArena::LEGACY.end` — **except its 24 data segments, which sit at `0x8000`**, inside the region the
 //! durable runtime puts the state word, the shadow-SP and the per-context shadow stacks.
 //!
 //! That is not a latent collision, it is a live one for exactly the session #1236 wants to freeze:
-//! shadow context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +STRIDE)`, so a session with a
+//! shadow context `i` occupies `[ShadowArena::region_base(i), +STRIDE)`, so a session with a
 //! handful of contexts (the root plus a few `task` fibers) reaches `0x8000` and overwrites the
 //! prelude. Using `assume_confined` as the map stands would be lying to the transform.
 //!
 //! So step 1's finding: **a Forth-side shape change, not a durability-axis gap** — relocate the data
-//! block above `DURABLE_RESERVE`. The map below the session-snapshot line (`0x40000`, #1235) is
+//! block above `ShadowArena::LEGACY.end`. The map below the session-snapshot line (`0x40000`, #1235) is
 //! fully packed, so that means reclaiming ~6.5 KiB from a region that has slack; it is a self-
 //! contained change and the rest of #1236 (freeze mid-session, thaw, compare transcripts) unblocks
 //! behind it. These tests pin the finding so the next person does not re-derive it.
@@ -59,7 +59,7 @@ fn the_strict_transform_refuses_the_kernel_for_aliasing_the_durable_reserve() {
     assert_eq!(
         temen_durable::transform_module(&m),
         Err(temen_durable::TransformError::GuestUsesMemory),
-        "the strict path must fail closed for a guest whose memory ops could reach [0, DURABLE_RESERVE)"
+        "the strict path must fail closed for a guest whose memory ops could reach [0, ShadowArena::LEGACY.end)"
     );
 }
 
@@ -69,16 +69,16 @@ fn the_strict_transform_refuses_the_kernel_for_aliasing_the_durable_reserve() {
 #[test]
 fn the_kernels_data_block_still_sits_inside_the_durable_reserve() {
     let m = kernel();
-    let reserve = temen_interp::DURABLE_RESERVE;
+    let reserve = temen_interp::ShadowArena::LEGACY.end;
     let inside: Vec<_> = m.data.iter().filter(|d| d.offset < reserve).collect();
     let lo = inside.iter().map(|d| d.offset).min();
     let hi = inside.iter().map(|d| d.offset + d.bytes.len() as u64).max();
 
     // Everything that is NOT a data segment already clears the reserve — the globals base at exactly
-    // `DURABLE_RESERVE`. So the relocation is one contiguous block, not a re-lay of the whole map.
+    // `ShadowArena::LEGACY.end`. So the relocation is one contiguous block, not a re-lay of the whole map.
     assert!(
         !inside.is_empty(),
-        "the data block has moved above DURABLE_RESERVE ({reserve:#x}) — #1236's precondition is met. \
+        "the data block has moved above ShadowArena::LEGACY.end ({reserve:#x}) — #1236's precondition is met. \
          Delete this test, switch the kernel to `transform_module_assume_confined`, and carry on with \
          freeze/thaw (step 2: freeze mid-session with a suspended `task`, thaw, and compare the two \
          halves' stdout against the uninterrupted run)."
@@ -90,7 +90,7 @@ fn the_kernels_data_block_still_sits_inside_the_durable_reserve() {
         "the data block must at least clear the NULL guard: starts at {lo:#x}"
     );
     // The numbers the relocation has to satisfy: this much payload has to find a home in
-    // [DURABLE_RESERVE, SESSION_SNAP) — above the durable region, below the line a `JitSession`
+    // [`ShadowArena::LEGACY.end`, SESSION_SNAP) — above the durable region, below the line a `JitSession`
     // carries across prompts (#1235), because the prelude and the error messages must survive one.
     println!(
         "#1236 blocker: {} data segment(s), {bytes} bytes spanning [{lo:#x}, {hi:#x}), \

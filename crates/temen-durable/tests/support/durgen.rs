@@ -20,7 +20,7 @@
 
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, read_thaw_state,
-    transform_module, write_state, SHADOW_BASE, STATE_NORMAL, STATE_UNWINDING,
+    transform_module, write_state, ShadowArena, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
 use temen_ir::{
@@ -38,7 +38,7 @@ fn durgen_type_section() -> Vec<TypeEntry> {
     })]
 }
 
-// 128 KiB: the durable region needs `DURABLE_RESERVE` (64 KiB), and a smaller window keeps the
+// 128 KiB: the durable region needs `ShadowArena::LEGACY.end` (64 KiB), and a smaller window keeps the
 // per-run commit footprint modest — the JIT commits a window per compile, and on a memory-tight
 // Windows CI runner the cumulative commit of many compiles can hit the limit (os error 1455).
 pub const SIZE_LOG2: u8 = 17;
@@ -560,17 +560,22 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
     }
 }
 
-// §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at `SHADOW_BASE`),
-// not the legacy global `SHADOW_SP_OFF`. Frames grow just past it, so an empty root stack reads
-// `SHADOW_BASE + 8`.
+// §12.8 4A.5: the root context's shadow-SP word is the first 8 bytes of its region (at
+// `ShadowArena::region_base(0)`), not the legacy global `SHADOW_SP_OFF`. Frames grow past the 16-byte
+// region header (SP word + thaw word), so an empty root stack reads `ShadowArena::frame_base(0)`.
+// (This used to say `+ 8` — the 4A.5 value from before §12.8 stage 1 added the thaw word — which
+// made the `read_sp > ROOT_EMPTY_SP` "a frame was pushed" assertions vacuous.)
 fn read_sp(w: &[u8]) -> u64 {
     let mut b = [0u8; 8];
-    b.copy_from_slice(&w[SHADOW_BASE as usize..SHADOW_BASE as usize + 8]);
+    b.copy_from_slice(
+        &w[ShadowArena::LEGACY.region_base(0) as usize
+            ..ShadowArena::LEGACY.region_base(0) as usize + 8],
+    );
     u64::from_le_bytes(b)
 }
 
 /// The empty (no-frames) root shadow-SP under the 4A.5 per-context layout.
-const ROOT_EMPTY_SP: u64 = SHADOW_BASE + 8;
+const ROOT_EMPTY_SP: u64 = ShadowArena::LEGACY.frame_base(0);
 
 // ---- Fiber generator + freeze/thaw property (Phase 3.1 hardening) ----
 //

@@ -239,7 +239,7 @@ pub enum Trap {
 /// under 2048 reified frames, so `coroutine.lua`'s "infinite recursion of coroutines" test
 /// raises a `pcall`-catchable "C stack overflow" on all three engines instead of the
 /// tree-walker uniquely tripping this cap (an uncatchable §5 kill) at 256. Kept comfortably
-/// below the durable shadow-reserve's frame budget (`DURABLE_RESERVE`, §12.7) so a deep
+/// below the durable shadow-reserve's frame budget (the shadow arena's `end`, §12.7) so a deep
 /// durable freeze still traps at *this* cap, never by corrupting guest memory.
 const MAX_CALL_DEPTH: u32 = 2048;
 
@@ -2522,7 +2522,7 @@ fn drive_over_cell(
             .map(|m| m.durable_load_dstate(root.vcpu_ctx))
             .unwrap_or(STATE_NORMAL);
         // The root's active shadow-SP: its flattened extent on a multi-vCPU thaw (recorded residue), or
-        // the window's active-SP word otherwise (a fresh/freeze run leaves it at `SHADOW_BASE`; a
+        // the window's active-SP word otherwise (a fresh/freeze run leaves it at the root region base; a
         // single-vCPU thaw's window already holds the root's extent). The runtime swaps it in per
         // dispatch (slice 3.2.1).
         let root_word = shadow_region_base(root.vcpu_ctx);
@@ -2566,7 +2566,7 @@ fn drive_over_cell(
             // into its *parent child's* table, which must already exist.
             vseed.sort_by_key(|f| f.task);
             // Per-piece rebuild (none of "top `n`, densely" holds with recycling / nesting):
-            //   • context — *derived* from the restored shadow-SP (`(sp − SHADOW_BASE) / STRIDE`), since
+            //   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since
             //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
             //     post-thaw spawn lands in a genuinely-free context.
             //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze is byte-identical.
@@ -2582,7 +2582,7 @@ fn drive_over_cell(
                 let cid = ff.task as TaskId;
                 s.next_task = s.next_task.max(cid + 1);
                 s.live += 1;
-                let ctx = ((ff.shadow_sp - SHADOW_BASE) / SHADOW_STRIDE) as usize;
+                let ctx = ShadowArena::LEGACY.ctx_of_sp(ff.shadow_sp);
                 vcpu_mask |= 1 << ctx;
                 let child_mem = root.mem.as_ref().map(|m| m.fork_for_thread());
                 let mut child = Box::new(VCpu::new(
@@ -8349,18 +8349,16 @@ impl SchedDriver {
 //
 // These describe where a **durable** (freeze/thaw-instrumented) module's per-context shadow
 // state lives in the window. They are the runtime half of a contract whose tooling half is
-// `temen-durable`: the transform emits IR that reads/writes the *active* shadow-SP word at
-// [`SHADOW_SP_OFF`]; the runtime (here) keeps that word pointing at the **currently-running
-// context's** shadow region, swapping it on every fiber switch (D-fiber-cont option A — the
-// switch knowledge lives in the runtime's resume chain, not in emitted IR). `temen-interp` is
-// TCB and must not depend on the tooling-tier `temen-durable`, so these constants are duplicated
-// and cross-checked against `temen_durable`'s in that crate's tests.
+// `temen-durable`: the transform emits IR that addresses the **currently-running context's**
+// shadow region through `durable.shadow_base` (§12.8 4A.5); the runtime (here) re-points that
+// register on every fiber switch (D-fiber-cont option A — the switch knowledge lives in the
+// runtime's resume chain, not in emitted IR). The layout constants live in `temen_ir::durable_abi`
+// (#915), so TCB `temen-interp` never depends on the tooling-tier `temen-durable`.
 //
-// Per-context layout: context `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +
-// SHADOW_STRIDE)`, all within the reserved low slice `[0, DURABLE_RESERVE)`. The root
-// computation is context 0 (so a single-context run is byte-identical to the pre-fiber layout,
-// whose lone shadow stack started at `SHADOW_BASE`); a `cont.new`-created fiber in registry
-// slot `s` is context `s + 1`.
+// Per-context layout has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503) —
+// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)`, currently `ShadowArena::LEGACY`
+// until the arena is module-declared. The root computation is context 0; a `cont.new`-created
+// fiber in registry slot `s` is context `s + 1`.
 
 /// Freeze **armed**: the deterministic mid-run freeze trigger. The runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each safepoint and promotes the word to `UNWINDING` at 0; transparent to
@@ -8402,31 +8400,27 @@ pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
 /// `svc.wait`-parked consumers only. Read once at run setup into [`Sched::freeze_on_quiesce`].
 /// Must equal `temen_durable::ARM_QUIESCE_OFF`.
 pub use temen_ir::durable_abi::ARM_QUIESCE_OFF;
-/// Ceiling of the reserved durable region `[0, DURABLE_RESERVE)`. Must equal
-/// `temen_durable::DURABLE_RESERVE`.
-pub use temen_ir::durable_abi::DURABLE_RESERVE;
-/// Window byte offset where **context 0's** (the root's) shadow stack begins. Must equal
-/// `temen_durable::SHADOW_BASE`.
-pub use temen_ir::durable_abi::SHADOW_BASE;
-/// Window byte offset of the `i64` *active* shadow-stack pointer (the running context's, a
-/// window byte offset itself). The instrumented IR reads/writes this; the runtime re-points it
-/// on each fiber switch. Must equal `temen_durable::SHADOW_SP_OFF`.
+/// The legacy global shadow-SP word's slot in the fixed control block — **unused since §12.8
+/// 4A.5** (each context's SP word is the first 8 bytes of its own region); kept as a reserved ABI
+/// offset. Must equal `temen_durable::SHADOW_SP_OFF`.
 pub use temen_ir::durable_abi::SHADOW_SP_OFF;
-/// Per-context shadow-stack stride: context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +
-/// SHADOW_STRIDE)`. 4 KiB per context fits ~15 contexts in the 64 KiB reserve — a provisional
+/// Per-context shadow-stack stride: context `i` occupies `[ShadowArena::region_base(i), +
+/// SHADOW_STRIDE)`. 4 KiB per context fits 11 contexts in the `LEGACY` arena — a provisional
 /// slice-1 value; precise per-fiber sizing + quota accounting is the open §12.8 sub-question.
 ///
-/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the global
-/// `DURABLE_RESERVE` ceiling, not at a per-region bound, so a fiber recursed deeper than
+/// NOTE (slice-1 limitation): the transform's shadow-overflow guard still trips at the arena's
+/// `end`, not at a per-region bound, so a fiber recursed deeper than
 /// `SHADOW_STRIDE` would grow into the next context's region before tripping. Shallow fibers
 /// (every test today) stay confined; making the overflow bound per-region travels with the
 /// sizing decision.
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
+/// The shadow arena: where the per-context shadow regions sit (one definition of placement).
+pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 
 /// The shadow-region base (window offset) of context `ctx_idx` (root = 0, fiber slot `s` =
 /// `s + 1`). The per-context partition that keeps two fibers' frozen frames from colliding.
 fn shadow_region_base(ctx_idx: usize) -> u64 {
-    SHADOW_BASE + ctx_idx as u64 * SHADOW_STRIDE
+    ShadowArena::LEGACY.region_base(ctx_idx)
 }
 
 /// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the SP word
@@ -8446,23 +8440,24 @@ pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 /// The empty shadow-SP / frame base of context `ctx_idx`: just past its in-region SP + thaw words. The
 /// empty (no-frames) extent of a context's shadow stack.
 fn shadow_frame_base(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + REGION_HEADER_LEN
+    ShadowArena::LEGACY.frame_base(ctx_idx)
 }
 
 /// Byte offset of context `ctx_idx`'s per-context **thaw** state word (§12.8 concurrent-thaw stage 1).
 fn thaw_state_off(ctx_idx: usize) -> u64 {
-    shadow_region_base(ctx_idx) + STATE_IN_REGION_OFF
+    ShadowArena::LEGACY.thaw_state_off(ctx_idx)
 }
 
 /// Whether context `ctx_idx`'s shadow region fits within the reserve — the capacity bound
 /// `cont.new` checks before handing out a new fiber's region.
 fn shadow_region_fits(ctx_idx: usize) -> bool {
-    shadow_region_base(ctx_idx) + SHADOW_STRIDE <= DURABLE_RESERVE
+    ShadowArena::LEGACY.region_fits(ctx_idx)
 }
 
-/// The highest usable shadow-context index: the reserve holds `DURABLE_RESERVE / SHADOW_STRIDE`
-/// contexts and index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root regions.
-const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
+/// The highest shadow-context index an allocator considers — [`ShadowArena::ctx_ceiling`], the
+/// same expression the JIT uses; index 0 is the root, so `1..=MAX_SHADOW_CTX` are the non-root
+/// regions (the top few do not fit the `LEGACY` arena and are skipped via `shadow_region_fits`).
+const MAX_SHADOW_CTX: usize = ShadowArena::LEGACY.ctx_ceiling();
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
 /// (DURABILITY.md §12.8 recycling step 1). [`MAX_FIBERS`] is `1 << 24`, so a slot always fits in the
@@ -8926,7 +8921,11 @@ impl FiberRegistry {
     /// Out-of-range slots return the root base — they can only arise from a corrupt chain, which
     /// the surrounding fiber logic already treats as `Malformed`.
     fn saved_sp(&self, slot: usize) -> u64 {
-        self.lock().shadow.get(slot).copied().unwrap_or(SHADOW_BASE)
+        self.lock()
+            .shadow
+            .get(slot)
+            .copied()
+            .unwrap_or(ShadowArena::LEGACY.region_base(0))
     }
 
     /// The `slot`'s current generation (recycling step 2) — recorded in its [`FrozenFiber`] residue at
@@ -8954,8 +8953,8 @@ impl FiberRegistry {
         // a freed (cleared) bit is the recycling that lifts the lifetime cap to peak-concurrent.
         let floor = t.fibers.len();
         let mut c = MAX_SHADOW_CTX;
-        // #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
-        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as the
+        // #1094: the arena base moved one guard up while `ctx_ceiling` did not, so the top contexts no
+        // longer all fit (`ShadowArena::region_fits`) — skip them before searching, exactly as the
         // fiber path gates `cont.new` with [`shadow_region_fits`]. (Before the guard relocation every
         // context fit, so this loop was a no-op.)
         while c > floor && !shadow_region_fits(c) {
@@ -9340,7 +9339,7 @@ struct VCpu {
     /// The root computation's saved shadow-SP (window offset) while it is parked resuming a fiber
     /// — the off-table root's slot in the per-context saved-SP table (a fiber's lives in the
     /// registry's `shadow`). The root is context 0, so this starts at [`shadow_frame_base`]`(0)` (its
-    /// in-region SP word at `SHADOW_BASE`, frames just past it).
+    /// in-region SP word at the root region base, frames just past it).
     root_shadow_sp: u64,
     /// §12.8 4A.5: the **active spill context** — whose region the running instrumented code addresses
     /// via `durable.shadow_base`. The root's `vcpu_ctx` while at root, a fiber's `slot + 1` while a
@@ -26303,13 +26302,13 @@ impl Mem {
 
     /// The durable **active shadow-SP** word at [`SHADOW_SP_OFF`] (the running context's
     /// shadow-stack pointer). Read/written by the runtime on a fiber switch to keep it pointing at
-    /// the current context's region (D-fiber-cont option A). Falls back to [`SHADOW_BASE`] if the
+    /// the current context's region (D-fiber-cont option A). Falls back to the root region base (`ShadowArena::region_base(0)`) if the
     /// word's page is somehow uncommitted (a malformed durable window) — `set` then no-ops.
     fn durable_get_sp(&self, sp_word: u64) -> u64 {
         self.read_bytes_impl(sp_word, 8)
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
-            .unwrap_or(SHADOW_BASE)
+            .unwrap_or(ShadowArena::LEGACY.region_base(0))
     }
 
     fn durable_set_sp(&mut self, sp_word: u64, sp: u64) {

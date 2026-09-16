@@ -14,7 +14,8 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module, transform_module_assume_confined,
     write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_BASE, SHADOW_STRIDE};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_STRIDE};
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Inst, Memory, Module, Terminator};
 
 const SIZE_LOG2: u8 = 17;
@@ -206,8 +207,8 @@ block 0 (v0: i64, v1: i64) {
     );
 
     // Region bases: root is context 0, the single fiber (slot 0) is context 1.
-    let root_base = SHADOW_BASE;
-    let fiber_base = SHADOW_BASE + SHADOW_STRIDE;
+    let root_base = ShadowArena::LEGACY.region_base(0);
+    let fiber_base = ShadowArena::LEGACY.region_base(1);
 
     // The root unwound its `cont.resume` frame into context 0's region.
     let root_region = &snap[root_base as usize..(root_base + SHADOW_STRIDE) as usize];
@@ -641,7 +642,7 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
     temen_verify::verify_module(&inst).expect("verify");
 
     // Baseline (no freeze): park → poll (FIBER_PARKED) → store+notify → collect. (The futex
-    // cell sits above `DURABLE_RESERVE` — the low 64 KiB belongs to the durable header/shadow.)
+    // cell sits above `ShadowArena::LEGACY.end` — the low 64 KiB belongs to the durable header/shadow.)
     assert_eq!(
         run_normal(&inst),
         Ok(vec![Value::I32(1), Value::I64(107), Value::I64(7)]),

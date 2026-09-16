@@ -31,11 +31,12 @@ use durgen::{
 };
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
-    DURABLE_RESERVE, SHADOW_SP_OFF, STATE_NORMAL, STATE_UNWINDING,
+    STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{
     run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Trap, Value,
 };
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Module, ValType};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
@@ -58,10 +59,12 @@ fn from_slot(t: ValType, s: i64) -> Value {
     }
 }
 
+/// The root context's shadow-SP word — the first 8 bytes of its region (§12.8 4A.5). This used to
+/// read the legacy global `SHADOW_SP_OFF`, which no backend writes, so the cross-backend shadow-region
+/// compare it feeds was over `[0, 0)`; reading the real word makes that assertion live.
 fn read_sp(w: &[u8]) -> usize {
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&w[SHADOW_SP_OFF as usize..SHADOW_SP_OFF as usize + 8]);
-    u64::from_le_bytes(b) as usize
+    let b = ShadowArena::LEGACY.region_base(0) as usize;
+    u64::from_le_bytes(w[b..b + 8].try_into().unwrap()) as usize
 }
 
 fn window_with(state: i32) -> Vec<u8> {
@@ -326,7 +329,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     );
 
     // (2) The two backends armed-freeze the recycled fiber into a byte-identical durable reserve...
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],

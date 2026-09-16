@@ -30,7 +30,8 @@ use core::ffi::c_void;
 use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value, DURABLE_RESERVE, SHADOW_BASE};
+use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Memory, Module};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv, FrozenFiber as JitFiber,
@@ -129,9 +130,9 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
             &[clk as i64],
             &jwin,
             &[],
-            &[],         // freeze: no fiber seed
-            &[],         // freeze: no vcpu seed
-            SHADOW_BASE, // freeze: root_sp unused
+            &[],                                // freeze: no fiber seed
+            &[],                                // freeze: no vcpu seed
+            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -151,7 +152,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
 
     // (1) The two backends flatten the child into a byte-identical durable reserve (control words +
     // both contexts' shadow regions): the same emitted IR spills the same values to the same offsets.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -216,7 +217,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
             &[],
             &[],
             &[],
-            SHADOW_BASE,
+            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut fhost as *mut Host as *mut c_void,
@@ -479,7 +480,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
             &[],
             &[],
             &[],
-            SHADOW_BASE,
+            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -496,7 +497,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
 
     // (1) Byte-identical durable reserve (control words + every context's flattened region): the
     // child's fiber (ctx 1) + the child vCPU (top-down ctx) flatten to the same bytes on both backends.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -680,7 +681,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
             &[],
             &[],
             &[],
-            SHADOW_BASE,
+            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -697,7 +698,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
 
     // (1) Byte-identical durable reserve — incl. the grandchild's spilled per-vCPU handle (= 0 in the
     // child's namespace, not a global running index).
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],

@@ -472,7 +472,7 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
 /// (Child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it to scratch and
 /// reloads the low word with `i32.load` to get the `i32` instantiator handle for spawning C2,
 /// avoiding `i32.wrap_i64` which the durable transform does not type. Scratch sits above the 64 KiB
-/// `DURABLE_RESERVE` and below C2's sub-carve.)
+/// `ShadowArena::LEGACY.end` and below C2's sub-carve.)
 const SRC_NESTED_SERVERS_3: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
@@ -671,7 +671,7 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
 /// Fixture notes: child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it
 /// to scratch and reloads the low word with `i32.load` for the `i32` instantiator handle (the
 /// durable transform types loads/stores but not width conversions). Scratch sits above the 64 KiB
-/// `DURABLE_RESERVE`, below each child's own sub-carve.
+/// `ShadowArena::LEGACY.end`, below each child's own sub-carve.
 const SRC_NESTED_HOLDER: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)

@@ -1098,7 +1098,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
 ///
 /// # Safety
 /// As [`thread_spawn`]: `dom` is the run's live `Domain`; `code` is a guest entry trampoline;
-/// `trap_out` is the live trap cell; the durable reserve `[0, DURABLE_RESERVE)` is committed RW.
+/// `trap_out` is the live trap cell; the durable control words + shadow arena (`[0, ShadowArena::end)`) are committed RW.
 unsafe fn defer_spawn(
     dom: &Domain,
     code: u64,

@@ -9648,7 +9648,7 @@ struct VTask {
     /// DURABILITY.md §12.8 (D-fiber-cont option A): the root computation's (context 0's) saved durable
     /// shadow-stack pointer, swapped with the in-window active word ([`super::SHADOW_SP_OFF`]) on each
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
-    /// durable run; `super::SHADOW_BASE` (context 0's region base) otherwise.
+    /// durable run; `ShadowArena::region_base(0)` (context 0's region base) otherwise.
     root_shadow_sp: u64,
     /// Debug **step-into** of a §14 coroutine body — set for every *debug-engine* task (`true` by
     /// default: the single-vCPU [`DebugRun`] *and* the multi-vCPU [`ScheduledDebugRun`], where the
@@ -9692,7 +9692,7 @@ impl VTask {
             active: Vm::new(c, entry, args)?,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            root_shadow_sp: super::SHADOW_BASE,
+            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
             active_invoke: None,
             invoke_step_into: false, // DebugRun::new_with_host flips this on for the single-vCPU engine
         })
@@ -9779,7 +9779,7 @@ fn freeze_drive(
         .mem
         .as_ref()
         .map(|m| m.durable_get_sp(root_word))
-        .unwrap_or(super::SHADOW_BASE + super::REGION_HEADER_LEN);
+        .unwrap_or(super::ShadowArena::LEGACY.frame_base(0));
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
@@ -9823,7 +9823,7 @@ fn freeze_drive(
             .mem
             .as_ref()
             .map(|m| m.durable_get_sp(super::shadow_region_base(slot + 1)))
-            .unwrap_or(super::SHADOW_BASE + super::REGION_HEADER_LEN);
+            .unwrap_or(super::ShadowArena::LEGACY.frame_base(0));
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -12239,7 +12239,7 @@ impl CoopSched {
                             active: twin_active,
                             active_id: ROOT_FIBER,
                             chain: Vec::new(),
-                            root_shadow_sp: super::SHADOW_BASE,
+                            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
                             active_invoke: None,
                             invoke_step_into: false,
                         };
@@ -12530,7 +12530,7 @@ impl CoopSched {
                                 active: twin_active,
                                 active_id: ROOT_FIBER,
                                 chain: Vec::new(),
-                                root_shadow_sp: super::SHADOW_BASE,
+                                root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
                                 active_invoke: None,
                                 invoke_step_into: false,
                             };
@@ -14620,7 +14620,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             active: twin_active,
                             active_id: ROOT_FIBER,
                             chain: Vec::new(),
-                            root_shadow_sp: super::SHADOW_BASE,
+                            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
                             active_invoke: None,
                             invoke_step_into: false,
                         };
@@ -15360,7 +15360,7 @@ struct Vm {
     setjmp_points: std::collections::BTreeMap<u64, ByteSetJmp>,
     /// §12.8 4A.5: the window offset of this context's shadow-SP **word** — the base of its own region
     /// (`shadow_region_base`), which `durable.shadow_base` returns so the instrumented IR addresses its
-    /// per-context SP word. The root's is context 0 (`SHADOW_BASE`); a fiber's its `slot + 1`. Set when
+    /// per-context SP word. The root's is context 0 (`ShadowArena::region_base(0)`); a fiber's its `slot + 1`. Set when
     /// the Vm is created (fiber) / activated; unused on a non-durable run.
     durable_region_base: u64,
     /// **wasm-JIT tier-up bitmap** (browser wasm-JIT threads slice), for module-0 functions only. Set

@@ -43,7 +43,7 @@ use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, CapturedProt, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit,
     DurableNamedCap, FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
-    NonDurableHandle, StreamRole, SvcDispatch, SHADOW_BASE,
+    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
 };
 use temen_ir::Module;
 
@@ -439,7 +439,9 @@ pub fn freeze_with_prots(
     nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
     let child_state = host.frozen_child_state().to_vec();
-    let root_sp = host.frozen_root_sp().unwrap_or(SHADOW_BASE);
+    let root_sp = host
+        .frozen_root_sp()
+        .unwrap_or(ShadowArena::LEGACY.region_base(0));
     let digest = digest256(&encode_module(module));
 
     let mut out = Vec::new();
@@ -1033,7 +1035,13 @@ fn decode_control(
 > {
     let body = match (body, fiber_count, spawned_count) {
         (None, 0, 0) => {
-            return Ok((Vec::new(), Vec::new(), SHADOW_BASE, Vec::new(), Vec::new()));
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                ShadowArena::LEGACY.region_base(0),
+                Vec::new(),
+                Vec::new(),
+            ));
             // no residue ⇒ no section
         }
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
@@ -1067,7 +1075,7 @@ fn decode_control(
     }
     // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.
     let mut vcpus = Vec::with_capacity(spawned_count as usize);
-    let mut root_sp = SHADOW_BASE;
+    let mut root_sp = ShadowArena::LEGACY.region_base(0);
     if spawned_count > 0 {
         let nv = cr.uleb()?;
         if nv != spawned_count {

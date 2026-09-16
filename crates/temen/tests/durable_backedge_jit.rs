@@ -18,7 +18,7 @@ use core::ffi::c_void;
 use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
-    write_state, DURABLE_RESERVE, STATE_NORMAL, STATE_UNWINDING,
+    write_state, ShadowArena, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
@@ -167,8 +167,8 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
     );
     assert_eq!(read_state(&snap_j), STATE_UNWINDING, "JIT left UNWINDING");
     assert_eq!(
-        &snap_i[..DURABLE_RESERVE as usize],
-        &snap_j[..DURABLE_RESERVE as usize],
+        &snap_i[..ShadowArena::LEGACY.end as usize],
+        &snap_j[..ShadowArena::LEGACY.end as usize],
         "interp/JIT freeze a loop header into a byte-identical durable reserve\n{inst:#?}"
     );
 

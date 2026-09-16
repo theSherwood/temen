@@ -17,7 +17,8 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
     STATE_UNWINDING,
 };
-use temen_interp::{Host, SHADOW_BASE};
+use temen_interp::Host;
+use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Memory, Module};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv,
@@ -99,7 +100,7 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        ShadowArena::LEGACY.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
@@ -659,7 +660,7 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        ShadowArena::LEGACY.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
@@ -1108,7 +1109,7 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        ShadowArena::LEGACY.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,

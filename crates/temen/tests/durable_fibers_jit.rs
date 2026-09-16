@@ -23,8 +23,7 @@ use temen_durable::{
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use temen_interp::{
-    run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value, DURABLE_RESERVE,
-    SHADOW_BASE, SHADOW_STRIDE,
+    run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, ShadowArena, Value,
 };
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable, FrozenFiber as JitFrozen, JitOutcome,
@@ -71,7 +70,7 @@ fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
         .collect()
 }
 
-const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ DURABLE_RESERVE (64 KiB)
+const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ ShadowArena::LEGACY.end (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
 
 #[test]
@@ -147,9 +146,9 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
 
     let seen = probes.lock().unwrap().clone();
     assert_eq!(seen.len(), 4, "four probes: root, fiber A, fiber B, root");
-    let root = SHADOW_BASE; // context 0
-    let a = SHADOW_BASE + SHADOW_STRIDE; // fiber slot 0 → context 1
-    let b = SHADOW_BASE + 2 * SHADOW_STRIDE; // fiber slot 1 → context 2
+    let root = ShadowArena::LEGACY.region_base(0); // context 0
+    let a = ShadowArena::LEGACY.region_base(1); // fiber slot 0 → context 1
+    let b = ShadowArena::LEGACY.region_base(2); // fiber slot 1 → context 2
     assert_eq!(seen[0], root, "root runs in context 0's region");
     assert_eq!(
         seen[1], a,
@@ -239,7 +238,7 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
 
     // The whole durable reserve (control words + both contexts' flattened shadow regions) must
     // match byte-for-byte: the interp and JIT freeze the fiber into the identical artifact.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -580,7 +579,7 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
 
     // Byte-identical durable reserve (control words + both contexts' flattened shadow regions): the
     // two backends armed-freeze the recycled fiber into the same image.
-    let reserve = DURABLE_RESERVE as usize;
+    let reserve = ShadowArena::LEGACY.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],

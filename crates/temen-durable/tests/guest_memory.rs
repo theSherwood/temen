@@ -1,7 +1,7 @@
 //! A memory-using durable guest round-trips through the **confined** path (R9 / §12.7).
 //!
-//! The durable region is a reserved low slice `[0, DURABLE_RESERVE)` of the guest's own
-//! window; guest memory lives in `[DURABLE_RESERVE, window)` (the wasm shadow-stack
+//! The durable region is a reserved low slice `[0, `ShadowArena::LEGACY.end`)` of the guest's own
+//! window; guest memory lives in `[`ShadowArena::LEGACY.end`, window)` (the wasm shadow-stack
 //! convention — runtime state below `__heap_base`, the program's data above). A cooperating
 //! toolchain bases the guest's data there, so the two never overlap. This test instruments
 //! such a guest via [`transform_module_assume_confined`] and shows guest memory survives
@@ -10,7 +10,7 @@
 
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, read_thaw_state, transform_module,
-    transform_module_assume_confined, write_state, TransformError, DURABLE_RESERVE, STATE_NORMAL,
+    transform_module_assume_confined, write_state, ShadowArena, TransformError, STATE_NORMAL,
     STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
@@ -44,7 +44,7 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>) {
     (r.expect("runs to completion"), win)
 }
 
-// Store 77 into guest memory at `DURABLE_RESERVE` (the first usable byte), call the clock,
+// Store 77 into guest memory at `ShadowArena::LEGACY.end` (the first usable byte), call the clock,
 // then load it back *after* the call. The stored value must survive the freeze (it lives in
 // the window image), and the address `v1` is live across the call (used by the reload).
 // Baseline (clock 42): 42 + 77 = 119.
@@ -62,7 +62,7 @@ block 0 (v0: i32) {{\n\
   return v6\n\
   }}\n\
 }}\n",
-        addr = DURABLE_RESERVE
+        addr = ShadowArena::LEGACY.end
     )
 }
 

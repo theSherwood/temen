@@ -12,13 +12,11 @@
 //! root's region. The fibers suspend rather than return so neither slot is recycled mid-run.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::{
-    bytecode, Host, Value, DURABLE_RESERVE, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
-};
+use temen_interp::{bytecode, Host, ShadowArena, Value, SHADOW_SP_OFF, SHADOW_STRIDE};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ DURABLE_RESERVE (64 KiB)
+const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ ShadowArena::LEGACY.end (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
 
 #[test]
@@ -87,9 +85,9 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
 
     let seen = probes.lock().unwrap().clone();
     assert_eq!(seen.len(), 4, "four probes: root, fiber A, fiber B, root");
-    let root = SHADOW_BASE; // context 0
-    let a = SHADOW_BASE + SHADOW_STRIDE; // fiber slot 0 → context 1
-    let b = SHADOW_BASE + 2 * SHADOW_STRIDE; // fiber slot 1 → context 2
+    let root = ShadowArena::LEGACY.region_base(0); // context 0
+    let a = ShadowArena::LEGACY.region_base(1); // fiber slot 0 → context 1
+    let b = ShadowArena::LEGACY.region_base(2); // fiber slot 1 → context 2
     assert_eq!(seen[0], root, "root runs in context 0's region");
     assert_eq!(seen[1], a, "fiber A unwinds into its own region");
     assert_eq!(seen[2], b, "fiber B unwinds into a distinct region");
@@ -102,7 +100,7 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
         "per-context regions are distinct (no collision)"
     );
     assert!(
-        b + SHADOW_STRIDE <= DURABLE_RESERVE,
+        b + SHADOW_STRIDE <= ShadowArena::LEGACY.end,
         "every assigned region fits within the durable reserve"
     );
 }
