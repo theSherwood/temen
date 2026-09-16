@@ -4690,7 +4690,12 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // name (`grant_onramp_caps`) so both reference hosts present one frontier (INVARIANTS #14).
     let inst = h.grant_instantiator(0, win);
     h.register_cap_name("instantiator", inst);
-    h.grant_detached_spawn_caps(win);
+    // The by-name spawn set, only for a guest that spawns detached (`temen_ir::spawns_detached`):
+    // a `Module` and a `Budget` are non-durable, so granting them everywhere would make every
+    // snapshot-taking guest unfreezable.
+    if h.self_module_spawns_detached() {
+        h.grant_detached_spawn_caps(win);
+    }
     v
 }
 

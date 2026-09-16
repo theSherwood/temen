@@ -3564,7 +3564,12 @@ fn grant_onramp_caps(
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
         let handle = host.grant_instantiator(0, win);
         host.register_cap_name("instantiator", handle);
-        host.grant_detached_spawn_caps(win);
+        // The by-name spawn set, only for a guest that spawns detached: a `Module` and a
+        // `Budget` are non-durable, so granting them everywhere would make every reactor that
+        // saves a warm snapshot unfreezable.
+        if temen_ir::spawns_detached(m) {
+            host.grant_detached_spawn_caps(win);
+        }
         granted.instantiator = Some(handle);
         granted.budget = host.resolve_cap_name("budget");
     }

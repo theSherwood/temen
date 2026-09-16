@@ -3228,6 +3228,23 @@ impl Func {
         })
     }
 
+    /// Whether this function issues a static `Instantiator.instantiate_detached` (`call.cap 6 15`).
+    /// See [`Module::spawns_detached`].
+    pub fn spawns_detached(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            b.insts.iter().any(|i| {
+                matches!(
+                    i,
+                    Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        op: 15,
+                        ..
+                    }
+                )
+            })
+        })
+    }
+
     /// Whether this function contains a futex op (`atomic.wait`/`notify`). Split out of
     /// [`uses_concurrency`](Func::uses_concurrency) for the §14 JIT child compile: waits/notifies
     /// are allowed when the child shares its parent domain's futex, rejected otherwise.
@@ -3372,6 +3389,19 @@ pub const POWERBOX_STACK_PAGE: u64 = POWERBOX_ARGS_END; // 16384
 /// definition every host shares — `temen-run`'s front door, the browser on-ramp, and the DAP backend
 /// all key off the identical predicate so a module accepted as an entry by one host is by all
 /// (guest-ABI shape must not drift per host — #912).
+/// Whether `module` can spawn a §5 **detached** child: a static `call.cap 6 15` in any function, or
+/// an import named `vm_instantiate_detached` (the by-name spelling a C `extern` takes). The two
+/// reference powerboxes grant the by-name spawn set (`"module"`, `"budget"`) **only** to such a
+/// guest — least authority, and both grants are non-durable, so a guest that never spawns keeps a
+/// powerbox a warm snapshot can freeze.
+pub fn spawns_detached(module: &Module) -> bool {
+    module.funcs.iter().any(Func::spawns_detached)
+        || module
+            .imports
+            .iter()
+            .any(|im| im.name == "vm_instantiate_detached")
+}
+
 pub fn is_named_powerbox_entry(module: &Module) -> bool {
     module.funcs.first().is_some_and(|f| f.params.is_empty())
         && module
