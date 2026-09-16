@@ -393,11 +393,11 @@ block 0 (v0: i64) {
     mode: 'io',
     desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
       'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
-      'child\\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
+      'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
       '`instantiator` and `stdout` by name, fills the op-17 spawn record (entry = the child function, a ' +
       '64 KiB carve of its window, no fuel cap) and a 16-byte grant record, and spawns child A with ' +
       '`{"stdout" → its stdout}` and child B with an empty list. Each child `self.resolve`s `"stdout"`: A ' +
-      'finds a re-grant of the parent\\'s stream and prints through it; B finds nothing and returns 0. ' +
+      'finds a re-grant of the parent\'s stream and prints through it; B finds nothing and returns 0. ' +
       'Result 10 (= A·10 + B), stdout "granted" once. Edit the grant count (`vn1`/`vn0`) or the carve to ' +
       'explore; runs on the bytecode engine with in-process confined children.',
     src: `; Two children, two powerboxes — attenuation is the grant list (#1509).
@@ -1126,7 +1126,7 @@ int main(void) {
     url: './assets/chibicc.temen',
     mode: 'io',
     desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
-      '`<temen/spawn.h>` (the tree\\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
+      '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
       'record into one call — `vm_spawn(module, entry, carve, size_log2, quota, grants, n, scratch)` — ' +
       'so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns `child` (a ' +
       'function of this same program, by funcref) twice into two 64 KiB carves: A with `{"stdout"}`, B ' +
