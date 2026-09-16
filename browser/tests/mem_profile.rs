@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 use temen_browser::{temen_mem_profile, temen_mem_profile_stats_len, temen_mem_profile_stats_ptr};
 use temen_dap::models::{MemModel, MemModelCfg};
-use temen_interp::bytecode::DebugRun;
+use temen_interp::bytecode::ScheduledDebugRun;
 use temen_text::parse_module;
 
 // The store loop bases at 16384 (the #1094 NULL guard end, `[0, 16 KiB)` faults on any guest
@@ -62,7 +62,7 @@ fn profile(src: &str) -> (i32, String) {
 /// feed of the two-feed design; must produce identical stats.
 fn sink_stats(src: &str) -> String {
     let m = parse_module(src).expect("parses");
-    let mut run = DebugRun::new(&m, 0, &[]).expect("subset");
+    let mut run = ScheduledDebugRun::new(&m, 0, &[]).expect("subset");
     let model = Arc::new(Mutex::new(MemModel::new(MemModelCfg::default())));
     {
         let mut g = model.lock().unwrap();

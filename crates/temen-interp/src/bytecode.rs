@@ -5157,7 +5157,7 @@ struct ModuleDebug {
 
 impl ModuleDebug {
     /// Build the per-`(func, block)` slot base + value types + §6 debug info for module `m`, pushed to the
-    /// shared source at index `module`. Mirrors the module-0 computation in [`DebugRun::new_with_host`], so
+    /// shared source at index `module`. Mirrors the module-0 computation in [`ScheduledDebugRun::new_with_host`], so
     /// a separate-module child is inspected exactly as the primary program is.
     fn build(m: &Module, module: usize) -> ModuleDebug {
         let arities: Vec<usize> = m.funcs.iter().map(|g| g.results.len()).collect();
@@ -5189,33 +5189,6 @@ impl ModuleDebug {
         }
     }
 }
-
-/// The bytecode engine's half of a single-vCPU time-travel **checkpoint** (DEBUGGING.md W1): the
-/// re-executable continuation of a [`DebugRun`], so a reverse `seek`/`step_back` on the DAP backend
-/// can restart a replay here instead of from clock 0 — bounding the replay to the checkpoint stride.
-/// The window image and the host substate are the [`Moment`](super::moment::Moment)'s own halves,
-/// shared with every other engine's checkpoint; the clock is the ladder's key. Opaque to the backend,
-/// which only stores the moment in a ladder and hands it back to [`DebugRun::restore`].
-pub struct DebugRunContinuation {
-    /// The active root `Vm` (call stack, register windows, cursor) — a plain deep copy.
-    active: Vm,
-    /// The active continuation id — `ROOT_FIBER` or the handle of the fiber currently running.
-    active_id: usize,
-    /// Parked resumers on the §12 fiber resume chain: `(fiber id, its `Vm`, resume-result slot)`. Each
-    /// `Vm` shares the one window (snapshotted in `mem`), so cloning is a faithful deep copy.
-    chain: Vec<(usize, Vm, u32)>,
-    /// The §12 fiber registry (handle = index); reconstructed verbatim on restore.
-    fibers: Vec<FiberState>,
-    /// The non-primary [`ModuleSource`] units (a §14 **separate-module** coroutine's pushed program), so
-    /// `restore` re-pushes them and a coroutine frame's `module >= 1` resolves. Empty for a run with only
-    /// same-module coroutines. Cheap `Arc` clones — the compiled units are immutable.
-    extra_units: Vec<std::sync::Arc<Compiled>>,
-}
-
-/// A single-vCPU checkpoint: [`DebugRunContinuation`] plus the shared window image (committed bytes
-/// **and** page-protection map — capturing the map is what admits a **page-mapping** root; fibers and
-/// same-module coroutines share this one window, so their bytes ride in it) and the host substate.
-pub type DebugRunSnapshot = super::moment::Moment<DebugRunContinuation>;
 
 /// Whether a §14 child window (a coroutine or an `instantiate` env) is captured by a checkpoint: its own
 /// page map is capturable ([`Mem::layout_snapshot_safe`] — no §13 region aliasing) **and** its extent
@@ -5269,79 +5242,6 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
     }
 }
 
-/// A minimal **resumable bytecode debug session** (DEBUGGING.md §1b G3) — the engine-level primitive a
-/// DAP-over-bytecode backend would wire into, the first prerequisite for that second backend. Holds the
-/// running [`Vm`] across stops: [`DebugRun::run_to`] steps until the current op's [`crate::IrPc`] is a
-/// breakpoint (stopping *before* it, like the tree-walker's `seek`/`run_until_stop`) or the run
-/// finishes, and is **resumable** — call it again to reach the next hit (a loop-body breakpoint each
-/// iteration). [`DebugRun::value`] reads a block-local SSA value at the current stop, typed via
-/// `func_value_types` over the stable per-value slots — the bytecode counterpart of
-/// `Inspector::read_ir_value`. Scoped to a single function (the value reader resolves slots for the
-/// entry function's blocks; a call or concurrency seam ends the run). Test surface; not production.
-pub struct DebugRun {
-    source: std::sync::Arc<ModuleSource>,
-    table: SharedSlots,
-    mem: Option<Mem>,
-    host: Host,
-    /// The reified continuation being debugged: the active `Vm` plus its §12 fiber resume `chain`. A
-    /// `cont.resume` switches `vt.active` into a fiber; `suspend` / a fiber return switches back. The
-    /// debugger inspects (backtrace / read_var) the **active** continuation.
-    vt: VTask,
-    /// The session's §12 fiber registry (handle = index). Populated by `cont.new`; rebuilt
-    /// deterministically on a reverse `seek` replay. Empty for a fiber-free program.
-    fibers: Vec<FiberState>,
-    /// Per-**function**, per-block slot base (mirror of `compile_func`'s `base`) — for reading a value
-    /// in any live call frame, not just the innermost.
-    fn_block_base: Vec<Vec<u32>>,
-    /// Per-function, per-block value types (`func_value_types`), for typing a slot's `Reg` to a `Value`.
-    fn_block_types: Vec<Vec<Vec<ValType>>>,
-    /// The §6 debug info (cloned from the module), for resolving a source variable name to its `VarLoc`
-    /// in [`read_var`](DebugRun::read_var). `None` ⇒ the module carried no `-g` section.
-    debug: Option<DebugInfo>,
-    /// Paused on a reported breakpoint — step past it before the next `run_to` so we make progress.
-    at_bp: bool,
-    done: Option<Result<Vec<Value>, Trap>>,
-    /// Number of ops executed so far — the **logical clock** for reverse debugging (DEBUGGING.md W1).
-    /// `seek(t)` reaches a state by replaying a fresh run to this count; `step_back` = `seek(clock-1)`.
-    op_clock: u64,
-    /// The IR functions (for looking up the op about to execute, to compute its memory access when a
-    /// watchpoint is armed). `Arc` so `seek`'s replay-rebuild is cheap.
-    funcs: std::sync::Arc<[Func]>,
-    /// Armed window watchpoints (DEBUGGING.md W2): `(addr, len, kind)`. Empty in the common case, so
-    /// the per-op `access_of` computation is skipped entirely. Ids are owned by the caller (the DAP
-    /// backend), which re-applies the set after a `seek` rebuild.
-    watchpoints: Vec<(u64, u64, super::WatchKind)>,
-    /// Set when the last advance parked at a **blocking-stdin** `read` ([`Outcome::StdinPark`],
-    /// INTERACTIVE_EMBEDDING.md W4): the read did not execute and `op_clock` did not advance.
-    /// Cleared at each advance entry — the parked read re-executes on resume, so the state
-    /// re-derives (re-parks or proceeds) rather than being carried (invariant 7).
-    stdin_parked: bool,
-    /// #1366 — set when the last advance parked on a **host-completed cap call**: `(completion id,
-    /// awaiting result slot)`. The op already advanced `pc`; nothing more can run until the
-    /// embedder [`deliver_cap`](DebugRun::deliver_cap)s the value (advances refuse to proceed while
-    /// parked). Cleared by `deliver_cap` and on a checkpoint `restore` (a replay serves the call
-    /// from the tape and never re-parks).
-    cap_parked: Option<(u64, u32, Option<super::IrPc>)>,
-    /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
-    /// op with the op's [`MemEvent`](super::MemEvent), the run's `op_clock`, and task 0. `None`
-    /// (the default) is zero-cost. Not part of snapshots; the DAP backend re-installs it on every
-    /// `seek` rebuild (the `watch_specs` pattern) and leaves its rev-trace probes silent.
-    access_sink: Option<AccessSinkFn>,
-    /// The session's **scheduled debugger writes** ([`ScheduledWrite`], slice 8), sorted by clock,
-    /// with the cursor of the next un-applied entry. Empty (the default) is one index compare per
-    /// advance; the DAP backend re-installs the list on every rebuild.
-    scheduled_writes: Vec<(u64, ScheduledWrite)>,
-    write_cursor: usize,
-    /// Set when [`run_to`](DebugRun::run_to) stopped *before* an op that hits a watchpoint (the access
-    /// hasn't applied yet); taken by the caller to report `StopReason::Watchpoint`.
-    last_watch: Option<(u64, bool)>,
-    /// Value watchpoints on SSA-held (address-less) source variables (#1229): stop when a watched
-    /// variable's holding value **changes**. The window-range `watchpoints` can't reach these — a
-    /// promoted scalar has no address. Empty in the common case; the DAP backend re-applies the set
-    /// after a `seek` rebuild, preserving each id's running `last` across an in-place re-apply.
-    value_watches: Vec<ValueWatchRun>,
-}
-
 /// A resolved value-watch target for the bytecode engine — frame-independent so the DAP backend can
 /// re-apply it verbatim after a `seek` rebuild: the owning function, how to find the variable's
 /// holding value at any pc ([`ValueSite`]), and the arm-time baseline value. Opaque to the DAP layer
@@ -5353,7 +5253,7 @@ pub struct ValueWatchTarget {
     last: super::Reg,
 }
 
-/// A value watch live in a [`DebugRun`] — a [`ValueWatchTarget`] plus the caller-owned [`WatchId`]
+/// A value watch live in a [`ScheduledDebugRun`] — a [`ValueWatchTarget`] plus the caller-owned [`WatchId`]
 /// and the running `last` value (updated on each fire so the next change re-fires). Kind gates
 /// firing (change is a write; a `Read`-only value watch never fires — an SSA value has no read).
 struct ValueWatchRun {
@@ -5445,8 +5345,8 @@ fn value_watch_hit_before(
 /// reports (a value watch has no window address and reports `(0, true)`; the DAP maps the variant,
 /// not the address). `None` off module 0 (coroutine-child / invoked-unit ops over other windows are
 /// out of scope), with nothing armed (the common zero-cost case), or when nothing fires. The **one**
-/// pre-op watch scan every debug driver runs — `DebugRun::run_to`/`step_to` and
-/// `ScheduledDebugRun::drive` — so a watch kind exists on every engine and verb at once.
+/// pre-op watch scan the debug driver runs (`ScheduledDebugRun::drive`, every verb), so a watch kind
+/// exists on every verb at once.
 #[allow(clippy::too_many_arguments)]
 fn watch_stop_before(
     vm: &Vm,
@@ -5603,8 +5503,8 @@ enum FiberStep {
     /// A trap (including a `FiberFault`).
     Trapped(Trap),
     /// A non-fiber seam the caller must apply: `thread.spawn`/`join`, `memory.wait`/`notify`,
-    /// `instantiate`, coroutine, tier-up. The single-vCPU [`DebugRun`] treats these as `Malformed`; the
-    /// multi-vCPU [`ScheduledDebugRun`] dispatches the ones it schedules (spawn/join/wait/notify).
+    /// `instantiate`, coroutine, tier-up. [`ScheduledDebugRun`] dispatches the ones it schedules
+    /// (spawn/join/wait/notify/instantiate) and declines the rest.
     Other(Outcome),
     /// #1366 — the op punted to a host-completed cap: the debug run parks on completion `id`
     /// (result slot `dst`); `at` is the call's own pc (captured before the op advanced), the stop
@@ -5634,7 +5534,7 @@ fn debug_advance_fiber(
     // #1366: the op's own pc, before it advances — a host-completed park reports it as the stop
     // location (the position after a call may be a terminator, which has no pc).
     let at = vt.debug_active().cur_ir_pc(source);
-    // Step-into a §14 coroutine body (single-vCPU `DebugRun` only): while a coroutine child is the
+    // Step-into a §14 coroutine body: while a coroutine child is the
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
     // each child op is what makes breakpoints fire inside the body and the child frame inspectable.
     // Stepping *inside* a §22 `Jit.invoke`d unit (single-vCPU step-into): drive it one op over the
@@ -5736,9 +5636,8 @@ fn debug_advance_fiber(
         }
         // §22 guest-JIT install / uninstall / invoke: self-contained host-side ops (they mutate only
         // `vt.active` + the shared dispatch table, spawning no scheduler task), so — like the coroutine
-        // arms above — they are serviced **inline** here, which is why BOTH the single-vCPU `DebugRun`
-        // and the `ScheduledDebugRun` reach them (the `FiberStep::Other` decline sites never see a Jit
-        // outcome). `invoke` runs the unit to completion as a seam-free leaf (stepping *over* it, not
+        // arms above — they are serviced **inline** here (the `FiberStep::Other` decline sites never
+        // see a Jit outcome). `invoke` runs the unit to completion as a seam-free leaf (stepping *over* it, not
         // into it — matching production `run_invoke`). A forged handle / out-of-coverage unit traps the
         // vCPU (`CapFault`/`Malformed`), exactly as the production `drive`. (DESIGN.md §22 debug tier.)
         Ok(Outcome::JitInstall { h, code, dst }) => {
@@ -5786,16 +5685,15 @@ fn debug_advance_fiber(
             }
         }
         // Threads / wait / notify / instantiate / (scheduled-engine) separate-module coroutine / tier-up
-        // — a scheduler seam the caller applies (single-vCPU `DebugRun` rejects them; the scheduled engine
-        // dispatches its subset).
+        // — a scheduler seam the caller applies (`service_advance` dispatches its subset, declines the rest).
         Ok(other) => FiberStep::Other(other),
         Err(t) => FiberStep::Trapped(t),
     }
 }
 
 /// A read-only inspection view over **one vCPU's** reified state (`vm`) plus the module's §6 debug
-/// metadata. This is the shared frame-reading engine behind both the single-vCPU [`DebugRun`] and the
-/// multi-vCPU [`ScheduledDebugRun`]: given any task's `Vm`, it resolves backtrace frames, block-local
+/// metadata. This is the frame-reading engine behind [`ScheduledDebugRun`]'s inspection (every task's
+/// `Vm`, and a coroutine child's): given any task's `Vm`, it resolves backtrace frames, block-local
 /// SSA values, and named source variables identically — so a thread selected mid-stop (`select_task`)
 /// reads its own stack through the exact same code the single-vCPU path uses.
 struct FrameReader<'a> {
@@ -5868,60 +5766,11 @@ fn apply_target(
     }
 }
 
-/// Apply every scheduled write due at `clock` to a **single-vCPU** run's pieces; `cursor` advances
-/// past applied and stale entries (entries below `clock` are inside a restored checkpoint already).
+/// Apply every scheduled write due at `turn` to the run's pieces (a `Var` write resolves in its
+/// recorded `task`'s frame); `cursor` advances past applied and stale entries (entries below `turn`
+/// are inside a restored checkpoint already).
 #[allow(clippy::too_many_arguments)]
 fn apply_due_writes(
-    writes: &[(u64, ScheduledWrite)],
-    cursor: &mut usize,
-    clock: u64,
-    vt: &mut VTask,
-    source: &ModuleSource,
-    mem: &mut Option<Mem>,
-    debug: Option<&DebugInfo>,
-    fn_block_base: &[Vec<u32>],
-    fn_block_types: &[Vec<Vec<ValType>>],
-) {
-    while *cursor < writes.len() && writes[*cursor].0 < clock {
-        *cursor += 1;
-    }
-    while *cursor < writes.len() && writes[*cursor].0 == clock {
-        match &writes[*cursor].1 {
-            ScheduledWrite::Window { addr, bytes } => {
-                if let Some(m) = mem.as_mut() {
-                    let _ = m.write_bytes(*addr, bytes);
-                }
-            }
-            ScheduledWrite::Var {
-                frame,
-                name,
-                value,
-                width,
-                ..
-            } => {
-                if vt.active_invoke.is_none() {
-                    let target = FrameReader {
-                        vm: &vt.active,
-                        source,
-                        mem: &*mem,
-                        debug,
-                        fn_block_base,
-                        fn_block_types,
-                        coro_debug: None,
-                    }
-                    .write_target(*frame, name);
-                    apply_target(target, *value, *width, &mut vt.active.regs, mem);
-                }
-            }
-        }
-        *cursor += 1;
-    }
-}
-
-/// The scheduled-engine twin of [`apply_due_writes`]: a `Var` write resolves in its recorded
-/// `task`'s frame.
-#[allow(clippy::too_many_arguments)]
-fn apply_due_writes_sched(
     writes: &[(u64, ScheduledWrite)],
     cursor: &mut usize,
     turn: u64,
@@ -6159,799 +6008,10 @@ impl<'a> FrameReader<'a> {
     }
 }
 
-impl DebugRun {
-    /// A [`FrameReader`] over this single-vCPU session's currently-stepping `Vm` + debug metadata —
-    /// the active §14 coroutine child (over its own confined `mem`) during step-into, else the parent.
-    fn reader(&self) -> FrameReader<'_> {
-        let vm = self.vt.debug_active();
-        FrameReader {
-            vm,
-            source: &self.source,
-            mem: &self.mem,
-            debug: self.debug.as_ref(),
-            fn_block_base: &self.fn_block_base,
-            fn_block_types: &self.fn_block_types,
-            // A separate-module coroutine carries its own §6 metadata; a same-module one leaves it `None`
-            // (its frames are module 0, read against the session fields above).
-            coro_debug: None,
-        }
-    }
-
-    /// Open a debug session on `m`'s `func(args)`. `None` if the module is outside the engine's subset.
-    /// The powerbox is empty (`Host::new()`); use [`DebugRun::new_with_host`] to debug a guest that
-    /// needs a granted capability (e.g. a §14 `Instantiator` for coroutines).
-    pub fn new(m: &Module, func: FuncIdx, args: &[Value]) -> Option<DebugRun> {
-        DebugRun::new_with_host(m, func, args, Host::new())
-    }
-
-    /// [`DebugRun::new`] carrying a live powerbox `host`, so synchronous `call.cap`s execute against it
-    /// — e.g. a §14 `Instantiator` grant (`host.grant_instantiator(..)`) reaching the guest as an
-    /// argument, which makes `spawn_coroutine`/`resume`/`yield` debuggable. `None` if the module is
-    /// outside the engine's subset.
-    pub fn new_with_host(
-        m: &Module,
-        func: FuncIdx,
-        args: &[Value],
-        host: Host,
-    ) -> Option<DebugRun> {
-        m.funcs.get(func as usize)?;
-        // Slot base + value types per (function, block), so any frame on the call stack is readable — the
-        // module-0 counterpart of a §14 separate-module child's own [`ModuleDebug`].
-        let ModuleDebug {
-            fn_block_base,
-            fn_block_types,
-            ..
-        } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
-                                                             // The debug engines hold `source`/`table` as separate fields (a `Domain` shares its table).
-        let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
-        let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
-        let mem = build_mem(m);
-        let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
-        Some(DebugRun {
-            source,
-            table,
-            mem,
-            host,
-            vt,
-            fibers: Vec::new(),
-            fn_block_base,
-            fn_block_types,
-            debug: m.debug_info.clone(),
-            at_bp: false,
-            done: None,
-            op_clock: 0,
-            funcs: std::sync::Arc::from(m.funcs.clone()),
-            watchpoints: Vec::new(),
-            stdin_parked: false,
-            cap_parked: None,
-            access_sink: None,
-            scheduled_writes: Vec::new(),
-            write_cursor: 0,
-            last_watch: None,
-            value_watches: Vec::new(),
-        })
-    }
-
-    /// Replace the armed **window watchpoints** (DEBUGGING.md W2) — each `(addr, len, kind)` makes
-    /// `run_to` stop *before* any op that accesses `[addr, addr+len)` with a matching read/write kind.
-    /// Caller-owned ids; re-applied by the DAP backend after a `seek` rebuild.
-    pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
-        self.watchpoints = ranges;
-    }
-
-    /// Take the `(addr, write)` of the watchpoint the last `run_to` stopped before (cleared by the
-    /// read), so the caller can report `StopReason::Watchpoint`. `None` if the last stop was a plain
-    /// breakpoint / step. A **value** watch (#1229) reports `(0, true)` — it has no window address.
-    pub fn take_watch_hit(&mut self) -> Option<(u64, bool)> {
-        self.last_watch.take()
-    }
-
-    /// Resolve a source variable held in an SSA value (no window address) to a value-watch target
-    /// (#1229), for the frame `depth` levels from the top. `None` for a memory-located var (watch it
-    /// by address via [`var_addr`](DebugRun::var_addr)/[`set_watchpoints`](DebugRun::set_watchpoints)),
-    /// an unknown name, or one not live at the stopped pc. The target is frame-independent, so the DAP
-    /// backend can re-apply it verbatim after a `seek` rebuild.
-    pub fn resolve_value_watch(&self, depth: usize, name: &str) -> Option<ValueWatchTarget> {
-        let (func, site, last) = self.reader().value_watch_target(depth, name)?;
-        Some(ValueWatchTarget { func, site, last })
-    }
-
-    /// Replace the armed **value watchpoints** (#1229) — each `(id, target, kind)` makes `run_to`
-    /// stop when the target variable's holding value changes. Re-applied by the DAP backend after a
-    /// `seek` rebuild ([`merge_value_watches`] keeps a live watch's running baseline).
-    pub fn set_value_watches(
-        &mut self,
-        watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
-    ) {
-        self.value_watches = merge_value_watches(&self.value_watches, watches);
-    }
-
-    /// Ops executed so far — the reverse-debugging clock ([`DebugRun::op_clock`]).
-    pub fn op_clock(&self) -> u64 {
-        self.op_clock
-    }
-
-    /// Whether the last advance parked at a **blocking-stdin** `read` (W4): the run is live and
-    /// resumable, paused at the read, and the clock did not advance. Arm the mode via
-    /// [`Host::set_stdin_blocking`](super::Host::set_stdin_blocking) on the run's host.
-    pub fn stdin_parked(&self) -> bool {
-        self.stdin_parked
-    }
-
-    /// Append stdin bytes for a parked blocking `read` ([`Host::push_stdin`](super::Host::push_stdin))
-    /// — the next advance re-issues the read against them, and the completed read joins the recorded
-    /// cap tape so a later `seek` replays it faithfully.
-    pub fn provide_stdin(&mut self, bytes: &[u8]) {
-        self.host.push_stdin(bytes);
-    }
-
-    /// #1366 — the completion id this run is parked on (a host-completed cap call), if any. The
-    /// backend reports it as `StopReason::CapPark { id }`; [`deliver_cap`](DebugRun::deliver_cap)
-    /// resumes it.
-    pub fn cap_parked(&self) -> Option<u64> {
-        self.cap_parked.map(|(id, _, _)| id)
-    }
-
-    /// #1366 — the pc of the host-completed cap call this run is parked on (the stop location),
-    /// if parked and the call had a source position.
-    pub fn cap_park_pc(&self) -> Option<super::IrPc> {
-        self.cap_parked.and_then(|(_, _, at)| at)
-    }
-
-    /// #1366 — finish the host-completed cap call this run is parked on: `value` lands in the
-    /// call's result slot, the completion settles, the delivered value joins the cap tape as the
-    /// call's record (so a reverse `seek` replays it without re-parking), and the op counts on the
-    /// clock. `false` if the run isn't parked on `id`. The twin of `provide_stdin`.
-    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
-        let Some((pid, dst, _)) = self.cap_parked else {
-            return false;
-        };
-        if pid != id {
-            return false;
-        }
-        let comps = self.host.completions();
-        let prefix = comps.complete_host(id, value);
-        let _ = comps.try_take(id);
-        if let Some((type_id, op, handle, args)) = prefix {
-            self.host.tape_cap_record(super::CapRecord {
-                type_id,
-                op,
-                handle,
-                args,
-                result: Ok(vec![value]),
-                mem_writes: Vec::new(),
-            });
-        }
-        self.vt.active.set(dst, Reg::from_i64(value));
-        self.cap_parked = None;
-        self.op_clock += 1;
-        true
-    }
-
-    /// Install the session's per-op **access sink** ([`AccessSinkFn`]) — observation only, zero
-    /// cost when never installed. Replaces any prior sink.
-    pub fn set_access_sink(&mut self, sink: AccessSinkFn) {
-        self.access_sink = Some(sink);
-    }
-
-    /// Install the session's **scheduled debugger writes** (slice 8): sorted by clock; entries at
-    /// clocks already passed are skipped (a rebuilt run applies them during its replay instead).
-    pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
-        writes.sort_by_key(|(c, _)| *c);
-        self.write_cursor = writes.partition_point(|(c, _)| *c < self.op_clock);
-        self.scheduled_writes = writes;
-    }
-
-    /// The run's window memory-map introspection ([`MemMapInfo`]). `None` for a memory-less
-    /// module.
-    pub fn mem_map_info(&self) -> Option<MemMapInfo> {
-        self.mem.as_ref().map(|m| m.map_info())
-    }
-
-    /// Arm the "paused on a breakpoint" state so the next [`run_to`](DebugRun::run_to) steps past the
-    /// current op before scanning — used after a `seek`/replay lands exactly on a breakpoint, so a
-    /// forward resume makes progress instead of re-reporting the same stop.
-    pub fn arm_breakpoint_skip(&mut self) {
-        self.at_bp = true;
-    }
-
-    /// Whether this run's state is fully captured by its `VTask` continuation + the window bytes + the
-    /// host's replay substate — the subset a single-vCPU time-travel **checkpoint** (W1) snapshots. The
-    /// bytecode counterpart of [`VCpu::checkpointable`](super::Inspector). The host has grown no state a
-    /// checkpoint can't restore (`checkpoint_safe`) and the shared window has a pristine layout
-    /// (`layout_snapshot_safe`). **§12 fibers** are admitted (their `Vm`s share the one window), except an
-    /// event-parked (`memory.wait`) fiber whose wall-clock deadline is non-deterministic. **§14
-    /// coroutines** are admitted (same-module *or* separate-module, whose pushed unit rides in
-    /// `extra_units`), including **demand** (`fault_yields`) and self-page-mapping ones — their own page
-    /// map is captured (`layout_snapshot_safe`, no §13 regions) and their bytes ride in the parent
-    /// snapshot, provided the child window lies within the parent's captured prefix
-    /// (`nested_within_prefix`). A region-aliased child stays outside. Outside this subset the DAP backend
-    /// falls back to replay-from-clock-0.
-    fn checkpointable(&self) -> bool {
-        self.done.is_none()
-            && self.host.checkpoint_safe()
-            && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
-            // Reverse-replay *across* a §22 `Jit.invoke` step-into is out-of-subset (CONSOLIDATION.md
-            // §11 debug boundary): the invoked unit's transient `Vm` + its `source.push`ed module aren't
-            // captured here, so a checkpoint mid-invoke can't be restored. A reverse-seek near an invoke
-            // replays from an earlier checkpoint, which re-enters the invoke deterministically.
-            && self.vt.active_invoke.is_none()
-            && !self.fibers.iter().any(|f| {
-                matches!(
-                    f,
-                    FiberState::WaitParked { .. } | FiberState::CapParked { .. }
-                )
-            })
-    }
-
-    /// Snapshot this run's continuation at its current [`op_clock`](DebugRun::op_clock) for the `seek`
-    /// checkpoint ladder — `None` if the run is outside the [`checkpointable`](DebugRun::checkpointable)
-    /// subset. Deep-copies the full `VTask` (active `Vm`, fiber resume chain, fiber registry, coroutine
-    /// children) + the shared window bytes + the host's replay substate + any separate-module coroutine's
-    /// pushed source units.
-    pub fn snapshot(&self) -> Option<DebugRunSnapshot> {
-        if !self.checkpointable() {
-            return None;
-        }
-        Some(super::moment::Moment::new(
-            self.mem.as_ref().map(|m| m.layout_snapshot()),
-            &self.host,
-            DebugRunContinuation {
-                active: self.vt.active.clone(),
-                active_id: self.vt.active_id,
-                chain: self.vt.chain.clone(),
-                fibers: self.fibers.clone(),
-                extra_units: self.source.extra_units(),
-            },
-        ))
-    }
-
-    /// Restore a [`snapshot`](DebugRun::snapshot) into this **freshly built** run (its powerbox already
-    /// re-created + tape re-armed by the backend), so a subsequent replay resumes exactly at the
-    /// snapshot's logical time rather than clock 0. Rebuilds the whole `VTask` (active `Vm`, resume
-    /// chain, fiber registry, and each same-module coroutine — its `nested_view` recreated over the
-    /// reseeded parent window, its Yielder-only host rebuilt), reseeds the window bytes, restores the
-    /// host replay substate, and sets the clock. A separate-module coroutine's pushed source units are
-    /// re-pushed first (so its `module` index resolves); `table`/`funcs` for module 0 already match.
-    /// `clock` is the logical time the snapshot was taken at — the ladder's key, handed back with it.
-    pub fn restore(&mut self, clock: u64, snap: &DebugRunSnapshot) {
-        let c = snap.continuation();
-        self.vt.active = c.active.clone();
-        self.vt.active_id = c.active_id;
-        self.vt.chain = c.chain.clone();
-        self.fibers = c.fibers.clone();
-        // Re-push any separate-module coroutine's units before rebuilding coroutines (their `module`
-        // indices resolve against the source).
-        self.source.reset_extra(&c.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
-            m.restore_layout(layout);
-        }
-        snap.restore_host(&mut self.host);
-        self.op_clock = clock;
-        self.done = None;
-        self.at_bp = false;
-        self.stdin_parked = false; // a restored run is not parked; a re-executed read re-parks
-        self.cap_parked = None; // likewise: a replayed cap call is served from the tape
-    }
-
-    /// Execute **exactly one op** (advancing the clock), for replay-based `seek`. Returns `false` once
-    /// the run has finished (its result is then available via [`result`](DebugRun::result)). Unlike the
-    /// stepping verbs it does not skip unmapped ops or honor breakpoints — it is the raw time quantum.
-    pub fn tick(&mut self, fuel: &mut u64) -> bool {
-        if self.done.is_some() {
-            return false;
-        }
-        self.at_bp = false;
-        // #1366: parked on a host-completed cap — nothing can advance until the embedder
-        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
-        if self.cap_parked.is_some() {
-            return false;
-        }
-        self.host.completions().allow_host_completed();
-        self.stdin_parked = false;
-        let Self {
-            source,
-            table,
-            mem,
-            host,
-            vt,
-            fibers,
-            done,
-            op_clock,
-            stdin_parked,
-            cap_parked,
-            funcs,
-            fn_block_base,
-            fn_block_types,
-            debug,
-            access_sink,
-            scheduled_writes,
-            write_cursor,
-            ..
-        } = self;
-        apply_due_writes(
-            scheduled_writes,
-            write_cursor,
-            *op_clock,
-            vt,
-            source,
-            mem,
-            debug.as_ref(),
-            fn_block_base,
-            fn_block_types,
-        );
-        if let Some(sink) = access_sink.as_mut() {
-            let cur_vm = vt.debug_active();
-            emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
-        }
-        match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
-            FiberStep::Stepped => {
-                *op_clock += 1;
-                true
-            }
-            FiberStep::Finished(vals) => {
-                *op_clock += 1;
-                *done = Some(Ok(vals));
-                false
-            }
-            FiberStep::Trapped(t) => {
-                *done = Some(Err(t));
-                false
-            }
-            // Parked at a blocking-stdin read (W4): the read did not run and the clock holds —
-            // the run stays live; the driver pushes bytes and re-ticks to re-issue it.
-            FiberStep::Other(Outcome::StdinPark) => {
-                *stdin_parked = true;
-                false
-            }
-            // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-            FiberStep::CapParked { id, dst, at } => {
-                *cap_parked = Some((id, dst, at));
-                false
-            }
-            // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
-            FiberStep::Other(_) => {
-                *done = Some(Err(Trap::Malformed));
-                false
-            }
-        }
-    }
-
-    /// Run until the current op's `IrPc` is in `bps` (stopping *before* it) or the run finishes; returns
-    /// the stop pc, or `None` at completion / a seam. Resumable — a re-entry steps past the last hit.
-    pub fn run_to(&mut self, bps: &[super::IrPc], fuel: &mut u64) -> Option<super::IrPc> {
-        if self.done.is_some() {
-            return None;
-        }
-        // #1366: parked on a host-completed cap — nothing can advance until the embedder
-        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
-        if self.cap_parked.is_some() {
-            return None;
-        }
-        self.host.completions().allow_host_completed();
-        self.stdin_parked = false;
-        let Self {
-            source,
-            table,
-            mem,
-            host,
-            vt,
-            fibers,
-            at_bp,
-            done,
-            op_clock,
-            fn_block_base,
-            fn_block_types,
-            debug,
-            funcs,
-            watchpoints,
-            stdin_parked,
-            cap_parked,
-            access_sink,
-            scheduled_writes,
-            write_cursor,
-            last_watch,
-            value_watches,
-            ..
-        } = self;
-        // Step past the breakpoint we last reported, so a re-entry makes progress (loop bodies).
-        if *at_bp {
-            *at_bp = false;
-            apply_due_writes(
-                scheduled_writes,
-                write_cursor,
-                *op_clock,
-                vt,
-                source,
-                mem,
-                debug.as_ref(),
-                fn_block_base,
-                fn_block_types,
-            );
-            if let Some(sink) = access_sink.as_mut() {
-                let cur_vm = vt.debug_active();
-                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
-            }
-            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
-                FiberStep::Stepped => *op_clock += 1,
-                FiberStep::Finished(vals) => {
-                    *op_clock += 1;
-                    *done = Some(Ok(vals));
-                    return None;
-                }
-                FiberStep::Trapped(t) => {
-                    *done = Some(Err(t));
-                    return None;
-                }
-                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
-                FiberStep::Other(Outcome::StdinPark) => {
-                    *stdin_parked = true;
-                    return None;
-                }
-                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::CapParked { id, dst, at } => {
-                    *cap_parked = Some((id, dst, at));
-                    return None;
-                }
-                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
-                FiberStep::Other(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-            }
-        }
-        loop {
-            // Scan the currently-stepping continuation — the active §14 coroutine child (over its own
-            // confined window) during step-into, else the parent. A same-module child is module 0, so
-            // its ops share the parent's pc space; a breakpoint on the child's function fires here.
-            let hit = {
-                let cur_vm = vt.debug_active();
-                match cur_vm.cur_ir_pc(source) {
-                    Some(pc) if bps.contains(&pc) => Some((pc, None)),
-                    // A window-range watch stops *before* the access; a value watch (#1229) stops
-                    // when a watched SSA-held variable's value changed.
-                    Some(pc) => watch_stop_before(
-                        cur_vm,
-                        mem,
-                        funcs,
-                        fn_block_base,
-                        watchpoints,
-                        value_watches,
-                        pc,
-                    )
-                    .map(|w| (pc, Some(w))),
-                    None => None,
-                }
-            };
-            if let Some((pc, watch)) = hit {
-                // A watchpoint stops *before* the access applies (step once to observe the new bytes).
-                if let Some(w) = watch {
-                    *last_watch = Some(w);
-                }
-                *at_bp = true;
-                return Some(pc);
-            }
-            apply_due_writes(
-                scheduled_writes,
-                write_cursor,
-                *op_clock,
-                vt,
-                source,
-                mem,
-                debug.as_ref(),
-                fn_block_base,
-                fn_block_types,
-            );
-            if let Some(sink) = access_sink.as_mut() {
-                let cur_vm = vt.debug_active();
-                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
-            }
-            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
-                FiberStep::Stepped => {
-                    *op_clock += 1;
-                    continue;
-                }
-                FiberStep::Finished(vals) => {
-                    *op_clock += 1;
-                    *done = Some(Ok(vals));
-                    return None;
-                }
-                FiberStep::Trapped(t) => {
-                    *done = Some(Err(t));
-                    return None;
-                }
-                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
-                FiberStep::Other(Outcome::StdinPark) => {
-                    *stdin_parked = true;
-                    return None;
-                }
-                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::CapParked { id, dst, at } => {
-                    *cap_parked = Some((id, dst, at));
-                    return None;
-                }
-                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
-                FiberStep::Other(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-            }
-        }
-    }
-
-    /// Execute the current op, then stop at the next instruction whose call depth is `<= max_depth`
-    /// (`None` ⇒ any depth). The shared driver for the stepping verbs — mirrors the tree-walker's
-    /// `step_to_depth` (step off the current op first, then seek the next qualifying stop).
-    fn step_to(&mut self, max_depth: Option<usize>, fuel: &mut u64) -> Option<super::IrPc> {
-        if self.done.is_some() {
-            return None;
-        }
-        // #1366: parked on a host-completed cap — nothing can advance until the embedder
-        // delivers (`deliver_cap`); admit host-completed punts on this run's host.
-        if self.cap_parked.is_some() {
-            return None;
-        }
-        self.host.completions().allow_host_completed();
-        self.stdin_parked = false;
-        let Self {
-            source,
-            table,
-            mem,
-            host,
-            vt,
-            fibers,
-            at_bp,
-            done,
-            op_clock,
-            stdin_parked,
-            cap_parked,
-            funcs,
-            fn_block_base,
-            fn_block_types,
-            debug,
-            access_sink,
-            scheduled_writes,
-            write_cursor,
-            watchpoints,
-            value_watches,
-            last_watch,
-            ..
-        } = self;
-        *at_bp = false; // a step leaves the breakpoint-paused state
-        loop {
-            apply_due_writes(
-                scheduled_writes,
-                write_cursor,
-                *op_clock,
-                vt,
-                source,
-                mem,
-                debug.as_ref(),
-                fn_block_base,
-                fn_block_types,
-            );
-            if let Some(sink) = access_sink.as_mut() {
-                let cur_vm = vt.debug_active();
-                emit_access(cur_vm, source, funcs, fn_block_base, *op_clock, 0, sink);
-            }
-            match debug_advance_fiber(vt, fibers, source, table, fuel, mem, host) {
-                FiberStep::Stepped => *op_clock += 1,
-                FiberStep::Finished(vals) => {
-                    *op_clock += 1;
-                    *done = Some(Ok(vals));
-                    return None;
-                }
-                FiberStep::Trapped(t) => {
-                    *done = Some(Err(t));
-                    return None;
-                }
-                // Blocking-stdin park (W4): live and resumable, no clock advance (see `tick`).
-                FiberStep::Other(Outcome::StdinPark) => {
-                    *stdin_parked = true;
-                    return None;
-                }
-                // #1366: parked on a host-completed cap — surface it (see `cap_parked`).
-                FiberStep::CapParked { id, dst, at } => {
-                    *cap_parked = Some((id, dst, at));
-                    return None;
-                }
-                // A scheduler seam (threads/instantiate/…) is out of the single-vCPU debug scope.
-                FiberStep::Other(_) => {
-                    *done = Some(Err(Trap::Malformed));
-                    return None;
-                }
-            }
-            // Depth is *cumulative* across a coroutine boundary: a child's frames sit above the parent's
-            // resume frame (`parent_depth + child stack`), so step-over of a `resume` (target =
-            // parent depth) runs the child to completion, and step-out of the child body lands back in
-            // the parent — while stepping *within* the child compares child-local frames as usual.
-            let cur_vm = vt.debug_active();
-            // A watchpoint fires *during* a step too — parity with `continue` (`run_to`) and with the
-            // tree-walker, whose per-op seam checks watches ahead of the step target. Checked before
-            // the step-boundary return and independent of the step's depth (a watch is not
-            // depth-scoped): a window-range access, or a value watch (#1229) whose SSA-held variable
-            // just changed, stops the step here with the watch reason.
-            if let Some(pc) = cur_vm.cur_ir_pc(source) {
-                if let Some(w) = watch_stop_before(
-                    cur_vm,
-                    mem,
-                    funcs,
-                    fn_block_base,
-                    watchpoints,
-                    value_watches,
-                    pc,
-                ) {
-                    *last_watch = Some(w);
-                    *at_bp = true;
-                    return Some(pc);
-                }
-            }
-            if max_depth.is_none_or(|m| vt.debug_depth() <= m) {
-                if let Some(pc) = cur_vm.cur_ir_pc(source) {
-                    return Some(pc);
-                }
-            }
-        }
-    }
-
-    /// **Step** one instruction — descends into a call (stops at the callee's first op), the bytecode
-    /// counterpart of `Inspector::step`. `None` at completion / a seam.
-    pub fn step(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
-        self.step_to(None, fuel)
-    }
-
-    /// **Step over**: execute the current op and stop at the next op in *this* frame — running any call
-    /// it makes to completion rather than descending. The counterpart of `Inspector::step_over`.
-    pub fn step_over(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
-        let d = self.step_depth();
-        self.step_to(Some(d), fuel)
-    }
-
-    /// **Step out**: run until the current function returns, stopping at the op in the caller it
-    /// returned to. Runs to completion (returns `None`) when no caller frame has a remaining
-    /// *steppable* op — from the outermost frame, and equally when the caller's only remaining action
-    /// is its own `return` terminator: `step_to` stops only where `cur_ir_pc` is `Some`, and a
-    /// terminator (`SRC_TERM`) yields `None`, so there is no op at the caller's depth to land on. The
-    /// counterpart of `Inspector::step_out`; both engines agree — see the `debug_parity` pin
-    /// `stepout_runs_to_completion_when_caller_immediately_returns`.
-    pub fn step_out(&mut self, fuel: &mut u64) -> Option<super::IrPc> {
-        let d = self.step_depth();
-        self.step_to(Some(d.saturating_sub(1)), fuel)
-    }
-
-    /// Number of live call frames at the current stop (callers + the running activation) — the depth a
-    /// DAP `stackTrace` would report. Inside a §14 coroutine child (step-into) this is the *child's*
-    /// own frame count; see [`step_depth`](DebugRun::step_depth) for the cumulative form the stepping
-    /// verbs use across the resume boundary.
-    pub fn depth(&self) -> usize {
-        self.reader().depth()
-    }
-
-    /// The **cumulative** call depth used by the stepping verbs: while stepping inside a coroutine child
-    /// its frames count *above* the parent's resume frame (`parent_depth + child depth`), so step-over /
-    /// step-out treat the resume boundary like an ordinary call. Equal to [`depth`](DebugRun::depth)
-    /// when the parent itself is running.
-    fn step_depth(&self) -> usize {
-        self.vt.debug_depth()
-    }
-
-    /// The `IrPc` of the frame `depth` levels from the top — the bytecode counterpart of a
-    /// `Inspector::backtrace` entry. `None` past the stack.
-    pub fn frame_pc(&self, depth: usize) -> Option<super::IrPc> {
-        self.reader().frame_pc(depth)
-    }
-
-    /// Block-local SSA value `idx` in the frame `depth` levels from the top, typed — the bytecode
-    /// counterpart of `Inspector::read_ir_value`. `None` for a cross-module frame, a bad `idx`, or past
-    /// the stack. A not-yet-computed slot reads as its default; the caller compares only the defined
-    /// prefix (where `read_ir_value` returns `Some`).
-    pub fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
-        self.reader().value_in_frame(depth, idx)
-    }
-
-    /// Read a **source variable by name** in the frame `depth` levels from the top — the bytecode
-    /// counterpart of `Inspector::read_var`, resolving the same `VarLoc` over the §6 debug info: an
-    /// `Ssa`/`SsaList` promoted scalar from the typed value slot, a `Window`/`WindowVia`/`Fixed` var
-    /// from window memory. `None` if there is no debug info, the name isn't an in-scope var here, or
-    /// the location can't be resolved. This is the name→value read a DAP `variables` backend needs.
-    pub fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
-        self.reader().read_var(depth, name, width)
-    }
-
-    /// The **window address** of a source variable by name in the frame `depth` from the top — the
-    /// bytecode counterpart of `Inspector::var_addr`. `Some(addr)` only for a memory-located variable
-    /// (`Window`/`WindowVia`/`Fixed`); `None` for a promoted SSA scalar (no address), a name that
-    /// isn't an in-scope var here, or no debug info. Feeds a DAP `variables` aggregate/array/pointer
-    /// expansion (and, on the tree-walker, data breakpoints).
-    pub fn var_addr(&self, depth: usize, name: &str) -> Option<u64> {
-        self.reader().var_addr(depth, name)
-    }
-
-    /// Read `len` bytes from the guest window at `addr` — the bytecode counterpart of
-    /// `Inspector::read_window`, for a DAP `variables` backend walking an aggregate / following a
-    /// pointer. Reads the active §14 coroutine child's confined window during step-into, else the
-    /// parent's. Errs if the range is unmapped or the module has no memory.
-    pub fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match self.mem.as_ref() {
-            Some(m) => m.read_window(addr, len),
-            None => Err(Trap::Malformed),
-        }
-    }
-
-    /// The faulting guest address of the last `MemoryFault` (window-relative; a NULL deref → `0`),
-    /// or `None` if the last termination was not an address-recording memory fault. Read by the DAP
-    /// layer to report a segfault's address (#1190).
-    pub fn fault_addr(&self) -> Option<u64> {
-        self.mem.as_ref().and_then(|m| m.peek_fault_rel())
-    }
-
-    /// **Write a source variable by name** (slice 8, the DAP `setVariable` backend): a promoted
-    /// SSA scalar takes `value` coerced to its slot type (integers only); a memory-located var
-    /// takes `value`'s low `width` bytes little-endian at its resolved window address. Refused
-    /// (`false`) mid-coroutine-step, for float slots, or for an unresolvable name — fail-closed,
-    /// never a guess. The DAP backend records successful writes and re-applies them at the same
-    /// clock on every seek replay, so time travel stays truthful.
-    pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
-        let Some(target) = self.reader().write_target(depth, name) else {
-            return false;
-        };
-        match target {
-            WriteTarget::Ssa { reg, ty } => {
-                let v = match ty {
-                    ValType::I32 => Value::I32(value as i32),
-                    ValType::I64 => Value::I64(value),
-                    _ => return false,
-                };
-                match self.vt.active.regs.get_mut(reg) {
-                    Some(r) => {
-                        *r = Reg::from_value(v);
-                        true
-                    }
-                    None => false,
-                }
-            }
-            WriteTarget::Win { addr } => {
-                let w = width.clamp(1, 8);
-                self.write_window(addr, &value.to_le_bytes()[..w])
-            }
-        }
-    }
-
-    /// **Write bytes into the guest window** (slice 8, the DAP `writeMemory` backend). `false` if
-    /// the range is unmapped or the module has no memory.
-    pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        self.mem
-            .as_mut()
-            .and_then(|m| m.write_bytes(addr, bytes))
-            .is_some()
-    }
-
-    /// The running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
-    pub fn value(&self, idx: usize) -> Option<Value> {
-        self.value_in_frame(0, idx)
-    }
-
-    /// The run result once finished (`None` while still running).
-    pub fn result(&self) -> Option<&Result<Vec<Value>, Trap>> {
-        self.done.as_ref()
-    }
-
-    /// The session's powerbox host (`Host::new_with_host`'s grant), for reading effects a debugged guest
-    /// produced — captured stdout/stderr, and the [`CapTape`](Host::cap_tape) a reverse `seek` replays so
-    /// a **powerbox** run (streams/clock/exit) re-executes with identical cap inputs.
-    pub fn host(&self) -> &Host {
-        &self.host
-    }
-    /// Mutable powerbox host — e.g. to drain captured stdout between stops.
-    pub fn host_mut(&mut self) -> &mut Host {
-        &mut self.host
-    }
-}
-
-/// Whether `m` can spawn a second vCPU — it contains a `thread.spawn` op somewhere. The DAP backend
-/// routes such a module to the multithreaded [`ScheduledDebugRun`] instead of the single-vCPU
-/// [`DebugRun`]; a spawn-free module stays on the (reverse- and watch-capable) single-vCPU path.
+/// Whether `m` can spawn a second vCPU — it contains a `thread.spawn` op somewhere. A spawn-free
+/// module runs on [`ScheduledDebugRun`] as a one-task schedule (every verb, watch, and checkpoint
+/// reads identically); the predicate remains for callers that key a *policy* on it (a schedule seed
+/// is meaningless with one vCPU).
 pub fn module_spawns_threads(m: &Module) -> bool {
     m.funcs
         .iter()
@@ -7024,11 +6084,11 @@ enum DbgTaskState {
     /// [`ScheduledDebugRun::provide_stdin`]; a [`restore`](ScheduledDebugRun::restore) re-admits it
     /// (a restored run is not parked — the re-executed read is served from the cap tape, or re-parks
     /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
-    /// and the single-vCPU `DebugRun::stdin_parked` — invariant 14's debugger axis.
+    /// — invariant 14's debugger axis.
     BlockedStdin,
     /// #1366 — parked on a **host-completed** cap call: the embedder services it asynchronously and
     /// [`ScheduledDebugRun::deliver_cap`] resumes. `dst` is the awaiting result slot; `at` the call's
-    /// pc (the stop location). The scheduled twin of `DebugRun`'s `cap_parked`; not runnable until
+    /// pc (the stop location). Not runnable until
     /// delivered, and cleared to `Runnable` on a checkpoint restore (a replay serves the call from
     /// the tape, exactly as a restored stdin park re-issues its read).
     CapParked {
@@ -7055,7 +6115,7 @@ struct DbgTask {
     env: Option<usize>,
     state: DbgTaskState,
     /// Paused on a just-reported breakpoint — step one op past it before the next scan makes progress
-    /// (the per-task analogue of [`DebugRun::at_bp`], so a loop-body breakpoint re-fires each iteration).
+    /// (so a loop-body breakpoint re-fires each iteration).
     at_bp: bool,
 }
 
@@ -7096,7 +6156,7 @@ struct DbgTaskSnapshot {
 /// [`ScheduledDebugRun::checkpointable`]: no §12 fibers, no §14 coroutines/`instantiate` children, a
 /// pristine shared window, a restorable host) — where the per-task active `Vm`s + the shared window
 /// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
-/// counterpart of [`DebugRunContinuation`]. Opaque to the DAP backend, which stores the moment in a
+/// Opaque to the DAP backend, which stores the moment in a
 /// ladder keyed on the global turn and hands it back to [`ScheduledDebugRun::restore`].
 pub struct ScheduledContinuation {
     /// The scheduled-mode op clock (visible ops across all vCPUs) — continuation state, unlike the
@@ -7186,8 +6246,8 @@ pub struct ScheduledDebugRun {
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
     /// Run-shared **value watchpoints** (#1229, #1517 slice 2): stop when a watched SSA-held source
     /// variable's holding value changes, in whichever thread's top frame runs the variable's function
-    /// — cross-thread exactly like `watchpoints` (a target is `(func, site)`, not a task; the one-task
-    /// run this engine collapses `DebugRun` into reads identically). Empty in the common case.
+    /// — cross-thread exactly like `watchpoints` (a target is `(func, site)`, not a task). Empty in
+    /// the common case.
     value_watches: Vec<ValueWatchRun>,
     /// The session's optional per-op access sink ([`AccessSinkFn`]) — fired before every module-0
     /// op with the global `turn` and the **executing task index** (the vCPU attribution host-side
@@ -7198,8 +6258,9 @@ pub struct ScheduledDebugRun {
     /// [`set_sched_trace`](ScheduledDebugRun::set_sched_trace); `None` (the default) is zero-cost.
     /// Re-armed by the DAP backend on `seek` rebuilds (the replay refills it deterministically).
     sched_trace: Option<Vec<SchedTraceEvent>>,
-    /// Scheduled debugger writes ([`ScheduledWrite`], slice 8) + the next-un-applied cursor — the
-    /// scheduled-engine twin of `DebugRun::scheduled_writes`.
+    /// Scheduled debugger writes ([`ScheduledWrite`], slice 8), sorted by turn, + the next-un-applied
+    /// cursor. Empty (the default) is one index compare per advance; the DAP backend re-installs the
+    /// list on every rebuild.
     scheduled_writes: Vec<(u64, ScheduledWrite)>,
     write_cursor: usize,
     /// The **seeded pick** (slice 7): `Some(seed)` chooses uniformly among the runnable set via
@@ -7589,7 +6650,7 @@ fn service_advance(
                 }
             }
             // #1146 (deeper) — a blocking-stdin park (W4): the read did not run and the turn holds
-            // (as in the single-vCPU `DebugRun`); `drive` reports `SchedStop::StdinPark` once nothing
+            // `drive` reports `SchedStop::StdinPark` once nothing
             // else can run, and `provide_stdin` re-admits the task so the read re-issues.
             Outcome::StdinPark => tasks[ti].state = DbgTaskState::BlockedStdin,
             // Everything this engine does **not** dispatch, named rather than caught by a `_`
@@ -7937,8 +6998,7 @@ fn dbg_join(tasks: &mut [DbgTask], ti: usize, handle: i32, dst: u32) {
 /// (a forged/cross-domain handle is an inert `CapFault` → trap), compile the unit to bytecode, and
 /// install it into the debug run's shared `(source, table)` — the debug-engine counterpart of the
 /// production `drive`'s `JitInstall` arm. Serviced inline in [`debug_advance_fiber`] (it mutates only
-/// `vt.active` + the shared table, spawning no scheduler task), so both the single-vCPU `DebugRun` and
-/// the `ScheduledDebugRun` reach it. Writes the slot (or `-ENOSPC`, an ordinary value) to `dst`; `Err`
+/// `vt.active` + the shared table, spawning no scheduler task). Writes the slot (or `-ENOSPC`, an ordinary value) to `dst`; `Err`
 /// traps the vCPU (`CapFault` forged handle, `Malformed` unit outside bytecode coverage — the one place
 /// a guest-provided unit can outrun coverage, with no tree-walker fallback mid-run).
 fn dbg_jit_install(
@@ -8274,7 +7334,7 @@ impl ScheduledDebugRun {
 
     /// [`new`](ScheduledDebugRun::new) carrying a live powerbox `host`, so a granted `Instantiator`
     /// (`host.grant_instantiator(..)`) reaches the guest as an argument and makes an `instantiate`-using
-    /// multithreaded guest debuggable (the debug-scheduler analogue of [`DebugRun::new_with_host`]).
+    /// multithreaded guest debuggable.
     pub fn new_with_host(
         m: &Module,
         func: FuncIdx,
@@ -8320,7 +7380,9 @@ impl ScheduledDebugRun {
             sched_seed: None,
             forced: Vec::new(),
             last_watch: None,
-            stopped: None,
+            // Entry-stopped: the first `step` steps off the entry op (not to completion), and the
+            // `stopped`/`focus` reads resolve the root task without an explicit `locate`.
+            stopped: Some(0),
             focus: 0,
             turn: 0,
             clock: 0,
@@ -8340,17 +7402,19 @@ impl ScheduledDebugRun {
     }
 
     /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
-    /// **focused** thread's frame `depth` levels from the top — see `DebugRun::resolve_value_watch`.
-    /// The target is `(func, site, baseline)`, frame- and thread-independent, so the DAP backend
-    /// re-applies it verbatim after a `seek` rebuild.
+    /// **focused** thread's frame `depth` levels from the top. `None` for a memory-located var (watch
+    /// it by address via [`var_addr`](ScheduledDebugRun::var_addr)/[`set_watchpoints`](ScheduledDebugRun::set_watchpoints)),
+    /// an unknown name, or one not live at the stopped pc. The target is `(func, site, baseline)`,
+    /// frame- and thread-independent, so the DAP backend re-applies it verbatim after a `seek` rebuild.
     pub fn resolve_value_watch(&self, depth: usize, name: &str) -> Option<ValueWatchTarget> {
         let (func, site, last) = self.reader().value_watch_target(depth, name)?;
         Some(ValueWatchTarget { func, site, last })
     }
 
     /// Replace the run-shared **value watchpoints** (#1229) — each `(id, target, kind)` makes the
-    /// schedule stop, in whichever thread, when the target variable's holding value changes. See
-    /// `DebugRun::set_value_watches`; [`merge_value_watches`] keeps a live watch's running baseline.
+    /// schedule stop, in whichever thread, when the target variable's holding value changes.
+    /// Re-applied by the DAP backend after a `seek` rebuild ([`merge_value_watches`] keeps a live
+    /// watch's running baseline).
     pub fn set_value_watches(
         &mut self,
         watches: Vec<(super::WatchId, ValueWatchTarget, super::WatchKind)>,
@@ -8364,7 +7428,9 @@ impl ScheduledDebugRun {
         self.access_sink = Some(sink);
     }
 
-    /// Install the session's **scheduled debugger writes** — see `DebugRun::set_scheduled_writes`.
+    /// Install the session's **scheduled debugger writes** ([`ScheduledWrite`], slice 8): each is
+    /// applied when execution passes its turn — on the live resume and on every replay — so time
+    /// travel stays truthful. The cursor lands past entries at turns already passed.
     pub fn set_scheduled_writes(&mut self, mut writes: Vec<(u64, ScheduledWrite)>) {
         writes.sort_by_key(|(c, _)| *c);
         self.write_cursor = writes.partition_point(|(c, _)| *c < self.turn);
@@ -8377,7 +7443,7 @@ impl ScheduledDebugRun {
         self.focus
     }
 
-    /// The shared window's memory-map introspection — see `DebugRun::mem_map_info`.
+    /// The shared window's memory-map introspection ([`MemMapInfo`]); `None` without a memory.
     pub fn mem_map_info(&self) -> Option<MemMapInfo> {
         self.mem.as_ref().map(|m| m.map_info())
     }
@@ -8581,7 +7647,7 @@ impl ScheduledDebugRun {
                 }
                 // The step target: the stepping thread is at an instruction at a qualifying call
                 // depth. Checked *after* the watch scan, so a watch stops a step mid-line (parity
-                // with `continue` and with `DebugRun::step_to`), and — like the scan — not for the
+                // with `continue`), and — like the scan — not for the
                 // op the thread must first step off. Depth is cumulative across a coroutine / §22
                 // invoke boundary (`VTask::debug_depth`), so a step-over of a `resume`/`invoke` runs
                 // the child to completion and a step inside its body compares child-local frames.
@@ -8598,7 +7664,7 @@ impl ScheduledDebugRun {
                     }
                 }
             }
-            apply_due_writes_sched(
+            apply_due_writes(
                 scheduled_writes,
                 write_cursor,
                 *turn,
@@ -8637,7 +7703,7 @@ impl ScheduledDebugRun {
 
     /// Step the stopped thread until its call depth is `<= max_depth` (`None` ⇒ any = one instruction),
     /// keeping other threads frozen unless the stepped thread blocks. The shared driver for the stepping
-    /// verbs — mirrors `DebugRun::step_to`.
+    /// verbs (step off the current op first, then seek the next qualifying stop).
     fn step_to(&mut self, max_depth: Option<usize>, fuel: &mut u64) -> SchedStop {
         let Some(st) = self.stopped else {
             return self.run_until_stop(fuel);
@@ -8646,14 +7712,14 @@ impl ScheduledDebugRun {
         self.drive(fuel, Some((st, max_depth)))
     }
 
-    /// **Step** one instruction — descends into a call — the multithreaded counterpart of
-    /// `DebugRun::step`. Drives the stopped thread; other threads stay frozen.
+    /// **Step** one instruction — descends into a call. Drives the stopped thread; other threads
+    /// stay frozen.
     pub fn step(&mut self, fuel: &mut u64) -> SchedStop {
         self.step_to(None, fuel)
     }
 
     /// The stopped thread's **cumulative** call depth (the child's frames count above the parent's resume
-    /// frame while it is mid-coroutine — see [`DebugRun::step_depth`]). Used by the depth-bounded verbs so
+    /// frame while it is mid-coroutine or mid-invoke — [`VTask::debug_depth`]). Used by the depth-bounded verbs so
     /// they treat a coroutine `resume` boundary like an ordinary call.
     fn step_depth(&self, s: usize) -> usize {
         self.tasks[s].vt.debug_depth()
@@ -8718,7 +7784,7 @@ impl ScheduledDebugRun {
         if let (Some(trace), Some(before)) = (sched_trace.as_mut(), pre_pick.as_ref()) {
             trace_pick_diff(before, tasks, *turn, trace);
         }
-        apply_due_writes_sched(
+        apply_due_writes(
             scheduled_writes,
             write_cursor,
             *turn,
@@ -8764,7 +7830,7 @@ impl ScheduledDebugRun {
 
     /// The powerbox host backing this run — for reading effects a debugged multithreaded guest
     /// produced (captured stdout) and its [`CapTape`](Host::cap_tape) so a reverse `seek` rebuild
-    /// replays identical cap inputs. The scheduled-engine twin of [`DebugRun::host`].
+    /// replays identical cap inputs.
     pub fn host(&self) -> &Host {
         &self.host
     }
@@ -8775,7 +7841,7 @@ impl ScheduledDebugRun {
 
     /// #1146 (deeper) — whether some thread is parked in a blocking-stdin `read` (W4): the run is live,
     /// paused at that read, and resumable once [`provide_stdin`](ScheduledDebugRun::provide_stdin)
-    /// supplies bytes. The scheduled twin of [`DebugRun::stdin_parked`].
+    /// supplies bytes.
     pub fn stdin_parked(&self) -> bool {
         self.tasks
             .iter()
@@ -8785,7 +7851,7 @@ impl ScheduledDebugRun {
     /// #1146 (deeper) — append stdin bytes for the parked blocking `read`s ([`Host::push_stdin`]) and
     /// re-admit every stdin-parked thread: the next advance re-issues each read against the new
     /// bytes, and the completed read joins the recorded cap tape so a later `seek` replays it
-    /// faithfully. The scheduled twin of [`DebugRun::provide_stdin`]; the wake is explicit (no
+    /// faithfully. The wake is explicit (no
     /// readiness poll) so the schedule stays a pure function of the recorded inputs.
     pub fn provide_stdin(&mut self, bytes: &[u8]) {
         self.host.push_stdin(bytes);
@@ -8798,8 +7864,7 @@ impl ScheduledDebugRun {
 
     /// #1366 — the completion id some thread is parked on (a host-completed cap call), if any: the
     /// lowest-index parked thread's. The backend reports it as `StopReason::CapPark { id }`;
-    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it. The scheduled twin of
-    /// `DebugRun::cap_parked`.
+    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it.
     pub fn cap_parked(&self) -> Option<u64> {
         self.tasks.iter().find_map(|t| match t.state {
             DbgTaskState::CapParked { id, .. } => Some(id),
@@ -8873,7 +7938,7 @@ impl ScheduledDebugRun {
 
     /// Whether the scheduled continuation is fully captured by the per-task active `Vm`s + the shared
     /// window bytes + the host substate + the scheduler clocks — the subset a multi-vCPU time-travel
-    /// **checkpoint** (W1) snapshots. Mirrors [`DebugRun::checkpointable`], extended over every task:
+    /// **checkpoint** (W1) snapshots, over every task:
     /// **§12 fibers** are admitted (the run-shared registry + each task's active fiber / resume chain,
     /// all sharing the run's window) except an event-parked (`memory.wait`) fiber (non-deterministic
     /// wall-clock deadline); **§14 coroutines** are admitted (not demand, pristine `nested_view`),
@@ -8889,7 +7954,7 @@ impl ScheduledDebugRun {
     fn checkpointable(&self) -> bool {
         self.host.checkpoint_safe()
             && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
-            // A task mid-§22-invoke is out-of-subset, exactly as on `DebugRun::checkpointable`.
+            // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
             && self.tasks.iter().all(|t| t.vt.active_invoke.is_none())
             && !self.fibers.iter().any(|f| {
                 matches!(
@@ -8995,7 +8060,7 @@ impl ScheduledDebugRun {
                     env: ts.env,
                     // A restored run is not parked (#1146 deeper): a captured blocking-stdin park
                     // re-admits, and the re-executed read is served from the cap tape (or re-parks
-                    // at the frontier) — the scheduled twin of `DebugRun::restore`'s rule.
+                    // at the frontier).
                     state: match &ts.state {
                         DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. } => {
                             DbgTaskState::Runnable
@@ -9009,8 +8074,7 @@ impl ScheduledDebugRun {
         snap.restore_host(&mut self.host);
         self.turn = turn;
         self.clock = c.clock;
-        self.stopped = None;
-        self.focus = 0;
+        self.locate(); // stepping-ready: the stop state rederives from the restored task states
         self.last_watch = None;
     }
 
@@ -9089,6 +8153,19 @@ impl ScheduledDebugRun {
         self.reader().frame_pc(depth)
     }
 
+    /// Block-local SSA value `idx` in the focused thread's frame `depth` levels from the top, typed —
+    /// the bytecode counterpart of `Inspector::read_ir_value`. `None` for a cross-module frame, a bad
+    /// `idx`, or past the stack. A not-yet-computed slot reads as its default; the caller compares only
+    /// the defined prefix (where `read_ir_value` returns `Some`).
+    pub fn value_in_frame(&self, depth: usize, idx: usize) -> Option<Value> {
+        self.reader().value_in_frame(depth, idx)
+    }
+
+    /// The focused thread's running frame's block-local SSA value `idx` ([`value_in_frame`] at depth 0).
+    pub fn value(&self, idx: usize) -> Option<Value> {
+        self.value_in_frame(0, idx)
+    }
+
     /// Read a source variable by name in the focused thread's frame `depth` levels from the top.
     pub fn read_var(&self, depth: usize, name: &str, width: usize) -> Option<VarValue> {
         self.reader().read_var(depth, name, width)
@@ -9099,7 +8176,12 @@ impl ScheduledDebugRun {
         self.reader().var_addr(depth, name)
     }
 
-    /// Write a source variable in the **focused** thread's frame — see `DebugRun::write_var`.
+    /// **Write a source variable by name** in the **focused** thread's frame (slice 8, the DAP
+    /// `setVariable` backend): a promoted SSA scalar takes `value` coerced to its slot type (integers
+    /// only); a memory-located var takes `value`'s low `width` bytes little-endian at its resolved
+    /// window address. Refused (`false`) for float slots or an unresolvable name — fail-closed, never a
+    /// guess. The DAP backend records successful writes and re-applies them at the same turn on every
+    /// seek replay.
     pub fn write_var(&mut self, depth: usize, name: &str, value: i64, width: usize) -> bool {
         let focus = self.focus;
         if self.tasks.get(focus).is_none() {
@@ -9130,7 +8212,8 @@ impl ScheduledDebugRun {
         }
     }
 
-    /// Write bytes into the shared guest window — see `DebugRun::write_window`.
+    /// **Write bytes into the shared guest window** (slice 8, the DAP `writeMemory` backend). `false`
+    /// if the range is unmapped or the module has no memory.
     pub fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
         self.mem
             .as_mut()
@@ -9656,7 +8739,7 @@ fn sched_wall_deadline(_timeout: u64) -> u64 {
 /// A §12 fiber's state in the driver's per-vCPU registry (handle = index). A durable run maintains the
 /// per-context shadow-SP swap ([`shadow_switch`]) and, on freeze, flattens each `Parked` fiber into its
 /// shadow region ([`freeze_drive`]); on thaw a flattened fiber is re-seeded as `Pending`. `Clone` for
-/// time-travel checkpointing (W1): a fiber-carrying `DebugRun` snapshots its whole registry — each
+/// time-travel checkpointing (W1): a fiber-carrying `ScheduledDebugRun` snapshots its whole registry — each
 /// fiber `Vm` shares the one window (snapshotted separately), so a clone is a faithful deep copy.
 #[derive(Clone)]
 enum FiberState {
@@ -9770,8 +8853,8 @@ struct VTask {
     /// fiber switch so a freeze poll spills into the *running* context's region. Only meaningful on a
     /// durable run; `super::SHADOW_BASE` (context 0's region base) otherwise.
     root_shadow_sp: u64,
-    /// Debug **step-into** of a §22 `Jit.invoke`d unit — `Some` while a debug engine ([`DebugRun`] or
-    /// [`ScheduledDebugRun`], #1517 slice 3) is stepping inside one, `None` otherwise and always on a
+    /// Debug **step-into** of a §22 `Jit.invoke`d unit — `Some` while the debug engine
+    /// ([`ScheduledDebugRun`], #1517 slice 3) is stepping inside one, `None` otherwise and always on a
     /// production task (only [`debug_advance_fiber`] arms it). An invoked unit is seam-free (a
     /// `cont.*`/`spawn`/re-invoke inside it `CapFault`s), so no scheduler seam can occur mid-invoke;
     /// a checkpoint mid-invoke is refused on both engines (`checkpointable`), since the unit's
@@ -15446,10 +14529,10 @@ struct ByteSetJmp {
     dst: u32,
 }
 
-// `Clone` for time-travel checkpointing (DEBUGGING.md W1): a single-vCPU `DebugRun` snapshots its
+// `Clone` for time-travel checkpointing (DEBUGGING.md W1): a `ScheduledDebugRun` snapshots each task's
 // active `Vm` into the `seek` checkpoint ladder. Every field is a plain value or read-only `Arc`
 // (`jit_eligible` — the tier-up bitmap, shared not mutated), so this is a faithful deep copy; the
-// guest page store is **not** here (it lives in `DebugRun::mem`, snapshotted separately via
+// guest page store is **not** here (it lives in `ScheduledDebugRun::mem`, snapshotted separately via
 // `Mem::window_snapshot`), so cloning a `Vm` never aliases another run's memory.
 #[derive(Clone)]
 struct Vm {

@@ -289,9 +289,9 @@ machinery *inside* a bulk resume at 2-3%; this is a different, much larger cost.
 WHY A COARSER TURN IS NOT A ONE-LINE CHANGE — three things that had to be checked, two of which
 corrected an earlier reading of mine:
 
-  1. The loop a single-vCPU `continue` runs is `DebugRun::run_to`, reached from the DAP backend as
-     `run.run_to(&self.breakpoints, ..)`. The scheduler's `drive()` is the **threaded** path, and a
-     guest like the ones here never enters it.
+  1. The loop a `continue` runs is `ScheduledDebugRun::drive()`, reached from the DAP backend as
+     `run.run_until_stop(..)` (since #1517 slice 4 the one-task and threaded cases are the same
+     path; before it, a spawn-free guest ran the former `DebugRun::run_to`).
   2. The live `continue` lays **no checkpoints** — `maybe_checkpoint` is called only from
      `drive_single_to`, the replay/seek path, and the time-travel ladder is populated lazily on a
      seek. So `CHECKPOINT_STRIDE` does *not* bound how much a live run may advance per turn.

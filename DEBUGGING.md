@@ -534,6 +534,18 @@ different things depending on which pair you compare:
   `ThreadFault` on the production engine too — an invalid VM combination — so the scheduled coverage uses a
   coroutine driven through the scheduler on its own vCPU.)
 
+  **`DebugRun` collapsed into `ScheduledDebugRun` (#1517 slice 4).** The two bytecode debug engines
+  were one behaviour on two routes: a single-vCPU run *is* a scheduled run with one task. Once the
+  scheduled engine carried every capability the single one had — the host-completed cap park (slice 1),
+  value watches (slice 2), and `Jit.invoke` step-into (slice 3) — `DebugRun` was **deleted**, not
+  aliased (INVARIANTS #15; the acceptance of #1517). `Engine` no longer exists; the DAP `BytecodeBackend`
+  holds one `ScheduledDebugRun` and its ~76 two-arm matches became straight calls. A spawn-free guest is
+  simply a one-task schedule: it steps, watches, checkpoints, and traces its turns identically, so
+  `module_spawns_threads` now only gates whether a schedule *seed* is meaningful (it is not, with one
+  vCPU). The one time coordinate is the global `turn`. The historical slice entries above say "the
+  single-vCPU `DebugRun`" for what, at the time, was a distinct engine; that engine is now the one-task
+  case of the scheduled one.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus

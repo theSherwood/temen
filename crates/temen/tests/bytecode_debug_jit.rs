@@ -1,17 +1,17 @@
 //! Debugging the §22 guest-driven **`Jit` capability** (iface 11: `compile`/`install`/`uninstall`/
 //! `invoke`) on the interpreter debug engines. Before this slice the debug drivers declined every
-//! §22 op — the single-vCPU `DebugRun` trapped `Malformed`, the `ScheduledDebugRun` returned
+//! §22 op — the former single-vCPU `DebugRun` trapped `Malformed`, the `ScheduledDebugRun` returned
 //! `Declined` — so a guest-JIT program fell back to the tree-walker oracle instead of being
 //! debuggable over bytecode. Now the ops are serviced **inline in `debug_advance_fiber`** (they mutate
-//! only the stepping vCPU + the shared dispatch table, spawning no scheduler task), so both engines
-//! step a §22 program op-by-op, breakpoints fire around the ops, and the result stays bit-identical to
+//! only the stepping vCPU + the shared dispatch table, spawning no scheduler task), so the engine
+//! steps a §22 program op-by-op, breakpoints fire around the ops, and the result stays bit-identical to
 //! the tree-walker oracle + the production bytecode engine.
 //!
-//! `invoke` runs the submitted unit to completion as a **seam-free leaf** (stepping *over* it, matching
-//! production `run_invoke`); `install` + `call.dyn` steps op-by-op like any module-≥1 frame.
+//! `install` + `call.dyn` steps op-by-op like any module-≥1 frame; `invoke` **steps into** the
+//! submitted unit (#1517 slice 3 — it was a seam-free leaf before).
 
 use temen_encode::encode_module;
-use temen_interp::bytecode::{DebugRun, SchedBreak, SchedStop, ScheduledDebugRun};
+use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, IrPc, Trap, Value};
 use temen_ir::Data;
 use temen_run::grant_jit;
@@ -75,6 +75,16 @@ fn sched_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value
     }
 }
 
+/// Arm `bps` and run to the next breakpoint (its pc) or completion (`None`).
+fn run_to(run: &mut ScheduledDebugRun, bps: &[IrPc], fuel: &mut u64) -> Option<IrPc> {
+    run.set_breakpoints(bps.to_vec());
+    match run.run_until_stop(fuel) {
+        SchedStop::Break { pc, .. } => Some(pc),
+        SchedStop::Finished(_) => None,
+        other => panic!("unexpected §22 debug stop {other:?}"),
+    }
+}
+
 /// **old→new via `install`, under the debugger.** Guest `(jit, a, b)`: compile a unit, `install` it,
 /// `call.dyn` the returned slot with `(a, b)`. The unit is `(a,b) -> a*b + 100`, so `(6,7) → 142`.
 /// Both debug engines must run it to completion (no decline) and agree with the tree-walker oracle;
@@ -104,24 +114,21 @@ fn debug_install_then_call_indirect_agrees() {
         "oracle: 6*7+100 = 142, got {want:?}"
     );
 
-    // Single-vCPU DebugRun, driven to completion (a §22 program has no threads).
-    let mut run = DebugRun::new_with_host(&m, 0, &args, host).expect("debug engine drives §22");
+    // Driven to completion: the §22 ops are serviced inline, not declined to the tree-walker.
+    let mut run =
+        ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("debug engine drives §22");
     let mut fuel = 50_000_000u64;
     assert_eq!(
-        run.run_to(&[], &mut fuel),
-        None,
-        "run to completion (no breakpoints), not a mid-run decline"
-    );
-    assert_eq!(
-        run.result().cloned(),
-        Some(want.clone()),
-        "single-vCPU DebugRun result must match the tree-walker oracle"
+        sched_to_end(&mut run, &mut fuel),
+        want,
+        "debug-engine result must match the tree-walker oracle"
     );
 
     // A breakpoint at inst 4 (`i32.wrap_i64`, right after the `install` at inst 3) must fire — which
     // is only reachable if the install executed and did not decline to the tree-walker.
     let (host2, _) = jit_host(&m, 4);
-    let mut run2 = DebugRun::new_with_host(&m, 0, &args, host2).expect("debug engine drives §22");
+    let mut run2 =
+        ScheduledDebugRun::new_with_host(&m, 0, &args, host2).expect("debug engine drives §22");
     let after_install = IrPc {
         module: 0,
         func: 0,
@@ -130,24 +137,13 @@ fn debug_install_then_call_indirect_agrees() {
     };
     let mut fuel2 = 50_000_000u64;
     assert_eq!(
-        run2.run_to(&[after_install], &mut fuel2),
+        run_to(&mut run2, &[after_install], &mut fuel2),
         Some(after_install),
         "breakpoint after the install op must fire (the install was serviced, not declined)"
     );
     // …and continuing from there still reaches the same result.
-    assert_eq!(run2.run_to(&[], &mut fuel2), None);
-    assert_eq!(run2.result().cloned(), Some(want.clone()));
-
-    // The scheduled engine must service it too (same guest; no threads, but proves the twin path).
-    let (host3, _) = jit_host(&m, 4);
-    let mut sched = ScheduledDebugRun::new_with_host(&m, 0, &args, host3)
-        .expect("scheduled debug engine drives §22");
-    let mut fuel3 = 50_000_000u64;
-    assert_eq!(
-        sched_to_end(&mut sched, &mut fuel3),
-        want,
-        "ScheduledDebugRun result must match the oracle"
-    );
+    run2.set_breakpoints(Vec::new());
+    assert_eq!(sched_to_end(&mut run2, &mut fuel2), want.clone());
 }
 
 /// **`invoke` under the debugger — result agreement.** Guest `(jit, a, b)`: compile a unit and `invoke`
@@ -175,21 +171,14 @@ fn debug_invoke_agrees() {
         "oracle: 6+7 = 13, got {want:?}"
     );
 
-    let mut run =
-        DebugRun::new_with_host(&m, 0, &args, host).expect("debug engine drives §22 invoke");
+    let mut run = ScheduledDebugRun::new_with_host(&m, 0, &args, host)
+        .expect("debug engine drives §22 invoke");
     let mut fuel = 50_000_000u64;
-    assert_eq!(run.run_to(&[], &mut fuel), None, "invoke run to completion");
     assert_eq!(
-        run.result().cloned(),
-        Some(want.clone()),
-        "invoked-unit result must match the oracle (seam-free leaf)"
+        sched_to_end(&mut run, &mut fuel),
+        want,
+        "invoked-unit result must match the oracle"
     );
-
-    let (host2, _) = jit_host(&m, 0);
-    let mut sched = ScheduledDebugRun::new_with_host(&m, 0, &args, host2)
-        .expect("scheduled debug engine drives §22 invoke");
-    let mut fuel2 = 50_000_000u64;
-    assert_eq!(sched_to_end(&mut sched, &mut fuel2), want);
 }
 
 /// **Step *into* an invoked unit** — on both engines (#1517 slice 3: the scheduled engine used to keep
@@ -229,12 +218,11 @@ fn debug_invoke_step_into_breakpoint() {
         block: 0,
         inst: 1,
     };
-    let mut run =
-        DebugRun::new_with_host(&m, 0, &args, host).expect("debug engine drives §22 invoke");
+    let mut run = ScheduledDebugRun::new_with_host(&m, 0, &args, host)
+        .expect("debug engine drives §22 invoke");
     let mut fuel = 50_000_000u64;
-    let stop = run.run_to(&[inside_unit], &mut fuel);
     assert_eq!(
-        stop,
+        run_to(&mut run, &[inside_unit], &mut fuel),
         Some(inside_unit),
         "breakpoint INSIDE the invoked unit (module 1) must fire — the debugger stepped into invoke"
     );
@@ -245,38 +233,15 @@ fn debug_invoke_step_into_breakpoint() {
         "the running frame at the breakpoint is the invoked unit's (module 1)"
     );
     // Step out of the unit: back in the caller (module 0), then to completion, matching the oracle.
-    assert_eq!(
-        run.step_out(&mut fuel).map(|pc| pc.module),
-        Some(0),
-        "step_out from inside the unit lands in the caller"
-    );
-    assert_eq!(run.run_to(&[], &mut fuel), None);
-    assert_eq!(run.result().cloned(), Some(want.clone()));
-
-    // The scheduled engine: the same breakpoint inside the unit fires on the (sole) thread, the top
-    // frame is the unit's, step_out lands in the caller, and the run completes with the same result.
-    let (host2, _) = jit_host(&m, 0);
-    let mut sched = ScheduledDebugRun::new_with_host(&m, 0, &args, host2)
-        .expect("scheduled debug engine drives §22 invoke");
-    let mut fuel2 = 50_000_000u64;
-    sched.set_breakpoints(vec![inside_unit]);
+    run.set_breakpoints(Vec::new());
     assert!(
         matches!(
-            sched.run_until_stop(&mut fuel2),
-            SchedStop::Break { pc, reason: SchedBreak::Breakpoint } if pc == inside_unit
-        ),
-        "breakpoint INSIDE the invoked unit fires on the scheduled engine too"
-    );
-    assert_eq!(sched.frame_pc(0).map(|pc| pc.module), Some(1));
-    assert!(
-        matches!(
-            sched.step_out(&mut fuel2),
+            run.step_out(&mut fuel),
             SchedStop::Break { pc, reason: SchedBreak::Step } if pc.module == 0
         ),
-        "scheduled step_out from inside the unit lands in the caller"
+        "step_out from inside the unit lands in the caller"
     );
-    sched.set_breakpoints(Vec::new());
-    assert_eq!(sched_to_end(&mut sched, &mut fuel2), want);
+    assert_eq!(sched_to_end(&mut run, &mut fuel), want.clone());
 }
 
 /// **Fail-closed under the debugger.** A `Jit.install` / `Jit.invoke` of a **forged** code handle
@@ -309,27 +274,13 @@ fn debug_forged_handle_traps_identically() {
             "forged handle must trap on the oracle, got {want:?}"
         );
 
-        let mut run = DebugRun::new_with_host(&m, 0, &args, host).expect("debug engine builds");
+        let mut run =
+            ScheduledDebugRun::new_with_host(&m, 0, &args, host).expect("debug engine builds");
         let mut fuel = 50_000_000u64;
         assert_eq!(
-            run.run_to(&[], &mut fuel),
-            None,
-            "trapping run reaches no breakpoint"
-        );
-        assert_eq!(
-            run.result().cloned(),
-            Some(want.clone()),
-            "single-vCPU DebugRun must trap identically to the oracle (forged handle)"
-        );
-
-        let (host2, _) = jit_host(&m, 4);
-        let mut sched =
-            ScheduledDebugRun::new_with_host(&m, 0, &args, host2).expect("scheduled engine builds");
-        let mut fuel2 = 50_000_000u64;
-        assert_eq!(
-            sched_to_end(&mut sched, &mut fuel2),
+            sched_to_end(&mut run, &mut fuel),
             want,
-            "ScheduledDebugRun must trap identically to the oracle (forged handle)"
+            "the debug engine must trap identically to the oracle (forged handle)"
         );
     }
 }

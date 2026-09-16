@@ -1293,8 +1293,7 @@ fn dap_over_bytecode_multithreaded_wait_notify() {
 
 // A generator fiber: the root cont.new's + cont.resume's a fiber that suspends (11) then returns (25);
 // the root sums 11+25 = 36. The fiber's `v1 = i64.add varg v0` is line 17 (leading newline = line 1).
-// Drives §12 fiber debugging on the single-vCPU engine over DAP (a fiber-only program is spawn-free, so
-// it routes to the single-vCPU `DebugRun`).
+// Drives §12 fiber debugging over DAP (a fiber-only program is spawn-free: a one-task schedule).
 const SUSPEND_ROUNDTRIP: &str = r#"
 func () -> (i64) {
 block 0 () {
