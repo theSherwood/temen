@@ -1138,6 +1138,27 @@ impl Translator {
                 bytes[off..off + ebytes.len()].copy_from_slice(&ebytes);
                 relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
                 funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
+            } else if ka[1].tag() == Some("oconstr") {
+                // A **nested aggregate field** — most often a `string`, which nimony lowers to an SSO
+                // object: `(kv name (oconstr string (kv bytes <packed>) (kv more (nil))))`. Same
+                // treatment as the inline-array arm above: materialize it recursively at the field's
+                // offset and shift its relocations. Without this arm any object holding a string fell
+                // to the placeholder path, so a module-level `let s = Shape(name: "sq", area: 16)`
+                // failed the whole link with "non-scalar-int global initializer" (#1444).
+                let Some((ebytes, _, erelocs, efrelocs)) = self.const_aggregate_bytes(&ka[1])?
+                else {
+                    return Ok(None);
+                };
+                if bytes.len() < off + ebytes.len() {
+                    bytes.resize(off + ebytes.len(), 0);
+                }
+                bytes[off..off + ebytes.len()].copy_from_slice(&ebytes);
+                relocs.extend(erelocs.into_iter().map(|(at, t)| (at + off as u64, t)));
+                funcrelocs.extend(efrelocs.into_iter().map(|(at, s)| (at + off as u64, s)));
+            } else if ka[1].tag() == Some("nil") {
+                // An explicit null pointer field — an SSO string's `more` when the text fits inline.
+                // The blob is already zeroed, so this is a no-op; it exists to stop `(nil)` falling
+                // through to the placeholder path and discarding the whole aggregate.
             } else if matches!(peel_cast(&ka[1]).as_atom(), Some(s) if self.proc_names.contains(s))
             {
                 // A **funcref pointer field** — a bare/`cast`-wrapped proc symbol in a pointer slot.
@@ -3038,6 +3059,15 @@ impl<'a> FuncGen<'a> {
                         return Ok((v.id, desc));
                     }
                 }
+                // A **pointer-typed local** used where an object is expected — C's `p->f`, which
+                // hexer writes as `(dot p f 0)` with no `deref` in the generated `=copy`/`=destroy`
+                // hooks of a variant object. Its slot value *is* the address, pointing at the
+                // pointee: the same rule as the aggregate param above, one indirection further out.
+                if let Some(TyDesc::Ptr(pointee)) = self.local_desc.get(name).cloned() {
+                    if let Some(v) = self.lookup(name) {
+                        return Ok((v.id, *pointee));
+                    }
+                }
                 // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
                 // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
                 // and `indirect_callee` recover the `call.dyn` signature.
@@ -3049,7 +3079,9 @@ impl<'a> FuncGen<'a> {
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
                 // scalar; the linker binds it, and an unresolved name is a fail-closed link error.
                 // (A runnable module has nothing to bind to, so it stays the error below.)
-                if self.t.link_mode {
+                // A name this proc *declares* is never that: silently aliasing a local to a foreign
+                // symbol is a miscompile, so it falls to the error below instead (#1480).
+                if self.t.link_mode && !self.local_desc.contains_key(name) {
                     let addr = self.emit_data_sym(name, 0);
                     return Ok((addr, TyDesc::Scalar(ValType::I64)));
                 }
@@ -3312,7 +3344,11 @@ impl<'a> FuncGen<'a> {
                 )));
             }
         }
-        Err(LengError::Unsupported("`dot` on a non-object".into()))
+        // Name the field and the base's descriptor: "`dot` on a non-object" alone gives whoever hits
+        // this nothing to search for, and the base is exactly what went wrong.
+        Err(LengError::Unsupported(format!(
+            "`dot` field `{fname}` on a non-object base ({bdesc:?})"
+        )))
     }
 
     /// Element `(size, type)` of an array descriptor.
