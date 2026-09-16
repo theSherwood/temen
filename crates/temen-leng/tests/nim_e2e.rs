@@ -1502,6 +1502,10 @@ const STD_MODULES: &[&str] = &[
     // Runnable since #1498 taught the sret import path to coerce args to the callee's param types.
     "macros",
     "nifply",
+    // Runnable since #1499 made the generic atomic leaves bind by signature, not by name.
+    "locks",
+    "rlocks",
+    "ticketlocks",
     "strutils",
     "sequtils",
     "algorithm",
