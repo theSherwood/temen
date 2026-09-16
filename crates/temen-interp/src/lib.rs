@@ -12252,9 +12252,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             //
                             // Re-lift this together with that capture, not before.
                             let durable = host.lock_unpoisoned().is_durable();
+                            // #1501 — §4's other half, mirrored from the nested arm: *a durable
+                            // domain admits only freezable modules*. An un-instrumented child could
+                            // never drain-then-unwind, so once the gate above lifts this is what
+                            // keeps a durable parent's detached child capturable at all. Inert
+                            // behind the `!durable` gate today; load-bearing the moment it comes out.
+                            let mod_durable_ok = !durable || cm.durable;
                             let admitted = ok_entry
                                 && child_size != 0
                                 && mod_ok
+                                && mod_durable_ok
                                 && payload_ok
                                 && premap_ok
                                 && !durable
@@ -12272,6 +12279,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
                                 let mut ch = Host::new();
+                                // §4: *a durable domain may only spawn durable children* — the
+                                // detached child inherits the bit exactly as a nested one does (the
+                                // nested arm above), so its own spawns/fibers reserve shadow state
+                                // and its own instantiates re-apply the admission rule. #1501: this
+                                // was the half the detached arm never had. Inert behind the
+                                // `!durable` gate; without it a re-lift spawns a child no freeze
+                                // could ever capture.
+                                ch.set_durable(durable);
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
                                     hg.detached_child_attestation()
@@ -12454,6 +12469,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             cdt,
                                         );
                                         child.memop = memop;
+                                        // §4 / #1501: the vCPU's durable bit too, as the nested arm
+                                        // sets it — the shadow-SP bookkeeping keys on this, not the
+                                        // host's.
+                                        child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
                                         Box::new(child)
                                     });
@@ -23430,7 +23449,15 @@ impl Host {
         reservation: u64,
     ) -> Option<(Host, i32, i32)> {
         let attestation = self.detached_child_attestation();
-        self.spawn_child_powerbox(grants, reservation, attestation)
+        // §4 / #1501: the detached child inherits the spawner's durability, as the tree-walker's
+        // op-15 arm sets it (this builder is the native path's twin of that arm).
+        // `spawn_child_powerbox` itself stays durability-neutral — its nested callers carry the bit on
+        // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
+        // this builder's to decide.
+        let durable = self.durable;
+        let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
+        ch.set_durable(durable);
+        Some((ch, cinst, cas))
     }
 
     fn spawn_child_powerbox(
