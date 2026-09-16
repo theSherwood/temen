@@ -1213,6 +1213,160 @@ pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
         && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
 }
 
+/// A §5 `instantiate_detached` (op 15) child as every bytecode driver builds it — the **one
+/// definition** of admission and of the child powerbox (INVARIANTS #15), shared by the cooperative
+/// executor (`drive`), the OS-thread parallel driver (`run_vcpu_parallel`) and the debug scheduler
+/// (`dbg_instantiate_detached`). Only *how the child is scheduled* differs per driver: an executor
+/// task, an OS thread, a debug task.
+struct DetachedChild {
+    /// The child's fresh window (`Mem::with_reservation`, its own guard — not a carve), seeded with
+    /// the module's data, the args payload at `module_args_base()`, and any pre-mapped region.
+    mem: Mem,
+    /// The child powerbox: starter `Instantiator`/`AddressSpace` over the reservation, the by-name
+    /// re-grants, the staged pre-map, the manifest bound (leniently for a child of the running
+    /// module, #1234).
+    host: Host,
+    /// The child module compiled to bytecode, manifest attached — the driver pushes it to its source.
+    compiled: Compiled,
+    /// The entry's arguments: the starter `Instantiator` (plus `AddressSpace` for a two-arg entry).
+    args: Vec<Value>,
+    /// The child's fuel: the op's quota clamped to the parent's remaining fuel.
+    fuel: u64,
+}
+
+/// Admit an op-15 spawn against `host` (the parent powerbox) and build the child. `pm` is the
+/// parent's window (the grant list and the args payload are read from it); `parent_fuel` its
+/// remaining fuel. `Ok(None)` is a **probeable refusal** — the driver lands `-EINVAL` and nothing
+/// was charged; `Err` is a trap (a forged handle, an unreadable payload). The checks — entry shape,
+/// the window = the module's declared memory, the payload fitting the args area, `premap_admit`,
+/// no durable domain — run before the `Budget.mem` take, so a refusal charges nothing.
+#[allow(clippy::too_many_arguments)]
+fn admit_detached_child(
+    host: &mut Host,
+    pm: Option<&Mem>,
+    parent_fuel: u64,
+    budget: i32,
+    mh: i32,
+    entry: i64,
+    size_log2: i64,
+    quota: i64,
+    grants: Option<(u64, u64)>,
+    args: Option<(u64, u64)>,
+    premap: Option<(i32, u64)>,
+) -> Result<Option<DetachedChild>, Trap> {
+    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow) = {
+        let g = host.resolve_module(mh)?;
+        (
+            g.funcs.clone(),
+            g.memory_log2,
+            g.data.clone(),
+            g.imports.clone(),
+            g.types.clone(),
+            std::sync::Arc::clone(&g.module),
+            g.shadow,
+        )
+    };
+    let compiled = compile_module(&cfuncs, &ctypes, cshadow)
+        .ok_or(Trap::Malformed)?
+        .with_manifest(cimports, ctypes);
+    let sig = compiled.sigs.get(entry as usize);
+    let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
+    let child_size = if (0..64).contains(&size_log2) {
+        1u64 << size_log2
+    } else {
+        0
+    };
+    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+    let payload: Vec<u8> = match args {
+        Some((ptr, len)) => pm.ok_or(Trap::Malformed)?.read_window(ptr, len as usize)?,
+        None => Vec::new(),
+    };
+    let payload_ok =
+        payload.len() as u64 <= temen_ir::module_args_end() - temen_ir::module_args_base();
+    // The op-11 record format: `{name_off u32, name_len u32, handle i32, _ u32}`, fail-closed on a
+    // handle the parent may not re-grant.
+    let mut glist: Vec<(String, i32)> = Vec::new();
+    if let Some((gptr, gn)) = grants {
+        let m = pm.ok_or(Trap::Malformed)?;
+        for i in 0..gn {
+            let rec = m.read_window(gptr + i * 16, 16)?;
+            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+            let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+            let name = String::from_utf8(m.read_window(name_off, name_len)?)
+                .map_err(|_| Trap::CapFault)?;
+            if !host.can_regrant(gh) {
+                return Err(Trap::CapFault);
+            }
+            glist.push((name, gh));
+        }
+    }
+    let premap_ok = match premap {
+        Some((r, o)) => host.premap_admit(r, o, child_size)?,
+        None => true,
+    };
+    if !ok_entry
+        || child_size == 0
+        || !mod_ok
+        || !payload_ok
+        || !premap_ok
+        || host.is_durable()
+        || !host.budget_mem_take(budget, child_size)
+    {
+        return Ok(None);
+    }
+    let mut mem = Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow);
+    mem.init_data(&cdata);
+    mem.seed_null_guard(temen_ir::module_null_guard());
+    if !payload.is_empty() {
+        let _ = mem.write_bytes(temen_ir::module_args_base(), &payload);
+    }
+    let mut child_host = Host::new();
+    child_host.set_attestation(host.detached_child_attestation());
+    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+    let cinst = child_host.grant_instantiator(0, reservation);
+    let cas = child_host.grant_address_space(0, reservation);
+    for (name, gh) in &glist {
+        if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
+            child_host.register_cap_name(name, cg);
+        }
+    }
+    if let Some((r, o)) = premap {
+        if !(host.stage_premap(r, o, &mut child_host) && child_host.apply_premap(&mut mem) >= 0) {
+            return Err(Trap::Malformed);
+        }
+    }
+    child_host.set_self_module(&cmodule);
+    // A child of the running module itself binds leniently (#1234 — its manifest is the parent's
+    // whole import surface, not one written for the child).
+    let bound = if host.is_self_module(mh) {
+        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
+    } else {
+        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
+    };
+    if bound.is_err() {
+        return Ok(None);
+    }
+    let args = if want_as {
+        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+    } else {
+        vec![Value::I64(cinst as i64)]
+    };
+    let fuel = if quota <= 0 {
+        parent_fuel
+    } else {
+        (quota as u64).min(parent_fuel)
+    };
+    Ok(Some(DetachedChild {
+        mem,
+        host: child_host,
+        compiled,
+        args,
+        fuel,
+    }))
+}
+
 pub fn compile_module(
     funcs: &[Func],
     types: &[temen_ir::TypeEntry],
@@ -3104,8 +3258,8 @@ pub enum VcpuEvent {
     /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
     /// carve. A spawn with a grant list and/or a pre-mapped region stashes the child powerbox
     /// ([`Vcpu::take_granted_host`] is `Some`); the pre-map rides it and the child constructor applies
-    /// it, so a driver needs no extra step — a driver whose emitted tier cannot honour a §13 alias
-    /// checks `Host::has_premap` and runs such a child on the interpreter.
+    /// it, so a driver needs no extra step — a driver whose emitted tier cannot alias
+    /// [`Host::take_premap`]s it instead and copies the region in before / out after the run.
     InstantiateDetached {
         module: u32,
         entry: u32,
@@ -6689,13 +6843,27 @@ fn service_advance(
                     dbg_complete(tasks, ti, Err(t));
                 }
             }
-            // §5 `instantiate_detached` (op 15): the debugger path mints no windows, so it declines
-            // exactly as the cooperative driver does (#1415). This was `Trap::Malformed`, which ended
-            // the debuggee — the worst place to kill a domain for an op the guest may well handle on
-            // its own error path. Declining keeps the session alive and steppable.
-            Outcome::InstantiateDetached { dst, .. } => {
+            // §5 `instantiate_detached` (op 15): a fresh window of its own as a debug task — the
+            // cooperative executor's spawn on this path, so a spawning guest stays steppable through
+            // its child (a `DbgEnv` over the child's own `Mem`, joined like a confined child's).
+            Outcome::InstantiateDetached {
+                budget,
+                mh,
+                entry,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                args,
+                premap,
+            } => {
                 *turn += 1;
-                tasks[ti].vt.active.decline_unsupported(dst);
+                if let Err(t) = dbg_instantiate_detached(
+                    tasks, ti, extra_envs, source, mem, *fuel, host, budget, mh, entry, size_log2,
+                    quota, grants, args, premap, dst,
+                ) {
+                    dbg_complete(tasks, ti, Err(t));
+                }
             }
             // §14 `instantiate_module` (op 5): a confined child running a granted separate module.
             Outcome::InstantiateModule {
@@ -7023,6 +7191,88 @@ fn dbg_instantiate_module(
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem: child_mem,
+        host: child_host,
+        table: child_table,
+        fuel: child_fuel,
+    });
+    let cidx = tasks.len();
+    tasks.push(DbgTask {
+        vt: child_vt,
+        threads: Vec::new(),
+        env: Some(eidx),
+        state: DbgTaskState::Runnable,
+        at_bp: false,
+    });
+    let handle = tasks[ti].threads.len() as i32;
+    tasks[ti].threads.push(Some(cidx));
+    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
+    Ok(())
+}
+
+/// §5 `instantiate_detached` (op 15) on the debugger path — [`dbg_instantiate_module`]'s twin over a
+/// **fresh window** instead of a carve. Admission and the child powerbox are [`admit_detached_child`]
+/// (the executor's); the child is a `DbgTask` over its own `DbgEnv`, joined like a confined child's.
+#[allow(clippy::too_many_arguments)]
+fn dbg_instantiate_detached(
+    tasks: &mut Vec<DbgTask>,
+    ti: usize,
+    extra_envs: &mut Vec<DbgEnv>,
+    source: &ModuleSource,
+    shared_mem: &Option<Mem>,
+    shared_fuel: u64,
+    host: &mut Host,
+    budget: i32,
+    mh: i32,
+    entry: i64,
+    size_log2: i64,
+    quota: i64,
+    grants: Option<(u64, u64)>,
+    args: Option<(u64, u64)>,
+    premap: Option<(i32, u64)>,
+    dst: u32,
+) -> Result<(), Trap> {
+    let pm: Option<&Mem> = match tasks[ti].env {
+        None => shared_mem.as_ref(),
+        Some(k) => extra_envs[k].mem.as_ref(),
+    };
+    let pfuel = match tasks[ti].env {
+        None => shared_fuel,
+        Some(k) => extra_envs[k].fuel,
+    };
+    let Some(child) = admit_detached_child(
+        host, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
+    )?
+    else {
+        tasks[ti]
+            .vt
+            .active
+            .set(dst, Reg::from_i32(super::EINVAL as i32));
+        return Ok(());
+    };
+    let live = tasks
+        .iter()
+        .filter(|t| !matches!(t.state, DbgTaskState::Done(_)))
+        .count();
+    if live >= super::MAX_VCPUS {
+        return Err(Trap::ThreadFault);
+    }
+    let DetachedChild {
+        mem: fm,
+        host: child_host,
+        compiled: child_compiled,
+        args: child_args,
+        fuel: child_fuel,
+    } = child;
+    let progs_len = child_compiled.progs.len();
+    let cm = source.push(child_compiled);
+    let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
+    let cunit = source.get(cm).ok_or(Trap::Malformed)?;
+    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
+    child_vt.active.module = cm;
+    child_vt.active.home = cm;
+    let eidx = extra_envs.len();
+    extra_envs.push(DbgEnv {
+        mem: Some(fm),
         host: child_host,
         table: child_table,
         fuel: child_fuel,
@@ -12225,115 +12475,30 @@ impl CoopSched {
                     args,
                     premap,
                 }) => {
-                    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow) =
-                        match host.resolve_module(mh) {
-                            Ok(g) => (
-                                g.funcs.clone(),
-                                g.memory_log2,
-                                g.data.clone(),
-                                g.imports.clone(),
-                                g.types.clone(),
-                                std::sync::Arc::clone(&g.module),
-                                g.shadow,
-                            ),
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                        };
-                    let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
-                        Some(c) => c.with_manifest(cimports, ctypes),
-                        None => {
-                            complete(tasks, ti, Err(Trap::Malformed));
-                            continue;
-                        }
-                    };
-                    let want_as = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-                    let ok_entry = child_compiled
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, r)| child_entry_ok(p, r));
-                    let child_size = if (0..64).contains(&size_log2) {
-                        1u64 << size_log2
-                    } else {
-                        0
-                    };
-                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
                     let pm: Option<&Mem> = match tasks[ti].env {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    let payload: Vec<u8> = match args {
-                        Some((ptr, len)) => match pm
-                            .ok_or(Trap::Malformed)
-                            .and_then(|m| m.read_window(ptr, len as usize))
-                        {
-                            Ok(p) => p,
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                        },
-                        None => Vec::new(),
+                    let pfuel = match tasks[ti].env {
+                        None => *fuel,
+                        Some(k) => extra_envs[k].fuel,
                     };
-                    let payload_ok = payload.len() as u64
-                        <= temen_ir::module_args_end() - temen_ir::module_args_base();
-                    let glist: Result<Vec<(String, i32)>, Trap> = (|| {
-                        let Some((gptr, gn)) = grants else {
-                            return Ok(Vec::new());
-                        };
-                        let m = pm.ok_or(Trap::Malformed)?;
-                        let mut list: Vec<(String, i32)> = Vec::new();
-                        for i in 0..gn {
-                            let rec = m.read_window(gptr + i * 16, 16)?;
-                            let name_off =
-                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                            let name_len =
-                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                            let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                            let name = String::from_utf8(m.read_window(name_off, name_len)?)
-                                .map_err(|_| Trap::CapFault)?;
-                            if !host.can_regrant(gh) {
-                                return Err(Trap::CapFault);
-                            }
-                            list.push((name, gh));
+                    let child = match admit_detached_child(
+                        host, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
+                    ) {
+                        Ok(Some(c)) => c,
+                        Ok(None) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
                         }
-                        Ok(list)
-                    })();
-                    let glist = match glist {
-                        Ok(l) => l,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
                             continue;
                         }
                     };
-                    let premap_ok = match premap {
-                        Some((r, o)) => match host.premap_admit(r, o, child_size) {
-                            Ok(ok) => ok,
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                        },
-                        None => true,
-                    };
-                    if !ok_entry
-                        || child_size == 0
-                        || !mod_ok
-                        || !payload_ok
-                        || !premap_ok
-                        || host.is_durable()
-                        || !host.budget_mem_take(budget, child_size)
-                    {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
                     let live = tasks
                         .iter()
                         .filter(|t| !matches!(t.state, TaskState::Done(_)))
@@ -12342,60 +12507,13 @@ impl CoopSched {
                         complete(tasks, ti, Err(Trap::ThreadFault));
                         continue;
                     }
-                    let mut fm =
-                        Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow);
-                    fm.init_data(&cdata);
-                    fm.seed_null_guard(temen_ir::module_null_guard());
-                    if !payload.is_empty() {
-                        let _ = fm.write_bytes(temen_ir::module_args_base(), &payload);
-                    }
-                    let mut child_host = Host::new();
-                    child_host.set_attestation(host.detached_child_attestation());
-                    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
-                    let cinst = child_host.grant_instantiator(0, reservation);
-                    let cas = child_host.grant_address_space(0, reservation);
-                    for (name, gh) in &glist {
-                        if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
-                            child_host.register_cap_name(name, cg);
-                        }
-                    }
-                    if let Some((r, o)) = premap {
-                        if !(host.stage_premap(r, o, &mut child_host)
-                            && child_host.apply_premap(&mut fm) >= 0)
-                        {
-                            complete(tasks, ti, Err(Trap::Malformed));
-                            continue;
-                        }
-                    }
-                    child_host.set_self_module(&cmodule);
-                    // A child of the running module itself binds leniently (#1234 — its manifest
-                    // is the parent's whole import surface, not one written for the child).
-                    let bound = if host.is_self_module(mh) {
-                        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
-                    } else {
-                        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
-                    };
-                    if bound.is_err() {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
-                    let child_args = if want_as {
-                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                    } else {
-                        vec![Value::I64(cinst as i64)]
-                    };
-                    let pfuel = match tasks[ti].env {
-                        None => *fuel,
-                        Some(k) => extra_envs[k].fuel,
-                    };
-                    let child_fuel = if quota <= 0 {
-                        pfuel
-                    } else {
-                        (quota as u64).min(pfuel)
-                    };
+                    let DetachedChild {
+                        mem: fm,
+                        host: child_host,
+                        compiled: child_compiled,
+                        args: child_args,
+                        fuel: child_fuel,
+                    } = child;
                     let progs_len = child_compiled.progs.len();
                     let cm = dom.source.push(child_compiled);
                     let child_table =
@@ -14549,11 +14667,87 @@ fn run_vcpu_parallel<'scope, 'env>(
                 threads.push(Some(id));
                 vt.active.set(dst, Reg::from_i32(handle));
             }
-            // §5 `instantiate_detached` (op 15): the OS-thread parallel driver mints no windows, so
-            // it declines exactly as the cooperative driver does (#1415). This was `Trap::Malformed`
-            // — a domain-killing trap for a verified module, which invariant 5 reserves for forgery.
-            Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
-                vt.active.decline_unsupported(dst);
+            // §5 `instantiate_detached` (op 15): a fresh window of its own on its own OS thread — the
+            // cooperative executor's spawn (`admit_detached_child`, the same admission and child
+            // powerbox) on this driver, then `run_vcpu_parallel` over the child's `Mem` exactly as a
+            // confined child, its result published to the parent's `reg` for `join`.
+            Ok(VcpuStop::InstantiateDetached {
+                budget,
+                mh,
+                entry,
+                size_log2,
+                quota,
+                dst,
+                grants,
+                args,
+                premap,
+            }) => {
+                let admitted = {
+                    let mut hg = host.lock_unpoisoned();
+                    admit_detached_child(
+                        &mut hg, mem.as_ref(), fuel, budget, mh, entry, size_log2, quota, grants,
+                        args, premap,
+                    )
+                };
+                let child = match admitted {
+                    Ok(Some(c)) => c,
+                    Ok(None) => {
+                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    Err(t) => return (Err(t), mem),
+                };
+                if reg.live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+                    > super::MAX_VCPUS
+                {
+                    reg.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return (Err(Trap::ThreadFault), mem);
+                }
+                let DetachedChild {
+                    mem: fm,
+                    host: child_host,
+                    compiled: child_compiled,
+                    args: child_args,
+                    fuel: child_fuel,
+                } = child;
+                let progs_len = child_compiled.progs.len();
+                let cm = dom.source.push(child_compiled);
+                let child_table =
+                    build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
+                let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
+                let cunit = match child_dom.source.get(cm) {
+                    Some(u) => u,
+                    None => return (Err(Trap::Malformed), mem),
+                };
+                let mut child_vt = match VTask::new(&cunit, entry as usize, &child_args) {
+                    Ok(v) => v,
+                    Err(t) => return (Err(t), mem),
+                };
+                child_vt.active.module = cm;
+                child_vt.active.home = cm;
+                let id = reg
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scope.spawn(move || {
+                    let child_reg = ThreadRegistry::new();
+                    let child_host = std::sync::Arc::new(std::sync::Mutex::new(child_host));
+                    let (r, _m) = std::thread::scope(|cscope| {
+                        run_vcpu_parallel(
+                            cscope,
+                            &child_dom,
+                            &child_reg,
+                            std::sync::Arc::clone(&child_host),
+                            None,
+                            child_vt,
+                            Some(fm),
+                            child_fuel,
+                        )
+                    });
+                    reg.publish(id, r);
+                });
+                let handle = threads.len() as i32;
+                threads.push(Some(id));
+                vt.active.set(dst, Reg::from_i32(handle));
             }
             // §14 `Instantiator.instantiate_module` (THREADS.md 4c-domain) — a **separate-module**
             // confined child: the host (which holds the powerbox) is locked to resolve + clone the
@@ -14957,30 +15151,6 @@ impl Vm {
     /// last `resume` persisted, so this targets the same window the op's `dst` was resolved against.
     fn set(&mut self, slot: u32, v: Reg) {
         self.regs[self.base + slot as usize] = v;
-    }
-
-    /// Decline an event **this driver** does not service — the one definition every run loop uses
-    /// (#1415).
-    ///
-    /// A driver that cannot host an op has not been handed a malformed module: the module verified,
-    /// the op is real, and the guest did nothing wrong — this particular run loop simply mints no
-    /// windows (or no threads, or no children). That is a value on the caller's own error path
-    /// (INVARIANTS #5: "errors are values; traps are for forgery"), never a trap. Trapping here
-    /// kills the domain for a condition the guest could have probed and fallen back from, and names
-    /// a module defect that does not exist.
-    ///
-    /// Routed through one function so the coop driver, the OS-thread parallel driver and the
-    /// debugger path cannot drift apart on *how* they decline (INVARIANTS #9 "one shared predicate,
-    /// one definition"; #15 "one path per behaviour") — op 15 had three different answers across
-    /// them before this landed.
-    ///
-    /// The errno is `-EINVAL` because that is what the coop driver and the JIT tiers already
-    /// returned; converging on the incumbent keeps every currently-passing guest unchanged. Whether
-    /// "this driver cannot service the op" deserves its own errno (`-ENOSYS`) so a guest can tell it
-    /// apart from a genuine argument refusal is an open question on #1415 — a behaviour change, so
-    /// it is deliberately not bundled here.
-    fn decline_unsupported(&mut self, dst: u32) {
-        self.set(dst, Reg::from_i32(super::EINVAL as i32));
     }
 
     /// The [`crate::IrPc`] of the op the cursor is on, or `None` if that op is a terminator (which the

@@ -7,6 +7,16 @@
 // `vm_map`-grows past its declared 64 KiB (the child memory grows with it), stores into and loads back the
 // grown page, and returns `word + attest`. Expected value is fully determined; non-vacuity: the child
 // emitted, its memory grew, the driver's own window never held the argv word at the child's address.
+//
+// Second case (#1527): the same loop with an op-15 **pre-mapped SharedRegion** (the 11-arg form). Two
+// `WebAssembly.Memory`s cannot alias, so the servicer copies the region's bytes into the child memory at
+// the offset before the emitted child starts and copies the span back into the region at deliver — a
+// detached child runs to completion before its parent resumes, so that is observationally the alias.
+// The driver mints a 64 KiB region, maps it at 65536 of its own window, stores 41 there, spawns the
+// child with the region pre-mapped at 65536 of ITS window, joins, and reads the child's 82 back through
+// its own mapping: 1000 × 42 + 82 = 42082. Non-vacuity: the child emitted (no region op of its own),
+// the child memory holds 41 (copy-in) and 82 (the child's store) at the offset, and the driver's 82
+// can only have arrived by copy-out.
 import { startServer } from './serve.mjs';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
@@ -84,7 +94,59 @@ block 0 (v0: i64) {
 }
 `;
 
-const res = await page.evaluate(async ({ driverSrc, childSrc }) => {
+// #1527 — the pre-mapped driver (memory 17; entry `(Instantiator, Module, WindowMinter, AddressSpace)
+// -> i64`: the fourth arg is what lets it mint a region): create 64 KiB, map at 65536, store 41, spawn
+// the child detached with the region pre-mapped at 65536 of its `memory 17` window, join, read 82 back.
+const DRIVER_PREMAP = `memory 17
+func (i32, i32, i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32, v2: i32, v3: i32) {
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) v3 (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vin = i64.const 41
+  i64.store vwo vin
+  vb = i64.extend_i32_u v2
+  vmh = i64.extend_i32_u v1
+  vz = i64.const 0
+  vlog = i64.const 17
+  vreg = i64.extend_i32_u vrh
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vb, vmh, vz, vz, vz, vlog, vz, vz, vz, vreg, vwo)
+  vj = call.cap 6 1 (i32) -> (i64) v0 (vc)
+  vk = i64.const 1000
+  vm = i64.mul vj vk
+  vob = i64.const 65544
+  vo = i64.load vob
+  vr = i64.add vm vo
+  return vr
+  }
+}
+`;
+// The pre-mapped child (memory 17, `(i64) -> (i64)`): no handle, no `map` — reads 41 at 65536, stores
+// 82 at 65544, returns 42. Pure loads/stores, so it emits.
+const CHILD_PREMAP = `memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 65536
+  vin = i64.load va
+  vtwo = i64.const 2
+  vout = i64.mul vin vtwo
+  vb = i64.const 65544
+  i64.store vb vout
+  vone = i64.const 1
+  vr = i64.add vin vone
+  return vr
+  }
+}
+`;
+
+// Run both cases on one engine: open the detached op-13 loop over `(driver, child)`, step it — a
+// `2` (OP13JIT_CHILD_DETACHED) stages an emitted child in a fresh memory that `driveDetachedRun` runs
+// and `deliver` banks — and read `probe` words out of the child memory (guest offsets) at the end.
+const res = await page.evaluate(async ({ cases }) => {
   const par = await import('./par.js');
   const { driveDetachedRun, jitCacheStats } = await import('./wasmjit-module.js');
   const { foreignMemory } = await import('./foreign-mem.js');
@@ -102,52 +164,70 @@ const res = await page.evaluate(async ({ driverSrc, childSrc }) => {
     if (okp !== 1) throw new Error('parse: ' + new TextDecoder().decode(outp));
     return outp;
   };
-  const driver = parse(driverSrc), child = parse(childSrc);
-  const dp = push(driver), cp = push(child);
-  const opened = ex.temen_op13jit_open_detached(dp, driver.length, cp, child.length);
-  ex.temen_dealloc(dp, driver.length); ex.temen_dealloc(cp, child.length);
-  if (opened !== 0) return { err: `open failed: ${opened}` };
-  const compilesBefore = jitCacheStats.compiles;
-  const steps = [];
-  let memId = -1, pagesAtStage = 0, pagesAfter = 0, driveErr = null;
-  for (let i = 0; i < 8; i++) {
-    const s = ex.temen_op13jit_step();
-    steps.push(s);
-    if (s === 0) break;
-    if (s === 2) {
-      memId = ex.temen_op13jit_child_mem_id();
-      const cm = foreignMemory(memId);
-      pagesAtStage = cm.buffer.byteLength / 65536;
-      try { await driveDetachedRun(ex, memory, cm, 'op13jit-detached-test'); }
-      catch (e) { driveErr = String(e && e.message || e); ex.temen_op13jit_close(); return { err: `driveDetachedRun: ${driveErr}`, steps }; }
-      pagesAfter = cm.buffer.byteLength / 65536;
-      ex.temen_op13jit_deliver();
-      continue;
+  const runCase = async ({ name, driverSrc, childSrc, probe }) => {
+    const driver = parse(driverSrc), child = parse(childSrc);
+    const dp = push(driver), cp = push(child);
+    const opened = ex.temen_op13jit_open_detached(dp, driver.length, cp, child.length);
+    ex.temen_dealloc(dp, driver.length); ex.temen_dealloc(cp, child.length);
+    if (opened !== 0) return { name, err: `open failed: ${opened}` };
+    const compilesBefore = jitCacheStats.compiles;
+    const steps = [];
+    let memId = -1, pagesAtStage = 0, pagesAfter = 0;
+    for (let i = 0; i < 8; i++) {
+      const s = ex.temen_op13jit_step();
+      steps.push(s);
+      if (s === 0) break;
+      if (s === 2) {
+        memId = ex.temen_op13jit_child_mem_id();
+        const cm = foreignMemory(memId);
+        pagesAtStage = cm.buffer.byteLength / 65536;
+        try { await driveDetachedRun(ex, memory, cm, `op13jit-detached-test:${name}`); }
+        catch (e) { ex.temen_op13jit_close(); return { name, err: `driveDetachedRun: ${String(e && e.message || e)}`, steps }; }
+        pagesAfter = cm.buffer.byteLength / 65536;
+        ex.temen_op13jit_deliver();
+        continue;
+      }
+      ex.temen_op13jit_close();
+      return { name, err: `unexpected step ${s}`, steps };
     }
+    const result = String(ex.temen_op13jit_result());
+    // Isolation half: the child's stores must be in the CHILD memory (guest offset + header), and the
+    // driver's own window (engine memory) is not where the child ran.
+    const header = ex.temen_detached_header_bytes();
+    const cm = foreignMemory(memId);
+    const dv = new DataView(cm.buffer);
+    const probed = probe.map((off) => String(dv.getBigInt64(header + off, true)));
     ex.temen_op13jit_close();
-    return { err: `unexpected step ${s}`, steps };
-  }
-  const result = String(ex.temen_op13jit_result());
-  // Isolation half: the child's stored word must be in the CHILD memory at header + 65600, and the
-  // driver's own window (engine memory) is not where the child ran.
-  const header = ex.temen_detached_header_bytes();
-  const cm = foreignMemory(memId);
-  const storedInChild = String(new DataView(cm.buffer).getBigInt64(header + 65600, true));
-  ex.temen_op13jit_close();
-  return { steps, result, memId, pagesAtStage, pagesAfter, storedInChild, compiles: jitCacheStats.compiles - compilesBefore };
-}, { driverSrc: DRIVER, childSrc: CHILD });
+    return { name, steps, result, memId, pagesAtStage, pagesAfter, probed, compiles: jitCacheStats.compiles - compilesBefore };
+  };
+  const out = [];
+  for (const c of cases) out.push(await runCase(c));
+  return out;
+}, { cases: [
+  { name: 'argv+grow', driverSrc: DRIVER, childSrc: CHILD, probe: [65600] },
+  { name: 'premap', driverSrc: DRIVER_PREMAP, childSrc: CHILD_PREMAP, probe: [65536, 65544] },
+] });
 
 await browser.close();
 await new Promise((r) => server.close(r));
 console.log('RESULT', JSON.stringify(res, null, 2));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
+const [grow, premap] = res;
 const WANT = String(ARGV_WORD + 1n);
-const ok = errors.length === 0 && !res.err
-  && res.result === WANT
-  && res.steps.length === 2 && res.steps[0] === 2 && res.steps[1] === 0   // one detached stage, then done
-  && res.memId >= 0 && res.pagesAtStage === 2 && res.pagesAfter >= 3        // header+declared → grown
-  && res.storedInChild === String(ARGV_WORD)                                  // the store landed in the child memory
-  && res.compiles >= 1;
-console.log(`  op13jit detached: result=${res.result} (want ${WANT}) steps=${JSON.stringify(res.steps)} childMem#${res.memId} pages ${res.pagesAtStage}→${res.pagesAfter} storedInChild=${res.storedInChild === String(ARGV_WORD)} emitted=${res.compiles}${res.err ? ` · ERR ${res.err}` : ''}`);
-console.log(ok ? 'PASS — a guest-issued op 15 on the op-13 loop ran its child on the emitted tier in a freshly minted WebAssembly.Memory, with the args payload, growing on vm_map' : 'FAIL');
+const growOk = !grow.err
+  && grow.result === WANT
+  && grow.steps.length === 2 && grow.steps[0] === 2 && grow.steps[1] === 0   // one detached stage, then done
+  && grow.memId >= 0 && grow.pagesAtStage === 2 && grow.pagesAfter >= 3        // header+declared → grown
+  && grow.probed[0] === String(ARGV_WORD)                                       // the store landed in the child memory
+  && grow.compiles >= 1;
+const premapOk = !premap.err
+  && premap.result === '42082'
+  && premap.steps.length === 2 && premap.steps[0] === 2 && premap.steps[1] === 0
+  && premap.memId >= 0 && premap.memId !== grow.memId
+  && premap.probed[0] === '41' && premap.probed[1] === '82'                     // copy-in landed; the child's store is in ITS memory
+  && premap.compiles >= 1;                                                      // the pre-mapped child emitted
+const ok = errors.length === 0 && growOk && premapOk;
+console.log(`  op13jit detached: result=${grow.result} (want ${WANT}) steps=${JSON.stringify(grow.steps)} childMem#${grow.memId} pages ${grow.pagesAtStage}→${grow.pagesAfter} storedInChild=${grow.probed && grow.probed[0] === String(ARGV_WORD)} emitted=${grow.compiles}${grow.err ? ` · ERR ${grow.err}` : ''}`);
+console.log(`  op13jit detached pre-mapped: result=${premap.result} (want 42082) steps=${JSON.stringify(premap.steps)} childMem#${premap.memId} child[65536]=${premap.probed && premap.probed[0]} child[65544]=${premap.probed && premap.probed[1]} emitted=${premap.compiles}${premap.err ? ` · ERR ${premap.err}` : ''}`);
+console.log(ok ? 'PASS — a guest-issued op 15 on the op-13 loop ran its child on the emitted tier in a freshly minted WebAssembly.Memory (args payload + vm_map growth; a pre-mapped region by copy-in/copy-out)' : 'FAIL');
 process.exit(ok ? 0 : 1);

@@ -22839,11 +22839,22 @@ impl Host {
         true
     }
 
-    /// Whether an op-15 pre-map is staged and not yet applied (a driver whose emitted tier cannot
-    /// honour a §13 alias — the wasm-JIT — declines such a child to the interpreter, as it does a child
-    /// that `map`s for itself).
+    /// Whether an op-15 pre-map is staged and not yet applied.
     pub fn has_premap(&self) -> bool {
         self.premap.is_some()
+    }
+    /// Take the staged op-15 pre-map — `(the region's backing, window offset)` — **instead of**
+    /// applying it, for a driver whose emitted tier cannot alias (#1527): the browser's op-13
+    /// servicer copies the region's bytes into the child's own `WebAssembly.Memory` at the offset
+    /// before the child starts and copies `[offset, offset + size)` back into the region when it
+    /// returns. A detached child runs to completion before its parent resumes (the handle is
+    /// delivered only after the run, and `join` reads the banked result), so with no interleaving
+    /// copy-in/copy-out is observationally identical to the alias. The child keeps the region
+    /// handle it was re-granted, exactly as after [`apply_premap`](Self::apply_premap).
+    pub fn take_premap(&mut self) -> Option<(RegionBacking, u64)> {
+        let (id, off) = self.premap.take()?;
+        let backing = self.regions.get(id as usize).cloned()?;
+        Some((backing, off))
     }
 
     /// Op-15 **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
