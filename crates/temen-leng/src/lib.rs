@@ -998,14 +998,37 @@ pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Le
 /// EOF / a null mapping), never a silent wrong answer. Func order is fixed — see
 /// [`LIBC_CAP_STUB_NAMES`].
 const LIBC_CAP_STUBS: &str = "\
+import 0 \"write\" (i64, i64) -> (i64)
+
 func (i64, i64, i64, i64, i64) -> (i64) { block 0 (v0: i64, v1: i64, v2: i64, v3: i64, v4: i64) { v5 = i64.const -1 return v5 } }
 func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = i64.const 0 return v2 } }
 func (i32) -> () { block 0 (v0: i32) { return } }
 func (i64, i64, i32) -> (i64) { block 0 (v0: i64, v1: i64, v2: i32) { v3 = i64.const 0 return v3 } }
-func () -> (i64) { block 0 () { v0 = i64.const 65536 return v0 } }";
+func () -> (i64) { block 0 () { v0 = i64.const 65536 return v0 } }
+func (i64, i64) -> (i64) { block 0 (v0: i64, v1: i64) { v2 = call.import 0 (v0, v1) return v2 } }";
 
 /// The cap names [`LIBC_CAP_STUBS`] serves, in its func order.
-const LIBC_CAP_STUB_NAMES: &[&str] = &["vm_fs", "read", "exit", "vm_map", "vm_page_size"];
+///
+/// **Keyed by the guest libc's actual import names, so it moves when that edge is renamed.** The libc
+/// used to reach stdin/stdout through the frontend's fd-less `write`/`read` builtins; once `<unistd.h>`
+/// gained real fd-dispatching definitions those became `__vm_stream_write`/`__vm_stream_read`, i.e.
+/// `stream_write`/`stream_read`. A name here that the libc no longer imports is not an error — the
+/// export simply goes unused, the libc's real import stays unbound, and it surfaces in the *program's*
+/// capability manifest. `libc_cap_edge_is_fully_served` pins that, because the nim end-to-end test
+/// that caught it needs the real nimony toolchain and skips without one.
+///
+/// `stream_write` is the one that is **aliased rather than stubbed**: it resolves to a body that
+/// tail-calls the powerbox `write` cap, the same import [`SYSCALL_ADAPTER`] carries, so the two
+/// coalesce into the single manifest import the program already had. Stubbing it would have kept the
+/// manifest just as narrow while silently swallowing anything the libc ever writes.
+const LIBC_CAP_STUB_NAMES: &[&str] = &[
+    "vm_fs",
+    "stream_read",
+    "exit",
+    "vm_map",
+    "vm_page_size",
+    "stream_write",
+];
 
 /// Build the **prebuilt guest-libc link units** for a nim program: the libc itself (its functions
 /// exported under the *nim* leaf symbols that import them, so the linker resolves them directly) plus
