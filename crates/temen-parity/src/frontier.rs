@@ -53,8 +53,9 @@
 //! is **non-durable** (`SharedRegion`, `Module`, `Offer`, pipe ends, `HostProc`), and the two purely
 //! window-coordinate caps a child can *never* be granted — `AddressSpace`, `Instantiator` — are
 //! exactly the ones that **are** durable. `Stream`/`Exit`/`Clock` and `Jit` are both; `Budget` is
-//! neither. Nobody could see that before, because the two classifications live ~2,000 lines apart in
-//! two functions that never mention each other.
+//! durable but never crosses into a child (it hands down a *sub*-budget by `split`/`transfer`, not
+//! the handle — #1502 made it durable, it was neither before). Nobody could see that before, because
+//! the two classifications live ~2,000 lines apart in two functions that never mention each other.
 
 use crate::{Cell, Status};
 
@@ -323,12 +324,14 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             ),
         ],
 
-        // The one row that declines on BOTH audited axes. Its index into `Host::budgets` is
-        // meaningless in another table, and `Budget` is a `NonDurableKind` — the caveat INVARIANTS
-        // #14's R2 ruling records against itself ("minting authority does not survive a freeze").
+        // Declines on nesting (its index into `Host::budgets` is meaningless in another table — a child
+        // is granted a *sub*-budget by `split`/`transfer`, never the handle) but **durable** since
+        // #1502: the artifact carries the remaining quotas verbatim (`DurableBinding::Budget`) and the
+        // thaw may only attenuate them. This closed the caveat INVARIANTS #3's R2 ruling had recorded
+        // against itself ("minting authority does not survive a freeze").
         Capability::Budget => [
             declines("index-carrying: the child is granted a sub-budget by split/transfer, not the handle"),
-            declines("NonDurableKind::Budget — R2 records this caveat against its own ruling"),
+            F,
             U,
             U,
             U,

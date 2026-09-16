@@ -2819,10 +2819,8 @@ pub unsafe extern "C" fn premap_apply(
         install_region_hook(&mut child, base, reserved);
         let pages = child.cap_window_pages(base as usize);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
-        // Same chokepoint the non-detached path reads (#1506): the guard is a constant of the
-        // layout, not per-run host state. This line asked `Host` for it, which #1506 removed for
-        // exactly the reason it would have bitten here — a child whose host never registered a self
-        // module would have pre-mapped its region with guard `0`.
+        // #1506: the guard is a constant of the layout, read from its one chokepoint — the same
+        // port d964db3 made for the root window above. (`Host::null_guard()` no longer exists.)
         wm.set_null_guard(temen_ir::module_null_guard());
         i32::from(child.apply_premap(&mut wm) >= 0)
     }

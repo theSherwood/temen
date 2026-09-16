@@ -4311,7 +4311,7 @@ impl<'p> Vcpu<'p> {
         premap: Option<(i32, u64)>,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        let (cfuncs, cmem_log2, cimports, ctypes, cdata) = match self.shared_host {
+        let (cfuncs, cmem_log2, cimports, ctypes, cdata, cdurable) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
@@ -4321,6 +4321,7 @@ impl<'p> Vcpu<'p> {
                     g.imports.clone(),
                     g.types.clone(),
                     g.data.clone(),
+                    g.durable,
                 )
             }
             None => {
@@ -4331,6 +4332,7 @@ impl<'p> Vcpu<'p> {
                     g.imports.clone(),
                     g.types.clone(),
                     g.data.clone(),
+                    g.durable,
                 )
             }
         };
@@ -4375,7 +4377,18 @@ impl<'p> Vcpu<'p> {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
         };
-        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || durable {
+        // #1501 — §4's other half, as the tree-walker's op-15 arm and the nested arms enforce it: a
+        // durable domain admits only a module the grant attests as instrumented. Inert behind the
+        // `durable` gate; what keeps a re-lift from surfacing an uncapturable child to the host.
+        let mod_durable_ok = !durable || cdurable;
+        if !ok_entry
+            || child_size == 0
+            || !mod_ok
+            || !mod_durable_ok
+            || !payload_ok
+            || !premap_ok
+            || durable
+        {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
