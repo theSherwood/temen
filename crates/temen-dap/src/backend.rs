@@ -990,7 +990,7 @@ impl BytecodeBackend {
         // `provideCap` delivers the value.
         let cap = match &self.engine {
             Engine::Single(run) => run.cap_parked().map(|id| (id, run.cap_park_pc())),
-            Engine::Threaded(_) => None,
+            Engine::Threaded(run) => run.cap_parked().map(|id| (id, run.cap_park_pc())),
         };
         if let Some((id, at)) = cap {
             // The stop location is the call itself (the position after it may be a terminator).
@@ -1055,6 +1055,12 @@ impl BytecodeBackend {
                 pc,
             },
             // No runnable thread (deadlock/`wait`), or an op outside the scheduler's subset.
+            // #1366: parked on a host-completed cap — live, paused at the call, resumable once
+            // `provideCap` delivers (the scheduled twin of the single engine's `CapPark` stop).
+            SchedStop::CapPark { id, pc } => Stop::Break {
+                reason: StopReason::CapPark { id },
+                pc,
+            },
             SchedStop::Blocked | SchedStop::Declined => Stop::Blocked,
         }
     }
@@ -1642,11 +1648,12 @@ impl Debuggee for BytecodeBackend {
         }
         true
     }
-    /// #1366 — single-vCPU sessions only (the scheduled engine keeps its inline decline).
+    /// #1366 — deliver the value for the host-completed cap call the session is parked on, on either
+    /// engine (#1517 gave the scheduled one the same park/deliver protocol).
     fn provide_cap(&mut self, id: u64, value: i64) -> bool {
         let ok = match &mut self.engine {
             Engine::Single(run) => run.deliver_cap(id, value),
-            Engine::Threaded(_) => false,
+            Engine::Threaded(run) => run.deliver_cap(id, value),
         };
         if ok {
             *self.parked_cap.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1656,7 +1663,7 @@ impl Debuggee for BytecodeBackend {
     fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
         let parked = match &self.engine {
             Engine::Single(run) => run.cap_parked(),
-            Engine::Threaded(_) => None,
+            Engine::Threaded(run) => run.cap_parked(),
         }?;
         let g = self.parked_cap.lock().unwrap_or_else(|e| e.into_inner());
         g.as_ref()

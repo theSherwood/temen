@@ -1,11 +1,13 @@
 //! **#1415 — a driver declines what it cannot service; it never traps.**
 //!
 //! `Instantiator.instantiate_detached` (op 15) is hosted by the tree-walker and surfaced as an event
-//! by the resumable engine, but three run loops mint no windows at all: the cooperative driver, the
-//! OS-thread parallel driver, and the debugger path. Before #1415 those three gave *three different
-//! answers* to the same unsupported op — `-EINVAL` on the cooperative driver (whose comment stated
-//! the intended policy: "refuse probeably, as the JIT tiers do, **never a trap**") and
-//! `Trap::Malformed` on the other two.
+//! by the resumable engine. When this was written three run loops minted no windows at all: the
+//! cooperative driver, the OS-thread parallel driver, and the debugger path. Before #1415 those
+//! three gave *three different answers* to the same unsupported op — `-EINVAL` on the cooperative
+//! driver (whose comment stated the intended policy: "refuse probeably, as the JIT tiers do,
+//! **never a trap**") and `Trap::Malformed` on the other two. The cooperative driver has since
+//! grown a real fresh-window spawn (the child is a task over its own `Mem`), so its answer is now
+//! the tree-walker's — a child handle — and this file pins that beside the two that still decline.
 //!
 //! `Trap::Malformed` is wrong twice over. The module is not malformed — it parsed, it verified, and
 //! the op is real; the driver simply does not implement it. And a trap is **terminal for the domain**
@@ -123,11 +125,13 @@ fn the_parallel_driver_declines_an_unsupported_op_instead_of_trapping() {
     );
 }
 
-/// The cooperative driver's answer is the one the other drivers converged **onto**, so pinning it
-/// here is what makes the parallel driver's assertion a *parity* claim rather than a lone number.
-/// Same guest, same powerbox, same sentinel.
+/// The cooperative driver **services** op 15 now (a fresh-window child task, the tree-walker's
+/// spawn on this driver), so the same probe lands the child's handle — `0`, the first spawn — in
+/// the destination register and the guest runs on: `1000 + 0`. The `-EINVAL` above is what a
+/// driver that cannot mint a window answers; this is what one that can does. Same guest, same
+/// powerbox, same sentinel arithmetic.
 #[test]
-fn the_cooperative_driver_declines_the_same_op_the_same_way() {
+fn the_cooperative_driver_services_the_same_op_and_hands_back_a_child() {
     let parent = module(PROBE);
     let child = module(CHILD);
     let mut host = Host::new();
@@ -139,7 +143,7 @@ fn the_cooperative_driver_declines_the_same_op_the_same_way() {
 
     assert_eq!(
         result,
-        Ok(vec![Value::I64(DECLINED)]),
-        "the cooperative driver's incumbent answer — the parallel driver now matches it"
+        Ok(vec![Value::I64(1000)]),
+        "the cooperative driver spawns the child (handle 0) and the guest reads it back"
     );
 }

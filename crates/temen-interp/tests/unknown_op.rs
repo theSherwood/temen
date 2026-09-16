@@ -116,3 +116,32 @@ fn clock_still_ignores_its_op_number_until_it_is_seeded() {
         "op 999 is served as `now` (the deterministic clock ticked once)"
     );
 }
+
+/// The other party's route (#1515): a **host** binds an import slot to `(EXIT, 5)`. Nothing the
+/// guest wrote is wrong, so this cannot be caught at verify time; it is caught at the one sink every
+/// binding passes through (`set_import_bindings`), which marks the slot unbound. A call through it
+/// then gets exactly what a never-attached rebindable slot gets — `CapFault`, fail-closed — instead
+/// of the op-0 behaviour (`Exit` would have terminated the domain).
+#[test]
+fn a_host_binding_past_a_seeded_shape_leaves_the_slot_unbound() {
+    use temen_interp::BoundImport;
+    let mut h = Host::new();
+    let exit = h.grant_exit();
+    h.set_import_bindings(vec![
+        BoundImport::required(cap_id::EXIT, 0, exit), // slot 0: the real op
+        BoundImport::required(cap_id::EXIT, 5, exit), // slot 1: an op Exit does not have
+    ]);
+    // `call.import` dispatches as `(CAP_IMPORT_TYPE_ID, slot | consumer_op << 16)`; a flat binding
+    // takes consumer op 0.
+    assert!(matches!(
+        h.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, 0, 0, &[3], None),
+        Err(Trap::Exit(3))
+    ));
+    assert!(
+        matches!(
+            h.cap_dispatch_slots(temen_ir::CAP_IMPORT_TYPE_ID, 1, 0, &[3], None),
+            Err(Trap::CapFault)
+        ),
+        "a slot bound past the interface's shape is unbound, never a live exit"
+    );
+}

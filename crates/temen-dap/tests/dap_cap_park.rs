@@ -232,3 +232,123 @@ fn host_caps_are_refused_outside_the_bytecode_powerbox() {
         "tree-walker ⇒ refused"
     );
 }
+
+// ---- #1517 slice 1: the same round-trip on the scheduled engine --------------------------------------
+//
+// The DAP backend used to answer `provideCap` with `false` and report no `cap` stop on a threaded
+// session, because the scheduled engine had no park/deliver protocol (it waited a punt inline). Now
+// it has the single engine's, so the identical client round-trip has to hold when the declared call
+// is made from a spawned thread — a session that is threaded for its whole life picks that engine.
+
+/// `BLINK` made from a worker thread: the root spawns one, the worker makes the flat declared call
+/// and returns its value, the root joins it and returns that — so the delivered value is still the
+/// program's result, through the join.
+const BLINK_THREADED: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vsp = i64.const 0
+  vz = i64.const 0
+  vh = thread.spawn 1 vsp vz
+  vj = thread.join vh
+  return vj
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vh = i32.const 0
+  vop = i64.const 7
+  va = i64.const 35
+  vr = call.sym "blink" (i64, i64) -> (i64) vh (vop, va)
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_declared_cap_from_a_spawned_thread_parks_and_provide_cap_resumes() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(BLINK_THREADED)),
+            ("function", Json::i(0)),
+            ("args", Json::Arr(vec![])),
+            ("engine", Json::s("bytecode")),
+            ("powerbox", Json::s("onramp")),
+            ("hostCaps", Json::Arr(vec![Json::s("blink")])),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "launch a threaded guest with hostCaps: {out:?}"
+    );
+    s.handle(&req(3, "configurationDone", Json::obj(vec![])));
+
+    let out = s.handle(&req(
+        4,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let stops = events(&out, "stopped");
+    assert_eq!(stops.len(), 1, "one stop on the scheduled engine: {out:?}");
+    let body = stops[0].get("body").expect("stopped body");
+    assert_eq!(
+        body.get("reason"),
+        Some(&Json::s("cap")),
+        "a live cap park, not a trap"
+    );
+    assert_eq!(body.get("capName"), Some(&Json::s("blink")));
+    assert_eq!(
+        body.get("args"),
+        Some(&Json::Arr(vec![Json::i(7), Json::i(35)])),
+        "the worker's flat call arguments ride the event"
+    );
+    let id = body.get("capId").and_then(|v| v.as_i64()).expect("capId");
+    assert!(
+        events(&out, "exited").is_empty(),
+        "not finished while parked"
+    );
+
+    // A resume without delivering runs nothing: still parked on the same call.
+    let out = s.handle(&req(
+        5,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let stops = events(&out, "stopped");
+    assert_eq!(stops.len(), 1);
+    assert_eq!(
+        stops[0]
+            .get("body")
+            .and_then(|b| b.get("capId"))
+            .and_then(|v| v.as_i64()),
+        Some(id),
+        "still parked on the same request"
+    );
+
+    let out = s.handle(&req(
+        6,
+        "provideCap",
+        Json::obj(vec![("id", Json::i(id)), ("value", Json::i(42))]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "provideCap is honoured on the scheduled engine"
+    );
+    let out = s.handle(&req(
+        7,
+        "continue",
+        Json::obj(vec![("threadId", Json::i(1))]),
+    ));
+    let exited = events(&out, "exited");
+    assert_eq!(exited.len(), 1, "finished: {out:?}");
+    assert_eq!(
+        exited[0].get("body").and_then(|b| b.get("exitCode")),
+        Some(&Json::i(42)),
+        "the delivered value is the program's result, through the join"
+    );
+}

@@ -151,3 +151,115 @@ fn replaying_the_tape_serves_the_delivered_value_without_re_parking() {
         "the tape served the call — the handler's submit hook never ran on the replay"
     );
 }
+
+// ---- #1517 slice 1: the same protocol on the scheduled engine --------------------------------------
+//
+// A single-vCPU run is a scheduled run with one task, so the scheduled engine has to carry every
+// capability the single one does before the single one can go (INVARIANTS #9c: a collapse that
+// silently dropped one would be a fiction). These are the two cases above, driven through
+// `ScheduledDebugRun` — which until this slice could not park at all: it never admitted
+// host-completed punts, so a punt was waited inline and the `CapParked` arm was unreachable.
+
+use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
+
+#[test]
+fn scheduled_run_parks_on_a_host_completed_cap_and_resumes() {
+    let m = module();
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (host, h) = recording_host(&recorded);
+    let mut run =
+        ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(h)], host).expect("in subset");
+    let mut fuel = 2_000_000u64;
+
+    let stop = run.run_until_stop(&mut fuel);
+    let id = run.cap_parked().expect("parked on the host-completed call");
+    assert!(
+        matches!(stop, SchedStop::CapPark { id: sid, .. } if sid == id),
+        "the drive reports a live CapPark stop on the parked thread"
+    );
+    assert!(run.result().is_none(), "parked, not finished");
+    assert_eq!(
+        recorded.lock().unwrap().clone(),
+        vec![(id, 7)],
+        "the submit hook recorded the request under the surfaced id"
+    );
+
+    // Advancing while parked refuses (nothing is runnable), and the park is stable.
+    assert!(matches!(
+        run.run_until_stop(&mut fuel),
+        SchedStop::CapPark { .. }
+    ));
+    assert_eq!(run.cap_parked(), Some(id), "still parked on the same call");
+    assert!(
+        !run.tick(&mut fuel),
+        "a raw tick cannot advance a parked run"
+    );
+    assert!(!run.deliver_cap(id + 1, 0), "a foreign id is refused");
+
+    assert!(run.deliver_cap(id, 107));
+    assert_eq!(run.cap_parked(), None);
+    assert!(matches!(
+        run.run_until_stop(&mut fuel),
+        SchedStop::Finished(Ok(ref v)) if *v == vec![Value::I64(WANT)]
+    ));
+    assert_eq!(
+        run.result().cloned(),
+        Some(Ok(vec![Value::I64(WANT)])),
+        "the delivered value landed in the call's result slot"
+    );
+
+    let tape = run.host().cap_tape();
+    let host_procs: Vec<_> = tape.records.iter().filter(|r| r.type_id == 13).collect();
+    assert_eq!(host_procs.len(), 2, "both HOST_PROC calls taped: {tape:?}");
+    assert_eq!(host_procs[0].op, 0);
+    assert_eq!(host_procs[0].result, Ok(vec![105]));
+    assert_eq!(host_procs[1].op, 1);
+    assert_eq!(host_procs[1].args, vec![7]);
+    assert_eq!(
+        host_procs[1].result,
+        Ok(vec![107]),
+        "the delivered value, taped at delivery"
+    );
+}
+
+#[test]
+fn scheduled_replay_serves_the_delivered_value_without_re_parking() {
+    let m = module();
+    let recorded: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (host, h) = recording_host(&recorded);
+    let mut run =
+        ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(h)], host).expect("in subset");
+    let mut fuel = 2_000_000u64;
+    assert!(matches!(
+        run.run_until_stop(&mut fuel),
+        SchedStop::CapPark { .. }
+    ));
+    let id = run.cap_parked().expect("parked");
+    assert!(run.deliver_cap(id, 107));
+    assert!(matches!(
+        run.run_until_stop(&mut fuel),
+        SchedStop::Finished(_)
+    ));
+    let tape = run.host().cap_tape();
+
+    let replayed: Recorded = Arc::new(Mutex::new(Vec::new()));
+    let (mut host, h) = recording_host(&replayed);
+    host.replay_cap_tape(tape);
+    let mut run =
+        ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(h)], host).expect("in subset");
+    let mut fuel = 2_000_000u64;
+    assert!(
+        matches!(run.run_until_stop(&mut fuel), SchedStop::Finished(_)),
+        "a replayed host-completed call never re-parks"
+    );
+    assert_eq!(run.cap_parked(), None);
+    assert_eq!(
+        run.result().cloned(),
+        Some(Ok(vec![Value::I64(WANT)])),
+        "the replay reproduces the delivered value"
+    );
+    assert!(
+        replayed.lock().unwrap().is_empty(),
+        "the tape served the call — the handler's submit hook never ran on the replay"
+    );
+}
