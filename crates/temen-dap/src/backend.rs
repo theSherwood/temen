@@ -1,33 +1,27 @@
 //! The **debuggee backend seam** (DEBUGGING.md G3). `DapServer` was hard-wired to the tree-walking
 //! `temen_interp::Inspector`; this trait lets the same server drive *either* engine — the tree-walker
 //! (the reference oracle, full feature set) or the **bytecode VM** the browser playground actually
-//! runs, over `temen_interp::bytecode::DebugRun`.
+//! runs, over `temen_interp::bytecode::ScheduledDebugRun`.
 //!
-//! The bytecode engine covers breakpoints, stepping, backtrace, scalar/aggregate inspection,
-//! **reverse debugging** (`seek`/`step_back`/`reverseContinue`, by deterministic replay — the debug
-//! run is pure compute, so seeking to an earlier op clock rebuilds a fresh `DebugRun` and replays to
-//! that many ops, restarting from the nearest **checkpoint** in a single-vCPU ladder so the replay is
-//! bounded by the checkpoint stride rather than O(t) from clock 0), and **data breakpoints**
-//! (`set_watchpoint` — a per-op check of the effective
-//! address, computed like the interpreter's `access_of`, against the watched ranges; the run stops
-//! *before* an op that touches one). For a spawn-free guest `supports_reverse`/`supports_watch` are
-//! both `true`.
-//!
-//! **Multithreading** lands on its *own* engine — a `thread.spawn` guest launches the
-//! `temen_interp::bytecode::ScheduledDebugRun`, a deterministic cooperative multi-vCPU **debug
-//! scheduler**: breakpoints fire in whichever thread reaches them, `threads`/`stopped_task`/
-//! `select_task` serve per-thread stacks, stepping (in/over/out) drives the stopped thread,
-//! **cross-thread watchpoints** fire in whichever thread touches the range, and **reverse debugging**
-//! works by deterministic replay to a global scheduler `turn` — *not* delegated to the tree-walker
-//! (the differential oracle only, far too slow for any user-facing path). Both engines report
-//! `supports_reverse`/`supports_watch` = `true`; the single-vCPU coordinate is the op `clock`, the
-//! multithreaded one the global `turn`. Correctness is guaranteed by `crates/temen/tests/debug_parity.rs`
-//! and `bytecode_debug_threads.rs` (engine level, vs the tree-walker oracle) and `dap_over_bytecode_*`
-//! (server level).
+//! The bytecode engine is one deterministic cooperative multi-vCPU **debug scheduler** — a spawn-free
+//! guest is simply a one-task schedule (#1517 slice 4 collapsed the former single-vCPU `DebugRun` into
+//! it). It covers breakpoints (firing in whichever thread reaches them), `threads`/`stopped_task`/
+//! `select_task` per-thread stacks, stepping (in/over/out) of the stopped thread, scalar/aggregate
+//! inspection, **cross-thread data breakpoints** (`set_watchpoint` — a per-op check of the effective
+//! address, computed like the interpreter's `access_of`, against the watched ranges; the schedule
+//! stops *before* an op that touches one — and #1229 value watches), and **reverse debugging**
+//! (`seek`/`step_back`/`reverseContinue`, by deterministic replay to a global scheduler `turn`: the
+//! debug run is pure compute plus a recorded cap tape, so seeking to an earlier turn rebuilds a fresh
+//! run and replays to it, restarting from the nearest **checkpoint** in a ladder so the replay is
+//! bounded by the checkpoint stride rather than O(t) from turn 0) — *not* delegated to the
+//! tree-walker (the differential oracle only, far too slow for any user-facing path).
+//! `supports_reverse`/`supports_watch` are both `true`. Correctness is guaranteed by
+//! `crates/temen/tests/debug_parity.rs` and `bytecode_debug_threads.rs` (engine level, vs the
+//! tree-walker oracle) and `dap_over_bytecode_*` (server level).
 
 use temen_interp::bytecode::{
-    self, AccessSinkFn, DebugRun, DebugRunContinuation, SchedBreak, SchedStop,
-    ScheduledContinuation, ScheduledDebugRun, ScheduledWrite, ValueWatchTarget,
+    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledContinuation, ScheduledDebugRun,
+    ScheduledWrite, ValueWatchTarget,
 };
 use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
@@ -163,55 +157,18 @@ fn grant_io_powerbox(
     }
 }
 
-/// Build a single-vCPU [`DebugRun`] for `module`'s `func(args)`: under the on-ramp I/O powerbox when
+/// Build a [`ScheduledDebugRun`] for `module`'s `func(args)`: under the on-ramp I/O powerbox when
 /// `powerbox` (recording cap inputs, and replaying `tape` from a prior forward run so a reverse-`seek`
-/// rebuild re-executes with identical clock/stdin inputs), else deny-all (`DebugRun::new`). `None` if the
-/// module is outside the engine's subset.
+/// rebuild re-executes with identical clock/stdin inputs — so a C guest's `malloc`/`printf` reach the
+/// `memory`/`write` caps instead of `CapFault`ing, and `main`'s return becomes an `exit` code), else
+/// deny-all. The `seed` is the slice-7 schedule variation. `None` if the module is outside the
+/// engine's subset. `block_stdin` (W4) arms the blocking-stdin park on the powerbox host: a thread's
+/// `read` on an exhausted buffer parks it (`SchedStop::StdinPark`) instead of returning EOF, re-armed
+/// on every `seek` rebuild so a read past the replay frontier parks again. `mem_limit` (slice 5) is
+/// the Memory-capability growth cap — a `vm_map` past it returns -ENOMEM, so a guest malloc observes
+/// NULL (the OOM-teaching knob) — likewise re-armed on every rebuild.
 #[allow(clippy::too_many_arguments)]
-fn build_single_run(
-    module: &Module,
-    func: FuncIdx,
-    args: &[Value],
-    powerbox: bool,
-    stdin: &[u8],
-    block_stdin: bool,
-    mem_limit: Option<u64>,
-    fs_seed: Option<&temen_fs::FsSeed>,
-    host_caps: &[String],
-    parked: &SharedCapRequest,
-    tape: &CapTape,
-) -> Option<DebugRun> {
-    if !powerbox {
-        return DebugRun::new(module, func, args);
-    }
-    let mut host = Host::new();
-    grant_io_powerbox(&mut host, module, stdin, fs_seed, host_caps, parked);
-    // Slice 5: the Memory-capability growth cap — a `vm_map` past the limit returns -ENOMEM, so a
-    // guest malloc observes NULL (the OOM-teaching knob). Re-armed on every seek rebuild.
-    host.set_mem_map_limit(mem_limit);
-    // W4 blocking stdin: a `read` on an exhausted buffer parks the run (`StopReason::StdinPark`)
-    // instead of returning EOF; `provideStdin` appends bytes and a resume re-issues the read.
-    // Re-armed on every `seek` rebuild so a read past the replay frontier parks again.
-    if block_stdin {
-        host.set_stdin_blocking(true);
-    }
-    host.record_caps(); // tape this run's cap inputs so a later reverse seek can replay them
-    if !tape.records.is_empty() {
-        host.replay_cap_tape(tape.clone()); // serve the furthest-forward inputs on a rebuild
-    }
-    DebugRun::new_with_host(module, func, args, host)
-}
-
-/// Build a multi-vCPU [`ScheduledDebugRun`] for `module`'s `func(args)`: the scheduled-engine twin of
-/// [`build_single_run`]. Under the on-ramp I/O powerbox when `powerbox` (so a threaded C guest's
-/// `malloc`/`printf` reach the `memory`/`write` caps instead of `CapFault`ing, and `main`'s return
-/// becomes an `exit` code), else deny-all. The `seed` is the slice-7 schedule variation. `None` if the
-/// module is outside the scheduled engine's subset. `block_stdin` (W4, #1146 deeper) arms the
-/// blocking-stdin park on the powerbox host exactly as [`build_single_run`] does: a thread's `read` on
-/// an exhausted buffer parks it (`SchedStop::StdinPark`) instead of returning EOF, re-armed on every
-/// `seek` rebuild so a read past the replay frontier parks again.
-#[allow(clippy::too_many_arguments)]
-fn build_scheduled_run(
+fn build_run(
     module: &Module,
     func: FuncIdx,
     args: &[Value],
@@ -241,13 +198,6 @@ fn build_scheduled_run(
         ScheduledDebugRun::new(module, func, args)?
     };
     run.set_sched_seed(seed);
-    // Position the run **stopped at the entry op of the root task**, so the first `step` steps from
-    // there instead of falling through to `run_until_stop` (which — with no breakpoint set — would
-    // run the whole program on the first step). The single-vCPU `DebugRun` is entry-stopped by
-    // construction; the scheduled run needs an explicit `locate()` (the seek path already calls it
-    // after its replay drive; a fresh launch didn't). Without this, a threaded program couldn't be
-    // source-line-stepped at all — `stepIn` ran it to completion.
-    run.locate();
     Some(run)
 }
 
@@ -275,7 +225,7 @@ pub trait Debuggee {
     /// `frame_from_top` levels up — stop when its value changes (#1229). `None` when the variable has
     /// no SSA location there (it's memory-located — watch it with [`set_watchpoint`] via
     /// [`var_addr`](Debuggee::var_addr) — or isn't live/known), or the backend doesn't serve value
-    /// watches (the scheduled bytecode engine this slice). Default `None`.
+    /// watches. Default `None`.
     fn set_value_watchpoint(
         &mut self,
         frame_from_top: usize,
@@ -488,19 +438,6 @@ impl Debuggee for Inspector {
     }
 }
 
-/// The bytecode engine behind a [`BytecodeBackend`]: the single-vCPU [`DebugRun`] for a spawn-free
-/// guest, or the multi-vCPU [`ScheduledDebugRun`] (a cooperative debug scheduler with per-thread
-/// breakpoints, `select_task`, in/over/out stepping, cross-thread watchpoints, and reverse debugging)
-/// for a `thread.spawn` guest. Chosen at launch by [`bytecode::module_spawns_threads`]; both are fully
-/// forward + reverse + watch capable.
-enum Engine {
-    // Both `DebugRun` and `ScheduledDebugRun` are large (their `VTask`s carry the reified continuation),
-    // so box each variant to keep `Engine` — and the `BytecodeBackend` holding it — pointer-sized
-    // (`clippy::large_enum_variant`).
-    Single(Box<DebugRun>),
-    Threaded(Box<ScheduledDebugRun>),
-}
-
 /// A cached map of the run's **stoppable positions** — `(clock, depth)` for every op that sits at a
 /// real IR instruction — over `[0, high_water]`. The op timeline of a deterministic replay is fixed
 /// for the whole session (breakpoints never change *which* ops run, and cap-input `tape` records are
@@ -516,10 +453,10 @@ struct RevTrace {
     stoppable: Vec<(u64, usize)>,
 }
 
-/// The **bytecode backend** — the resumable bytecode debug session ([`Engine`]) plus the persistent
-/// breakpoint set `DapServer` expects, the module (for `source_loc`/`func_name`, which are
+/// The **bytecode backend** — the resumable bytecode debug session ([`ScheduledDebugRun`]) plus the
+/// persistent breakpoint set `DapServer` expects, the module (for `source_loc`/`func_name`, which are
 /// engine-neutral free functions keyed on the `IrPc`), and the launch `func`/`args` so reverse
-/// debugging can rebuild a fresh run and replay to an earlier op clock.
+/// debugging can rebuild a fresh run and replay to an earlier turn.
 pub struct BytecodeBackend {
     /// #1366 slice (c): the launch's declared host-completed cap names (`hostCaps`), re-granted on
     /// every rebuild (see `grant_io_powerbox`).
@@ -527,24 +464,23 @@ pub struct BytecodeBackend {
     /// #1366 slice (c): the request the run is currently parked on (filled by a declared proc's
     /// submit hook; read by `cap_park_request`; cleared by `provide_cap`).
     parked_cap: SharedCapRequest,
-    engine: Engine,
+    run: ScheduledDebugRun,
     module: Module,
     func: FuncIdx,
     args: Vec<Value>,
     breakpoints: Vec<IrPc>,
     /// Armed watchpoints with backend-owned stable ids (re-applied to the run after a `seek` rebuild).
-    /// Single-vCPU only — the scheduled engine reports `supports_watch = false` this slice.
+    /// Cross-thread: a range fires in whichever thread touches it.
     watch_specs: Vec<(WatchId, u64, u64, WatchKind)>,
     /// Armed **value** watchpoints on SSA-held source variables (#1229), backend-owned stable ids,
-    /// re-applied after a `seek` rebuild like `watch_specs`. Single-vCPU only this slice; the target
-    /// is frame-independent so re-application is verbatim.
+    /// re-applied after a `seek` rebuild like `watch_specs` (the target is frame-independent so
+    /// re-application is verbatim).
     value_specs: Vec<(WatchId, ValueWatchTarget, WatchKind)>,
     next_watch: u32,
     fuel: u64,
     /// This session runs its guest under the **on-ramp I/O powerbox** ([`grant_io_powerbox`]) instead of
     /// deny-all — so a manifest program that calls a host capability (a chibicc `printf` → `write`) runs
-    /// and its output is captured, rather than `CapFault`ing. Single-vCPU only (a `thread.spawn` guest
-    /// stays deny-all this slice). Off ⇒ the compute-only path, unchanged.
+    /// and its output is captured, rather than `CapFault`ing. Off ⇒ the compute-only path, unchanged.
     powerbox: bool,
     /// Preloaded stdin for the powerbox (`read(0, …)`); empty for a pure-output program.
     stdin: Vec<u8>,
@@ -553,16 +489,16 @@ pub struct BytecodeBackend {
     /// `None` = an empty scratch store.
     fs_seed: Option<temen_fs::FsSeed>,
     /// W4 blocking stdin: a `read` on an exhausted buffer parks the session
-    /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF. Powerbox
-    /// sessions on either bytecode engine (the threaded one since #1146 deeper — invariant 14).
+    /// (`StopReason::StdinPark`, resumed by `provideStdin`) instead of returning EOF (powerbox
+    /// sessions).
     block_stdin: bool,
     /// Slice 5: the session's Memory-capability growth cap ([`Host::set_mem_map_limit`]) — set on
     /// the powerbox at build and on every seek rebuild. `None` = unbounded.
     mem_limit: Option<u64>,
-    /// Slice 6: whether the scheduler trace tape is armed (threaded engine only) — re-armed on
-    /// every seek rebuild so the replay refills the tape deterministically.
+    /// Slice 6: whether the scheduler trace tape is armed — re-armed on every seek rebuild so the
+    /// replay refills the tape deterministically.
     sched_trace: bool,
-    /// Slice 7: the seeded-pick schedule policy (threaded engine only) — applied at construction
+    /// Slice 7: the seeded-pick schedule policy — applied at construction
     /// and re-applied on every rebuild (seek and rev-trace probes: the seed is *semantic* schedule
     /// policy, unlike the observation-only sink/trace, so every replay must carry it).
     seed: Option<u64>,
@@ -583,19 +519,15 @@ pub struct BytecodeBackend {
     /// Cached stoppable-position timeline for `step_back` target search (see [`RevTrace`]). `None` until
     /// the first `step_back`; rebuilt when a forward step moves the position past its `high_water`.
     rev_trace: Option<RevTrace>,
-    /// Time-travel **checkpoint ladder** (DEBUGGING.md W1), single-vCPU only: snapshots of the run at
-    /// ascending op clocks (kept sorted) so a reverse `seek`/`step_back` restarts from the nearest one
-    /// (`clock <= t`) instead of clock 0, bounding the replay to [`CHECKPOINT_STRIDE`]. Populated lazily
-    /// as `seek` drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s
-    /// ladder. One `Ladder` (unbounded) keyed on the op clock; the ladder itself is the same type the
-    /// tree-walker and the reactor timeline use (`temen_interp::moment`, #1460).
-    checkpoints: Ladder<DebugRunContinuation>,
-    /// Multi-vCPU checkpoint ladder (same role as `checkpoints`, keyed on the global scheduler `turn`)
-    /// for a threaded session's `ScheduledDebugRun`. Only one of the two ladders is ever populated —
-    /// a session is single-vCPU xor threaded for its whole life.
-    sched_checkpoints: Ladder<ScheduledContinuation>,
+    /// Time-travel **checkpoint ladder** (DEBUGGING.md W1): snapshots of the run at ascending global
+    /// turns (kept sorted) so a reverse `seek`/`step_back` restarts from the nearest one (`turn <= t`)
+    /// instead of turn 0, bounding the replay to [`CHECKPOINT_STRIDE`]. Populated lazily as `seek`
+    /// drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s ladder. One
+    /// `Ladder` (unbounded) keyed on the turn; the ladder itself is the same type the tree-walker and
+    /// the reactor timeline use (`temen_interp::moment`, #1460).
+    checkpoints: Ladder<ScheduledContinuation>,
     /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
-    /// boundary falls outside the [`DebugRun::snapshot`] / [`ScheduledDebugRun::snapshot`] subset (a
+    /// boundary falls outside the [`ScheduledDebugRun::snapshot`] subset (a
     /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable
     /// state), after which `seek` reverts to replay-from-0 for the rest of the session — mirroring
     /// `Inspector::maybe_checkpoint`.
@@ -629,11 +561,10 @@ fn wrap_sink(sink: &SharedSink) -> AccessSinkFn {
 pub(crate) const CHECKPOINT_STRIDE: u64 = 1024;
 
 impl BytecodeBackend {
-    /// Open a bytecode debug session on `module`'s `func(args)`. A `thread.spawn` guest gets the
-    /// multithreaded scheduled engine; a spawn-free one the single-vCPU engine. `None` if the module
-    /// is outside the bytecode engine's subset (`compile_module` declines it). `powerbox` runs a
-    /// spawn-free guest under the on-ramp I/O powerbox (`stdin` preloads `read`); a threaded guest ignores
-    /// it (deny-all).
+    /// Open a bytecode debug session on `module`'s `func(args)`. `None` if the module is outside the
+    /// bytecode engine's subset (`compile_module` declines it), or a schedule `seed` is given for a
+    /// spawn-free guest (meaningless with one vCPU — declined rather than silently ignored).
+    /// `powerbox` runs the guest under the on-ramp I/O powerbox (`stdin` preloads `read`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         module: Module,
@@ -680,46 +611,26 @@ impl BytecodeBackend {
     ) -> Option<BytecodeBackend> {
         let tape = CapTape::default();
         let parked_cap: SharedCapRequest = SharedCapRequest::default();
-        let engine = if bytecode::module_spawns_threads(&module) {
-            // The powerbox rides the scheduled engine too now, so a threaded C guest's
-            // `malloc`/`printf` work under the debugger (the seed is the slice-7 variation), and so
-            // does W4 blocking stdin (#1146 deeper): a thread's exhausted `read` parks the session.
-            let run = build_scheduled_run(
-                &module,
-                func,
-                args,
-                powerbox,
-                &stdin,
-                block_stdin,
-                mem_limit,
-                seed,
-                fs_seed.as_ref(),
-                &host_caps,
-                &parked_cap,
-                &tape,
-            )?;
-            Engine::Threaded(Box::new(run))
-        } else {
-            // A seed is meaningless with one vCPU — decline rather than silently ignore it.
-            if seed.is_some() {
-                return None;
-            }
-            Engine::Single(Box::new(build_single_run(
-                &module,
-                func,
-                args,
-                powerbox,
-                &stdin,
-                block_stdin,
-                mem_limit,
-                fs_seed.as_ref(),
-                &host_caps,
-                &parked_cap,
-                &tape,
-            )?))
-        };
+        // A seed is meaningless with one vCPU — decline rather than silently ignore it.
+        if seed.is_some() && !bytecode::module_spawns_threads(&module) {
+            return None;
+        }
+        let run = build_run(
+            &module,
+            func,
+            args,
+            powerbox,
+            &stdin,
+            block_stdin,
+            mem_limit,
+            seed,
+            fs_seed.as_ref(),
+            &host_caps,
+            &parked_cap,
+            &tape,
+        )?;
         Some(BytecodeBackend {
-            engine,
+            run,
             module,
             func,
             args: args.to_vec(),
@@ -738,7 +649,6 @@ impl BytecodeBackend {
             tape,
             rev_trace: None,
             checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
-            sched_checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
             checkpointing: true,
             access_sink: None,
             sched_trace: false,
@@ -753,44 +663,24 @@ impl BytecodeBackend {
     /// `sink` as `(clock-or-turn, task, MemEvent)`. Re-installed transparently across `seek`
     /// rebuilds; the rev-trace probes never fire it.
     pub fn set_access_sink(&mut self, sink: SharedSink) {
-        match &mut self.engine {
-            Engine::Single(run) => run.set_access_sink(wrap_sink(&sink)),
-            Engine::Threaded(run) => run.set_access_sink(wrap_sink(&sink)),
-        }
+        self.run.set_access_sink(wrap_sink(&sink));
         self.access_sink = Some(sink);
     }
 
-    /// Number of time-travel checkpoints currently in the ladder (single-vCPU or scheduled — only one
-    /// is ever populated) — test/introspection hook (mirrors `Inspector::checkpoint_count`). `0` for a
-    /// run not yet seeked far enough to lay one down, or one outside the checkpointable subset (fibers,
-    /// coroutines, §14 children, stateful host), which replays from clock 0 / turn 0.
+    /// Number of time-travel checkpoints currently in the ladder — test/introspection hook (mirrors
+    /// `Inspector::checkpoint_count`). `0` for a run not yet seeked far enough to lay one down, or one
+    /// outside the checkpointable subset (an event-parked fiber, a mid-invoke task, a non-pristine
+    /// layout, a stateful host), which replays from turn 0.
     pub fn checkpoint_count(&self) -> usize {
-        self.checkpoints.len() + self.sched_checkpoints.len()
+        self.checkpoints.len()
     }
 
-    /// Build a fresh single-vCPU [`DebugRun`] with this session's engine config — under the on-ramp I/O
-    /// powerbox (recording + replaying `tape`) when `self.powerbox`, else deny-all. Used at launch and on
-    /// every reverse `seek`/`step_back` rebuild, so a re-executed powerbox run sees identical cap inputs.
-    fn fresh_single(&self) -> Option<DebugRun> {
-        build_single_run(
-            &self.module,
-            self.func,
-            &self.args,
-            self.powerbox,
-            &self.stdin,
-            self.block_stdin,
-            self.mem_limit,
-            self.fs_seed.as_ref(),
-            &self.host_caps,
-            &self.parked_cap,
-            &self.tape,
-        )
-    }
-
-    /// Rebuild a fresh scheduled run with this session's powerbox + seed (the threaded twin of
-    /// [`fresh_single`]) — the base a reverse `seek`/rev-trace probe re-drives from.
-    fn fresh_scheduled(&self) -> Option<ScheduledDebugRun> {
-        build_scheduled_run(
+    /// Rebuild a fresh run with this session's engine config — under the on-ramp I/O powerbox
+    /// (recording + replaying `tape`) when `self.powerbox`, else deny-all, with the schedule seed —
+    /// the base a reverse `seek`/rev-trace probe re-drives from, so a re-executed powerbox run sees
+    /// identical cap inputs.
+    fn fresh(&self) -> Option<ScheduledDebugRun> {
+        build_run(
             &self.module,
             self.func,
             &self.args,
@@ -806,20 +696,20 @@ impl BytecodeBackend {
         )
     }
 
-    /// Drive a freshly rebuilt (and possibly checkpoint-restored) single-vCPU `run` forward to op clock
-    /// `t`, laying down a checkpoint at each [`CHECKPOINT_STRIDE`] boundary along the way (so a later
+    /// Drive a freshly rebuilt (and possibly checkpoint-restored) `run` forward to global turn `t`,
+    /// laying down a checkpoint at each [`CHECKPOINT_STRIDE`] boundary along the way (so a later
     /// reverse `seek`/`step_back` restarts nearby). With checkpointing off it is a straight tick-to-`t`.
     /// The stride capture is transparent — ticking is the same raw replay quantum regardless — so the
     /// state at `t` is identical to a single run from the restore point to `t`.
-    fn drive_single_to(&mut self, run: &mut DebugRun, t: u64, fuel: &mut u64) {
+    fn drive_to(&mut self, run: &mut ScheduledDebugRun, t: u64, fuel: &mut u64) {
         loop {
-            let clock = run.op_clock();
-            if clock >= t {
+            let turn = run.op_turn();
+            if turn >= t {
                 break;
             }
             // At a positive stride boundary short of `t`, snapshot before executing the op (so the
-            // checkpoint's clock is exactly the boundary). Deduped + subset-guarded by `maybe_checkpoint`.
-            if self.checkpointing && clock > 0 && clock.is_multiple_of(CHECKPOINT_STRIDE) {
+            // checkpoint's turn is exactly the boundary). Deduped + subset-guarded by `maybe_checkpoint`.
+            if self.checkpointing && turn > 0 && turn.is_multiple_of(CHECKPOINT_STRIDE) {
                 self.maybe_checkpoint(run);
             }
             if !run.tick(fuel) {
@@ -828,11 +718,11 @@ impl BytecodeBackend {
         }
     }
 
-    /// Snapshot `run` into the checkpoint ladder at its current clock, if checkpointing is still on and
-    /// the continuation is [`DebugRun::snapshot`]-able; otherwise disable checkpointing and drop the
-    /// ladder (the run left the snapshottable subset, so `seek` reverts to replay-from-0). A clock
-    /// already in the ladder is not duplicated. Mirrors `Inspector::maybe_checkpoint`.
-    fn maybe_checkpoint(&mut self, run: &DebugRun) {
+    /// Snapshot `run` into the checkpoint ladder at its current turn, if checkpointing is still on and
+    /// the continuation is [`ScheduledDebugRun::snapshot`]-able; otherwise disable checkpointing and
+    /// drop the ladder (the run left the snapshottable subset, so `seek` reverts to replay-from-0). A
+    /// turn already in the ladder is not duplicated. Mirrors `Inspector::maybe_checkpoint`.
+    fn maybe_checkpoint(&mut self, run: &ScheduledDebugRun) {
         if !self.checkpointing {
             return;
         }
@@ -842,92 +732,39 @@ impl BytecodeBackend {
             return;
         };
         // Sorted insert, deduped, is the ladder's own contract now.
-        self.checkpoints.take(run.op_clock(), snap);
-    }
-
-    /// Scheduled-engine counterpart of [`drive_single_to`](BytecodeBackend::drive_single_to): drive a
-    /// freshly rebuilt (and possibly checkpoint-restored) `ScheduledDebugRun` forward to global turn `t`,
-    /// laying down a checkpoint at each [`CHECKPOINT_STRIDE`] boundary. With checkpointing off it is a
-    /// straight tick-to-`t`. Ticking is the same raw quantum regardless, so the state at `t` equals a
-    /// single run from the restore point to `t`.
-    fn drive_scheduled_to(&mut self, run: &mut ScheduledDebugRun, t: u64, fuel: &mut u64) {
-        loop {
-            let turn = run.op_turn();
-            if turn >= t {
-                break;
-            }
-            if self.checkpointing && turn > 0 && turn.is_multiple_of(CHECKPOINT_STRIDE) {
-                self.maybe_sched_checkpoint(run);
-            }
-            if !run.tick(fuel) {
-                break;
-            }
-        }
-    }
-
-    /// Scheduled-engine counterpart of [`maybe_checkpoint`](BytecodeBackend::maybe_checkpoint): snapshot
-    /// `run` into the scheduled ladder at its current turn, or disable checkpointing + drop the ladder if
-    /// the continuation left the [`ScheduledDebugRun::snapshot`]-able subset.
-    fn maybe_sched_checkpoint(&mut self, run: &ScheduledDebugRun) {
-        if !self.checkpointing {
-            return;
-        }
-        let Some(snap) = run.snapshot() else {
-            self.checkpointing = false;
-            self.sched_checkpoints.clear();
-            return;
-        };
-        self.sched_checkpoints.take(run.op_turn(), snap);
+        self.checkpoints.take(run.op_turn(), snap);
     }
 
     /// Push the recorded writes into the live engine (slice 8) — its cursor lands past entries at
     /// clocks already passed, so the just-applied live write isn't double-counted going forward.
     fn sync_writes(&mut self) {
-        match &mut self.engine {
-            Engine::Single(run) => run.set_scheduled_writes(self.writes.clone()),
-            Engine::Threaded(run) => run.set_scheduled_writes(self.writes.clone()),
-        }
+        self.run.set_scheduled_writes(self.writes.clone());
     }
 
-    /// Absorb the live single-vCPU run's recorded cap-input tape if it now reaches further than the one
-    /// held — so a later reverse `seek` replays the furthest-forward inputs. Cheap no-op for a
-    /// pure-output (`write`-only) program (its tape stays empty) and for deny-all sessions.
+    /// Absorb the live run's recorded cap-input tape if it now reaches further than the one held — so
+    /// a later reverse `seek` replays the furthest-forward inputs. Cheap no-op for a pure-output
+    /// (`write`-only) program (its tape stays empty) and for deny-all sessions.
     fn capture_tape(&mut self) {
         if !self.powerbox {
             return;
         }
-        let live = match &self.engine {
-            Engine::Single(run) => run.host().cap_tape(),
-            Engine::Threaded(run) => run.host().cap_tape(),
-        };
+        let live = self.run.host().cap_tape();
         if live.records.len() > self.tape.records.len() {
             self.tape = live;
         }
     }
 
-    /// Whether this session runs on the multithreaded scheduled engine (so the DAP server uses the
-    /// global `turn` as the reverse time coordinate, not the single-vCPU op `clock`).
-    pub fn is_threaded(&self) -> bool {
-        matches!(self.engine, Engine::Threaded(_))
-    }
-
-    /// Push the current watchpoint ranges into the live engine (after arming/clearing one, or re-arming
-    /// a fresh single-vCPU run built by `seek`). Cross-thread on the scheduled engine.
+    /// Push the current watchpoints — window ranges and #1229 value watches — into the live run
+    /// (after arming/clearing one, or re-arming a fresh run built by `seek`; a value target is
+    /// frame-independent, so re-application is verbatim). Both are cross-thread.
     fn apply_watches(&mut self) {
         let ranges: Vec<_> = self
             .watch_specs
             .iter()
             .map(|(_, a, l, k)| (*a, *l, *k))
             .collect();
-        match &mut self.engine {
-            Engine::Single(run) => {
-                run.set_watchpoints(ranges);
-                // Value watches (#1229) ride the single-vCPU engine this slice; the target is
-                // frame-independent so re-application after a `seek` rebuild is verbatim.
-                run.set_value_watches(self.value_specs.clone());
-            }
-            Engine::Threaded(run) => run.set_watchpoints(ranges),
-        }
+        self.run.set_watchpoints(ranges);
+        self.run.set_value_watches(self.value_specs.clone());
     }
 
     /// Ensure [`Self::rev_trace`] covers `[0, now]`, (re)building it with a single fresh-run scan when
@@ -945,48 +782,24 @@ impl BytecodeBackend {
         }
         let mut fuel = self.fuel;
         let mut stoppable = Vec::new();
-        match &self.engine {
-            Engine::Single(_) => {
-                let Some(mut probe) = self.fresh_single() else {
-                    return false;
-                };
-                // Slice 8: the probe replays the debugger writes too, or its timeline diverges.
-                probe.set_scheduled_writes(self.writes.clone());
-                loop {
-                    let c = probe.op_clock();
-                    if c >= now {
-                        break;
-                    }
-                    if probe.frame_pc(0).is_some() {
-                        stoppable.push((c, probe.depth()));
-                    }
-                    if !probe.tick(&mut fuel) {
-                        break;
-                    }
-                }
+        let Some(mut probe) = self.fresh() else {
+            return false;
+        };
+        // The probe must replay the *same schedule* as the session (slice 7 policy; the seed rides
+        // `fresh`) and the same debugger writes (slice 8), or its timeline diverges.
+        probe.set_forced_switches(self.forced.clone());
+        probe.set_scheduled_writes(self.writes.clone());
+        loop {
+            let c = probe.op_turn();
+            if c >= now {
+                break;
             }
-            Engine::Threaded(_) => {
-                let Some(mut probe) = self.fresh_scheduled() else {
-                    return false;
-                };
-                // The probe must replay the *same schedule* as the session (slice 7 policy; the
-                // seed rides `fresh_scheduled`) and the same debugger writes (slice 8), or its
-                // timeline diverges.
-                probe.set_forced_switches(self.forced.clone());
-                probe.set_scheduled_writes(self.writes.clone());
-                loop {
-                    let c = probe.op_turn();
-                    if c >= now {
-                        break;
-                    }
-                    probe.locate();
-                    if probe.frame_pc(0).is_some() {
-                        stoppable.push((c, probe.depth()));
-                    }
-                    if !probe.tick(&mut fuel) {
-                        break;
-                    }
-                }
+            probe.locate();
+            if probe.frame_pc(0).is_some() {
+                stoppable.push((c, probe.depth()));
+            }
+            if !probe.tick(&mut fuel) {
+                break;
             }
         }
         self.rev_trace = Some(RevTrace {
@@ -1001,17 +814,10 @@ impl BytecodeBackend {
     /// then the finished result (or trap) if the root is done, else `Blocked` (a concurrency seam
     /// that engine can't follow).
     fn finish_stop(&self) -> Stop {
-        let (parked, pc) = match &self.engine {
-            Engine::Single(run) => (run.stdin_parked(), run.frame_pc(0)),
-            Engine::Threaded(run) => (run.stdin_parked(), run.frame_pc(0)),
-        };
+        let (parked, pc) = (self.run.stdin_parked(), self.run.frame_pc(0));
         // #1366: parked on a host-completed cap call — live, paused past the call, resumable once
         // `provideCap` delivers the value.
-        let cap = match &self.engine {
-            Engine::Single(run) => run.cap_parked().map(|id| (id, run.cap_park_pc())),
-            Engine::Threaded(run) => run.cap_parked().map(|id| (id, run.cap_park_pc())),
-        };
-        if let Some((id, at)) = cap {
+        if let Some((id, at)) = self.run.cap_parked().map(|id| (id, self.run.cap_park_pc())) {
             // The stop location is the call itself (the position after it may be a terminator).
             if let Some(pc) = at.or(pc) {
                 return Stop::Break {
@@ -1026,12 +832,8 @@ impl BytecodeBackend {
                 pc,
             };
         }
-        let result = match &self.engine {
-            Engine::Single(run) => run.result().cloned(),
-            Engine::Threaded(run) => run.result().cloned(),
-        };
-        match result {
-            Some(r) => Stop::Finished(r),
+        match self.run.result() {
+            Some(r) => Stop::Finished(r.clone()),
             None => Stop::Blocked,
         }
     }
@@ -1039,11 +841,7 @@ impl BytecodeBackend {
     /// A `Step` stop at the focused thread's current pc (or the finished result), for a resume/seek that
     /// didn't hit a breakpoint.
     fn step_stop(&self) -> Stop {
-        let pc = match &self.engine {
-            Engine::Single(run) => run.frame_pc(0),
-            Engine::Threaded(run) => run.frame_pc(0),
-        };
-        match pc {
+        match self.run.frame_pc(0) {
             Some(pc) => Stop::Break {
                 reason: StopReason::Step,
                 pc,
@@ -1090,98 +888,37 @@ impl Debuggee for BytecodeBackend {
         // A fresh fuel budget per resume (debugging is interactive; the run replays from scratch on a
         // seek, so a shared decrementing counter would be inconsistent).
         let mut fuel = self.fuel;
-        let stop = match &mut self.engine {
-            Engine::Single(run) => match run.run_to(&self.breakpoints, &mut fuel) {
-                // A stop is a watchpoint hit if the run flagged one before this op, else a breakpoint.
-                Some(pc) => {
-                    let reason = match run.take_watch_hit() {
-                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
-                        None => StopReason::Breakpoint,
-                    };
-                    Stop::Break { reason, pc }
-                }
-                None => self.finish_stop(),
-            },
-            Engine::Threaded(run) => {
-                run.set_breakpoints(self.breakpoints.clone());
-                Self::sched_stop(run.run_until_stop(&mut fuel))
-            }
-        };
+        self.run.set_breakpoints(self.breakpoints.clone());
+        let stop = Self::sched_stop(self.run.run_until_stop(&mut fuel));
         self.capture_tape(); // absorb any new cap inputs this advance recorded (for a later reverse seek)
         stop
     }
     fn step(&mut self) -> Stop {
         let mut fuel = self.fuel;
-        let stop = match &mut self.engine {
-            Engine::Single(run) => match run.step(&mut fuel) {
-                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
-                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
-                // watch hit and report it, else a plain step.
-                Some(pc) => {
-                    let reason = match run.take_watch_hit() {
-                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
-                        None => StopReason::Step,
-                    };
-                    Stop::Break { reason, pc }
-                }
-                None => self.finish_stop(),
-            },
-            Engine::Threaded(run) => Self::sched_stop(run.step(&mut fuel)),
-        };
+        let stop = Self::sched_stop(self.run.step(&mut fuel));
         self.capture_tape();
         stop
     }
     fn step_over(&mut self) -> Stop {
         let mut fuel = self.fuel;
-        let stop = match &mut self.engine {
-            Engine::Single(run) => match run.step_over(&mut fuel) {
-                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
-                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
-                // watch hit and report it, else a plain step.
-                Some(pc) => {
-                    let reason = match run.take_watch_hit() {
-                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
-                        None => StopReason::Step,
-                    };
-                    Stop::Break { reason, pc }
-                }
-                None => self.finish_stop(),
-            },
-            Engine::Threaded(run) => Self::sched_stop(run.step_over(&mut fuel)),
-        };
+        let stop = Self::sched_stop(self.run.step_over(&mut fuel));
         self.capture_tape();
         stop
     }
     fn step_out(&mut self) -> Stop {
         let mut fuel = self.fuel;
-        let stop = match &mut self.engine {
-            Engine::Single(run) => match run.step_out(&mut fuel) {
-                // A step can stop for a watchpoint mid-line (a window-range access, or a #1229 value
-                // watch) — `run_to`'s per-op check now runs in the step path too, so consult the
-                // watch hit and report it, else a plain step.
-                Some(pc) => {
-                    let reason = match run.take_watch_hit() {
-                        Some((addr, write)) => StopReason::Watchpoint { addr, write },
-                        None => StopReason::Step,
-                    };
-                    Stop::Break { reason, pc }
-                }
-                None => self.finish_stop(),
-            },
-            Engine::Threaded(run) => Self::sched_stop(run.step_out(&mut fuel)),
-        };
+        let stop = Self::sched_stop(self.run.step_out(&mut fuel));
         self.capture_tape();
         stop
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
-    // (single-vCPU, no capabilities), so seeking to an earlier op clock = rebuild a fresh run and
-    // replay to that many ops. `step_back` = one op earlier. The `seek` replay is bounded by the
-    // single-vCPU **checkpoint ladder** (see `drive_single_to`/`maybe_checkpoint`): a restart from the
-    // nearest snapshot replays at most `CHECKPOINT_STRIDE` ops instead of O(t) from clock 0.
+    // plus a recorded cap tape, so seeking to an earlier turn = rebuild a fresh run and replay to that
+    // many turns. `step_back` = one stoppable op earlier. The `seek` replay is bounded by the
+    // **checkpoint ladder** (see `drive_to`/`maybe_checkpoint`): a restart from the nearest snapshot
+    // replays at most `CHECKPOINT_STRIDE` turns instead of O(t) from turn 0.
     fn step_back(&mut self) -> Stop {
         // Rewind to the previous op that sits at a real IR instruction (a stoppable position — not a
-        // terminator slot, where there's nothing to inspect) strictly before now, then seek there. The
-        // single-vCPU coordinate is the op `clock`; the multithreaded one is the global scheduler `turn`.
+        // terminator slot, where there's nothing to inspect) strictly before now, then seek there.
         //
         // **Depth-aware** (the reverse of `next`, not `stepIn`): only ops at call depth ≤ the current
         // frame count are candidates, so a step-back from a line that *called* something (a chibicc
@@ -1192,10 +929,7 @@ impl Debuggee for BytecodeBackend {
         // The candidate positions come from the cached [`RevTrace`] (the run's fixed stoppable-op
         // timeline), so the target search is a lookup rather than a second full replay — only the `seek`
         // below re-executes. The first `step_back` past a new high-water builds the trace with one scan.
-        let (now, now_depth) = match &self.engine {
-            Engine::Single(run) => (run.op_clock(), run.depth()),
-            Engine::Threaded(run) => (run.op_turn(), run.depth()),
-        };
+        let (now, now_depth) = (self.run.op_turn(), self.run.depth());
         if !self.ensure_rev_trace(now) {
             return Stop::Blocked;
         }
@@ -1212,84 +946,49 @@ impl Debuggee for BytecodeBackend {
     }
     fn seek(&mut self, t: u64) -> Stop {
         let mut fuel = self.fuel;
-        if self.is_threaded() {
-            // Rebuild a fresh scheduled run and replay `t` turns — the schedule is deterministic, so
-            // this reproduces the exact state at global turn `t` (DEBUGGING.md W1, multithreaded).
-            let Some(mut run) = self.fresh_scheduled() else {
-                return Stop::Blocked;
-            };
-            run.set_breakpoints(self.breakpoints.clone());
-            run.set_watchpoints(
-                self.watch_specs
-                    .iter()
-                    .map(|(_, a, l, k)| (*a, *l, *k))
-                    .collect(),
-            );
-            // Re-install the access sink *before* the replay drive, so a model consumer observes
-            // the re-execution and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
-            if let Some(sink) = &self.access_sink {
-                run.set_access_sink(wrap_sink(sink));
-            }
-            // Re-arm the trace tape: the replay refills it deterministically from the restore point.
-            if self.sched_trace {
-                run.set_sched_trace(true);
-            }
-            // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it (the
-            // seed rides `fresh_scheduled`; forced switches are applied here).
-            run.set_forced_switches(self.forced.clone());
-            // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
-            run.set_scheduled_writes(self.writes.clone());
-            // Restart from the nearest scheduled checkpoint at or before `t` (ladder kept sorted by
-            // turn) instead of turn 0, when still checkpointable — bounding the replay to the stride.
-            if self.checkpointing {
-                if let Some((turn, cp)) = self.sched_checkpoints.nearest_at_or_before(t) {
-                    run.restore(turn, cp);
-                }
-            }
-            self.drive_scheduled_to(&mut run, t, &mut fuel);
-            run.locate();
-            if let Some(pc) = run.frame_pc(0) {
-                if self.breakpoints.contains(&pc) {
-                    run.arm_breakpoint_skip();
-                }
-            }
-            self.engine = Engine::Threaded(Box::new(run));
-            // A `seek` past the furthest point reached so far runs new ground **live**, recording cap
-            // crossings a later reverse seek would otherwise have to re-run live against a rebuilt
-            // powerbox. Absorb them here, exactly as every forward advance does — a host capability's
-            // closure is gone on a rebuild, so only the tape reproduces it (`is_recorded_input`).
-            self.capture_tape();
-            return self.step_stop();
-        }
-        let Some(mut run) = self.fresh_single() else {
+        // Rebuild a fresh run and replay `t` turns — the schedule is deterministic, so this reproduces
+        // the exact state at global turn `t` (DEBUGGING.md W1).
+        let Some(mut run) = self.fresh() else {
             return Stop::Blocked;
         };
-        // Re-install the access sink *before* the replay drive (see the threaded path above).
+        run.set_breakpoints(self.breakpoints.clone());
+        // Re-install the access sink *before* the replay drive, so a model consumer observes the
+        // re-execution and can re-derive its state (`seek(t)` ≡ a from-0 run to `t`).
         if let Some(sink) = &self.access_sink {
             run.set_access_sink(wrap_sink(sink));
         }
-        // And the recorded debugger writes (slice 8) — the replay re-applies them at their clocks.
+        // Re-arm the trace tape: the replay refills it deterministically from the restore point.
+        if self.sched_trace {
+            run.set_sched_trace(true);
+        }
+        // Re-apply the schedule policy (slice 7) — semantic, so the replay must carry it (the seed
+        // rides `fresh`; forced switches are applied here).
+        run.set_forced_switches(self.forced.clone());
+        // And the recorded debugger writes (slice 8) — the replay re-applies them at their turns.
         run.set_scheduled_writes(self.writes.clone());
-        // Restart from the nearest checkpoint at or before `t` (the ladder is kept sorted by clock)
-        // instead of clock 0, when this run is still checkpointable — bounding the replay to the stride.
+        // Restart from the nearest checkpoint at or before `t` (ladder kept sorted by turn) instead
+        // of turn 0, when still checkpointable — bounding the replay to the stride.
         if self.checkpointing {
-            if let Some((clock, cp)) = self.checkpoints.nearest_at_or_before(t) {
-                run.restore(clock, cp);
+            if let Some((turn, cp)) = self.checkpoints.nearest_at_or_before(t) {
+                run.restore(turn, cp);
             }
         }
-        self.drive_single_to(&mut run, t, &mut fuel);
-        self.engine = Engine::Single(Box::new(run));
-        self.capture_tape(); // see the threaded arm above — a forward seek records new cap crossings
-        self.apply_watches(); // re-arm the watchpoints on the fresh (replayed) run
-                              // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
-                              // here makes progress instead of immediately re-reporting this stop.
-        if let Engine::Single(run) = &mut self.engine {
-            if let Some(pc) = run.frame_pc(0) {
-                if self.breakpoints.contains(&pc) {
-                    run.arm_breakpoint_skip();
-                }
+        self.drive_to(&mut run, t, &mut fuel);
+        run.locate();
+        // If the replay landed exactly on a breakpoint op, arm the skip so a forward `continue` from
+        // here makes progress instead of immediately re-reporting this stop.
+        if let Some(pc) = run.frame_pc(0) {
+            if self.breakpoints.contains(&pc) {
+                run.arm_breakpoint_skip();
             }
         }
+        self.run = run;
+        // A `seek` past the furthest point reached so far runs new ground **live**, recording cap
+        // crossings a later reverse seek would otherwise have to re-run live against a rebuilt
+        // powerbox. Absorb them here, exactly as every forward advance does — a host capability's
+        // closure is gone on a rebuild, so only the tape reproduces it (`is_recorded_input`).
+        self.capture_tape();
+        self.apply_watches(); // re-arm the range + value watches on the fresh (replayed) run
         self.step_stop()
     }
     fn set_breakpoint(&mut self, pc: IrPc) {
@@ -1303,7 +1002,7 @@ impl Debuggee for BytecodeBackend {
         self.breakpoints.len() != before
     }
     // Data breakpoints: arm a window watchpoint (a backend-owned stable id, so it survives a `seek`).
-    // Cross-thread on the scheduled engine (fires in whichever thread touches the range).
+    // Cross-thread: fires in whichever thread touches the range.
     fn set_watchpoint(&mut self, addr: u64, len: u64, kind: WatchKind) -> Option<WatchId> {
         let id = WatchId::from_raw(self.next_watch);
         self.next_watch += 1;
@@ -1321,19 +1020,15 @@ impl Debuggee for BytecodeBackend {
         }
         removed
     }
-    // Value watches (#1229): stop when an SSA-held source variable's value changes. Single-vCPU only
-    // this slice — `resolve_value_watch` yields `None` on the scheduled engine, so the arm fails
-    // cleanly (the DAP reports the data breakpoint unverified).
+    // Value watches (#1229): stop when an SSA-held source variable's value changes — resolved in the
+    // focused thread's frame, armed run-wide (cross-thread, like a range).
     fn set_value_watchpoint(
         &mut self,
         frame_from_top: usize,
         name: &str,
         kind: WatchKind,
     ) -> Option<WatchId> {
-        let target = match &self.engine {
-            Engine::Single(run) => run.resolve_value_watch(frame_from_top, name)?,
-            Engine::Threaded(_) => return None,
-        };
+        let target = self.run.resolve_value_watch(frame_from_top, name)?;
         let id = WatchId::from_raw(self.next_watch);
         self.next_watch += 1;
         self.value_specs.push((id, target, kind));
@@ -1342,17 +1037,9 @@ impl Debuggee for BytecodeBackend {
     }
     fn backtrace(&self) -> Vec<FrameInfo> {
         let mut out = Vec::new();
-        // The focused thread's stack (single-vCPU: the sole thread; scheduled: `select_task`'s pick).
-        let depth = match &self.engine {
-            Engine::Single(run) => run.depth(),
-            Engine::Threaded(run) => run.depth(),
-        };
-        for d in 0..depth {
-            let pc = match &self.engine {
-                Engine::Single(run) => run.frame_pc(d),
-                Engine::Threaded(run) => run.frame_pc(d),
-            };
-            if let Some(pc) = pc {
+        // The focused thread's stack (`select_task`'s pick; the sole thread of a spawn-free guest).
+        for d in 0..self.run.depth() {
+            if let Some(pc) = self.run.frame_pc(d) {
                 let source = temen_interp::source_loc(&self.module, pc);
                 out.push(FrameInfo {
                     pc,
@@ -1370,63 +1057,34 @@ impl Debuggee for BytecodeBackend {
         temen_interp::source_loc(&self.module, pc)
     }
     fn read_var(&self, frame_from_top: usize, name: &str, width: usize) -> Option<VarValue> {
-        match &self.engine {
-            Engine::Single(run) => run.read_var(frame_from_top, name, width),
-            Engine::Threaded(run) => run.read_var(frame_from_top, name, width),
-        }
+        self.run.read_var(frame_from_top, name, width)
     }
     fn var_addr(&self, frame_from_top: usize, name: &str) -> Option<u64> {
-        match &self.engine {
-            Engine::Single(run) => run.var_addr(frame_from_top, name),
-            Engine::Threaded(run) => run.var_addr(frame_from_top, name),
-        }
+        self.run.var_addr(frame_from_top, name)
     }
     fn read_window(&self, addr: u64, len: usize) -> Result<Vec<u8>, Trap> {
-        match &self.engine {
-            Engine::Single(run) => run.read_window(addr, len),
-            Engine::Threaded(run) => run.read_window(addr, len),
-        }
+        self.run.read_window(addr, len)
     }
     fn fault_addr(&self) -> Option<u64> {
-        match &self.engine {
-            Engine::Single(run) => run.fault_addr(),
-            Engine::Threaded(run) => run.fault_addr(),
-        }
+        self.run.fault_addr()
     }
     fn threads(&self) -> Vec<u64> {
-        match &self.engine {
-            // Single-vCPU: the sole task is 0 (DAP thread 1).
-            Engine::Single(_) => vec![0],
-            Engine::Threaded(run) => run.threads(),
-        }
+        self.run.threads()
     }
     fn select_task(&mut self, id: u64) -> bool {
-        match &mut self.engine {
-            Engine::Single(_) => id == 0,
-            Engine::Threaded(run) => run.select_task(id),
-        }
+        self.run.select_task(id)
     }
     fn stopped_task(&self) -> Option<u64> {
-        match &self.engine {
-            Engine::Single(_) => Some(0),
-            Engine::Threaded(run) => run.stopped_task(),
-        }
+        self.run.stopped_task()
     }
+    // One time coordinate: the global scheduler `turn` (for a spawn-free guest, its op count).
     fn turn(&self) -> u64 {
-        match &self.engine {
-            // Single-vCPU: no scheduler turns; the op `clock` is the time coordinate.
-            Engine::Single(_) => 0,
-            Engine::Threaded(run) => run.turn(),
-        }
+        self.run.turn()
     }
     fn clock(&self) -> u64 {
-        match &self.engine {
-            Engine::Single(run) => run.op_clock(),
-            Engine::Threaded(run) => run.turn(),
-        }
+        self.run.turn()
     }
-    // Both engines are fully reversible (deterministic replay) and watch-capable: the single-vCPU op
-    // `clock` and the multithreaded global `turn` are the two time coordinates.
+    // Fully reversible (deterministic replay) and watch-capable.
     fn supports_reverse(&self) -> bool {
         true
     }
@@ -1438,10 +1096,7 @@ impl Debuggee for BytecodeBackend {
     /// constants, and — under the powerbox — the guest heap cursor (window words at
     /// `POWERBOX_HEAP_BRK`/`_TOP`; the heap base is the mapped end, §1a growth into the tail).
     fn memory_map(&self) -> Option<Json> {
-        let (page, mapped, reserved, pages) = match &self.engine {
-            Engine::Single(run) => run.mem_map_info(),
-            Engine::Threaded(run) => run.mem_map_info(),
-        }?;
+        let (page, mapped, reserved, pages) = self.run.mem_map_info()?;
         let kinds = ["ro", "rw", "unmapped", "region"];
         let mut fields = vec![
             ("pageSize", Json::i(page as i64)),
@@ -1518,22 +1173,14 @@ impl Debuggee for BytecodeBackend {
         }
         Some(Json::obj(fields))
     }
-    /// The trace tape is a threaded-engine feature (a single vCPU has no schedule).
+    /// The scheduler trace tape (a one-task schedule traces its turns alone).
     fn set_sched_trace(&mut self, on: bool) -> bool {
-        match &mut self.engine {
-            Engine::Threaded(run) => {
-                run.set_sched_trace(on);
-                self.sched_trace = on;
-                true
-            }
-            Engine::Single(_) => false,
-        }
+        self.run.set_sched_trace(on);
+        self.sched_trace = on;
+        true
     }
     fn sched_trace_json(&self) -> Option<Json> {
-        let Engine::Threaded(run) = &self.engine else {
-            return None;
-        };
-        let tape = run.sched_trace()?;
+        let tape = self.run.sched_trace()?;
         use bytecode::SchedTraceEvent as E;
         Some(Json::Arr(
             tape.iter()
@@ -1582,16 +1229,13 @@ impl Debuggee for BytecodeBackend {
                 .collect(),
         ))
     }
-    /// Slice 8: apply + record a window write. The engine re-applies it at this clock on every
+    /// Slice 8: apply + record a window write. The engine re-applies it at this turn on every
     /// path that passes it — live resume and seek replay alike.
     fn write_window(&mut self, addr: u64, bytes: &[u8]) -> bool {
-        let (ok, now) = match &mut self.engine {
-            Engine::Single(run) => (run.write_window(addr, bytes), run.op_clock()),
-            Engine::Threaded(run) => (run.write_window(addr, bytes), run.op_turn()),
-        };
+        let ok = self.run.write_window(addr, bytes);
         if ok {
             self.writes.push((
-                now,
+                self.run.op_turn(),
                 ScheduledWrite::Window {
                     addr,
                     bytes: bytes.to_vec(),
@@ -1601,26 +1245,15 @@ impl Debuggee for BytecodeBackend {
         }
         ok
     }
-    /// Slice 8: apply + record a variable write (with the focused task on the scheduled engine,
-    /// so replays resolve it in the same thread).
+    /// Slice 8: apply + record a variable write (with the focused task, so replays resolve it in
+    /// the same thread).
     fn write_var(&mut self, frame_from_top: usize, name: &str, value: i64, width: usize) -> bool {
-        let (ok, now, task) = match &mut self.engine {
-            Engine::Single(run) => (
-                run.write_var(frame_from_top, name, value, width),
-                run.op_clock(),
-                0,
-            ),
-            Engine::Threaded(run) => (
-                run.write_var(frame_from_top, name, value, width),
-                run.op_turn(),
-                run.focus_task(),
-            ),
-        };
+        let ok = self.run.write_var(frame_from_top, name, value, width);
         if ok {
             self.writes.push((
-                now,
+                self.run.op_turn(),
                 ScheduledWrite::Var {
-                    task,
+                    task: self.run.focus_task(),
                     frame: frame_from_top,
                     name: name.to_string(),
                     value,
@@ -1631,59 +1264,47 @@ impl Debuggee for BytecodeBackend {
         }
         ok
     }
-    /// Slice 7: resolve + record a forced switch on the threaded engine.
+    /// Slice 7: resolve + record a forced switch.
     fn force_switch(&mut self, target: Option<usize>) -> Option<usize> {
-        let Engine::Threaded(run) = &mut self.engine else {
-            return None;
-        };
-        let runnable = run.runnable_tasks();
+        let runnable = self.run.runnable_tasks();
         let chosen = match target {
             Some(t) if runnable.contains(&t) => t,
             Some(_) => return None, // the named task isn't runnable — refuse, don't guess
             // Default: the lowest-index runnable that is *not* the schedule's default choice —
-            // "switch away"; with a single runnable task there is nothing to switch to.
-            None => *runnable.get(1).or_else(|| runnable.first())?,
+            // "switch away". With a single runnable task (a spawn-free guest always) there is
+            // nothing to switch to, so `get(1)` is `None` and the request fails cleanly.
+            None => *runnable.get(1)?,
         };
-        let turn = run.op_turn();
+        let turn = self.run.op_turn();
         self.forced.push((turn, chosen));
-        run.set_forced_switches(self.forced.clone());
+        self.run.set_forced_switches(self.forced.clone());
         Some(chosen)
     }
-    /// The engine-level sink installer (both bytecode engines support it).
+    /// The engine-level sink installer.
     fn set_access_sink(&mut self, sink: SharedSink) -> bool {
         BytecodeBackend::set_access_sink(self, sink);
         true
     }
     /// W4 blocking stdin: append the provided bytes to the parked run's stdin — the next resume
     /// re-issues the parked read against them (and the completed read joins the session's cap
-    /// tape, so a later reverse `seek` replays it faithfully). Either bytecode engine (#1146 deeper).
+    /// tape, so a later reverse `seek` replays it faithfully).
     fn provide_stdin(&mut self, bytes: &[u8]) -> bool {
         if !self.block_stdin {
             return false;
         }
-        match &mut self.engine {
-            Engine::Single(run) => run.provide_stdin(bytes),
-            Engine::Threaded(run) => run.provide_stdin(bytes),
-        }
+        self.run.provide_stdin(bytes);
         true
     }
-    /// #1366 — deliver the value for the host-completed cap call the session is parked on, on either
-    /// engine (#1517 gave the scheduled one the same park/deliver protocol).
+    /// #1366 — deliver the value for the host-completed cap call the session is parked on.
     fn provide_cap(&mut self, id: u64, value: i64) -> bool {
-        let ok = match &mut self.engine {
-            Engine::Single(run) => run.deliver_cap(id, value),
-            Engine::Threaded(run) => run.deliver_cap(id, value),
-        };
+        let ok = self.run.deliver_cap(id, value);
         if ok {
             *self.parked_cap.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
         ok
     }
     fn cap_park_request(&self) -> Option<(String, Vec<i64>)> {
-        let parked = match &self.engine {
-            Engine::Single(run) => run.cap_parked(),
-            Engine::Threaded(run) => run.cap_parked(),
-        }?;
+        let parked = self.run.cap_parked()?;
         let g = self.parked_cap.lock().unwrap_or_else(|e| e.into_inner());
         g.as_ref()
             .filter(|r| r.id == parked)
@@ -1693,9 +1314,6 @@ impl Debuggee for BytecodeBackend {
     /// reverse `seek` the run is rebuilt and replayed to the earlier point, so this reflects exactly the
     /// output produced up to *here* — it rewinds with the program. Empty for a deny-all session.
     fn stdout(&self) -> &[u8] {
-        match &self.engine {
-            Engine::Single(run) => &run.host().stdout,
-            Engine::Threaded(run) => &run.host().stdout,
-        }
+        &self.run.host().stdout
     }
 }

@@ -1,8 +1,7 @@
 //! Reverse-debug **checkpointing of a page-mapping root window** (debugging slice 6a). Before this
 //! slice the checkpoint ladder fell back to replay-from-clock-0 whenever the root window's layout was
 //! non-pristine — i.e. the guest had `map`ped (grown a reserved-tail page), `unmap`ped, or `protect`ed
-//! (`Ro`) any page through its `AddressSpace` (cap 5). The single-vCPU `DebugRun` (and the multi-vCPU
-//! scheduler, same `self.mem`) now capture the window's **page-protection map alongside its bytes**
+//! (`Ro`) any page through its `AddressSpace` (cap 5). The debug engine now captures the window's **page-protection map alongside its bytes**
 //! ([`Mem::layout_snapshot`]/`restore_layout`), so such a run is bounded-reverse like any other. Only
 //! §13 region aliasing (cross-domain shared bytes) still forces the fallback.
 //!
@@ -14,7 +13,7 @@
 //! — and the terminal load of the unmapped page — which would *not* fault, diverging, if its `Unmapped`
 //! entry were lost).
 
-use temen_interp::bytecode::{self, DebugRun, ScheduledDebugRun};
+use temen_interp::bytecode::{self, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, Value};
 use temen_text::parse_module;
 
@@ -64,21 +63,21 @@ block 0 (v0: i32) {
 
 const GRANT: u64 = 1 << 20; // the AddressSpace sub-range: [0, 1 MiB)
 
-/// A fresh single-vCPU `DebugRun` on the page-mapping kernel carrying the `AddressSpace` powerbox. The
-/// grant is deterministic (a fresh `Host` mints the same handle), so every session is bit-identical.
-fn session() -> DebugRun {
+/// A fresh run on the page-mapping kernel carrying the `AddressSpace` powerbox. The grant is
+/// deterministic (a fresh `Host` mints the same handle), so every session is bit-identical.
+fn session() -> ScheduledDebugRun {
     let m = parse_module(PAGE_MAPPING).expect("parse");
     let mut host = Host::new();
     let h = host.grant_address_space(0, GRANT);
-    DebugRun::new_with_host(&m, 0, &[Value::I32(h)], host)
+    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I32(h)], host)
         .expect("bytecode debug engine must drive a page-mapping root")
 }
 
-/// A per-op observation: the op clock, the call-stack `IrPc`s, and the whole touched window range
+/// A per-op observation: the turn, the call-stack `IrPc`s, and the whole touched window range
 /// `[0, 160 KiB)` (covering the grown tail page at 128 KiB and the zeroed unmapped range). `read_window`
 /// is a pure byte view (it bounds- but not protection-checks), so it reads uncommitted pages as zero.
-fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
-    let clock = run.op_clock();
+fn obs(run: &ScheduledDebugRun) -> (u64, String, Vec<u8>) {
+    let clock = run.op_turn();
     let mut frames = Vec::new();
     for d in 0..run.depth() {
         if let Some(pc) = run.frame_pc(d) {
@@ -117,7 +116,7 @@ fn page_mapping_fixture_faults_on_both_engines() {
 
 /// Warm≡cold oracle for **§6a page-mapping-root checkpointing** (DEBUGGING.md W1): at every clock where
 /// a checkpoint can be taken — including after the window has grown a page, protected one `Ro`, and
-/// unmapped another — a `DebugRun::restore`d run replays forward **identically** to the trusted from-0
+/// unmapped another — a `restore`d run replays forward **identically** to the trusted from-0
 /// run, all the way to the shared terminal `MemoryFault`. This exercises the full
 /// `layout_snapshot`/`restore_layout` round-trip: the committed byte range (grown tail included) and the
 /// page-protection map.
@@ -146,14 +145,14 @@ fn page_mapping_root_checkpoint_snapshot_restore_round_trips() {
     for c in 0..=total {
         let mut at_c = session();
         let mut f = FUEL;
-        while at_c.op_clock() < c as u64 && at_c.tick(&mut f) {}
+        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
         let Some(snap) = at_c.snapshot() else {
             continue; // outside the checkpointable subset
         };
         checkpoints += 1;
 
         let mut warm = session();
-        warm.restore(at_c.op_clock(), &snap);
+        warm.restore(at_c.op_turn(), &snap);
         let mut i = c;
         assert_eq!(
             obs(&warm),

@@ -17,7 +17,7 @@
 //! cells are plain data.
 
 use std::sync::Arc;
-use temen_interp::bytecode::{DebugRun, ScheduledDebugRun};
+use temen_interp::bytecode::ScheduledDebugRun;
 use temen_interp::{run_with_host, Host, Value};
 use temen_text::parse_module;
 
@@ -72,7 +72,7 @@ fn module() -> Arc<temen_ir::Module> {
 }
 
 /// A host seeded exactly as the oracle's: self-module registered, the queue pre-loaded with the
-/// dispatches. Both the reference `DebugRun`, each warm `session()`, and the oracle build one of these,
+/// dispatches. The reference run, each warm `session()`, and the oracle build one of these,
 /// so they serve the identical queue.
 fn seeded_host(m: &Arc<temen_ir::Module>) -> Host {
     let mut host = Host::new();
@@ -83,11 +83,11 @@ fn seeded_host(m: &Arc<temen_ir::Module>) -> Host {
     host
 }
 
-/// A fresh single-vCPU `DebugRun` on the serving kernel, its host pre-seeded with the dispatch queue.
-fn session() -> DebugRun {
+/// A fresh `ScheduledDebugRun` on the serving kernel, its host pre-seeded with the dispatch queue.
+fn session() -> ScheduledDebugRun {
     let m = module();
     let host = seeded_host(&m);
-    DebugRun::new_with_host(&m, 0, &[], host)
+    ScheduledDebugRun::new_with_host(&m, 0, &[], host)
         .expect("bytecode debug engine drives the native serve loop")
 }
 
@@ -100,11 +100,11 @@ fn oracle_result() -> Vec<Value> {
     run_with_host(&m, 0, &[], &mut fuel, &mut host).expect("tree-walker serves")
 }
 
-/// A per-op observation: the op clock, the call-stack `IrPc`s (which enter the handler body when the
+/// A per-op observation: the turn, the call-stack `IrPc`s (which enter the handler body when the
 /// serve loop admits a dispatch — so a mid-handler stop is visible here), and the 8 window bytes at
 /// 16384 holding the live counter mem[16384] (above the #1094 NULL guard) that each handler mutates.
-fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
-    let clock = run.op_clock();
+fn obs(run: &ScheduledDebugRun) -> (u64, String, Vec<u8>) {
+    let clock = run.op_turn();
     let mut frames = Vec::new();
     for d in 0..run.depth() {
         if let Some(pc) = run.frame_pc(d) {
@@ -117,7 +117,7 @@ fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
 
 /// Warm≡cold oracle for **§7 serve-loop checkpointing** (DEBUGGING.md W1): at every clock where a
 /// checkpoint can be taken — including while the serve loop is mid-drain and while a handler activation
-/// is in flight — a `DebugRun::restore`d run replays forward identically to the trusted from-0 run, to
+/// is in flight — a `restore`d run replays forward identically to the trusted from-0 run, to
 /// the same final result. This exercises the serve-state round-trip (`svc_state`/`set_svc_state` carried
 /// in the host replay substate) and the preserved in-flight `serve_ticket`.
 #[test]
@@ -146,14 +146,14 @@ fn serve_loop_checkpoint_snapshot_restore_round_trips() {
     for c in 0..=total {
         let mut at_c = session();
         let mut f = FUEL;
-        while at_c.op_clock() < c as u64 && at_c.tick(&mut f) {}
+        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
         let Some(snap) = at_c.snapshot() else {
             continue;
         };
         checkpoints += 1;
 
         let mut warm = session();
-        warm.restore(at_c.op_clock(), &snap);
+        warm.restore(at_c.op_turn(), &snap);
         let mut i = c;
         assert_eq!(
             obs(&warm),
@@ -190,77 +190,4 @@ fn serve_loop_checkpoint_snapshot_restore_round_trips() {
 #[test]
 fn serve_run_result_is_pinned() {
     assert_eq!(oracle_result(), vec![Value::I64(3142)]);
-}
-
-/// A root-only serving run on the **multi-vCPU** scheduler. The pure serve module (no park seam / no
-/// `instantiate`) is admitted natively on both debug engines, so the serve-state round-trip must hold
-/// through [`ScheduledSnapshot`] too — the same `HostReplaySubstate` seam carries it. Mirrors the
-/// single-vCPU round-trip over global turns.
-fn sched_session() -> ScheduledDebugRun {
-    let m = module();
-    let host = seeded_host(&m);
-    ScheduledDebugRun::new_with_host(&m, 0, &[], host)
-        .expect("scheduled debug engine drives the native serve loop")
-}
-
-fn sched_obs(run: &ScheduledDebugRun) -> (u64, Vec<u8>) {
-    (run.turn(), run.read_window(16384, 8).unwrap_or_default())
-}
-
-#[test]
-fn scheduled_serve_loop_checkpoint_snapshot_restore_round_trips() {
-    const FUEL: u64 = 5_000_000;
-    let want = oracle_result();
-
-    let mut refr = sched_session();
-    let mut f = FUEL;
-    let mut ref_obs = vec![sched_obs(&refr)];
-    while refr.tick(&mut f) {
-        ref_obs.push(sched_obs(&refr));
-    }
-    let total = ref_obs.len() - 1;
-    assert_eq!(
-        refr.result(),
-        Some(&Ok(want.clone())),
-        "scheduled serve run matches the oracle"
-    );
-
-    let mut checkpoints = 0usize;
-    for c in 0..=total {
-        let mut at_c = sched_session();
-        let mut f = FUEL;
-        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
-        let Some(snap) = at_c.snapshot() else {
-            continue;
-        };
-        checkpoints += 1;
-
-        let mut warm = sched_session();
-        warm.restore(at_c.op_turn(), &snap);
-        let mut i = c;
-        assert_eq!(
-            sched_obs(&warm),
-            ref_obs[i],
-            "scheduled restore at C={c} lands"
-        );
-        let mut f = FUEL;
-        while warm.tick(&mut f) {
-            i += 1;
-            assert_eq!(
-                sched_obs(&warm),
-                ref_obs[i],
-                "scheduled forward serve replay diverged after restore at C={c}"
-            );
-        }
-        assert_eq!(
-            i, total,
-            "scheduled warm serve run from C={c} reached the same end"
-        );
-        assert_eq!(warm.result(), Some(&Ok(want.clone())));
-    }
-    assert_eq!(
-        checkpoints,
-        total + 1,
-        "every scheduled turn is checkpointable — the serve state rides in ScheduledSnapshot's host substate"
-    );
 }

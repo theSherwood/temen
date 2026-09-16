@@ -2,7 +2,7 @@
 //! (#1454, #1460).
 //!
 //! Three time-travel routes grew up here separately: the tree-walk `Inspector`'s seek checkpoints, the
-//! bytecode engine's `DebugRun`/`ScheduledDebugRun` snapshots behind the DAP backend, and the reactor
+//! bytecode engine's `ScheduledDebugRun` snapshots behind the DAP backend, and the reactor
 //! moments behind the playground's scrub bar. Each captured the same two things — a window image and
 //! the host's run-mutable substate — plus its own idea of a continuation, and each kept its own sorted
 //! ladder of them with its own stride, dedupe, nearest-at-or-before and drop-past logic. Four copies

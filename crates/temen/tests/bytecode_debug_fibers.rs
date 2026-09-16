@@ -1,9 +1,9 @@
-//! Debugging **§12 fibers** (`cont.new` / `cont.resume` / `suspend`) on the single-vCPU bytecode
-//! `DebugRun`. A `cont.resume` switches the debugged continuation into the fiber, so breakpoints fire
+//! Debugging **§12 fibers** (`cont.new` / `cont.resume` / `suspend`) on the bytecode
+//! `ScheduledDebugRun`. A `cont.resume` switches the debugged continuation into the fiber, so breakpoints fire
 //! inside the fiber body, the backtrace shows the fiber's stack, stepping descends into it, and the
 //! whole run stays bit-identical to the production engine + tree-walker oracle across the switches.
 
-use temen_interp::bytecode::{self, DebugRun};
+use temen_interp::bytecode::{self, SchedStop, ScheduledDebugRun};
 use temen_interp::{run, IrPc, Value};
 use temen_text::parse_module;
 
@@ -37,16 +37,30 @@ block 0 (vsp: i64, varg: i64) {
 }
 "#;
 
-/// Drive a `DebugRun` to completion, stopping only at `bps` (which it counts), returning the result.
-fn drive(run: &mut DebugRun, bps: &[IrPc], fuel: &mut u64) -> (usize, Result<Vec<Value>, ()>) {
+/// Drive a run to completion, stopping only at `bps` (which it counts), returning the result.
+fn drive(
+    run: &mut ScheduledDebugRun,
+    bps: &[IrPc],
+    fuel: &mut u64,
+) -> (usize, Result<Vec<Value>, ()>) {
+    run.set_breakpoints(bps.to_vec());
     let mut hits = 0;
     loop {
-        match run.run_to(bps, fuel) {
-            Some(_) => hits += 1,
-            None => {
-                return (hits, run.result().cloned().unwrap().map_err(|_| ()));
-            }
+        match run.run_until_stop(fuel) {
+            SchedStop::Break { .. } => hits += 1,
+            SchedStop::Finished(r) => return (hits, r.map_err(|_| ())),
+            other => panic!("unexpected stop {other:?}"),
         }
+    }
+}
+
+/// Run to the first stop with `bps` armed: the stop pc, or `None` at completion.
+fn run_to(run: &mut ScheduledDebugRun, bps: &[IrPc], fuel: &mut u64) -> Option<IrPc> {
+    run.set_breakpoints(bps.to_vec());
+    match run.run_until_stop(fuel) {
+        SchedStop::Break { pc, .. } => Some(pc),
+        SchedStop::Finished(_) => None,
+        other => panic!("unexpected stop {other:?}"),
     }
 }
 
@@ -55,7 +69,7 @@ fn drive(run: &mut DebugRun, bps: &[IrPc], fuel: &mut u64) -> (usize, Result<Vec
 #[test]
 fn breakpoint_fires_inside_a_fiber() {
     let m = parse_module(SUSPEND_ROUNDTRIP).unwrap();
-    let mut r = DebugRun::new(&m, 0, &[]).unwrap();
+    let mut r = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
     let mut fuel = 1_000_000u64;
     let in_fiber = IrPc {
         module: 0,
@@ -65,7 +79,7 @@ fn breakpoint_fires_inside_a_fiber() {
     }; // `v1 = i64.add varg v0` in the fiber
 
     // The root does cont.new + cont.resume; the debugger follows into the fiber and stops there.
-    assert_eq!(r.run_to(&[in_fiber], &mut fuel), Some(in_fiber));
+    assert_eq!(run_to(&mut r, &[in_fiber], &mut fuel), Some(in_fiber));
     assert_eq!(
         r.frame_pc(0),
         Some(in_fiber),
@@ -87,7 +101,7 @@ fn breakpoint_fires_inside_a_fiber() {
 #[test]
 fn step_descends_into_a_resumed_fiber() {
     let m = parse_module(SUSPEND_ROUNDTRIP).unwrap();
-    let mut r = DebugRun::new(&m, 0, &[]).unwrap();
+    let mut r = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
     let mut fuel = 1_000_000u64;
     let resume = IrPc {
         module: 0,
@@ -96,14 +110,14 @@ fn step_descends_into_a_resumed_fiber() {
         inst: 4,
     }; // `v4, v5 = cont.resume v2 v3` in the root
 
-    assert_eq!(r.run_to(&[resume], &mut fuel), Some(resume));
+    assert_eq!(run_to(&mut r, &[resume], &mut fuel), Some(resume));
     // Step over the resume: it switches into the fiber, so the next stop is the fiber's first op.
     match r.step(&mut fuel) {
-        Some(pc) => assert_eq!(
+        SchedStop::Break { pc, .. } => assert_eq!(
             pc.func, 1,
             "stepped into the fiber (func 1), not past the resume"
         ),
-        None => panic!("step ran to completion unexpectedly"),
+        other => panic!("step did not stop inside the fiber: {other:?}"),
     }
 }
 
@@ -112,7 +126,7 @@ fn step_descends_into_a_resumed_fiber() {
 #[test]
 fn fiber_debug_run_matches_the_oracle() {
     let m = parse_module(SUSPEND_ROUNDTRIP).unwrap();
-    let mut r = DebugRun::new(&m, 0, &[]).unwrap();
+    let mut r = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
     let mut fuel = 1_000_000u64;
     let (_, res) = drive(&mut r, &[], &mut fuel);
     assert_eq!(res, Ok(vec![Value::I64(36)]));
@@ -129,7 +143,7 @@ fn fiber_debug_run_matches_the_oracle() {
     assert_eq!(run(&m, 0, &[], &mut f_tw), bc, "bytecode ≡ tree-walker");
 }
 
-/// Reverse debugging composes with fibers: a fresh session ticked to an op clock reproduces the exact
+/// Reverse debugging composes with fibers: a fresh session ticked to a turn reproduces the exact
 /// position (including which fiber is active) a forward run reached — what `seek` relies on.
 #[test]
 fn fiber_tick_replays_deterministically() {
@@ -141,15 +155,16 @@ fn fiber_tick_replays_deterministically() {
         inst: 1,
     };
     // Forward to the in-fiber breakpoint; record the op clock + position.
-    let mut a = DebugRun::new(&m, 0, &[]).unwrap();
+    let mut a = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
     let mut fuel = 1_000_000u64;
-    assert_eq!(a.run_to(&[in_fiber], &mut fuel), Some(in_fiber));
-    let clock = a.op_clock();
+    assert_eq!(run_to(&mut a, &[in_fiber], &mut fuel), Some(in_fiber));
+    let clock = a.op_turn();
 
     // A fresh run raw-ticked to that clock lands at the identical (fiber) position.
-    let mut b = DebugRun::new(&m, 0, &[]).unwrap();
+    let mut b = ScheduledDebugRun::new(&m, 0, &[]).unwrap();
     let mut f2 = 1_000_000u64;
-    while b.op_clock() < clock && b.tick(&mut f2) {}
-    assert_eq!(b.op_clock(), clock, "replayed to the same op clock");
+    while b.op_turn() < clock && b.tick(&mut f2) {}
+    assert_eq!(b.op_turn(), clock, "replayed to the same op clock");
+    b.locate();
     assert_eq!(b.frame_pc(0), Some(in_fiber), "same fiber position");
 }
