@@ -193,3 +193,44 @@ fn host_proc_seam_overrides_the_table() {
     assert_eq!(b.op, 0, "flat: the guest's fs op rides in arg0");
     assert_eq!(b.handle, h);
 }
+
+/// **A capability's scalar width may differ from the pinned one; its arity may not.**
+///
+/// The pinned `exit` is `(i32) -> ()`, but `temen-dap`'s `exit_code` manifest declares
+/// `(i64) -> ()` and has always run correctly — the dispatcher reads the code the same way at
+/// either width. An exact-`FuncType` check refused that well-formed import and took the DAP exit
+/// path down on every platform; the discriminator is *arity*, because the data-SP the
+/// function-symbol form prepends is what changes it. Both widths bind here; the SP-led two-arg
+/// form does not.
+#[test]
+fn exit_binds_at_either_width_but_not_at_the_wrong_arity() {
+    for code in [ValType::I32, ValType::I64] {
+        let (mut host, granted) = powerbox();
+        let imports = vec![Import {
+            name: "exit".to_string(),
+            shape: ImportShape::Func(0),
+            mode: ImportMode::Required,
+        }];
+        let types = vec![TypeEntry::Func(sig(vec![code], vec![]))];
+        let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+        assert!(
+            refusals.is_empty(),
+            "exit declared as ({code:?}) -> () is a well-formed capability import, got {refusals:?}"
+        );
+    }
+
+    // The function-symbol form: `exit(SP, code)` — one parameter too many.
+    let (mut host, granted) = powerbox();
+    let imports = vec![Import {
+        name: "exit".to_string(),
+        shape: ImportShape::Func(0),
+        mode: ImportMode::Required,
+    }];
+    let types = vec![TypeEntry::Func(sig(
+        vec![ValType::I64, ValType::I32],
+        vec![],
+    ))];
+    let refusals = host.bind_powerbox_manifest(&imports, &types, &granted, &[]);
+    assert_eq!(refusals.len(), 1, "the SP-led form is refused");
+    assert_eq!(refusals[0].name, "exit");
+}

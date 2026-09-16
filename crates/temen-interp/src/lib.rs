@@ -16324,12 +16324,14 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
         params: vec![],
         results: vec![],
     };
-    // `exit(code: i32)` — noreturn. The one built-in besides `Stream` whose signature every
-    // caller in the tree already agrees on (every `call.cap EXIT 0` site is `(i32) -> ()`, and it
-    // is the `sig_exit` the manifest tests declare), so it can be seeded without pinning a
-    // convention first. `Clock` and `SharedRegion` are *not* seeded for exactly that reason:
+    // `exit(code)` — noreturn. Seeded at `(i32) -> ()`, which is the *arity* every caller in the
+    // tree agrees on; the width does not agree (five sites declare `(i32) -> ()`, `temen-dap`'s
+    // `exit_code` manifest declares `(i64) -> ()`), which is why the bind check compares arity —
+    // see `sig_binds_as_capability`. `Clock` and `SharedRegion` are *not* seeded because their
+    // *arity* disagrees, which no amount of width tolerance papers over:
     // `Clock.now` is called both as `(i32) -> (i64)` and `() -> (i64)`, `SharedRegion.map` both
-    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost.
+    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost, and
+    // would make the bind check refuse it.
     let exit = FuncType {
         params: vec![ValType::I32],
         results: vec![],
@@ -16387,6 +16389,21 @@ fn canonical_op_sig(type_id: u32, op: u32) -> Option<FuncType> {
         .into_iter()
         .nth(op as usize)
         .map(|(_, ft)| ft)
+}
+
+/// Does `declared` bind as the capability whose pinned signature is `expected`?
+///
+/// **Arity, not exact types.** The hazard this discriminates (#1524) is the retained
+/// *function-symbol* import, whose C list is led by the data stack pointer — so the wrong form
+/// always carries at least one extra parameter, and arity is what separates them. Scalar width is
+/// *not* a discriminator: the tree legitimately declares the same capability at both widths
+/// (`exit` is `(i32) -> ()` at five sites and `(i64) -> ()` in `temen-dap`'s `exit_code` manifest),
+/// the dispatcher reads the code the same way either way, and rejecting one of them would refuse a
+/// well-formed capability import to catch nothing. Comparing exact `FuncType`s here did exactly
+/// that — it broke that manifest on every platform.
+fn sig_binds_as_capability(declared: &FuncType, expected: &FuncType) -> bool {
+    declared.params.len() == expected.params.len()
+        && declared.results.len() == expected.results.len()
 }
 
 /// The canonical op names + signatures of a pre-seeded built-in interface
@@ -19771,9 +19788,10 @@ impl Host {
     /// only the signature can. When the retained function-symbol import's name happens to be a
     /// powerbox row (`extern long vm_map(long, long)` in a program unit that no linked unit
     /// defines), binding it by name alone dispatches the capability with every argument shifted by
-    /// one: the data-SP arrives where the length belongs. So an import whose declared signature is
-    /// not the capability op's is refused here and left unbound, and the refusal is returned for
-    /// the embedder to surface.
+    /// one: the data-SP arrives where the length belongs. So an import whose declared signature does
+    /// not bind as the capability op's ([`sig_binds_as_capability`] — **arity**, since the data-SP
+    /// is what changes it, and scalar width legitimately varies) is refused here and left unbound,
+    /// and the refusal is returned for the embedder to surface.
     ///
     /// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for
     /// `Stream` and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins
@@ -19807,7 +19825,8 @@ impl Host {
                     (im.shape, canonical_op_sig(cap.type_id, cap.op))
                 {
                     match types.get(t as usize) {
-                        Some(temen_ir::TypeEntry::Func(declared)) if *declared == expected => {}
+                        Some(temen_ir::TypeEntry::Func(declared))
+                            if sig_binds_as_capability(declared, &expected) => {}
                         Some(temen_ir::TypeEntry::Func(declared)) => {
                             refusals.push(ShapeRefusal {
                                 import: i as u32,
