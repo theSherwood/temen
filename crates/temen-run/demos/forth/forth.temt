@@ -51,7 +51,7 @@
 ; whole map to fit one — 2^19 (512 KiB) at 0x80000, clear of everything above.
 ;
 ; Kernel globals (8-byte cells at 0x10000 = 65536):
-;   65536 HERE      65544 IN_POS    65552 IN_LEN    65560 DICT_N    65576 VS_DEPTH
+;   65536 HERE      65544 IN_POS    65552 IN_LEN    65560 DICT_N    65568 IN_HELD  65576 VS_DEPTH
 ;   65584 NEXTV     65592 NBLK      65600 CUR_BLK   65608 SCR_LEN   65616 CUR_INSTS
 ;   65624 CS_DEPTH  65632 MODE      65640 RDEPTH    65648 DEF_NIN   65656 DEF_NOUT
 ;   65664 OUT_LEN   65672 DEAD      65680 TOK_PTR   65688 TOK_LEN   65696 DEF_NAME_PTR
@@ -77,13 +77,13 @@
 ;   34 lookup(p,n)      35 add_entry(p,n,k,ni,no,pay)           36 parse_num(p,n) 37 streq(p1,p2,n)
 ;   38 error(msg,len)   39 print_i64(v)     40 anon_begin()     41 anon_flush()   42 process(p,n)
 ;   43 do_word(e)       44 do_imm(id)       45 do_colon()       46 do_semi()      47 do_prim()
-;   48 read_stdin()     49 cs_push(k,a,b,c,d) 50 cs_pop()       51 parse_effect() 52 vs_params(n)
+;   48 read_stdin() [retired]  49 cs_push(k,a,b,c,d) 50 cs_pop()  51 parse_effect() 52 vs_params(n)
 ;   53 do_string()      54 strlen(p)        55 ab(b)            56 auleb(v)       57 skip_line()
 ;   58 skip_paren()     59 emit_flag(x)     60 is_newline()     61 do_control(id) 62 do_shuffle(id)
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
 ;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)  75 child_start(x)  76 sandbox(p,n)
-;   77 key()
+;   77 key()            78 scan_input()     79 end_input()
 
 ; The durable shadow arena (INVARIANTS.md #16): 0x74000..0x80000 — 48 KiB = 12 contexts, inside the
 ; `sandbox` spawn-scratch page (which uses only its first 0x78 bytes) and clear of every data segment.
@@ -236,7 +236,14 @@ prim key 0 0 1 77
 \0"
 
 ; ================================================================================================
-; 0 _start: HERE = heap base; run the prelude, then all of stdin; flush.
+; 0 _start: HERE = heap base; run the prelude, then stdin **as it arrives** (#1237): each `read`
+; appends to the input buffer, every complete line it delivers is interpreted at once (the tokenizer
+; continues from IN_POS), and an unterminated tail waits for the next read — so a line-at-a-time
+; stdin (`temen-run --interactive`) is a live REPL, and a buffered stdin (a test, the playground)
+; arrives in one chunk and runs exactly as the old slurp did. Multi-line colon definitions work: the
+; buffer is recycled (tail moved to its base) only between top-level lines (MODE 0), since an open
+; definition's name points into it. A single definition longer than the buffer (64 KiB) is processed
+; as-is when the buffer fills — the old slurp truncated there.
 func () -> (i32) {
 block 0 () {
   hp = i64.const 65536
@@ -248,9 +255,92 @@ block 0 () {
   lnp = i64.const 65784
   onel = i64.const 1
   i64.store lnp onel
-  n = call 48 ()
   ib = i64.const 393216
-  call 42 (ib, n)
+  bp = i64.const 65752
+  i64.store bp ib
+  ipp = i64.const 65544
+  z = i64.const 0
+  i64.store ipp z
+  br 1(z)
+  }
+; len = bytes held in the input buffer (IN_POS .. len is unprocessed).
+block 1 (len: i64) {
+  cap = i64.const 65536
+  room = i64.sub cap len
+  z = i64.const 0
+  full = i64.le_s room z
+  br_if full 6(len) 2(len, room)
+  }
+block 2 (len: i64, room: i64) {
+  ib = i64.const 393216
+  a = i64.add ib len
+  r = call.import 1 (a, room)
+  z = i64.const 0
+  eof = i64.le_s r z
+  len1 = i64.add len r
+  br_if eof 8(len) 3(len1, len1)
+  }
+; Find the cut: one past the last newline in [0, len). No newline yet → keep reading.
+block 3 (len: i64, i: i64) {
+  z = i64.const 0
+  none = i64.le_s i z
+  br_if none 1(len) 4(len, i)
+  }
+block 4 (len: i64, i: i64) {
+  one = i64.const 1
+  i1 = i64.sub i one
+  ib = i64.const 393216
+  a = i64.add ib i1
+  ch = i64.load8_u a
+  nl = i64.const 10
+  isnl = i64.eq ch nl
+  br_if isnl 5(len, i) 3(len, i1)
+  }
+; Interpret [IN_POS, cut) — IN_HELD carries `len` so a runtime `key` (77) can refill past the line —
+; then hold the tail: recycle the buffer between top-level lines.
+block 5 (len: i64, cut: i64) {
+  lp = i64.const 65552
+  i64.store lp cut
+  hp = i64.const 65568
+  i64.store hp len
+  call 78 ()
+  hp2 = i64.const 65568
+  held = i64.load hp2
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  open = i64.ne mode z
+  br_if open 1(held) 7()
+  }
+; Buffer full: interpret everything held, then start over (a >64 KiB definition loses its name).
+block 6 (len: i64) {
+  lp = i64.const 65552
+  i64.store lp len
+  hp = i64.const 65568
+  i64.store hp len
+  call 78 ()
+  br 7()
+  }
+; Everything up to IN_POS is consumed: move the tail [IN_POS, IN_HELD) to the buffer's base.
+block 7 () {
+  hp = i64.const 65568
+  held = i64.load hp
+  ipp = i64.const 65544
+  pos = i64.load ipp
+  tail = i64.sub held pos
+  ib = i64.const 393216
+  src = i64.add ib pos
+  mem.copy ib src tail
+  z = i64.const 0
+  i64.store ipp z
+  br 1(tail)
+  }
+; End of input: the unterminated tail is the last line.
+block 8 (len: i64) {
+  lp = i64.const 65552
+  i64.store lp len
+  call 78 ()
+  call 79 ()
   call 5 ()
   z = i32.const 0
   return z
@@ -1720,7 +1810,8 @@ block 10 () {
   }
 }
 
-; 42 process(p, n): the outer interpreter over one input buffer.
+; 42 process(p, n): the outer interpreter over one whole input buffer — the prelude, a `prompt`
+; (74), a `sandbox` child. `_start` instead feeds stdin incrementally through 78/79 directly.
 func (i64, i64) -> () {
 block 0 (p: i64, n: i64) {
   bp = i64.const 65752
@@ -1730,146 +1821,8 @@ block 0 (p: i64, n: i64) {
   i64.store pp z
   lp = i64.const 65552
   i64.store lp n
-  br 1()
-  }
-block 1 () {
-  len = call 33 ()
-  z = i64.const 0
-  end = i64.eq len z
-  br_if end 20() 2()
-  }
-block 2 () {
-  ep = i64.const 65712
-  err = i64.load ep
-  z = i64.const 0
-  bad = i64.ne err z
-  br_if bad 3() 7()
-  }
-block 3 () {
-  isnl = call 60 ()
-  z = i64.const 0
-  nl = i64.ne isnl z
-  br_if nl 4() 5()
-  }
-block 4 () {
-  br 6()
-  }
-block 5 () {
-  call 57 ()
-  br 6()
-  }
-block 6 () {
-  z = i64.const 0
-  ep = i64.const 65712
-  i64.store ep z
-  call 40 ()
-  br 1()
-  }
-block 7 () {
-  isnl = call 60 ()
-  z = i64.const 0
-  nl = i64.ne isnl z
-  br_if nl 8() 10()
-  }
-block 8 () {
-  mp = i64.const 65632
-  mode = i64.load mp
-  z = i64.const 0
-  top = i64.eq mode z
-  br_if top 9() 1()
-  }
-block 9 () {
-  call 41 ()
-  br 1()
-  }
-block 10 () {
-  tl = i64.const 65688
-  n = i64.load tl
-  four = i64.const 4
-  is4 = i64.eq n four
-  br_if is4 11() 13()
-  }
-block 11 () {
-  tp = i64.const 65680
-  t = i64.load tp
-  prim = i64.const 33008
-  four = i64.const 4
-  eq = call 37 (t, prim, four)
-  z = i64.const 0
-  hit = i64.ne eq z
-  br_if hit 12() 13()
-  }
-block 12 () {
-  call 47 ()
-  br 1()
-  }
-block 13 () {
-  tp = i64.const 65680
-  t = i64.load tp
-  tl = i64.const 65688
-  n = i64.load tl
-  e = call 34 (t, n)
-  z = i64.const 0
-  miss = i64.eq e z
-  br_if miss 17() 14(e)
-  }
-block 14 (e: i64) {
-  kind = i64.load32_s e offset=12
-  two = i64.const 2
-  imm = i64.eq kind two
-  br_if imm 15(e) 16(e)
-  }
-block 15 (e: i64) {
-  id = i64.load e offset=24
-  call 44 (id)
-  br 1()
-  }
-block 16 (e: i64) {
-  call 43 (e)
-  br 1()
-  }
-block 17 () {
-  tp = i64.const 65680
-  t = i64.load tp
-  tl = i64.const 65688
-  n = i64.load tl
-  ok = call 36 (t, n)
-  z = i64.const 0
-  isnum = i64.ne ok z
-  br_if isnum 18() 19()
-  }
-block 18 () {
-  np = i64.const 65760
-  v = i64.load np
-  x = call 22 (v)
-  call 10 (x)
-  br 1()
-  }
-block 19 () {
-  m = i64.const 32784
-  n = i64.const 12
-  call 38 (m, n)
-  br 1()
-  }
-block 20 () {
-  mp = i64.const 65632
-  mode = i64.load mp
-  z = i64.const 0
-  top = i64.eq mode z
-  br_if top 22() 21()
-  }
-block 21 () {
-  m = i64.const 32800
-  n = i64.const 23
-  call 38 (m, n)
-  z = i64.const 0
-  ep = i64.const 65712
-  i64.store ep z
-  call 40 ()
-  return
-  }
-block 22 () {
-  call 41 ()
+  call 78 ()
+  call 79 ()
   return
   }
 }
@@ -2751,8 +2704,9 @@ block 7 () {
   }
 }
 
-; 48 read_stdin() -> n: read all of stdin into the input buffer (up to 64 KiB — #1234 shrank it from
-; 256 KiB so the whole kernel map fits a 2^19 `sandbox` carve; see the memory map above).
+; 48 read_stdin() -> n: read all of stdin into the input buffer (up to 64 KiB). **Retired** by the
+; incremental `_start` loop (#1237), which reads as input arrives; kept so the function indices (`call N`
+; by position) stay stable. No caller.
 func () -> (i64) {
 block 0 () {
   z = i64.const 0
@@ -4410,7 +4364,9 @@ block 6 (hinst: i32, ch: i32) {
 
 ; 77 key() -> c: the next unconsumed input byte at the tokenizer cursor (IN_POS, advanced), or -1 at
 ; the end of the input. It runs at run time, after its line was compiled, so a top-level `key` reads
-; the bytes that follow its line; the tokenizer resumes after whatever `key` consumed.
+; the bytes that follow its line; the tokenizer resumes after whatever `key` consumed. Past the held
+; input it reads more stdin into the buffer (the `_start` loop's IN_HELD/IN_LEN), so an interactive
+; session's `key` waits for the next line; a `prompt` (74) input has no stdin behind it → -1.
 func () -> (i64) {
 block 0 () {
   pp = i64.const 65544
@@ -4418,13 +4374,45 @@ block 0 () {
   lp = i64.const 65552
   len = i64.load lp
   atend = i64.ge_s pos len
-  br_if atend 1() 2(pos)
+  br_if atend 2(pos) 6(pos)
   }
 block 1 () {
   neg1 = i64.const -1
   return neg1
   }
 block 2 (pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  ib = i64.const 393216
+  stdin = i64.eq base ib
+  br_if stdin 3(pos) 1()
+  }
+block 3 (pos: i64) {
+  hp = i64.const 65568
+  held = i64.load hp
+  cap = i64.const 65536
+  room = i64.sub cap held
+  z = i64.const 0
+  full = i64.le_s room z
+  br_if full 1() 4(pos, held, room)
+  }
+block 4 (pos: i64, held: i64, room: i64) {
+  ib = i64.const 393216
+  a = i64.add ib held
+  r = call.import 1 (a, room)
+  z = i64.const 0
+  eof = i64.le_s r z
+  held1 = i64.add held r
+  br_if eof 1() 5(pos, held1)
+  }
+block 5 (pos: i64, held: i64) {
+  hp = i64.const 65568
+  i64.store hp held
+  lp = i64.const 65552
+  i64.store lp held
+  br 6(pos)
+  }
+block 6 (pos: i64) {
   bp = i64.const 65752
   base = i64.load bp
   a = i64.add base pos
@@ -4436,3 +4424,164 @@ block 2 (pos: i64) {
   return ch
   }
 }
+
+; 78 scan_input(): interpret tokens from IN_POS to IN_LEN — the outer interpreter's loop. Returns
+; at the end of the buffer with the compiler state (mode, virtual stack, open definition) intact, so a
+; caller that holds more input (`_start`) can continue after appending it.
+func () -> () {
+block 0 () {
+  br 1()
+  }
+block 1 () {
+  len = call 33 ()
+  z = i64.const 0
+  end = i64.eq len z
+  br_if end 20() 2()
+  }
+block 2 () {
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 3() 7()
+  }
+block 3 () {
+  isnl = call 60 ()
+  z = i64.const 0
+  nl = i64.ne isnl z
+  br_if nl 4() 5()
+  }
+block 4 () {
+  br 6()
+  }
+block 5 () {
+  call 57 ()
+  br 6()
+  }
+block 6 () {
+  z = i64.const 0
+  ep = i64.const 65712
+  i64.store ep z
+  call 40 ()
+  br 1()
+  }
+block 7 () {
+  isnl = call 60 ()
+  z = i64.const 0
+  nl = i64.ne isnl z
+  br_if nl 8() 10()
+  }
+block 8 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 9() 1()
+  }
+block 9 () {
+  call 41 ()
+  br 1()
+  }
+block 10 () {
+  tl = i64.const 65688
+  n = i64.load tl
+  four = i64.const 4
+  is4 = i64.eq n four
+  br_if is4 11() 13()
+  }
+block 11 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  prim = i64.const 33008
+  four = i64.const 4
+  eq = call 37 (t, prim, four)
+  z = i64.const 0
+  hit = i64.ne eq z
+  br_if hit 12() 13()
+  }
+block 12 () {
+  call 47 ()
+  br 1()
+  }
+block 13 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  e = call 34 (t, n)
+  z = i64.const 0
+  miss = i64.eq e z
+  br_if miss 17() 14(e)
+  }
+block 14 (e: i64) {
+  kind = i64.load32_s e offset=12
+  two = i64.const 2
+  imm = i64.eq kind two
+  br_if imm 15(e) 16(e)
+  }
+block 15 (e: i64) {
+  id = i64.load e offset=24
+  call 44 (id)
+  br 1()
+  }
+block 16 (e: i64) {
+  call 43 (e)
+  br 1()
+  }
+block 17 () {
+  tp = i64.const 65680
+  t = i64.load tp
+  tl = i64.const 65688
+  n = i64.load tl
+  ok = call 36 (t, n)
+  z = i64.const 0
+  isnum = i64.ne ok z
+  br_if isnum 18() 19()
+  }
+block 18 () {
+  np = i64.const 65760
+  v = i64.load np
+  x = call 22 (v)
+  call 10 (x)
+  br 1()
+  }
+block 19 () {
+  m = i64.const 32784
+  n = i64.const 12
+  call 38 (m, n)
+  br 1()
+  }
+block 20 () {
+  return
+  }
+}
+
+; 79 end_input(): the end of ALL input — an open definition is an error (recovered so the state is
+; clean), else the pending top-level line runs.
+func () -> () {
+block 0 () {
+  br 1()
+  }
+block 1 () {
+  mp = i64.const 65632
+  mode = i64.load mp
+  z = i64.const 0
+  top = i64.eq mode z
+  br_if top 3() 2()
+  }
+block 2 () {
+  m = i64.const 32800
+  n = i64.const 23
+  call 38 (m, n)
+  z = i64.const 0
+  ep = i64.const 65712
+  i64.store ep z
+  call 40 ()
+  return
+  }
+block 3 () {
+  call 41 ()
+  return
+  }
+}
+

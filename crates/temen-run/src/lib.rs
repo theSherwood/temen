@@ -4399,6 +4399,21 @@ pub fn run_powerbox_cfg(
     deadline: Option<std::time::Duration>,
     quota: Quota,
 ) -> Result<Run, String> {
+    run_powerbox_with_host(module, stdin, args, env, deadline, quota, None)
+}
+
+/// [`run_powerbox_cfg`] plus a **host setup hook** ([`Instance::run_with_caps_and_host`]): the CLI's
+/// interactive mode (`temen-run --interactive`) wires the real stdin/stdout to the guest's streams
+/// through it. `None` is exactly `run_powerbox_cfg`.
+pub fn run_powerbox_with_host(
+    module: &Module,
+    stdin: &[u8],
+    args: &[&[u8]],
+    env: &[&[u8]],
+    deadline: Option<std::time::Duration>,
+    quota: Quota,
+    host_setup: Option<&mut dyn FnMut(&mut Host)>,
+) -> Result<Run, String> {
     // Escape gate (fail-closed, §2a): the single chokepoint both public powerbox entry points funnel
     // through (`run_powerbox`, `run_powerbox_cfg`). Verify here so a library embedder
     // calling any of them directly cannot bypass the verifier the CLI (`main.rs`) and guest-driven JIT
@@ -4436,7 +4451,7 @@ pub fn run_powerbox_cfg(
         env: env.iter().map(|s| s.to_vec()).collect(),
         ..RunConfig::default()
     };
-    inst.run(Backend::Jit, &config)
+    inst.run_with_caps_and_host(Backend::Jit, &config, &[], host_setup)
 }
 
 /// **A powerbox program compiled once, run many times** — the build-once/run-many split for the §3e
@@ -6190,6 +6205,21 @@ impl Instance {
         config: &RunConfig,
         extra_caps: &[(&str, HostCap)],
     ) -> Result<Run, String> {
+        self.run_with_caps_and_host(backend, config, extra_caps, None)
+    }
+
+    /// [`run_with_caps`](Instance::run_with_caps), plus a **host setup hook** run on the granted
+    /// powerbox `Host` just before the guest starts — for what a [`RunConfig`] cannot carry: live
+    /// I/O closures. The CLI's interactive mode installs a lazy stdin source and a stdout tee here
+    /// (`Host::set_stdin_source` / `set_stdout_tee`); an embedder can set any other per-run host
+    /// policy the same way. `None` is exactly `run_with_caps`.
+    pub fn run_with_caps_and_host(
+        &self,
+        backend: Backend,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+        host_setup: Option<&mut dyn FnMut(&mut Host)>,
+    ) -> Result<Run, String> {
         let owned = self.window_override(config);
         let m = owned.as_ref().unwrap_or(&self.module);
         let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
@@ -6203,6 +6233,9 @@ impl Instance {
         for (name, cap) in extra_caps {
             let handle = (cap.grant)(&mut host, win);
             host.register_cap_name(name, handle);
+        }
+        if let Some(setup) = host_setup {
+            setup(&mut host);
         }
 
         // §3.6 behavioral parity (narrowed by I36 slice 3): a **serve-qualified** module (service

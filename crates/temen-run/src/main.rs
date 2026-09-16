@@ -1,7 +1,7 @@
 //! `temen-run` — run a guest program in the sandbox from the command line.
 //!
 //! ```text
-//! temen-run <file> [--stdin FILE] [-- <guest args>]
+//! temen-run <file> [--stdin FILE | --interactive] [-- <guest args>]
 //! ```
 //!
 //! `<file>` is `.temt` (text IR; `.temt` deprecated), `.temen` (binary), or `.c` (C source —
@@ -11,13 +11,18 @@
 //! or `main`'s return value). A bare kernel (a non-powerbox entry) is run with zero args and its
 //! result printed. A guest that traps is detect-and-killed (§5) and reported on stderr.
 //!
+//! `--interactive` (the default when stdin is a terminal) wires the process's real stdin to the
+//! guest's `read` a line at a time, and streams the guest's stdout as it is written — so a REPL
+//! guest (`temen-run demos/forth/forth.temt`) is live. Without it a guest reads `--stdin FILE`, or
+//! nothing.
+//!
 //! `--specialize` instead partial-evaluates the entry (§20c first Futamura projection): bind some
 //! parameters to constants (`--arg i64:N`) and/or declare window bytes constant (`--const-region`),
 //! and the residual — re-verified — is written as a binary artifact (`-o`), printed as text IR
 //! (`--emit-text`), or run as a kernel. See `--help`.
 
 use std::hash::{BuildHasher, RandomState};
-use std::io::Write;
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,7 +30,7 @@ use std::{env, fs, process};
 
 use temen_ir::Module;
 use temen_run::{
-    is_named_powerbox_entry, run_kernel, run_powerbox_cfg, specialize_module, Outcome, Quota,
+    is_named_powerbox_entry, run_kernel, run_powerbox_with_host, specialize_module, Outcome, Quota,
     SpecArg, SpecializeOpts, Value,
 };
 use temen_verify::verify_module;
@@ -51,6 +56,7 @@ fn try_main() -> Result<(), String> {
     let mut assemble = false;
     let mut link_files: Vec<String> = Vec::new();
     let mut stdin_path: Option<String> = None;
+    let mut interactive = false;
     // Everything after a `--` is the guest's own argument vector (the §3e args buffer): it becomes
     // `argv[1..]`, with `argv[0]` set to the input file name — so a `main(int, char**)` program sees
     // them exactly as a native invocation would.
@@ -79,6 +85,7 @@ fn try_main() -> Result<(), String> {
             "--stdin" => {
                 stdin_path = Some(it.next().ok_or("--stdin needs a file argument")?.clone())
             }
+            "--interactive" => interactive = true,
             "--link" => link = true,
             "--assemble" => assemble = true,
             "--specialize" => specialize = true,
@@ -141,6 +148,11 @@ fn try_main() -> Result<(), String> {
         return run_link(&link_files, out_path, emit_text);
     }
     let file = file.ok_or("no input file")?;
+    if interactive && stdin_path.is_some() {
+        return Err("--interactive and --stdin are mutually exclusive".into());
+    }
+    // A terminal on stdin means a person is typing: interactive unless a file was given.
+    let interactive = interactive || (stdin_path.is_none() && std::io::stdin().is_terminal());
     let stdin = match stdin_path {
         Some(p) => fs::read(&p).map_err(|e| format!("read --stdin file `{p}`: {e}"))?,
         None => Vec::new(),
@@ -211,11 +223,30 @@ fn try_main() -> Result<(), String> {
                 .chain(guest_args.iter().map(|s| s.as_bytes()))
                 .collect()
         };
-        let run = run_powerbox_cfg(&module, &stdin, &argv, &[], deadline, quota)?;
+        // Interactive: the guest's `read` pulls the real stdin a line at a time as it asks (a lazy
+        // `Host` stdin source), and each `write` to its stdout goes straight to the real stream (a
+        // tee, flushed per write) — the run still captures stdout, so it is *not* echoed again below.
+        let mut live_stdio = |host: &mut temen_interp::Host| {
+            host.set_stdin_source(Box::new(|| {
+                let mut line = Vec::new();
+                let _ = std::io::stdin().lock().read_until(b'\n', &mut line);
+                line
+            }));
+            host.set_stdout_tee(Box::new(|bytes: &[u8]| {
+                let mut out = std::io::stdout().lock();
+                out.write_all(bytes).ok();
+                out.flush().ok();
+            }));
+        };
+        let host_setup: Option<&mut dyn FnMut(&mut temen_interp::Host)> =
+            interactive.then_some(&mut live_stdio);
+        let run = run_powerbox_with_host(&module, &stdin, &argv, &[], deadline, quota, host_setup)?;
         // Flush captured output to the real streams (process::exit skips destructors, so flush
         // explicitly), then terminate with the guest's exit code.
         let mut out = std::io::stdout().lock();
-        out.write_all(&run.stdout).ok();
+        if !interactive {
+            out.write_all(&run.stdout).ok();
+        }
         out.flush().ok();
         let mut err = std::io::stderr().lock();
         err.write_all(&run.stderr).ok();
@@ -342,11 +373,14 @@ fn parse_arg(s: &str) -> Result<SpecArg, String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: temen-run <file.temt|.temen|.c> [--stdin FILE] [-- <guest args>]\n\
+        "usage: temen-run <file.temt|.temen|.c> [--stdin FILE | --interactive] [-- <guest args>]\n\
          \n  Verify a module, then run it sandboxed on the JIT under the MVP powerbox\n\
          \n  (stdout/stderr → real streams, exit code = the guest's). `.c` is compiled via\n\
          \n  the chibicc frontend ($TEMEN_CHIBICC or the in-repo build). Arguments after `--`\n\
          \n  are passed to the guest as argv[1..] (argv[0] = the file name; empty environment).\n\
+         \n  --stdin FILE   the guest's stdin (default: empty)\n\
+         \n  --interactive  the guest reads the real stdin a line at a time and its stdout\n\
+         \n                 streams live (a REPL guest is live); the default on a terminal\n\
          \n  env: TEMEN_DEADLINE_MS (kill a runaway guest after N ms),\n\
          \n       TEMEN_MAX_FIBERS / TEMEN_MAX_VCPUS (§15 spawn quotas — kill a fiber/thread bomb).\n\
          \n\

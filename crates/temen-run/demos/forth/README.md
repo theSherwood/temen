@@ -8,6 +8,14 @@ guest-driven `Jit` capability. Design, rationale, and status: issue #1214.
 cargo run -p temen-run --bin temen-run -- crates/temen-run/demos/forth/forth.temt --stdin program.fs
 ```
 
+or live, as a REPL — on a terminal `temen-run` is interactive by default (`--interactive` forces it,
+e.g. under a pipe): each line is interpreted as it is typed, a colon definition may span lines, and a
+runtime `key` waits for the next line.
+
+```sh
+cargo run -p temen-run --bin temen-run -- crates/temen-run/demos/forth/forth.temt
+```
+
 The playground card (`browser/web/play.js`, "Forth") runs the same kernel on the bytecode engine
 from the committed asset `browser/web/assets/forth.temen`, rebuilt by
 `ONLY=forth bash scripts/rebuild-assets.sh`.
@@ -31,7 +39,8 @@ from the committed asset `browser/web/assets/forth.temen`, rebuilt by
 - **`pick <n>`** copies the (n+1)-th stack value from the top (`pick 0` = `dup`, `pick 1` = `over`).
   `n` is a literal read at compile time, so it is a virtual-stack permutation like the others.
 - **`key ( -- c )`** reads the next unconsumed input byte at run time (`-1` at the end of input). A
-  top-level `key` runs after its line was compiled, so it reads the bytes that follow the line.
+  top-level `key` runs after its line was compiled, so it reads the bytes that follow the line — in
+  an interactive session it waits for the next line to be typed.
 - **Top level.** Each line is compiled as an anonymous unit, `Jit.install`ed, called, and
   uninstalled. Values left on the stack persist in a REPL stack between lines.
 - **Words:** `+ - * / mod and or xor lshift rshift = <> < u< <= > >= 0= negate invert 1+ 1- abs
