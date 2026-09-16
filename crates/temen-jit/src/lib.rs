@@ -5457,6 +5457,7 @@ pub fn child_compiles() -> u64 {
 /// baked). The durable / nesting child keeps the per-call [`compile_child_and_run`] path (its baked
 /// per-child nursery makes its code un-shareable).
 #[cfg(fiber_rt)]
+#[allow(clippy::too_many_arguments)] // the per-spawn child parameters, as `compile_child`
 pub(crate) fn compile_nondurable_child(
     funcs: &[Func],
     // #922 — the child module's type section, threaded to `compile_child`.

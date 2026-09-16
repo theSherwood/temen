@@ -235,10 +235,6 @@ pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp_word: u64, sp: u64) {
     *((mem_base + sp_word) as *mut u64) = sp;
 }
 
-/// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
-/// region base plus [`STATE_IN_REGION_OFF`]. Each context rewinds against its own, so concurrent thaws
-/// don't race (vs. the global [`STATE_OFF`] freeze word).
-
 /// Whether a freeze or thaw is in progress — the gate for running spawned children **inline**
 /// (single-worker, slice 3.3): the global [`STATE_OFF`] freeze word is non-`NORMAL` (a freeze), or the
 /// **active** context's per-context thaw word is non-`NORMAL` (a thaw — §12.8 concurrent-thaw stage 1).

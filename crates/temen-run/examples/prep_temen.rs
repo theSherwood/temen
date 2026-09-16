@@ -53,7 +53,11 @@ fn main() {
     );
 
     let t = Instant::now();
-    let compiled = temen_interp::bytecode::compile_module(&module.funcs, &module.types);
+    let compiled = temen_interp::bytecode::compile_module(
+        &module.funcs,
+        &module.types,
+        module.memory.and_then(|x| x.shadow),
+    );
     println!(
         "  bytecode compile {:>8.1?}  (interpreter cold cost, once at load; ok={})",
         t.elapsed(),
