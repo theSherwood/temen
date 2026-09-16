@@ -36,6 +36,9 @@ mod webgpu;
 // A powerbox whose capabilities are **defined in JS** (`temen_jspb_*`): the page names them, the
 // module's import manifest binds them, one wasm import services every call. Built on both targets —
 // natively the JS side is a test hook, so the binding path is testable off-browser (`tests/jspb.rs`).
+/// The JS ↔ Rust export ABI as data (#1414) — host-side tooling, kept out of the cdylib.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod exports_abi;
 pub mod jspb;
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------

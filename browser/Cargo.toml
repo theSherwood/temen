@@ -21,6 +21,11 @@ path = "src/genfixture.rs"
 name = "gencorpus"
 path = "src/gencorpus.rs"
 
+[[bin]]
+# The JS <-> Rust export ABI table (`EXPORTS.md`, #1414); pinned by tests/exports_abi.rs.
+name = "genexports"
+path = "src/genexports.rs"
+
 # The prebuilt libc unit (#1392): runs the committed `chibicc.temen` over `__pg_libc.c` to build
 # `web/assets/pg_libc.temeno`. Self-hosted (no clang) — driven by `scripts/rebuild-assets.sh`.
 [[bin]]
