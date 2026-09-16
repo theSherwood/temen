@@ -3595,6 +3595,23 @@ impl CompiledModule {
         )
     }
 
+    /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
+    /// fiber-hosting / `Jit`-domain setup (`enable_fiber_hosting`, reconstructed units) stays the
+    /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
+    /// `seed` is the thaw seed: the frozen fibers to re-create before a `REWINDING` run (empty for a
+    /// freeze or an ordinary durable run). The freeze residue comes back via
+    /// [`Self::take_frozen_fibers`].
+    pub fn set_durable(&mut self, seed: Vec<FrozenFiber>) {
+        self.frozen_seed = seed;
+        self.durable = true;
+    }
+
+    /// The fibers the freeze driver flattened in the last durable run (empty unless a freeze
+    /// flattened fibers); taken, so a later run starts clean.
+    pub fn take_frozen_fibers(&mut self) -> Vec<FrozenFiber> {
+        std::mem::take(&mut self.frozen_out)
+    }
+
     /// Run an **incrementally defined** function (a trampoline pointer returned by
     /// [`Self::define_extra`]) over a fresh guest window, exactly like [`Self::run`] runs the
     /// entry. This is the test/demo surface; the Phase-2 `Jit` capability instead uses
