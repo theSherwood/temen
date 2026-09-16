@@ -58,6 +58,7 @@ if [ -x "$REPO/nimony/bin/nifler" ]; then
   export PATH="$REPO/nimony/bin:$PATH"
   export NIFLER_BIN="$REPO/nimony/bin/nifler"
   export NIMONY_BIN="$REPO/nimony/bin"
+  export NIMONY_TOOLCHAIN_BIN="$REPO/nimony/bin" # the chain builders find nimony's `lib/` beside it
   [ -x "$REPO/nimony/bin/hexer" ] && export HEXER_BIN="$REPO/nimony/bin/hexer"
 fi
 # The nim C backend #include's `nimbase.h` from the Nim lib. build_e2e_chain.sh falls back to
