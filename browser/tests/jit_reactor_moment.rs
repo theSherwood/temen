@@ -21,7 +21,10 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use temen_browser::{Frame, JitOnrampReactor, JitStart, ReactorMoment};
+use temen_browser::{
+    Frame, JitOnrampReactor, JitStart, MomentReactor, ReactorMoment, ReactorTimeline,
+    SteppableReactor, STATUS_OK,
+};
 use temen_interp::Value;
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
@@ -30,6 +33,7 @@ const WIN_SIZE: u64 = 1 << WIN_LOG2;
 const WIN_BASE: u32 = 0x1_0000; // the window starts at 64 KiB (the env cell lives below it)
 const ENV_PTR: u32 = 1024;
 const LEFT: i32 = 37;
+const RIGHT: i32 = 39;
 
 fn frame_hash(f: &Frame) -> u64 {
     let mut h = DefaultHasher::new();
@@ -194,8 +198,23 @@ impl JitDriver {
         self.store.data_mut().as_mut().unwrap()
     }
 
-    /// Run one frame on the emitted tier and return the presented frame's hash.
-    fn step(&mut self) -> u64 {
+    /// Run one frame on the emitted tier and hash what it presented — the per-frame equality unit
+    /// these cases compare.
+    fn hashed(&mut self) -> u64 {
+        assert_eq!(self.step(), STATUS_OK, "the emitted tick should keep going");
+        frame_hash(&self.reactor().take_frame().expect("a frame was presented"))
+    }
+}
+
+/// The wasm-JIT reactor joins the moment/timeline surface by **implementing** the library's trait
+/// rather than by a second ladder of its own (INVARIANTS #15). It has to be here rather than in the
+/// library because this tier's `tick` is emitted wasm, run by whoever compiled it — the browser's JS
+/// host in production, `wasmi` here — so "run one tick" is the driver's to define, not the reactor's.
+impl SteppableReactor for JitDriver {
+    /// `wasmi` runs in this process, so unlike the cdylib's wasm-JIT reactor (whose tick a browser's
+    /// JS host owns) this harness *can* step itself — which is what lets the same cases run the
+    /// self-driving `frame` and the split form and compare them.
+    fn step(&mut self) -> i32 {
         // Refill fuel (the emitted code debits an i64 counter at env[0] and traps when it goes < 0).
         self.memory
             .write(
@@ -217,7 +236,22 @@ impl JitDriver {
             let why = self.reactor().last_trap().to_string();
             panic!("emitted tick trapped: {e} ({why})");
         }
-        frame_hash(&self.reactor().take_frame().expect("a frame was presented"))
+        STATUS_OK
+    }
+}
+
+impl MomentReactor for JitDriver {
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        self.reactor().push_key(keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        self.reactor().push_mouse(kind, payload);
+    }
+    fn moment(&self) -> Option<ReactorMoment> {
+        self.reactor().moment()
+    }
+    fn restore(&mut self, m: &ReactorMoment) -> bool {
+        self.reactor_mut().restore(m)
     }
 }
 
@@ -226,13 +260,13 @@ impl JitDriver {
 fn rewind_replays_the_recorded_future(fixture: &[u8]) {
     let mut d = JitDriver::open(fixture);
     for _ in 0..4 {
-        d.step();
+        d.hashed();
     }
     let moment: ReactorMoment = d.reactor().moment().expect("the JIT window is capturable");
-    let recorded: Vec<u64> = (0..8).map(|_| d.step()).collect();
+    let recorded: Vec<u64> = (0..8).map(|_| d.hashed()).collect();
 
     assert!(d.reactor_mut().restore(&moment), "restore the JIT reactor");
-    let replayed: Vec<u64> = (0..8).map(|_| d.step()).collect();
+    let replayed: Vec<u64> = (0..8).map(|_| d.hashed()).collect();
     assert_eq!(
         recorded, replayed,
         "a rewound wasm-JIT reactor replays the emitted frames exactly"
@@ -266,16 +300,16 @@ fn jit_rewind_carries_a_heap_grown_above_the_window() {
 fn jit_moment_carries_queued_input() {
     let mut d = JitDriver::open(include_bytes!("fixtures/bounce.temen"));
     for _ in 0..3 {
-        d.step();
+        d.hashed();
     }
     d.reactor().push_key(LEFT, 1);
     let moment = d.reactor().moment().expect("capturable");
-    let steered: Vec<u64> = (0..4).map(|_| d.step()).collect();
+    let steered: Vec<u64> = (0..4).map(|_| d.hashed()).collect();
 
     assert!(d.reactor_mut().restore(&moment));
     assert_eq!(
         steered,
-        (0..4).map(|_| d.step()).collect::<Vec<_>>(),
+        (0..4).map(|_| d.hashed()).collect::<Vec<_>>(),
         "the undrained keypress rides the moment on the emitted tier"
     );
 }
@@ -293,16 +327,16 @@ fn a_jit_reactor_freezes_and_thaws_playing(fixture: &[u8]) {
     let m = temen_encode::decode_module(fixture).expect("decode fixture");
     let mut d = JitDriver::open(fixture);
     for _ in 0..5 {
-        d.step();
+        d.hashed();
     }
     let artifact = d
         .reactor()
         .freeze(&m)
         .expect("freeze the emitted-tier window");
-    let recorded: Vec<u64> = (0..8).map(|_| d.step()).collect();
+    let recorded: Vec<u64> = (0..8).map(|_| d.hashed()).collect();
 
     let mut thawed = JitDriver::thaw(fixture, &artifact);
-    let replayed: Vec<u64> = (0..8).map(|_| thawed.step()).collect();
+    let replayed: Vec<u64> = (0..8).map(|_| thawed.hashed()).collect();
     assert_eq!(
         recorded, replayed,
         "a thawed wasm-JIT reactor resumes the frozen instant frame for frame"
@@ -337,16 +371,16 @@ fn a_thawed_jit_reactor_keeps_undrained_input() {
     let m = temen_encode::decode_module(fixture).expect("decode fixture");
     let mut d = JitDriver::open(fixture);
     for _ in 0..3 {
-        d.step();
+        d.hashed();
     }
     d.reactor().push_key(LEFT, 1);
     let artifact = d.reactor().freeze(&m).expect("freeze");
-    let steered: Vec<u64> = (0..4).map(|_| d.step()).collect();
+    let steered: Vec<u64> = (0..4).map(|_| d.hashed()).collect();
 
     let mut thawed = JitDriver::thaw(fixture, &artifact);
     assert_eq!(
         steered,
-        (0..4).map(|_| thawed.step()).collect::<Vec<_>>(),
+        (0..4).map(|_| thawed.hashed()).collect::<Vec<_>>(),
         "the undrained keypress rides the artifact onto the emitted tier"
     );
 }
@@ -358,7 +392,7 @@ fn a_jit_save_state_refuses_a_different_module() {
     let bounce = include_bytes!("fixtures/bounce.temen");
     let m = temen_encode::decode_module(bounce).expect("decode fixture");
     let mut d = JitDriver::open(bounce);
-    d.step();
+    d.hashed();
     let artifact = d.reactor().freeze(&m).expect("freeze");
 
     let life = temen_encode::decode_module(include_bytes!("fixtures/life.temen")).expect("decode");
@@ -390,24 +424,172 @@ fn a_thawed_jit_reactor_can_be_frozen_again() {
     let m = temen_encode::decode_module(fixture).expect("decode fixture");
     let mut d = JitDriver::open(fixture);
     for _ in 0..4 {
-        d.step();
+        d.hashed();
     }
     let first = d.reactor().freeze(&m).expect("freeze");
 
     let mut thawed = JitDriver::thaw(fixture, &first);
     for _ in 0..3 {
-        thawed.step();
+        thawed.hashed();
     }
     let second = thawed
         .reactor()
         .freeze(&m)
         .expect("re-freeze a thawed reactor");
-    let recorded: Vec<u64> = (0..5).map(|_| thawed.step()).collect();
+    let recorded: Vec<u64> = (0..5).map(|_| thawed.hashed()).collect();
 
     let mut again = JitDriver::thaw(fixture, &second);
     assert_eq!(
         recorded,
-        (0..5).map(|_| again.step()).collect::<Vec<_>>(),
+        (0..5).map(|_| again.hashed()).collect::<Vec<_>>(),
         "a save-state taken from a thawed reactor is as good as the first"
+    );
+}
+
+// ---- the tape and the ladder on the emitted tier (#1457 items 3–4) -------------------------------
+
+/// The scripted input for frame `i`, addressed to a timeline so it lands on the tape. Key-*downs*
+/// only: `bounce` steers on `(e >> 16) & 1` and ignores releases, so a schedule built from press/release
+/// pairs would be one event's worth of input pretending to be four (and a branch off it would not
+/// branch).
+fn drive(t: &mut ReactorTimeline, i: usize) {
+    match i % 6 {
+        0 => t.push_key(RIGHT, 1),
+        3 => t.push_key(LEFT, 1),
+        _ => {}
+    }
+}
+
+/// Extend the recording by `frames` frames, feeding the scripted input for each.
+fn record(t: &mut ReactorTimeline, d: &mut JitDriver, frames: usize) -> Vec<u64> {
+    (0..frames)
+        .map(|_| {
+            let i = t.tick();
+            drive(t, i);
+            assert_eq!(t.frame(d), STATUS_OK, "the emitted tick should keep going");
+            frame_hash(&d.reactor().take_frame().expect("a frame was presented"))
+        })
+        .collect()
+}
+
+/// Play `frames` frames from wherever the timeline stands, replaying the tape rather than branching.
+fn play(t: &mut ReactorTimeline, d: &mut JitDriver, frames: usize) -> Vec<u64> {
+    (0..frames)
+        .map(|_| {
+            assert_eq!(t.frame(d), STATUS_OK, "the emitted tick should keep going");
+            frame_hash(&d.reactor().take_frame().expect("a frame was presented"))
+        })
+        .collect()
+}
+
+/// The scrub gate, with every frame produced by **emitted wasm**: any recorded tick is reachable and
+/// replays the frame it originally produced.
+///
+/// This is INVARIANTS #14 rather than a repeat — a scrub bar the playable tier cannot serve is not the
+/// feature. It also answers the question the interpreter cases cannot: emitted code writes the window
+/// directly and reads host-maintained globals from an env cell *outside* it, so if any guest-visible
+/// state lived in that cell a ladder would rewind the window and leave it behind. It does not.
+#[test]
+fn a_jit_timeline_seeks_to_any_recorded_tick() {
+    const N: usize = 24;
+    let mut d = JitDriver::open(include_bytes!("fixtures/bounce.temen"));
+    let mut t = ReactorTimeline::new(6, 4, 0);
+    let recorded = record(&mut t, &mut d, N);
+    assert_eq!((t.tick(), t.len()), (N, N));
+    assert_eq!(
+        t.keyframe_ticks(),
+        vec![0, 6, 12, 18],
+        "a rung every stride"
+    );
+
+    for target in [21usize, 2, 13, 0, 23, 13] {
+        assert!(t.seek(&mut d, target), "tick {target} is on the recording");
+        assert_eq!(
+            play(&mut t, &mut d, 1),
+            vec![recorded[target]],
+            "frame {target} replays identically from a seek on the emitted tier"
+        );
+    }
+    assert!(
+        !t.seek(&mut d, N + 1),
+        "a position past the recording is not a position"
+    );
+    assert!(
+        recorded
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            > 1,
+        "the fixture animates, so the gate is not vacuous"
+    );
+}
+
+/// Branching on the emitted tier: steering differently from a rewound position drops the recorded
+/// future, and the new one is a recording like any other.
+#[test]
+fn a_jit_timeline_branches_on_new_input_in_the_past() {
+    let mut d = JitDriver::open(include_bytes!("fixtures/bounce.temen"));
+    let mut t = ReactorTimeline::new(4, 4, 0);
+    let recorded = record(&mut t, &mut d, 20);
+
+    assert!(t.seek(&mut d, 8));
+    t.push_key(LEFT, 1); // recorded is heading right at tick 8 (RIGHT↓ at 6), so this really turns
+    assert_eq!(t.len(), 8, "the abandoned future leaves the tape");
+    assert!(t.keyframe_ticks().iter().all(|&k| k <= 8));
+
+    let branch = play(&mut t, &mut d, 6);
+    assert_ne!(branch, recorded[8..14].to_vec(), "the branch diverges");
+    assert!(t.seek(&mut d, 8));
+    assert_eq!(
+        play(&mut t, &mut d, 6),
+        branch,
+        "and replays like any other recording"
+    );
+}
+
+/// The **split** form on the tier that forces it. In the browser this reactor's `tick` is emitted
+/// wasm compiled and called by the page's JS host, so Rust cannot step it: the page drives
+/// `begin_tick` / its own tick / `end_tick`. Driving it that way here must record and seek exactly as
+/// the self-driving `frame` does — that equivalence is what lets the page drop its own ladder.
+#[test]
+fn a_jit_timeline_drives_the_split_form_identically() {
+    let fixture = include_bytes!("fixtures/bounce.temen");
+    let mut whole = JitDriver::open(fixture);
+    let mut tw = ReactorTimeline::new(6, 4, 0);
+    let expected = record(&mut tw, &mut whole, 18);
+
+    let mut split = JitDriver::open(fixture);
+    let mut ts = ReactorTimeline::new(6, 4, 0);
+    let mut got = Vec::new();
+    for _ in 0..18 {
+        let i = ts.tick();
+        drive(&mut ts, i);
+        ts.begin_tick(&mut split);
+        assert_eq!(split.step(), STATUS_OK); // the embedder's own tick — JS's job in the browser
+        ts.end_tick();
+        got.push(frame_hash(
+            &split.reactor().take_frame().expect("a frame was presented"),
+        ));
+    }
+    assert_eq!(
+        got, expected,
+        "hand-driven emitted ticks record the same run"
+    );
+    assert_eq!(
+        ts.keyframe_ticks(),
+        tw.keyframe_ticks(),
+        "and the same ladder"
+    );
+
+    assert!(ts.seek_begin(&mut split, 7));
+    while ts.tick() < 7 {
+        ts.begin_tick(&mut split);
+        assert_eq!(split.step(), STATUS_OK);
+        ts.end_tick();
+    }
+    assert_eq!(
+        play(&mut ts, &mut split, 4),
+        expected[7..11].to_vec(),
+        "a hand-driven seek lands where the self-driving one does"
     );
 }

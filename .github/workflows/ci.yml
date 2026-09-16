@@ -824,6 +824,12 @@ jobs:
     # contract of #1392 — the seeded libc's three-way linkage split (`__pg_linkage.h`), the
     # cross-unit data symbols `fprintf(stdout, …)` resolves through, and the merged debug info a
     # debug session steps on. It runs ~60 s; a header edit that breaks any of those fails the PR.
+    # `reactor_moment` / `jit_reactor_moment` gate the #1454 moment family — capture/restore, the
+    # §12 save-state round trip, and the #1457 input tape + keyframe ladder — on all three reactors,
+    # the emitted (wasm-JIT) tier included via `wasmi`. They belong here rather than in `browser-real`
+    # for the same reason `pg_libc_asset` does: their fixtures (`tests/fixtures/{bounce,life,fsread}.temen`)
+    # are committed, so nothing is staged, and the pair runs in ~3 s. A comment further down this file
+    # already calls them the gate for the reactor tiers; until now no job ran them.
     # `pg_libc_asset` gates the committed prebuilt libc unit (`web/assets/pg_libc.temeno`) the card
     # links against: it is doubly wire-coupled (built by the committed `chibicc.temen`, and itself an
     # encoded unit), so an IR / encoder / wire change must regenerate it via `scripts/rebuild-assets.sh`
@@ -854,6 +860,7 @@ jobs:
             --test onramp --test onramp_posix --test powerbox_cap_names \
             --test emit_budget --test dap_batch --test link_run \
             --test setjmp --test pg_snapshot_roundtrip --test uxn_reactor \
+            --test reactor_moment --test jit_reactor_moment \
             --test chibicc_link_libc --test pg_libc_asset --test jspb \
             --test module_imports
 
