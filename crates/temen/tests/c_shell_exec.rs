@@ -1,15 +1,22 @@
-//! Stage 1 (STAGE1.md) — **op 13 wired into a chibicc shell**: a compiled-C shell (not hand-written
-//! IR) drives `instantiate_module_named` (op 13) to `exec` a *separate*, unmodified compiled-C command
-//! with inherited stdout, and collects its status. The shell parses its own `argv` (the powerbox args
-//! buffer), looks the command up, seeds the command's `argv` into a carve, re-grants `stdout` by name,
-//! spawns via op 13, and `join`s — the whole external-command path emitted by the frontend.
+//! Stage 1 (STAGE1.md) — **a compiled-C shell execs a compiled-C command**: the shell (not
+//! hand-written IR) spawns a *separate*, unmodified compiled-C command with inherited stdout and
+//! collects its status. The shell parses its own `argv` (the powerbox args buffer), looks the command
+//! up, seeds the command's `argv` into a carve, and spawns + `join`s through `posix_libc/spawn.c`
+//! (#1509) — `vm_spawn` fills the `Instantiator.instantiate_rec` (op 17) record and the by-name grant
+//! list (`{"stdout" -> out}`) that used to be laid out by hand here — the whole external-command path
+//! emitted by the frontend.
 //!
 //! Both the shell and the command are ordinary C. Capability wiring: `stdout` is a re-grantable
 //! `Stream` (shared sink, so the command's output and any shell output unify); `exec_stdout`/
-//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); `__spawn`/`__join` link to
-//! `call.cap 6 13`/`6 1` (`Resolved::Cap`, link-time symbol resolution) and dispatch on the
-//! `Instantiator`/host-fn handles the guest discovers itself via `cap.self` reflection. Differential
-//! interp==JIT — the JIT is given the module resolver *and* the named-grant hooks op 13 needs.
+//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); the helper's
+//! `vm_instantiate_rec`/`vm_instantiate_join` externs bind through the one shared name table
+//! (`temen_ir::default_cap_resolver`, `Resolved::Cap`, link-time symbol resolution) and dispatch on
+//! the `Instantiator`/host-fn handles the guest discovers itself via `cap.self` reflection.
+//! Differential interp==JIT — the JIT is given the module resolver *and* the named-grant hooks the
+//! record spawn needs.
+//!
+//! The second test is the **per-child attenuation witness**: one parent spawns the same command
+//! twice with different grant lists, and only the child that was handed `stdout` can resolve it.
 //!
 //! This is the frontend-drives-exec proof. Folding it into the full `c_shell.rs` builtin dispatch (its
 //! personality-heap-at-`win/2` layout vs. a 128 KiB command carve) is the follow-up.
@@ -82,61 +89,33 @@ int main(int argc, char **argv){
 }
 "#;
 
+/// The guest-side spawn helper (#1509), concatenated ahead of each C program that spawns.
+const SPAWN_C: &str = include_str!("../../temen-run/demos/posix_libc/spawn.c");
+
 /// The shell: `main(argc, argv)` — exec `argv[1]` as an external command, passing it `argv[1..]`.
 /// `pool` (a big writable global) both forces a window large enough for the command's carve and holds
-/// the grant record + the aligned carve. Names link via imports (see [`link_shim`]); handles come
-/// from the guest's own cap.self reflection.
-const SHELL: &str = r#"
-/* Natural C prototypes: the child handle is a plain `long`, as a shell author would write it. chibicc
- * widens every scalar to an i64 slot, so `call.cap 6 13` is declared `(i64…) -> (i64)` even though the
- * Instantiator contract's canonical child handle is i32. Both backends reconcile that width: the interp
- * reads args as i64 slots and coerces the result to the declared type; the JIT's `lower_instantiator`
- * does the matching `slot_i64`/`slot_i32`/`result_as` coercions. (Before that fix the JIT CapFaulted on
- * the i64 result — no compiled-C program could drive the Instantiator on the JIT.) The handle operand
- * (`inst`) stays `int`: the lowered `call.cap` dispatches on it, and the shell passes the handle it
- * discovers via cap.self reflection (`__inst()`/`__hf()`). */
-long __spawn(int inst, long module, long gp, long gn, long entry, long off, long sl, long q);
-long __join(int inst, long child);
+/// the spawn record + the aligned carve. Names link via imports (see [`link_shim`]); handles come
+/// from the guest's own cap.self reflection (`vm_cap_of`).
+///
+/// chibicc widens every scalar to an i64 slot, so the helper's `call.cap 6 17`/`6 1` are declared
+/// `(i64…) -> (i64)` even though the Instantiator contract's canonical child handle is i32. Both
+/// backends reconcile that width: the interp reads args as i64 slots and coerces the result to the
+/// declared type; the JIT's `lower_instantiator` does the matching `slot_i64`/`slot_i32`/`result_as`
+/// coercions.
+const SHELL_MAIN: &str = r#"
 long exec_stdout(int h);
 long exec_lookup(int h, char *name, long len);
 long stream_write(int h, void *buf, long n);
-int __vm_cap_count(void);
-int __vm_cap_at(int i, int *type_id_out);
 static long slen(char *s){ long n=0; while(s[n]) n++; return n; }
-/* Discover the handle of interface `want` from the domain's own capability table
-   (cap.self reflection — the discovery tier IMPORTS.md keeps). */
-static int __capof(int want) {
-  int n = __vm_cap_count();
-  int i = 0;
-  while (i < n) {
-    int t = 0;
-    int h = __vm_cap_at(i, &t);
-    if (t == want) return h;
-    i = i + 1;
-  }
-  return -1;
-}
-static int __h_hf = -1;
-static int __hf(void) { if (__h_hf < 0) __h_hf = __capof(13); return __h_hf; }   /* HOST_PROC = 13 */
-static int __h_inst = -1;
-static int __inst(void) { if (__h_inst < 0) __h_inst = __capof(6); return __h_inst; } /* Instantiator = 6 */
-/* 384 KiB: room for the grant record/name low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
+/* 384 KiB: room for the spawn record low, a 128 KiB-aligned 128 KiB carve, all below the SP. */
 static char pool[393216];
 int main(int argc, char **argv){
-  long out = exec_stdout(__hf());
+  int hf = vm_cap_of(13);   /* HOST_PROC = 13: the embedder's exec host fn */
+  long out = exec_stdout(hf);
   if (argc < 2) return 1;
-  long mod = exec_lookup(__hf(), argv[1], slen(argv[1]));
+  long mod = exec_lookup(hf, argv[1], slen(argv[1]));
   if (mod < 0){ stream_write(out, "not found\n", 10); return 127; }
-  long base = (long)pool;
-  long carve = (base + 131071) & ~131071;
-  /* grant record at base: {name_off, name_len, out, flags} ; "stdout" name follows at base+16 */
-  int *rec = (int *)base;
-  rec[0] = (int)(base + 16);
-  rec[1] = 6;
-  rec[2] = (int)out;
-  rec[3] = 0;
-  char *nm = (char *)(base + 16);
-  nm[0]='s'; nm[1]='t'; nm[2]='d'; nm[3]='o'; nm[4]='u'; nm[5]='t';
+  long carve = ((long)pool + 131071) & ~131071;
   /* the command's args buffer at carve + guard + 128 (#1059: chibicc reads argv one 16 KiB NULL
      guard up, module_args_base): {argc-1, envc=0} then packed argv[1..] */
   char *ab = (char *)(carve + 16384 + 128);
@@ -145,8 +124,51 @@ int main(int argc, char **argv){
   hdr[1] = 0;
   char *p = ab + 8;
   for (int i = 1; i < argc; i++){ char *s = argv[i]; long L = slen(s); for (long k=0;k<L;k++) *p++ = s[k]; *p++ = 0; }
-  long child = __spawn(__inst(), mod, base, 1, 0, carve, 17, 0);
-  return __join(__inst(), child);
+  vm_grant g[1];
+  g[0].name = "stdout";
+  g[0].handle = (int)out;
+  long child = vm_spawn(mod, 0, carve, 17, 0, g, 1, pool);
+  return (int)vm_join(child);
+}
+"#;
+
+/// The attenuation-witness command: returns 1 and prints if it was handed `stdout`, else 0. It
+/// writes through the handle `self.resolve` returns (`__vm_write`, a `call.cap` on that handle) rather
+/// than the ambient `write`: an ambient `write` is a manifest import, and a child whose manifest names
+/// a capability its powerbox cannot bind is refused at spawn (`-EINVAL`, fail closed) — which is also
+/// attenuation, but the witness wants the ungranted child to *run* and find nothing.
+const PROBE: &str = r#"
+long __vm_resolve(const char *name, long len);
+long __vm_write(int h, void *buf, long len);
+int main(int argc, char **argv){
+  long h = __vm_resolve("stdout", 6);
+  if (h < 0) return 0;
+  __vm_write((int)h, "granted\n", 8);
+  return 1;
+}
+"#;
+
+/// The witness parent: spawns `PROBE` twice from one module — child A with `{"stdout" -> out}`,
+/// child B with an empty grant list — and returns `A*10 + B`.
+const TWO_CHILDREN: &str = r#"
+long exec_stdout(int h);
+long exec_lookup(int h, char *name, long len);
+/* 640 KiB: the spawn record low, then two 128 KiB-aligned 128 KiB carves. */
+static char pool[655360];
+int main(int argc, char **argv){
+  int hf = vm_cap_of(13);
+  long out = exec_stdout(hf);
+  long mod = exec_lookup(hf, "echo", 4);
+  long ca = ((long)pool + 131071) & ~131071;
+  long cb = ca + 131072;
+  vm_grant g[1];
+  g[0].name = "stdout";
+  g[0].handle = (int)out;
+  long a = vm_spawn(mod, 0, ca, 17, 0, g, 1, pool);
+  long ra = vm_join(a);
+  long b = vm_spawn(mod, 0, cb, 17, 0, g, 0, pool);
+  long rb = vm_join(b);
+  return (int)(ra * 10 + rb);
 }
 "#;
 
@@ -172,20 +194,18 @@ fn exec_host(out_h: i32, echo_h: i32) -> temen_interp::HostProc {
 }
 
 /// Link the shell's import names to their interfaces — link-time symbol resolution (the phase-4
-/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__spawn`/`__join` are `Instantiator` ops
-/// (13 / 1); `exec_stdout`/`exec_lookup` are the embedder host fn's ops (0 / 1); `stream_write` is
-/// `Stream.write`. No handle is baked at link: each lowered `call.cap` dispatches on the guest's own
-/// handle operand — `stream_write`'s comes from `exec_stdout`, the rest are discovered at run time
-/// via `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
-/// dynamic mode).
+/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `exec_stdout`/`exec_lookup` are the embedder
+/// host fn's ops (0 / 1); `stream_write` is `Stream.write`; everything else (the spawn helper's
+/// `vm_instantiate_rec`/`vm_instantiate_join`) comes from the one shared name table. No handle is
+/// baked at link: each lowered `call.cap` dispatches on the guest's own handle operand, discovered at
+/// run time via `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary,
+/// IMPORTS.md §2.3 dynamic mode).
 fn link_shim(name: &str) -> Option<Resolved> {
     let cap = match name {
         "stream_write" => ResolvedCap { type_id: 0, op: 1 },
-        "__spawn" => ResolvedCap { type_id: 6, op: 13 },
-        "__join" => ResolvedCap { type_id: 6, op: 1 },
         "exec_stdout" => ResolvedCap { type_id: 13, op: 0 },
         "exec_lookup" => ResolvedCap { type_id: 13, op: 1 },
-        _ => return None,
+        _ => temen_ir::default_cap_resolver(name)?,
     };
     Some(Resolved::Cap(cap))
 }
@@ -263,13 +283,14 @@ fn run(
 
 /// The compiled shell execs the compiled `echo` command with inherited stdout, identically on both
 /// backends: the command's argv reaches its stdout (the shell's sink) and its `argc` is the shell's
-/// exit status. This is op 13 driven end to end by the frontend.
+/// exit status. This is the record spawn (op 17) driven end to end by the frontend.
 #[test]
-fn compiled_shell_execs_command_via_op13() {
-    // Parse the shell raw — its imports (`__spawn`/`exec_*`/`stream_write`) are resolved per-run by
+fn compiled_shell_execs_command_via_vm_spawn() {
+    // Parse the shell raw — its imports (`vm_instantiate_*`/`exec_*`/`stream_write`) are resolved per-run by
     // `resolver` against that run's handles, so the names must survive parsing.
-    let shell = parse_module_raw(&c_to_ir(SHELL, false)).expect("parse shell");
-    // Phase 3: keep the manifest — the op-13 spawn binds the child's slots.
+    let shell = parse_module_raw(&c_to_ir(&format!("{SPAWN_C}\n{SHELL_MAIN}"), false))
+        .expect("parse shell");
+    // Phase 3: keep the manifest — the spawn binds the child's slots by name.
     let cmd = parse_module_raw(&c_to_ir(CMD, true)).expect("parse cmd");
     verify_module(&cmd).expect("verify cmd");
 
@@ -294,4 +315,22 @@ fn compiled_shell_execs_command_via_op13() {
         assert_eq!(jout, iout, "jit: exec output must match interp");
         assert_eq!(jc, ic, "jit: exec status must match interp");
     }
+}
+
+/// Two children of one parent, two powerboxes: the child handed `stdout` resolves it and prints; its
+/// twin, spawned from the same module with an empty grant list, cannot. Attenuation is the grant
+/// list — nothing else distinguishes the two spawns. Identically on both backends.
+#[test]
+fn siblings_get_the_powerboxes_their_grant_lists_say() {
+    let parent = parse_module_raw(&c_to_ir(&format!("{SPAWN_C}\n{TWO_CHILDREN}"), false))
+        .expect("parse parent");
+    let probe = parse_module_raw(&c_to_ir(PROBE, true)).expect("parse probe");
+    verify_module(&probe).expect("verify probe");
+
+    let (ic, iout) = run(&parent, &probe, &["p"], false);
+    assert_eq!(iout, b"granted\n", "interp: only the granted child printed");
+    assert_eq!(ic, 10, "interp: A (granted) = 1, B (not granted) = 0");
+    let (jc, jout) = run(&parent, &probe, &["p"], true);
+    assert_eq!(jout, iout, "jit: output must match interp");
+    assert_eq!(jc, ic, "jit: status must match interp");
 }

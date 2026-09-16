@@ -4244,6 +4244,11 @@ pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
         "vm_jit_release" => (cap_id::JIT, 2),
         "vm_jit_install" => (cap_id::JIT, 3),
         "vm_jit_uninstall" => (cap_id::JIT, 4),
+        // Instantiator (§14) — the config-record spawn + join, as `posix_libc/spawn.c` reaches them
+        // (#1509): the helper fills the op-17 record from C and dispatches on the `Instantiator`
+        // handle it discovers by reflection.
+        "vm_instantiate_rec" => (cap_id::INSTANTIATOR, 17),
+        "vm_instantiate_join" => (cap_id::INSTANTIATOR, 1),
         _ => return None,
     };
     Some(ResolvedCap { type_id, op })

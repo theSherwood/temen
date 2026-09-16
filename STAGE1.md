@@ -134,10 +134,13 @@ map** the personality holds; command lookup is a map lookup; `exec` is spawn.
 4c. **op 13 driven by a compiled-C shell** *(done — `crates/temen/tests/c_shell_exec.rs`)*
    — where 4b's parent was hand-written IR, here a **chibicc shell** (`main(argc,
    argv)`) parses its own powerbox args, looks the command up via a host fn,
-   seeds the command's `argv` into a 128 KiB carve, lays a `"stdout"` grant record,
-   and drives `instantiate_module_named` (op 13) + `join` through capability
-   imports (`Resolved::CapBound`, the `Instantiator` baked in) — the whole
-   external-command path emitted by the frontend, differential interp==JIT.
+   seeds the command's `argv` into a 128 KiB carve, and spawns + `join`s with a
+   `"stdout"` grant — the whole external-command path emitted by the frontend,
+   differential interp==JIT. *(#1509: the shell no longer lays the grant record by
+   hand — it links `posix_libc/spawn.c`, whose `vm_spawn` fills the op-17
+   `instantiate_rec` record + grant list and dispatches on the reflected
+   `Instantiator`; the same file carries the per-child attenuation witness, two
+   children of one parent with different grant lists.)*
    This surfaced a **latent JIT/interp differential gap** (now fixed, no
    confinement code touched): the JIT's `lower_instantiator` demanded an
    *exact-width* Instantiator contract (i32 child handle / i32 `join` arg), but
