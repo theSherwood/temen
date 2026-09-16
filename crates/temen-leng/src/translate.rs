@@ -55,6 +55,39 @@ fn escape_bytes(bytes: &[u8]) -> String {
     s
 }
 
+/// `{.emit.}` bodies that are **pure hints with no semantics**, lowered to nothing (#1443). Exact,
+/// whitespace-normalized matches — see `FuncGen::emit_stmt` for why this is a list and not a pattern.
+const EMIT_NOPS: &[&str] = &[
+    // `std/atomics` `cpuRelax()` — the x86 `PAUSE` / ARM `YIELD` spin-wait hint.
+    r#"asm volatile("pause");"#,
+    r#"asm volatile("yield");"#,
+];
+
+/// Decode a NIF string atom — strip the surrounding quotes and undo the `\HH` byte escapes the
+/// format uses for anything outside its bare-token alphabet (`\22` is `"`, `\28`/`\29` are the
+/// parens). Lossy on non-UTF-8, which is fine: the callers compare or display the result.
+fn nif_unquote(raw: &str) -> String {
+    let inner = raw
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or(raw);
+    let b = inner.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\\' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&inner[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The RTTI type-header field every `RootObj`-derived object carries at offset 0: an 8-byte pointer
 /// to the object's `Rtti` (vtable / type descriptor). nimony spells the field `vt.00` and accesses
 /// it as `(dot (deref x) vt.00 <inheritance-level>)`; `temen-leng` synthesizes it under this exact name
@@ -3746,11 +3779,54 @@ impl<'a> FuncGen<'a> {
             Some("lab") => self.lab_stmt(s),
             Some("break") => self.loop_jump(false, "break"),
             Some("continue") => self.loop_jump(true, "continue"),
+            Some("emit") => self.emit_stmt(s),
             other => Err(LengError::Unsupported(format!(
                 "statement `{}`",
                 other.unwrap_or("<headless>")
             ))),
         }
+    }
+
+    /// `(emit "<raw C>")` — nim's `{.emit.}`, which splices raw C into the generated source.
+    ///
+    /// There is no C front-end on this path and inventing one would be a second route through code
+    /// generation (the prime directive), so the general case fails closed. But **one** emit body was
+    /// blocking six stdlib modules (#1443): `cpuRelax`'s spin-wait hint,
+    ///
+    /// ```c
+    /// asm volatile("pause");   // amd64/i386
+    /// asm volatile("yield");   // arm64/arm
+    /// ```
+    ///
+    /// `std/atomics` is the only module in the vendored stdlib with a C-reaching `emit` at all, and
+    /// `ticketlocks`/`threadpool`/`ioring` import it directly while `locks`/`rlocks` reach it
+    /// transitively — so this single hint is the whole of the reported `emit` gap.
+    ///
+    /// A `PAUSE`/`YIELD` is a **hint with no architectural effect**: it asks the core to back off
+    /// inside a spin loop. Dropping it cannot change what a program computes, and on a confined
+    /// single-vCPU guest there is nothing to back off for. So it lowers to nothing.
+    ///
+    /// The allow-list is deliberately exact rather than a pattern. Silently dropping *arbitrary*
+    /// inline asm would be a correctness hole wearing a compatibility hat: the next emit to appear
+    /// might have real semantics, and we would not find out. Anything unrecognized still fails the
+    /// link — now quoting the body, so the next one takes a minute to triage instead of an hour
+    /// (the old message was a bare "statement `emit`", which said nothing about *which* emit).
+    fn emit_stmt(&mut self, s: &Node) -> Result<(), LengError> {
+        let raw = s
+            .args()
+            .first()
+            .and_then(|n| n.as_atom())
+            .ok_or_else(|| LengError::Malformed("`emit` without a body".into()))?;
+        let body = nif_unquote(raw);
+        let norm: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+        if EMIT_NOPS.contains(&norm.as_str()) {
+            return Ok(());
+        }
+        let shown: String = body.chars().take(120).collect();
+        Err(LengError::Unsupported(format!(
+            "`emit` of raw C: `{shown}` (no C front-end on this path; if it is a pure hint with no \
+             semantics, add it to EMIT_NOPS)"
+        )))
     }
 
     /// `(if (elif Cond Body)+ (else Body)?)` → a chain of `br_if`s over blocks.

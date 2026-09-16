@@ -1479,6 +1479,8 @@ fn nimony_stdlib_dir() -> Option<std::path::PathBuf> {
 /// entry must exist in `lib/std/`; the sweep asserts that up front (#1490) rather than letting an
 /// absent module read as a pass.
 const STD_MODULES: &[&str] = &[
+    // Runnable since #1443 lowered `cpuRelax`'s `{.emit.}` hint and bound the last four atomic leaves.
+    "atomics",
     "strutils",
     "sequtils",
     "algorithm",
