@@ -3217,8 +3217,8 @@ pub enum VcpuEvent {
     /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
     /// carve. A spawn with a grant list and/or a pre-mapped region stashes the child powerbox
     /// ([`Vcpu::take_granted_host`] is `Some`); the pre-map rides it and the child constructor applies
-    /// it, so a driver needs no extra step — a driver whose emitted tier cannot honour a §13 alias
-    /// checks `Host::has_premap` and runs such a child on the interpreter.
+    /// it, so a driver needs no extra step — a driver whose emitted tier cannot alias
+    /// [`Host::take_premap`]s it instead and copies the region in before / out after the run.
     InstantiateDetached {
         module: u32,
         entry: u32,

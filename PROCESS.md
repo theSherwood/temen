@@ -495,12 +495,18 @@ object, and *who holds authority over its backing* is the whole visibility story
   through the same `map_region` the `map` op takes): the child holds the region handle (unnamed);
   admission is the `map` op's geometry (region-granularity aligned, above the NULL guard, inside the
   declared window) and refuses `-EINVAL` before the quota take; a wrong-kind handle traps `CapFault`.
-  Tree-walk, bytecode, and Cranelift JIT (a real `MAP_SHARED` view) carry it; on the wasm-JIT tier a
-  pre-mapped child declines to the interpreter twin, as a child that `map`s for itself does (two
-  `WebAssembly.Memory`s cannot alias). This is the bulk data plane for a child whose memory the parent
-  cannot address (§13), and the spawn-time args payload's big sibling: the payload copies ≤ 16 KiB in
-  once, the pre-map aliases any size both ways for the child's lifetime. Pinned by
-  `temen-interp/tests/detached_premap.rs` and `temen-run/tests/detached_child_jit.rs`.
+  Tree-walk, bytecode, and Cranelift JIT (a real `MAP_SHARED` view) carry it. On the wasm-JIT tier
+  two `WebAssembly.Memory`s cannot alias, but a detached child runs to completion before its parent
+  resumes (the handle is delivered after the run; `join` reads the banked result), so with no
+  interleaving the alias is observationally **copy-in before start, copy-out after return**: the
+  op-13 servicer copies the region's bytes into the child's memory at `child_off` before the emitted
+  child starts and copies the span back into the region at deliver (`Host::take_premap`, #1527) —
+  the child still emits; only a child that `map`s for itself declines to the interpreter twin. This
+  is the bulk data plane for a child whose memory the parent cannot address (§13), and the
+  spawn-time args payload's big sibling: the payload copies ≤ 16 KiB in once, the pre-map aliases
+  any size both ways for the child's lifetime. Pinned by `temen-interp/tests/detached_premap.rs`,
+  `temen-run/tests/detached_child_jit.rs`, and (the copy-in/copy-out twin, real Chromium)
+  `browser/browser-op13jit-detached-test.mjs`.
 - Demand-paged sits between, and honestly: **pager authority is read authority** — a
   domain whose pages are supplied by its parent is visible to it. `attest` (§6) reports
   this.

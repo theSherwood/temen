@@ -11424,6 +11424,13 @@ struct Op13JitDriver {
     /// #1286: the foreign-memory id of the **detached** child currently staged (`OP13JIT_CHILD_DETACHED`),
     /// `-1` otherwise — JS looks the child's `WebAssembly.Memory` up by it to drive the run.
     child_mem_id: i32,
+    /// #1527: the staged detached child's op-15 **pre-mapped region** on the emitted tier —
+    /// `(backing, child window offset, child window size)`. The region's bytes were copied into the
+    /// child's memory at the offset before it started; [`temen_op13jit_deliver`] copies the span back
+    /// into the region before it banks the result (see [`Host::take_premap`]). `None` for an
+    /// un-mapped child and for the interpreter twin (whose `Mem` aliases the region in software).
+    #[allow(dead_code)] // read only by the wasm32 threads build (the foreign-memory seam)
+    premap_copyback: Option<(temen_interp::RegionBacking, u64, u64)>,
 }
 static mut OP13_JIT: Option<Op13JitDriver> = None;
 
@@ -11617,7 +11624,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     });
 
     let mut host = Host::new();
-    let win = 1u64 << 16; // parent `memory 16`
+    let win = 1u64 << driver.memory.map_or(16, |mc| mc.size_log2); // the built-in driver: `memory 16`
     let inst = host.grant_instantiator(0, win);
     let modh = host.grant_module(&child);
     let fs_h = host.grant_host_proc_forkable(handler, fork);
@@ -11638,6 +11645,13 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     } else {
         fs_h
     };
+    // #1527: a driver whose entry takes a fourth arg gets an `AddressSpace` over its window — so a
+    // detached driver can mint a region (`create_region`), map it for itself and pre-map it into
+    // the child (the op-15 11-arg form). The three-arg drivers are unchanged.
+    let mut args = vec![Value::I32(inst), Value::I32(modh), Value::I32(third)];
+    if driver.funcs.first().is_some_and(|f| f.params.len() == 4) {
+        args.push(Value::I32(host.grant_address_space(0, win)));
+    }
 
     let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
         unsafe { drop(Box::from_raw(prog)) };
@@ -11655,7 +11669,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
     let root = match bytecode::Vcpu::new_root_with_powerbox(
         unsafe { &*prog },
         0,
-        &[Value::I32(inst), Value::I32(modh), Value::I32(third)],
+        &args,
         std::sync::Arc::clone(&back),
         &[],
         host,
@@ -11683,6 +11697,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
             readback: None,
             child_key: 0,
             child_mem_id: -1,
+            premap_copyback: None,
         });
     }
     STATUS_OK
@@ -12116,6 +12131,7 @@ unsafe fn op13_phase_open_impl(
             readback: Some(readback),
             child_key,
             child_mem_id: -1,
+            premap_copyback: None,
         });
     }
     STATUS_OK
@@ -12397,17 +12413,9 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     None
                 };
                 let had_cache = cached.is_some();
-                // An op-15 pre-mapped region is a §13 alias the emitted tier cannot honour (its
-                // loads/stores reach the child's own `Memory`, never the region's bytes) — exactly a
-                // child that `map`s for itself (`func_uses_region_ops`), so it declines the same way:
-                // whole-child, to the interpreter twin below, whose `Mem` aliases in software.
-                let emitted = if host.has_premap() {
-                    None
-                } else {
-                    match cached {
-                        Some(c) => Some(c),
-                        None => JitOnrampRun::emit_for_run(&d.child, true).ok(),
-                    }
+                let emitted = match cached {
+                    Some(c) => Some(c),
+                    None => JitOnrampRun::emit_for_run(&d.child, true).ok(),
                 };
                 let emit = match emitted {
                     Some(e) => e,
@@ -12450,6 +12458,15 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     return OP13JIT_TRAP;
                 };
                 let _ = entry;
+                // #1527: an op-15 pre-mapped region on the emitted tier. Two `WebAssembly.Memory`s
+                // cannot alias, but a detached child runs to completion before its parent resumes
+                // (the handle is delivered only after `driveDetachedRun`; `join` reads the banked
+                // result), so with no interleaving an alias is observationally **copy-in before
+                // start, copy-out after return**: the region's bytes land at the offset below (after
+                // the data segments, as the interpreter's `apply_premap` follows `init_data`), and
+                // `temen_op13jit_deliver` copies the span back. The interpreter twin above keeps the
+                // software alias, so the two tiers agree byte-for-byte (INVARIANTS #14).
+                let premap = host.take_premap();
                 match JitOnrampRun::open_foreign_run(
                     &d.child,
                     mem_id,
@@ -12464,6 +12481,12 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Some(emit),
                 ) {
                     Ok(r) => {
+                        if let Some((backing, off)) = premap {
+                            let bytes: Vec<u8> =
+                                (0..backing.size()).map(|i| backing.read_byte(i)).collect();
+                            foreign_region(mem_id, child_size).write_from(off, &bytes);
+                            d.premap_copyback = Some((backing, off, child_size));
+                        }
                         if !had_cache && d.child_key != 0 {
                             unsafe {
                                 *core::ptr::addr_of_mut!(OP13_CHILD_EMIT) = Some(Op13ChildEmit {
@@ -12528,6 +12551,15 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
     let Some(d) = (unsafe { (*core::ptr::addr_of_mut!(OP13_JIT)).as_mut() }) else {
         return OP13JIT_TRAP;
     };
+    // #1527: copy the pre-mapped span back into the region before the parent can read it.
+    #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
+    if let Some((backing, off, child_size)) = d.premap_copyback.take() {
+        let mut bytes = vec![0u8; backing.size() as usize];
+        foreign_region(d.child_mem_id as u32, child_size).read_into(off, &mut bytes);
+        for (i, b) in bytes.iter().enumerate() {
+            backing.write_byte(i as u64, *b);
+        }
+    }
     let handle = d.children.len() as i32;
     d.children.push(Ok(vec![Value::I64(value)]));
     d.root.deliver_handle(handle);
