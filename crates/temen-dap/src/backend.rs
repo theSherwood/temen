@@ -20,8 +20,7 @@
 //! tree-walker oracle) and `dap_over_bytecode_*` (server level).
 
 use temen_interp::bytecode::{
-    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledContinuation, ScheduledDebugRun,
-    ScheduledWrite, ValueWatchTarget,
+    self, AccessSinkFn, SchedBreak, SchedStop, ScheduledDebugRun, ScheduledWrite, ValueWatchTarget,
 };
 use temen_interp::moment::Ladder;
 use temen_interp::MemEvent;
@@ -506,7 +505,7 @@ pub struct BytecodeBackend {
     /// drives past stride boundaries — the bytecode port of the tree-walker `Inspector`'s ladder. One
     /// `Ladder` (unbounded) keyed on the turn; the ladder itself is the same type the tree-walker and
     /// the reactor timeline use (`temen_interp::moment`, #1460).
-    checkpoints: Ladder<ScheduledContinuation>,
+    checkpoints: Ladder,
     /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
     /// boundary falls outside the [`ScheduledDebugRun::snapshot`] subset (a
     /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable

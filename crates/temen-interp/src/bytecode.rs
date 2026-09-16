@@ -6230,9 +6230,26 @@ pub struct ScheduledContinuation {
     extra_units: Vec<std::sync::Arc<Compiled>>,
 }
 
+impl ScheduledContinuation {
+    /// An empty scheduled continuation — for [`moment`](super::moment)'s continuation-agnostic ladder
+    /// test, which needs a `Continuation::Bytecode` payload but never restores it (the ladder treats
+    /// the continuation opaquely). Not a valid resume state; only the ladder's variant-independence
+    /// rests on it.
+    #[cfg(test)]
+    pub fn empty_for_test() -> ScheduledContinuation {
+        ScheduledContinuation {
+            clock: 0,
+            tasks: Vec::new(),
+            fibers: Vec::new(),
+            extra_envs: Vec::new(),
+            extra_units: Vec::new(),
+        }
+    }
+}
+
 /// A multi-vCPU checkpoint: [`ScheduledContinuation`] plus the shared window image (all tasks share the
 /// one window; capturing its protection map admits a **page-mapping** run) and the host substate.
-pub type ScheduledSnapshot = super::moment::Moment<ScheduledContinuation>;
+pub type ScheduledSnapshot = super::moment::Moment;
 
 /// A §14 `instantiate`-child environment ([`DbgEnv`]) inside a [`ScheduledSnapshot`]. Like a coroutine
 /// child, its window is a `nested_view` sharing the root backing region — so its bytes ride in the
@@ -8069,7 +8086,7 @@ impl ScheduledDebugRun {
         Some(super::moment::Moment::new(
             self.mem.as_ref().map(|m| m.layout_snapshot()),
             &self.host,
-            continuation,
+            super::moment::Continuation::Bytecode(continuation),
         ))
     }
 
@@ -8082,7 +8099,10 @@ impl ScheduledDebugRun {
     /// index resolves); the run-shared fibers and each child env are rebuilt from the snapshot.
     /// `turn` is the global turn the snapshot was taken at — the ladder's key, handed back with it.
     pub fn restore(&mut self, turn: u64, snap: &ScheduledSnapshot) {
-        let c = snap.continuation();
+        let c = snap
+            .continuation()
+            .as_bytecode()
+            .expect("a scheduled seek ladder holds only Bytecode moments");
         self.fibers = c.fibers.clone();
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).

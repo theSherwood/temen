@@ -546,6 +546,23 @@ different things depending on which pair you compare:
   single-vCPU `DebugRun`" for what, at the time, was a distinct engine; that engine is now the one-task
   case of the scheduled one.
 
+  **The continuation enum (#1517 slice 5, closing #1460).** The three time-travel routes — the
+  tree-walk `Inspector`'s seek checkpoints, the bytecode `ScheduledDebugRun`'s snapshots, and the
+  reactor scrub moments — shared one `Moment`/`Ladder` (the window image + host substate + a keyframe
+  ring) but kept the continuation as a *type parameter*, one instantiation each, because collapsing
+  them into one restore path was the same work as collapsing the engines. With `DebugRun` gone (slice
+  4) that work is done, so `Moment<C>`/`Ladder<C>` drop the parameter for one `Continuation` enum:
+  `None` (a reactor resumes nothing between frames), `Bytecode(ScheduledContinuation)` (the scheduled
+  debug engine's task set + fibers + child envs), and `ShadowStack` (the tree-walk oracle's call stack
+  + fuel, kept as the differential per INVARIANTS #15). Each engine matches the variant it captured; the
+  ladder is variant-agnostic (proved directly by `moment::ladder_is_continuation_agnostic`, the one
+  parameterised property over the three, in place of trusting the three engine harnesses to). A §12
+  durable artifact is the serialized form of a `ShadowStack` moment — window image = the moment's `mem`
+  half, handle table = its host half — except the durable shadow stack is **window-resident** where the
+  checkpoint moment's is a host-side frame vector for a non-durable run; `temen-snapshot`'s module doc
+  draws the correspondence. Bridging a non-durable checkpoint moment *to* an artifact needs the
+  `temen-durable` shadow schema for that run, which is an owner-level question, not part of this slice.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus

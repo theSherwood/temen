@@ -11,6 +11,22 @@
 //! shadow stack, spilled live values, and the state word are all guest-resident bytes, so
 //! they ride along in the window for free. What lives *host-side* and is captured separately
 //! is the **handle table** (authority, not the resources it names — §12.5 / D-scope). The
+//!
+//! ## Relationship to [`moment::Moment`](temen_interp::moment) (#1517 slice 5)
+//!
+//! An artifact is a durable [`Moment`](temen_interp::moment::Moment) with a
+//! [`Continuation::ShadowStack`](temen_interp::moment::Continuation::ShadowStack): the window image is
+//! the moment's `mem` half and the handle table its host half, so a save-state and a checkpoint moment
+//! cannot disagree about what "the state" is (INVARIANTS #13). The one difference is *where the
+//! continuation lives*: a **durable** domain's shadow stack is **window-resident** (the `temen-durable`
+//! transform put it there, so `freeze` captures it for free inside the image), whereas the checkpoint
+//! ladder's `ShadowStack` is the tree-walk oracle's **host-side** `Vec<Frame>` for a **non-durable** run
+//! (`VCpu::checkpointable` requires `!durable`). The two are disjoint by construction, and this crate
+//! deliberately moves bytes rather than decoding one form into the other — so it serializes the
+//! window-resident form directly and does **not** re-encode a host-side checkpoint moment. Bridging a
+//! non-durable checkpoint moment to an artifact would require the `temen-durable` shadow schema to
+//! exist for that run, an owner-level design question, not a codec change here.
+//!
 //! artifact binds the **instrumented-module digest** (R5 / D-hash): restore refuses on a
 //! mismatch, which is the durability boundary from §1 (the shadow schema is a function of the
 //! instrumented module's structure).
