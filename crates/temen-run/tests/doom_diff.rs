@@ -69,16 +69,9 @@ fn doom_frame_hashes_match_native() {
         jit: None,
         stderr: None,
     };
-    let bindings = m
-        .imports
-        .iter()
-        .map(|im| match granted.bind(&im.name) {
-            Some((cap, handle)) => temen_interp::BoundImport::required(cap.type_id, cap.op, handle),
-            // Unknown name: declared but unbound — a dispatch through it is a fail-closed CapFault.
-            None => temen_interp::BoundImport::rebindable(0, 0, None),
-        })
-        .collect();
-    host.set_import_bindings(bindings);
+    // The one shared powerbox binder (#1524): an unknown name — or one whose declared signature
+    // is not the capability op's — is left unbound, a fail-closed `CapFault` at dispatch.
+    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
 
     // A read-only in-memory WAD over the `fs` capability (op protocol per lua_files_stdio.c):
     // 0 open(name,len,flags)->fd; 1 read(fd,buf,len)->n; 3 seek(fd,whence,off)->pos; 4 close.

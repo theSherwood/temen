@@ -3543,34 +3543,16 @@ fn grant_onramp_caps(
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
     // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
-    if !m.imports.is_empty() {
-        use temen_interp::cap_id;
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| {
-                // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
-                // HostProc granted above; the guest's fs op rides in arg0.
-                if im.name == "vm_fs" {
-                    return match vm_fs_h {
-                        Some(h) => temen_interp::BoundImport::required(cap_id::HOST_PROC, 0, h),
-                        None => temen_interp::BoundImport::rebindable(0, 0, None),
-                    };
-                }
-                // The shared powerbox ABI (#912): the name's capability and the handle this run
-                // granted for it. A name this host did not grant (`stderr`, or `Jit` on a guest that
-                // declares no `vm_jit_*` import) or a dynamic-only interface leaves its slot
-                // unbound — fail-closed at dispatch.
-                match granted.bind(&im.name) {
-                    Some((cap, handle)) => {
-                        temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                    }
-                    None => temen_interp::BoundImport::rebindable(0, 0, None),
-                }
-            })
-            .collect();
-        host.set_import_bindings(bindings);
-    }
+    // The one shared powerbox binder (#1524): the `#912` name→cap table plus this host's own
+    // raw-`HostProc` seams. A name this host did not grant (`stderr`, or `Jit` on a guest that
+    // declares no `vm_jit_*` import), a dynamic-only interface, or an import whose declared
+    // signature is not the capability op's leaves its slot unbound — fail-closed at dispatch.
+    //
+    // #1323: the `vm_fs` file-I/O seam is a flat `call.sym` (base op 0) on the memfs HostProc
+    // granted above; the guest's fs op rides in arg0. Absent (not imported) ⇒ not overridden,
+    // and `vm_fs` is not a powerbox row, so the slot stays unbound exactly as before.
+    let fs_seam: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
+    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &fs_seam);
     // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
     // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
     // `fs` is last in `NAMES` — a read-only in-memory file (Doom slice 4: the WAD read path), granted
@@ -4157,17 +4139,8 @@ fn pg_setup(
             jit: None,
             stderr: None,
         };
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| match granted.bind(&im.name) {
-                Some((cap, handle)) => {
-                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                }
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            })
-            .collect();
-        host.set_import_bindings(bindings);
+        // The one shared powerbox binder (#1524).
+        host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
     }
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
     // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out

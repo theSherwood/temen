@@ -34,8 +34,8 @@ use temen_interp::MemEvent;
 
 use crate::json::Json;
 use temen_interp::{
-    cap_id, BoundImport, CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason,
-    Trap, Value, VarValue, WatchId, WatchKind,
+    CapTape, FrameInfo, Host, Inspector, IrPc, SourceLoc, Stop, StopReason, Trap, Value, VarValue,
+    WatchId, WatchKind,
 };
 use temen_ir::{FuncIdx, Module};
 
@@ -132,35 +132,16 @@ fn grant_io_powerbox(
         host.register_cap_name(name, h);
         declared.push((name.clone(), h));
     }
-    if !m.imports.is_empty() {
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| {
-                // #1366 slice (c): a declared host-completed cap — a flat `call.sym` (base op 0)
-                // on the proc granted above, like `vm_fs`.
-                if let Some((_, h)) = declared.iter().find(|(n, _)| *n == im.name) {
-                    return BoundImport::required(cap_id::HOST_PROC, 0, *h);
-                }
-                // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
-                // HostProc granted above; the guest's fs op rides in arg0.
-                if im.name == "vm_fs" {
-                    return match vm_fs_h {
-                        Some(h) => BoundImport::required(cap_id::HOST_PROC, 0, h),
-                        None => BoundImport::rebindable(0, 0, None),
-                    };
-                }
-                // The shared powerbox ABI (#912): the name's capability and the handle this
-                // session granted for it. A name it did not grant (the `Jit` cap, `stderr`) or a
-                // dynamic-only interface leaves its slot unbound — fail-closed at dispatch.
-                match granted.bind(&im.name) {
-                    Some((cap, handle)) => BoundImport::required(cap.type_id, cap.op, handle),
-                    None => BoundImport::rebindable(0, 0, None),
-                }
-            })
-            .collect();
-        host.set_import_bindings(bindings);
+    // The one shared powerbox binder (#1524): the `#912` name→cap table plus this session's raw
+    // `HostProc` seams — the #1366 slice (c) host-completed caps declared above, and the #1323
+    // `vm_fs` memfs. Each is a flat `call.sym` (base op 0) with the guest's own op in arg0. A name
+    // the session did not grant (the `Jit` cap, `stderr`), a dynamic-only interface, or an import
+    // whose declared signature is not the capability op's leaves its slot unbound.
+    let mut seams: Vec<(&str, i32)> = declared.iter().map(|(n, h)| (n.as_str(), *h)).collect();
+    if let Some(h) = vm_fs_h {
+        seams.push(("vm_fs", h));
     }
+    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &seams);
 }
 
 /// Build a single-vCPU [`DebugRun`] for `module`'s `func(args)`: under the on-ramp I/O powerbox when

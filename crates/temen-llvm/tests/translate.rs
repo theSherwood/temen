@@ -7779,15 +7779,8 @@ fn bind_powerbox_imports(h: &mut temen_interp::Host, m: &temen_ir::Module, grant
         jit: Some(hv(6)),
         stderr: None,
     };
-    let bindings = m
-        .imports
-        .iter()
-        .map(|im| match granted.bind(&im.name) {
-            Some((cap, handle)) => temen_interp::BoundImport::required(cap.type_id, cap.op, handle),
-            None => temen_interp::BoundImport::rebindable(0, 0, None),
-        })
-        .collect();
-    h.set_import_bindings(bindings);
+    // The one shared powerbox binder (#1524).
+    h.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
 }
 
 /// `__vm_cap(i)` reaches the **tail** powerbox handles (`i ≥ 4`): `__vm_cap(5)` (the test

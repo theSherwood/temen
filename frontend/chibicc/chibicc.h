@@ -148,6 +148,11 @@ struct Obj {
 
   // Function
   bool is_inline;
+  // #1524: declared `__attribute__((temen_cap))` — an undefined extern that is a **host
+  // capability**, not a cross-TU function. Only meaningful for a declaration without a body;
+  // it selects the capability calling convention in `--emit-object` mode, where an undefined
+  // extern otherwise lowers to a cross-TU function-symbol import.
+  bool is_temen_cap;
   Obj *params;
   Node *body;
   Obj *locals;

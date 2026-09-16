@@ -1898,3 +1898,102 @@ int main(void) { struct R r = {.a = 1, .c = 3}; int arr[5] = {[2] = 9, [4] = 1};
         );
     }
 }
+
+/// #1524 — **in `--emit-object` mode an undefined extern is a cross-TU function unless the
+/// declaration says it is a capability.**
+///
+/// Both lowerings are `call.sym` and both intern as `ImportShape::Func`, so the shape *enum*
+/// cannot tell them apart — only the signature can, and they differ in exactly one place:
+///
+/// * function-symbol (cross-TU): the C argument list **led by the data stack pointer**, with an
+///   `i32.const 0` placeholder in the handle operand that the linker drops when it rewrites the
+///   call to a direct one;
+/// * capability: the op's own arguments, with the **real granted handle** in the handle operand.
+///
+/// When no linked unit defines the symbol, `link_with_manifest` retains it as a manifest import —
+/// and if its name is one the host's powerbox knows (`vm_map` is `AddressSpace` op 0), binding by
+/// name alone dispatches with every argument shifted by one: the data-SP lands where `len`
+/// belongs. `__attribute__((temen_cap))` — spelled `TEMEN_CAP` by `<temen.h>` — is how object-mode
+/// C says which one it meant, making the `<temen.h>` §7 late-binding pattern work outside
+/// whole-program mode. This test spells the attribute directly because `object_unit` compiles
+/// without an include path.
+#[test]
+fn emit_object_capability_extern_is_shaped_by_the_attribute() {
+    use temen_ir::{ImportShape, TypeEntry, ValType};
+
+    /// The declared parameter types of `name`'s retained manifest import.
+    fn import_params(m: &temen_ir::Module, name: &str) -> Vec<ValType> {
+        let im = m
+            .imports
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{name} retained as a manifest import: {:?}",
+                    m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+                )
+            });
+        let ImportShape::Func(t) = im.shape else {
+            panic!("{name} is flat (both lowerings intern as ImportShape::Func)")
+        };
+        match &m.types[t as usize] {
+            TypeEntry::Func(ft) => ft.params.clone(),
+            other => panic!("{name} shape must name a Func type, got {other:?}"),
+        }
+    }
+
+    // Bare: a cross-TU function-symbol import. Three params — the data-SP chibicc leads every
+    // cross-unit call with, then the two C arguments. This is the hazard: nothing downstream can
+    // see that the leading `i64` is a stack pointer rather than `AddressSpace.map`'s length.
+    let bare = object_unit(
+        "capbare",
+        "extern long vm_map(long len, long prot);\n\
+         int main(void) { return (int)vm_map(4096, 3); }\n",
+    );
+    let linked = temen_ir::link_with_manifest(&[bare]).expect("link the bare unit");
+    assert_eq!(
+        import_params(&linked, "vm_map"),
+        vec![ValType::I64, ValType::I64, ValType::I64],
+        "bare extern → the SP-led C list (SP, len, prot)"
+    );
+
+    // Attributed: the capability convention. Two params — `len` and `prot` only, because the
+    // handle is the first *C* argument and chibicc moves it to the `call.sym` handle operand
+    // rather than passing it in the argument list.
+    let attributed = object_unit(
+        "capattr",
+        // `__vm_cap` is a reserved builtin; `<temen.h>` declares it, which this harness cannot
+        // include, so declare it inline.
+        "int __vm_cap(int i);\n\
+         __attribute__((temen_cap)) extern long vm_map(int h, long len, long prot);\n\
+         int main(void) { return (int)vm_map(__vm_cap(4), 4096, 3); }\n",
+    );
+    let linked = temen_ir::link_with_manifest(&[attributed]).expect("link the attributed unit");
+    assert_eq!(
+        import_params(&linked, "vm_map"),
+        vec![ValType::I64, ValType::I64],
+        "temen_cap → the capability's own args (len, prot); the handle rides the operand"
+    );
+}
+
+/// The attribute is **scoped to object mode's ambiguity** and changes nothing else: an extern the
+/// unit *defines* stays a direct call (the attribute is only consulted for a declaration without a
+/// body), and an unrecognized attribute is skipped rather than rejected — before #1524 a leading
+/// top-level `__attribute__` was a hard parse error, so nothing can depend on it being refused.
+#[test]
+fn temen_cap_leaves_definitions_and_unknown_attributes_alone() {
+    let unit = object_unit(
+        "capscope",
+        "__attribute__((aligned(16))) long tbl[4];\n\
+         __attribute__((temen_cap)) long defined_here(int h, long x);\n\
+         long defined_here(int h, long x) { return h + x + tbl[0]; }\n\
+         int main(void) { return (int)defined_here(1, 2); }\n",
+    );
+    let linked = temen_ir::link_with_manifest(&[unit]).expect("link");
+    assert!(
+        !linked.imports.iter().any(|i| i.name == "defined_here"),
+        "a symbol this unit defines is a direct call, attribute or not: {:?}",
+        linked.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+    temen_verify::verify_module(&linked).expect("verify");
+}
