@@ -196,6 +196,36 @@ pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
 /// A fresh `fs` `HostProc` over the shared memfs store (a new grant per phase run / per exec spawn).
 type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
 
+/// A phase module with its bytecode program compiled **once** and shared by every run of it. The card
+/// runs nifler once per stdlib import nimsem resolves (21 times on the bench program), and each run's
+/// compile of the 13 MB module was most of what that run cost (#1540 follow-up). Lazy, so a phase
+/// that only ever spawns as an op-13 child ([`run_phase_op13`] compiles its own child program) never
+/// pays it; `None` once compiled means the module is outside the bytecode subset ([`run_phase`]'s
+/// "declined" arm, as before).
+pub(crate) struct Phase {
+    module: Arc<Module>,
+    program: std::sync::OnceLock<Option<Arc<bytecode::Compiled>>>,
+}
+
+impl Phase {
+    pub(crate) fn new(module: Arc<Module>) -> Arc<Phase> {
+        Arc::new(Phase {
+            module,
+            program: std::sync::OnceLock::new(),
+        })
+    }
+
+    pub(crate) fn module(&self) -> &Arc<Module> {
+        &self.module
+    }
+
+    fn program(&self) -> Option<Arc<bytecode::Compiled>> {
+        self.program
+            .get_or_init(|| bytecode::compile_reserved(&self.module))
+            .clone()
+    }
+}
+
 /// Run phase module `m` with `argv` on the bytecode engine, granting the on-ramp powerbox
 /// (stdout/stdin/exit/memory), a fresh `fs` grant, and — for `nimsem` — an `exec` cap. Returns the
 /// guest's captured stdout and its exit/return code. Mirrors `temen-run`'s `run_with_caps` (and the
@@ -212,7 +242,8 @@ fn diag_tail(out: &[u8]) -> String {
     format!(": {}", String::from_utf8_lossy(&out[start..]).trim())
 }
 
-fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
+fn run_phase(phase: &Phase, argv: &[&str], fs: HostProc, exec: Option<HostProc>) -> (Vec<u8>, i64) {
+    let m: &Module = &phase.module;
     if onramp_check(m).is_err() {
         return (b"phase module is not a manifest module".to_vec(), -1);
     }
@@ -261,15 +292,18 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
 
     let mut fuel = u64::MAX;
     bytecode::LAST_UNREACHABLE_FUNC.with(|c| c.set(u32::MAX)); // reset before the run (#1382)
-    let outcome = bytecode::compile_and_run_capture_reserved_with_host(
-        m,
-        0,
-        &[],
-        &mut fuel,
-        &init_mem,
-        temen_ir::DEFAULT_RESERVED_LOG2,
-        &mut host,
-    );
+    let outcome = phase.program().and_then(|program| {
+        bytecode::run_capture_reserved_over_compiled_with_host(
+            m,
+            program,
+            0,
+            &[],
+            &mut fuel,
+            &init_mem,
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            &mut host,
+        )
+    });
     let code = match outcome {
         Some((Ok(vals), _)) => vals.first().map_or(0, |v| match v {
             Value::I64(x) => *x,
@@ -597,7 +631,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
 pub(crate) static EXEC_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub(crate) fn make_exec(
-    nifler: Arc<Module>,
+    nifler: Arc<Phase>,
     nifler_ce: Option<Arc<Module>>,
     fs_factory: FsFactory,
 ) -> HostProc {
@@ -695,7 +729,9 @@ fn compile_nim_ce_impl(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<Module, String> {
-    let nifler_m = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
+    let nifler_m = Phase::new(Arc::new(
+        temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?,
+    ));
     let nifler_ce_m: Option<Arc<Module>> = match nifler_ce {
         Some(bytes) => {
             let m = temen_encode::decode_module(bytes).map_err(|_| "decode nifler_ce")?;
@@ -704,8 +740,12 @@ fn compile_nim_ce_impl(
         }
         None => None,
     };
-    let nimsem_m = temen_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?;
-    let hexer_m = temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?;
+    let nimsem_m = Phase::new(Arc::new(
+        temen_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?,
+    ));
+    let hexer_m = Phase::new(Arc::new(
+        temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?,
+    ));
 
     let (factory, handle) = temen_fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
     let factory: FsFactory = Arc::new(factory);
@@ -1095,7 +1135,9 @@ mod tests {
         };
         let ce_m = temen_encode::decode_module(&ce).expect("decode nifler_ce");
         temen_verify::verify_module(&ce_m).expect("verify nifler_ce");
-        let top_m = Arc::new(temen_encode::decode_module(&top).expect("decode nifler"));
+        let top_m = Phase::new(Arc::new(
+            temen_encode::decode_module(&top).expect("decode nifler"),
+        ));
 
         let src = b"let x = 1\n".to_vec();
         let argv = [
@@ -1106,7 +1148,7 @@ mod tests {
             "/in.nim",
             "/nimcache/in.p.nif",
         ];
-        let run = |m_inline: Option<&Arc<Module>>, ce: Option<&Module>| {
+        let run = |m_inline: Option<&Arc<Phase>>, ce: Option<&Module>| {
             let (factory, handle) = temen_fs::mem_fs_shared_factory(
                 vec![("in.nim".into(), src.clone())],
                 vec!["nimcache".into()],
@@ -1179,7 +1221,9 @@ mod tests {
             temen_verify::verify_module(&m).expect("verify nifler_ce");
             m
         });
-        let top_m = Arc::new(temen_encode::decode_module(&top).expect("decode nifler"));
+        let top_m = Phase::new(Arc::new(
+            temen_encode::decode_module(&top).expect("decode nifler"),
+        ));
 
         // argv is a single NUL-separated blob (temen_exec::read_argv), placed above a small scratch gap.
         let mut blob = Vec::new();
