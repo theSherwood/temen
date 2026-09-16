@@ -36,6 +36,9 @@ mod webgpu;
 // A powerbox whose capabilities are **defined in JS** (`temen_jspb_*`): the page names them, the
 // module's import manifest binds them, one wasm import services every call. Built on both targets —
 // natively the JS side is a test hook, so the binding path is testable off-browser (`tests/jspb.rs`).
+/// The JS ↔ Rust export ABI as data (#1414) — host-side tooling, kept out of the cdylib.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod exports_abi;
 pub mod jspb;
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
@@ -557,7 +560,7 @@ pub extern "C" fn temen_prep_bench(ptr: *const u8, len: usize) -> i64 {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
-    if bytecode::compile_module(&m.funcs, &m.types).is_none() {
+    if bytecode::compile_module(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow)).is_none() {
         set(STATUS_UNSUPPORTED);
         return 0;
     }
@@ -3573,34 +3576,17 @@ fn grant_onramp_caps(
     }
     // The manifest binding comes last so it can name every grant above (the by-name Instantiator
     // included); the grant order itself is unchanged, so every handle keeps its value.
-    if !m.imports.is_empty() {
-        use temen_interp::cap_id;
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| {
-                // #1323: the `vm_fs` file-I/O seam — a flat `call.sym` (base op 0) on the memfs
-                // HostProc granted above; the guest's fs op rides in arg0.
-                if im.name == "vm_fs" {
-                    return match vm_fs_h {
-                        Some(h) => temen_interp::BoundImport::required(cap_id::HOST_PROC, 0, h),
-                        None => temen_interp::BoundImport::rebindable(0, 0, None),
-                    };
-                }
-                // The shared powerbox ABI (#912): the name's capability and the handle this run
-                // granted for it. A name this host did not grant (`stderr`, or `Jit` on a guest that
-                // declares no `vm_jit_*` import) or a dynamic-only interface leaves its slot
-                // unbound — fail-closed at dispatch.
-                match granted.bind(&im.name) {
-                    Some((cap, handle)) => {
-                        temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                    }
-                    None => temen_interp::BoundImport::rebindable(0, 0, None),
-                }
-            })
-            .collect();
-        host.set_import_bindings(bindings);
-    }
+    //
+    // The one shared powerbox binder (#1524): the `#912` name→cap table plus this host's own
+    // raw-`HostProc` seams. A name this host did not grant (`stderr`, or `Jit` on a guest that
+    // declares no `vm_jit_*` import), a dynamic-only interface, or an import whose declared
+    // signature is not the capability op's leaves its slot unbound — fail-closed at dispatch.
+    //
+    // #1323: the `vm_fs` file-I/O seam is a flat `call.sym` (base op 0) on the memfs HostProc
+    // granted above; the guest's fs op rides in arg0. Absent (not imported) ⇒ not overridden,
+    // and `vm_fs` is not a powerbox row, so the slot stays unbound exactly as before.
+    let fs_seam: Vec<(&str, i32)> = vm_fs_h.map(|h| vec![("vm_fs", h)]).unwrap_or_default();
+    host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &fs_seam);
     caps
 }
 
@@ -4165,17 +4151,8 @@ fn pg_setup(
             jit: None,
             stderr: None,
         };
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| match granted.bind(&im.name) {
-                Some((cap, handle)) => {
-                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                }
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            })
-            .collect();
-        host.set_import_bindings(bindings);
+        // The one shared powerbox binder (#1524).
+        host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
     }
     // Mount the shipped data image as an in-memory `fs` cap (decode is fail-closed). The **shared**
     // mount hands back a `MemFsHandle`, so a persistent session can snapshot the live data dir back out
@@ -5601,7 +5578,19 @@ fn pg_pump(s: &mut PgSession) -> i32 {
             s.ended = true;
             STATUS_TRAP
         }
-        _ => {
+        // A `--single` backend spawns, JITs and nests nothing; named rather than `_` (see
+        // `VcpuEvent`) so a new event is a decision here, not a silent `STATUS_UNSUPPORTED`.
+        bytecode::VcpuEvent::TierUp { .. }
+        | bytecode::VcpuEvent::Spawn { .. }
+        | bytecode::VcpuEvent::Join { .. }
+        | bytecode::VcpuEvent::Wait { .. }
+        | bytecode::VcpuEvent::Notify { .. }
+        | bytecode::VcpuEvent::JitInstall { .. }
+        | bytecode::VcpuEvent::JitUninstall { .. }
+        | bytecode::VcpuEvent::JitInvoke { .. }
+        | bytecode::VcpuEvent::Instantiate { .. }
+        | bytecode::VcpuEvent::InstantiateDetached { .. }
+        | bytecode::VcpuEvent::CapPending { .. } => {
             s.ended = true;
             STATUS_UNSUPPORTED
         }
@@ -12486,6 +12475,13 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Err(_) => return OP13JIT_TRAP,
                 }
             }
+            // Without `atomics` the page cannot mint a shareable detached window (`foreign_mint` /
+            // `driveDetachedRun` need a `SharedArrayBuffer`-backed `WebAssembly.Memory`), so a
+            // detached spawn fails closed here. Named rather than `_` (see `VcpuEvent`): the wildcard
+            // gave this same answer invisibly in every non-atomics build, which is how a cfg-gated arm
+            // above could come to exist with nobody having decided what the other build does.
+            #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+            bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Join { handle } => {
                 let banked = d
                     .children
@@ -12495,7 +12491,18 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
-            _ => return OP13JIT_TRAP,
+            // The op-13 driver is a 64 KiB root that only spawns phases and joins them: no threads,
+            // no tier-up of its own, no §22 units, no cap or stdin park. Named rather than `_` (see
+            // `VcpuEvent`) so a new event fails to build here instead of trapping the crawl.
+            bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Spawn { .. }
+            | bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::JitInstall { .. }
+            | bytecode::VcpuEvent::JitUninstall { .. }
+            | bytecode::VcpuEvent::JitInvoke { .. }
+            | bytecode::VcpuEvent::CapPending { .. }
+            | bytecode::VcpuEvent::StdinPark => return OP13JIT_TRAP,
         }
     }
 }
@@ -12508,7 +12515,20 @@ fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap>
     match vcpu.run() {
         bytecode::VcpuEvent::Done(v) => Ok(v),
         bytecode::VcpuEvent::Trapped(t) => Err(t),
-        _ => Err(Trap::Malformed),
+        // A leaf: anything that would need the host again is out of this fallback's scope and
+        // fails closed. Named rather than `_` (see `VcpuEvent`).
+        bytecode::VcpuEvent::TierUp { .. }
+        | bytecode::VcpuEvent::Spawn { .. }
+        | bytecode::VcpuEvent::Join { .. }
+        | bytecode::VcpuEvent::Wait { .. }
+        | bytecode::VcpuEvent::Notify { .. }
+        | bytecode::VcpuEvent::JitInstall { .. }
+        | bytecode::VcpuEvent::JitUninstall { .. }
+        | bytecode::VcpuEvent::JitInvoke { .. }
+        | bytecode::VcpuEvent::Instantiate { .. }
+        | bytecode::VcpuEvent::InstantiateDetached { .. }
+        | bytecode::VcpuEvent::CapPending { .. }
+        | bytecode::VcpuEvent::StdinPark => Err(Trap::Malformed),
     }
 }
 
@@ -13641,8 +13661,14 @@ pub extern "C" fn temen_durable_freeze(
         set(STATUS_VERIFY_ERR);
         return STATUS_VERIFY_ERR;
     }
-    let size_log2 = match m.memory.as_ref() {
-        Some(mc) => mc.size_log2,
+    let (size_log2, arena) = match m.memory.as_ref() {
+        Some(mc) => match mc.shadow {
+            Some(a) => (mc.size_log2, a),
+            None => {
+                set(STATUS_UNSUPPORTED);
+                return STATUS_UNSUPPORTED;
+            }
+        },
         None => {
             set(STATUS_UNSUPPORTED);
             return STATUS_UNSUPPORTED;
@@ -13655,7 +13681,7 @@ pub extern "C" fn temen_durable_freeze(
         set(STATUS_UNSUPPORTED);
         return STATUS_UNSUPPORTED;
     };
-    let init = temen_durable::init_durable_window(1usize << size_log2);
+    let init = temen_durable::init_durable_window(1usize << size_log2, arena);
     let Some(back) =
         temen_interp::Region::owned_zeroed(1u64 << reserved_log2, temen_snapshot::PAGE as u64)
     else {
@@ -13803,7 +13829,11 @@ pub extern "C" fn temen_durable_thaw_resume(
         set(STATUS_UNSUPPORTED);
         return 0;
     };
-    temen_durable::begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
+    let Some(arena) = m.memory.and_then(|mc| mc.shadow) else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
+    temen_durable::begin_thaw(&mut rwin, arena, 0); // clear the freeze word, set context 0 REWINDING
                                              // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
                                              // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
     let Some(back) =
@@ -14111,7 +14141,7 @@ block 0 (v0: i64) {
 /// emitted IR runs on this target. Returns `-1` on any mismatch.
 #[no_mangle]
 pub extern "C" fn run_durable() -> i64 {
-    const SRC: &str = r#"memory 17
+    const SRC: &str = r#"memory 17 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 2 0 () -> (i64) v0 ()
@@ -14127,7 +14157,10 @@ block 0 (v0: i32) {
     let Ok(inst) = temen_durable::transform_module(&m) else {
         return -1;
     };
-    let mut win = temen_durable::init_durable_window(1 << 17);
+    let Some(arena) = inst.memory.and_then(|mc| mc.shadow) else {
+        return -1;
+    };
+    let mut win = temen_durable::init_durable_window(1 << 17, arena);
     temen_durable::write_state(&mut win, temen_durable::STATE_NORMAL);
     match durable_run(&inst, &win, 1000) {
         (STATUS_OK, v, _, _) => v,

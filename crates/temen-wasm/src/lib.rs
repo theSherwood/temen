@@ -769,7 +769,10 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         });
     let memory = if mem.is_some() || !globals.is_empty() || tsize > 0 {
         let size_log2 = needed.max(1).next_power_of_two().trailing_zeros().max(16) as u8;
-        Some(temen_ir::Memory { size_log2 })
+        Some(temen_ir::Memory {
+            size_log2,
+            shadow: None,
+        })
     } else {
         None
     };

@@ -15,6 +15,11 @@
 //!   4. thawing the bytecode artifact (REWINDING, fibers re-seeded) reproduces the tree-walker's thaw
 //!      result and ends NORMAL.
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
@@ -28,7 +33,7 @@ const SIZE_LOG2: u8 = 17; // 128 KiB ≥ the durable reserve
 const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn window_with(state: i32) -> Vec<u8> {
-    let mut w = init_durable_window(WINDOW);
+    let mut w = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut w, state);
     w
 }
@@ -140,7 +145,7 @@ fn check(src: &str) {
     // end NORMAL. The frozen point's results are reloaded, so the run reproduces the baseline.
     let thaw_fibers = rhost.frozen_fibers().to_vec();
     let mut thaw_win = rwin;
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let (thaw_tw, final_tw, _) = tw_run(&inst, &thaw_win, thaw_fibers.clone());
     let (thaw_bc, final_bc, _) = bc_run(&inst, &thaw_win, thaw_fibers);
     assert_eq!(
@@ -168,7 +173,7 @@ fn check(src: &str) {
 /// the root resumes a fiber that suspends once (yielding 42) and then returns 7 + 100. Freezing under
 /// `UNWINDING` parks the fiber after its suspend, so the freeze driver must flatten it into its region.
 /// `base = 107`.
-const FIBER_SRC: &str = "memory 17\n\
+const FIBER_SRC: &str = "memory 17 shadow 16448 65536\n\
     func () -> (i64) {\n\
     block 0 () {\n\
     \x20 v0 = ref.func 1\n\
@@ -200,7 +205,7 @@ fn parked_fiber_freeze_thaw_round_trip() {
 /// driver's ascending-slot flatten over more than one fiber and the dense thaw re-seed. Each fiber
 /// suspends once (yielding 42) then returns its resume arg + 100; the root resumes A then B to
 /// completion. `base = (7 + 100) + (8 + 100)`.
-const TWO_FIBERS_SRC: &str = "memory 17\n\
+const TWO_FIBERS_SRC: &str = "memory 17 shadow 16448 65536\n\
     func () -> (i64) {\n\
     block 0 () {\n\
     \x20 v0 = ref.func 1\n\

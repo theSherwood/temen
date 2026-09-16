@@ -15,6 +15,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18; // 256 KiB window — ample room for a handful of stacked frames
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -22,6 +28,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR must verify");
@@ -54,11 +61,11 @@ fn run(
 /// baseline; a re-issue bug at the leaf — or a missing re-issue at a propagated frame —
 /// would diverge. Returns the agreed result for the caller to pin.
 fn assert_roundtrips(inst: &Module) -> Vec<Value> {
-    let (baseline, _) = run(inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _) = run(inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
     let baseline = baseline.expect("baseline runs to completion");
 
     // Freeze: same initial conditions, state UNWINDING.
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let (frozen, snapshot) = run(inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
@@ -70,7 +77,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
 
     // Thaw on a fresh host (clock now 0): reload, do not re-issue the call.cap.
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0); // §12.8 stage 1: thaw the root (ctx 0) per-context
+    begin_thaw(&mut win, TEST_ARENA, 0); // §12.8 stage 1: thaw the root (ctx 0) per-context
     let (thawed, final_win) = run(inst, 0, &win);
     assert_eq!(
         thawed,
@@ -78,7 +85,7 @@ fn assert_roundtrips(inst: &Module) -> Vec<Value> {
         "thaw equals the uninterrupted run"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "the deepest frame flipped the state back to NORMAL exactly once"
     );

@@ -1,30 +1,18 @@
-//! #1236 — **freeze/thaw a live Forth session.** The issue says "pin it or record what refuses", so
-//! this file records the answer to step 1: *what stops the Forth kernel being a durable domain today.*
+//! #1236 — **freeze/thaw a live Forth session**, step 1: *is the Forth kernel a durable domain?*
 //!
-//! The answer is narrow and good news. The kernel's **code** is already durable-ready: the durable
-//! transform accepts all 77 of its functions through `transform_module_assume_confined`, and the
-//! instrumented module verifies. Nothing about the tokenizer, the compiler, the fibers or the §22
-//! install path is outside the transform's shape.
+//! Yes, on both halves. Its **code** is durable-ready: the durable transform accepts all 77 functions
+//! through `transform_module_assume_confined`, and the instrumented module verifies. Its **memory map**
+//! declares where the durable runtime may keep its per-context shadow regions — `memory 20 shadow
+//! 475136 524288`, i.e. `[0x74000, 0x80000)`, inside the `sandbox` spawn-scratch page — and the verifier
+//! holds that declaration to the geometry every backend assumes, including that no data segment
+//! overlaps it (the R9 "guest bytes never alias the arena" contract, checked statically).
 //!
-//! What refuses is the **memory map**, and only one region of it. `transform_module` — the strict
-//! path for an untrusted module — fails closed with `GuestUsesMemory` because the kernel does guest
-//! loads/stores that could alias the reserved durable region `[0, DURABLE_RESERVE)` (R9). Its own
-//! doc names the way out: a guest from a cooperating toolchain that *reserves* that region (basing
-//! its data and heap at `DURABLE_RESERVE`) uses `transform_module_assume_confined` instead. The
-//! Forth kernel almost does reserve it — everything from the globals up already starts at exactly
-//! `DURABLE_RESERVE` — **except its 24 data segments, which sit at `0x8000`**, inside the region the
-//! durable runtime puts the state word, the shadow-SP and the per-context shadow stacks.
-//!
-//! That is not a latent collision, it is a live one for exactly the session #1236 wants to freeze:
-//! shadow context `i` occupies `[SHADOW_BASE + i*SHADOW_STRIDE, +STRIDE)`, so a session with a
-//! handful of contexts (the root plus a few `task` fibers) reaches `0x8000` and overwrites the
-//! prelude. Using `assume_confined` as the map stands would be lying to the transform.
-//!
-//! So step 1's finding: **a Forth-side shape change, not a durability-axis gap** — relocate the data
-//! block above `DURABLE_RESERVE`. The map below the session-snapshot line (`0x40000`, #1235) is
-//! fully packed, so that means reclaiming ~6.5 KiB from a region that has slack; it is a self-
-//! contained change and the rest of #1236 (freeze mid-session, thaw, compare transcripts) unblocks
-//! behind it. These tests pin the finding so the next person does not re-derive it.
+//! History: before #1503 the arena was a substrate constant under `0x10000`, and the kernel's 24 data
+//! segments at `0x8000` sat inside it — a live collision once a session had a root plus a few `task`
+//! fibers. The fix was never to move the data: placement is the guest's (INVARIANTS.md #16), so the
+//! kernel now says where its arena goes and the collision cannot exist. `transform_module` (the strict
+//! path for an *untrusted* module) still fails closed with `GuestUsesMemory` because the kernel does
+//! guest loads/stores at all; a cooperating toolchain's module — this one — uses `assume_confined`.
 #![cfg(all(unix, target_arch = "x86_64"))]
 
 fn kernel() -> temen_ir::Module {
@@ -59,42 +47,43 @@ fn the_strict_transform_refuses_the_kernel_for_aliasing_the_durable_reserve() {
     assert_eq!(
         temen_durable::transform_module(&m),
         Err(temen_durable::TransformError::GuestUsesMemory),
-        "the strict path must fail closed for a guest whose memory ops could reach [0, DURABLE_RESERVE)"
+        "the strict path must fail closed for a guest whose memory ops could alias the durable control words or its arena"
     );
 }
 
-/// The one thing standing between the kernel and a durable domain: its data segments live inside the
-/// region the durable runtime owns. Pinned as a **known gap**, so the day the map moves this test
-/// flips and says so rather than quietly passing.
+/// The kernel **declares** its shadow arena, the verifier accepts it, and it is clear of every data
+/// segment — the precondition #1236's freeze/thaw needs, now a property of the module rather than a
+/// gap to work around. It also holds enough contexts for a REPL with a root and a handful of `task`
+/// fibers.
 #[test]
-fn the_kernels_data_block_still_sits_inside_the_durable_reserve() {
-    let m = kernel();
-    let reserve = temen_interp::DURABLE_RESERVE;
-    let inside: Vec<_> = m.data.iter().filter(|d| d.offset < reserve).collect();
-    let lo = inside.iter().map(|d| d.offset).min();
-    let hi = inside.iter().map(|d| d.offset + d.bytes.len() as u64).max();
-
-    // Everything that is NOT a data segment already clears the reserve — the globals base at exactly
-    // `DURABLE_RESERVE`. So the relocation is one contiguous block, not a re-lay of the whole map.
-    assert!(
-        !inside.is_empty(),
-        "the data block has moved above DURABLE_RESERVE ({reserve:#x}) — #1236's precondition is met. \
-         Delete this test, switch the kernel to `transform_module_assume_confined`, and carry on with \
-         freeze/thaw (step 2: freeze mid-session with a suspended `task`, thaw, and compare the two \
-         halves' stdout against the uninterrupted run)."
+fn the_kernel_declares_an_arena_clear_of_its_data() {
+    use temen_ir::durable_abi::{ShadowArena, SHADOW_STRIDE};
+    let m = kernel(); // `kernel()` already ran the verifier, which rejects a data/arena overlap
+    let arena = m
+        .memory
+        .and_then(|x| x.shadow)
+        .expect("forth.temt declares a shadow arena");
+    assert_eq!(
+        arena,
+        ShadowArena {
+            base: 0x74000,
+            end: 0x80000
+        },
+        "the arena lives in the sandbox spawn-scratch page, below the child carve"
     );
-    let (lo, hi) = (lo.unwrap(), hi.unwrap());
-    let bytes: usize = inside.iter().map(|d| d.bytes.len()).sum();
+    for (i, d) in m.data.iter().enumerate() {
+        let end = d.offset + d.bytes.len() as u64;
+        assert!(
+            end <= arena.base || d.offset >= arena.end,
+            "data segment {i} [{:#x}, {end:#x}) overlaps the arena [{:#x}, {:#x})",
+            d.offset,
+            arena.base,
+            arena.end
+        );
+    }
     assert!(
-        lo >= temen_ir::POWERBOX_NULL_GUARD,
-        "the data block must at least clear the NULL guard: starts at {lo:#x}"
-    );
-    // The numbers the relocation has to satisfy: this much payload has to find a home in
-    // [DURABLE_RESERVE, SESSION_SNAP) — above the durable region, below the line a `JitSession`
-    // carries across prompts (#1235), because the prelude and the error messages must survive one.
-    println!(
-        "#1236 blocker: {} data segment(s), {bytes} bytes spanning [{lo:#x}, {hi:#x}), \
-         inside the durable reserve [0, {reserve:#x})",
-        inside.len()
+        arena.contexts() >= 8,
+        "a REPL with a root and a few task fibers needs several contexts; got {} (stride {SHADOW_STRIDE})",
+        arena.contexts()
     );
 }

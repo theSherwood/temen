@@ -12,6 +12,12 @@ use temen_interp::{run_capture_reserved_with_host_prots, CapturedProt, Host, Val
 use temen_ir::Memory;
 use temen_snapshot::{freeze_with_prots, restore_with_prots, PageProt, PAGE};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 const RO_OFF: usize = 5 * PAGE; // a read-only data segment lands on page 5
@@ -55,6 +61,7 @@ fn readonly_data_segment_is_captured_and_survives_the_codec() {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
 
     let mut host = Host::new();
@@ -119,7 +126,7 @@ fn a_vm_map_grown_window_survives_the_codec() {
     const GROW_SIZE_LOG2: u8 = 17; // 128 KiB declared
     const GROW_RESERVED_LOG2: u8 = 19; // 512 KiB reservation
     const GROWN_MARK_OFF: usize = (1 << GROW_SIZE_LOG2) + 3 * PAGE + 7; // a byte in a grown page
-    let src = r#"memory 17
+    let src = r#"memory 17 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   voff = i64.const 131072
@@ -136,6 +143,7 @@ block 0 (v0: i32) {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: GROW_SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
 
     let mut host = Host::new();
@@ -222,6 +230,7 @@ fn restore_re_establishes_ro_so_a_thawed_write_faults() {
     let mut m = temen_text::parse_module(STORE_SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let mut host = Host::new();
     let _ = host.grant_clock();
@@ -278,6 +287,7 @@ fn jit_re_establishes_ro_so_a_thawed_write_faults() {
     let mut m = temen_text::parse_module(STORE_SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let mut host = Host::new();
     let _ = host.grant_clock();
@@ -344,6 +354,7 @@ fn jit_capture_matches_interp_for_a_readonly_segment() {
     let mut m = temen_text::parse_module(SRC).expect("parse"); // `data ro 20480 "ABCD"`
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let npages = WINDOW / PAGE;
     let init = vec![0u8; WINDOW];

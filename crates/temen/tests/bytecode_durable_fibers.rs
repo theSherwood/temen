@@ -12,13 +12,17 @@
 //! root's region. The fibers suspend rather than return so neither slot is recycled mid-run.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::{
-    bytecode, Host, Value, DURABLE_RESERVE, SHADOW_BASE, SHADOW_SP_OFF, SHADOW_STRIDE,
-};
+use temen_interp::{bytecode, Host, Value, SHADOW_SP_OFF, SHADOW_STRIDE};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
-const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ DURABLE_RESERVE (64 KiB)
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
+const WINDOW_LOG2: u8 = 17; // 128 KiB ≥ TEST_ARENA.end (64 KiB)
 const WINDOW: usize = 1 << WINDOW_LOG2;
 
 #[test]
@@ -28,7 +32,7 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
     // §12.8 4A.5: each probe passes `durable.shadow_base` (the active context's own region base, from
     // the runtime-private register) to the host fn, which records it — directly exercising per-context
     // routing (vs. the legacy single swapped `SHADOW_SP_OFF` word, now retired).
-    let src = "memory 17\n\
+    let src = "memory 17 shadow 16448 65536\n\
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v1 = durable.shadow_base\n\
@@ -87,9 +91,9 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
 
     let seen = probes.lock().unwrap().clone();
     assert_eq!(seen.len(), 4, "four probes: root, fiber A, fiber B, root");
-    let root = SHADOW_BASE; // context 0
-    let a = SHADOW_BASE + SHADOW_STRIDE; // fiber slot 0 → context 1
-    let b = SHADOW_BASE + 2 * SHADOW_STRIDE; // fiber slot 1 → context 2
+    let root = TEST_ARENA.region_base(0); // context 0
+    let a = TEST_ARENA.region_base(1); // fiber slot 0 → context 1
+    let b = TEST_ARENA.region_base(2); // fiber slot 1 → context 2
     assert_eq!(seen[0], root, "root runs in context 0's region");
     assert_eq!(seen[1], a, "fiber A unwinds into its own region");
     assert_eq!(seen[2], b, "fiber B unwinds into a distinct region");
@@ -102,7 +106,7 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
         "per-context regions are distinct (no collision)"
     );
     assert!(
-        b + SHADOW_STRIDE <= DURABLE_RESERVE,
+        b + SHADOW_STRIDE <= TEST_ARENA.end,
         "every assigned region fits within the durable reserve"
     );
 }
@@ -111,7 +115,7 @@ fn bytecode_durable_fiber_switch_routes_shadow_sp_per_context() {
 fn bytecode_non_durable_fiber_run_leaves_the_reserve_untouched() {
     // The same shape run **without** `set_durable` must not touch the shadow-SP word — fibers still
     // work, and a non-durable guest's reserve word stays whatever it was (here, a sentinel).
-    let src = "memory 17\n\
+    let src = "memory 17 shadow 16448 65536\n\
         func (i32) -> (i64) {\n\
         block 0 (v0: i32) {\n\
         \x20 v2 = ref.func 1\n\

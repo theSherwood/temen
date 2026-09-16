@@ -32,7 +32,7 @@ mkdir -p "$CACHE"
 if ! command -v nim >/dev/null; then echo "SKIP: nim not on PATH"; exit 0; fi
 [ -f "$REPO/nimony/src/nimony/nimsem.nim" ] || { echo "SKIP: nimony submodule absent"; exit 0; }
 BIN="${NIMONY_TOOLCHAIN_BIN:-$REPO/.nimtool/nimony/bin}"
-NIMONY="${NIMONY_BIN:-$(command -v nimony || echo "$BIN/nimony")}"
+NIMONY="${NIMONY_BIN:+$NIMONY_BIN/nimony}"; NIMONY="${NIMONY:-$(command -v nimony || echo "$BIN/nimony")}"
 NIMSEM_ORACLE="${NIMSEM_BIN:-$BIN/nimsem}"
 [ -x "$NIMONY" ] && [ -x "$NIMSEM_ORACLE" ] || { echo "SKIP: nimony/nimsem binaries absent (NIM.md §2)"; exit 0; }
 CLANG="${CLANG:-clang}"

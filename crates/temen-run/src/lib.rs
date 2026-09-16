@@ -1989,7 +1989,7 @@ pub unsafe extern "C" fn module_resolver(
 ) -> i32 {
     let host = &*(ctx as *const Host);
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -1998,6 +1998,7 @@ pub unsafe extern "C" fn module_resolver(
                 n_data,
                 types,
                 n_types,
+                shadow,
             };
             1
         }
@@ -2019,7 +2020,7 @@ pub unsafe extern "C" fn module_resolver_locked(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -2028,6 +2029,7 @@ pub unsafe extern "C" fn module_resolver_locked(
                 n_data,
                 types,
                 n_types,
+                shadow,
             };
             1
         }
@@ -6268,7 +6270,10 @@ impl Instance {
     fn window_override(&self, config: &RunConfig) -> Option<Module> {
         config.memory_size_log2.map(|size_log2| {
             let mut m = self.module.clone();
-            m.memory = Some(temen_ir::Memory { size_log2 });
+            m.memory = Some(temen_ir::Memory {
+                size_log2,
+                shadow: None,
+            });
             m
         })
     }
@@ -6436,20 +6441,15 @@ impl Instance {
                         jit: Some(jit),
                         stderr: Some(stderr),
                     };
-                    let bindings = self
-                        .module
-                        .imports
-                        .iter()
-                        .map(|im| match granted.bind(&im.name) {
-                            Some((cap, handle)) => {
-                                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                            }
-                            // Unknown name, or a capability this host did not grant: declared but
-                            // unbound — fail-closed at dispatch.
-                            None => temen_interp::BoundImport::rebindable(0, 0, None),
-                        })
-                        .collect();
-                    h.set_import_bindings(bindings);
+                    // The one shared powerbox binder (#1524). An unknown name, a capability
+                    // this host did not grant, or a declared signature that is not the
+                    // capability op's: declared but unbound — fail-closed at dispatch.
+                    h.bind_powerbox_manifest(
+                        &self.module.imports,
+                        &self.module.types,
+                        &granted,
+                        &[],
+                    );
                 }
             }
         }

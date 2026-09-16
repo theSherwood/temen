@@ -3,7 +3,7 @@
 //! module rewrite* — so the machine view and op-clock are untouched — while the hook pass rewrites
 //! the module. The two are each other's oracle: on the same program they must report the
 //! **identical event sequence** (kind, address, width/span, order). This file drives the *pristine*
-//! module under a `DebugRun` with a sink and asserts the exact stream `mem_hooks_diff.rs` pins for
+//! module under a `ScheduledDebugRun` with a sink and asserts the exact stream `mem_hooks_diff.rs` pins for
 //! the instrumented module on all three backends — the differential that also pins the sink's
 //! bulk-op/atomic/v128 coverage.
 //!
@@ -12,7 +12,7 @@
 //! hid the gap because the engines shared the single-range decode).
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::DebugRun;
+use temen_interp::bytecode::{SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{Inspector, MemEvent, Stop, StopReason, WatchKind};
 use temen_text::parse_module;
 
@@ -84,11 +84,11 @@ fn expected_events() -> Vec<MemEvent> {
     ]
 }
 
-/// Drive a fresh `DebugRun` over `SRC` to completion with a collecting sink; returns the events,
+/// Drive a fresh `ScheduledDebugRun` over `SRC` to completion with a collecting sink; returns the events,
 /// the final op clock, and the guest result.
 fn sink_run() -> (Vec<MemEvent>, u64, Option<Vec<temen_interp::Value>>) {
     let m = parse_module(SRC).expect("parses");
-    let mut run = DebugRun::new(&m, 0, &[]).expect("in the bytecode debug subset");
+    let mut run = ScheduledDebugRun::new(&m, 0, &[]).expect("in the bytecode debug subset");
     let log: Arc<Mutex<Vec<MemEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&log);
     run.set_access_sink(Box::new(move |_clock, _task, ev| {
@@ -98,7 +98,7 @@ fn sink_run() -> (Vec<MemEvent>, u64, Option<Vec<temen_interp::Value>>) {
     while run.tick(&mut fuel) {}
     let events = log.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let result = run.result().cloned().and_then(|r| r.ok());
-    (events, run.op_clock(), result)
+    (events, run.op_turn(), result)
 }
 
 /// **The differential**: the sink's stream over the pristine module equals the hook pass's stream
@@ -114,12 +114,12 @@ fn sink_stream_matches_the_hook_pass_stream() {
 #[test]
 fn sink_is_inert() {
     let m = parse_module(SRC).expect("parses");
-    let mut plain = DebugRun::new(&m, 0, &[]).expect("subset");
+    let mut plain = ScheduledDebugRun::new(&m, 0, &[]).expect("subset");
     let mut fuel = u64::MAX;
     while plain.tick(&mut fuel) {}
     let (_, sink_clock, sink_result) = sink_run();
     assert_eq!(
-        plain.op_clock(),
+        plain.op_turn(),
         sink_clock,
         "op-clock unchanged by the sink"
     );
@@ -151,13 +151,16 @@ fn bulk_copy_dst_write_watchpoint_fires_on_both_engines() {
 
     // Bytecode debug engine: must agree on the hit (address = the access span's base, a write)
     // and on the op it stopped before.
-    let mut run = DebugRun::new(&m, 0, &[]).expect("subset");
+    let mut run = ScheduledDebugRun::new(&m, 0, &[]).expect("subset");
     run.set_watchpoints(vec![(16584, 4, WatchKind::Write)]);
     let mut fuel = u64::MAX;
-    let pc = run
-        .run_to(&[], &mut fuel)
-        .expect("bytecode missed the mem.copy write watchpoint");
-    let (addr, write) = run.take_watch_hit().expect("a watch hit, not a breakpoint");
+    let SchedStop::Break {
+        pc,
+        reason: SchedBreak::Watchpoint { addr, write },
+    } = run.run_until_stop(&mut fuel)
+    else {
+        panic!("bytecode missed the mem.copy write watchpoint");
+    };
     assert_eq!((addr, write, pc), tw, "engines agree on the bulk watch hit");
     assert_eq!((addr, write), (16576, true), "the copy's dst span, a write");
 }
@@ -179,13 +182,16 @@ fn bulk_copy_src_read_watchpoint_fires_on_both_engines() {
         other => panic!("tree-walker missed the mem.copy read watchpoint: {other:?}"),
     };
 
-    let mut run = DebugRun::new(&m, 0, &[]).expect("subset");
+    let mut run = ScheduledDebugRun::new(&m, 0, &[]).expect("subset");
     run.set_watchpoints(vec![(16464, 1, WatchKind::Read)]);
     let mut fuel = u64::MAX;
-    let pc = run
-        .run_to(&[], &mut fuel)
-        .expect("bytecode missed the mem.copy read watchpoint");
-    let (addr, write) = run.take_watch_hit().expect("a watch hit");
+    let SchedStop::Break {
+        pc,
+        reason: SchedBreak::Watchpoint { addr, write },
+    } = run.run_until_stop(&mut fuel)
+    else {
+        panic!("bytecode missed the mem.copy read watchpoint");
+    };
     assert_eq!((addr, write, pc), tw, "engines agree on the src-read hit");
     assert_eq!((addr, write), (16448, false), "the copy's src span, a read");
 }

@@ -55,7 +55,7 @@ fn wide_module(n_callees: usize, loads_each: usize) -> Module {
     }
     let m = Module {
         funcs,
-        memory: Some(Memory { size_log2: 17 }),
+        memory: Some(Memory { size_log2: 17, shadow: None }),
         exports: vec![Export {
             name: "_start".into(),
             func: 0,

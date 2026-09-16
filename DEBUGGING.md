@@ -534,6 +534,18 @@ different things depending on which pair you compare:
   `ThreadFault` on the production engine too — an invalid VM combination — so the scheduled coverage uses a
   coroutine driven through the scheduler on its own vCPU.)
 
+  **`DebugRun` collapsed into `ScheduledDebugRun` (#1517 slice 4).** The two bytecode debug engines
+  were one behaviour on two routes: a single-vCPU run *is* a scheduled run with one task. Once the
+  scheduled engine carried every capability the single one had — the host-completed cap park (slice 1),
+  value watches (slice 2), and `Jit.invoke` step-into (slice 3) — `DebugRun` was **deleted**, not
+  aliased (INVARIANTS #15; the acceptance of #1517). `Engine` no longer exists; the DAP `BytecodeBackend`
+  holds one `ScheduledDebugRun` and its ~76 two-arm matches became straight calls. A spawn-free guest is
+  simply a one-task schedule: it steps, watches, checkpoints, and traces its turns identically, so
+  `module_spawns_threads` now only gates whether a schedule *seed* is meaningful (it is not, with one
+  vCPU). The one time coordinate is the global `turn`. The historical slice entries above say "the
+  single-vCPU `DebugRun`" for what, at the time, was a distinct engine; that engine is now the one-task
+  case of the scheduled one.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
@@ -544,11 +556,11 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the
-  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on the single-vCPU
-  `DebugRun` (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into): a
-  breakpoint fires *inside* the unit and the backtrace descends into its module-≥1 frames, over the
-  caller's shared window — while the scheduled engine keeps invoke an opaque leaf (as it does
-  coroutines). Two boundaries stay forward-first (as every seam landed): **source-variable** names
+  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on both engines
+  (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into; the scheduled
+  engine since #1517 slice 3 — it kept invoke an opaque leaf before): a breakpoint fires *inside* the
+  unit and the backtrace descends into its module-≥1 frames, over the caller's shared window. Two
+  boundaries stay forward-first (as every seam landed): **source-variable** names
   inside an invoked/installed unit's frame resolve to `None` (its module-≥1 SSA metadata is not plumbed;
   `IrPc`s/stepping/backtrace are exact), and **reverse-replay across a §22 op** is out-of-subset (an
   `install` mutates the shared dispatch table, and an in-flight `invoke` holds a transient `Vm` — both

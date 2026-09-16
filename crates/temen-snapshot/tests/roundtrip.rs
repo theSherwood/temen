@@ -6,9 +6,15 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -88,6 +94,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -111,7 +118,7 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
         0,
         &[Value::I32(clk)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -125,7 +132,7 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
     let mut fhost = Host::new();
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -162,7 +169,7 @@ fn freeze_serialize_restore_thaw_through_the_codec() {
     // guest receives the clock as a handle argument; restore reinstated it at its original
     // slot/generation, so the same handle value (`(generation << 8) | slot`) still resolves.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable");
     let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 100_000u64;
@@ -211,7 +218,7 @@ fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
         0,
         &[Value::I32(clk)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -226,7 +233,7 @@ fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
     fhost.clock_ns = 42;
     fhost.set_attestation(attest);
     let clk = fhost.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -261,7 +268,7 @@ fn a_detached_shaped_domains_attestation_survives_freeze_serialize_thaw() {
 
     // Thaw + run: the domain re-reads self.attest and must report the restored (detached) exposure.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable");
     let clk = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 100_000u64;
@@ -292,7 +299,7 @@ fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
         0,
         &[],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -306,7 +313,7 @@ fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // freeze driver flattens the parked fiber into its shadow region and exports its residue.
     let mut fhost = Host::new();
     fhost.set_durable(true);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
@@ -338,7 +345,7 @@ fn fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: flip to REWINDING and re-enter. The root rewinds and re-issues cont.resume; the
     // re-seeded fiber re-enters its entry, rewinds, re-parks; forward execution then completes.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let mut fuel = 100_000u64;
     let (thawed, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
@@ -354,7 +361,7 @@ fn restore_refuses_a_mismatched_module() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
     let other = instrument(SRC_OTHER);
@@ -378,7 +385,7 @@ fn a_non_default_attestation_round_trips_through_the_codec() {
         freeze_exposed: true,
     };
     host.set_attestation(attest);
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
     // A fresh restore host defaults to the root attestation; restore must overwrite it from the artifact.
@@ -404,7 +411,7 @@ fn a_default_attestation_elides_the_attest_section() {
     let inst = instrument(SRC);
     let mut host = Host::new();
     host.grant_clock();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact_default = freeze(&inst, &win, &host).expect("freeze default");
 
     let mut host2 = Host::new();
@@ -438,7 +445,7 @@ fn freeze_refuses_a_non_durable_handle() {
     let mut host = Host::new();
     host.grant_clock();
     host.grant_blocking(std::time::Duration::ZERO, None); // non-durable (out-of-line state)
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     match freeze(&inst, &win, &host) {
         Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
         other => panic!("expected NonDurableHandle refusal, got {other:?}"),
@@ -454,7 +461,7 @@ fn freeze_succeeds_after_draining_a_non_durable_handle() {
     let mut host = Host::new();
     host.grant_clock();
     host.grant_blocking(std::time::Duration::ZERO, None); // non-durable — blocks the freeze until drained
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     assert!(
         matches!(
             freeze(&inst, &win, &host),
@@ -505,6 +512,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     let mut m = temen_text::parse_module(SRC_MULTIVCPU).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -521,7 +529,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut host,
         );
@@ -538,7 +546,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.set_durable(true);
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -578,7 +586,7 @@ fn multivcpu_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: REWINDING re-enter. The child is re-spawned and rewinds; the root rewinds, joins, sums.
     // Both clock reads reload (42, 43 → 95), not re-issue (which would use clock 1000+ → ≠ 95).
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
@@ -653,6 +661,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     let mut m = temen_text::parse_module(SRC_FIBER_AND_VCPU).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -669,7 +678,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut host,
         );
@@ -686,7 +695,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.set_durable(true);
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -722,7 +731,7 @@ fn vcpu_and_fiber_freeze_serialize_restore_thaw_through_the_codec() {
 
     // Thaw: the fiber re-seeds and re-parks, the child re-spawns and reloads its clock; result == 57.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
@@ -756,7 +765,7 @@ fn fiber_residue_generation_round_trips_through_the_codec() {
     // A real freeze produces a (gen-0) fiber residue + the matching window image.
     let mut fhost = Host::new();
     fhost.set_durable(true);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
@@ -843,7 +852,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
         0,
         &[],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -858,7 +867,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // and slot 0 is at generation 1 when the root unwinds.
     let mut fhost = Host::new();
     fhost.set_durable(true);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 3);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) =
@@ -894,7 +903,7 @@ fn recycled_fiber_freeze_serialize_restore_thaw_through_the_codec() {
     // Thaw: the root rewinds and re-issues resume B; the gen-1 handle resolves to the re-seeded
     // fiber, which re-parks, and forward execution then resumes it to completion → 107.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let mut fuel = 100_000u64;
     let (thawed, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut thost);
@@ -953,6 +962,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
     let mut m = temen_text::parse_module(SRC_NESTED).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -969,7 +979,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut host,
         );
@@ -986,7 +996,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
     fhost.set_durable(true);
     fhost.clock_ns = 42;
     let clk = fhost.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -1031,7 +1041,7 @@ fn nested_spawn_tree_freeze_serialize_restore_thaw_through_the_codec() {
 
     // Thaw: the grandchild's handle resolves in the child's rebuilt table; all reads reload → 129.
     let mut win = window;
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let clk = {
         let caps = thost.capture_durable_handles().expect("durable");
         ((caps[0].generation << 8) | caps[0].slot) as i32
@@ -1062,7 +1072,7 @@ fn serve_state_round_trips_through_the_codec() {
     use temen_interp::SvcDispatch;
 
     let inst = instrument(SRC);
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
 
     let mut host = Host::new();
     host.set_svc_state(
@@ -1107,7 +1117,7 @@ fn serve_state_round_trips_through_the_codec() {
 #[test]
 fn empty_serve_state_elides_the_section() {
     let inst = instrument(SRC);
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let host = Host::new();
     let artifact = freeze(&inst, &win, &host).expect("freeze without serve state");
 
@@ -1187,6 +1197,7 @@ block 0 (vx: i64) {
     let mut m = temen_text::parse_module(SRC_SERVE).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -1196,7 +1207,7 @@ block 0 (vx: i64) {
     host.set_durable(true);
     host.set_self_module(&inst);
     let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 1_000_000u64;
     let (r, snap) =
@@ -1215,7 +1226,7 @@ block 0 (vx: i64) {
     rhost.set_durable(true);
     rhost.set_self_module(&inst);
     let mut twin = rwin.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;
     let (thawed, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut rhost);
@@ -1280,6 +1291,7 @@ block 0 (vx: i64) {
     let mut m = temen_text::parse_module(SRC_SERVE).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -1289,7 +1301,7 @@ block 0 (vx: i64) {
     host.set_durable(true);
     host.set_self_module(&inst);
     let ticket = host.svc_enqueue(0, 0, vec![41]).expect("enqueue");
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 1_000_000u64;
     let (r1, snap1) =
@@ -1308,7 +1320,7 @@ block 0 (vx: i64) {
     rhost.set_durable(true);
     rhost.set_self_module(&inst);
     let mut twin = rwin.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 1_000_000u64;
     let (thawed1, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &twin, SIZE_LOG2, &mut rhost);
@@ -1335,7 +1347,7 @@ block 0 (vx: i64) {
     // already-served dispatch back onto the queue: restoring artifact #2 yields an empty queue, and
     // the ticket's completion cell **reloads** its saved result (42) rather than the call being
     // re-issued (which would re-append the dispatch and re-run the handler on the next thaw).
-    let win_rf = init_durable_window(WINDOW);
+    let win_rf = init_durable_window(WINDOW, TEST_ARENA);
     let artifact2 = freeze(&inst, &win_rf, &rhost).expect("re-freeze post-serve");
     let mut rhost2 = Host::new();
     restore(&artifact2, &inst, &mut rhost2).expect("restore #2");
@@ -1419,6 +1431,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     let mut m = temen_text::parse_module(SRC_4D_SUPERVISOR).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -1428,7 +1441,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
     h.set_durable(true);
     h.set_self_module(&inst);
     let ih = h.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 5_000_000u64;
     let (r, snap) = run_capture_reserved_with_host(
@@ -1456,7 +1469,7 @@ fn a_supervisor_holding_a_live_cap_freezes_and_thaws_with_the_cap_relinked() {
         .svc_enqueue(0, 0, vec![0])
         .expect("seed a dispatch for the supervisor's svc.wait");
     let mut twin = rwin.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 5_000_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,
@@ -1492,7 +1505,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     host.register_cap_name("fs", h);
     host.set_cap_state_capture(h, Box::new(|| b"cursor=7".to_vec()));
 
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("a named host capability is freezable");
 
     let seen: CapLog = Default::default();
@@ -1525,7 +1538,7 @@ fn restore_refuses_an_artifact_naming_a_cap_the_embedder_does_not_serve() {
     host.grant_clock();
     let h = host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0])));
     host.register_cap_name("fs", h);
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
     let mut bare = Host::new(); // no registrar
@@ -1543,7 +1556,7 @@ fn freeze_still_refuses_an_unnamed_host_cap() {
     let mut host = Host::new();
     host.grant_clock();
     host.grant_host_proc(Box::new(|_op, _args, _mem, _| Ok(vec![0]))); // never named
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     match freeze(&inst, &win, &host) {
         Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
         other => panic!("expected NonDurableHandle refusal, got {other:?}"),
@@ -1557,7 +1570,7 @@ fn a_cap_free_domain_elides_the_named_section() {
     let inst = instrument(SRC);
     let mut plain = Host::new();
     plain.grant_clock();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let without = freeze(&inst, &win, &plain).expect("freeze");
 
     let mut with = Host::new();
@@ -1602,7 +1615,7 @@ fn read_mem(host: &mut Host, h: i32) -> i64 {
 fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
     let inst = instrument(SRC);
     let (host, h, remaining) = budget_host();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("a Budget no longer refuses the freeze");
 
     let mut thost = Host::new(); // no hook: the carried state verbatim
@@ -1625,7 +1638,7 @@ fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
 fn the_thaw_hook_may_attenuate_a_carried_budget() {
     let inst = instrument(SRC);
     let (host, h, remaining) = budget_host();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
     let mut thost = Host::new();
@@ -1656,7 +1669,7 @@ fn the_thaw_hook_may_attenuate_a_carried_budget() {
 fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
     let inst = instrument(SRC);
     let (host, _h, remaining) = budget_host();
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let artifact = freeze(&inst, &win, &host).expect("freeze");
 
     let cases: Vec<(&str, temen_interp::BudgetThawHook)> = vec![
@@ -1692,4 +1705,55 @@ fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
             "{what}: a refused restore pins nothing"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1361 step 2 — a completed-but-unjoined **detached** §14 child rides the control section. A
+// detached child owns a separate window; a completed one has nothing to unwind, so only its
+// `thread.join` result crosses the freeze boundary (reload-not-reissue), the same shape a completed
+// nested child uses. This exercises the codec half end to end. The freeze-**capture** and
+// thaw-**delivery** halves are inert behind op 15's `!durable` admission gate (a durable parent
+// cannot yet spawn a detached child, #1361 step 4), so they are validated by a scratch gate-lift
+// rather than shipped here — see the PR description.
+// ---------------------------------------------------------------------------------------------
+
+/// A detached residue — `(parent_task, slot, join-result)` per child — round-trips through the codec
+/// and re-freezes byte-identically. A negative result exercises the two's-complement uleb, and two
+/// records exercise the canonical `(parent_task, slot)` sort + the trailing-block framing.
+#[test]
+fn a_completed_detached_child_rides_the_control_section() {
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.set_frozen_detached(vec![
+        FrozenDetached {
+            parent_task: 0,
+            slot: 0,
+            completed_result: 33,
+        },
+        FrozenDetached {
+            parent_task: 0,
+            slot: 2,
+            completed_result: -7,
+        },
+    ]);
+    let artifact = freeze(&inst, &win, &host).expect("a detached residue is freezable");
+
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    restore(&artifact, &inst, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_detached(),
+        host.frozen_detached(),
+        "the detached residue round-trips exactly: (parent_task, slot, result), negative included",
+    );
+
+    let win2 = init_durable_window(WINDOW, TEST_ARENA);
+    assert_eq!(
+        freeze(&inst, &win2, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze is byte-identical",
+    );
 }

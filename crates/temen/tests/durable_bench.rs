@@ -16,6 +16,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -41,6 +47,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -76,6 +83,7 @@ fn durable_overhead_probe() {
         let mut m = temen_text::parse_module(&src).unwrap();
         m.memory = Some(Memory {
             size_log2: SIZE_LOG2,
+            shadow: Some(TEST_ARENA),
         });
         let t_transform = time(2000, || {
             let _ = std::hint::black_box(transform_module_assume_confined(&m).unwrap());
@@ -91,7 +99,7 @@ fn durable_overhead_probe() {
             let mut h = Host::new();
             let clk = h.grant_clock();
             let slots = [clk as i64];
-            let win = init_durable_window(WINDOW);
+            let win = init_durable_window(WINDOW, TEST_ARENA);
             let r = temen_jit::compile_and_run_capture_reserved_with_host(
                 &inst,
                 0,
@@ -109,7 +117,7 @@ fn durable_overhead_probe() {
             let mut h = Host::new();
             h.clock_ns = 42;
             let clk = h.grant_clock();
-            let mut win = init_durable_window(WINDOW);
+            let mut win = init_durable_window(WINDOW, TEST_ARENA);
             write_state(&mut win, STATE_UNWINDING);
             let mut fuel = 1_000_000u64;
             let (_, snap) = run_capture_reserved_with_host(
@@ -122,7 +130,7 @@ fn durable_overhead_probe() {
                 &mut h,
             );
             let mut win = snap;
-            begin_thaw(&mut win, 0);
+            begin_thaw(&mut win, TEST_ARENA, 0);
             let mut h2 = Host::new();
             h2.clock_ns = h.clock_ns;
             let clk2 = h2.grant_clock();

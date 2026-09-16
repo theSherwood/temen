@@ -2117,7 +2117,17 @@ static int gen_expr(Node *node) {
         // call against the defining unit. The intercepted builtins above (`write`/`read`/`exit`,
         // `__vm_*`) still win in both modes — a personality that needs a raw capability reaches it
         // through those, exactly as it does today.
-        if (!node->lhs->var->is_definition && !opt_emit_object)
+        //
+        // #1524: unless the declaration said so. The two lowerings are *both* `call.sym` and both
+        // intern as `ImportShape::Func`, differing only in the argument list — capability: the
+        // handle operand plus the op's args; function-symbol: a placeholder handle plus the C list
+        // led by the data stack pointer. Nothing downstream can recover which was meant, so if a
+        // retained function-symbol import's name happens to be a powerbox row the host binds it as
+        // a capability and dispatches with every argument shifted by one. `temen_cap` is how object
+        // -mode C says "this extern is a capability", making the `<temen.h>` §7 late-binding pattern
+        // work in both modes instead of only whole-program.
+        if (!node->lhs->var->is_definition &&
+            (!opt_emit_object || node->lhs->var->is_temen_cap))
           return gen_builtin_import(node);
       }
     }

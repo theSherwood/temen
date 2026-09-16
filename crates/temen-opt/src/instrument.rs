@@ -370,7 +370,10 @@ mod tests {
                     term: Terminator::Return(vec![4]),
                 }],
             }],
-            memory: Some(Memory { size_log2: 16 }),
+            memory: Some(Memory {
+                size_log2: 16,
+                shadow: None,
+            }),
             data: vec![],
             imports: vec![],
             exports: vec![],

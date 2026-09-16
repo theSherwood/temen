@@ -15,13 +15,19 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
 // Root (v0 = host-fn handle): a host-fn call (observable, *not* a safepoint) before each fiber
 // interaction, around three resumes of a fiber that suspends twice then returns. The five fiber
 // safepoints, in order, are: resume#1, suspend#1, resume#2, suspend#2, resume#3.
-const SRC: &str = "memory 18\n\
+const SRC: &str = "memory 18 shadow 16448 65536\n\
     func (i32) -> (i64) {\n\
     block 0 (v0: i32) {\n\
     \x20 v1 = ref.func 1\n\
@@ -53,6 +59,7 @@ fn instrument() -> Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -71,7 +78,7 @@ fn run_armed(n: i64) -> (u64, bool) {
         Ok(vec![0])
     }));
 
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, n);
     let mut fuel = 100_000u64;
     let (res, snap) = run_capture_reserved_with_host(
@@ -127,7 +134,7 @@ fn an_unarmed_durable_run_is_untouched() {
         sink.fetch_add(1, Ordering::Relaxed);
         Ok(vec![0])
     }));
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let mut fuel = 100_000u64;
     let (res, snap) = run_capture_reserved_with_host(
         &inst,

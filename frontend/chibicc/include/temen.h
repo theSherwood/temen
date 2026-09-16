@@ -62,13 +62,24 @@ long __vm_budget_read(int budget, long field);
 int __vm_cap_count(void);
 int __vm_cap_at(int i, int *type_id_out);
 //
+// `TEMEN_CAP` marks a declaration as a **capability** rather than a cross-TU function (#1524).
+// It is required in `--emit-object` (separate-compilation) mode and harmless in whole-program mode,
+// where every undefined extern is already treated as a capability. Without it, an object-mode call
+// to an undefined extern lowers to a cross-TU function-symbol import — whose argument list is the C
+// one led by the data stack pointer — and if the name happens to be one the host's powerbox knows,
+// it binds anyway and dispatches with every argument shifted by one. Always write it:
+//
+//     TEMEN_CAP extern long now(int h, int clk);
+//
+#define TEMEN_CAP __attribute__((temen_cap))
+
 // **Using an arbitrary host capability** (§7 late binding): declare it as a plain `extern` whose
 // FIRST parameter is the capability handle (an `int`), then call it. The frontend lowers any call
 // to an undefined `extern` (that isn't one of the builtins in this header) to a named import; the
 // host binds the name to a concrete interface operation at load (see `default_cap_resolver`). So a
 // new capability needs no frontend change — just an `extern` and a host that knows the name. E.g.:
 //
-//     extern long now(int clock_handle, int clock_id);   // host maps "now" -> (Clock, op 0)
+//     TEMEN_CAP extern long now(int clock_handle, int clock_id); // host maps "now" -> (Clock, op 0)
 //     long t = now(__vm_cap(/* a granted Clock handle */), 0);
 //
 // An unknown name is a clean load error (fail-closed), never a silent no-op.

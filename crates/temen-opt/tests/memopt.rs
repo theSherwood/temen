@@ -16,7 +16,10 @@ use temen_verify::verify_module;
 fn module(f: Func) -> Module {
     Module {
         funcs: vec![f],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     }
 }

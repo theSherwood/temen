@@ -11,6 +11,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -18,6 +24,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR must verify");
@@ -70,7 +77,7 @@ block 0 (v0: i32)
 #[test]
 fn a_v128_live_across_the_suspend_point_survives_freeze_and_thaw() {
     let inst = instrument(V128_ACROSS);
-    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
     let baseline = baseline.expect("baseline runs to completion");
     assert_eq!(
         baseline,
@@ -78,15 +85,15 @@ fn a_v128_live_across_the_suspend_point_survives_freeze_and_thaw() {
         "baseline: clock + 7 + 33"
     );
 
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let (frozen, snapshot) = run(&inst, 42, &win);
     assert!(frozen.is_ok(), "freeze returns a placeholder, not a trap");
     assert_eq!(read_state(&snapshot), STATE_UNWINDING);
 
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let (thawed, final_win) = run(&inst, 0, &win);
     assert_eq!(thawed, Ok(baseline), "thaw equals the uninterrupted run");
-    assert_eq!(read_thaw_state(&final_win, 0), STATE_NORMAL);
+    assert_eq!(read_thaw_state(&final_win, TEST_ARENA, 0), STATE_NORMAL);
 }

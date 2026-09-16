@@ -1,7 +1,7 @@
 (.nif27)
 (.vendor "Nifler")
 (.dialect "nim-parsed")
-(stmts@,1,../../../home/user/vm/nimony/lib/std/system.nim
+(stmts@,1,../../../home/user/temen/nimony/lib/std/system.nim
  (comment)
  (pragmas@,2
   (kv@9 feature~7 "lenientnils"@2))
