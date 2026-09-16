@@ -119,6 +119,34 @@ console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / $
 const DELTA_LO_NS = 56, DELTA_HI_NS = 88;
 const tax = (f) => f ? `${f.small.toLocaleString()} scalar + ${f.bulk.toLocaleString()} bulk (${(f.bulkBytes / 1e6).toFixed(1)} MB) → est. tax ${((f.small * DELTA_LO_NS) / 1e6).toFixed(0)}–${((f.small * DELTA_HI_NS) / 1e6).toFixed(0)}ms` : '—';
 console.log(`foreign accesses:     nimsem ${tax(tm.nimsemForeign)}\n                      hexer  ${tax(tm.hexerForeign)}`);
+// Where the time inside bounces goes (#1359 / #1068): the top emitted functions by bounce time.
+const topTable = (name, top, total) => {
+  if (!top || !top.length) return;
+  console.log(`\n${name}: top bounced functions (of ${fmt(total)} inside bounces)`);
+  console.log(`  ${'func'.padStart(6)} ${'bounces'.padStart(8)} ${'total'.padStart(10)} ${'share'.padStart(7)} ${'max one'.padStart(10)}`);
+  for (const e of top) console.log(`  ${String(e.func).padStart(6)} ${String(e.n).padStart(8)} ${fmt(e.ms).padStart(10)} ${pct(e.ms, total).padStart(7)} ${fmt(e.max).padStart(10)}`);
+};
+topTable('nimsem', tm.nimsemTop, tm.nimsemBounceMs);
+topTable('hexer', tm.hexerTop, tm.hexerBounceMs);
+// Does a bounce's cost track the run's committed extent? Per-bounce series → deciles of the ordinal,
+// with the mean ms and the mapped extent at each decile's end. A flat line is a fixed per-bounce cost;
+// a line that rises with `mapped` is a per-bounce cost proportional to the heap (page-map rebuild).
+const grow = (f) => f && f.grow ? `${f.grow} grows / ${f.growPages} pages (${(f.growPages * 65536 / 1e6).toFixed(0)} MB) in ${fmt(f.growMs)}` : '—';
+console.log(`\nforeign grows:        nimsem ${grow(tm.nimsemForeign)}\n                      hexer  ${grow(tm.hexerForeign)}`);
+const deciles = (name, series, func) => {
+  const s = (series || []).filter((e) => e[0] === func);
+  if (s.length < 20) return;
+  console.log(`\n${name} f${func}: mean bounce ms by decile of its ${s.length} bounces (mapped extent at decile end)`);
+  const row = [];
+  for (let d = 0; d < 10; d++) {
+    const a = Math.floor((d * s.length) / 10), b = Math.floor(((d + 1) * s.length) / 10);
+    const chunk = s.slice(a, b), mean = chunk.reduce((x, e) => x + e[1], 0) / chunk.length;
+    row.push(`${mean.toFixed(2)}ms@${(chunk[chunk.length - 1][2] / 1048576).toFixed(0)}MB`);
+  }
+  console.log(`  ${row.join('  ')}`);
+};
+for (const e of (tm.nimsemTop || []).slice(0, 3)) deciles('nimsem', tm.nimsemSeries, e.func);
+for (const e of (tm.hexerTop || []).slice(0, 3)) deciles('hexer', tm.hexerSeries, e.func);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;
   console.log(`\ntiered / interpreter = ${ratio.toFixed(2)}× ${ratio < 1 ? '(tiered faster)' : '(interpreter faster — emit overhead dominates for this small program)'}`);

@@ -39,9 +39,16 @@ export function foreignMemory(id) {
 // always the real one.
 export const foreignStats = {
   small: 0, bulk: 0, bulkBytes: 0, fill: 0, copy: 0, atomic: 0,
-  reset() { this.small = 0; this.bulk = 0; this.bulkBytes = 0; this.fill = 0; this.copy = 0; this.atomic = 0; },
+  // `foreign_grow` calls that actually grew the memory, the pages they added, and their wall-clock —
+  // so a `vm_map` bounce's cost can be split into the grow itself and everything around it.
+  grow: 0, growPages: 0, growMs: 0,
+  reset() {
+    this.small = 0; this.bulk = 0; this.bulkBytes = 0; this.fill = 0; this.copy = 0; this.atomic = 0;
+    this.grow = 0; this.growPages = 0; this.growMs = 0;
+  },
   take() {
-    const r = { small: this.small, bulk: this.bulk, bulkBytes: this.bulkBytes, fill: this.fill, copy: this.copy, atomic: this.atomic };
+    const r = { small: this.small, bulk: this.bulk, bulkBytes: this.bulkBytes, fill: this.fill, copy: this.copy, atomic: this.atomic,
+      grow: this.grow, growPages: this.growPages, growMs: this.growMs };
     this.reset(); return r;
   },
 };
@@ -115,7 +122,8 @@ export function foreignImports(engineMemory) {
       const { m, base } = mems[id];
       const need = base + len, have = m.buffer.byteLength;
       if (need <= have) return 1;
-      try { m.grow(Math.ceil((need - have) / 65536)); return 1; } catch { return 0; }
+      const pages = Math.ceil((need - have) / 65536), t = performance.now();
+      try { m.grow(pages); foreignStats.grow++; foreignStats.growPages += pages; foreignStats.growMs += performance.now() - t; return 1; } catch { return 0; }
     },
     foreign_atomic: (id, kind, off, width, ab) => {
       foreignStats.atomic++;
