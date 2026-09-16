@@ -1021,7 +1021,10 @@ fn translate_impl(
             top = top.max(eb + EH_REGION_SIZE);
         }
         let log2 = (64 - (top - 1).leading_zeros()) as u8;
-        temen_ir::Memory { size_log2: log2, shadow: None }
+        temen_ir::Memory {
+            size_log2: log2,
+            shadow: None,
+        }
     });
     // The guest heap begins at the window's mapped boundary (the first reserved page) and grows up
     // into the reserved tail as the allocator `vm_map`-commits it (§1a sparse address space).
