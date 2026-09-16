@@ -225,13 +225,16 @@ self.onmessage = async (e) => {
       view.set(mod, mp);
       if (sp) view.set(stdin, sp);
       chunkSink = (bytes) => self.postMessage({ type: 'stdout-chunk', id: msg.id, bytes }, [bytes.buffer]);
+      // The guest's result is this export's return value (like `temen_run_onramp` on the main
+      // thread) — it never fills the `temen_run_value` slot, which the JIT/warm tiers own; reading
+      // that slot here reported 0 for every streamed module (#1509's Temen card caught it).
+      let value;
       try {
-        ex.temen_run_onramp_stream(mp, mod.length, sp, stdin ? stdin.length : 0);
+        value = Number(ex.temen_run_onramp_stream(mp, mod.length, sp, stdin ? stdin.length : 0));
       } finally {
         chunkSink = null;
       }
       const status = ex.temen_status();
-      const value = Number(ex.temen_run_value());
       // Return the framebuffer too (a `display`-cap guest like gradient presents one), so a streamed
       // run stays feature-equivalent to the main-thread path — the page blits it from these bytes.
       const fbw = Number(ex.temen_framebuffer_width());

@@ -16,12 +16,16 @@ raw bytes.
 Terminal setup mirrors the temen line discipline so the byte streams line up: canonical mode with
 echo (the kernel's defaults), but `ONLCR` off (no `\\r\\n` translation of output and echoed
 newlines) and `ECHOCTL` off (a `^C` is not echoed as `^C`) — both are output cosmetics the #797
-discipline never had. Environment: `PATH`/`HOME`/`PS1`/`TERM` exactly as the harness sets them;
-`HISTFILE` empty so the session writes no history file.
+discipline never had — and the personality's 80×24 winsize. Environment: `PATH`/`HOME`/`PS1`
+exactly as the harness sets them; `HISTFILE` empty so the session writes no history file;
+`TERM`/`TERMCAP` inherited from the caller (#1496 — the harness exports the personality's fixed
+entry, `temen_posix::TERMCAP_ENTRY`, on both sides; `TERM=dumb` when unset).
 """
+import fcntl
 import os
 import pty
 import select
+import struct
 import sys
 import termios
 import time
@@ -31,9 +35,11 @@ ENV = {
     "PATH": "/bin:/usr/bin",
     "HOME": "/",
     "PS1": PS1.decode(),
-    "TERM": "dumb",
+    "TERM": os.environ.get("TERM", "dumb"),
     "HISTFILE": "",
 }
+if "TERMCAP" in os.environ:
+    ENV["TERMCAP"] = os.environ["TERMCAP"]
 
 
 def main() -> int:
@@ -51,6 +57,7 @@ def main() -> int:
         attrs[1] &= ~termios.ONLCR  # c_oflag
         attrs[3] &= ~termios.ECHOCTL  # c_lflag
         termios.tcsetattr(0, termios.TCSANOW, attrs)
+        fcntl.ioctl(0, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
         os.execve(bash, [bash, "--norc", "--noprofile", "-i"], ENV)
         os._exit(127)
 

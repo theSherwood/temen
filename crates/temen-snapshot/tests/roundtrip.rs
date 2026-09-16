@@ -1571,3 +1571,125 @@ fn a_cap_free_domain_elides_the_named_section() {
         "the named section is emitted only when there is one to carry"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1502 — a `Budget` rides the artifact. Before this, a durable domain that held a `Budget` (which
+// INVARIANTS #3 R2 makes every domain that can mint a detached child) could not be frozen without
+// draining it, and the thaw's fresh re-grant forgot what had been spent — the conservation break.
+// Now the artifact carries the *remaining* quotas, and the thaw may only narrow them.
+// ---------------------------------------------------------------------------------------------
+
+use temen_interp::{cap_id, BudgetState};
+
+/// A host holding a partly-spent budget, frozen **without** draining. `mem` remaining before the
+/// freeze; the handle the guest holds.
+fn budget_host() -> (Host, i32, i64) {
+    let mut host = Host::new();
+    host.grant_clock();
+    let h = host.grant_budget_channel(7, 1 << 20, 3, -1);
+    assert!(host.budget_mem_take(h, 4096));
+    (host, h, (1 << 20) - 4096)
+}
+
+fn read_mem(host: &mut Host, h: i32) -> i64 {
+    host.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[1], None)
+        .expect("the guest-held handle still dispatches")[0]
+}
+
+/// **The headline.** A budget-holding domain freezes without draining, and thaws — with no hook —
+/// holding exactly what it had left, not the original grant.
+#[test]
+fn a_budget_survives_freeze_and_thaw_with_its_remaining_intact() {
+    let inst = instrument(SRC);
+    let (host, h, remaining) = budget_host();
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("a Budget no longer refuses the freeze");
+
+    let mut thost = Host::new(); // no hook: the carried state verbatim
+    restore(&artifact, &inst, &mut thost).expect("restore");
+    assert_eq!(
+        read_mem(&mut thost, h),
+        remaining,
+        "the thawed domain holds what was left at freeze — what it minted stays minted (#3)"
+    );
+    assert_eq!(
+        thost.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        Ok(vec![-1]),
+        "an unbounded channel round-trips through the codec"
+    );
+}
+
+/// The hook may **attenuate**: a re-hosted domain under a tighter ceiling gets less than it carried,
+/// and an unbounded field may become bounded.
+#[test]
+fn the_thaw_hook_may_attenuate_a_carried_budget() {
+    let inst = instrument(SRC);
+    let (host, h, remaining) = budget_host();
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    let mut thost = Host::new();
+    thost.set_budget_thaw_hook(Box::new(|c| {
+        Some(BudgetState {
+            mem: c.mem / 2,
+            channel: 512, // unbounded → bounded is an attenuation
+            ..c
+        })
+    }));
+    restore(&artifact, &inst, &mut thost).expect("an attenuating hook is honoured");
+    assert_eq!(
+        read_mem(&mut thost, h),
+        remaining / 2,
+        "mem attenuated to half"
+    );
+    assert_eq!(
+        thost.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        Ok(vec![512]),
+        "channel bounded by the hook"
+    );
+}
+
+/// The hook may **never raise**: more than carried on a bounded field, lifting a bounded field to
+/// unbounded, or declining outright all refuse the restore before any handle is pinned — naming the
+/// carried and offered states so an embedder can tell a sign error from a deliberate refusal.
+#[test]
+fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
+    let inst = instrument(SRC);
+    let (host, _h, remaining) = budget_host();
+    let win = init_durable_window(WINDOW);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    let cases: Vec<(&str, temen_interp::BudgetThawHook)> = vec![
+        (
+            "raise a bounded field",
+            Box::new(|c| {
+                Some(BudgetState {
+                    mem: c.mem + 1,
+                    ..c
+                })
+            }),
+        ),
+        (
+            "lift a bounded field to unbounded",
+            Box::new(|c| Some(BudgetState { fuel: -1, ..c })),
+        ),
+        ("decline outright", Box::new(|_| None)),
+    ];
+    for (what, hook) in cases {
+        let mut thost = Host::new();
+        thost.set_budget_thaw_hook(hook);
+        match restore(&artifact, &inst, &mut thost) {
+            Err(RestoreError::BudgetRefused(e)) => {
+                assert_eq!(
+                    e.carried.mem, remaining,
+                    "{what}: the refusal names the carried state"
+                );
+            }
+            other => panic!("{what}: expected BudgetRefused, got {other:?}"),
+        }
+        assert!(
+            thost.capture_durable_handles().unwrap().is_empty(),
+            "{what}: a refused restore pins nothing"
+        );
+    }
+}

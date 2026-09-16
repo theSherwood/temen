@@ -8,10 +8,10 @@
 //!
 //! Both the shell and the command are ordinary C. Capability wiring: `stdout` is a re-grantable
 //! `Stream` (shared sink, so the command's output and any shell output unify); `exec_stdout`/
-//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map); the helper's
-//! `vm_instantiate_rec`/`vm_instantiate_join` externs bind through the one shared name table
-//! (`temen_ir::default_cap_resolver`, `Resolved::Cap`, link-time symbol resolution) and dispatch on
-//! the `Instantiator`/host-fn handles the guest discovers itself via `cap.self` reflection.
+//! `exec_lookup` are a tiny host fn (the embedder's PATH → `Module` map, `Resolved::Cap`, link-time
+//! symbol resolution); the helper's `__vm_instantiate_rec`/`__vm_instantiate_join` are frontend
+//! builtins (static `call.cap 6 17`/`6 1`) that dispatch on the `Instantiator`/host-fn handles the
+//! guest discovers itself via `cap.self` reflection.
 //! Differential interp==JIT — the JIT is given the module resolver *and* the named-grant hooks the
 //! record spawn needs.
 //!
@@ -195,17 +195,17 @@ fn exec_host(out_h: i32, echo_h: i32) -> temen_interp::HostProc {
 
 /// Link the shell's import names to their interfaces — link-time symbol resolution (the phase-4
 /// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `exec_stdout`/`exec_lookup` are the embedder
-/// host fn's ops (0 / 1); `stream_write` is `Stream.write`; everything else (the spawn helper's
-/// `vm_instantiate_rec`/`vm_instantiate_join`) comes from the one shared name table. No handle is
-/// baked at link: each lowered `call.cap` dispatches on the guest's own handle operand, discovered at
-/// run time via `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary,
-/// IMPORTS.md §2.3 dynamic mode).
+/// host fn's ops (0 / 1); `stream_write` is `Stream.write` (the spawn helper's Instantiator calls are
+/// frontend builtins, already static `call.cap`s). No handle is baked at link: each lowered `call.cap`
+/// dispatches on the guest's own handle operand, discovered at run time via
+/// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3 dynamic
+/// mode).
 fn link_shim(name: &str) -> Option<Resolved> {
     let cap = match name {
         "stream_write" => ResolvedCap { type_id: 0, op: 1 },
         "exec_stdout" => ResolvedCap { type_id: 13, op: 0 },
         "exec_lookup" => ResolvedCap { type_id: 13, op: 1 },
-        _ => temen_ir::default_cap_resolver(name)?,
+        _ => return None,
     };
     Some(Resolved::Cap(cap))
 }
@@ -286,7 +286,7 @@ fn run(
 /// exit status. This is the record spawn (op 17) driven end to end by the frontend.
 #[test]
 fn compiled_shell_execs_command_via_vm_spawn() {
-    // Parse the shell raw — its imports (`vm_instantiate_*`/`exec_*`/`stream_write`) are resolved per-run by
+    // Parse the shell raw — its imports (`exec_*`/`stream_write`) are resolved per-run by
     // `resolver` against that run's handles, so the names must survive parsing.
     let shell = parse_module_raw(&c_to_ir(&format!("{SPAWN_C}\n{SHELL_MAIN}"), false))
         .expect("parse shell");

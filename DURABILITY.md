@@ -1026,6 +1026,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
+| `Budget(BudgetState)` (#1502, v22) | fuel, mem, spawn, channel — the **remaining** quotas (`-1` = unbounded) | re-minted into `Host::budgets` at its captured slot; the thaw's **budget hook** (`set_budget_thaw_hook`) may attenuate, never raise; no hook ⇒ verbatim |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so

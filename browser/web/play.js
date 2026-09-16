@@ -386,6 +386,119 @@ block 0 (v0: i64) {
 `,
   },
 
+  '§14 attenuation: two children, two powerboxes (Temen)': {
+    kind: 'module',
+    editable: true,
+    lang: 'temen',
+    mode: 'io',
+    desc: 'A parent spawns the **same child function twice** with **different grant lists** — that is ' +
+      'the whole mechanism of per-child attenuation (DESIGN.md §3c "attenuation needs no new IR"): a ' +
+      'child\'s powerbox is exactly the handles its parent lists at spawn. The parent resolves its own ' +
+      '`instantiator` and `stdout` by name, fills the op-17 spawn record (entry = the child function, a ' +
+      '64 KiB carve of its window, no fuel cap) and a 16-byte grant record, and spawns child A with ' +
+      '`{"stdout" → its stdout}` and child B with an empty list. Each child `self.resolve`s `"stdout"`: A ' +
+      'finds a re-grant of the parent\'s stream and prints through it; B finds nothing and returns 0. ' +
+      'Result 10 (= A·10 + B), stdout "granted" once. Edit the grant count (`vn1`/`vn0`) or the carve to ' +
+      'explore; runs on the bytecode engine with in-process confined children.',
+    src: `; Two children, two powerboxes — attenuation is the grant list (#1509).
+memory 20
+data 16384 "instantiator"
+data 16400 "stdout"
+data 16408 "granted\\n"
+export 0 func "_start" 0    ; the powerbox entry shape: both reference hosts grant the named powerbox
+
+; parent: spawn the child (func 1) twice — A with {"stdout"}, B with nothing — return A*10 + B
+func () -> (i64) {
+block 0 () {
+  vnp = i64.const 16384
+  vnl = i64.const 12
+  vinst = self.resolve vnp vnl          ; this domain's Instantiator, by name
+  vop = i64.const 16400
+  vol = i64.const 6
+  vout = self.resolve vop vol           ; this domain's stdout, by name
+  ; the grant record at 17472: {name_off: "stdout", name_len: 6, handle: stdout, flags: 0}
+  vg0 = i64.const 17472
+  vopn = i32.const 16400
+  i32.store vg0 vopn
+  vg1 = i64.const 17476
+  vln = i32.const 6
+  i32.store vg1 vln
+  vg2 = i64.const 17480
+  i32.store vg2 vout
+  vg3 = i64.const 17484
+  vz = i32.const 0
+  i32.store vg3 vz
+  ; the spawn record at 17408 (temen_ir::SpawnRec): version 0 | entry 1, carve off/size_log2 16,
+  ; pager none, module -1 (self) | budget 0, quota 0, grants_ptr 17472, grants_n
+  vr0 = i64.const 17408
+  vf0 = i64.const 4294967296            ; version 0, entry 1
+  i64.store vr0 vf0
+  vr2 = i64.const 17424
+  vf2 = i64.const -4294967280           ; size_log2 16, pager u32::MAX
+  i64.store vr2 vf2
+  vr3 = i64.const 17432
+  vf3 = i64.const 4294967295            ; module -1 (self), budget 0
+  i64.store vr3 vf3
+  vr4 = i64.const 17440
+  vq = i64.const 0
+  i64.store vr4 vq                      ; quota 0
+  vr5 = i64.const 17448
+  i64.store vr5 vg0                     ; grants_ptr
+  ; child A: carve [64K, 128K), one grant
+  vr1 = i64.const 17416
+  voffa = i64.const 65536
+  i64.store vr1 voffa
+  vr6 = i64.const 17456
+  vn1 = i64.const 1
+  i64.store vr6 vn1
+  vha = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vra = call.cap 6 1 (i32) -> (i64) vinst (vha)
+  ; child B: carve [128K, 192K), no grants
+  voffb = i64.const 131072
+  i64.store vr1 voffb
+  vn0 = i64.const 0
+  i64.store vr6 vn0
+  vhb = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vrb = call.cap 6 1 (i32) -> (i64) vinst (vhb)
+  vten = i64.const 10
+  vm = i64.mul vra vten
+  vsum = i64.add vm vrb
+  return vsum
+  }
+}
+
+; child: its carve starts zeroed (a same-module child gets no data image), so it writes the two
+; strings it needs itself, then resolves "stdout" — a re-grant if the parent listed it — and
+; prints through it, else returns 0
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vop = i64.const 16400
+  vname = i64.const 128047728850035        ; "stdout" packed little-endian
+  i64.store vop vname
+  vtx = i64.const 16408
+  vtext = i64.const 748834988792836711    ; "granted\\n"
+  i64.store vtx vtext
+  vol = i64.const 6
+  vh = self.resolve vop vol
+  vz = i32.const 0
+  vmiss = i32.lt_s vh vz
+  br_if vmiss 1() 2(vh)
+}
+block 1 () {
+  vzero = i64.const 0
+  return vzero
+}
+block 2 (vh2: i32) {
+  vtx2 = i64.const 16408
+  vlen = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh2 (vtx2, vlen)
+  vone = i64.const 1
+  return vone
+  }
+}
+`,
+  },
+
   'Debugger (Temen — breakpoints, step, variables)': {
     debug: true,
     bp: 7, // a breakpoint pre-placed on line 8 (0-based 7), the loop body
@@ -1005,6 +1118,64 @@ int main(void) {
 }
 `,
   },
+  '§14 attenuation from C (chibicc + <temen/spawn.h>)': {
+    kind: 'chibicc',
+    jit: true,
+    editable: true,
+    lang: 'c',
+    url: './assets/chibicc.temen',
+    mode: 'io',
+    desc: 'The same two-children demo written in **C**, compiled in your browser by chibicc.temen: ' +
+      '`<temen/spawn.h>` (the tree\'s `posix_libc/spawn.c`, seeded as a header) turns the op-17 spawn ' +
+      'record into one call — `vm_spawn(module, entry, carve, size_log2, quota, grants, n, scratch)` — ' +
+      'so per-child attenuation is just **which `vm_grant`s you list**. The parent spawns `child` (a ' +
+      'function of this same program, by funcref) twice into two 64 KiB carves: A with `{"stdout"}`, B ' +
+      'with none. A resolves the re-granted stream and prints "granted"; B finds nothing. main() prints ' +
+      'both results and returns A·10 + B = 10. A same-module child starts in a zeroed carve and receives ' +
+      'its starter handles where a C function expects its data-stack pointer, so `child` is written ' +
+      '**stackless** (no address-taken locals, no string literals, VM builtins only).',
+    src: `// Two children, two powerboxes — attenuation is the grant list (#1509).
+#include <stdio.h>
+#include <temen/spawn.h>
+
+long __vm_resolve(const char *name, long len);
+long __vm_write(int h, void *buf, long len);
+
+/* The child entry, spawned into a 64 KiB carve of this window (seen by the child as its own
+   window at 0, zeroed — no data image). Stackless on purpose: a same-module child entry gets its
+   two starter handles where a C function expects its data-stack pointer, so no address-taken
+   locals, no string literals (they live in the parent's data image) and no calls into C here —
+   only VM builtins over two strings it writes itself, just above the NULL guard. */
+long child(long addrspace) {
+  *(long *)16384 = 128047728850035L;            /* "stdout" packed little-endian */
+  *(long *)16400 = 748834988792836711L;         /* "granted\\n" */
+  long h = __vm_resolve((char *)16384, 6);      /* re-granted, or not */
+  if (h < 0) return 0;
+  __vm_write((int)h, (char *)16400, 8);         /* through the re-grant */
+  return 1;
+}
+
+static char pool[3 * 65536]; /* room for two 64 KiB-aligned 64 KiB carves */
+static long scratch[16];     /* the spawn record + one grant record (8-byte aligned) */
+
+int main(void) {
+  int out = (int)__vm_resolve("stdout", 6);   /* this program's own stdout handle */
+  long ca = ((long)pool + 65535) & ~65535L;
+  long cb = ca + 65536;
+  vm_grant g[1];
+  g[0].name = "stdout";
+  g[0].handle = out;
+  long a = vm_spawn(-1, (long)child, ca, 16, 0, g, 1, scratch);   /* A: stdout re-granted */
+  long ra = vm_join(a);
+  long b = vm_spawn(-1, (long)child, cb, 16, 0, g, 0, scratch);   /* B: empty grant list */
+  long rb = vm_join(b);
+  printf("child A (granted stdout) returned %ld\\n", ra);
+  printf("child B (no grants)      returned %ld\\n", rb);
+  return (int)(ra * 10 + rb);
+}
+`,
+  },
+
   'C source-level debugging (chibicc → Temen — breakpoints on C lines)': {
     kind: 'chibicc',
     debug: true,
@@ -2209,17 +2380,18 @@ async function runBashInteractive(c) {
   const session = mk(coop ? 'coop' : 'session');
   const control = coop ? session : mk('control');
   c.bashWorkers = coop ? [session] : [session, control];
-  // A minimal TERMINAL model for the output pane (readline rung): the session's bytes are a
-  // terminal stream, not plain text — readline (running as `TERM=dumb`) erases with `\b \b`,
-  // returns to column 0 with `\r`, and may emit CSI sequences a real terminal would consume.
-  // Completed lines are kept verbatim; only the current line is edited: `\b` moves the cursor left,
-  // `\r` to column 0, printable bytes overwrite at the cursor, `\n` commits the line. `ESC [ … F` is
-  // parsed and dropped except `K` (clear to end of line) and `C`/`D` (cursor right/left). Without
-  // this the pane showed raw control characters after every Backspace.
-  const term = { lines: [], cur: '', col: 0, esc: '' };
-  const render = () => {
-    c.el.stdout.textContent = term.lines.join('\n') + (term.lines.length ? '\n' : '') + term.cur;
-  };
+  // A minimal TERMINAL model for the output pane (readline rung, #1496): the session's bytes are a
+  // terminal stream, not plain text. Readline runs against the personality's fixed termcap entry
+  // (`temen_posix::TERMCAP_ENTRY` — 80×24, NO auto-margin), so it edits with `\b`, returns to
+  // column 0 with `\r`, wraps a long line at 79 columns and moves DOWN with `\n\r`, UP with
+  // `ESC [ A`, right with `ESC [ C`, and clears to the end of the line with `ESC [ K`. The
+  // bracketed-paste toggles (`ESC [ ? 2004 h/l`) and any other CSI are parsed and dropped. The pane
+  // is a grid of rows with a cursor: printable bytes overwrite at the cursor, `\n` moves to the next
+  // row (created at the bottom — command output arrives with bare `\n`s, so the pane behaves as an
+  // ONLCR terminal), and every row stays editable so a wrapped readline line is redrawn in place
+  // after a cursor-up. Without this the pane showed raw control characters after every Backspace.
+  const term = { rows: [''], row: 0, col: 0, esc: '' };
+  const render = () => { c.el.stdout.textContent = term.rows.join('\n'); };
   const append = (text) => {
     for (const ch of text) {
       if (term.esc) {
@@ -2227,19 +2399,26 @@ async function runBashInteractive(c) {
         if (term.esc.length === 2 && ch !== '[') term.esc = ''; // ESC x — a 2-byte sequence, dropped
         else if (term.esc.length > 2 && /[@-~]/.test(ch)) {
           const n = parseInt(term.esc.slice(2, -1), 10) || 1;
-          if (ch === 'K') term.cur = term.cur.slice(0, term.col);
-          else if (ch === 'C') term.col = Math.min(term.cur.length, term.col + n);
+          const line = term.rows[term.row];
+          if (ch === 'K') term.rows[term.row] = line.slice(0, term.col);
+          else if (ch === 'C') term.col = Math.min(line.length, term.col + n);
           else if (ch === 'D') term.col = Math.max(0, term.col - n);
+          else if (ch === 'A') term.row = Math.max(0, term.row - n);
+          else if (ch === 'B') term.row = Math.min(term.rows.length - 1, term.row + n);
           term.esc = '';
         }
         continue;
       }
       if (ch === '\x1b') term.esc = ch;
-      else if (ch === '\n') { term.lines.push(term.cur); term.cur = ''; term.col = 0; }
-      else if (ch === '\r') term.col = 0;
+      else if (ch === '\n') {
+        term.row += 1;
+        term.col = 0;
+        if (term.row === term.rows.length) term.rows.push('');
+      } else if (ch === '\r') term.col = 0;
       else if (ch === '\b') term.col = Math.max(0, term.col - 1);
       else if (ch >= ' ' || ch === '\t') {
-        term.cur = term.cur.slice(0, term.col) + ch + term.cur.slice(term.col + 1);
+        const line = term.rows[term.row].padEnd(term.col);
+        term.rows[term.row] = line.slice(0, term.col) + ch + line.slice(term.col + 1);
         term.col += 1;
       }
       // other control bytes (BEL, …) are dropped
@@ -2337,19 +2516,30 @@ async function runModule(c) {
   const jitTier = snapshotClient ? 'wasm-JIT (streamed)' : 'wasm-JIT';
   const rec = runStart(c, { tier: useJit ? jitTier : interpTier });
   let bytes;
-  try {
-    bytes = await fetchTimed(rec, c, ex.url);
-  } catch (e) {
-    setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
-    logTo(c, `fetch failed: ${e.message}`);
-    runNote(rec, { fetchError: e.message });
-    runEnd(rec, { ok: false });
-    return;
+  if (!ex.url) {
+    // A text-source module card (#1509, the attenuation demo): the editor holds the Temen program
+    // itself, parsed like a text card and then run through this path's on-ramp powerbox (stdout /
+    // stdin / exit / memory / addrspace + a named `instantiator`) on the bytecode engine — the
+    // recipe a `.temen` asset gets, minus the fetch.
+    setState(c, 'running', 'parsing…');
+    bytes = parseGuest(c, rec, c.editor.getValue());
+    if (!bytes) return;
+  } else {
+    try {
+      bytes = await fetchTimed(rec, c, ex.url);
+    } catch (e) {
+      setState(c, 'error', `${e.message} — run \`node build-onramp-assets.mjs\` to generate it`);
+      logTo(c, `fetch failed: ${e.message}`);
+      runNote(rec, { fetchError: e.message });
+      runEnd(rec, { ok: false });
+      return;
+    }
+    logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
   }
-  logTo(c, `fetched ${ex.url}: ${bytes.length}B module`);
-  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua).
+  // An editable module reads the editor text as **stdin** (the guest evaluates it — e.g. Lua); a
+  // text-source module's editor *is* the program, so it feeds no stdin.
   let stdinBytes = null;
-  if (ex.editable) {
+  if (ex.editable && ex.url) {
     const enc = new TextEncoder().encode(c.editor.getValue());
     if (enc.length > 0) stdinBytes = enc;
   }

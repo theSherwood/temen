@@ -8,4 +8,4 @@ close the issue its header names.
 Every file starts with a `# KNOWN GAP — …` comment naming the issue. The directory is the whole
 expectation mechanism — there is no per-case list to keep in sync.
 
-Currently open: `subword_unsigned.nim` / `subword_signed.nim` (#1488).
+Currently empty — #1488 (sub-word arithmetic) was the last open gap and is fixed.

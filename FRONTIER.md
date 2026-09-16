@@ -35,7 +35,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `Instantiator` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | 🔶 |
-| `Budget` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
+| `Budget` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `Module` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ❔ | ❔ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
@@ -63,7 +63,6 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Budget`**
 - *nesting* ⛔ — index-carrying: the child is granted a sub-budget by split/transfer, not the handle
-- *durability* ⛔ — NonDurableKind::Budget — R2 records this caveat against its own ruling
 
 **`Module`**
 - *durability* ⛔ — NonDurableKind::Module — re-granted by the embedder after restore
