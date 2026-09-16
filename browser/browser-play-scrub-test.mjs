@@ -104,15 +104,21 @@ try {
     ? ok(`resumed live from the scrubbed frame (tick ${resumed.tick}, tape truncated)`)
     : fail(`resume: ${JSON.stringify(resumed)}`);
 
-  // The ring is bounded — a long run must not accumulate 16 MiB keyframes forever.
+  // The ring is bounded — a long run must not accumulate 16 MiB keyframes forever — and tick 0 is
+  // **pinned** inside it, so the whole run stays draggable however long it goes on. (It used to be
+  // evicted oldest-first, which walked the left edge of the track forward and left the start of the
+  // run visible on the bar and unreachable by it.) Boundedness is therefore the count staying capped
+  // while the ladder tracks the live end, not the oldest rung moving.
   await page.waitForFunction(() => (globalThis.__scrubState()?.tick ?? 0) >= 340, { timeout: 60_000 });
   const ring = await page.evaluate(() => globalThis.__scrubState());
-  ring.keyframes.length <= 8 && ring.keyframes[0] > 0
-    ? ok(`ladder ring bounded at ${ring.keyframes.length} keyframes (oldest now frame ${ring.keyframes[0]})`)
+  ring.keyframes.length <= 8 && ring.keyframes[0] === 0 && ring.keyframes[ring.keyframes.length - 1] > 200
+    ? ok(`ladder ring bounded at ${ring.keyframes.length} keyframes (${ring.keyframes.join(',')}), start pinned`)
     : fail(`ring: ${JSON.stringify(ring)}`);
 
   // Stopping a paused reactor still tears it down (a paused run has no pending frame callback, which is
   // exactly the case the old "no rAF ⇒ nothing open" shortcut got wrong).
+  // Seeking to the pinned start replays the whole run — the worst case the pin trades for always
+  // being reachable, and the thing an evicting ring could not do at all.
   await seek(ring.keyframes[0]);
   await page.click(`${sel} .stop`);
   const stopped = await page.evaluate((s) => ({

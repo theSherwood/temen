@@ -130,7 +130,43 @@ Taken after, it would sit in both. The reactor fixtures cannot witness that thro
 `bounce` and `life` drain their whole queue each tick and fold it idempotently, though the `keyboard`
 ABI explicitly allows a guest to take one event per tick, which is how Doom's `DG_GetKey` is pumped —
 so it is gated where it *is* visible: a rung, restored and frozen to a §12 artifact, must be
-byte-identical to a reactor driven the same way that was never handed that tick's input.
+byte-identical to a reactor driven the same way that was never handed that tick's input — and, since
+the ladder reached native, directly, by a hand-written guest that takes **one** event per tick
+(`crates/temen-interp/tests/native_reactor_timeline.rs`), where a doubled event shifts every later
+value.
+
+**Follow-on — one ladder, everywhere (2026-09-16, #1457 items 5–6).** The ladder shipped in
+`temen-browser`, and the playground page already had one of its own in JavaScript (#1458, when the
+engine offered only take/restore/free and policy was left to the page). Two implementations of one
+behaviour, already disagreeing on eviction and on whether the start of a run stays reachable — so this
+slice collapsed them instead of adding a third. `ReactorMoment`, `MomentReactor`, `ReactorInput` and
+`ReactorTimeline` now live in **`temen_interp::moment`**, the page drives that one through a new
+`temen_onramp_timeline_*` FFI, and `web/play.js` keeps only what is genuinely the page's: the frame
+loop, the DOM, and a cached picture beside each rung (the presented frame is *output* — no guest reads
+it back, so it is deliberately not in a moment, but a scrub landing exactly on a rung runs no frames
+and something has to repaint).
+
+Two pieces of design fell out of the move, and both are the parameterization rather than a fork
+(INVARIANTS #15):
+
+- **The timeline does not own the reactor, and "who runs the tick" is a type.** A wasm-JIT reactor's
+  `tick` is emitted wasm that the embedder compiled and calls — in the browser that is JavaScript, so
+  there is no tick for Rust to run at all. `MomentReactor` therefore covers capture/restore/input only,
+  and a reactor that *can* step itself additionally implements `SteppableReactor` and gets the
+  self-driving `frame`/`seek`. Everyone else uses `begin_tick` / their own tick / `end_tick`. The
+  alternative — one trait with a `step` the emitted tier answers with a refusal — would compile for a
+  reactor that cannot run it and fail halfway through a tick it had already opened.
+- **The ring takes a byte budget as well as a count,** because a rung costs a window image: eight rungs
+  is a few KiB for `bounce` and 128 MiB for Doom. Tick 0 is pinned inside both bounds, so the whole run
+  stays reachable; the page's old ring evicted oldest-first, which walked the left edge of the scrub
+  track forward and left the start of a run visible on the bar and unreachable by it.
+
+Native parity (#14's host-target axis) is what the crate move buys: a native embedder builds a reactor
+out of the same `bytecode::Reactor` + `Host` and gets the same ladder, gated by
+`native_reactor_timeline.rs` — a hand-granted powerbox, a hand-written guest, no cdylib. What is still
+absent natively is a *convenience driver* (`temen-run` has `Session`, which round-trips only a window
+prefix and so cannot host a grown-heap reactor at all); that is packaging, not capability, and wants a
+consumer before it is built.
 
 *Geometry footnote.* The §12 container's reservation checks were bounded by the **host's** pointer
 width (`usize::BITS`). The mask domain is a guest address-space quantity, so an ordinary 4 GiB

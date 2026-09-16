@@ -3398,341 +3398,69 @@ fn region_layout(back: &temen_interp::Region) -> Option<temen_interp::MemLayout>
     temen_interp::MemLayout::from_parts(bytes, temen_interp::host_page_size(), mapped, &[])
 }
 
-/// The capability-side half of a [`ReactorMoment`]: each host capability's own declared state,
-/// positional over the host's capability table (see the note above [`encode_events`]). Exactly what
-/// `Host::capture_cap_states` yields and `restore_cap_states` takes back — and the same bytes a
-/// freeze writes into the artifact's named-capability section, so the two paths cannot drift.
-type CapMoment = Vec<Option<Vec<u8>>>;
+// The moment / timeline types moved to `temen_interp::moment` (#1457 item 6): one ladder has to be
+// reachable by every reactor there is — these two, the wasm-JIT one below, and a native driver — or
+// the ones that cannot reach it grow their own, which is how a behaviour ends up with two
+// implementations (INVARIANTS #15; the page had exactly that before this). Re-exported here so the
+// cdylib's consumers and the reactor tests keep one name for them.
+pub use temen_interp::moment::{
+    MomentReactor, ReactorInput, ReactorMoment, ReactorTimeline, SteppableReactor,
+};
 
-/// A **moment** of a reactor: everything needed to put the guest back exactly where it was at a frame
-/// boundary — the window image (bytes + page-protection map) plus the capability state above.
-///
-/// There is no continuation here, and that is the point. A reactor's `tick` returns to the host every
-/// frame, so between frames there is no guest stack, no shadow stack and no handle table to serialize:
-/// a moment is one window image and a few host-side words. That is why this costs a memcpy rather than
-/// the `temen-durable` instrumentation an arbitrary-safepoint freeze needs (DURABILITY.md §2), and why
-/// it works identically on every tier — the interpreter reactors and the wasm-JIT one alike.
-///
-/// Restoring a moment gives **rewind**; keeping several gives a keyframe ladder; re-running the guest
-/// forward over recorded input gives the frames between two keyframes. A moment restored into a fresh
-/// reactor is a save-state; restored twice, a branch.
-pub struct ReactorMoment {
-    layout: temen_interp::MemLayout,
-    caps: CapMoment,
-}
+// The capability-side half of a moment is **each capability's own state**, declared once by the
+// provider that owns it (`Host::set_cap_state_capture`/`_restore`) and read two ways: an in-session
+// rewind puts it straight back into the live handler, and a freeze writes it into the artifact's
+// named-capability section (#1455). `ReactorMoment::capture` takes both halves at one instant, so
+// they always describe the same one.
 
-impl ReactorMoment {
-    /// The window image's byte length — what holding this moment costs (the capability half is a
-    /// handful of words). A ladder sizes its ring against this.
-    pub fn byte_len(&self) -> usize {
-        self.layout.byte_len()
-    }
-}
-
-/// One frame's worth of driver input, as it rides a [`ReactorTimeline`]'s tape.
-///
-/// This records the `push_key` / `push_mouse` **arguments**, not the packed queue words they encode
-/// into, so the tape stays independent of that encoding — and so a replay goes back in through the
-/// same front door the live driver used rather than reaching into the queues behind it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReactorInput {
-    /// A key transition: `pressed` is 1 (down) / 0 (up), `keycode` the platform key id.
-    Key { keycode: i32, pressed: i32 },
-    /// A pointer event: `kind` 0 = pointer, 1 = wheel; `payload` per the mouse queue's encoding.
-    Mouse { kind: i32, payload: i32 },
-}
-
-/// What one tick produced.
-pub struct TickOutcome {
-    /// The reactor's status for the frame ([`STATUS_OK`] while it keeps going).
-    pub status: i32,
-    /// Whatever the guest wrote to stdout during the tick.
-    pub stdout: Vec<u8>,
-    /// The frame the guest presented through `display`, if it presented one.
-    pub frame: Option<Frame>,
-}
-
-/// A reactor a [`ReactorTimeline`] can drive: run one tick, take input, capture and restore a
-/// [`ReactorMoment`].
-///
-/// It is a trait because the tick is not always ours to run. The interpreter reactors step
-/// themselves, so their impls are here; the wasm-JIT reactor's `tick` is *emitted wasm*, run by the
-/// embedder that compiled it (the browser's JS host, or `wasmi` in the tests), so its impl belongs
-/// with that driver. Both shapes get the same ladder because the ladder is written against this and
-/// not against a concrete reactor (INVARIANTS #15).
-pub trait MomentReactor {
-    /// Run one tick to the next frame boundary.
-    fn step(&mut self) -> TickOutcome;
-    /// Enqueue a key event for the guest to `poll` next tick.
-    fn push_key(&self, keycode: i32, pressed: i32);
-    /// Enqueue a pointer event for the guest to `poll` next tick.
-    fn push_mouse(&self, kind: i32, payload: i32);
-    /// Capture this reactor's state at the current frame boundary, or `None` if it cannot be imaged
-    /// faithfully (see [`ReactorMoment`]).
-    fn moment(&self) -> Option<ReactorMoment>;
-    /// Put the reactor back at `m`. `false` if it has no window to restore into.
-    fn restore(&mut self, m: &ReactorMoment) -> bool;
-
-    /// Hand one recorded input back to the reactor — the replay side of the tape.
-    fn feed(&self, ev: ReactorInput) {
-        match ev {
-            ReactorInput::Key { keycode, pressed } => self.push_key(keycode, pressed),
-            ReactorInput::Mouse { kind, payload } => self.push_mouse(kind, payload),
-        }
-    }
-}
-
-impl MomentReactor for OnrampReactor {
-    fn step(&mut self) -> TickOutcome {
-        let (status, stdout) = self.frame();
-        let frame = OnrampReactor::take_frame(self);
-        TickOutcome {
-            status,
-            stdout,
-            frame,
-        }
-    }
-    fn push_key(&self, keycode: i32, pressed: i32) {
-        OnrampReactor::push_key(self, keycode, pressed);
-    }
-    fn push_mouse(&self, kind: i32, payload: i32) {
-        OnrampReactor::push_mouse(self, kind, payload);
-    }
-    fn moment(&self) -> Option<ReactorMoment> {
-        OnrampReactor::moment(self)
-    }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
-        OnrampReactor::restore(self, m)
-    }
-}
-
-impl MomentReactor for SharedOnrampReactor {
-    fn step(&mut self) -> TickOutcome {
-        let (status, stdout) = self.frame();
-        let frame = SharedOnrampReactor::take_frame(self);
-        TickOutcome {
-            status,
-            stdout,
-            frame,
-        }
-    }
-    fn push_key(&self, keycode: i32, pressed: i32) {
-        SharedOnrampReactor::push_key(self, keycode, pressed);
-    }
-    fn push_mouse(&self, kind: i32, payload: i32) {
-        SharedOnrampReactor::push_mouse(self, kind, payload);
-    }
-    fn moment(&self) -> Option<ReactorMoment> {
-        SharedOnrampReactor::moment(self)
-    }
-    fn restore(&mut self, m: &ReactorMoment) -> bool {
-        SharedOnrampReactor::restore(self, m)
-    }
-}
-
-/// A reactor plus the two things that turn a rewind into a **scrub**: a tick-indexed input tape and a
-/// keyframe ladder (#1457 items 3–4).
-///
-/// A [`ReactorMoment`] on its own only goes *back* to a point you thought to save. A timeline records
-/// what the driver fed the guest each tick, so any recorded position can be reconstructed — restore
-/// the nearest keyframe at or before it, then re-feed the tape forward. Keyframe stride trades memory
-/// for seek latency; the tape is a few words per tick either way.
-///
-/// ## Why the tape records the driver, not the guest
-///
-/// The obvious move is `Host::record_caps`, which tapes every `HOST_PROC` crossing so a replay can
-/// serve them without a live powerbox — the seam the debug checkpoint ladder rides. A reactor needs
-/// none of it, and it is worth saying why, because the cost of getting this wrong is large: for Doom
-/// that tape would carry every `display.present` and the `mem_writes` of every `fs` read, which is
-/// approximately the whole WAD, per keyframe interval.
-///
-/// The reason it is unnecessary is that a reactor replays against its **live** powerbox — the same
-/// capabilities, still granted — and everything those capabilities read from is already inside the
-/// moment: the key and mouse queues and the `fs` cursors are captured cap state, the window is the
-/// image, and the on-ramp powerbox grants no wall clock and no host RNG. So given the same starting
-/// moment and the same driver input, the guest's crossings *recompute* identically instead of needing
-/// to be served from a recording. The only thing outside the moment is what the host injects from the
-/// outside world, which is exactly what this tape holds.
-///
-/// That is also the boundary of the claim: a reactor granted a genuinely nondeterministic capability
-/// — wall clock, entropy, a socket — would need its crossings taped as well, and the honest move then
-/// is the recorded-input predicate on `record_caps` that #1457 sketched, not a second tape.
-///
-/// ## Positions
-///
-/// [`tick`](Self::tick) is where the reactor stands (frames presented so far) and
-/// [`len`](Self::len) is how far the recording goes. They are equal at the live end, where
-/// [`frame`](Self::frame) *extends* the recording with whatever input has been pushed; when `tick <
-/// len` the timeline is parked inside its own history and `frame` *replays* the recorded input for
-/// that tick instead. Pushing input while parked in the past abandons the rest of the recording —
-/// that is a branch, and the tape and keyframes past this point describe a run that will not happen.
-pub struct ReactorTimeline<R: MomentReactor> {
-    reactor: R,
-    /// Frames presented so far — the position on the timeline.
-    tick: usize,
-    /// `tape[t]` is the input the driver offered for tick `t`, in the order it offered it.
-    tape: Vec<Vec<ReactorInput>>,
-    /// Input offered for a tick that has not run yet.
-    pending: Vec<ReactorInput>,
-    /// Keyframes, ascending by tick. `keyframes[0]` is tick 0 and is never evicted, so **every**
-    /// recorded position stays reachable — at worst by replaying the whole tape. A ring that could
-    /// evict it would leave the start of a run unreachable, which for a scrub bar means a region of
-    /// the track the user can see and cannot drag to.
-    keyframes: Vec<(usize, ReactorMoment)>,
-    stride: usize,
-    ring: usize,
-}
-
-impl<R: MomentReactor> ReactorTimeline<R> {
-    /// Start recording `reactor` from its current position (tick 0).
-    ///
-    /// `stride` is how often a keyframe is taken and `ring` how many are held — the seek-latency /
-    /// memory dial. A keyframe costs a window image ([`ReactorMoment::byte_len`]), so for a 16 MiB
-    /// Doom window a ring of 4 is ~64 MiB and puts every seek within `stride` ticks of a restore.
-    /// Both are clamped to at least 1.
-    pub fn new(reactor: R, stride: usize, ring: usize) -> ReactorTimeline<R> {
-        ReactorTimeline {
-            reactor,
-            tick: 0,
-            tape: Vec::new(),
-            pending: Vec::new(),
-            keyframes: Vec::new(),
-            stride: stride.max(1),
-            ring: ring.max(1),
-        }
-    }
-
-    /// The reactor being driven — for the frame/window surface the timeline does not wrap.
-    pub fn reactor(&self) -> &R {
-        &self.reactor
-    }
-
-    /// The reactor being driven, mutably. Stepping it directly moves the guest without moving the
-    /// timeline's position, so the tape would no longer describe the run; use [`frame`](Self::frame).
-    pub fn reactor_mut(&mut self) -> &mut R {
-        &mut self.reactor
-    }
-
-    /// Where the reactor stands: the number of frames presented, so the next [`frame`](Self::frame)
-    /// produces frame `tick`.
-    pub fn tick(&self) -> usize {
-        self.tick
-    }
-
-    /// How far the recording goes — the highest tick this timeline can [`seek`](Self::seek) to.
-    pub fn len(&self) -> usize {
-        self.tape.len()
-    }
-
-    /// Whether nothing has been recorded yet.
-    pub fn is_empty(&self) -> bool {
-        self.tape.is_empty()
-    }
-
-    /// The ticks currently held as keyframes, ascending — the ladder's rungs.
-    pub fn keyframe_ticks(&self) -> Vec<usize> {
-        self.keyframes.iter().map(|(t, _)| *t).collect()
-    }
-
-    /// What the ladder is holding, in bytes: the sum of its keyframes' window images.
-    pub fn held_bytes(&self) -> usize {
-        self.keyframes.iter().map(|(_, m)| m.byte_len()).sum()
-    }
-
-    /// Offer a key event for the next tick. Offered while parked in the past, this **branches**: the
-    /// recorded future is dropped (see the type's docs).
-    pub fn push_key(&mut self, keycode: i32, pressed: i32) {
-        self.offer(ReactorInput::Key { keycode, pressed });
-    }
-
-    /// Offer a pointer event for the next tick, branching as [`push_key`](Self::push_key) does.
-    pub fn push_mouse(&mut self, kind: i32, payload: i32) {
-        self.offer(ReactorInput::Mouse { kind, payload });
-    }
-
-    fn offer(&mut self, ev: ReactorInput) {
-        if self.tick < self.tape.len() {
-            // New input from inside the recording: from here the run diverges, so the tape beyond
-            // this point — and every keyframe past it — describes a future that will not happen.
-            self.tape.truncate(self.tick);
-            let here = self.tick;
-            self.keyframes.retain(|(t, _)| *t <= here);
-        }
-        self.pending.push(ev);
-    }
-
-    /// Run one tick, and either **extend** the recording with the input pushed since the last frame
-    /// (at the live end) or **replay** the input recorded for this tick (parked in the past).
-    pub fn frame(&mut self) -> TickOutcome {
-        self.keyframe_here();
-        if self.tick == self.tape.len() {
-            self.tape.push(std::mem::take(&mut self.pending));
-        }
-        for ev in self.tape[self.tick].clone() {
-            self.reactor.feed(ev);
-        }
-        let out = self.reactor.step();
-        self.tick += 1;
-        out
-    }
-
-    /// Move to tick `target`, replaying from the nearest keyframe at or before it. Returns `false`
-    /// for a position past the recording, or if the reactor refuses the restore.
-    ///
-    /// The frames the replay presents on the way are discarded: this positions the guest, and the
-    /// caller renders forward from there with [`frame`](Self::frame). Input pushed but not yet fed is
-    /// dropped — it was aimed at the tick being left, exactly as a [`restore`](MomentReactor::restore)
-    /// drops the queue it was sitting in.
-    ///
-    /// Seeking *forward* within the recording needs no restore at all — the replay just continues
-    /// from where the reactor already is — so dragging a scrub bar forward costs the frames crossed
-    /// rather than a rewind and a full re-run.
-    pub fn seek(&mut self, target: usize) -> bool {
-        if target > self.tape.len() {
-            return false;
-        }
-        self.pending.clear();
-        if target < self.tick {
-            let Some(i) = self.keyframes.iter().rposition(|(t, _)| *t <= target) else {
-                return false; // nothing captured at or before `target` — refuse, never guess (#9c)
-            };
-            let at = self.keyframes[i].0;
-            if !self.reactor.restore(&self.keyframes[i].1) {
-                return false;
+/// Drive an [`OnrampReactor`]-shaped reactor through the shared [`MomentReactor`] surface. Both
+/// interpreter reactors present the identical frame/input/moment API over different window backings,
+/// so the two impls are the same six forwarders and are written with one macro rather than twice.
+macro_rules! impl_moment_reactor {
+    ($t:ty) => {
+        impl SteppableReactor for $t {
+            fn step(&mut self) -> i32 {
+                let (status, _stdout) = self.frame();
+                status
             }
-            self.tick = at;
         }
-        while self.tick < target {
-            self.frame();
-        }
-        true
-    }
 
-    /// Take a keyframe if this boundary is a rung and we are not already holding one for it. A replay
-    /// re-takes a rung it crossed on the way out and has since evicted, which is what keeps the ladder
-    /// dense around wherever the driver is working.
-    fn keyframe_here(&mut self) {
-        if !self.tick.is_multiple_of(self.stride) {
-            return;
+        impl MomentReactor for $t {
+            fn push_key(&self, keycode: i32, pressed: i32) {
+                <$t>::push_key(self, keycode, pressed);
+            }
+            fn push_mouse(&self, kind: i32, payload: i32) {
+                <$t>::push_mouse(self, kind, payload);
+            }
+            fn moment(&self) -> Option<ReactorMoment> {
+                <$t>::moment(self)
+            }
+            fn restore(&mut self, m: &ReactorMoment) -> bool {
+                <$t>::restore(self, m)
+            }
         }
-        let Err(at) = self.keyframes.binary_search_by_key(&self.tick, |(t, _)| *t) else {
-            return; // already held for this tick
-        };
-        let Some(m) = self.reactor.moment() else {
-            return; // an uncapturable window: the ladder stays empty and `seek` refuses, rather than
-                    // holding a partial image that would restore a fiction (#9c)
-        };
-        self.keyframes.insert(at, (self.tick, m));
-        while self.keyframes.len() > self.ring {
-            // Tick 0 is pinned; of the rest, drop whichever rung is furthest from where we are, so
-            // the ladder stays dense around the working position instead of around where the run
-            // started. Dropping the *oldest* would evict a rung we just re-took while scrubbing back.
-            let here = self.tick;
-            let victim = (1..self.keyframes.len())
-                .max_by_key(|&i| self.keyframes[i].0.abs_diff(here))
-                .expect("len > ring >= 1, so there is a rung after the pinned one");
-            self.keyframes.remove(victim);
-        }
+    };
+}
+
+impl_moment_reactor!(OnrampReactor);
+impl_moment_reactor!(SharedOnrampReactor);
+
+/// The wasm-JIT reactor records and restores like the others but implements **only**
+/// [`MomentReactor`], never [`SteppableReactor`]: its `tick` is emitted wasm that a JS host compiles
+/// and calls, so there is no tick for Rust to run. A timeline over it is driven with `begin_tick` /
+/// the embedder's own tick / `end_tick`, and the type system says so rather than a runtime refusal.
+impl MomentReactor for JitOnrampReactor {
+    fn push_key(&self, keycode: i32, pressed: i32) {
+        JitOnrampReactor::push_key(self, keycode, pressed);
+    }
+    fn push_mouse(&self, kind: i32, payload: i32) {
+        JitOnrampReactor::push_mouse(self, kind, payload);
+    }
+    fn moment(&self) -> Option<ReactorMoment> {
+        JitOnrampReactor::moment(self)
+    }
+    fn restore(&mut self, m: &ReactorMoment) -> bool {
+        JitOnrampReactor::restore(self, m)
     }
 }
 
@@ -6204,10 +5932,10 @@ impl OnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment {
-            layout: self.inst.window_layout()?,
-            caps: self.host.capture_cap_states(),
-        })
+        Some(ReactorMoment::capture(
+            self.inst.window_layout()?,
+            &self.host,
+        ))
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -6218,10 +5946,10 @@ impl OnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.inst.restore_window(&moment.layout) {
+        if !self.inst.restore_window(moment.layout()) {
             return false;
         }
-        self.host.restore_cap_states(&moment.caps);
+        moment.restore_caps(&mut self.host);
         true
     }
 }
@@ -6391,10 +6119,10 @@ impl SharedOnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment {
-            layout: self.reactor.window_layout()?,
-            caps: self.host.lock().unwrap().capture_cap_states(),
-        })
+        Some(ReactorMoment::capture(
+            self.reactor.window_layout()?,
+            &self.host.lock().unwrap(),
+        ))
     }
 
     /// Put the guest back at `moment`: the window image and the capability state are reinstated, so the
@@ -6405,10 +6133,10 @@ impl SharedOnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if !self.reactor.restore_window(&moment.layout) {
+        if !self.reactor.restore_window(moment.layout()) {
             return false;
         }
-        self.host.lock().unwrap().restore_cap_states(&moment.caps);
+        moment.restore_caps(&mut self.host.lock().unwrap());
         true
     }
 }
@@ -6698,10 +6426,10 @@ impl JitOnrampReactor {
     /// later [`restore`](Self::restore) puts the guest back here. `None` when the window cannot be
     /// faithfully imaged (a §13 region alias — the capture refuses rather than handing back a fiction).
     pub fn moment(&self) -> Option<ReactorMoment> {
-        Some(ReactorMoment {
-            layout: region_layout(&self.back)?,
-            caps: self.host.capture_cap_states(),
-        })
+        Some(ReactorMoment::capture(
+            region_layout(&self.back)?,
+            &self.host,
+        ))
     }
 
     /// Freeze this reactor into a §12 save-state artifact — the emitted tier's twin of
@@ -6732,11 +6460,11 @@ impl JitOnrampReactor {
     /// dropped with the queues it sat in. A driver that wants the frames between two moments re-runs
     /// the guest forward over the input it recorded, rather than keeping a moment per frame.
     pub fn restore(&mut self, moment: &ReactorMoment) -> bool {
-        if moment.layout.byte_len() as u64 != self.back.len() {
+        if moment.byte_len() as u64 != self.back.len() {
             return false;
         }
-        self.back.write_from(0, moment.layout.bytes());
-        self.host.restore_cap_states(&moment.caps);
+        self.back.write_from(0, moment.layout().bytes());
+        moment.restore_caps(&mut self.host);
         true
     }
 }
@@ -10429,6 +10157,229 @@ pub extern "C" fn temen_onramp_moment_clear() {
     for s in slots.iter_mut() {
         *s = None;
     }
+}
+
+// ---- the reactor timeline: one ladder, driven from the page (#1457 items 3-5) -------------------
+//
+// The page used to carry its own keyframe ladder and input tape in JS, because when the save-state
+// FFI landed the engine shipped only take/restore/free. It is one ladder now, in `temen-interp`,
+// because a second one is a second thing to keep correct and the two had already drifted apart on
+// eviction policy and on whether the start of a run stays reachable (INVARIANTS #15, #13).
+//
+// What stayed on the page is what is genuinely the page's: the frame loop, the DOM, and the cached
+// picture beside each rung (the presented frame is *output* — no guest reads it back, so it is no part
+// of a moment; but a scrub landing exactly on a rung runs no frames, so something has to repaint).
+//
+// Only the **split** form is exported. The page already has a per-tier "run one tick" — the
+// interpreter's `temen_onramp_frame`, the emitted tier's JS-compiled `f{tick}` — and those do more
+// than run the guest (they stash the framebuffer for the page to read). So the timeline brackets that
+// call rather than replacing it: `begin_tick`, the page's own tick, `end_tick`. One code path per
+// tier, and the wasm-JIT tick stays where it has to be, in JS.
+
+/// The live timeline, or `None` when nothing is being recorded (single-threaded wasm ⇒ a plain
+/// static, like `REACTOR` beside it).
+static mut TIMELINE: Option<ReactorTimeline> = None;
+
+/// Whichever reactor tier is open, as the recording surface a timeline needs. The wasm-JIT reactor
+/// wins when both are set (the page closes one before opening the other). `None` when neither is.
+///
+/// This is `dyn MomentReactor` and not `dyn SteppableReactor` on purpose: the emitted tier cannot be
+/// stepped from here at all, so the only operations this hands out are the ones both tiers really
+/// have — capture, restore, feed.
+fn live_reactor() -> Option<&'static mut dyn MomentReactor> {
+    // SAFETY: single-threaded wasm; exclusive access to the reactor statics for this call.
+    unsafe {
+        if let Some(r) = (*core::ptr::addr_of_mut!(JIT_REACTOR)).as_mut() {
+            return Some(r);
+        }
+        match (*core::ptr::addr_of_mut!(REACTOR)).as_mut() {
+            Some(r) => Some(r),
+            None => None,
+        }
+    }
+}
+
+/// Run `f` against the live timeline and reactor, or return `-1` if either is missing.
+fn with_timeline(f: impl FnOnce(&mut ReactorTimeline, &mut dyn MomentReactor) -> i32) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    let Some(t) = (unsafe { (*core::ptr::addr_of_mut!(TIMELINE)).as_mut() }) else {
+        return -1;
+    };
+    match live_reactor() {
+        Some(r) => f(t, r),
+        None => -1,
+    }
+}
+
+/// Start recording the open reactor from tick 0.
+///
+/// `stride` is how often a keyframe is taken, `ring` how many are held, and `budget_bytes` a ceiling
+/// on their total size — a rung costs a window image, which is a few KiB for `bounce` and 16 MiB for
+/// Doom, so a count alone is not a memory bound. `0` for `budget_bytes` means no ceiling. Tick 0 is
+/// pinned inside the ring, so the start of a run stays reachable however long it goes on.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_open(stride: i32, ring: i32, budget_bytes: i32) -> i32 {
+    let t = ReactorTimeline::new(
+        stride.max(1) as usize,
+        ring.max(1) as usize,
+        budget_bytes.max(0) as usize,
+    );
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    unsafe { *core::ptr::addr_of_mut!(TIMELINE) = Some(t) };
+    0
+}
+
+/// Stop recording and release every held keyframe. The page calls this when a reactor closes — the
+/// rungs are images of *that* guest's window and mean nothing to the next one.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_close() {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    unsafe { *core::ptr::addr_of_mut!(TIMELINE) = None };
+}
+
+/// Offer a key event for the next tick — taped, then handed to the guest when that tick opens.
+/// Offered while parked in the past this **branches**: the recorded future is dropped, because the
+/// run is about to go somewhere else. `-1` if nothing is being recorded.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_key(keycode: i32, pressed: i32) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    match unsafe { (*core::ptr::addr_of_mut!(TIMELINE)).as_mut() } {
+        Some(t) => {
+            t.push_key(keycode, pressed);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Offer a pointer event for the next tick, branching as [`temen_onramp_timeline_key`] does.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_mouse(kind: i32, payload: i32) -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    match unsafe { (*core::ptr::addr_of_mut!(TIMELINE)).as_mut() } {
+        Some(t) => {
+            t.push_mouse(kind, payload);
+            0
+        }
+        None => -1,
+    }
+}
+
+/// Open the tick at the current position: take a keyframe if one is due, and hand the guest this
+/// tick's input — the input pushed since the last frame at the live end (recording it), or the input
+/// recorded for this tick when replaying. The caller then runs its own tick and calls
+/// [`temen_onramp_timeline_end_tick`]. `-1` if there is no timeline or no open reactor.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_begin_tick() -> i32 {
+    with_timeline(|t, r| {
+        t.begin_tick(r);
+        0
+    })
+}
+
+/// Close the tick the caller just ran, advancing the recorded position.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_end_tick() {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    if let Some(t) = unsafe { (*core::ptr::addr_of_mut!(TIMELINE)).as_mut() } {
+        t.end_tick();
+    }
+}
+
+/// Reposition to the nearest keyframe at or before `target`, without replaying the tail. The caller
+/// then runs ticks (`begin_tick` / its own tick / `end_tick`) until [`temen_onramp_timeline_tick`]
+/// reaches `target`. Seeking *forward* from where the reactor stands needs no rewind and succeeds
+/// having done nothing, so the caller simply runs the frames it crosses.
+///
+/// `-1` for a position past the recording, or if the reactor refuses the restore — a seek refuses
+/// rather than landing somewhere approximate (INVARIANTS #9c).
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_seek_begin(target: i32) -> i32 {
+    let Ok(target) = usize::try_from(target) else {
+        return -1;
+    };
+    with_timeline(|t, r| if t.seek_begin(r, target) { 0 } else { -1 })
+}
+
+/// Abandon the recorded future from the current position: drop the tape past it and every keyframe
+/// beyond it. New input does this on its own (a differently-steered run *has* diverged); this is the
+/// same act asked for outright, which is what the page's "Resume" button means — play on from this
+/// frame, the ones after it are gone.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_truncate() -> i32 {
+    // SAFETY: single-threaded wasm; exclusive access to the timeline for this call.
+    match unsafe { (*core::ptr::addr_of_mut!(TIMELINE)).as_mut() } {
+        Some(t) => {
+            t.truncate();
+            0
+        }
+        None => -1,
+    }
+}
+
+/// How many ticks carry recorded input, and…
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_taped_count() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }.map_or(0, |t| t.taped_ticks().len() as i32)
+}
+
+/// …which tick the `i`th of them is, ascending (`-1` past the end) — where the driver actually did
+/// something, so a scrub track can mark it. The engine holds the tape, so this is the one source for
+/// it rather than the page keeping a shadow copy that a branch would leave stale.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_taped_at(i: i32) -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }
+        .and_then(|t| {
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| t.taped_ticks().get(i).copied())
+        })
+        .map_or(-1, |t| t as i32)
+}
+
+/// Where the reactor stands: frames presented so far, so the next tick produces frame `tick`.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_tick() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }.map_or(-1, |t| t.tick() as i32)
+}
+
+/// How far the recording goes — the highest tick a seek can reach.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_len() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }.map_or(-1, |t| t.len() as i32)
+}
+
+/// Total bytes the ladder is holding, so a page can show (or cap) what a scrub bar costs.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_held_bytes() -> usize {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }.map_or(0, |t| t.held_bytes())
+}
+
+/// How many keyframes the ladder holds, and…
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_keyframe_count() -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }
+        .map_or(0, |t| t.keyframe_ticks().len() as i32)
+}
+
+/// …the tick of the `i`th of them, ascending (`-1` past the end). Two calls rather than a buffer
+/// because a ladder holds a handful of rungs and the page reads them only to draw the scrub track.
+#[no_mangle]
+pub extern "C" fn temen_onramp_timeline_keyframe_at(i: i32) -> i32 {
+    // SAFETY: single-threaded wasm; shared read of the timeline.
+    unsafe { (*core::ptr::addr_of!(TIMELINE)).as_ref() }
+        .and_then(|t| {
+            usize::try_from(i)
+                .ok()
+                .and_then(|i| t.keyframe_ticks().get(i).copied())
+        })
+        .map_or(-1, |t| t as i32)
 }
 
 // ---- reactor save-states: freeze / thaw across the FFI (#1458) -----------------------------------

@@ -22,8 +22,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use temen_browser::{
     Frame, MomentReactor, OnrampReactor, ReactorMoment, ReactorTimeline, SharedOnrampReactor,
-    STATUS_OK,
+    SteppableReactor, STATUS_OK,
 };
+
+/// Keyframe stride / ring / byte budget for the timeline cases. The budget is off (0) except where a
+/// case is about it — these fixtures' windows are small enough that a count bound is the only one that
+/// would ever bite.
+const STRIDE: usize = 8;
+const RING: usize = 4;
 
 /// The shared window the `SharedOnrampReactor` cases run over (matches `shared_reactor.rs`).
 const WIN_LOG2: u8 = 25;
@@ -35,14 +41,20 @@ const RIGHT: i32 = 39;
 /// that the library's [`MomentReactor`] does not carry (that trait is about *driving* a reactor, not
 /// building one). Every case below is written once against this and run against each interpreter
 /// reactor.
-trait Fixture: MomentReactor + Sized {
+trait Fixture: SteppableReactor + Sized {
     fn open_fixture(bytes: &[u8]) -> Self;
+    /// The frame the last tick presented. Not on [`MomentReactor`]: that trait drives ticks, and what
+    /// a reactor *presents* is its own business (the wasm-JIT one hands its framebuffer to a JS host).
+    fn presented(&self) -> Option<Frame>;
 }
 
 impl Fixture for OnrampReactor {
     fn open_fixture(bytes: &[u8]) -> Self {
         let m = temen_encode::decode_module(bytes).expect("decode fixture");
         OnrampReactor::open(&m).expect("open the reactor")
+    }
+    fn presented(&self) -> Option<Frame> {
+        self.take_frame()
     }
 }
 
@@ -51,13 +63,15 @@ impl Fixture for SharedOnrampReactor {
         let m = temen_encode::decode_module(bytes).expect("decode fixture");
         SharedOnrampReactor::open_owned(&m, WIN_LOG2).expect("open the shared reactor")
     }
+    fn presented(&self) -> Option<Frame> {
+        self.take_frame()
+    }
 }
 
 /// Run one tick and take the frame it presented, asserting the reactor kept going.
-fn stepped<R: MomentReactor>(r: &mut R) -> Frame {
-    let out = r.step();
-    assert_eq!(out.status, STATUS_OK, "tick should keep going");
-    out.frame.expect("tick presented a frame")
+fn stepped<R: Fixture>(r: &mut R) -> Frame {
+    assert_eq!(r.step(), STATUS_OK, "tick should keep going");
+    r.presented().expect("tick presented a frame")
 }
 
 const BOUNCE: &[u8] = include_bytes!("fixtures/bounce.temen");
@@ -77,7 +91,7 @@ fn frame_hash(f: &Frame) -> u64 {
 /// The scripted input for frame `i` of a run: a key press/release schedule that actually steers the
 /// guest, so the recorded frames differ from an idle run (a rewind that replayed *nothing* would pass
 /// a test whose input never mattered).
-fn drive<R: MomentReactor>(r: &R, i: usize) {
+fn drive<R: Fixture>(r: &R, i: usize) {
     match i % 6 {
         0 => r.push_key(RIGHT, 1),
         2 => r.push_key(RIGHT, 0),
@@ -89,7 +103,7 @@ fn drive<R: MomentReactor>(r: &R, i: usize) {
 
 /// Run `frames` frames from the current state, feeding the scripted input for each (offset by
 /// `from` so a replay presents the *same* schedule the recorded run saw), returning the frame hashes.
-fn run_scripted<R: MomentReactor>(r: &mut R, from: usize, frames: usize) -> Vec<u64> {
+fn run_scripted<R: Fixture>(r: &mut R, from: usize, frames: usize) -> Vec<u64> {
     (from..from + frames)
         .map(|i| {
             drive(r, i);
@@ -424,6 +438,9 @@ fn a_thawed_reactor_can_be_frozen_again() {
 // cursors, the window) — the on-ramp powerbox grants no wall clock and no entropy — so the guest's
 // crossings recompute rather than needing to be served from a recording. What is left outside the
 // moment is exactly what the host injects from the outside world, and that is what rides the tape.
+//
+// The timeline does not own the reactor: an embedder keeps its reactors in its own storage, and the
+// wasm-JIT tier's tick is run by the embedder rather than by Rust. So every helper here takes both.
 
 /// A reactor that counts the ticks run through it. Landing on the right frame does not by itself
 /// prove the ladder did anything — a `seek` that silently re-ran from tick 0 lands there too. This is
@@ -433,17 +450,14 @@ struct Counting<R> {
     steps: usize,
 }
 
-impl<R: MomentReactor> Counting<R> {
-    fn new(inner: R) -> Counting<R> {
-        Counting { inner, steps: 0 }
+impl<R: SteppableReactor> SteppableReactor for Counting<R> {
+    fn step(&mut self) -> i32 {
+        self.steps += 1;
+        self.inner.step()
     }
 }
 
 impl<R: MomentReactor> MomentReactor for Counting<R> {
-    fn step(&mut self) -> temen_browser::TickOutcome {
-        self.steps += 1;
-        self.inner.step()
-    }
     fn push_key(&self, keycode: i32, pressed: i32) {
         self.inner.push_key(keycode, pressed);
     }
@@ -458,9 +472,21 @@ impl<R: MomentReactor> MomentReactor for Counting<R> {
     }
 }
 
+impl<R: Fixture> Fixture for Counting<R> {
+    fn open_fixture(bytes: &[u8]) -> Self {
+        Counting {
+            inner: R::open_fixture(bytes),
+            steps: 0,
+        }
+    }
+    fn presented(&self) -> Option<Frame> {
+        self.inner.presented()
+    }
+}
+
 /// [`drive`], addressed to a timeline so the input lands on its tape. Keyed on the timeline's own
 /// position, so a recording carries the same schedule the reactor-level cases use.
-fn drive_timeline<R: MomentReactor>(t: &mut ReactorTimeline<R>, i: usize) {
+fn drive_timeline(t: &mut ReactorTimeline, i: usize) {
     match i % 6 {
         0 => t.push_key(RIGHT, 1),
         2 => t.push_key(RIGHT, 0),
@@ -470,23 +496,27 @@ fn drive_timeline<R: MomentReactor>(t: &mut ReactorTimeline<R>, i: usize) {
     }
 }
 
+/// Run one tick through the timeline and take the frame it presented.
+fn tl_frame<R: Fixture>(t: &mut ReactorTimeline, r: &mut R) -> Frame {
+    assert_eq!(t.frame(r), STATUS_OK, "tick should keep going");
+    r.presented().expect("tick presented a frame")
+}
+
 /// Extend the recording by `frames` frames, feeding the scripted input for each.
-fn record<R: MomentReactor>(t: &mut ReactorTimeline<R>, frames: usize) -> Vec<u64> {
+fn record<R: Fixture>(t: &mut ReactorTimeline, r: &mut R, frames: usize) -> Vec<u64> {
     (0..frames)
         .map(|_| {
             let i = t.tick();
             drive_timeline(t, i);
-            frame_hash(&t.frame().frame.expect("tick presented a frame"))
+            frame_hash(&tl_frame(t, r))
         })
         .collect()
 }
 
 /// Play `frames` frames from wherever the timeline stands, replaying the tape — no new input, so the
 /// recording is followed rather than branched.
-fn play<R: MomentReactor>(t: &mut ReactorTimeline<R>, frames: usize) -> Vec<u64> {
-    (0..frames)
-        .map(|_| frame_hash(&t.frame().frame.expect("tick presented a frame")))
-        .collect()
+fn play<R: Fixture>(t: &mut ReactorTimeline, r: &mut R, frames: usize) -> Vec<u64> {
+    (0..frames).map(|_| frame_hash(&tl_frame(t, r))).collect()
 }
 
 /// The gate for the pair: **every** recorded tick is reachable, in any order, repeatedly, and each
@@ -494,22 +524,23 @@ fn play<R: MomentReactor>(t: &mut ReactorTimeline<R>, frames: usize) -> Vec<u64>
 /// recording rather than a single saved point.
 fn a_timeline_seeks_to_any_recorded_tick<R: Fixture>(fixture: &[u8]) {
     const N: usize = 40;
-    let mut t = ReactorTimeline::new(R::open_fixture(fixture), 8, 4);
-    let recorded = record(&mut t, N);
+    let mut r = R::open_fixture(fixture);
+    let mut t = ReactorTimeline::new(STRIDE, RING, 0);
+    let recorded = record(&mut t, &mut r, N);
     assert_eq!((t.tick(), t.len()), (N, N));
 
     for target in [37usize, 3, 22, 0, 39, 22, 8] {
-        assert!(t.seek(target), "tick {target} is on the recording");
+        assert!(t.seek(&mut r, target), "tick {target} is on the recording");
         assert_eq!(t.tick(), target);
         assert_eq!(
-            play(&mut t, 1),
+            play(&mut t, &mut r, 1),
             vec![recorded[target]],
             "frame {target} replays identically from a seek"
         );
     }
 
     assert!(
-        !t.seek(N + 1),
+        !t.seek(&mut r, N + 1),
         "a position past the recording is not a position (#9c: refuse, never guess)"
     );
     assert!(
@@ -542,39 +573,34 @@ fn a_timeline_seeks_over_a_heap_grown_above_the_window() {
 #[test]
 fn the_ladder_bounds_a_backward_seek() {
     const N: usize = 40;
-    const STRIDE: usize = 8;
-    let mut t = ReactorTimeline::new(
-        Counting::new(OnrampReactor::open_fixture(BOUNCE)),
-        STRIDE,
-        8,
-    );
-    let recorded = record(&mut t, N);
+    let mut r = Counting::<OnrampReactor>::open_fixture(BOUNCE);
+    let mut t = ReactorTimeline::new(STRIDE, 8, 0);
+    let recorded = record(&mut t, &mut r, N);
     assert_eq!(
         t.keyframe_ticks(),
         vec![0, 8, 16, 24, 32],
         "a rung every stride"
     );
 
-    t.reactor_mut().steps = 0;
-    assert!(t.seek(39));
+    r.steps = 0;
+    assert!(t.seek(&mut r, 39));
     assert!(
-        t.reactor().steps <= STRIDE,
+        r.steps <= STRIDE,
         "a seek to 39 replays from the rung at 32, not from 0 (ran {} ticks)",
-        t.reactor().steps
+        r.steps
     );
-    assert_eq!(play(&mut t, 1), vec![recorded[39]]);
+    assert_eq!(play(&mut t, &mut r, 1), vec![recorded[39]]);
 
     // And a seek *forward* inside the recording needs no rewind at all — it just keeps replaying from
     // where the reactor already stands, so dragging a scrub bar forward costs the frames it crosses.
-    assert!(t.seek(4));
-    t.reactor_mut().steps = 0;
-    assert!(t.seek(20));
+    assert!(t.seek(&mut r, 4));
+    r.steps = 0;
+    assert!(t.seek(&mut r, 20));
     assert_eq!(
-        t.reactor().steps,
-        16,
+        r.steps, 16,
         "a forward seek replays only the frames between here and there"
     );
-    assert_eq!(play(&mut t, 1), vec![recorded[20]]);
+    assert_eq!(play(&mut t, &mut r, 1), vec![recorded[20]]);
 }
 
 /// Steering differently from a rewound position is a **branch**: the recorded future is gone, and so
@@ -582,11 +608,12 @@ fn the_ladder_bounds_a_backward_seek() {
 /// rewinds and then plays — without it the timeline would claim a future that cannot happen.
 #[test]
 fn new_input_in_the_past_branches_the_timeline() {
-    let mut t = ReactorTimeline::new(OnrampReactor::open_fixture(BOUNCE), 4, 8);
-    let recorded = record(&mut t, 24);
+    let mut r = OnrampReactor::open_fixture(BOUNCE);
+    let mut t = ReactorTimeline::new(4, 8, 0);
+    let recorded = record(&mut t, &mut r, 24);
     assert_eq!(t.len(), 24);
 
-    assert!(t.seek(10));
+    assert!(t.seek(&mut r, 10));
     // `bounce` steers on key-*downs* and ignores releases, so branch with the opposite direction: the
     // recorded run is heading left here (LEFT↓ at tick 9), and this turns it right on tick 10 itself
     // rather than only diverging later when the truncated RIGHT↓ at tick 12 fails to arrive.
@@ -598,7 +625,7 @@ fn new_input_in_the_past_branches_the_timeline() {
         t.keyframe_ticks()
     );
 
-    let branch = play(&mut t, 6);
+    let branch = play(&mut t, &mut r, 6);
     assert_eq!(t.len(), 16, "the branch is the recording now");
     assert_ne!(
         branch,
@@ -608,9 +635,9 @@ fn new_input_in_the_past_branches_the_timeline() {
 
     // The branch is a recording like any other — seekable, replayable. A scrub bar keeps working
     // after the user plays their own way.
-    assert!(t.seek(10));
+    assert!(t.seek(&mut r, 10));
     assert_eq!(
-        play(&mut t, 6),
+        play(&mut t, &mut r, 6),
         branch,
         "the new timeline replays like any other"
     );
@@ -621,28 +648,55 @@ fn new_input_in_the_past_branches_the_timeline() {
 /// worst case is a long replay rather than a refusal.
 #[test]
 fn the_ring_is_bounded_and_pins_the_start() {
-    const RING: usize = 3;
-    let mut t = ReactorTimeline::new(OnrampReactor::open_fixture(LIFE), 4, RING);
-    let recorded = record(&mut t, 40);
+    const SMALL: usize = 3;
+    let mut r = OnrampReactor::open_fixture(LIFE);
+    let mut t = ReactorTimeline::new(4, SMALL, 0);
+    let recorded = record(&mut t, &mut r, 40);
 
     let rungs = t.keyframe_ticks();
     assert!(
-        rungs.len() <= RING,
+        rungs.len() <= SMALL,
         "the ring is a budget, not a suggestion: {rungs:?}"
     );
     assert_eq!(
         rungs[0], 0,
         "tick 0 is pinned, so the start of the run stays reachable"
     );
-    let one = t.reactor().moment().expect("capturable").byte_len();
-    assert!(t.held_bytes() > 0 && t.held_bytes() <= RING * one);
+    let one = r.moment().expect("capturable").byte_len();
+    assert!(t.held_bytes() > 0 && t.held_bytes() <= SMALL * one);
 
     // The pin earning its keep: a tick the ring passed long ago is still reachable, by replaying from
     // 0 rather than refusing.
-    assert!(t.seek(17));
-    assert_eq!(play(&mut t, 1), vec![recorded[17]]);
-    assert!(t.seek(0));
-    assert_eq!(play(&mut t, 1), vec![recorded[0]]);
+    assert!(t.seek(&mut r, 17));
+    assert_eq!(play(&mut t, &mut r, 1), vec![recorded[17]]);
+    assert!(t.seek(&mut r, 0));
+    assert_eq!(play(&mut t, &mut r, 1), vec![recorded[0]]);
+}
+
+/// The **byte** bound, which is the one that matters for a real guest: a rung's cost is the guest's
+/// window, so a count alone means "8 rungs" is a few KiB for `bounce` and 128 MiB for Doom. A budget
+/// that admits two rungs holds two however big the count allows — and never drops below the pin.
+#[test]
+fn the_ring_honours_a_byte_budget_under_the_count() {
+    let mut r = OnrampReactor::open_fixture(LIFE);
+    let one = r.moment().expect("capturable").byte_len();
+    // Room for two rungs, against a count that would allow sixteen.
+    let mut t = ReactorTimeline::new(4, 16, one * 2 + one / 2);
+    let recorded = record(&mut t, &mut r, 40);
+
+    let rungs = t.keyframe_ticks();
+    assert!(
+        rungs.len() <= 2 && t.held_bytes() <= one * 2 + one / 2,
+        "the byte ceiling bit before the count did: {rungs:?} holding {} of {}",
+        t.held_bytes(),
+        one * 2 + one / 2
+    );
+    assert_eq!(rungs[0], 0, "the pin survives a budget that tight");
+    assert!(
+        t.seek(&mut r, 21),
+        "and the run is still fully seekable through it"
+    );
+    assert_eq!(play(&mut t, &mut r, 1), vec![recorded[21]]);
 }
 
 /// **Inertness pin** (INVARIANTS #9b): a run recorded and keyframed presents exactly the frames a
@@ -651,12 +705,13 @@ fn the_ring_is_bounded_and_pins_the_start() {
 #[test]
 fn recording_a_timeline_does_not_perturb_the_run() {
     let mut plain = OnrampReactor::open_fixture(LIFE);
-    let mut taped = ReactorTimeline::new(OnrampReactor::open_fixture(LIFE), 3, 4);
+    let mut taped = OnrampReactor::open_fixture(LIFE);
+    let mut t = ReactorTimeline::new(3, 4, 0);
     for i in 0..15 {
         drive(&plain, i);
-        drive_timeline(&mut taped, i);
+        drive_timeline(&mut t, i);
         let a = frame_hash(&stepped(&mut plain));
-        let b = frame_hash(&taped.frame().frame.expect("a frame was presented"));
+        let b = frame_hash(&tl_frame(&mut t, &mut taped));
         assert_eq!(a, b, "frame {i} is unchanged by taping and keyframing it");
     }
 }
@@ -674,34 +729,76 @@ fn recording_a_timeline_does_not_perturb_the_run() {
 /// pins that the two states are distinguishable at all, so passing means something.
 #[test]
 fn a_keyframe_holds_the_state_before_its_tick_of_input() {
-    const STRIDE: usize = 6; // `drive` offers input at tick 6, so the rung there has something to hold
+    const AT: usize = 6; // `drive` offers input at tick 6, so the rung there has something to hold
     let m = temen_encode::decode_module(BOUNCE).expect("decode bounce.temen");
 
     // The two states the rung at tick 6 could be in: driven to that boundary, frozen once before tick
     // 6's input is offered and once after.
     let mut plain = OnrampReactor::open(&m).expect("open");
-    let _ = run_scripted(&mut plain, 0, STRIDE);
+    let _ = run_scripted(&mut plain, 0, AT);
     let before = plain.freeze(&m).expect("freeze at the boundary");
-    drive(&plain, STRIDE); // tick 6's input: queued, not yet polled
+    drive(&plain, AT); // tick 6's input: queued, not yet polled
     let after = plain.freeze(&m).expect("freeze with it queued");
     assert_ne!(
         before, after,
         "queued input is visible in a frozen reactor, so this gate can tell the two apart"
     );
 
-    let mut t = ReactorTimeline::new(OnrampReactor::open(&m).expect("open"), STRIDE, 8);
-    let _ = record(&mut t, 18);
+    let mut r = OnrampReactor::open(&m).expect("open");
+    let mut t = ReactorTimeline::new(AT, 8, 0);
+    let _ = record(&mut t, &mut r, 18);
+    assert!(t.keyframe_ticks().contains(&AT), "there is a rung at {AT}");
     assert!(
-        t.keyframe_ticks().contains(&STRIDE),
-        "there is a rung at {STRIDE}"
-    );
-    assert!(
-        t.seek(STRIDE),
+        t.seek(&mut r, AT),
         "seek to the rung itself, so it is restored and nothing is replayed"
     );
     assert_eq!(
-        t.reactor().freeze(&m).expect("freeze the restored rung"),
+        r.freeze(&m).expect("freeze the restored rung"),
         before,
         "a rung holds the state *before* its tick's input, so a replay feeds that input exactly once"
+    );
+}
+
+/// The **split** form the wasm-JIT tier needs: `begin_tick` / run the tick yourself / `end_tick`,
+/// with `seek_begin` for the reposition half. An embedder whose tick is emitted wasm run by a JS host
+/// cannot hand Rust a `step`, so if this did not exist it would grow its own ladder — which is exactly
+/// what the playground page had before this (INVARIANTS #15). Driving the split form by hand must
+/// produce the same recording the self-driving `frame` does.
+#[test]
+fn the_split_form_records_and_seeks_like_the_self_driving_one() {
+    let mut whole = OnrampReactor::open_fixture(BOUNCE);
+    let mut tw = ReactorTimeline::new(STRIDE, RING, 0);
+    let expected = record(&mut tw, &mut whole, 24);
+
+    let mut split = OnrampReactor::open_fixture(BOUNCE);
+    let mut ts = ReactorTimeline::new(STRIDE, RING, 0);
+    let mut got = Vec::new();
+    for _ in 0..24 {
+        let i = ts.tick();
+        drive_timeline(&mut ts, i);
+        ts.begin_tick(&mut split);
+        assert_eq!(split.step(), STATUS_OK); // the embedder's own tick
+        ts.end_tick();
+        got.push(frame_hash(&split.presented().expect("a frame")));
+    }
+    assert_eq!(got, expected, "hand-driven ticks record the same run");
+    assert_eq!(
+        ts.keyframe_ticks(),
+        tw.keyframe_ticks(),
+        "and the same ladder"
+    );
+
+    // And the split seek: reposition, then run the tail yourself.
+    assert!(ts.seek_begin(&mut split, 9));
+    while ts.tick() < 9 {
+        ts.begin_tick(&mut split);
+        assert_eq!(split.step(), STATUS_OK);
+        ts.end_tick();
+    }
+    assert_eq!(ts.tick(), 9);
+    assert_eq!(
+        play(&mut ts, &mut split, 4),
+        expected[9..13].to_vec(),
+        "a hand-driven seek lands where the self-driving one does"
     );
 }
