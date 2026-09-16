@@ -3543,6 +3543,36 @@ fn grant_onramp_caps(
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
     // dynamic-only SharedRegion ops) leaves its slot unbound — fail-closed at dispatch.
+    // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
+    // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
+    // `fs` is last in `NAMES` — a read-only in-memory file (Doom slice 4: the WAD read path), granted
+    // only when the host supplies one; a guest that resolves no `fs` cap (bounce/life) is unaffected.
+    let caps = OnrampCaps::new(fs);
+    for name in OnrampCaps::NAMES {
+        caps.grant(host, name);
+    }
+    // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
+    // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
+    // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
+    // reference hosts — one frontier, INVARIANTS #14. Spawn authority is a strict subset of the
+    // guest's own reach: a child is a sub-carve of *this* window with fuel sub-allocated from this
+    // guest's own quota, its powerbox attenuated to what the parent re-grants by name, and it can
+    // reach nothing the parent could not already reach directly. The knob stays for an embedder that
+    // wants the narrower set (and for the differential harness, whose env-routed child tier-up
+    // (#1117) toggles it); granted last so every other handle keeps its value.
+    if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let handle = host.grant_instantiator(0, win);
+        host.register_cap_name("instantiator", handle);
+        // The by-name spawn set, only for a guest that spawns detached: a `Module` grant is
+        // non-durable, so granting it everywhere would make every reactor that saves a warm
+        // snapshot unfreezable.
+        if temen_ir::spawns_detached(m) {
+            host.grant_detached_spawn_caps(win);
+        }
+    }
+    // The manifest binding comes last so it can name every grant above (the by-name Instantiator
+    // included); the grant order itself is unchanged, so every handle keeps its value.
     if !m.imports.is_empty() {
         use temen_interp::cap_id;
         let bindings = m
@@ -3570,28 +3600,6 @@ fn grant_onramp_caps(
             })
             .collect();
         host.set_import_bindings(bindings);
-    }
-    // The stateful capabilities are minted by `OnrampCaps` (below), which is also the **registrar**
-    // a thaw re-grants through — one definition of what each on-ramp capability does, used by both.
-    // `fs` is last in `NAMES` — a read-only in-memory file (Doom slice 4: the WAD read path), granted
-    // only when the host supplies one; a guest that resolves no `fs` cap (bounce/life) is unaffected.
-    let caps = OnrampCaps::new(fs);
-    for name in OnrampCaps::NAMES {
-        caps.grant(host, name);
-    }
-    // #816/#1234: a §14 `Instantiator` over the guest's own window, named `"instantiator"` — **on by
-    // default**, matching `temen-run`'s reference powerbox (`grant_powerbox_prefix`), so a guest that
-    // nests a confined copy of itself (the Forth kernel's `sandbox` word) behaves identically on both
-    // reference hosts — one frontier, INVARIANTS #14. Spawn authority is a strict subset of the
-    // guest's own reach: a child is a sub-carve of *this* window with fuel sub-allocated from this
-    // guest's own quota, its powerbox attenuated to what the parent re-grants by name, and it can
-    // reach nothing the parent could not already reach directly. The knob stays for an embedder that
-    // wants the narrower set (and for the differential harness, whose env-routed child tier-up
-    // (#1117) toggles it); granted last so every other handle keeps its value.
-    if ONRAMP_GRANT_INSTANTIATOR.load(std::sync::atomic::Ordering::Relaxed) {
-        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
-        let handle = host.grant_instantiator(0, win);
-        host.register_cap_name("instantiator", handle);
     }
     caps
 }
@@ -4371,6 +4379,12 @@ pub extern "C" fn temen_run_pg(
 /// is linked, and a header costs nothing unless the program includes it. Source: `browser/playground-include/`.
 pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
     const HEADERS: &[(&str, &str)] = &[
+        // The Temen capability surface for C (SharedRegion, the guest JIT, by-name handles) — the
+        // frontend's own header, seeded verbatim so a card can `#include <temen.h>`.
+        (
+            "include/temen.h",
+            include_str!("../../frontend/chibicc/include/temen.h"),
+        ),
         (
             "include/stdio.h",
             include_str!("../playground-include/stdio.h"),
@@ -7029,6 +7043,7 @@ impl JitOnrampRun {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)] // the one open path every JIT on-ramp shape funnels into
     fn open_over_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
@@ -15710,23 +15725,6 @@ block 0 () {
         assert_eq!(temen_op13jit_counter(), 0, "close cleared the loop state");
     }
 
-    /// Inflate a committed `.gz` asset with the system `gzip` (mirrors nimc's test helper).
-    fn inflate(path: &str) -> Option<Vec<u8>> {
-        use std::io::Write;
-        let bytes = std::fs::read(path).ok()?;
-        let mut c = std::process::Command::new("gzip")
-            .args(["-dc"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        let mut stdin = c.stdin.take()?;
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
-        });
-        let out = c.wait_with_output().ok()?;
-        out.status.success().then_some(out.stdout)
-    }
 }
 
 // ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================

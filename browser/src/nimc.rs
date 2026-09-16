@@ -897,6 +897,34 @@ fn read(handle: &temen_fs::MemFsHandle, key: &str) -> Option<Vec<u8>> {
     files.into_iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
+fn toposort(mods: &BTreeMap<String, Mod>) -> Vec<String> {
+    let mut seen: BTreeMap<String, u8> = BTreeMap::new();
+    let mut order = vec![];
+    fn visit(
+        s: &str,
+        mods: &BTreeMap<String, Mod>,
+        seen: &mut BTreeMap<String, u8>,
+        order: &mut Vec<String>,
+    ) {
+        if seen.get(s).copied().unwrap_or(0) != 0 {
+            return;
+        }
+        seen.insert(s.to_string(), 1);
+        if let Some(m) = mods.get(s) {
+            for d in &m.deps {
+                visit(d, mods, seen, order);
+            }
+        }
+        seen.insert(s.to_string(), 2);
+        order.push(s.to_string());
+    }
+    for s in mods.keys() {
+        visit(s, mods, &mut seen, &mut order);
+    }
+    order.sort_by_key(|s| mods.get(s).map(|m| m.role != Role::System).unwrap_or(true));
+    order
+}
+
 #[cfg(test)]
 mod tests {
     //! Native validation of the in-browser compiler over the bytecode engine (the same engine the
@@ -954,7 +982,10 @@ mod tests {
         );
     }
 
-    fn seed() -> Option<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>)> {
+    /// The staged phases (nifler, nimsem, hexer) and the stdlib image's files.
+    type Seed = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>);
+
+    fn seed() -> Option<Seed> {
         let dir = std::path::Path::new("/tmp/e2e_temen");
         let lib = std::path::Path::new("../.nimtool/nimony/lib");
         if !dir.join("nifler.temen").exists() || !lib.exists() {
@@ -1219,32 +1250,4 @@ mod tests {
             "op-13-crawl in-browser compile matches the inline path"
         );
     }
-}
-
-fn toposort(mods: &BTreeMap<String, Mod>) -> Vec<String> {
-    let mut seen: BTreeMap<String, u8> = BTreeMap::new();
-    let mut order = vec![];
-    fn visit(
-        s: &str,
-        mods: &BTreeMap<String, Mod>,
-        seen: &mut BTreeMap<String, u8>,
-        order: &mut Vec<String>,
-    ) {
-        if seen.get(s).copied().unwrap_or(0) != 0 {
-            return;
-        }
-        seen.insert(s.to_string(), 1);
-        if let Some(m) = mods.get(s) {
-            for d in &m.deps {
-                visit(d, mods, seen, order);
-            }
-        }
-        seen.insert(s.to_string(), 2);
-        order.push(s.to_string());
-    }
-    for s in mods.keys() {
-        visit(s, mods, &mut seen, &mut order);
-    }
-    order.sort_by_key(|s| mods.get(s).map(|m| m.role != Role::System).unwrap_or(true));
-    order
 }

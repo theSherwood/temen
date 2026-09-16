@@ -13050,10 +13050,220 @@ impl CoopSched {
                     tasks[ti].threads.push(Some(cidx));
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
-                // §5 `instantiate_detached` (op 15, #1286): the cooperative scheduler hosts no fresh
-                // window yet — decline probeably, never a trap ([`Vm::decline_unsupported`]).
-                Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
-                    tasks[ti].vt.active.decline_unsupported(dst);
+                // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
+                // **fresh window of its own** (`Mem::with_reservation`, its own guard) — not a carve —
+                // the tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative
+                // driver. Admission first (entry shape, the window = the module's declared memory,
+                // the args payload, `premap_admit`, no durable domain, then the `Budget.mem` take —
+                // a refused spawn lands `-EINVAL` and charges nothing); then the child powerbox:
+                // starter `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants
+                // (the op-11 record format, fail-closed), and a pre-mapped `SharedRegion` staged and
+                // applied to the window before the child runs an op. `join` is the shared seam below.
+                Ok(VcpuStop::InstantiateDetached {
+                    budget,
+                    mh,
+                    entry,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    args,
+                    premap,
+                }) => {
+                    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule) =
+                        match host.resolve_module(mh) {
+                            Ok(g) => (
+                                g.funcs.clone(),
+                                g.memory_log2,
+                                g.data.clone(),
+                                g.imports.clone(),
+                                g.types.clone(),
+                                std::sync::Arc::clone(&g.module),
+                            ),
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        };
+                    let child_compiled = match compile_module(&cfuncs, &ctypes) {
+                        Some(c) => c.with_manifest(cimports, ctypes),
+                        None => {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    };
+                    let want_as = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let ok_entry = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
+                    let child_size = if (0..64).contains(&size_log2) {
+                        1u64 << size_log2
+                    } else {
+                        0
+                    };
+                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let payload: Vec<u8> = match args {
+                        Some((ptr, len)) => match pm
+                            .ok_or(Trap::Malformed)
+                            .and_then(|m| m.read_window(ptr, len as usize))
+                        {
+                            Ok(p) => p,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    let payload_ok = payload.len() as u64
+                        <= temen_ir::module_args_end() - temen_ir::module_args_base();
+                    let glist: Result<Vec<(String, i32)>, Trap> = (|| {
+                        let Some((gptr, gn)) = grants else {
+                            return Ok(Vec::new());
+                        };
+                        let m = pm.ok_or(Trap::Malformed)?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..gn {
+                            let rec = m.read_window(gptr + i * 16, 16)?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name = String::from_utf8(m.read_window(name_off, name_len)?)
+                                .map_err(|_| Trap::CapFault)?;
+                            if !host.can_regrant(gh) {
+                                return Err(Trap::CapFault);
+                            }
+                            list.push((name, gh));
+                        }
+                        Ok(list)
+                    })();
+                    let glist = match glist {
+                        Ok(l) => l,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let premap_ok = match premap {
+                        Some((r, o)) => match host.premap_admit(r, o, child_size) {
+                            Ok(ok) => ok,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        },
+                        None => true,
+                    };
+                    if !ok_entry
+                        || child_size == 0
+                        || !mod_ok
+                        || !payload_ok
+                        || !premap_ok
+                        || host.is_durable()
+                        || !host.budget_mem_take(budget, child_size)
+                    {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let live = tasks
+                        .iter()
+                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                        .count();
+                    if live >= super::MAX_VCPUS {
+                        complete(tasks, ti, Err(Trap::ThreadFault));
+                        continue;
+                    }
+                    let mut fm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8);
+                    fm.init_data(&cdata);
+                    fm.seed_null_guard(temen_ir::module_null_guard());
+                    if !payload.is_empty() {
+                        let _ = fm.write_bytes(temen_ir::module_args_base(), &payload);
+                    }
+                    let mut child_host = Host::new();
+                    child_host.set_attestation(host.detached_child_attestation());
+                    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                    let cinst = child_host.grant_instantiator(0, reservation);
+                    let cas = child_host.grant_address_space(0, reservation);
+                    for (name, gh) in &glist {
+                        if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
+                            child_host.register_cap_name(name, cg);
+                        }
+                    }
+                    if let Some((r, o)) = premap {
+                        if !(host.stage_premap(r, o, &mut child_host)
+                            && child_host.apply_premap(&mut fm) >= 0)
+                        {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    }
+                    child_host.set_self_module(&cmodule);
+                    // A child of the running module itself binds leniently (#1234 — its manifest
+                    // is the parent's whole import surface, not one written for the child).
+                    let bound = if host.is_self_module(mh) {
+                        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
+                    } else {
+                        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
+                    };
+                    if bound.is_err() {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let child_args = if want_as {
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    };
+                    let pfuel = match tasks[ti].env {
+                        None => *fuel,
+                        Some(k) => extra_envs[k].fuel,
+                    };
+                    let child_fuel = if quota <= 0 {
+                        pfuel
+                    } else {
+                        (quota as u64).min(pfuel)
+                    };
+                    let progs_len = child_compiled.progs.len();
+                    let cm = dom.source.push(child_compiled);
+                    let child_table =
+                        build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
+                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
+                    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
+                    child_vt.active.module = cm;
+                    child_vt.active.home = cm;
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: Some(fm),
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table: child_table,
+                        fuel: child_fuel,
+                    });
+                    let cidx = tasks.len();
+                    tasks.push(TaskSlot {
+                        vt: child_vt,
+                        threads: Vec::new(),
+                        env: Some(eidx),
+                        state: TaskState::Runnable,
+                    });
+                    let handle = tasks[ti].threads.len() as i32;
+                    tasks[ti].threads.push(Some(cidx));
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
                 Ok(VcpuStop::InstantiateModule {
                     ibase,
