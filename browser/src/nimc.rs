@@ -446,7 +446,9 @@ pub(crate) fn drive_op13<'p>(
                 fuel,
             } => {
                 if base.is_null() {
-                    return Err(Trap::Malformed); // a nested carve needs an addressable parent window
+                    // A nested carve needs an addressable parent window — the driver's decline
+                    // (see `crate::declined_child`), not a trap for the parent.
+                    return crate::declined_child();
                 }
                 let granted = vcpu.take_granted_host();
                 let declared = child
@@ -499,13 +501,15 @@ pub(crate) fn drive_op13<'p>(
                 }
             }
             // A phase is single-threaded and non-interactive: no threads, no tier-up (this is the
-            // interpreter path), no cap or stdin park. Named rather than `_` (see `VcpuEvent`).
+            // interpreter path), no cap or stdin park. The driver's decline — a value at the parent's
+            // join, never a parent-killing trap (see `crate::declined_child`). Named rather than `_`
+            // (see `VcpuEvent`).
             bytecode::VcpuEvent::TierUp { .. }
             | bytecode::VcpuEvent::Spawn { .. }
             | bytecode::VcpuEvent::Wait { .. }
             | bytecode::VcpuEvent::Notify { .. }
             | bytecode::VcpuEvent::CapPending { .. }
-            | bytecode::VcpuEvent::StdinPark => return Err(Trap::Malformed),
+            | bytecode::VcpuEvent::StdinPark => return crate::declined_child(),
         }
     }
 }

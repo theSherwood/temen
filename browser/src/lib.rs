@@ -12526,16 +12526,33 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
     }
 }
 
+/// **A child the driver cannot service is a value at the parent's `join`, never a trap.** The
+/// result a leaf runner banks when the child reaches an event that runner does not service
+/// (threads, tier-up, a cap or stdin park inside a leaf). `Vcpu::deliver_join(Err(t))` sets the
+/// *parent's* trap, so returning `Err(Trap::Malformed)` here — as every leaf did — killed the parent
+/// domain for a limitation of the host, not for anything either guest did. INVARIANTS #5: a
+/// lifecycle event from another party is never a domain-killing surprise. A child's *own* trap still
+/// propagates (`deliver_join`'s documented contract); this is only the driver's decline.
+///
+/// The value is `-EINVAL`, the same answer `Vm::decline_unsupported` gives a declined op (#1415) —
+/// one mechanism for "this tier does not do that", at both the op and the child level. `Malformed`
+/// was the wrong trap twice over: its definition is "structurally invalid in a way a verified
+/// module never is", and a verified module that `thread.spawn`s inside a leaf is not that.
+pub(crate) fn declined_child() -> Result<Vec<Value>, Trap> {
+    Ok(vec![Value::I64(temen_ir::errno::EINVAL)])
+}
+
 /// Run a declined **detached** child to completion on the interpreter (#1286): a leaf — it may `join`
 /// nothing and spawn nothing (a detached child that itself spawns is out of this fallback's scope and
-/// fails closed), so only `Done`/`Trapped` are expected.
+/// declines: the parent's `join` sees [`declined_child`]), so only `Done`/`Trapped` are serviced.
 #[cfg(all(target_arch = "wasm32", target_feature = "atomics"))]
 fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap> {
     match vcpu.run() {
         bytecode::VcpuEvent::Done(v) => Ok(v),
         bytecode::VcpuEvent::Trapped(t) => Err(t),
-        // A leaf: anything that would need the host again is out of this fallback's scope and
-        // fails closed. Named rather than `_` (see `VcpuEvent`).
+        // A leaf: anything that would need the host again is out of this fallback's scope and is
+        // the driver's decline — a value at the parent's join (see `declined_child`). Named rather
+        // than `_` (see `VcpuEvent`).
         bytecode::VcpuEvent::TierUp { .. }
         | bytecode::VcpuEvent::Spawn { .. }
         | bytecode::VcpuEvent::Join { .. }
@@ -12547,7 +12564,7 @@ fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap>
         | bytecode::VcpuEvent::Instantiate { .. }
         | bytecode::VcpuEvent::InstantiateDetached { .. }
         | bytecode::VcpuEvent::CapPending { .. }
-        | bytecode::VcpuEvent::StdinPark => Err(Trap::Malformed),
+        | bytecode::VcpuEvent::StdinPark => declined_child(),
     }
 }
 
@@ -15770,7 +15787,6 @@ block 0 () {
         temen_op13jit_close();
         assert_eq!(temen_op13jit_counter(), 0, "close cleared the loop state");
     }
-
 }
 
 // ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================
