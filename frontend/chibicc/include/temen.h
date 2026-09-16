@@ -28,6 +28,10 @@
 #define VM_CAP_BLOCKING 6
 #define VM_CAP_JIT 7
 int __vm_cap(int i);
+// `__vm_resolve(name, len)` returns the handle registered under `name` in this domain's §7 name
+// directory (`self.resolve`) — the by-name twin of `__vm_cap`, for capabilities outside the fixed
+// indexed set: `"instantiator"`, `"module"`, `"budget"`, `"stderr"`, a parent's re-grant …
+long __vm_resolve(const char *name, long len);
 //
 // **Reflection** (§7): discover what the host actually granted *this* domain — read-only and
 // authority-neutral (it only re-surfaces handles you already hold). `__vm_cap_count()` is how many

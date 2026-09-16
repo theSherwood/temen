@@ -4249,7 +4249,11 @@ pub fn default_cap_resolver(name: &str) -> Option<ResolvedCap> {
         // (#1509): the helper fills the op-17 record from C and dispatches on the `Instantiator`
         // handle it discovers by reflection.
         "vm_instantiate_rec" => (cap_id::INSTANTIATOR, 17),
+        "vm_instantiate_detached" => (cap_id::INSTANTIATOR, 15),
         "vm_instantiate_join" => (cap_id::INSTANTIATOR, 1),
+        // Budget (§5 / iface 14): `read(field) -> remaining` on the by-name `"budget"` grant — a
+        // guest sizing a detached child asks how much detached memory it may mint.
+        "vm_budget_read" => (cap_id::BUDGET, 1),
         _ => return None,
     };
     Some(ResolvedCap { type_id, op })
@@ -4269,6 +4273,13 @@ pub struct PowerboxHandles {
     pub addrspace: i32,
     pub jit: Option<i32>,
     pub stderr: Option<i32>,
+    /// The §14 `Instantiator` a host grants **by name** (`"instantiator"`), so an import naming
+    /// one of its ops (`vm_instantiate_join`, `vm_instantiate_detached`, …) binds; `None` leaves
+    /// those slots unbound (fail-closed at dispatch).
+    pub instantiator: Option<i32>,
+    /// The detached-spawn `Budget` granted by name (`"budget"`), for `vm_budget_read`; `None` leaves
+    /// that slot unbound.
+    pub budget: Option<i32>,
 }
 
 impl PowerboxHandles {
@@ -4283,6 +4294,8 @@ impl PowerboxHandles {
             addrspace,
             jit: None,
             stderr: None,
+            instantiator: None,
+            budget: None,
         }
     }
 
@@ -4306,6 +4319,8 @@ impl PowerboxHandles {
                 (cap_id::ADDRESS_SPACE, 0..=3) => self.memory,
                 (cap_id::ADDRESS_SPACE, _) => self.addrspace,
                 (cap_id::JIT, _) => self.jit?,
+                (cap_id::INSTANTIATOR, _) => self.instantiator?,
+                (cap_id::BUDGET, _) => self.budget?,
                 _ => return None,
             }
         };

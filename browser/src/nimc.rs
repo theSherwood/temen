@@ -246,6 +246,8 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
             addrspace: memory,
             jit: None,
             stderr: None,
+            instantiator: None,
+            budget: None,
         };
         let bindings = m
             .imports

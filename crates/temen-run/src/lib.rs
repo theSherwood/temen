@@ -2005,6 +2005,36 @@ pub unsafe extern "C" fn module_resolver(
     }
 }
 
+/// [`module_resolver`] for the **locked** cap-context shape ([`CapCtx::Locked`]): `ctx` is the
+/// `*const Mutex<Host>` the locked thunk takes. Same views, taken under the lock.
+///
+/// # Safety
+/// As [`module_resolver`], with `ctx` the live `*const Mutex<Host>` of the run.
+pub unsafe extern "C" fn module_resolver_locked(
+    ctx: *mut c_void,
+    handle: i32,
+    out: *mut temen_jit::ResolvedModule,
+) -> i32 {
+    let host = (*(ctx as *const Mutex<Host>))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match host.resolve_module_parts(handle) {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
+            *out = temen_jit::ResolvedModule {
+                funcs,
+                n_funcs,
+                memory_log2,
+                data,
+                n_data,
+                types,
+                n_types,
+            };
+            1
+        }
+        None => 0,
+    }
+}
+
 /// PROCESS.md S2 (JIT parity) — the §14 **granted-child builder** for `instantiate_granted` (op 8):
 /// CALLS.md 5c.1c — the production granted-child hook set (`powerbox_compile_run` installs it on
 /// every JIT run whose module nests): the same callbacks the test harnesses wire by hand.
@@ -2625,7 +2655,7 @@ pub unsafe extern "C" fn child_bind_imports(
         // manifest is the parent's whole import surface, not one written for it, so an unmet
         // `required` slot is left empty (fail-closed at use) rather than refusing the spawn.
         let mut child = child_cell.lock().unwrap_or_else(|e| e.into_inner());
-        let bound = if module as i32 == temen_interp::SELF_MODULE {
+        let bound = if parent.is_self_module(module as i32) {
             child.bind_same_module_manifest(&imports, &types)
         } else {
             child.bind_child_manifest(&imports, &types)
@@ -4062,7 +4092,7 @@ unsafe fn powerbox_compile_run(
             cc.ptr(),
             temen_ir::DEFAULT_RESERVED_LOG2,
             None,
-            None,
+            Some(module_resolver_locked), // §14 module children resolve their `Module` grant
             interrupt_ptr,
             None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
             None, // no D45 fast path: the fast fns deref a raw `*mut Host`, not a `Mutex<Host>`
@@ -4122,7 +4152,7 @@ unsafe fn powerbox_compile_run(
         cc.ptr(),
         temen_ir::DEFAULT_RESERVED_LOG2,
         None,
-        None,
+        Some(module_resolver), // §14 module children resolve their `Module` grant
         interrupt_ptr,
         None, // no fuel budget armed (the CLI bounds runaways via the interrupt kill-path)
         Some(fast_cap_resolver),
@@ -4376,7 +4406,9 @@ impl PowerboxProgram {
                 cc.ptr(),
                 temen_ir::DEFAULT_RESERVED_LOG2,
                 None, // sub
-                None, // resolve_module
+                // §14 module children (ops 5/13/15) resolve their `Module` grant through the
+                // powerbox host — the ctx is that host's box (`cc.ptr()`), as `cap_thunk`'s.
+                Some(module_resolver),
                 None, // interrupt (no §5 watchdog in the cached path; see `run`)
                 None, // fuel
                 Some(fast_cap_resolver),
@@ -4658,6 +4690,7 @@ fn grant_powerbox_prefix(h: &mut Host, win: u64) -> [i32; 7] {
     // name (`grant_onramp_caps`) so both reference hosts present one frontier (INVARIANTS #14).
     let inst = h.grant_instantiator(0, win);
     h.register_cap_name("instantiator", inst);
+    h.grant_detached_spawn_caps(win);
     v
 }
 
@@ -6392,6 +6425,10 @@ impl Instance {
                         addrspace,
                         jit: Some(jit),
                         stderr: Some(stderr),
+                        // Granted by name (`grant_powerbox_prefix`), so the Instantiator's and
+                        // the Budget's import names bind to them.
+                        instantiator: h.resolve_cap_name("instantiator"),
+                        budget: h.resolve_cap_name("budget"),
                     };
                     let bindings = self
                         .module

@@ -68,6 +68,8 @@ fn doom_frame_hashes_match_native() {
         addrspace: memory,
         jit: None,
         stderr: None,
+        instantiator: None,
+        budget: None,
     };
     let bindings = m
         .imports

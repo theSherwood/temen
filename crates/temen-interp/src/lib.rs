@@ -11267,6 +11267,40 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     }
                 }};
             }
+            // §5/§14 (IMPORTS.md phase 3): a `call.sym` whose manifest binding is an `Instantiator`
+            // op this eval loop services (`join`, `instantiate_detached`) cannot take the generic
+            // host dispatch — the Host never routes an Instantiator there. Re-dispatch it as the
+            // static `call.cap` it is — the same arm below, so the two spellings cannot diverge
+            // (the Jit driver ops take the same road, above) — on the **binding's** handle: the
+            // granted handle rides the binding and the call site's operand is vestigial (a linked
+            // object unit emits a placeholder there), so it is carried beside the synthesized
+            // instruction rather than read from a register.
+            let synth_cap;
+            let mut synth_handle: Option<i32> = None;
+            let inst = match inst {
+                Inst::CallSym {
+                    import, sig, args, ..
+                } if matches!(
+                    host.lock_unpoisoned().import_binding(*import),
+                    Some(b) if b.type_id == cap_id::INSTANTIATOR && matches!(b.op, 1 | 15)
+                ) =>
+                {
+                    let b = host
+                        .lock_unpoisoned()
+                        .import_binding(*import)
+                        .ok_or(Trap::CapFault)?;
+                    synth_handle = Some(b.handle);
+                    synth_cap = Inst::CapCall {
+                        type_id: cap_id::INSTANTIATOR,
+                        op: b.op,
+                        sig: *sig,
+                        handle: u32::MAX,
+                        args: args.clone(),
+                    };
+                    &synth_cap
+                }
+                _ => inst,
+            };
             match inst {
                 // Non-tail calls push a new frame and switch to it; the callee's results
                 // are appended to this frame's `vals` when it returns (see `Return`).
@@ -11320,7 +11354,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
-                    let h = get_i32(&frames[top].vals, *handle)?;
+                    let h = match synth_handle {
+                        Some(h) => h, // an import-bound call: the binding's handle (see above)
+                        None => get_i32(&frames[top].vals, *handle)?,
+                    };
                     let (ibase, isize) = {
                         let hg = host.lock_unpoisoned();
                         hg.resolve_instantiator(h)?
@@ -12377,7 +12414,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         }));
                                     }
                                 }
-                                if ch.bind_child_manifest(&cm.imports, &cm.types).is_err() {
+                                // A child of the running module itself binds leniently (#1234
+                                // — its manifest is the parent's whole import surface).
+                                let bound = if host.lock_unpoisoned().is_self_module(mh) {
+                                    ch.bind_same_module_manifest(&cm.imports, &cm.types)
+                                } else {
+                                    ch.bind_child_manifest(&cm.imports, &cm.types)
+                                };
+                                if bound.is_err() {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
                                     ch.self_module = Some(Arc::clone(&cm.module));
@@ -18552,6 +18596,10 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
+    /// #964: the running module's NULL guard (`0` = unguarded), recorded by
+    /// [`Host::set_self_module`] so the JIT cap path's window backend can enforce the reserved
+    /// region without the module in reach.
+    null_guard: u64,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
@@ -19037,6 +19085,7 @@ impl Host {
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
             cap_pages: None,
+            null_guard: 0,
             quota: Quota::default(),
             jit_tables: Vec::new(),
             jit_validator: None,
@@ -21517,7 +21566,17 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
+        // #964/#1094: every module's window reserves `[0, guard)` (the unconditional guard). Recording
+        // it here — the one place every run path registers the running module — lets the native JIT's
+        // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
+        // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
+        self.null_guard = temen_ir::module_null_guard();
         self.self_module = Some(Arc::clone(m));
+    }
+
+    /// #964: the running module's NULL guard (`0` = unguarded) — see [`Host::set_self_module`].
+    pub fn null_guard(&self) -> u64 {
+        self.null_guard
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
@@ -22153,6 +22212,28 @@ impl Host {
         self.grant_module_inner(m, false)
     }
 
+    /// The two **by-name grants a detached spawn needs** beyond `"instantiator"` itself, so a guest
+    /// can reach `Instantiator` op 15 from a plain powerbox: `"module"` — a `Module` handle for the
+    /// **running module**, letting a program spawn one of its own functions as the child (a child
+    /// that is a *different* module is a host grant, as the shell's PATH registry); and `"budget"`
+    /// — the detached-window allowance, `win` bytes of `Budget.mem` (a detached window is minted
+    /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
+    /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
+    /// them beside `"instantiator"` — one frontier (INVARIANTS #14). Spawn authority stays a subset
+    /// of the guest's own reach: the child runs this guest's code, on this guest's budget.
+    ///
+    /// Requires [`Host::set_self_module`] first (both powerboxes register the running module before
+    /// granting anything); with no running module registered, nothing is granted.
+    pub fn grant_detached_spawn_caps(&mut self, win: u64) {
+        let Some(m) = self.self_module.clone() else {
+            return;
+        };
+        let module = self.grant_module_shared(m, false);
+        self.register_cap_name("module", module);
+        let budget = self.grant_budget(0, win as i64, 0);
+        self.register_cap_name("budget", budget);
+    }
+
     /// [`Host::grant_module`], additionally attesting the module is **freezable** (DURABILITY.md
     /// §4): the host ran `temen_durable::transform_module` on `m` before granting, so a *durable*
     /// domain may instantiate it as a child (an unmarked grant is refused there — the child could
@@ -22185,6 +22266,13 @@ impl Host {
     }
 
     fn grant_module_inner(&mut self, m: &Module, durable: bool) -> i32 {
+        self.grant_module_shared(Arc::new(m.clone()), durable)
+    }
+
+    /// [`grant_module_inner`](Self::grant_module_inner) over an already-shared module — the grant
+    /// keeps `m` itself, so a grant of the **running** module (`set_self_module`'s Arc) stays
+    /// recognizable as such ([`Host::is_self_module`]).
+    fn grant_module_shared(&mut self, m: Arc<Module>, durable: bool) -> i32 {
         let id = self.modules.len() as u32;
         self.modules.push(ModuleGrant {
             funcs: m.funcs.clone().into(),
@@ -22194,10 +22282,22 @@ impl Host {
             imports: m.imports.clone().into(),
             types: m.types.clone().into(),
             durable,
-            digest: module_digest(m),
-            module: Arc::new(m.clone()),
+            digest: module_digest(&m),
+            module: m,
         });
         self.grant(cap_id::MODULE, Binding::Module(id))
+    }
+
+    /// Whether `handle` names the **running module** — the [`SELF_MODULE`] sentinel, or a `Module`
+    /// grant of the very module [`Host::set_self_module`] registered (a `"module"` by-name grant,
+    /// [`Host::grant_detached_spawn_caps`]). A child spawned from it runs the parent's own program,
+    /// so the spawn arms bind its manifest leniently ([`Host::bind_same_module_manifest`]).
+    pub fn is_self_module(&self, handle: i32) -> bool {
+        handle == SELF_MODULE
+            || match (self.resolve_module(handle), &self.self_module) {
+                (Ok(g), Some(s)) => Arc::ptr_eq(&g.module, s),
+                _ => false,
+            }
     }
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore

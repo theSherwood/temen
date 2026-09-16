@@ -81,6 +81,19 @@ try {
     ? ok('Temen text ran via the editor → 14')
     : fail(`hello run: ${JSON.stringify(hello)}`);
 
+  // The `detached` card: a §5 detached child spawned from the guest's OWN module over a pre-mapped
+  // SharedRegion (Instantiator op 15, 11-arg form) on the on-ramp recipe — the parent reads the
+  // child's answer back through its own mapping: 1000 × 42 + 82.
+  await runCard(page, 'detached', 30_000);
+  const det = await page.evaluate((sel) => ({
+    state: document.querySelector(`${sel} .state`).dataset.state,
+    msg: document.querySelector(`${sel} .state`).textContent,
+    result: document.querySelector(`${sel} .result`).textContent.trim(),
+  }), card('detached'));
+  det.state === 'done' && det.result === '42082'
+    ? ok('detached child over a pre-mapped region (Temen text, on-ramp recipe) → 42082')
+    : fail(`detached run: ${JSON.stringify(det)}`);
+
   // The "JS powerbox" card: the page defines the guest's capabilities in JavaScript (`web/powerbox.js`
   // over the `temen_jspb_*` seam). Two editors — the Temen guest and the powerbox implementing it.
   // Running it proves the whole loop through the DOM: a capability reads the guest's window (the
@@ -380,6 +393,23 @@ try {
     ccp.state === 'done' && ccp.msg.includes('byte-identical')
       ? ok('chibicc interpreter ≡ wasm-JIT — byte-identical emitted IR (in-browser)')
       : fail(`chibicc parity: ${JSON.stringify(ccp)}`);
+
+    // The C twin of the `detached` card: `main` spawns `child` (a function of the same program) as
+    // a detached child with a SharedRegion pre-mapped into its fresh window; the child squares the
+    // numbers in place and the parent prints what it reads back. Compiled by chibicc, linked
+    // against the prebuilt libc, spawn + join reached as by-name `extern`s.
+    const detName = 'detached child over a pre-mapped region (chibicc → Temen)';
+    await runCard(page, detName, 60_000);
+    const dc = await page.evaluate((sel) => ({
+      state: document.querySelector(`${sel} .state`).dataset.state,
+      msg: document.querySelector(`${sel} .state`).textContent,
+      result: document.querySelector(`${sel} .result`).textContent.trim(),
+      out: document.querySelector(`${sel} .stdout`).textContent,
+    }), card(detName));
+    dc.state === 'done' && dc.result === '0'
+    && dc.out.includes('child returned 8; the region now holds: 1 4 9 16 25 36 49 64')
+      ? ok('detached child over a pre-mapped region (C → Temen, chibicc in-browser) → squares')
+      : fail(`detached C run: ${JSON.stringify({ state: dc.state, msg: dc.msg, result: dc.result, out: dc.out.slice(0, 120) })}`);
 
     // #include + printf: the seeded <stdio.h> makes a text-emitting program actually print (its
     // output shows in the stdout pane, above the emitted IR) instead of trapping on an unresolved call.

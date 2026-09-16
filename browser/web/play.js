@@ -386,6 +386,78 @@ block 0 (v0: i64) {
 `,
   },
 
+  detached: {
+    mode: 'onramp',
+    desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
+      '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **its own func 1** ' +
+      'as a DETACHED child — a fresh 128 KiB window of its own, nothing of the parent addressable — with ' +
+      'the region pre-mapped at 65536 of the child’s window before it starts. The child needs no ' +
+      'handle, no `map`, no page-size query: it reads 41 at 65536, stores 82 at 65544, returns 42. After ' +
+      '`join` the parent reads 82 back through its own mapping and returns 1000 × 42 + 82 = **42082**. ' +
+      'The parent finds its `instantiator`, `addrspace`, `budget` (the detached-window allowance) and ' +
+      '`module` (itself, spawnable) by name through `self.resolve` — the on-ramp powerbox, one thread, ' +
+      'the bulk data plane between a parent and a child whose memory it cannot otherwise address.',
+    src: `memory 17
+data 20480 "instantiator"
+data 20496 "addrspace"
+data 20512 "budget"
+data 20528 "module"
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vp0 = i64.const 20480
+  vl0 = i64.const 12
+  vinst = self.resolve vp0 vl0
+  vp1 = i64.const 20496
+  vl1 = i64.const 9
+  vas = self.resolve vp1 vl1
+  vp2 = i64.const 20512
+  vl2 = i64.const 6
+  vbud = self.resolve vp2 vl2
+  vp3 = i64.const 20528
+  vl3 = i64.const 6
+  vmod = self.resolve vp3 vl3
+  vlen = i64.const 65536
+  vrh64 = call.cap 5 5 (i64) -> (i64) vas (vlen)
+  vrh = i32.wrap_i64 vrh64
+  vwo = i64.const 65536
+  vro = i64.const 0
+  vprot = i32.const 3
+  vm0 = call.cap 4 0 (i64, i64, i64, i32) -> (i64) vrh (vwo, vro, vlen, vprot)
+  vin = i64.const 41
+  i64.store vwo vin
+  vb = i64.extend_i32_u vbud
+  vmh = i64.extend_i32_u vmod
+  vz = i64.const 0
+  vent = i64.const 1
+  vlog = i64.const 17
+  vreg = i64.extend_i32_u vrh
+  vc = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) vinst (vb, vmh, vz, vz, vent, vlog, vz, vz, vz, vreg, vwo)
+  vj = call.cap 6 1 (i32) -> (i64) vinst (vc)
+  vk = i64.const 1000
+  vm = i64.mul vj vk
+  vob = i64.const 65544
+  vo = i64.load vob
+  vr = i64.add vm vo
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 65536
+  vin = i64.load va
+  vtwo = i64.const 2
+  vout = i64.mul vin vtwo
+  vb = i64.const 65544
+  i64.store vb vout
+  vone = i64.const 1
+  vr = i64.add vin vone
+  return vr
+  }
+}
+`,
+  },
+
   'Debugger (Temen — breakpoints, step, variables)': {
     debug: true,
     bp: 7, // a breakpoint pre-placed on line 8 (0-based 7), the loop body
@@ -1001,6 +1073,83 @@ int main(void) {
   printf("  pi  ~ %.6f   (%%e: %e)\\n", pi, pi);
   printf("  e   ~ %.10g\\n", 2.718281828459045);
   printf("  1/7 = %.4f,  2^0.5 rounds to %.3g\\n", 1.0 / 7.0, 1.41421356);
+  return 0;
+}
+`,
+  },
+  'detached child over a pre-mapped region (chibicc → Temen)': {
+    kind: 'chibicc',
+    jit: false, // the parent spawns + joins a §5 detached child: interpreter-serviced, no wasm-JIT tier
+    wholeProgram: true, // `extern` capability calls are a whole-program construct (see runChibicc)
+    editable: true,
+    lang: 'c',
+    url: './assets/chibicc.temen',
+    mode: 'io',
+    desc: 'The **IR card above, in C**: `main` mints a SharedRegion, maps it into its own window, fills it ' +
+      'with 1…8, and spawns `child` — a function of this very program — as a **detached** child ' +
+      '(`Instantiator` op 15, the 11-arg form) with the region **pre-mapped** into the child’s fresh ' +
+      'window at the same offset. The child squares the numbers in place through plain pointer access — ' +
+      'it holds no handle and calls no capability — and after `join` the parent prints the results it ' +
+      'reads back through its own mapping. Everything the parent needs comes by name from the ' +
+      'powerbox (`__vm_resolve`: `instantiator`, `budget`, `module`) plus the `<temen.h>` region builtins; ' +
+      'the spawn and join are ordinary `extern`s the host binds by name. Compiled by chibicc in your ' +
+      'browser (whole-program: a capability `extern` is not a link symbol, so the libc is compiled in) ' +
+      'and run on the bytecode engine.',
+    src: `// A detached child that shares memory with its parent: the op-15 pre-mapped SharedRegion.
+//
+// The parent mints a SharedRegion, maps it into its own window, fills it with numbers, and spawns
+// \`child\` (a function of THIS program) as a DETACHED child: a fresh window of its own, with nothing
+// of the parent's memory addressable — except the region, which the runtime pre-maps into the
+// child's window at CHILD_OFF before it starts. The child squares the numbers in place; after join
+// the parent reads the results back through its own mapping. No copying, nothing for the child to
+// resolve or map: the shared pages are just memory at a fixed offset.
+#include <stdio.h>
+#include <temen.h>
+
+#define N 8
+#define REGION_LEN 65536 // one 64 KiB region (the map granule)
+// The child's view of the region: the 64 KiB page its data would occupy. It runs only \`child\` —
+// never \`_start\` or the libc — so that page is free, whatever window chibicc sized.
+#define CHILD_OFF 65536
+
+// The host binds these by name (temen_ir::default_cap_resolver); the first argument is the handle.
+extern long vm_budget_read(int budget, long field);
+extern long vm_instantiate_detached(int inst, long budget, long module, long grants_ptr, long grants_n,
+                                    long entry, long size_log2, long quota, long args_ptr, long args_len,
+                                    long region, long child_off);
+extern long vm_instantiate_join(int inst, long child);
+
+// The child entry. A detached child receives capability handles, not a data stack, so it keeps to
+// register locals and the pre-mapped pages.
+long child(long unused) {
+  long *p = (long *)CHILD_OFF;
+  for (int i = 0; i < N; i++) p[i] = p[i] * p[i];
+  return N;
+}
+
+int main(void) {
+  int inst = (int)__vm_resolve("instantiator", 12); // spawn authority
+  int budget = (int)__vm_resolve("budget", 6);       // the detached-window allowance
+  int module = (int)__vm_resolve("module", 6);       // this program, as a spawnable Module
+  // The allowance is one window's worth of detached memory — this program's own size — and a
+  // child's window must equal the program's declared memory, so the budget says how big both are.
+  long win = vm_budget_read(budget, 1); // field 1 = memory, in bytes
+  int lg = 0;
+  while ((1L << lg) < win) lg++;
+  int region = (int)__vm_region_create(REGION_LEN);
+  long *p = (long *)(win - REGION_LEN); // the parent's view: its top 64 KiB, above all its data
+  __vm_region_map(region, (long)p, 0, REGION_LEN, 3);
+  for (int i = 0; i < N; i++) p[i] = i + 1;
+  long h = vm_instantiate_detached(inst, budget, module, 0, 0, (long)child, lg, 0, 0, 0, region,
+                                   CHILD_OFF);
+  if (h < 0) {
+    printf("spawn refused: %ld\\n", h);
+    return 1;
+  }
+  long r = vm_instantiate_join(inst, h);
+  printf("child returned %ld; the region now holds:", r);
+  for (int i = 0; i < N; i++) printf(" %ld", p[i]);
+  printf("\\n");
   return 0;
 }
 `,
@@ -2602,7 +2751,10 @@ async function runChibicc(c) {
   // Separate compilation (#1392): with the prebuilt libc unit resident, compile the user's TU as a
   // *program unit* against libc declarations only and link — instead of compiling the libc in.
   const libH = await openPgLibc(rec, c);
-  const sep = libH >= 0;
+  // A card can opt out of separate compilation (`wholeProgram`): chibicc lowers an undefined `extern`
+  // to a **capability** import only in whole-program mode — in a program unit it is a link symbol
+  // (`--emit-object`), so a C program that reaches a capability by name compiles the libc in.
+  const sep = libH >= 0 && !ex.wholeProgram;
   const flags = gOn | (sep ? 2 /* CHIBICC_PROGRAM_UNIT */ : 0);
   runNote(rec, { srcBytes: srcBytes.length, debugInfo: !!gOn, prebuiltLibc: sep });
   const tCompile = performance.now();
@@ -4640,6 +4792,29 @@ async function runText(c) {
   const guest = parseGuest(c, rec, src);
   if (!guest) return;
 
+  // The `onramp` recipe: the same single-threaded host the pre-built C/C++ cards run on
+  // (`temen_run_onramp`) — a `_start` that resolves its powerbox **by name** (`self.resolve`), the
+  // named `instantiator`/`module`/`budget` grants a detached spawn needs, and a stdout pane. No
+  // Workers: a pre-mapped SharedRegion aliases the parent's pages into the child's window, which
+  // has no analogue across separate `WebAssembly.Memory`s (the par driver refuses it, by design).
+  if (mode === 'onramp') {
+    setState(c, 'running', 'running…');
+    const t0 = performance.now();
+    const { rv, status, stdout } = moduleInterp(guest, null);
+    const ms = runStage(rec, 'run:interpreter', performance.now() - t0).toFixed(0);
+    c.el.result.textContent = `${rv}`;
+    c.el.stdout.textContent = stdout;
+    if (status === 0 || status === 5) {
+      setState(c, 'done', `done · ${ms}ms`);
+      logTo(c, `run → ${rv} in ${ms}ms`);
+      runEnd(rec, { ok: true, status, result: `${rv}` });
+    } else {
+      setState(c, 'error', `run failed: status ${status} (1=decode 2=unsupported 3=trap)`);
+      runEnd(rec, { ok: false, status });
+    }
+    return;
+  }
+
   aborter = new AbortController();
   c.el.run.disabled = true;
   c.el.stop.disabled = false;
@@ -4819,6 +4994,7 @@ const POWERBOX_MODES = [
   ['io', 'host I/O (stdout)'],
   ['jit', 'guest JIT (§22)'],
   ['inst', 'instantiator (§14)'],
+  ['onramp', 'on-ramp host (named powerbox, one thread)'],
 ];
 
 function buildCard(name, ex) {

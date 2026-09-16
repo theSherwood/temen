@@ -65,6 +65,8 @@ fn bind_imports(h: &mut Host, m: &temen_ir::Module, handles: &[Value; 7]) {
         addrspace: hv(4),
         jit: Some(hv(6)),
         stderr: None,
+        instantiator: None,
+        budget: None,
     };
     let bindings = m
         .imports
