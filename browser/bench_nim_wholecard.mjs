@@ -146,6 +146,17 @@ const deciles = (name, series, func) => {
   console.log(`  ${row.join('  ')}`);
 };
 for (const e of (tm.nimsemTop || []).slice(0, 3)) deciles('nimsem', tm.nimsemSeries, e.func);
+// Name nimsem's exec bounces: the exec log's lines pair 1:1, in order, with the bounces of the wrapper
+// that made them — the top nimsem function whose bounce count equals the line count.
+{
+  const lines = (tm.nimsemExecLog || '').split('\n').filter(Boolean);
+  const top = (tm.nimsemTop || []).find((e) => e.n === lines.length);
+  if (lines.length && top) {
+    const s = (tm.nimsemSeries || []).filter((e) => e[0] === top.func);
+    console.log(`\nnimsem f${top.func}: the ${lines.length} execs it wrapped`);
+    lines.forEach((l, i) => console.log(`  ${fmt(s[i]?.[1] ?? NaN).padStart(8)}  ${l}`));
+  }
+}
 for (const e of (tm.hexerTop || []).slice(0, 3)) deciles('hexer', tm.hexerSeries, e.func);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;

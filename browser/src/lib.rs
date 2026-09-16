@@ -12188,6 +12188,23 @@ pub extern "C" fn temen_op13jit_phase_diag() -> usize {
     len
 }
 
+/// The `exec` calls the card's phases serviced since the last take — one `argv → exit` line each, in
+/// order ([`nimc::EXEC_LOG`]) — onto [`OUT`]; returns the length and clears the log. The lines pair 1:1
+/// with the `exec` wrapper's entries in the JS driver's bounce series, which is how the bench names
+/// each exec bounce (#1540 follow-up).
+#[no_mangle]
+pub extern "C" fn temen_op13jit_exec_log() -> usize {
+    let bytes = nimc::EXEC_LOG
+        .lock()
+        .map(|mut l| std::mem::take(&mut *l))
+        .unwrap_or_default()
+        .into_bytes();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; exclusive access to the OUT stash.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
 /// Read **any** file the phase child wrote to the shared memfs, by memfs key (no leading `/`), onto
 /// [`OUT`]; returns its length (`0` if absent). Lets the JS crawl read both `nimcache/<stem>.p.nif` and
 /// its `.p.deps.nif` sibling (the import list) a nifler `--deps` run produces.

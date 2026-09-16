@@ -591,6 +591,11 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
 /// `op13_nifler_crawl_matches_inline`), which is what nimsem reads back — so the grandchild's stdout is
 /// unobserved (empty), matching the phase-1 crawl's discard. Without `nifler_ce`, the inline
 /// [`run_phase`] path is kept (identical output either way).
+/// Every `exec` the nim card serviced in this process, one `argv → exit` line each, in order — taken
+/// (and cleared) by `temen_op13jit_exec_log`. The bench pairs the lines 1:1 with the `exec` wrapper's
+/// bounce series, so each of the card's exec bounces has a name and a cost (#1540 follow-up).
+pub(crate) static EXEC_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 pub(crate) fn make_exec(
     nifler: Arc<Module>,
     nifler_ce: Option<Arc<Module>>,
@@ -616,6 +621,10 @@ pub(crate) fn make_exec(
             Some(ce) => (vec![], run_phase_op13(ce, &argv_refs, &fs_factory)),
             None => run_phase(&nifler, &argv_refs, (fs_factory)(), None),
         };
+        if let Ok(mut log) = EXEC_LOG.lock() {
+            use std::fmt::Write;
+            let _ = writeln!(log, "{} → {exit}", argv.join(" "));
+        }
         Ok(vec![jobs.push(temen_exec::Job {
             stdout,
             stderr: vec![],

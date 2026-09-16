@@ -1352,6 +1352,9 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
 
   const tNimsem = now();
   const bNimsem = bounceStats.take(), fNimsem = foreignStats.take();
+  // The `exec` calls nimsem made (`argv → exit`, one per line, in order) — pair with the exec wrapper's
+  // bounces in `bNimsem.series` to name each. Older cdylib: no accessor, empty.
+  const nimsemExecLog = ex.temen_op13jit_exec_log ? dec.decode(readOut().slice(0, ex.temen_op13jit_exec_log())) : '';
   // ---- phase 3: hexer per module (tiered, 3-cap) — main gets the app-entry glue --------------------
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
@@ -1390,6 +1393,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       // Top bounced functions per phase by time (emitted-module function index, count, ms, max ms).
       nimsemTop: bNimsem.top, hexerTop: bHexer.top,
       nimsemSeries: bNimsem.series, hexerSeries: bHexer.series,
+      nimsemExecLog,
       // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
       crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
     },
