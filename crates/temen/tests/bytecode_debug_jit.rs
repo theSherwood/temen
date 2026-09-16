@@ -66,7 +66,9 @@ fn sched_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value
             SchedStop::Finished(r) => return r,
             SchedStop::Break { .. } => continue,
             // No blocking stdin in these runs: a stdin park would be as stuck as a deadlock.
-            SchedStop::Blocked | SchedStop::StdinPark { .. } => return Err(Trap::Malformed),
+            SchedStop::Blocked | SchedStop::StdinPark { .. } | SchedStop::CapPark { .. } => {
+                return Err(Trap::Malformed)
+            }
             // The whole point of this slice: a §22 op must NOT decline to the tree-walker.
             SchedStop::Declined => panic!("scheduled debug engine declined a §22 op"),
         }

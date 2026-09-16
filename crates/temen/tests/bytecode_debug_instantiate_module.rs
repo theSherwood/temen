@@ -76,9 +76,10 @@ fn drive_to_end(run: &mut ScheduledDebugRun, fuel: &mut u64) -> Result<Vec<Value
             SchedStop::Finished(r) => return r.map_err(|_| ()),
             SchedStop::Break { .. } => continue,
             // No blocking stdin in these runs: a stdin park would be as stuck as a deadlock.
-            SchedStop::Blocked | SchedStop::StdinPark { .. } | SchedStop::Declined => {
-                return Err(())
-            }
+            SchedStop::Blocked
+            | SchedStop::StdinPark { .. }
+            | SchedStop::CapPark { .. }
+            | SchedStop::Declined => return Err(()),
         }
     }
 }
