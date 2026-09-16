@@ -504,7 +504,11 @@ holds exactly `"EXEC"` (a *different program* did that I/O as the child's task) 
 Three enablers made it work, each a small correctness fix in its own right:
 
 - **chibicc builtins** `__vm_exec_module` (lowers to the `CAP_SELF_EXEC` self-op) and `__vm_resolve`
-  (`self.resolve`) — the C-level `execve` primitive and the named-cap-handle reader.
+  (`self.resolve`) — the C-level `execve` primitive and the named-cap-handle reader. (#1509 added the
+  spawn twins in the same mold: `__vm_instantiate_rec`/`__vm_instantiate_join` lower to static
+  `call.cap 6 17`/`6 1` on the caller's `Instantiator`, which `posix_libc/spawn.c`'s `vm_spawn`/`vm_join`
+  wrap — a static `call.cap` because an executor op reaches its seam only that way, never through a
+  manifest-bound `call.sym`.)
 - **Modules are re-grantable into a child** (`can_regrant`/`regrant_into_child` + `ModuleGrant: Clone`):
   a shell hands a command module to a child it will `execve`. And **`fork_powerbox` carries modules**
   (was fail-closed on a non-empty module table) — a shell that holds command modules can now fork.

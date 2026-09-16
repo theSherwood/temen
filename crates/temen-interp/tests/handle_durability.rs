@@ -357,3 +357,74 @@ fn restore_closes_the_slots_the_capture_does_not_carry() {
     );
     assert!(b.handle_live(out));
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1502 — a `Budget` is durable. Its whole state is four `i64`s of *remaining* quota, so it rides a
+// capture verbatim and a restore re-mints it. Carrying the remaining rather than re-granting fresh is
+// what keeps INVARIANTS #3's conservation across a freeze: what the domain already spent stays spent.
+// ---------------------------------------------------------------------------------------------
+
+use temen_interp::BudgetState;
+
+/// A budget that has been partly spent captures as its **remaining** quotas, restores into a fresh
+/// table at the same slot, and the guest-held handle then reads the same remaining — not the
+/// original grant.
+#[test]
+fn a_budget_round_trips_through_capture_restore_with_its_remaining_intact() {
+    let mut a = Host::new();
+    a.grant_clock();
+    let h = a.grant_budget_channel(7, 1 << 20, 3, -1); // `-1` channel: the unbounded encoding
+    assert!(a.budget_mem_take(h, 4096), "spend some of the mem quota");
+    let remaining = BudgetState {
+        fuel: 7,
+        mem: (1 << 20) - 4096,
+        spawn: 3,
+        channel: -1,
+    };
+
+    let captured = a
+        .capture_durable_handles()
+        .expect("a Budget is durable: the capture must not refuse it");
+    assert!(
+        captured
+            .iter()
+            .any(|c| c.binding == DurableBinding::Budget(remaining)),
+        "the capture carries the remaining quotas, not the original grant: {captured:?}"
+    );
+
+    let mut b = Host::new();
+    b.restore_durable_handles(&captured);
+    assert_eq!(
+        b.capture_durable_handles().unwrap(),
+        captured,
+        "restore reinstates the exact captured set, Budget included"
+    );
+    // The guest's handle value resolves to the re-minted entry, and `read(mem)` is the remaining.
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[1], None),
+        Ok(vec![remaining.mem]),
+        "read(mem) after restore is what was left at capture"
+    );
+    assert_eq!(
+        b.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[3], None),
+        Ok(vec![-1]),
+        "an unbounded field survives the two's-complement uleb"
+    );
+}
+
+/// The complement: a drain keeps a `Budget`, exactly as it keeps every other durable binding — a
+/// domain holding one no longer has to give up its minting authority to become snapshottable.
+#[test]
+fn a_drain_keeps_a_budget() {
+    let mut a = Host::new();
+    let h = a.grant_budget(1, 2, 3);
+    assert!(
+        a.drain_non_durable().is_empty(),
+        "nothing to drain: a Budget is durable"
+    );
+    assert_eq!(
+        a.cap_dispatch_slots(cap_id::BUDGET, 1, h, &[2], None),
+        Ok(vec![3]),
+        "the budget is untouched by the drain"
+    );
+}
