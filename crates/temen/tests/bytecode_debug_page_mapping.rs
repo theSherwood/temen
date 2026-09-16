@@ -153,7 +153,7 @@ fn page_mapping_root_checkpoint_snapshot_restore_round_trips() {
         checkpoints += 1;
 
         let mut warm = session();
-        warm.restore(&snap);
+        warm.restore(at_c.op_clock(), &snap);
         let mut i = c;
         assert_eq!(
             obs(&warm),
@@ -303,7 +303,7 @@ fn scheduled_page_mapping_checkpoint_snapshot_restore_round_trips() {
         }
 
         let mut warm = sched_session();
-        warm.restore(&snap);
+        warm.restore(at_c.op_turn(), &snap);
         let mut i = c;
         assert_eq!(
             sched_obs(&mut warm),

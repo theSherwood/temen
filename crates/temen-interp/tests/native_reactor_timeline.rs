@@ -162,7 +162,7 @@ impl MomentReactor for NativeReactor {
         if !self.inst.restore_window(m.layout()) {
             return false;
         }
-        m.restore_caps(&mut self.host);
+        m.restore_host(&mut self.host);
         true
     }
 }

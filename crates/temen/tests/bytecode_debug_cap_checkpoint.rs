@@ -178,7 +178,7 @@ fn a_named_host_capability_checkpoints_and_restores() {
         checkpoints += 1;
 
         let mut warm = session(true);
-        warm.restore(&snap);
+        warm.restore(at_c.op_clock(), &snap);
         let mut i = c;
         assert_eq!(
             obs(&warm),

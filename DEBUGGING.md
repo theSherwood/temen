@@ -787,7 +787,11 @@ the DAP backend keeps a `sched_checkpoints` ladder keyed on the global turn, and
 hold it to the same warm ≡ cold oracle. *Still open:* dirty-page-tracked window copies (today's
 snapshot is the full mapped prefix — #1459), RNG via a dedicated iface (vs a host-fn), and capturing
 a `SchedTape`/`CapTape` from a *JIT* execution (the interpreter is the debug engine by design, so this
-is lower priority).
+is lower priority). *The ladder itself is shared (#1460):* both this engine's `checkpoints` and the DAP
+backend's two ladders are `temen_interp::moment::Ladder<C>` over `Moment<C>` — the same type the
+playground's reactor keyframes use — keyed on the op clock or the global turn; only the continuation
+`C` is the engine's own. The tree-walk checkpoint's window is a `MemLayout` now rather than raw bytes
+(under `snapshot_safe` the two capture the same bytes; it is the one image form, #1456).
 
 ---
 

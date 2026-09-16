@@ -5949,7 +5949,7 @@ impl OnrampReactor {
         if !self.inst.restore_window(moment.layout()) {
             return false;
         }
-        moment.restore_caps(&mut self.host);
+        moment.restore_host(&mut self.host);
         true
     }
 }
@@ -6136,7 +6136,7 @@ impl SharedOnrampReactor {
         if !self.reactor.restore_window(moment.layout()) {
             return false;
         }
-        moment.restore_caps(&mut self.host.lock().unwrap());
+        moment.restore_host(&mut self.host.lock().unwrap());
         true
     }
 }
@@ -6464,7 +6464,7 @@ impl JitOnrampReactor {
             return false;
         }
         self.back.write_from(0, moment.layout().bytes());
-        moment.restore_caps(&mut self.host);
+        moment.restore_host(&mut self.host);
         true
     }
 }

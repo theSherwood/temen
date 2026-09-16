@@ -1,59 +1,209 @@
-//! **Reactor moments and timelines** — capture a reactor at a frame boundary, restore it, and scrub
-//! (#1454's first cell; #1457).
+//! **Moments and ladders** — capture a run at a boundary, hold a ring of captures, scrub between them
+//! (#1454, #1460).
 //!
-//! A reactor's `tick` returns to the host every frame, so between frames there is no guest stack, no
-//! shadow stack and no handle table: a *moment* is one window image plus a few host-side words. That
-//! is why this costs a memcpy rather than the `temen-durable` instrumentation an arbitrary-safepoint
-//! freeze needs (DURABILITY.md §2), and why it works identically on every tier.
+//! Three time-travel routes grew up here separately: the tree-walk `Inspector`'s seek checkpoints, the
+//! bytecode engine's `DebugRun`/`ScheduledDebugRun` snapshots behind the DAP backend, and the reactor
+//! moments behind the playground's scrub bar. Each captured the same two things — a window image and
+//! the host's run-mutable substate — plus its own idea of a continuation, and each kept its own sorted
+//! ladder of them with its own stride, dedupe, nearest-at-or-before and drop-past logic. Four copies
+//! of one data structure is four things to keep correct (INVARIANTS #15), and the two that had a
+//! memory bound disagreed about it.
 //!
-//! This lives beside [`MemLayout`] and [`Host`] rather than in an embedder because **one** ladder
-//! serves every reactor there is — the engine-backed interpreter reactor, one over a caller-owned
-//! region, the wasm-JIT reactor whose tick the embedder runs, and a native driver. A ladder that an
-//! embedder could not reach would be answered by that embedder growing its own, which is how a
-//! behaviour ends up with two implementations that drift (INVARIANTS #15).
+//! This module is the one shape. [`Moment<C>`] is the shared halves plus a continuation `C` the engine
+//! chooses; [`Ladder<C>`] is the sorted, stride-gated, bounded ring of them; every driver keys it on its
+//! own monotonic coordinate (an op clock, a scheduler turn, a frame tick) and never has to say which.
+//! It is deliberately **driver-agnostic**: it owns no reactor, runs no tick, and knows nothing about
+//! who does — so it lands before the run loops it serves converge (#1414) rather than waiting on them.
+//!
+//! What is *not* unified yet is the continuation itself. The tree-walker's is a frame vector, the
+//! single-vCPU bytecode engine's a `Vm` plus fibers, the scheduled engine's a task set plus child
+//! environments, and a reactor has none at all. They are one type parameter here, not one enum,
+//! because collapsing them into one restore path is the same work as collapsing the engines' run loops
+//! — that is #1460's second half, inside #1414.
 
-use crate::{Host, MemLayout};
+use crate::{Host, HostReplaySubstate, MemLayout};
 
-/// A **moment** of a reactor: everything needed to put the guest back exactly where it was at a frame
-/// boundary — the window image (bytes + page-protection map) and each capability's own declared state.
+/// A **moment** of a run: the window image, the host's run-mutable substate, and a continuation `C`.
 ///
-/// The capability half is exactly what [`Host::capture_cap_states`] yields and
-/// [`Host::restore_cap_states`] takes back — the same bytes a §12 freeze writes into the artifact's
-/// named-capability section, so an in-session rewind and a save-state cannot drift apart (#1455).
+/// The first two are the same for every engine and are captured and restored here, once. `mem` is
+/// `None` for a memoryless run. `host` is [`Host::replay_substate`] — streams, the deterministic clock,
+/// the cap-tape cursor, serve state, growth accounting, and each named capability's own declared state
+/// (#1455) — the identical set a §12 freeze writes into an artifact, so a moment and a save-state
+/// cannot disagree about what "the host's state" is (INVARIANTS #13).
 ///
-/// Restoring a moment gives **rewind**; keeping several gives a keyframe ladder; re-running the guest
-/// forward over recorded input gives the frames between two rungs. A moment restored into a fresh
-/// reactor is a save-state; restored twice, a branch.
-pub struct ReactorMoment {
-    layout: MemLayout,
-    /// Each host capability's own state, positional over the host's capability table.
-    caps: Vec<Option<Vec<u8>>>,
+/// `C` is whatever the engine needs to resume execution from this boundary: `()` for a reactor
+/// (its `tick` returns to the host every frame, so between frames there is nothing to resume — which
+/// is why a reactor moment is a memcpy and no more), or an engine's frames. It is opaque to this
+/// module and to a [`Ladder`].
+pub struct Moment<C> {
+    mem: Option<MemLayout>,
+    host: HostReplaySubstate,
+    continuation: C,
 }
 
-impl ReactorMoment {
-    /// Capture `layout` together with `host`'s capability state — the two halves of a moment, taken
-    /// at one instant so they describe the same one.
-    pub fn capture(layout: MemLayout, host: &Host) -> ReactorMoment {
-        ReactorMoment {
-            layout,
-            caps: host.capture_cap_states(),
+impl<C> Moment<C> {
+    /// Capture `mem` and `host`'s substate together with `continuation`, at one instant so the three
+    /// halves describe the same one.
+    pub fn new(mem: Option<MemLayout>, host: &Host, continuation: C) -> Moment<C> {
+        Moment {
+            mem,
+            host: host.replay_substate(),
+            continuation,
         }
     }
 
-    /// The window image, for the reactor to seed back into whatever holds its window.
-    pub fn layout(&self) -> &MemLayout {
-        &self.layout
+    /// The window image, for the engine to seed back into whatever holds its window.
+    pub fn mem(&self) -> Option<&MemLayout> {
+        self.mem.as_ref()
     }
 
-    /// Put the capability half back into `host` — the other side of [`capture`](Self::capture).
-    pub fn restore_caps(&self, host: &mut Host) {
-        host.restore_cap_states(&self.caps);
+    /// The engine's half.
+    pub fn continuation(&self) -> &C {
+        &self.continuation
     }
 
-    /// The window image's byte length — what holding this moment costs (the capability half is a
-    /// handful of words). A ladder sizes its ring against this.
+    /// Put the host half back — the other side of [`new`](Self::new).
+    pub fn restore_host(&self, host: &mut Host) {
+        host.restore_replay_substate(&self.host);
+    }
+
+    /// What holding this moment costs: the window image's byte length (the other halves are a
+    /// handful of words, or the engine's frames). A ladder sizes its ring against this.
     pub fn byte_len(&self) -> usize {
-        self.layout.byte_len()
+        self.mem.as_ref().map_or(0, MemLayout::byte_len)
+    }
+}
+
+/// A reactor's moment: a window image and the host substate, with no continuation.
+///
+/// A reactor's `tick` returns to the host every frame, so at a frame boundary there is no guest stack,
+/// no shadow stack and no handle table to serialize. That is why this costs a memcpy rather than the
+/// `temen-durable` instrumentation an arbitrary-safepoint freeze needs (DURABILITY.md §2), and why it
+/// works identically on every tier. Restoring one gives **rewind**; a [`Ladder`] of them gives a
+/// keyframe ladder; re-running the guest forward over recorded input gives the frames between rungs. A
+/// moment restored into a fresh reactor is a save-state; restored twice, a branch.
+pub type ReactorMoment = Moment<()>;
+
+impl Moment<()> {
+    /// Capture `layout` with `host`'s substate — a reactor moment.
+    pub fn capture(layout: MemLayout, host: &Host) -> ReactorMoment {
+        Moment::new(Some(layout), host, ())
+    }
+
+    /// The window image. A reactor moment always carries one — it is only ever built by
+    /// [`capture`](Self::capture), which takes it by value.
+    pub fn layout(&self) -> &MemLayout {
+        self.mem
+            .as_ref()
+            .expect("a reactor moment is built from a window image and always carries it")
+    }
+}
+
+/// A sorted ring of [`Moment`]s keyed on a monotonic coordinate — a keyframe ladder.
+///
+/// Every time-travel driver needs the same five operations over its captures: is a rung due at this
+/// coordinate; take one; find the nearest at or before a target; drop everything past a position
+/// (a branch); and keep the set bounded. The coordinate's *meaning* — an op clock, a scheduler turn, a
+/// frame tick — is the driver's, and the ladder never has to know it.
+///
+/// Bounds are a ring size and a byte budget, whichever bites first, and both are optional (`0`). The
+/// **lowest rung is pinned** and never evicted, so every position from the first capture onward stays
+/// reachable — at worst by replaying the whole tail. A ring that could evict the start would leave a
+/// stretch of a scrub track the viewer can see and cannot drag to. Of the rest, eviction drops the rung
+/// furthest from the working position, so the ladder stays dense around wherever the driver is —
+/// oldest-first would evict a rung just re-taken while scrubbing back.
+pub struct Ladder<C> {
+    /// Ascending by coordinate; no two share one.
+    rungs: Vec<(u64, Moment<C>)>,
+    stride: u64,
+    ring: usize,
+    budget: usize,
+}
+
+impl<C> Ladder<C> {
+    /// A ladder with a rung due every `stride` coordinates, holding at most `ring` rungs and
+    /// `budget` bytes of window image — `0` for either bound means unbounded. `stride` is clamped to
+    /// at least 1.
+    pub fn new(stride: u64, ring: usize, budget: usize) -> Ladder<C> {
+        Ladder {
+            rungs: Vec::new(),
+            stride: stride.max(1),
+            ring,
+            budget,
+        }
+    }
+
+    /// Whether a rung is held at exactly `coord`.
+    pub fn holds(&self, coord: u64) -> bool {
+        self.rungs.binary_search_by_key(&coord, |(c, _)| *c).is_ok()
+    }
+
+    /// Whether `coord` is a rung boundary the ladder does not yet hold.
+    pub fn is_due(&self, coord: u64) -> bool {
+        coord.is_multiple_of(self.stride) && !self.holds(coord)
+    }
+
+    /// Hold `moment` at `coord`, keeping the ladder sorted and bounded. A coordinate already held is
+    /// left as it was: a replay re-crossing a rung it took on the way out captures the same state, so
+    /// there is nothing to replace.
+    pub fn take(&mut self, coord: u64, moment: Moment<C>) {
+        let Err(at) = self.rungs.binary_search_by_key(&coord, |(c, _)| *c) else {
+            return;
+        };
+        self.rungs.insert(at, (coord, moment));
+        self.evict(coord);
+    }
+
+    /// The nearest rung at or before `coord`, with its coordinate — where a seek to `coord` restarts.
+    /// `None` if nothing is held that early.
+    pub fn nearest_at_or_before(&self, coord: u64) -> Option<(u64, &Moment<C>)> {
+        let n = self.rungs.partition_point(|(c, _)| *c <= coord);
+        self.rungs[..n].last().map(|(c, m)| (*c, m))
+    }
+
+    /// Drop every rung past `coord` — the recorded future is being abandoned.
+    pub fn truncate_after(&mut self, coord: u64) {
+        let n = self.rungs.partition_point(|(c, _)| *c <= coord);
+        self.rungs.truncate(n);
+    }
+
+    /// Drop every rung.
+    pub fn clear(&mut self) {
+        self.rungs.clear();
+    }
+
+    /// How many rungs are held.
+    pub fn len(&self) -> usize {
+        self.rungs.len()
+    }
+
+    /// Whether none are.
+    pub fn is_empty(&self) -> bool {
+        self.rungs.is_empty()
+    }
+
+    /// The coordinates held, ascending.
+    pub fn coords(&self) -> Vec<u64> {
+        self.rungs.iter().map(|(c, _)| *c).collect()
+    }
+
+    /// What the ladder is holding, in bytes: the sum of its rungs' window images.
+    pub fn held_bytes(&self) -> usize {
+        self.rungs.iter().map(|(_, m)| m.byte_len()).sum()
+    }
+
+    /// Bring the ladder back inside both bounds, never below the pinned lowest rung. `here` is the
+    /// working position — the coordinate just taken — which the survivors stay dense around.
+    fn evict(&mut self, here: u64) {
+        while self.rungs.len() > 1
+            && ((self.ring > 0 && self.rungs.len() > self.ring)
+                || (self.budget > 0 && self.held_bytes() > self.budget))
+        {
+            let victim = (1..self.rungs.len())
+                .max_by_key(|&i| self.rungs[i].0.abs_diff(here))
+                .expect("len > 1, so there is a rung after the pinned one");
+            self.rungs.remove(victim);
+        }
     }
 }
 
@@ -112,38 +262,34 @@ pub trait SteppableReactor: MomentReactor {
     fn step(&mut self) -> i32;
 }
 
-/// The two things that turn a rewind into a **scrub**: a tick-indexed input tape and a keyframe
-/// ladder (#1457 items 3–4).
+/// A [`Ladder`] of reactor moments plus a tick-indexed input tape — the two things that turn a rewind
+/// into a **scrub** (#1457).
 ///
 /// A [`ReactorMoment`] on its own only goes *back* to a point someone thought to save. A timeline
 /// records what the driver fed the guest each tick, so any recorded position can be reconstructed —
-/// restore the nearest rung at or before it, then re-feed the tape forward. Keyframe stride trades
-/// memory for seek latency; the tape is a few words per tick either way.
+/// restore the nearest rung at or before it, then re-feed the tape forward.
 ///
 /// It does not own the reactor. Two reasons, both load-bearing: an embedder keeps its reactors in
 /// their own storage (the browser cdylib has one static per tier), and the wasm-JIT tier's tick is run
-/// by the embedder rather than by Rust, so the timeline has to be drivable from outside. One ladder
-/// covers all of it, parameterized by stride, ring size, byte budget and who runs the tick, rather
-/// than each driver growing its own (INVARIANTS #15).
+/// by the embedder rather than by Rust, so the timeline has to be drivable from outside.
 ///
 /// ## Why the tape records the driver, not the guest
 ///
 /// The obvious move is [`Host::record_caps`], which tapes every `HOST_PROC` crossing so a replay can
 /// serve them without a live powerbox — the seam the debug checkpoint ladder rides. A reactor needs
-/// none of it, and it is worth saying why, because the cost of getting this wrong is large: for Doom
-/// that tape would carry every `display.present` and the `mem_writes` of every `fs` read, which is
-/// approximately the whole WAD, per keyframe interval.
+/// none of it: it replays against its **live** powerbox — the same capabilities, still granted — and
+/// everything those capabilities read from is already inside the moment (the input queues and any
+/// `fs` cursors are captured cap state; the window is the image). Given the same starting moment and
+/// the same driver input, the guest's crossings *recompute* identically. The only thing outside the
+/// moment is what the host injects from the outside world, which is exactly what this tape holds. For
+/// Doom, taping the crossings instead would have carried every `display.present` and the `mem_writes`
+/// of every `fs` read — roughly the WAD — per keyframe interval.
 ///
-/// The reason it is unnecessary is that a reactor replays against its **live** powerbox — the same
-/// capabilities, still granted — and everything those capabilities read from is already inside the
-/// moment: the input queues and any `fs` cursors are captured cap state, and the window is the image.
-/// So given the same starting moment and the same driver input, the guest's crossings *recompute*
-/// identically instead of needing to be served from a recording. The only thing outside the moment is
-/// what the host injects from the outside world, which is exactly what this tape holds.
-///
-/// That is also the boundary of the claim: a reactor granted a genuinely nondeterministic capability
-/// — a wall clock, entropy, a socket — would need its crossings taped as well, and the honest move
-/// then is the recorded-input predicate on `record_caps` that #1457 sketched, not a second tape.
+/// So what a tape must hold is decided by whether the powerbox survives the restore: rebuilt (the
+/// debug ladder) ⇒ tape the guest's crossings; kept (a reactor) ⇒ tape the host's injections. A
+/// reactor granted a genuinely nondeterministic capability — a wall clock, entropy, a socket — would
+/// need its crossings taped as well, and the honest move then is a recorded-input predicate on
+/// `record_caps`, not a second tape.
 ///
 /// ## Positions
 ///
@@ -152,7 +298,7 @@ pub trait SteppableReactor: MomentReactor {
 /// *extends* the recording with whatever input has been pushed; when `tick < len` the timeline is
 /// parked inside its own history and `frame` *replays* the recorded input for that tick instead.
 /// Pushing input while parked in the past abandons the rest of the recording — that is a branch, and
-/// the tape and keyframes past that point describe a run that will not happen.
+/// the tape and rungs past that point describe a run that will not happen.
 pub struct ReactorTimeline {
     /// Frames presented so far — the position on the timeline.
     tick: usize,
@@ -160,14 +306,8 @@ pub struct ReactorTimeline {
     tape: Vec<Vec<ReactorInput>>,
     /// Input offered for a tick that has not run yet.
     pending: Vec<ReactorInput>,
-    /// Keyframes, ascending by tick. `keyframes[0]` is tick 0 and is never evicted, so **every**
-    /// recorded position stays reachable — at worst by replaying the whole tape. A ring that could
-    /// evict it would leave the start of a run unreachable, which for a scrub bar means a region of
-    /// the track the viewer can see and cannot drag to.
-    keyframes: Vec<(usize, ReactorMoment)>,
-    stride: usize,
-    ring: usize,
-    budget: usize,
+    /// The keyframes, keyed on tick.
+    ladder: Ladder<()>,
 }
 
 impl ReactorTimeline {
@@ -184,10 +324,7 @@ impl ReactorTimeline {
             tick: 0,
             tape: Vec::new(),
             pending: Vec::new(),
-            keyframes: Vec::new(),
-            stride: stride.max(1),
-            ring: ring.max(1),
-            budget,
+            ladder: Ladder::new(stride as u64, ring.max(1), budget),
         }
     }
 
@@ -209,12 +346,27 @@ impl ReactorTimeline {
 
     /// The ticks currently held as keyframes, ascending — the ladder's rungs.
     pub fn keyframe_ticks(&self) -> Vec<usize> {
-        self.keyframes.iter().map(|(t, _)| *t).collect()
+        self.ladder
+            .coords()
+            .into_iter()
+            .map(|c| c as usize)
+            .collect()
     }
 
     /// What the ladder is holding, in bytes: the sum of its rungs' window images.
     pub fn held_bytes(&self) -> usize {
-        self.keyframes.iter().map(|(_, m)| m.byte_len()).sum()
+        self.ladder.held_bytes()
+    }
+
+    /// The ticks whose recorded input is non-empty, ascending — where the driver actually did
+    /// something, for a scrub track that marks it.
+    pub fn taped_ticks(&self) -> Vec<usize> {
+        self.tape
+            .iter()
+            .enumerate()
+            .filter(|(_, evs)| !evs.is_empty())
+            .map(|(t, _)| t)
+            .collect()
     }
 
     /// Offer a key event for the next tick. Offered while parked in the past, this **branches**: the
@@ -246,19 +398,7 @@ impl ReactorTimeline {
             return;
         }
         self.tape.truncate(self.tick);
-        let here = self.tick;
-        self.keyframes.retain(|(t, _)| *t <= here);
-    }
-
-    /// The ticks whose recorded input is non-empty, ascending — where the driver actually did
-    /// something, for a scrub track that marks it.
-    pub fn taped_ticks(&self) -> Vec<usize> {
-        self.tape
-            .iter()
-            .enumerate()
-            .filter(|(_, evs)| !evs.is_empty())
-            .map(|(t, _)| t)
-            .collect()
+        self.ladder.truncate_after(self.tick as u64);
     }
 
     /// Open the tick at this position: take a rung if one is due, then hand the reactor its input —
@@ -273,7 +413,14 @@ impl ReactorTimeline {
     /// replay from the rung at `t` feeds it exactly once. Were the rung taken after, that input would
     /// sit in both and every replay would double it.
     pub fn begin_tick<R: MomentReactor + ?Sized>(&mut self, r: &mut R) {
-        self.keyframe_here(r);
+        let coord = self.tick as u64;
+        if self.ladder.is_due(coord) {
+            // An uncapturable window leaves the ladder as it was and `seek` refuses rather than
+            // holding a partial image that would restore a fiction (#9c).
+            if let Some(m) = r.moment() {
+                self.ladder.take(coord, m);
+            }
+        }
         if self.tick == self.tape.len() {
             self.tape.push(std::mem::take(&mut self.pending));
         }
@@ -313,14 +460,13 @@ impl ReactorTimeline {
         if target >= self.tick {
             return true; // replay forward from here; no rewind needed
         }
-        let Some(i) = self.keyframes.iter().rposition(|(t, _)| *t <= target) else {
+        let Some((at, m)) = self.ladder.nearest_at_or_before(target as u64) else {
             return false; // nothing captured at or before `target` — refuse, never guess (#9c)
         };
-        let at = self.keyframes[i].0;
-        if !r.restore(&self.keyframes[i].1) {
+        if !r.restore(m) {
             return false;
         }
-        self.tick = at;
+        self.tick = at as usize;
         true
     }
 
@@ -340,39 +486,130 @@ impl ReactorTimeline {
         }
         true
     }
+}
 
-    /// Take a rung if this boundary is one and we are not already holding it. A replay re-takes a rung
-    /// it crossed on the way out and has since evicted, which is what keeps the ladder dense around
-    /// wherever the driver is working.
-    fn keyframe_here<R: MomentReactor + ?Sized>(&mut self, r: &mut R) {
-        if !self.tick.is_multiple_of(self.stride) {
-            return;
-        }
-        let Err(at) = self.keyframes.binary_search_by_key(&self.tick, |(t, _)| *t) else {
-            return; // already held for this tick
-        };
-        let Some(m) = r.moment() else {
-            return; // an uncapturable window: the ladder stays empty and `seek` refuses, rather than
-                    // holding a partial image that would restore a fiction (#9c)
-        };
-        self.keyframes.insert(at, (self.tick, m));
-        self.evict();
+#[cfg(test)]
+mod ladder_tests {
+    //! The ladder's contract, on its own — no engine, no reactor. Every driver's seek/scrub/rewind
+    //! correctness rests on these five operations behaving exactly so, and the engine suites gate
+    //! them only through a whole seek; this pins them directly.
+
+    use super::*;
+
+    /// A moment whose window is `pages` 4 KiB pages, so byte bounds are testable.
+    fn moment(pages: usize) -> Moment<()> {
+        let n = pages * 4096;
+        let layout = MemLayout::from_parts(vec![0; n], 4096, n as u64, &[])
+            .expect("a whole number of pages is a valid layout");
+        Moment::new(Some(layout), &Host::new(), ())
     }
 
-    /// Bring the ladder back inside both bounds, never below the pinned tick-0 rung.
-    fn evict(&mut self) {
-        while self.keyframes.len() > 1
-            && (self.keyframes.len() > self.ring
-                || (self.budget > 0 && self.held_bytes() > self.budget))
-        {
-            // Tick 0 is pinned; of the rest, drop whichever rung is furthest from where we are, so the
-            // ladder stays dense around the working position instead of around where the run started.
-            // Dropping the *oldest* would evict a rung we just re-took while scrubbing back.
-            let here = self.tick;
-            let victim = (1..self.keyframes.len())
-                .max_by_key(|&i| self.keyframes[i].0.abs_diff(here))
-                .expect("len > 1, so there is a rung after the pinned one");
-            self.keyframes.remove(victim);
+    #[test]
+    fn rungs_stay_sorted_and_a_coordinate_is_held_once() {
+        let mut l: Ladder<()> = Ladder::new(4, 0, 0);
+        for c in [8u64, 0, 16, 4, 8] {
+            l.take(c, moment(1));
         }
+        assert_eq!(
+            l.coords(),
+            vec![0, 4, 8, 16],
+            "sorted on insert, duplicates ignored"
+        );
+        assert!(l.holds(8) && !l.holds(12));
+        assert!(
+            l.is_due(12) && !l.is_due(8) && !l.is_due(13),
+            "due = on-stride and not held"
+        );
+    }
+
+    #[test]
+    fn nearest_at_or_before_is_where_a_seek_restarts() {
+        let mut l: Ladder<()> = Ladder::new(1, 0, 0);
+        assert!(
+            l.nearest_at_or_before(5).is_none(),
+            "an empty ladder has nowhere to restart"
+        );
+        for c in [4u64, 8, 12] {
+            l.take(c, moment(1));
+        }
+        assert_eq!(
+            l.nearest_at_or_before(3).map(|(c, _)| c),
+            None,
+            "nothing that early"
+        );
+        assert_eq!(
+            l.nearest_at_or_before(4).map(|(c, _)| c),
+            Some(4),
+            "exact hit"
+        );
+        assert_eq!(
+            l.nearest_at_or_before(11).map(|(c, _)| c),
+            Some(8),
+            "between rungs"
+        );
+        assert_eq!(
+            l.nearest_at_or_before(100).map(|(c, _)| c),
+            Some(12),
+            "past the end"
+        );
+    }
+
+    #[test]
+    fn truncate_after_drops_the_abandoned_future_only() {
+        let mut l: Ladder<()> = Ladder::new(1, 0, 0);
+        for c in [0u64, 4, 8, 12] {
+            l.take(c, moment(1));
+        }
+        l.truncate_after(8);
+        assert_eq!(
+            l.coords(),
+            vec![0, 4, 8],
+            "a rung at the position itself survives"
+        );
+        l.truncate_after(100);
+        assert_eq!(l.len(), 3, "a no-op past the end");
+    }
+
+    #[test]
+    fn the_ring_pins_the_lowest_rung_and_drops_the_one_furthest_from_here() {
+        let mut l: Ladder<()> = Ladder::new(1, 3, 0);
+        for c in [0u64, 10, 20, 30] {
+            l.take(c, moment(1));
+        }
+        // Taking 30 with here=30: of {10, 20, 30}, 10 is furthest from 30 and goes; 0 is pinned.
+        assert_eq!(l.coords(), vec![0, 20, 30]);
+        // Scrubbing back: re-take 10 with here=10 — now 30 is furthest and goes, not the rung just
+        // taken (oldest-first would have evicted 10 immediately).
+        l.take(10, moment(1));
+        assert_eq!(l.coords(), vec![0, 10, 20]);
+        assert!(
+            l.holds(0),
+            "the start of the run stays reachable however long it goes on"
+        );
+    }
+
+    #[test]
+    fn the_byte_budget_binds_before_the_count_does() {
+        // Room for two one-page rungs against a count that would allow sixteen.
+        let mut l: Ladder<()> = Ladder::new(1, 16, 2 * 4096 + 100);
+        for c in [0u64, 1, 2, 3] {
+            l.take(c, moment(1));
+        }
+        assert_eq!(l.len(), 2, "two rungs fit the budget: {:?}", l.coords());
+        assert!(l.held_bytes() <= 2 * 4096 + 100);
+        assert!(l.holds(0), "and the pin survives a budget that tight");
+    }
+
+    #[test]
+    fn zero_bounds_mean_unbounded() {
+        let mut l: Ladder<()> = Ladder::new(1, 0, 0);
+        for c in 0..64u64 {
+            l.take(c, moment(1));
+        }
+        assert_eq!(
+            l.len(),
+            64,
+            "the debug ladders' shape: nothing is ever evicted"
+        );
     }
 }
