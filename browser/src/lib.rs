@@ -7038,6 +7038,7 @@ impl JitOnrampRun {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)] // the one open path every JIT on-ramp shape funnels into
     fn open_over_run(
         m: &temen_ir::Module,
         back: std::sync::Arc<temen_interp::Region>,
@@ -15719,23 +15720,6 @@ block 0 () {
         assert_eq!(temen_op13jit_counter(), 0, "close cleared the loop state");
     }
 
-    /// Inflate a committed `.gz` asset with the system `gzip` (mirrors nimc's test helper).
-    fn inflate(path: &str) -> Option<Vec<u8>> {
-        use std::io::Write;
-        let bytes = std::fs::read(path).ok()?;
-        let mut c = std::process::Command::new("gzip")
-            .args(["-dc"])
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .ok()?;
-        let mut stdin = c.stdin.take()?;
-        std::thread::spawn(move || {
-            let _ = stdin.write_all(&bytes);
-        });
-        let out = c.wait_with_output().ok()?;
-        out.status.success().then_some(out.stdout)
-    }
 }
 
 // ===== Region::Foreign host seam (#1284, DETACHED_JIT.md §3.3) ====================================
