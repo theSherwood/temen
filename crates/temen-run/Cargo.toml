@@ -48,6 +48,9 @@ temen-peval.workspace = true
 temen-opt.workspace = true
 
 [dev-dependencies]
+# #1236: the Forth session freeze/thaw tests serialize the kernel's durable domain through the §12
+# codec. Test-only; temen-snapshot depends on temen-interp only, so no cycle.
+temen-snapshot.workspace = true
 # W4 (NIM.md §3c): run a *real* temen-leng-compiled program as an isolated `domain_exec` child, not a
 # hand-written stand-in phase. Test-only, and temen-leng does not depend on temen-run, so no cycle.
 temen-leng = { path = "../temen-leng" }

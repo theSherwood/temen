@@ -1081,13 +1081,24 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  ; memory present, size_log2 20 (must match this kernel's window); no shadow arena — a unit is
-  ; not itself a freezable module (the domain's arena is this kernel's own declaration)
+  ; memory present, size_log2 20, shadow arena [0x74000, 0x80000): a unit declares the SAME window
+  ; as this kernel (the validator's memory-match precondition), arena included — under a durable
+  ; `Jit` grant the unit is instrumented for freeze/thaw before verify, and the transform reads the
+  ; arena from the declaration (INVARIANTS.md #16: no default placement). uleb128 of the two bounds.
   one = i64.const 1
   call 30 (one)
   twenty = i64.const 20
   call 30 (twenty)
-  call 30 (z)
+  call 30 (one)
+  c80 = i64.const 128
+  call 30 (c80)
+  call 30 (c80)
+  c1d = i64.const 29
+  call 30 (c1d)
+  call 30 (c80)
+  call 30 (c80)
+  c20 = i64.const 32
+  call 30 (c20)
   ; no data, no imports, no exports
   call 30 (z)
   call 30 (z)

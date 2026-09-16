@@ -153,3 +153,75 @@ fn an_unarmed_durable_run_is_untouched() {
         "never entered UNWINDING"
     );
 }
+
+// Root resumes a fiber twice; the fiber yields `1`, then `resumed + 1`. Uninterrupted: `(1, 11)`.
+const SRC_REDELIVERY: &str = "memory 18 shadow 16448 65536\n\
+    func () -> (i64, i64) {\n\
+    block 0 () {\n\
+    \x20 v1 = ref.func 1\n\
+    \x20 v2 = i64.const 4096\n\
+    \x20 v3 = cont.new v1 v2\n\
+    \x20 v5 = i64.const 0\n\
+    \x20 v6, v7 = cont.resume v3 v5\n\
+    \x20 v8 = i64.const 10\n\
+    \x20 v9, v10 = cont.resume v3 v8\n\
+    \x20 return v7 v10\n\
+      }\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block 0 (v0: i64, v1: i64) {\n\
+    \x20 v2 = i64.const 1\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.add v3 v2\n\
+    \x20 v5 = suspend v4\n\
+    \x20 v6 = i64.const 0\n\
+    \x20 return v6\n\
+      }\n\
+    }\n";
+
+/// **Known gap, pinned (#1538).** Arming at the `cont.resume` of an *already-parked* fiber
+/// (safepoint 3 here) promotes to `UNWINDING` before the resume is performed, so the fiber's
+/// `suspend` returns the delivered `10` and its trailing poll unwinds it at the `Yield` point —
+/// which spills `out − nres`, dropping the delivered value. On thaw the root re-issues the resume
+/// and the fiber's `Yield` arm **re-parks** with its old value, so the resumer sees `(SUSPENDED, 1)`
+/// a second time instead of the fiber running forward with `10`: the thaw returns `(1, 1)`, not the
+/// uninterrupted `(1, 11)`. Arming at a `suspend` safepoint (2 or 4) or freezing from the start is
+/// correct. This asserts the *current* behaviour so the fix flips it deliberately.
+#[test]
+fn a_resume_of_a_parked_fiber_frozen_mid_delivery_replays_the_old_yield() {
+    use temen_durable::begin_thaw;
+
+    let mut m = temen_text::parse_module(SRC_REDELIVERY).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = transform_module(&m).expect("transform");
+    temen_verify::verify_module(&inst).expect("verify");
+
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 3);
+    let mut fuel = 100_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut fhost);
+    assert!(r.is_ok(), "freeze returns a placeholder: {r:?}");
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "froze at resume #2");
+    let frozen = fhost.frozen_fibers().to_vec();
+    assert_eq!(frozen.len(), 1, "the in-flight fiber was captured");
+
+    let mut thaw_win = snap;
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.set_frozen_fibers(frozen);
+    let mut fuel = 100_000u64;
+    let (r, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &thaw_win, SIZE_LOG2, &mut thost);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(1), Value::I64(1)]),
+        "#1538: the thaw replays the old yield (fixed ⇒ (1, 11); flip this assertion)"
+    );
+}

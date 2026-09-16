@@ -839,6 +839,7 @@ dependencies = [
  "temen-opt",
  "temen-peval",
  "temen-posix",
+ "temen-snapshot",
  "temen-text",
  "temen-verify",
  "windows-sys 0.59.0",
