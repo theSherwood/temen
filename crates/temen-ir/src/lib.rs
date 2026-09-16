@@ -4149,14 +4149,15 @@ pub enum TypeEntry {
     Func(FuncType),
     /// A capability interface: an ordered tuple of **named** ops, each referencing a
     /// [`TypeEntry::Func`] entry for its signature. Op names are required (wire v7) and are the
-    /// binding-time contract (coverage matching is name-keyed); they are **excluded from the
-    /// structural intern key** — runtime `type_id` identity stays shape-only (D59). Interfaces
-    /// never nest.
+    /// binding-time contract (coverage matching is name-keyed). They are **part of the intern
+    /// key**: runtime `type_id` identity is `(names, shape)` equality (owner decision 2026-08-25,
+    /// #1109, superseding the shape-only D59 reading), so a same-shaped interface under different
+    /// names is a distinct interface. Interfaces never nest.
     Interface(Vec<IfaceOp>),
 }
 
-/// One named op of a [`TypeEntry::Interface`]: `name` is the coverage-matching key (required,
-/// non-identity); `ty` indexes the [`TypeEntry::Func`] carrying the op's signature.
+/// One named op of a [`TypeEntry::Interface`]: `name` is the coverage-matching key and half the
+/// intern key (#1109); `ty` indexes the [`TypeEntry::Func`] carrying the op's signature.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IfaceOp {
     pub name: String,
