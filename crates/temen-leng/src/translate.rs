@@ -5082,6 +5082,43 @@ impl<'a> FuncGen<'a> {
         Ok(spid)
     }
 
+    /// Marshal one argument of a **cross-module (import) call**, shared by [`call_import`] and its
+    /// sret twin [`call_import_sret`]. Returns the `(value id, type)` to pass.
+    ///
+    /// Aggregates go by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)` literal,
+    /// e.g. a `string` argument) is built into a temp, an aggregate **lvalue** rides its own address
+    /// (#760). A scalar goes by value, coerced to the callee's declared param type when the linker
+    /// pooled one (`want`, from [`ext_proc_params`]) — so a narrow value passed to a wider param is
+    /// widened, and a wide one passed to a narrow param is truncated, at the call site. Without that
+    /// the import's signature is inferred from the *arg* types and the mismatch only surfaces
+    /// post-link as a verify `TypeMismatch` (#1400/#1404).
+    ///
+    /// This exists as one function because it previously existed as two. #1400 added the `want`
+    /// coercion to the non-sret loop and left the sret copy untouched, so every cross-module call to
+    /// an **aggregate-returning** proc still inferred its signature from the call site. `std/macros`
+    /// and `std/nifply` both failed to verify on exactly that (#1498): `nifreader.openFromBuffer`
+    /// calls `vfs.initBlob`, whose defaulted `cleanup: proc {.nimcall.}` is an `i32` funcref, and
+    /// hexer expands the default to a bare `(nil)` — lowered as a pointer-width `i64` null with
+    /// nothing to narrow it. Two copies of a rule means one of them is a latent bug.
+    fn marshal_import_arg(
+        &mut self,
+        arg: &Node,
+        want: Option<ValType>,
+    ) -> Result<(u32, ValType), LengError> {
+        if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
+            return Ok((addr, ValType::I64));
+        }
+        if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
+            let (addr, _) = self.lvalue_addr(arg)?;
+            return Ok((addr, ValType::I64));
+        }
+        let v = match want {
+            Some(w) => self.expr_typed(arg, w)?,
+            None => self.expr(arg)?,
+        };
+        Ok((v.id, v.ty))
+    }
+
     /// Lower a cross-module call to a declared Temen `import` + `call.import`. Param types come from
     /// the args; the return arity from the call position (a stmt-call is treated as void). The
     /// runtime binds the import by name at instantiation — the frontend only makes it well-typed.
@@ -5117,23 +5154,10 @@ impl<'a> FuncGen<'a> {
         // Cloned up front so the per-arg `expr_typed` can borrow `self` mutably.
         let param_tys = self.t.ext_proc_params.get(name).cloned();
         for (i, arg) in args[..fixed_end].iter().enumerate() {
-            // Aggregate args pass by address (matching by-address params); scalars by value.
-            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
-                let (addr, _) = self.lvalue_addr(arg)?;
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(want) = param_tys.as_ref().and_then(|p| p.get(i)).copied() {
-                let v = self.expr_typed(arg, want)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            } else {
-                let v = self.expr(arg)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            }
+            let want = param_tys.as_ref().and_then(|p| p.get(i)).copied();
+            let (id, ty) = self.marshal_import_arg(arg, want)?;
+            argvals.push(id);
+            argtys.push(ty);
         }
         if varargs_fixed.is_some() {
             // Marshal the variadic tail into consecutive 8-byte slots of a fresh data-stack buffer
@@ -5223,24 +5247,14 @@ impl<'a> FuncGen<'a> {
         }
         argvals.push(dest_addr);
         argtys.push(ValType::I64); // the sret pointer
-        for arg in args {
-            // Aggregate args pass by address — an aggregate **rvalue** (an `(oconstr …)`/`(aconstr …)`
-            // literal, e.g. a `string` argument) is constructed into a temp, an aggregate **lvalue**
-            // (a var) rides its own address. Scalars go by value. This mirrors [`call_import`] (the
-            // non-sret twin); without the rvalue case an aggregate-literal arg to an aggregate-returning
-            // cross-module call (`s = f(a, "lit")`) fell through to `expr` and failed closed (#760).
-            if let Some((addr, _)) = self.agg_rvalue_temp(arg)? {
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else if let Some(TyDesc::Agg(_)) = self.lvalue_type(arg) {
-                let (addr, _) = self.lvalue_addr(arg)?;
-                argvals.push(addr);
-                argtys.push(ValType::I64);
-            } else {
-                let v = self.expr(arg)?;
-                argvals.push(v.id);
-                argtys.push(v.ty);
-            }
+                                   // The callee's declared param types index the **source** args — `$sp`/`$sret` are prepended
+                                   // above and are not among them — so `args[i]` pairs with `param_tys[i]` directly.
+        let param_tys = self.t.ext_proc_params.get(name).cloned();
+        for (i, arg) in args.iter().enumerate() {
+            let want = param_tys.as_ref().and_then(|p| p.get(i)).copied();
+            let (id, ty) = self.marshal_import_arg(arg, want)?;
+            argvals.push(id);
+            argtys.push(ty);
         }
         let slot = self.t.register_import(name, &argtys, None)?; // void: writes via the sret pointer
         let arglist = argvals

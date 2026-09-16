@@ -552,6 +552,24 @@ fn link_verify_std_module(module: &str) {
         .unwrap_or_else(|e| panic!("`{module}` linked module must verify: {e:?}"));
 }
 
+/// **#1498 — an *aggregate-returning* cross-module call coerces its args too.** `std/nifreader`'s
+/// `openFromBuffer` calls `std/vfs`'s `initBlob`, which returns a `VfsBlob` (so it is an **sret**
+/// callee) and whose last param is a defaulted `cleanup: proc {.nimcall.}` — an `i32` funcref. hexer
+/// expands the default to a bare `(nil)`, which lowers as a pointer-width `i64` null.
+///
+/// #1400 taught the non-sret import path to coerce each arg to the callee's declared param type, but
+/// the sret path was a **separate copy of the same loop** and never got it, so this `i64` reached the
+/// `i32` param and the module failed to verify post-link with
+/// `TypeMismatch { expected: I32, found: I64 }`. Both paths now share one `marshal_import_arg`.
+///
+/// `macros` and `nifply` are the two stdlib modules that reach this call; both were invisible until
+/// #1490 fixed the sweep's module list, and both are gated here.
+#[test]
+fn nim_sret_cross_module_arg_widths_verify() {
+    link_verify_std_module("macros");
+    link_verify_std_module("nifply");
+}
+
 /// **#1404 — a cross-module call widens its result to the callee's real return type.** `std/json`'s
 /// `getTok` calls `system.equalStrings`, which returns `bool` (`i32`), and uses the result in an
 /// `i64` comparison. Pre-fix, `call_import` declared the import's *return* from the call site's
@@ -1481,6 +1499,9 @@ fn nimony_stdlib_dir() -> Option<std::path::PathBuf> {
 const STD_MODULES: &[&str] = &[
     // Runnable since #1443 lowered `cpuRelax`'s `{.emit.}` hint and bound the last four atomic leaves.
     "atomics",
+    // Runnable since #1498 taught the sret import path to coerce args to the callee's param types.
+    "macros",
+    "nifply",
     "strutils",
     "sequtils",
     "algorithm",
