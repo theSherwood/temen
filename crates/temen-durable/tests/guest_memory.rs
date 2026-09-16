@@ -1,7 +1,7 @@
 //! A memory-using durable guest round-trips through the **confined** path (R9 / §12.7).
 //!
-//! The durable region is a reserved low slice `[0, `ShadowArena::LEGACY.end`)` of the guest's own
-//! window; guest memory lives in `[`ShadowArena::LEGACY.end`, window)` (the wasm shadow-stack
+//! The durable region is a reserved low slice `[0, `TEST_ARENA.end`)` of the guest's own
+//! window; guest memory lives in `[`TEST_ARENA.end`, window)` (the wasm shadow-stack
 //! convention — runtime state below `__heap_base`, the program's data above). A cooperating
 //! toolchain bases the guest's data there, so the two never overlap. This test instruments
 //! such a guest via [`transform_module_assume_confined`] and shows guest memory survives
@@ -10,11 +10,16 @@
 
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, read_thaw_state, transform_module,
-    transform_module_assume_confined, write_state, ShadowArena, TransformError, STATE_NORMAL,
-    STATE_UNWINDING,
+    transform_module_assume_confined, write_state, TransformError, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 
 const SIZE_LOG2: u8 = 18; // 256 KiB window: 64 KiB reserve + ~192 KiB guest-usable
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -23,6 +28,7 @@ fn module(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     m
 }
@@ -44,7 +50,7 @@ fn run(inst: &Module, clock_ns: i64, window: &[u8]) -> (Vec<Value>, Vec<u8>) {
     (r.expect("runs to completion"), win)
 }
 
-// Store 77 into guest memory at `ShadowArena::LEGACY.end` (the first usable byte), call the clock,
+// Store 77 into guest memory at `TEST_ARENA.end` (the first usable byte), call the clock,
 // then load it back *after* the call. The stored value must survive the freeze (it lives in
 // the window image), and the address `v1` is live across the call (used by the reload).
 // Baseline (clock 42): 42 + 77 = 119.
@@ -62,7 +68,7 @@ block 0 (v0: i32) {{\n\
   return v6\n\
   }}\n\
 }}\n",
-        addr = ShadowArena::LEGACY.end
+        addr = TEST_ARENA.end
     )
 }
 
@@ -73,11 +79,11 @@ fn guest_memory_survives_freeze_thaw_via_confined_path() {
     temen_verify::verify_module(&inst).expect("instrumented IR must verify");
 
     // Baseline: the uninterrupted run.
-    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW));
+    let (baseline, _) = run(&inst, 42, &init_durable_window(WINDOW, TEST_ARENA));
     assert_eq!(baseline, vec![Value::I64(119)], "42 + stored 77");
 
     // Freeze: the store happens, then the poll after the call unwinds.
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let (_, snapshot) = run(&inst, 42, &win);
     assert_eq!(
@@ -89,14 +95,14 @@ fn guest_memory_survives_freeze_thaw_via_confined_path() {
     // Thaw on a fresh host: the guest's stored 77 rides the restored window image, the cap
     // result (42) is reloaded, and the post-call reload reads 77 back.
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let (thawed, final_win) = run(&inst, 0, &win);
     assert_eq!(
         thawed, baseline,
         "guest memory + durable state round-tripped"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw ends NORMAL"
     );
@@ -109,12 +115,18 @@ fn strict_path_rejects_the_same_memory_using_guest() {
 }
 
 #[test]
-fn window_smaller_than_the_reserve_is_rejected() {
-    // A window that cannot even hold the reserved region is too small.
+fn a_window_too_small_for_any_arena_is_refused() {
+    // A 4 KiB window cannot hold a shadow arena at all — the verifier requires one to start at or
+    // above `DURABLE_CONTROL_END` (guard+64) and hold a whole `SHADOW_STRIDE` region — so such a
+    // module can only declare none, and a module that declares none is not freezable: the transform
+    // fails closed rather than inventing a placement (INVARIANTS.md #16).
     let mut m = temen_text::parse_module(
         "func (i32) -> (i64) {\nblock 0 (v0: i32) {\n  v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )
     .unwrap();
-    m.memory = Some(Memory { size_log2: 12 }); // 4 KiB < 64 KiB reserve
-    assert_eq!(transform_module(&m), Err(TransformError::MemoryTooSmall));
+    m.memory = Some(Memory {
+        size_log2: 12,
+        shadow: None,
+    });
+    assert_eq!(transform_module(&m), Err(TransformError::NoShadowArena));
 }

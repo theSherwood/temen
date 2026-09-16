@@ -20,9 +20,15 @@
 
 use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, read_state, read_thaw_state,
-    transform_module, write_state, ShadowArena, STATE_NORMAL, STATE_UNWINDING,
+    transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, run_with_host, Host, Value};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_ir::{
     BinOp, Block, CastOp, CmpOp, ConvOp, FToI, Func, FuncType, IToF, Inst, IntTy, Memory, Module,
     Terminator, TypeEntry, VShape, ValType,
@@ -38,7 +44,7 @@ fn durgen_type_section() -> Vec<TypeEntry> {
     })]
 }
 
-// 128 KiB: the durable region needs `ShadowArena::LEGACY.end` (64 KiB), and a smaller window keeps the
+// 128 KiB: the durable region needs `TEST_ARENA.end` (64 KiB), and a smaller window keeps the
 // per-run commit footprint modest — the JIT commits a window per compile, and on a memory-tight
 // Windows CI runner the cumulative commit of many compiles can hit the limit (os error 1455).
 pub const SIZE_LOG2: u8 = 17;
@@ -443,6 +449,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
         funcs,
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
+            shadow: Some(TEST_ARENA),
         }),
         data: Vec::new(),
         imports: Vec::new(),
@@ -549,6 +556,7 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
         }],
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
+            shadow: Some(TEST_ARENA),
         }),
         data: Vec::new(),
         imports: Vec::new(),
@@ -568,14 +576,13 @@ pub fn gen_loop_module(g: &mut Gen) -> Module {
 fn read_sp(w: &[u8]) -> u64 {
     let mut b = [0u8; 8];
     b.copy_from_slice(
-        &w[ShadowArena::LEGACY.region_base(0) as usize
-            ..ShadowArena::LEGACY.region_base(0) as usize + 8],
+        &w[TEST_ARENA.region_base(0) as usize..TEST_ARENA.region_base(0) as usize + 8],
     );
     u64::from_le_bytes(b)
 }
 
 /// The empty (no-frames) root shadow-SP under the 4A.5 per-context layout.
-const ROOT_EMPTY_SP: u64 = ShadowArena::LEGACY.frame_base(0);
+const ROOT_EMPTY_SP: u64 = TEST_ARENA.frame_base(0);
 
 // ---- Fiber generator + freeze/thaw property (Phase 3.1 hardening) ----
 //
@@ -699,6 +706,7 @@ pub fn gen_fiber_module(g: &mut Gen) -> Module {
         funcs: vec![gen_fiber_root(g, suspends), gen_fiber_func(g, suspends)],
         memory: Some(Memory {
             size_log2: SIZE_LOG2,
+            shadow: Some(TEST_ARENA),
         }),
         data: Vec::new(),
         imports: Vec::new(),
@@ -733,7 +741,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
             0,
             &[],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -747,7 +755,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
     let (r_freeze, snap, frozen) = {
         let mut h = Host::new();
         h.set_durable(true);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -764,7 +772,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
     // (3) thaw: re-seed the fiber residue, flip to REWINDING, re-enter; must equal the baseline.
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen);
@@ -777,7 +785,7 @@ pub fn fuzz_fiber_one(g: &mut Gen) {
         "thawed fiber run must equal the uninterrupted run"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );
@@ -903,6 +911,7 @@ pub fn gen_recycle_fiber_module(g: &mut Gen) -> RecycleModule {
             funcs: vec![root, fiber_b, fiber_a],
             memory: Some(Memory {
                 size_log2: SIZE_LOG2,
+                shadow: Some(TEST_ARENA),
             }),
             data: Vec::new(),
             imports: Vec::new(),
@@ -945,7 +954,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
             0,
             &[],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -958,7 +967,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
     let (r_freeze, snap, frozen) = {
         let mut h = Host::new();
         h.set_durable(true);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, arm);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -981,7 +990,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
     // (3) thaw: re-seed the residue (at its generation), re-enter under REWINDING; equals baseline.
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen);
@@ -994,7 +1003,7 @@ pub fn fuzz_recycle_fiber_one(g: &mut Gen) {
         "thawed recycled-fiber run must equal the uninterrupted run"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );
@@ -1041,7 +1050,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         )
@@ -1059,7 +1068,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
         let mut h = Host::new();
         h.clock_ns = clock_v; // same initial conditions as the baseline
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -1087,7 +1096,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
     // suspend points re-perform against the continued clock, matching the baseline. ---
     let (r_thaw, final_win) = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.clock_ns = clock_after;
         let clk = h.grant_clock();
@@ -1108,7 +1117,7 @@ fn check_roundtrip(m: &Module, clock_v: i64) {
         "thawed run must equal the uninterrupted run (frozen result reloaded, not re-issued)"
     );
     assert_eq!(
-        read_thaw_state(&final_win, 0),
+        read_thaw_state(&final_win, TEST_ARENA, 0),
         STATE_NORMAL,
         "thaw must flip the state word back to NORMAL"
     );

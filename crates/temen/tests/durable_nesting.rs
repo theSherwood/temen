@@ -35,6 +35,12 @@ const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 use temen_ir::errno::EINVAL;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 fn instrument(src: &str) -> Module {
     let m = parse_module(src).expect("parse");
     let inst = transform_module(&m).expect("transform");
@@ -47,7 +53,7 @@ fn instrument(src: &str) -> Module {
 /// parent may admit it — *when the grant attests it*.
 fn child() -> Module {
     instrument(
-        "memory 17
+        "memory 17 shadow 16448 65536
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 4321
@@ -62,7 +68,7 @@ block 0 (v0: i64) {
 /// so a freeze reliably catches it live — the separate-module analog of `PARENT_SELF_LOOP`'s child.
 fn child_loop() -> Module {
     instrument(
-        "memory 17
+        "memory 17 shadow 16448 65536
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 0
@@ -92,7 +98,7 @@ block 3 (v12: i64) {
 /// differs from `child_loop`, so re-granting it in place of the frozen child fails closed.
 fn child_other() -> Module {
     instrument(
-        "memory 17
+        "memory 17 shadow 16448 65536
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   v1 = i64.const 8888
@@ -107,7 +113,7 @@ block 0 (v0: i64) {
 /// `[128 KiB, 256 KiB)` and returns the op's i32 status — the refusal probe (no join). The module
 /// handle arrives as an `i64` entry arg (the op's slot ABI) since the Phase-1 durable transform
 /// has no conversions.
-const PARENT_PROBE: &str = "memory 18
+const PARENT_PROBE: &str = "memory 18 shadow 16448 65536
 func (i32, i64) -> (i32) {
 block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
@@ -120,7 +126,7 @@ block 0 (v0: i32, v1: i64) {
 ";
 
 /// Durable parent that instantiates its granted child and `join`s it (op 1) — the happy path.
-const PARENT_JOIN: &str = "memory 18
+const PARENT_JOIN: &str = "memory 18 shadow 16448 65536
 func (i32, i64) -> (i64) {
 block 0 (v0: i32, v1: i64) {
   v2 = i64.const 0
@@ -134,7 +140,7 @@ block 0 (v0: i32, v1: i64) {
 ";
 
 /// Durable parent that instantiates a **same-module** child (op 0: its own func 1) and joins it.
-const PARENT_SELF: &str = "memory 18
+const PARENT_SELF: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -156,7 +162,7 @@ block 0 (v0: i64) {
 
 /// `PARENT_SELF` with a **looping** child (func 1 sums 0..100 with back-edge polls — a real
 /// mid-computation continuation for the subtree freeze). Total = 4950.
-const PARENT_SELF_LOOP: &str = "memory 18
+const PARENT_SELF_LOOP: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -201,7 +207,7 @@ fn run_durable(parent: &Module, host: &mut Host, args: &[Value]) -> Vec<Value> {
         0,
         args,
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         host,
     );
@@ -269,7 +275,7 @@ fn non_durable_domain_admits_an_unmarked_module_grant() {
         0,
         &[Value::I32(ih), Value::I64(mh as i64)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -329,7 +335,7 @@ block 0 () {
 /// (the armed freeze trigger ticks on `cont.resume`, so `arm = 2` lands the freeze at the second
 /// resume — after the join, with the fiber parked: the covered residue shape). Returns child
 /// result + fiber result = 777 + 55 = 832.
-const PARENT_JOIN_THEN_FIBER: &str = "memory 18
+const PARENT_JOIN_THEN_FIBER: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -384,7 +390,7 @@ fn freeze_with_live_nested_child_thaws_and_completes() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -396,7 +402,7 @@ fn freeze_with_live_nested_child_thaws_and_completes() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -422,7 +428,7 @@ fn freeze_with_live_nested_child_thaws_and_completes() {
     // Thaw: re-attach the child from its carve; the parent reloads its handle, re-executes join,
     // and the rewound child completes its loop — the uninterrupted total, reproduced.
     let mut twin = fsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_nested(residue);
@@ -458,7 +464,7 @@ fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
     fhost.set_durable(true);
     let ih = fhost.grant_instantiator(0, WINDOW as u64);
     let mh = fhost.grant_durable_module(&child_loop());
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -506,7 +512,7 @@ fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
     let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let tmh = thost.grant_durable_module(&child_loop());
     let mut twin = window;
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 50_000_000u64;
     let (tr, tsnap) = run_capture_reserved_with_host(
         &parent,
@@ -536,7 +542,7 @@ fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {
         fhost.set_durable(true);
         let ih = fhost.grant_instantiator(0, WINDOW as u64);
         let mh = fhost.grant_durable_module(&child_loop());
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 50_000_000u64;
         let (_, fsnap) = run_capture_reserved_with_host(
@@ -563,7 +569,7 @@ fn thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module() {
         let tmh = granted.map(|m| thost.grant_durable_module(&m)).unwrap_or(0);
         thost.set_frozen_nested(residue.clone());
         let mut twin = fsnap.clone();
-        begin_thaw(&mut twin, 0);
+        begin_thaw(&mut twin, TEST_ARENA, 0);
         let mut fuel = 50_000_000u64;
         run_capture_reserved_with_host(
             &parent,
@@ -605,7 +611,7 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -617,7 +623,7 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 2);
     let mut fuel = 5_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -642,7 +648,7 @@ fn freeze_after_nested_child_joined_thaws_and_reloads_the_join_result() {
     // Thaw: the parent rewinds, reloading the instantiate handle and the join result from its
     // shadow frame — the child never re-runs — and completes to the uninterrupted total.
     let mut twin = fsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_fibers(fhost.frozen_fibers().to_vec());
@@ -682,7 +688,7 @@ fn bytecode_durable_capture_declines_a_nesting_module() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -705,7 +711,7 @@ fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -747,7 +753,7 @@ fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
 
     // Thaw: the child re-attaches from its carve and completes; join delivers the total.
     let mut twin = window;
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable handles");
     let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 50_000_000u64;
@@ -773,7 +779,7 @@ fn nested_artifact_serializes_restores_and_thaws_through_the_codec() {
 /// first (while parked in A's join the single durable worker also runs B to completion), then drives
 /// a fiber so an armed freeze can land *after* B finished but *before* the parent joins B. Total =
 /// 4950 (A) + 33 (B) + 5 (fiber) = 4988.
-const PARENT_TWO_CHILDREN: &str = "memory 18
+const PARENT_TWO_CHILDREN: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 2
@@ -853,7 +859,7 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -864,7 +870,7 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 2);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -915,7 +921,7 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
     // Thaw: B's result reloads into the parent's join without re-running B; A rewinds/reloads; the
     // fiber re-attaches; the total is reproduced.
     let mut twin = window;
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable");
     let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 50_000_000u64;
@@ -968,7 +974,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 /// handle value `(1 << CAP_LOG2) | 0 == 256`. So the child ignores its `i64` entry arg and names its own
 /// `Instantiator` with the constant `i32.const 256` — the same value the fresh-host grant returns on both
 /// the freeze and the thaw re-attach (which re-grants the `Instantiator` first, too).
-const PARENT_DEPTH2: &str = "memory 19
+const PARENT_DEPTH2: &str = "memory 19 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -1039,7 +1045,7 @@ fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(D2_WINDOW),
+        &init_durable_window(D2_WINDOW, TEST_ARENA),
         D2_SIZE_LOG2,
         &mut host,
     );
@@ -1056,7 +1062,7 @@ fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, D2_WINDOW as u64);
-    let mut win = init_durable_window(D2_WINDOW);
+    let mut win = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -1108,7 +1114,7 @@ fn freeze_with_live_depth2_grandchild_thaws_and_completes() {
     // (3) Thaw: re-attach both levels from their carves; each rewinds, and the two joins deliver the
     // grandchild's total all the way up to the root — freeze→thaw ≡ uninterrupted across TWO levels.
     let mut twin = fsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_nested(residue);
@@ -1146,7 +1152,7 @@ fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, D2_WINDOW as u64);
-    let mut win = init_durable_window(D2_WINDOW);
+    let mut win = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -1190,7 +1196,7 @@ fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
 
     // Thaw: both levels re-attach from their carves and rewind; both joins deliver the total up.
     let mut twin = window;
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let caps = thost.capture_durable_handles().expect("durable handles");
     let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
     let mut fuel = 50_000_000u64;
@@ -1217,7 +1223,7 @@ fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
 /// (its parent reads its carve) + `freeze_exposed` (it froze) at tier 1 — packed `1 | 1<<8 | 1<<9 =
 /// 769`. Before the thaw re-stamped the child's attestation it defaulted (`1`), so the thawed read
 /// lied; now the uninterrupted and thawed runs agree.
-const PARENT_ATTEST_LOOP: &str = "memory 18
+const PARENT_ATTEST_LOOP: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -1271,7 +1277,7 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -1285,7 +1291,7 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
     let mut fhost = Host::new();
     fhost.set_durable(true);
     let fih = fhost.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (fr, fsnap) = run_capture_reserved_with_host(
@@ -1304,7 +1310,7 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
     // Thaw: the reconstructed child runs its body (loop + attest) on the thawed host. Its attest must
     // equal the control — the thaw re-derived its exposure, rather than defaulting it to unexposed.
     let mut twin = fsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_nested(residue);
@@ -1345,7 +1351,7 @@ fn a_thawed_nested_childs_attestation_reports_exposed() {
 ///
 /// **Rewritten again when the capture lands** (#1361): the spawn succeeds, and the freeze captures the
 /// child into its own artifact rather than refusing anything.
-const PARENT_DETACHED: &str = "memory 18
+const PARENT_DETACHED: &str = "memory 18 shadow 16448 65536
 func (i32, i32, i32) -> (i64) {
 block 0 (v0: i32, v1: i32, v2: i32) {
   vb = i64.extend_i32_u v2
@@ -1370,7 +1376,7 @@ fn a_durable_freeze_is_never_killed_by_a_detached_child() {
     let ih = host.grant_instantiator(0, WINDOW as u64);
     let mh = host.grant_module(&child_mod);
     let bh = host.grant_budget(0, (1u64 << 17) as i64, 0); // one detached window
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING); // freeze from the start
     let mut fuel = 50_000_000u64;
     let (r, _snap) = run_capture_reserved_with_host(

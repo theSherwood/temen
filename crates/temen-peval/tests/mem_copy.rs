@@ -67,7 +67,10 @@ fn tvalue_copy_module() -> Module {
     };
     Module {
         funcs: vec![entry],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![],
         imports: vec![],
         exports: vec![],

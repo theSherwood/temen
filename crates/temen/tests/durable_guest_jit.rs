@@ -39,9 +39,15 @@ use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17; // 128 KiB ≥ the durable reserve (64 KiB)
 const WINDOW: usize = 1 << SIZE_LOG2;
-const BLOB_OFF: usize = 0x1_1000; // above `ShadowArena::LEGACY.end` (64 KiB) — the guest usable region
+const BLOB_OFF: usize = 0x1_1000; // above `TEST_ARENA.end` (64 KiB) — the guest usable region
 
 /// Encode+verify a unit blob a guest submits to `Jit.compile`.
 fn blob(src: &str) -> Vec<u8> {
@@ -54,7 +60,7 @@ fn blob(src: &str) -> Vec<u8> {
 /// units) with a trivial entry — used only to set up the domain for the host-API compile tests.
 fn dummy_guest() -> temen_ir::Module {
     parse_module(
-        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  return v0\n  }\n}\n",
     )
     .expect("parse guest")
 }
@@ -67,7 +73,7 @@ fn durable_grant_admits_submitted_unit() {
     // An in-scope unit: declares memory 17 (memory-match), non-suspending, returns 42. The transform
     // returns a non-suspending function unchanged, so it is admitted and invoke-equivalent.
     let unit = blob(
-        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
     );
     let guest = dummy_guest();
 
@@ -105,7 +111,7 @@ fn durable_grant_admits_submitted_unit() {
 #[test]
 fn durable_grant_admits_unit_with_conversions_before_its_suspend_point() {
     let unit = blob(
-        "memory 17\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
          v1 = i64.extend_i32_u v0\n  v2 = i32.wrap_i64 v1\n  \
          v3 = i32.trunc_sat_f64_s vf\n  v4 = f32.convert_i32_s v3\n  v5 = f64.promote_f32 v4\n  \
          v6 = i64.trunc_f64_s v5\n  \
@@ -115,7 +121,7 @@ fn durable_grant_admits_unit_with_conversions_before_its_suspend_point() {
     // The program taints the unit's `(i32, f64)->(i64)` signature (a may-suspend function of that
     // shape establishes the `call.dyn` seam the install fence keys on — see the fence test below).
     let guest = parse_module(
-        "memory 17\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32, f64) -> (i64) {\nblock 0 (v0: i32, vf: f64) {\n  \
          v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )
     .expect("parse program");
@@ -143,7 +149,7 @@ fn durable_grant_admits_unit_with_conversions_before_its_suspend_point() {
 #[test]
 fn durable_grant_rejects_memory_touching_unit() {
     let unit = blob(
-        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
          vaddr = i64.const 65536\n  v1 = i64.load vaddr\n  \
          v2 = call.cap 2 0 () -> (i64) v0 ()\n  v3 = i64.add v1 v2\n  return v3\n  }\n}\n",
     );
@@ -165,13 +171,13 @@ fn durable_grant_rejects_memory_touching_unit() {
 fn durable_run_compiles_and_invokes_agrees() {
     // The submitted unit: `() -> i64` returning 42 (non-suspending; declares memory 17 to match).
     let unit = blob(
-        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
     );
 
     // Guest `(jit) -> i64`: compile the unit staged at BLOB_OFF, then invoke it. Single block, two
-    // call.cap calls, return — in the durable transform's shape. The blob ptr is above `ShadowArena::LEGACY.end`.
+    // call.cap calls, return — in the durable transform's shape. The blob ptr is above `TEST_ARENA.end`.
     let guest_src = format!(
-        "memory 17\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32) -> (i64) {{\nblock 0 (v0: i32) {{\n  \
          v1 = i64.const {off}\n  v2 = i64.const {len}\n  \
          v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
          v4 = call.cap 11 1 (i64) -> (i64) v0 (v3)\n  return v4\n  }}\n}}\n",
@@ -205,7 +211,7 @@ fn durable_run_compiles_and_invokes_agrees() {
     // --- Durable run: instrument the guest, durable window (NORMAL), durable grant, blob staged.
     let inst = transform_module(&guest).expect("guest must be in transform scope");
     verify_module(&inst).expect("instrumented guest verifies");
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_NORMAL);
     win[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
     let mut hd = Host::new();
@@ -239,13 +245,13 @@ fn durable_run_compiles_and_invokes_agrees() {
 fn durable_jit_domain_survives_freeze_and_invokes() {
     // The unit a guest compiled at some earlier point: `() -> i64` returning 42.
     let unit = blob(
-        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
     );
 
     // The gate module holding the `Jit` cap — an **invoker** `(jit_domain, code_handle) -> i64` that
     // calls `Jit.invoke` (iface 11 op 1) on the domain handle, passing the compiled-code handle. Its
     // single-block/one-call.cap shape is in the durable transform scope.
-    let invoker_src = "memory 17\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
+    let invoker_src = "memory 17 shadow 16448 65536\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
          v2 = call.cap 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
     let invoker = parse_module(invoker_src).expect("parse invoker");
     verify_module(&invoker).expect("verify invoker");
@@ -264,7 +270,7 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
     // Freeze the domain (NORMAL state — no continuation) and serialize the real artifact. Before
     // Slice 2 this refused (`JitCode`/`JitTable` were non-durable); now the units ride Section 5.
     let win = {
-        let mut w = init_durable_window(WINDOW);
+        let mut w = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut w, STATE_NORMAL);
         w
     };
@@ -303,9 +309,9 @@ fn durable_jit_domain_survives_freeze_and_invokes() {
 #[test]
 fn durable_jit_domain_reconstructs_and_invokes_native() {
     let unit = blob(
-        "memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n",
     );
-    let invoker_src = "memory 17\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
+    let invoker_src = "memory 17 shadow 16448 65536\nfunc (i32, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64) {\n  \
          v2 = call.cap 11 1 (i64) -> (i64) v0 (v1)\n  return v2\n  }\n}\n";
     let invoker = parse_module(invoker_src).expect("parse invoker");
     verify_module(&invoker).expect("verify invoker");
@@ -321,7 +327,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
 
     // Freeze (NORMAL) + serialize.
     let win = {
-        let mut w = init_durable_window(WINDOW);
+        let mut w = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut w, STATE_NORMAL);
         w
     };
@@ -355,7 +361,7 @@ fn durable_jit_domain_reconstructs_and_invokes_native() {
 /// A durable program with two entries: **func 0** compiles + B2-`install`s a unit and returns its
 /// table slot; **func 1** `call.dyn`s that slot. Shared by the interp + native install-slot
 /// durability tests. The unit is `() -> i64` returning 42; the module declares memory 17 to match.
-const INSTALLER_CALLER: &str = "memory 17\n\
+const INSTALLER_CALLER: &str = "memory 17 shadow 16448 65536\n\
     func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
       v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
       v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
@@ -364,7 +370,7 @@ const INSTALLER_CALLER: &str = "memory 17\n\
 
 /// The unit blob the installer compiles + installs.
 fn install_unit() -> Vec<u8> {
-    blob("memory 17\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n")
+    blob("memory 17 shadow 16448 65536\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 42\n  return v0\n  }\n}\n")
 }
 
 /// A `call.dyn` table reservation with room for the installer's padding slots.
@@ -517,7 +523,7 @@ fn durable_jit_install_slot_survives_freeze_thaw_native() {
 fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     // The submitted unit: `(clk) -> i64` = Clock.now + 100 — a `call.cap` suspend point.
     let unit = blob(
-        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
          v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  \
          v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
     );
@@ -525,7 +531,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     // slot, passing the Clock handle); func 2 = a `(i32)->(i64)` may-suspend function so the taint
     // analysis marks the caller's `call.dyn` of that signature may-suspend (PropagatedIndirect),
     // the fork-critical case — else the site would be under-instrumented and the freeze miss it.
-    let m_src = "memory 17\n\
+    let m_src = "memory 17 shadow 16448 65536\n\
         func (i32, i64, i64) -> (i64) {\nblock 0 (v0: i32, v1: i64, v2: i64) {\n  \
           v3 = call.cap 11 0 (i64, i64) -> (i64) v0 (v1, v2)\n  \
           v4 = call.cap 11 3 (i64) -> (i64) v0 (v3)\n  return v4\n  }\n}\n\
@@ -541,7 +547,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     // Install the unit once (NORMAL), so the occupancy is recorded on the domain (it persists across
     // runs and rides the freeze). Grant Clock (durable) + a durable JIT domain with table room.
     let install = |h: &mut Host, jd: i32| -> i32 {
-        let mut w = init_durable_window(WINDOW);
+        let mut w = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut w, STATE_NORMAL);
         w[BLOB_OFF..BLOB_OFF + unit.len()].copy_from_slice(&unit);
         let mut fuel = 5_000_000u64;
@@ -570,7 +576,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     let clk_b = hb.grant_clock();
     let jd_b = grant_jit_durable(&mut hb, &m, TABLE_LOG2);
     let slot_b = install(&mut hb, jd_b);
-    let mut wb = init_durable_window(WINDOW);
+    let mut wb = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut wb, STATE_NORMAL);
     let mut fuel = 5_000_000u64;
     let (rb, _) = run_capture_reserved_with_host(
@@ -596,7 +602,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
     let jd = grant_jit_durable(&mut hf, &m, TABLE_LOG2);
     let slot = install(&mut hf, jd);
     assert_eq!(slot, slot_b, "install is deterministic across hosts");
-    let mut wf = init_durable_window(WINDOW);
+    let mut wf = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut wf, STATE_UNWINDING);
     let mut fuel = 5_000_000u64;
     let (rf, snap) = run_capture_reserved_with_host(
@@ -618,7 +624,7 @@ fn durable_jit_install_call_indirect_freezes_in_flight_continuation() {
 
     // Thaw: REWINDING → the caller re-issues the call.dyn (install slot survived), the unit
     // rewinds and reloads the saved clock (42), not the fresh 0.
-    begin_thaw(&mut window, 0);
+    begin_thaw(&mut window, TEST_ARENA, 0);
     let mut fuel = 5_000_000u64;
     let (rt, _) = run_capture_reserved_with_host(
         &inst,
@@ -647,7 +653,7 @@ fn durable_jit_compile_fences_suspending_untainted_unit() {
     // Program taints only `(i32)->(i64)` — a may-suspend function of that signature (never called;
     // it establishes the `call.dyn` seam the taint analysis keys on).
     let prog = parse_module(
-        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
          v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  return v2\n  }\n}\n",
     )
     .expect("parse program");
@@ -659,7 +665,7 @@ fn durable_jit_compile_fences_suspending_untainted_unit() {
 
     // (A) suspendable, signature `(i32)->(i64)` — TAINTED by the program → admitted.
     let unit_a = blob(
-        "memory 17\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i32) -> (i64) {\nblock 0 (v0: i32) {\n  \
          v1 = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) v0 (v1)\n  \
          v3 = i64.const 100\n  v4 = i64.add v2 v3\n  return v4\n  }\n}\n",
     );
@@ -670,7 +676,7 @@ fn durable_jit_compile_fences_suspending_untainted_unit() {
 
     // (B) suspendable, signature `(i64)->(i64)` — NOT tainted → fenced closed.
     let unit_b = blob(
-        "memory 17\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
          vh = i32.const 0\n  v2 = call.cap 2 0 (i32) -> (i64) vh (vh)\n  return v2\n  }\n}\n",
     );
     assert!(
@@ -680,7 +686,7 @@ fn durable_jit_compile_fences_suspending_untainted_unit() {
 
     // (C) non-suspendable, signature `(i64)->(i64)` — untainted but SAFE → admitted.
     let unit_c = blob(
-        "memory 17\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
+        "memory 17 shadow 16448 65536\nfunc (i64) -> (i64) {\nblock 0 (v0: i64) {\n  \
          vc = i64.const 7\n  return vc\n  }\n}\n",
     );
     assert!(

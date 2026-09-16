@@ -4,6 +4,12 @@
 
 use temen_interp::{Host, StreamRole};
 use temen_ir::{Memory, Module};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_snapshot::{
     freeze, freeze_layout, freeze_with_prots, restore_layout, restore_with_prots, FreezeError,
     PageProt,
@@ -30,6 +36,7 @@ fn module() -> Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     m
 }

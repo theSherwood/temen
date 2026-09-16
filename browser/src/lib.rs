@@ -557,7 +557,7 @@ pub extern "C" fn temen_prep_bench(ptr: *const u8, len: usize) -> i64 {
         set(STATUS_VERIFY_ERR);
         return 0;
     }
-    if bytecode::compile_module(&m.funcs, &m.types).is_none() {
+    if bytecode::compile_module(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow)).is_none() {
         set(STATUS_UNSUPPORTED);
         return 0;
     }

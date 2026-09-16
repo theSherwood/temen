@@ -18,6 +18,12 @@ use temen_durable::{init_durable_window, transform_module_assume_confined};
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -25,6 +31,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR verifies");
@@ -80,7 +87,7 @@ fn recycling_lifts_the_lifetime_spawn_cap() {
         0,
         &[],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut h,
     );
@@ -144,7 +151,7 @@ fn recycling_handles_concurrent_contexts() {
         0,
         &[],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut h,
     );

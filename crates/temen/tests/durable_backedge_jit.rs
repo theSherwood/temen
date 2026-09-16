@@ -18,10 +18,16 @@ use core::ffi::c_void;
 use std::sync::Arc;
 use temen_durable::{
     arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state, transform_module,
-    write_state, ShadowArena, STATE_NORMAL, STATE_UNWINDING,
+    write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
     compile_and_run_capture_reserved_with_host_durable_interruptible, FreezeController, JitError,
@@ -35,6 +41,7 @@ fn module(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -42,7 +49,7 @@ fn module(src: &str) -> Module {
 }
 
 fn window_with(state: i32) -> Vec<u8> {
-    let mut w = init_durable_window(WINDOW);
+    let mut w = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut w, state);
     w
 }
@@ -167,15 +174,15 @@ fn freeze_from_start_at_a_loop_header_is_byte_identical_across_backends() {
     );
     assert_eq!(read_state(&snap_j), STATE_UNWINDING, "JIT left UNWINDING");
     assert_eq!(
-        &snap_i[..ShadowArena::LEGACY.end as usize],
-        &snap_j[..ShadowArena::LEGACY.end as usize],
+        &snap_i[..TEST_ARENA.end as usize],
+        &snap_j[..TEST_ARENA.end as usize],
         "interp/JIT freeze a loop header into a byte-identical durable reserve\n{inst:#?}"
     );
 
     // The interp-frozen artifact thaws on the JIT to the oracle (clock did not advance before the
     // header freeze, so the continuation clock is unchanged).
     let mut thaw = snap_i.clone();
-    begin_thaw(&mut thaw, 0);
+    begin_thaw(&mut thaw, TEST_ARENA, 0);
     let (tj, final_j) = jit(&inst, clock, &thaw).expect("JIT thaw compiles");
     assert_eq!(
         jit_i64(&tj),
@@ -244,7 +251,7 @@ fn jit_async_freeze(
 // Thaw a frozen window on the JIT via the durable entry (REWINDING); returns (result, final window).
 fn jit_durable_thaw(inst: &Module, clock: i64, snap: &[u8]) -> (JitOutcome, Vec<u8>) {
     let mut win = snap.to_vec();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let mut h = Host::new();
     h.clock_ns = clock;
     let clk = h.grant_clock();
@@ -322,7 +329,7 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
 
     // Freeze mid-loop on the interpreter via the back-edge countdown: the clock (42) is already
     // baked into the spilled accumulator.
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after_backedges(&mut win, 3);
     let (fi, snap) = interp(&inst, 42, &win, true);
     assert_eq!(fi, vec![Value::I64(0)], "interp froze mid-loop");
@@ -332,7 +339,7 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
     // the real mid-loop accumulator and reload the baked-in clock — not re-issue the call.cap
     // (which would now read 0 and give the wrong total).
     let mut thaw = snap.clone();
-    begin_thaw(&mut thaw, 0);
+    begin_thaw(&mut thaw, TEST_ARENA, 0);
     let (tj, final_j) = jit(&inst, 0, &thaw).expect("JIT thaw compiles");
     assert_eq!(
         jit_i64(&tj),

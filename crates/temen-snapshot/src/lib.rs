@@ -439,9 +439,13 @@ pub fn freeze_with_prots(
     nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
     let child_state = host.frozen_child_state().to_vec();
-    let root_sp = host
-        .frozen_root_sp()
-        .unwrap_or(ShadowArena::LEGACY.region_base(0));
+    let root_sp = host.frozen_root_sp().unwrap_or(
+        module
+            .memory
+            .and_then(|m| m.shadow)
+            .unwrap_or(ShadowArena::EMPTY)
+            .region_base(0),
+    );
     let digest = digest256(&encode_module(module));
 
     let mut out = Vec::new();
@@ -953,8 +957,16 @@ pub fn restore_with_prots(
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
     // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
     // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
-    let (fibers, vcpus, root_sp, nested, child_state) =
-        decode_control(control_body, fiber_count, spawned_count)?;
+    let (fibers, vcpus, root_sp, nested, child_state) = decode_control(
+        control_body,
+        fiber_count,
+        spawned_count,
+        module
+            .memory
+            .and_then(|m| m.shadow)
+            .unwrap_or(ShadowArena::EMPTY)
+            .region_base(0),
+    )?;
     host.set_frozen_fibers(fibers);
     if !vcpus.is_empty() {
         host.set_frozen_vcpus(vcpus);
@@ -1023,6 +1035,8 @@ fn decode_control(
     body: Option<&[u8]>,
     fiber_count: u64,
     spawned_count: u64,
+    // The root's empty extent when the artifact carries no residue: the module's arena base.
+    root_default: u64,
 ) -> Result<
     (
         Vec<FrozenFiber>,
@@ -1035,13 +1049,7 @@ fn decode_control(
 > {
     let body = match (body, fiber_count, spawned_count) {
         (None, 0, 0) => {
-            return Ok((
-                Vec::new(),
-                Vec::new(),
-                ShadowArena::LEGACY.region_base(0),
-                Vec::new(),
-                Vec::new(),
-            ));
+            return Ok((Vec::new(), Vec::new(), root_default, Vec::new(), Vec::new()));
             // no residue ⇒ no section
         }
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
@@ -1075,7 +1083,7 @@ fn decode_control(
     }
     // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.
     let mut vcpus = Vec::with_capacity(spawned_count as usize);
-    let mut root_sp = ShadowArena::LEGACY.region_base(0);
+    let mut root_sp = root_default;
     if spawned_count > 0 {
         let nv = cr.uleb()?;
         if nv != spawned_count {

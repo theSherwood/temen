@@ -12,6 +12,12 @@ use temen_durable::{arm_freeze_after, init_durable_window, transform_module_assu
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::Memory;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -57,6 +63,7 @@ fn a_mid_handler_freeze_fails_closed_instead_of_settling_a_bogus_reply() {
     let mut m = temen_text::parse_module(SRC_SERVING_HANDLER_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -74,7 +81,7 @@ fn a_mid_handler_freeze_fails_closed_instead_of_settling_a_bogus_reply() {
             0,
             &[],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -90,7 +97,7 @@ fn a_mid_handler_freeze_fails_closed_instead_of_settling_a_bogus_reply() {
         h.set_durable(true);
         h.set_self_module(&inst);
         h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, 1);
         let mut fuel = 1_000_000u64;
         let (r, _) =
@@ -154,6 +161,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     let mut m = temen_text::parse_module(SRC_SERVING_POLL).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -170,7 +178,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
             0,
             &[],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -184,7 +192,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
         h.set_self_module(&inst);
         let t = h.svc_enqueue(0, 0, vec![41]).expect("enqueue");
         assert_eq!(t, 0);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -204,7 +212,7 @@ fn a_domain_frozen_at_its_serve_point_thaws_and_drains_the_restored_queue() {
     h2.set_frozen_root_sp(root_sp);
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut fuel = 1_000_000u64;
         let (r, _) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h2);
@@ -267,6 +275,7 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
     let mut m = temen_text::parse_module(SRC_IDLE_SERVER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
@@ -277,7 +286,7 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
         let mut h = Host::new();
         h.set_durable(true);
         h.set_self_module(&inst);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_on_quiesce(&mut win);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -303,7 +312,7 @@ fn an_idle_server_freezes_on_quiesce_and_thaws_still_serving() {
         .expect("enqueue into restored server");
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut fuel = 1_000_000u64;
         let (r, _) =
             run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h2);
@@ -378,7 +387,10 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
     const P_WINDOW: usize = 1 << P_LOG2;
 
     let mut m = temen_text::parse_module(SRC_NESTED_TWO_SERVER).expect("parse");
-    m.memory = Some(Memory { size_log2: P_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: P_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
 
@@ -388,7 +400,7 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
         h.set_durable(true);
         h.set_self_module(&inst);
         let ih = h.grant_instantiator(0, P_WINDOW as u64);
-        let mut win = init_durable_window(P_WINDOW);
+        let mut win = init_durable_window(P_WINDOW, TEST_ARENA);
         arm_freeze_on_quiesce(&mut win);
         let mut fuel = 5_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -434,7 +446,7 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
     h2.set_frozen_root_sp(root_sp);
     let _ih2 = h2.grant_instantiator(0, P_WINDOW as u64);
     let mut win = snap.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 5_000_000u64;
     let (r, _) = run_capture_reserved_with_host(
@@ -472,7 +484,7 @@ fn a_nested_two_server_subtree_freezes_on_quiesce_and_thaws_still_serving() {
 /// (Child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it to scratch and
 /// reloads the low word with `i32.load` to get the `i32` instantiator handle for spawning C2,
 /// avoiding `i32.wrap_i64` which the durable transform does not type. Scratch sits above the 64 KiB
-/// `ShadowArena::LEGACY.end` and below C2's sub-carve.)
+/// `TEST_ARENA.end` and below C2's sub-carve.)
 const SRC_NESTED_SERVERS_3: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
@@ -554,7 +566,10 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
     const P_WINDOW: usize = 1 << P_LOG2;
 
     let mut m = temen_text::parse_module(SRC_NESTED_SERVERS_3).expect("parse");
-    m.memory = Some(Memory { size_log2: P_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: P_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
 
@@ -564,7 +579,7 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
         h.set_durable(true);
         h.set_self_module(&inst);
         let ih = h.grant_instantiator(0, P_WINDOW as u64);
-        let mut win = init_durable_window(P_WINDOW);
+        let mut win = init_durable_window(P_WINDOW, TEST_ARENA);
         arm_freeze_on_quiesce(&mut win);
         let mut fuel = 20_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -623,7 +638,7 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
     h2.set_frozen_root_sp(root_sp);
     let ih2 = h2.grant_instantiator(0, P_WINDOW as u64);
     let mut win = snap.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     arm_freeze_on_quiesce(&mut win);
     let mut fuel = 20_000_000u64;
     let (r, _) = run_capture_reserved_with_host(
@@ -671,7 +686,7 @@ fn a_three_level_nested_server_subtree_keys_the_grandchild_serve_state_to_its_re
 /// Fixture notes: child entries take the `(i64)` starter arg the spawn-ABI enforces; C1 stores it
 /// to scratch and reloads the low word with `i32.load` for the `i32` instantiator handle (the
 /// durable transform types loads/stores but not width conversions). Scratch sits above the 64 KiB
-/// `ShadowArena::LEGACY.end`, below each child's own sub-carve.
+/// `TEST_ARENA.end`, below each child's own sub-carve.
 const SRC_NESTED_HOLDER: &str = r#"
 memory 19
 type 0 func (i64) -> (i64)
@@ -777,7 +792,10 @@ fn a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked() {
     const P_WINDOW: usize = 1 << P_LOG2;
 
     let mut m = temen_text::parse_module(SRC_NESTED_HOLDER).expect("parse");
-    m.memory = Some(Memory { size_log2: P_LOG2 });
+    m.memory = Some(Memory {
+        size_log2: P_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
     let inst = std::sync::Arc::new(transform_module_assume_confined(&m).expect("transform"));
     temen_verify::verify_module(&inst).expect("verify");
 
@@ -787,7 +805,7 @@ fn a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked() {
         h.set_durable(true);
         h.set_self_module(&inst);
         let ih = h.grant_instantiator(0, P_WINDOW as u64);
-        let mut win = init_durable_window(P_WINDOW);
+        let mut win = init_durable_window(P_WINDOW, TEST_ARENA);
         arm_freeze_on_quiesce(&mut win);
         let mut fuel = 20_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -831,7 +849,7 @@ fn a_nested_holder_freezes_and_thaws_with_the_grandchild_cap_relinked() {
     h2.svc_enqueue(0, 0, vec![0])
         .expect("seed a dispatch so the root's svc.wait returns");
     let mut win = snap.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let mut fuel = 20_000_000u64;
     let (thawed, _) = run_capture_reserved_with_host(
         &inst,

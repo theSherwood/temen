@@ -15,8 +15,13 @@ use temen_durable::{
     write_state, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value, SHADOW_STRIDE};
-use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Inst, Memory, Module, Terminator};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -54,7 +59,7 @@ fn run_normal(m: &Module) -> Result<Vec<Value>, Trap> {
         0,
         &[],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -66,6 +71,7 @@ fn fiber_module_is_inert_under_instrumentation_in_normal() {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
 
     let base = run_normal(&m).expect("baseline fiber run");
@@ -122,6 +128,7 @@ fn both_fiber_thaw_arms_reissue_their_op() {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let (res0, susp0, _) = op_and_trap_counts(&m);
     assert_eq!((res0, susp0), (2, 1), "source: 2 cont.resume, 1 suspend");
@@ -189,12 +196,13 @@ block 0 (v0: i64, v1: i64) {
     let mut m = temen_text::parse_module(SRC2).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR verifies");
 
     // Freeze: seed the window in UNWINDING so the run unwinds instead of completing.
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut host = Host::new();
     host.set_durable(true);
@@ -207,8 +215,8 @@ block 0 (v0: i64, v1: i64) {
     );
 
     // Region bases: root is context 0, the single fiber (slot 0) is context 1.
-    let root_base = ShadowArena::LEGACY.region_base(0);
-    let fiber_base = ShadowArena::LEGACY.region_base(1);
+    let root_base = TEST_ARENA.region_base(0);
+    let fiber_base = TEST_ARENA.region_base(1);
 
     // The root unwound its `cont.resume` frame into context 0's region.
     let root_region = &snap[root_base as usize..(root_base + SHADOW_STRIDE) as usize];
@@ -278,6 +286,7 @@ block 0 (v0: i64, v1: i64) {
     let mut m = temen_text::parse_module(SRC3).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented IR verifies");
@@ -287,7 +296,7 @@ block 0 (v0: i64, v1: i64) {
     assert_eq!(want, vec![Value::I64(107)], "uninterrupted result");
 
     // Freeze from the start: the run unwinds at resume #1's poll (fiber parked after suspend).
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fhost = Host::new();
     fhost.set_durable(true);
@@ -300,7 +309,7 @@ block 0 (v0: i64, v1: i64) {
 
     // Thaw: restore the captured window (REWINDING), re-seed the fiber, re-enter the root.
     let mut thaw_win = frozen_win;
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.set_frozen_fibers(frozen);
@@ -356,6 +365,7 @@ block 0 (v0: i64, v1: i64) {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     // The guest uses linear memory (the handle stash), so transform on the cooperating-toolchain
     // path; the stash is above the durable reserve.
@@ -373,7 +383,7 @@ block 0 (v0: i64, v1: i64) {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -388,7 +398,7 @@ block 0 (v0: i64, v1: i64) {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -417,7 +427,7 @@ block 0 (v0: i64, v1: i64) {
     // not re-issue the clock (which would yield clock_after + 5). Re-seed the fiber and re-enter.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -491,6 +501,7 @@ block 0 (v0: i64, v1: i64) {
     let mut ok = temen_text::parse_module(OK).expect("parse OK");
     ok.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     assert_eq!(
         run_normal(&ok),
@@ -501,6 +512,7 @@ block 0 (v0: i64, v1: i64) {
     let mut forged = temen_text::parse_module(FORGED).expect("parse FORGED");
     forged.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     assert_eq!(
         run_normal(&forged),
@@ -539,6 +551,7 @@ block 0 (v0: i64, v1: i64) {
     let mut reuse = temen_text::parse_module(REUSE).expect("parse REUSE");
     reuse.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     assert_eq!(
         run_normal(&reuse),
@@ -572,6 +585,7 @@ block 0 (v0: i64, v1: i64) {
     let mut stale = temen_text::parse_module(STALE).expect("parse STALE");
     stale.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     assert_eq!(
         run_normal(&stale),
@@ -637,12 +651,13 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
     let mut m = temen_text::parse_module(SRC_FUTEX_PARKED_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
 
     // Baseline (no freeze): park → poll (FIBER_PARKED) → store+notify → collect. (The futex
-    // cell sits above `ShadowArena::LEGACY.end` — the low 64 KiB belongs to the durable header/shadow.)
+    // cell sits above `TEST_ARENA.end` — the low 64 KiB belongs to the durable header/shadow.)
     assert_eq!(
         run_normal(&inst),
         Ok(vec![Value::I32(1), Value::I64(107), Value::I64(7)]),
@@ -655,7 +670,7 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
     let (frozen_fibers, root_sp, snap) = {
         let mut h = Host::new();
         h.set_durable(true);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, 2);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -679,7 +694,7 @@ fn a_futex_event_parked_fiber_freezes_and_the_thawed_wait_reissues() {
     // store + notify wake it just as in the uninterrupted run.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen_fibers);
@@ -754,13 +769,14 @@ fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
     let mut m = temen_text::parse_module(SRC_WOKEN_PARKED_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
 
     let mut h = Host::new();
     h.set_durable(true);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 2);
     let mut fuel = 1_000_000u64;
     let (r, _) = run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
@@ -818,6 +834,7 @@ fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
     let mut m = temen_text::parse_module(SRC_CAP_PARKED_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -826,7 +843,7 @@ fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
     h.set_durable(true);
     let handle = h.grant_stream(StreamRole::In);
     h.set_stdin_blocking(true);
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut win, 2);
     let mut fuel = 1_000_000u64;
     let (r, _) = run_capture_reserved_with_host(
@@ -928,6 +945,7 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
     let mut m = temen_text::parse_module(SRC_WOKEN_PARK_COLLECTED_LATE).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -943,7 +961,7 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
     let (frozen_fibers, root_sp, snap) = {
         let mut h = Host::new();
         h.set_durable(true);
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         arm_freeze_after(&mut win, 2);
         let mut fuel = 1_000_000u64;
         let (r, snap) =
@@ -967,7 +985,7 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
     // NORMAL execution — the re-arm makes it rewind instead of starting fresh.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.set_frozen_fibers(frozen_fibers);

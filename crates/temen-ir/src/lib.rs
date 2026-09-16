@@ -331,6 +331,7 @@ pub mod durable_abi {
     /// codec — computes a region through these methods, replacing the three hand-synced
     /// `shadow_region_base`/`shadow_region_fits`/`MAX_SHADOW_CTX` copies that used to have to
     /// "MUST match" each other.
+    #[repr(C)]
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub struct ShadowArena {
         /// First byte of the arena (context 0's region base). 8-aligned, `>= DURABLE_CONTROL_END`.
@@ -340,16 +341,6 @@ pub mod durable_abi {
     }
 
     impl ShadowArena {
-        /// Migration scaffolding: the fixed placement every durable module had before the arena
-        /// became module-declared — `[guard+64, 1<<16)`, the old `SHADOW_BASE..DURABLE_RESERVE`.
-        /// Exists so the placement plumbing could land as a behaviour-identical refactor; the
-        /// follow-up that reads the arena from `Memory` deletes it (INVARIANTS.md #13: scaffolding
-        /// with a scheduled removal, never a standing default).
-        pub const LEGACY: ShadowArena = ShadowArena {
-            base: DURABLE_CONTROL_END,
-            end: 1 << 16,
-        };
-
         /// Bytes in the arena (mirrors [`Memory::size`]).
         pub const fn size(self) -> u64 {
             self.end - self.base
@@ -378,15 +369,25 @@ pub mod durable_abi {
             self.region_base(ctx) + STATE_IN_REGION_OFF
         }
 
-        /// The highest context index an allocator may *consider* — the top of the spawned-vCPU
-        /// pool, which grows down from here while fibers grow up from 1. Computed from `end`
-        /// alone (`end / SHADOW_STRIDE - 1`) rather than from [`Self::size`], reproducing the
-        /// pre-arena ceiling exactly: #1094 moved the base one guard up without moving this
-        /// ceiling, so the top indices do not all fit and every allocator skips them through
-        /// [`Self::region_fits`]. Byte-identical to the old `MAX_SHADOW_CTX`; the module-declared
-        /// arena replaces it with the honest `len / SHADOW_STRIDE - 1`.
+        /// A module that declared **no** arena: zero regions at the control-word boundary. Nothing
+        /// can be placed in it ([`Self::region_fits`] is false for every context), so a durable run
+        /// of such a module is refused at setup rather than defaulted — there is no default
+        /// placement (INVARIANTS.md #16).
+        pub const EMPTY: ShadowArena = ShadowArena {
+            base: DURABLE_CONTROL_END,
+            end: DURABLE_CONTROL_END,
+        };
+
+        /// How many whole regions the arena holds (context indices `0..contexts()`).
+        pub const fn contexts(self) -> usize {
+            (self.size() / SHADOW_STRIDE) as usize
+        }
+
+        /// The highest context index an allocator may hand out — the top of the spawned-vCPU
+        /// pool, which grows down from here while fibers grow up from 1. `contexts() - 1`, so
+        /// every index up to it fits ([`Self::region_fits`]); 0 (root only) for [`Self::EMPTY`].
         pub const fn ctx_ceiling(self) -> usize {
-            (self.end / SHADOW_STRIDE) as usize - 1
+            self.contexts().saturating_sub(1)
         }
 
         /// The context whose region contains shadow-SP `sp` — the inverse of
@@ -3358,6 +3359,12 @@ impl Func {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Memory {
     pub size_log2: u8,
+    /// The durable **shadow arena** (`durable_abi::ShadowArena`): where a freeze/thaw run keeps
+    /// its per-context shadow regions inside this window. Declared by the module — placement is
+    /// the guest's (INVARIANTS.md #16) — and verified (`temen-verify`): above the always-live
+    /// control words, 8-aligned, at least one region, inside the window, overlapping no data
+    /// segment. `None` means the module is **not freezable**: the durable transform fails closed.
+    pub shadow: Option<durable_abi::ShadowArena>,
 }
 
 impl Memory {
@@ -3659,7 +3666,10 @@ pub fn synth_manifest_start(
     let size_log2 = module
         .memory
         .map_or(need_log2, |m| m.size_log2.max(need_log2));
-    module.memory = Some(Memory { size_log2 });
+    module.memory = Some(Memory {
+        size_log2,
+        shadow: None,
+    });
     // The guest heap (when the program allocates) begins at the window's mapped boundary and grows
     // up into the reserved tail via `Memory.map`.
     let heap_base = seed_heap.then(|| 1u64 << size_log2);
@@ -4883,6 +4893,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
                 };
                 Memory {
                     size_log2: declared.max(need),
+                    shadow: None,
                 }
             }),
         data,
@@ -5730,7 +5741,10 @@ mod link_layout_tests {
                 data_funcrefs: Vec::new(),
                 types: vec![],
                 funcs: vec![],
-                memory: Some(Memory { size_log2: 16 }),
+                memory: Some(Memory {
+                    size_log2: 16,
+                    shadow: None,
+                }),
                 data: vec![Data {
                     offset: seg_offset,
                     readonly,
@@ -5838,7 +5852,10 @@ mod link_layout_tests {
                         term: Terminator::Return(vec![]),
                     }],
                 }],
-                memory: Some(Memory { size_log2: 16 }), // small declared window (64 KiB)
+                memory: Some(Memory {
+                    size_log2: 16,
+                    shadow: None,
+                }), // small declared window (64 KiB)
                 data: vec![Data {
                     offset: 0,
                     readonly: false,

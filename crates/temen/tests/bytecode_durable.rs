@@ -15,6 +15,11 @@
 //!   3. restore+re-freeze is byte-identical (the §12.6 canonical invariant);
 //!   4. thawing the bytecode artifact (REWINDING) reproduces the uninterrupted result and ends NORMAL.
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module, write_state, STATE_NORMAL,
     STATE_UNWINDING,
@@ -28,7 +33,7 @@ const SIZE_LOG2: u8 = 17; // 128 KiB ≥ the durable reserve
 const WINDOW: usize = 1 << SIZE_LOG2;
 
 fn window_with(state: i32) -> Vec<u8> {
-    let mut w = init_durable_window(WINDOW);
+    let mut w = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut w, state);
     w
 }
@@ -137,7 +142,7 @@ fn check(src: &str) {
     // frozen point's result is *reloaded* (not re-issued), so the run reproduces the baseline and ends
     // NORMAL.
     let mut thaw_win = rwin;
-    begin_thaw(&mut thaw_win, 0);
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
     let (thaw_res, final_win, _, _) = bc_run(&inst, clock_after, &thaw_win);
     assert_eq!(
         thaw_res,
@@ -154,7 +159,7 @@ fn check(src: &str) {
 /// A single-fiber durable program with two may-suspend calls (`Clock.now`, iface 2 op 0 — an unwind
 /// point): the first value is live across the second call, so a freeze after the first call spills it
 /// into the shadow stack and a thaw reloads it. `base = clock_v + (clock_v + 1)`.
-const TWO_CLOCK_READS: &str = r#"memory 17
+const TWO_CLOCK_READS: &str = r#"memory 17 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 2 0 () -> (i64) v0 ()
@@ -173,7 +178,7 @@ fn single_fiber_clock_freeze_thaw_round_trip() {
 /// **Multiple** live values across the suspend point: the freeze must spill `v3` and `v8` (both
 /// derived from the first call's result and used after the second call) into the continuation block's
 /// params, and the thaw must restore them. `base = 5*clock_v + 8`.
-const MULTI_LIVE: &str = r#"memory 17
+const MULTI_LIVE: &str = r#"memory 17 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 2 0 () -> (i64) v0 ()

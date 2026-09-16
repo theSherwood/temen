@@ -50,7 +50,10 @@ impl Op {
 
 // ---- minimal-module builders --------------------------------------------------------------------
 
-const MEM: Memory = Memory { size_log2: 16 };
+const MEM: Memory = Memory {
+    size_log2: 16,
+    shadow: None,
+};
 
 fn func(params: Vec<ValType>, results: Vec<ValType>, insts: Vec<Inst>, term: Terminator) -> Func {
     Func {

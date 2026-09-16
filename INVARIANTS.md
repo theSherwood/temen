@@ -344,3 +344,21 @@ another backend or axis where a parameterised harness exists; a capability varia
 parameter combination rather than per parameter. (Owner decision 2026-09-14; sharpens invariants 1 +
 13 + 14. Evidence: the six browser driver families and their hand-mirroring bug stream — #1026,
 #1339, #1347, #748 — and the 44-entry `run`/`compile_and_run` family; #1414 is the convergence.)
+
+## 16. Runtime-private placement is the guest's
+
+The substrate fixes in a guest window only what it polls on the hot path — the durable control
+words at `[guard, guard+64)`. Where any *other* runtime-private structure lives inside a window —
+today the durable shadow arena, the per-context regions a freeze/thaw run spills into — is
+**declared by the module and verified**, never a substrate constant, and never defaulted when the
+module declares none (a module without a declaration is simply not freezable; the transform and both
+runtimes fail closed). A guest already places everything else in its window; a fixed carve-out is a
+hole in its address space it cannot see and, by invariant 2, cannot trap on — the collision is
+silent by construction. *Violated by:* a new `*_RESERVE` / `*_BASE` constant that claims window
+bytes; a runtime that applies a default placement when the declaration is absent; a second copy of
+the placement arithmetic (there is one, `temen_ir::durable_abi::ShadowArena`, and every backend
+calls it — invariant 15). (Owner decision 2026-09-16, #1503; sharpens 4 — guest = policy — and
+15. It earned its place by rejecting three real proposals in one afternoon: donating heap to move
+the guest's data around the reserve, mapping the NULL guard as scratch during freeze, and widening
+the session snapshot to make room — each a workaround for the substrate owning a placement that was
+the guest's to make.)

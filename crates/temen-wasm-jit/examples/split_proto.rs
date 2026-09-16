@@ -303,7 +303,10 @@ fn build(n_filler: usize, filler_len: usize, hot_blocks: usize, hot_block_len: u
     }
     Module {
         funcs,
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     }
 }
@@ -374,7 +377,10 @@ fn build_outlined(
     }
     Module {
         funcs,
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         ..Default::default()
     }
 }
@@ -482,7 +488,10 @@ fn main() {
         let f = callfree_loop(hot_blocks, hot_block_len);
         let m = Module {
             funcs: vec![f],
-            memory: Some(Memory { size_log2: 16 }),
+            memory: Some(Memory {
+                size_log2: 16,
+                shadow: None,
+            }),
             ..Default::default()
         };
         let mono = compile_module_with(&m, false).expect("monolithic emits");

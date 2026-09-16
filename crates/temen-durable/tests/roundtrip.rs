@@ -15,6 +15,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::Memory;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18; // 256 KiB window, fully mapped (reserved == mapped)
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -37,6 +43,7 @@ fn module() -> temen_ir::Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     transform_module(&m).expect("transform")
 }
@@ -56,7 +63,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
         0,
         &[Value::I32(clk)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );
@@ -70,7 +77,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
     let mut host = Host::new();
     host.clock_ns = 42; // same initial conditions as the baseline
     let clk = host.grant_clock();
-    let mut win = init_durable_window(WINDOW);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut win, STATE_UNWINDING);
     let mut fuel = 100_000u64;
     let (frozen, snapshot) = run_capture_reserved_with_host(
@@ -98,7 +105,7 @@ fn freeze_serialize_restore_thaw_equals_uninterrupted_run() {
     // artifact). Clock would now return 0 — so if thaw re-issued the call instead of
     // reloading the saved 42, the result would be 100, not 142.
     let mut win = snapshot.clone();
-    begin_thaw(&mut win, 0);
+    begin_thaw(&mut win, TEST_ARENA, 0);
     let mut host = Host::new(); // clock_ns defaults to 0
     let clk = host.grant_clock();
     let mut fuel = 100_000u64;
@@ -137,7 +144,7 @@ fn normal_run_of_instrumented_module_matches_unmodified_behavior() {
         0,
         &[Value::I32(clk)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut host,
     );

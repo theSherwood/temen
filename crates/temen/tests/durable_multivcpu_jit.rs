@@ -31,8 +31,13 @@ use temen_durable::{
     begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
-use temen_ir::durable_abi::ShadowArena;
 use temen_ir::{Memory, Module};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv, FrozenFiber as JitFiber,
     FrozenVCpu as JitVCpu, JitError, JitOutcome,
@@ -77,6 +82,7 @@ fn instrument() -> Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented multi-vCPU IR verifies");
@@ -97,7 +103,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -121,7 +127,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
     jhost.set_durable(true);
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jout, jsnap, jfibers, jvcpus, _jroot_sp) =
         match compile_and_run_capture_reserved_with_host_durable_mv(
@@ -130,9 +136,9 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
             &[clk as i64],
             &jwin,
             &[],
-            &[],                                // freeze: no fiber seed
-            &[],                                // freeze: no vcpu seed
-            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
+            &[],                       // freeze: no fiber seed
+            &[],                       // freeze: no vcpu seed
+            TEST_ARENA.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -152,7 +158,7 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
 
     // (1) The two backends flatten the child into a byte-identical durable reserve (control words +
     // both contexts' shadow regions): the same emitted IR spills the same values to the same offsets.
-    let reserve = ShadowArena::LEGACY.end as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -193,7 +199,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -206,7 +212,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     fhost.set_durable(true);
     fhost.clock_ns = 42;
     let fclk = fhost.grant_clock();
-    let mut fwin = init_durable_window(WINDOW);
+    let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
     let (fout, fsnap, _ff, fvcpus, froot_sp) =
         match compile_and_run_capture_reserved_with_host_durable_mv(
@@ -217,7 +223,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
             &[],
             &[],
             &[],
-            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
+            TEST_ARENA.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut fhost as *mut Host as *mut c_void,
@@ -240,7 +246,7 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     // JIT thaw on a host whose clock has *advanced* to 44: re-attach the child + restore the root's
     // extent, re-enter under REWINDING. Reload (42, 43) → 95; a re-issue would read {44, 45} → 99.
     let mut twin = fsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 44;
@@ -290,7 +296,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -324,7 +330,7 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
         })
         .collect();
     let mut twin = isnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 44;
@@ -403,6 +409,7 @@ fn instrument_child_fiber() -> Module {
     let mut m = temen_text::parse_module(SRC_CHILD_FIBER).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented child-fiber IR verifies");
@@ -427,7 +434,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -441,7 +448,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -469,7 +476,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     jhost.set_durable(true);
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jout, jsnap, jfibers, jvcpus, jroot_sp) =
         match compile_and_run_capture_reserved_with_host_durable_mv(
@@ -480,7 +487,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
             &[],
             &[],
             &[],
-            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
+            TEST_ARENA.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -497,7 +504,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
 
     // (1) Byte-identical durable reserve (control words + every context's flattened region): the
     // child's fiber (ctx 1) + the child vCPU (top-down ctx) flatten to the same bytes on both backends.
-    let reserve = ShadowArena::LEGACY.end as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -523,7 +530,7 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     let seed_fibers: Vec<JitFiber> = jfibers.clone();
     let seed_vcpus: Vec<JitVCpu> = jvcpus.clone();
     let mut twin = jsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 99;
@@ -606,6 +613,7 @@ fn instrument_nested() -> Module {
     let mut m = temen_text::parse_module(SRC_NESTED).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented nested IR verifies");
@@ -630,7 +638,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -644,7 +652,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -670,7 +678,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     jhost.set_durable(true);
     jhost.clock_ns = 42;
     let clk = jhost.grant_clock();
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jout, jsnap, _jf, jvcpus, jroot_sp) =
         match compile_and_run_capture_reserved_with_host_durable_mv(
@@ -681,7 +689,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
             &[],
             &[],
             &[],
-            ShadowArena::LEGACY.region_base(0), // freeze: root_sp unused
+            TEST_ARENA.region_base(0), // freeze: root_sp unused
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
@@ -698,7 +706,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
 
     // (1) Byte-identical durable reserve — incl. the grandchild's spilled per-vCPU handle (= 0 in the
     // child's namespace, not a global running index).
-    let reserve = ShadowArena::LEGACY.end as usize;
+    let reserve = TEST_ARENA.end as usize;
     assert_eq!(
         &isnap[..reserve],
         &jsnap[..reserve],
@@ -721,7 +729,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     // (3) Thaw on the JIT with an advanced clock: rebuild the per-parent join tables, run children
     // before parents, reload all three clock reads → 129 (a re-issue would be 99+100+101 = 300).
     let mut twin = jsnap.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
     thost.clock_ns = 99;

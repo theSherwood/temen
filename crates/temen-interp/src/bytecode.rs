@@ -674,6 +674,9 @@ thread_local! {
 /// A whole compiled module: one [`Program`] per function plus each function's result types (for
 /// reconstructing typed `Value`s at the entry boundary).
 pub struct Compiled {
+    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none —
+    /// a child window built for this program places its contexts here.
+    shadow: Option<super::ShadowArena>,
     progs: Vec<Program>,
     result_types: Vec<Vec<ValType>>,
     /// Per-function `(params, results)` for `call.dyn` type-checking — the natural module-0
@@ -1131,7 +1134,7 @@ fn compile_module_for(m: &Module) -> Option<Compiled> {
     if uses_rec && !m.impl_exports.is_empty() && !scan_seams(&m.funcs).bytecode_serves_fork() {
         return None;
     }
-    compile_module(&m.funcs, &m.types)
+    compile_module(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))
 }
 
 /// §3d — validate + **drain** a spawn record's `Budget` at a driver's commit site, returning the
@@ -1207,16 +1210,24 @@ pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
         && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
 }
 
-pub fn compile_module(funcs: &[Func], types: &[temen_ir::TypeEntry]) -> Option<Compiled> {
-    compile_module_with(funcs, types, true)
+pub fn compile_module(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    shadow: Option<super::ShadowArena>,
+) -> Option<Compiled> {
+    compile_module_with(funcs, types, true, shadow)
 }
 
 /// Unfused lowering — one op per source instruction, so the step/location trace stays
 /// tree-walker-identical. The debug/trace entries (`ir_trace`, `ir_window_trace`, `ir_value_trace`,
 /// `debug_advance_fiber`, `dbg_pick_runnable`) use this; results and traps are identical to the fused
 /// form (fusion only merges a pure compare into its sole-consumer branch).
-pub fn compile_module_unfused(funcs: &[Func], types: &[temen_ir::TypeEntry]) -> Option<Compiled> {
-    compile_module_with(funcs, types, false)
+pub fn compile_module_unfused(
+    funcs: &[Func],
+    types: &[temen_ir::TypeEntry],
+    shadow: Option<super::ShadowArena>,
+) -> Option<Compiled> {
+    compile_module_with(funcs, types, false, shadow)
 }
 
 /// Lower every function, or `None` if any uses an op outside this slice's subset.
@@ -1224,6 +1235,7 @@ fn compile_module_with(
     funcs: &[Func],
     types: &[temen_ir::TypeEntry],
     fuse: bool,
+    shadow: Option<super::ShadowArena>,
 ) -> Option<Compiled> {
     // Coroutines (§14, `spawn_coroutine`/`resume`/`yield`) are driven **inline** as single-vCPU
     // children with a Yielder-only powerbox. A coroutine module that *also* uses fibers or threads
@@ -1271,6 +1283,7 @@ fn compile_module_with(
     }
     let table_mask = funcs.len().next_power_of_two().max(1) - 1;
     Some(Compiled {
+        shadow,
         progs,
         result_types: funcs.iter().map(|f| f.results.clone()).collect(),
         sigs: funcs
@@ -2059,7 +2072,7 @@ fn compile_inst(
 /// [`crate::run`] (a module with no memory yields `None`).
 fn build_mem(m: &Module) -> Option<Mem> {
     m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
@@ -2243,7 +2256,7 @@ pub fn compile_and_run_capture(
     let mut host = Host::new();
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2);
+        let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
         mm.seed(init_mem);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -2285,6 +2298,7 @@ pub fn compile_and_run_capture_over(
             DEFAULT_RESERVED_LOG2,
             mc.size_log2,
             std::sync::Arc::clone(&back),
+            mc.shadow,
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
@@ -2325,7 +2339,8 @@ pub fn compile_and_run_over_shared_with_host(
     }
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back);
+        let mut mm =
+            Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, mc.size_log2, back, mc.shadow);
         if seed_data {
             mm.init_data(&m.data);
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -2345,6 +2360,8 @@ pub struct SharedProgram {
     source: std::sync::Arc<ModuleSource>,
     n_funcs: usize,
     mem_size_log2: Option<u8>,
+    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
+    shadow: Option<super::ShadowArena>,
     data: Vec<super::Data>,
     /// #964: the module's NULL-guard extent (`0` = unmarked/legacy).
     null_guard: u64,
@@ -2359,6 +2376,7 @@ impl SharedProgram {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
             mem_size_log2: m.memory.map(|mc| mc.size_log2),
+            shadow: m.memory.and_then(|mc| mc.shadow),
             data: m.data.clone(),
             null_guard: temen_ir::module_null_guard(),
         })
@@ -2473,7 +2491,7 @@ impl SharedProgram {
             None => Domain::child(self.source.clone(), SharedSlots::new(self.n_funcs, 0, 0)),
         };
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
             if seed_data {
                 mm.init_data(&self.data);
             }
@@ -2541,7 +2559,7 @@ impl SharedProgram {
             build_table(self.n_funcs, host.jit_table_log2()),
         );
         let mut mem = self.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
             mm.seed_null_guard(self.null_guard); // #964
             mm.seed_pages(prots);
             mm
@@ -2617,6 +2635,7 @@ pub fn compile_and_run_capture_over_parallel_with_host(
             DEFAULT_RESERVED_LOG2,
             mc.size_log2,
             std::sync::Arc::clone(&back),
+            mc.shadow,
         );
         mm.seed(init_mem);
         mm.init_data(&m.data);
@@ -2647,6 +2666,8 @@ pub fn compile_and_run_capture_over_parallel_with_host(
 pub struct VcpuProgram {
     dom: Domain,
     mem_size_log2: Option<u8>,
+    /// The module's declared durable shadow arena (INVARIANTS.md #16), `None` if it declared none.
+    shadow: Option<super::ShadowArena>,
     data: Vec<temen_ir::Data>,
     /// #964: the module's NULL-guard extent (`0` = unmarked/legacy), captured at compile so every
     /// window this program is run over seeds the same guard the module's layout was built for.
@@ -2673,6 +2694,7 @@ impl VcpuProgram {
         Some(VcpuProgram {
             dom,
             mem_size_log2: m.memory.as_ref().map(|mc| mc.size_log2),
+            shadow: m.memory.as_ref().and_then(|mc| mc.shadow),
             data: m.data.clone(),
             null_guard: temen_ir::module_null_guard(),
         })
@@ -3194,7 +3216,7 @@ impl<'p> Vcpu<'p> {
         init_mem: &[u8],
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm.seed_null_guard(prog.null_guard); // #964
@@ -3219,7 +3241,7 @@ impl<'p> Vcpu<'p> {
         host: Host,
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back, prog.shadow);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm.seed_null_guard(prog.null_guard); // #964
@@ -3244,7 +3266,7 @@ impl<'p> Vcpu<'p> {
         reserved_log2: u8,
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation(reserved_log2, sl);
+            let mut mm = Mem::with_reservation(reserved_log2, sl, prog.shadow);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm.seed_null_guard(prog.null_guard); // #964
@@ -3269,7 +3291,7 @@ impl<'p> Vcpu<'p> {
         back: std::sync::Arc<super::Region>,
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = prog.mem_size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, prog.shadow);
             mm.seed(init_mem);
             mm.init_data(&prog.data);
             mm.seed_null_guard(prog.null_guard); // #964
@@ -3328,7 +3350,12 @@ impl<'p> Vcpu<'p> {
         size_log2: Option<u8>,
     ) -> Result<Vcpu<'p>, Trap> {
         let mem = size_log2.map(|sl| {
-            let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, sl, back);
+            let mut mm = Mem::with_reservation_over(
+                DEFAULT_RESERVED_LOG2,
+                sl,
+                back,
+                prog.dom.source.get(module as usize).and_then(|c| c.shadow),
+            );
             // #1206: a spawned thread's `Mem` carries its own page map over the shared window, so it
             // seeds the guard itself — a thread storing at NULL traps exactly as its spawner does.
             mm.seed_null_guard(temen_ir::module_null_guard());
@@ -3591,7 +3618,8 @@ impl<'p> Vcpu<'p> {
         } else {
             vec![Value::I64(cinst as i64)]
         };
-        let mut mm = Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, size_log2, back);
+        let mut mm =
+            Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, size_log2, back, cunit.shadow);
         // #964/#1094/#1206: the NULL guard is the one canonical layout — a confined child's carve
         // reserves `[0, POWERBOX_NULL_GUARD)` exactly as a root window does (the tree-walker's nested
         // arm and every cross-tier bounce over the same carve already seed it; the emitted tier's guard
@@ -4167,7 +4195,7 @@ impl<'p> Vcpu<'p> {
     ) -> Result<Option<VcpuEvent>, Trap> {
         // Resolve the granted module from the run's powerbox (the shared one when attached). Its
         // import manifest + type section come along so the child's `call.import`s bind at spawn.
-        let (cfuncs, cmem_log2, cdata, cimports, ctypes) = match self.shared_host {
+        let (cfuncs, cmem_log2, cdata, cimports, ctypes, cshadow) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
@@ -4177,6 +4205,7 @@ impl<'p> Vcpu<'p> {
                     g.data.clone(),
                     g.imports.clone(),
                     g.types.clone(),
+                    g.shadow,
                 )
             }
             None => {
@@ -4187,10 +4216,11 @@ impl<'p> Vcpu<'p> {
                     g.data.clone(),
                     g.imports.clone(),
                     g.types.clone(),
+                    g.shadow,
                 )
             }
         };
-        let child_compiled = compile_module(&cfuncs, &ctypes)
+        let child_compiled = compile_module(&cfuncs, &ctypes, cshadow)
             .ok_or(Trap::Malformed)?
             .with_manifest(cimports, ctypes);
         let ok_entry = child_compiled
@@ -4281,7 +4311,7 @@ impl<'p> Vcpu<'p> {
         args: Option<(u64, u64)>,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
-        let (cfuncs, cmem_log2, cimports, ctypes, cdata) = match self.shared_host {
+        let (cfuncs, cmem_log2, cimports, ctypes, cdata, cshadow) = match self.shared_host {
             Some(m) => {
                 let g = m.lock_unpoisoned();
                 let g = g.resolve_module(mh)?;
@@ -4291,6 +4321,7 @@ impl<'p> Vcpu<'p> {
                     g.imports.clone(),
                     g.types.clone(),
                     g.data.clone(),
+                    g.shadow,
                 )
             }
             None => {
@@ -4301,10 +4332,11 @@ impl<'p> Vcpu<'p> {
                     g.imports.clone(),
                     g.types.clone(),
                     g.data.clone(),
+                    g.shadow,
                 )
             }
         };
-        let child_compiled = compile_module(&cfuncs, &ctypes)
+        let child_compiled = compile_module(&cfuncs, &ctypes, cshadow)
             .ok_or(Trap::Malformed)?
             .with_manifest(cimports, ctypes);
         let ok_entry = child_compiled
@@ -4498,7 +4530,7 @@ impl<'p> Vcpu<'p> {
                 return None;
             }
         };
-        let (res, slot) = match compile_module(&funcs, &types) {
+        let (res, slot) = match compile_module(&funcs, &types, None) {
             // Install into THIS vCPU's domain (== the shared one for a root; a §14 confined child —
             // which can't hold a Jit cap anyway — would only ever fill its own table).
             Some(unit) => match self
@@ -4568,7 +4600,7 @@ impl<'p> Vcpu<'p> {
                 return;
             }
         };
-        let unit = match compile_module(&funcs, &types) {
+        let unit = match compile_module(&funcs, &types, None) {
             Some(u) => u,
             None => {
                 self.trap = Some(Trap::Malformed);
@@ -4897,7 +4929,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
     host.wire_park_door();
     let dom = Domain::over_primary(compiled, host.jit_table_log2());
     let mut mem = m.memory.map(|mc| {
-        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+        let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
         mm.seed(init_mem);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -4933,7 +4965,7 @@ pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>)
 /// reports tree-walker-identical locations, so breakpoints/stepping at [`crate::IrPc`] granularity
 /// land at the same program points on both backends.
 pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Option<IrTrace> {
-    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
+    let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -4982,7 +5014,7 @@ pub fn ir_window_trace(
     addr: u64,
     len: usize,
 ) -> Option<WindowTrace> {
-    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
+    let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -5049,7 +5081,7 @@ pub fn ir_value_trace(
     .into_iter()
     .next()
     .unwrap_or_default();
-    let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: one step per source inst (Slice 5a)
+    let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: one step per source inst (Slice 5a)
     if func as usize >= c.progs.len() {
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
@@ -5210,7 +5242,11 @@ fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
 /// captured host replay substate, its natural module-0 table, and its fuel quota.
 fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource) -> DbgEnv {
     let child_size = 1u64 << es.size_log2;
-    let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2));
+    let child_shadow = source
+        .get(es.module)
+        .and_then(|c| c.shadow)
+        .unwrap_or(super::ShadowArena::EMPTY);
+    let mem = shared_mem.map(|m| m.nested_view(es.win_base, es.size_log2, child_shadow));
     if let Some(m) = &mem {
         m.install_prot(&es.prot); // its `map`/`unmap`/`protect`ed pages (bytes rode in the shared reseed)
     }
@@ -6106,8 +6142,8 @@ impl DebugRun {
             fn_block_types,
             ..
         } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
-                                                             // The debug engines hold `source`/`table` as separate fields (a `Domain` shares its table).
+        let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: debug stepping (Slice 5a)
+                                                                                              // The debug engines hold `source`/`table` as separate fields (a `Domain` shares its table).
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
         let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
         let mem = build_mem(m);
@@ -7670,11 +7706,11 @@ fn dbg_instantiate(
     let child_mem = match tasks[ti].env {
         None => shared_mem
             .as_ref()
-            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
         Some(k) => extra_envs[k]
             .mem
             .as_ref()
-            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
     };
     // Attenuated powerbox over the child's *own* `[0, child_size)`: an `Instantiator` (so it can nest —
     // confinement composes) and an `AddressSpace`; these are its entry arguments.
@@ -7741,16 +7777,17 @@ fn dbg_instantiate_module(
 ) -> Result<(), Trap> {
     // Resolve + clone the granted module from the powerbox (mirrors production: the module handle is
     // resolved against the shared host). A forged/closed/wrong-type handle is an inert CapFault.
-    let (cfuncs, cmem_log2, cdata, ctypes) = {
+    let (cfuncs, cmem_log2, cdata, ctypes, cshadow) = {
         let g = host.resolve_module(mh)?;
         (
             g.funcs.clone(),
             g.memory_log2,
             g.data.clone(),
             g.types.clone(),
+            g.shadow,
         )
     };
-    let child_compiled = match compile_module(&cfuncs, &ctypes) {
+    let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
         Some(c) => c,
         None => return Err(Trap::Malformed),
     };
@@ -7815,7 +7852,7 @@ fn dbg_instantiate_module(
                 }
             }
         }
-        pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+        pm.map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
     };
     let mut child_host = Host::new();
     let cinst = child_host.grant_instantiator(0, child_size);
@@ -7916,7 +7953,7 @@ fn dbg_jit_install(
                     .map(|t| (f, t))
             })
     })?;
-    let res = match compile_module(&funcs, &types) {
+    let res = match compile_module(&funcs, &types, None) {
         Some(unit) => match jit_install_into(source, table, unit) {
             Some(slot) => slot as i64,
             None => super::ENOSPC,
@@ -7976,7 +8013,7 @@ fn dbg_jit_invoke_unit(
                     .map(|t| (f, t))
             })
     })?;
-    let unit = compile_module(&funcs, &types).ok_or(Trap::Malformed)?;
+    let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
     let arity_ok = unit
         .sigs
         .first()
@@ -8276,7 +8313,7 @@ impl ScheduledDebugRun {
             fn_block_types,
             ..
         } = ModuleDebug::build(m, 0);
-        let c = compile_module_unfused(&m.funcs, &m.types)?; // unfused: debug stepping (Slice 5a)
+        let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: debug stepping (Slice 5a)
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
         let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
         let mem = build_mem(m);
@@ -9103,7 +9140,12 @@ fn exec_image_build(
         ),
         Err(_) => return Err(()),
     };
-    let child_compiled = compile_module(&cfuncs, &cmodule.types).ok_or(())?;
+    let child_compiled = compile_module(
+        &cfuncs,
+        &cmodule.types,
+        cmodule.memory.and_then(|x| x.shadow),
+    )
+    .ok_or(())?;
     // Entry sig + window fit: the command reuses the caller's window in place, so its declared memory
     // must be `<=` the caller's backed-prefix window (a larger window is a safe §2-masked superset).
     let want_as = child_compiled
@@ -9692,7 +9734,7 @@ impl VTask {
             active: Vm::new(c, entry, args)?,
             active_id: ROOT_FIBER,
             chain: Vec::new(),
-            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
+            root_shadow_sp: c.shadow.unwrap_or(super::ShadowArena::EMPTY).frame_base(0), // §12.8 4A.5: empty root = frame base
             active_invoke: None,
             invoke_step_into: false, // DebugRun::new_with_host flips this on for the single-vCPU engine
         })
@@ -9731,8 +9773,8 @@ fn shadow_switch(
     // §12.8 4A.5: each context's SP word lives in its own region (root = context 0, fiber slot `s` =
     // context `s + 1`). (This bytecode durable path is unreachable today — durable hosts always run on
     // the tree-walker — but kept correct and compiling.)
-    let region_of =
-        |ctx: usize| super::shadow_region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
+    let arena = m.shadow_arena();
+    let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
     let sp = m.durable_get_sp(region_of(out_ctx));
     if out_ctx == ROOT_FIBER {
         *root_shadow_sp = sp;
@@ -9774,12 +9816,16 @@ fn freeze_drive(
     budget: u64,
 ) -> Result<Vec<super::FrozenFiber>, Trap> {
     // The root's post-unwind SP (context 0); restored at the end so the window is thaw-ready.
-    let root_word = super::shadow_region_base(0);
+    let arena = ctx
+        .mem
+        .as_ref()
+        .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena());
+    let root_word = arena.region_base(0);
     let root_sp = ctx
         .mem
         .as_ref()
         .map(|m| m.durable_get_sp(root_word))
-        .unwrap_or(super::ShadowArena::LEGACY.frame_base(0));
+        .unwrap_or(arena.frame_base(0));
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
@@ -9794,10 +9840,7 @@ fn freeze_drive(
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
-            m.durable_set_sp(
-                super::shadow_region_base(slot + 1),
-                super::shadow_region_base(slot + 1) + super::REGION_HEADER_LEN,
-            );
+            m.durable_set_sp(arena.region_base(slot + 1), arena.frame_base(slot + 1));
         }
         // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
         // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
@@ -9822,8 +9865,8 @@ fn freeze_drive(
         let shadow_sp = ctx
             .mem
             .as_ref()
-            .map(|m| m.durable_get_sp(super::shadow_region_base(slot + 1)))
-            .unwrap_or(super::ShadowArena::LEGACY.frame_base(0));
+            .map(|m| m.durable_get_sp(arena.region_base(slot + 1)))
+            .unwrap_or(arena.frame_base(slot + 1));
         fiber_sp[slot] = shadow_sp;
         frozen.push(super::FrozenFiber {
             slot,
@@ -10043,8 +10086,11 @@ fn drive_nested(
                     ..
                 }) = run_meta.as_mut()
                 {
-                    fiber_sp
-                        .push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN);
+                    fiber_sp.push(
+                        mem.as_ref()
+                            .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
+                            .frame_base(h as usize + 1),
+                    );
                     let func_idx = (funcref as u32 as usize & source.primary().table_mask) as i32;
                     fiber_meta.push((func_idx, sp));
                 }
@@ -10123,7 +10169,7 @@ fn drive_nested(
             Outcome::JitInstall { h, code, dst } if run_meta.is_some() => {
                 let _ = code; // the mirror keys on the unit identity, not the (revocable) handle
                 let ((funcs, types), unit_id) = host.with(|p| resolve_jit_unit(p, h, code))?;
-                let res = match compile_module(&funcs, &types) {
+                let res = match compile_module(&funcs, &types, None) {
                     Some(unit) => match jit_install_into(source, table, unit) {
                         Some(slot) => {
                             if let Some(m) = run_meta.as_mut().and_then(|c| c.jit_mirror.as_mut()) {
@@ -10172,7 +10218,7 @@ fn drive_nested(
                 results,
             } => {
                 let ((funcs, types), _) = host.with(|p| resolve_jit_unit(p, h, code))?;
-                let unit = compile_module(&funcs, &types).ok_or(Trap::Malformed)?;
+                let unit = compile_module(&funcs, &types, None).ok_or(Trap::Malformed)?;
                 let arity_ok = unit
                     .sigs
                     .first()
@@ -10520,11 +10566,16 @@ fn step_vcpu(
                 // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
-                fiber_sp.push(super::shadow_region_base(h as usize + 1) + super::REGION_HEADER_LEN); // §12.8 4A.5: empty = frame base (past the in-region SP + thaw words)
-                                                                                                     // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
-                                                                                                     // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
-                                                                                                     // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
-                                                                                                     // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
+                fiber_sp.push(
+                    ctx.mem
+                        .as_ref()
+                        .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
+                        .frame_base(h as usize + 1),
+                ); // §12.8 4A.5: empty = frame base (past the in-region SP + thaw words)
+                   // Freeze residue (DURABILITY.md §12.8): record the fiber's re-entry metadata — its
+                   // **resolved** entry function index (the natural-table lookup `cont.resume` does, so
+                   // a `FrozenFiber.func` matches the tree-walker's `Frame::func`) and data-stack base —
+                   // so the freeze driver can emit a `FrozenFiber` for it even after it parks.
                 let func_idx = (funcref as u32 as usize & dom.source.primary().table_mask) as i32;
                 fiber_meta.push((func_idx, sp));
                 vt.active.set(dst, Reg::from_i32(h));
@@ -10580,7 +10631,11 @@ fn step_vcpu(
                         let mut fvm = Vm::new(&tm, tfunc, &[Value::I64(sp), Value::I64(arg)])?;
                         fvm.module = tmod;
                         // §12.8 4A.5: this fiber spills into its own region (slot `k` = context `k + 1`).
-                        fvm.durable_region_base = super::shadow_region_base(k + 1);
+                        fvm.durable_region_base = ctx
+                            .mem
+                            .as_ref()
+                            .map_or(super::ShadowArena::EMPTY, |m| m.shadow_arena())
+                            .region_base(k + 1);
                         fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
@@ -12235,11 +12290,13 @@ impl CoopSched {
                             twin_active.jit_eligible = None;
                             twin_active.jit_page_checked = false;
                         }
+                        let twin_root_sp =
+                            twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
                             chain: Vec::new(),
-                            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
+                            root_shadow_sp: twin_root_sp,
                             active_invoke: None,
                             invoke_step_into: false,
                         };
@@ -12526,11 +12583,13 @@ impl CoopSched {
                                 twin_active.jit_eligible = None;
                                 twin_active.jit_page_checked = false;
                             }
+                            let twin_root_sp =
+                                twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
                             let twin_vt = VTask {
                                 active: twin_active,
                                 active_id: ROOT_FIBER,
                                 chain: Vec::new(),
-                                root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
+                                root_shadow_sp: twin_root_sp,
                                 active_invoke: None,
                                 invoke_step_into: false,
                             };
@@ -12741,11 +12800,11 @@ impl CoopSched {
                     let child_mem = match tasks[ti].env {
                         None => mem
                             .as_ref()
-                            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
                         Some(k) => extra_envs[k]
                             .mem
                             .as_ref()
-                            .map(|m| m.nested_view(abs_base, size_log2 as u8)),
+                            .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena())),
                     };
                     // Attenuated powerbox: an `Instantiator` (so the child can itself nest — confinement
                     // composes to any depth) and an `AddressSpace` (so it manages its own pages), each
@@ -12937,7 +12996,11 @@ impl CoopSched {
                     // Compile the granted module to bytecode. A module using an op the engine can't lower
                     // is the one place a guest-provided program outruns coverage (no tree-walker fallback
                     // mid-run) — a `Malformed` trap, exactly as for `Jit.install`.
-                    let child_compiled = match compile_module(&cfuncs, &cmodule.types) {
+                    let child_compiled = match compile_module(
+                        &cfuncs,
+                        &cmodule.types,
+                        cmodule.memory.and_then(|x| x.shadow),
+                    ) {
                         Some(c) => c,
                         None => {
                             complete(tasks, ti, Err(Trap::Malformed));
@@ -13014,7 +13077,7 @@ impl CoopSched {
                                 }
                             }
                         }
-                        pm.map(|m| m.nested_view(abs_base, size_log2 as u8))
+                        pm.map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
                     };
                     // op 5 grants only Instantiator+AddressSpace; op 13 (`grants` is `Some((ptr, n))`)
                     // additionally re-grants a by-name cap list read from the parent window, so a spawned
@@ -13343,7 +13406,7 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let res = match compile_module(&funcs, &types) {
+                    let res = match compile_module(&funcs, &types, None) {
                         Some(unit) => match match tasks[ti].env {
                             None => dom.install(unit),
                             Some(k) => jit_install_into(&dom.source, &extra_envs[k].table, unit),
@@ -13473,7 +13536,7 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let unit = match compile_module(&funcs, &types) {
+                    let unit = match compile_module(&funcs, &types, None) {
                         Some(u) => u,
                         None => {
                             complete(tasks, ti, Err(Trap::Malformed));
@@ -13709,7 +13772,7 @@ impl CoopRun {
         back: std::sync::Arc<super::Region>,
     ) -> Option<Result<CoopRun, Trap>> {
         let mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back);
+            let mut mm = Mem::with_reservation_over(reserved_log2, mc.size_log2, back, mc.shadow);
             mm.seed(init_mem);
             mm.init_data(&m.data);
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -13774,7 +13837,7 @@ impl CoopRun {
         host.wire_park_door();
         let dom = Domain::over_primary(compiled, host.jit_table_log2());
         let mut mem = m.memory.map(|mc| {
-            let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2);
+            let mut mm = Mem::with_reservation(reserved_log2, mc.size_log2, mc.shadow);
             mm.seed(init_mem);
             mm.init_data(&m.data);
             mm.seed_null_guard(temen_ir::module_null_guard()); // #964
@@ -14616,11 +14679,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                         twin_host.wire_park_door();
                         let mut twin_active = vt.active.clone();
                         twin_active.set(dst, Reg::from_i64(0));
+                        let twin_root_sp = twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
                             chain: Vec::new(),
-                            root_shadow_sp: super::ShadowArena::LEGACY.region_base(0),
+                            root_shadow_sp: twin_root_sp,
                             active_invoke: None,
                             invoke_step_into: false,
                         };
@@ -14826,7 +14890,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                         Err(t) => return (Err(t), mem),
                     }
                 };
-                let res = match compile_module(&funcs, &types) {
+                let res = match compile_module(&funcs, &types, None) {
                     Some(unit) => match dom.install(unit) {
                         Some(slot) => slot as i64,
                         None => super::ENOSPC,
@@ -14878,7 +14942,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                         Err(t) => return (Err(t), mem),
                     }
                 };
-                let unit = match compile_module(&funcs, &types) {
+                let unit = match compile_module(&funcs, &types, None) {
                     Some(u) => u,
                     None => return (Err(Trap::Malformed), mem),
                 };
@@ -14983,7 +15047,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let abs_base = pbase + ibase + off_u;
                 let child_mem = mem
                     .as_ref()
-                    .map(|m| m.nested_view(abs_base, size_log2 as u8));
+                    .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()));
                 let mut child_host = Host::new();
                 let cinst = child_host.grant_instantiator(0, child_size);
                 let cas = child_host.grant_address_space(0, child_size);
@@ -15065,7 +15129,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 }
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
                 // handle is an inert CapFault → trap).
-                let (cfuncs, cmem_log2, cdata, ctypes) = {
+                let (cfuncs, cmem_log2, cdata, ctypes, cshadow) = {
                     let g = host.lock_unpoisoned();
                     match g.resolve_module(mh) {
                         Ok(grant) => (
@@ -15073,13 +15137,14 @@ fn run_vcpu_parallel<'scope, 'env>(
                             grant.memory_log2,
                             grant.data.clone(),
                             grant.types.clone(),
+                            grant.shadow,
                         ),
                         Err(t) => return (Err(t), mem),
                     }
                 };
                 // Compile to bytecode — a module using an op the engine can't lower is the one place a
                 // guest-provided program outruns coverage (a `Malformed` trap, as for `Jit.install`).
-                let child_compiled = match compile_module(&cfuncs, &ctypes) {
+                let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
                     Some(c) => c,
                     None => return (Err(Trap::Malformed), mem),
                 };
@@ -15136,7 +15201,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                         }
                     }
                     mem.as_ref()
-                        .map(|m| m.nested_view(abs_base, size_log2 as u8))
+                        .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
                 };
                 let mut child_host = Host::new();
                 let cinst = child_host.grant_instantiator(0, child_size);
@@ -15422,7 +15487,7 @@ impl Vm {
             pc: 0,
             scratch: Vec::new(),
             setjmp_points: std::collections::BTreeMap::new(),
-            durable_region_base: super::shadow_region_base(0), // root context (overwritten for fibers)
+            durable_region_base: c.shadow.unwrap_or(super::ShadowArena::EMPTY).region_base(0), // root context (overwritten for fibers)
             jit_eligible: None, // set only on the root Vm via `Vcpu::with_jit_eligible`
             jit_page_checked: false,
             serve_ticket: None,
