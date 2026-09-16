@@ -156,7 +156,9 @@ fn non_durable_kind_of(c: Capability) -> Option<NonDurableKind> {
         | Capability::AddressSpace
         | Capability::Instantiator
         | Capability::Jit
-        | Capability::JitCode => return None,
+        | Capability::JitCode
+        // #1502: a Budget's remaining quotas ride the artifact verbatim.
+        | Capability::Budget => return None,
         Capability::SharedRegion => NonDurableKind::SharedRegion,
         Capability::Module => NonDurableKind::Module,
         Capability::ModuleLoader => NonDurableKind::ModuleLoader,
@@ -164,7 +166,6 @@ fn non_durable_kind_of(c: Capability) -> Option<NonDurableKind> {
         Capability::HostProc => NonDurableKind::HostProc,
         Capability::Offer => NonDurableKind::Offer,
         Capability::LiveImpl => NonDurableKind::LiveImpl,
-        Capability::Budget => NonDurableKind::Budget,
         Capability::PipeEnd => NonDurableKind::Pipe,
     })
 }
