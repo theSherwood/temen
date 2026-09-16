@@ -2819,7 +2819,7 @@ pub unsafe extern "C" fn premap_apply(
         install_region_hook(&mut child, base, reserved);
         let pages = child.cap_window_pages(base as usize);
         let mut wm = MprotectWindow::new_shared(base, mapped, reserved, pages);
-        wm.set_null_guard(child.null_guard());
+        wm.set_null_guard(temen_ir::module_null_guard());
         i32::from(child.apply_premap(&mut wm) >= 0)
     }
     #[cfg(not(any(unix, windows)))]
