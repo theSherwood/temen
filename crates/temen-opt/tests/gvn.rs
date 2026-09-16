@@ -15,7 +15,10 @@ fn module(f: Func) -> Module {
         data_funcrefs: Vec::new(),
         types: vec![],
         funcs: vec![f],
-        memory: Some(Memory { size_log2: 16 }),
+        memory: Some(Memory {
+            size_log2: 16,
+            shadow: None,
+        }),
         data: vec![],
         imports: vec![],
         exports: vec![],

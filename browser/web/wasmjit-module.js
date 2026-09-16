@@ -19,7 +19,7 @@
 // fresh instance, window, and env cell are built per Run, so no guest state crosses Runs. A missing
 // key (undefined) disables caching for that call. Bounded so a session that Runs many distinct modules
 // can't grow it without limit.
-import { foreignMemory } from './foreign-mem.js';
+import { foreignMemory, foreignStats } from './foreign-mem.js';
 const jitModuleCache = new Map();
 const JIT_MODULE_CACHE_MAX = 16;
 function cacheGet(key) {
@@ -94,6 +94,18 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // once. Returns the finish status. The caller must have opened the run (`temen_onramp_jit_run_open*`) already.
 // `cacheKey` (optional) is a stable identity of the guest module; when given, the compiled Module and its
 // instance are reused across Runs (see `cachedInstanceF0`).
+// #1417 — cross-tier bounce accounting. Every function the emitter declined runs interpreted inside a
+// `call_interp` bounce; on a DETACHED child that interpreted stretch reads and writes the child's memory
+// through `Region::Foreign` (one JS import per access). Counting bounces and the wall-clock spent inside
+// them, per phase, is the direct measurement of what a declined body costs on the shipped path
+// (DETACHED_JIT.md §8: "how often do the real phases decline, and does it matter?"). One counter for
+// both bounce sites; `jitNimWholeCardOp13` reads it per phase into `timings`.
+export const bounceStats = {
+  n: 0, ms: 0,
+  reset() { this.n = 0; this.ms = 0; },
+  take() { const r = { bounces: this.n, bounceMs: this.ms }; this.reset(); return r; },
+};
+
 export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
   const u8 = () => new Uint8Array(memory.buffer);
   // Read the window base + the powerbox handle slots `_start` takes as params, and the env-cell size.
@@ -133,7 +145,10 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
         return u8().slice(wptr, wptr + wlen);
       },
       (func, argsPtr) => {
-        if (ex.temen_onramp_jit_run_call_interp(func, argsPtr) !== 0) throw new Error('cross-tier stop');
+        const tb = performance.now();
+        const st = ex.temen_onramp_jit_run_call_interp(func, argsPtr);
+        bounceStats.n++; bounceStats.ms += performance.now() - tb;
+        if (st !== 0) throw new Error('cross-tier stop');
         // A `vm_map` grow in the bounce advanced the run's committed extent — re-sync the emitted
         // `"mapped"` (the `driveCoopTierupRun` scalar pattern; on-ramp guests grow scalar, no paged
         // pagestate on the mask-only emit; a paged run re-points its table too). Inert until the
@@ -230,10 +245,12 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey, afterF
         return eu8().slice(wptr, wptr + wlen);
       },
       (func, argsPtr) => {
+        const tb = performance.now(); // the env-cell copies are part of this path's bounce cost
         eu8().set(cu8().subarray(env, env + envBytes), scratch);
         const st = ex.temen_onramp_jit_run_call_interp(func, scratch + (argsPtr - env));
         // Copy back even on a stop: the cell is the child's, and a later read must see the results.
         cu8().set(eu8().subarray(scratch, scratch + envBytes), env);
+        bounceStats.n++; bounceStats.ms += performance.now() - tb;
         if (st !== 0) throw new Error('cross-tier stop');
         syncGlobals();
       },
@@ -1203,6 +1220,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   // ---- phase 1: crawl the import closure with nifler (tiered), capturing the module graph -----------
   const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
   const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
+  bounceStats.reset();
+  foreignStats.reset();
   const mods = new Map(); // stem -> { file, deps: [stem], role }
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   let crawled = 0;
@@ -1268,6 +1287,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tCrawl = now();
+  const bCrawl = bounceStats.take(), fCrawl = foreignStats.take();
   // ---- dependency order (DFS postorder, System first) — mirrors nimc::toposort ----------------------
   const order = [], mark = new Map();
   const visit = (s) => {
@@ -1313,6 +1333,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tNimsem = now();
+  const bNimsem = bounceStats.take(), fNimsem = foreignStats.take();
   // ---- phase 3: hexer per module (tiered, 3-cap) — main gets the app-entry glue --------------------
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
@@ -1339,7 +1360,19 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tHexer = now();
-  return { crawled, semmed, hexed, produced, timings: { crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem } };
+  const bHexer = bounceStats.take(), fHexer = foreignStats.take();
+  return {
+    crawled, semmed, hexed, produced,
+    timings: {
+      crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem,
+      // #1417: declined-body accounting per phase — bounce count and wall-clock inside bounces.
+      crawlBounces: bCrawl.bounces, crawlBounceMs: bCrawl.bounceMs,
+      nimsemBounces: bNimsem.bounces, nimsemBounceMs: bNimsem.bounceMs,
+      hexerBounces: bHexer.bounces, hexerBounceMs: bHexer.bounceMs,
+      // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
+      crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
+    },
+  };
 }
 
 // Run the **self-host** compile on the wasm-JIT (SELFHOST_C.md §7 step 5): chibicc.temen compiles one of

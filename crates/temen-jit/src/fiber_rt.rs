@@ -121,28 +121,17 @@ const FIBER_STACK: usize = 1 << 18;
 
 // ---- Durable per-fiber shadow-stack layout (DURABILITY.md §12.8, D-fiber-cont option A) ----
 //
-// These MUST match `temen-interp`'s `SHADOW_BASE` / `SHADOW_STRIDE` (the durable runtime ABI) — like
-// `DURABLE_SNAPSHOT_PAGE`, temen-jit is TCB and can't depend on the interpreter, so the constants are
-// duplicated; the cross-backend fiber freeze/thaw property catches drift. On a **durable** run context
-// `i` owns the shadow region `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` — the root is context 0,
-// a fiber in registry slot `s` is context `s+1`. §12.8 4A.5: each context's shadow-SP word is the
+// Placement has **one definition**: `temen_ir::durable_abi::ShadowArena` (#1503). On a **durable** run
+// context `i` owns `[arena.region_base(i), +SHADOW_STRIDE)` — the root is context 0, a fiber in
+// registry slot `s` is context `s+1` — and both backends call the same methods, so there is nothing
+// to keep in sync by hand (the cross-backend fiber freeze/thaw property still catches a *runtime*
+// divergence). §12.8 4A.5: each context's shadow-SP word is the
 // **first 8 bytes of its own region**, with frames following, so `durable.shadow_base` (the per-OS-thread
 // register the instrumented IR reads) points at the running context's region — no shared SP word.
-/// Size of the reserved durable low slice (one 64 KiB wasm page); must match `temen-interp`'s
-/// `DURABLE_RESERVE`. The per-context shadow regions live within `[0, DURABLE_RESERVE)`.
-pub use temen_ir::durable_abi::DURABLE_RESERVE;
-pub use temen_ir::durable_abi::SHADOW_BASE;
-pub use temen_ir::durable_abi::SHADOW_STRIDE;
-/// Highest shadow-context index (must match `temen-interp`'s `MAX_SHADOW_CTX`): `DURABLE_RESERVE /
-/// SHADOW_STRIDE - 1` = 15. Fibers grow **up** from context 1 (`slot+1`); spawned vCPUs grow **down**
-/// from here (slice 3.3, mirroring the interp), so a `u16` mask holds every vCPU-context bit.
-const MAX_SHADOW_CTX: usize = (DURABLE_RESERVE / SHADOW_STRIDE) as usize - 1;
-/// Window byte offset of the `i64` arm countdown (must match `temen-interp`'s `ARM_COUNTDOWN_OFF`).
+/// The shadow arena — one definition of placement (see the module note above).
+pub use temen_ir::durable_abi::ShadowArena;
+/// Window byte offset of the `i64` arm countdown (from `temen_ir::durable_abi`, shared with the interpreter).
 pub use temen_ir::durable_abi::ARM_COUNTDOWN_OFF;
-/// §12.8 concurrent-thaw stage 1: bytes reserved at a region's base before its frames — the 8-byte
-/// shadow-SP word plus the thaw state word at [`STATE_IN_REGION_OFF`] (padded to 8 for frame alignment).
-/// Frames grow up from here. Must match `temen-interp`/`temen_durable::REGION_HEADER_LEN`.
-pub use temen_ir::durable_abi::REGION_HEADER_LEN;
 /// State-word value meaning "freeze armed" — the mid-run freeze trigger (must match
 /// `temen-interp`'s `STATE_ARMED`). On an armed durable run the runtime counts down
 /// [`ARM_COUNTDOWN_OFF`] at each fiber safepoint and promotes the word to `UNWINDING` at 0.
@@ -156,9 +145,9 @@ pub use temen_ir::durable_abi::STATE_IN_REGION_OFF;
 /// driver reads it to confirm a freeze is in progress. Must match `temen-interp`'s `STATE_OFF`.
 pub use temen_ir::durable_abi::STATE_OFF;
 /// State-word value meaning "thaw in progress" — a restored vCPU rewinds from its shadow extent
-/// then flips to `NORMAL` and runs forward (must match `temen-interp`'s `STATE_REWINDING`).
+/// then flips to `NORMAL` and runs forward (from `temen_ir::durable_abi`, shared with the interpreter).
 pub use temen_ir::durable_abi::STATE_REWINDING;
-/// State-word value meaning "freeze in progress" (must match `temen-interp`'s `STATE_UNWINDING`).
+/// State-word value meaning "freeze in progress" (from `temen_ir::durable_abi`, shared with the interpreter).
 pub use temen_ir::durable_abi::STATE_UNWINDING;
 
 /// Tick the **mid-run freeze trigger** at a fiber safepoint (`cont.resume`/`suspend`), the JIT mirror
@@ -181,11 +170,6 @@ unsafe fn window_tick_arm(mem_base: u64) {
     if n <= 0 {
         *((mem_base + STATE_OFF) as *mut i32) = STATE_UNWINDING;
     }
-}
-
-/// The shadow-region base (window offset) of the fiber in registry `slot` (context `slot+1`).
-fn fiber_region_base(slot: usize) -> u64 {
-    SHADOW_BASE + (slot as u64 + 1) * SHADOW_STRIDE
 }
 
 /// Bits a fiber **guest handle** reserves for the registry slot; the rest carry a **generation**
@@ -251,36 +235,6 @@ pub(crate) unsafe fn write_shadow_sp(mem_base: u64, sp_word: u64, sp: u64) {
     *((mem_base + sp_word) as *mut u64) = sp;
 }
 
-/// The shadow-region base (window offset) of a durable **vCPU** context `ctx` — context `i` owns
-/// `[SHADOW_BASE + i*SHADOW_STRIDE, +SHADOW_STRIDE)` (must match `temen-interp`'s `shadow_region_base`).
-/// Spawned vCPUs occupy the contexts the [`SharedFiberTable`] allocator hands out (top-down from
-/// `MAX_SHADOW_CTX`); the inline single-worker path points the active shadow-SP word here before
-/// running a child (slice 3.3).
-pub(crate) fn shadow_region_base(ctx: usize) -> u64 {
-    SHADOW_BASE + ctx as u64 * SHADOW_STRIDE
-}
-
-/// Whether context `ctx`'s shadow region fits within the reserve (must match `temen-interp`'s
-/// `shadow_region_fits`). #1094: `SHADOW_BASE` moved one guard up, so the top `MAX_SHADOW_CTX`
-/// regions no longer all fit under `DURABLE_RESERVE` — the allocator skips the non-fitting ones so
-/// the JIT and interpreter hand out the identical context indices.
-pub(crate) fn shadow_region_fits(ctx: usize) -> bool {
-    shadow_region_base(ctx) + SHADOW_STRIDE <= DURABLE_RESERVE
-}
-
-/// The empty shadow-SP / frame base of a vCPU context `ctx`: just past its in-region SP word (§12.8
-/// 4A.5). Frames grow upward from here; the 8-byte SP word itself lives at `shadow_region_base(ctx)`.
-pub(crate) fn shadow_frame_base(ctx: usize) -> u64 {
-    shadow_region_base(ctx) + REGION_HEADER_LEN
-}
-
-/// Window byte offset of context `ctx`'s **thaw** state word (§12.8 concurrent-thaw stage 1) — its
-/// region base plus [`STATE_IN_REGION_OFF`]. Each context rewinds against its own, so concurrent thaws
-/// don't race (vs. the global [`STATE_OFF`] freeze word).
-fn thaw_word_off(ctx: usize) -> u64 {
-    shadow_region_base(ctx) + STATE_IN_REGION_OFF
-}
-
 /// Whether a freeze or thaw is in progress — the gate for running spawned children **inline**
 /// (single-worker, slice 3.3): the global [`STATE_OFF`] freeze word is non-`NORMAL` (a freeze), or the
 /// **active** context's per-context thaw word is non-`NORMAL` (a thaw — §12.8 concurrent-thaw stage 1).
@@ -299,16 +253,8 @@ pub(crate) unsafe fn window_is_durable_active(mem_base: u64) -> bool {
 /// 3.3): a re-attached child (and the root) starts in `REWINDING` to rewind from its restored shadow
 /// extent, then the instrumented prologue flips *its own* word to `NORMAL` and runs forward (§12.8
 /// concurrent-thaw stage 1). # Safety: `mem_base` is a durable run's committed window base.
-pub(crate) unsafe fn window_set_rewinding(mem_base: u64, ctx: usize) {
-    *((mem_base + thaw_word_off(ctx)) as *mut i32) = STATE_REWINDING;
-}
-
-/// The durable vCPU shadow **context** a restored shadow-SP lives in — the inverse of
-/// [`shadow_region_base`] (`(sp − SHADOW_BASE) / SHADOW_STRIDE`, mirroring the interp's thaw). A thaw
-/// derives a re-attached child's context from its frozen extent so the occupancy is rebuilt without a
-/// separate record.
-pub(crate) fn shadow_context_of_sp(sp: u64) -> usize {
-    ((sp - SHADOW_BASE) / SHADOW_STRIDE) as usize
+pub(crate) unsafe fn window_set_rewinding(mem_base: u64, arena: ShadowArena, ctx: usize) {
+    *((mem_base + arena.thaw_state_off(ctx)) as *mut i32) = STATE_REWINDING;
 }
 
 /// Whether the durable state word is `UNWINDING` (a freeze is in progress) — the entry path's gate
@@ -397,7 +343,7 @@ struct TableState {
     /// registry's `vcpu_mask`. Spawned vCPUs grow **down** from `MAX_SHADOW_CTX` while fibers grow
     /// **up** from context 1; a child's bit is freed when it finishes, so the bound is *peak
     /// concurrent* vCPUs. Only touched on a durable run (state ≠ NORMAL ⇒ single-worker).
-    vcpu_mask: u16,
+    vcpu_mask: u64,
 }
 
 pub(crate) struct SharedFiberTable {
@@ -407,10 +353,13 @@ pub(crate) struct SharedFiberTable {
     max_fibers: usize,
     /// Owner-token allocator: each vCPU's `FiberRuntime` takes a unique token at construction.
     next_owner: AtomicU64,
+    /// The module-declared shadow arena (INVARIANTS.md #16) — where this domain's per-context
+    /// shadow regions sit; every placement question in this runtime is answered from it.
+    pub(crate) shadow: ShadowArena,
 }
 
 impl SharedFiberTable {
-    pub(crate) fn new(max_fibers: usize) -> SharedFiberTable {
+    pub(crate) fn new(max_fibers: usize, shadow: ShadowArena) -> SharedFiberTable {
         SharedFiberTable {
             state: Mutex::new(TableState {
                 slots: Vec::new(),
@@ -419,6 +368,7 @@ impl SharedFiberTable {
             }),
             max_fibers: max_fibers.clamp(1, MAX_FIBERS),
             next_owner: AtomicU64::new(0),
+            shadow,
         }
     }
 
@@ -434,16 +384,10 @@ impl SharedFiberTable {
     pub(crate) fn reserve_vcpu_context(&self) -> Option<usize> {
         let mut t = self.lock();
         let floor = t.slots.len(); // fibers occupy contexts 1..=slots.len()
-        let mut c = MAX_SHADOW_CTX;
-        // #1094: SHADOW_BASE moved one guard up, so the top `MAX_SHADOW_CTX` regions no longer all fit
-        // under `DURABLE_RESERVE` — skip the non-fitting top contexts before searching, exactly as
-        // `temen-interp`'s `reserve_vcpu_context` does, so both backends allocate the same context.
-        while c > floor && !shadow_region_fits(c) {
-            c -= 1;
-        }
+        let mut c = self.shadow.ctx_ceiling();
         while c > floor {
-            if t.vcpu_mask & (1 << c) == 0 {
-                t.vcpu_mask |= 1 << c;
+            if t.vcpu_mask & (1u64 << c) == 0 {
+                t.vcpu_mask |= 1u64 << c;
                 return Some(c);
             }
             c -= 1;
@@ -454,8 +398,8 @@ impl SharedFiberTable {
     /// Free a spawned vCPU's shadow context for reuse (slice 3.3): called when the child genuinely
     /// finishes (a freeze-unwound child keeps it for thaw). A no-op for an out-of-range context.
     pub(crate) fn free_vcpu_context(&self, ctx: usize) {
-        if (1..=MAX_SHADOW_CTX).contains(&ctx) {
-            self.lock().vcpu_mask &= !(1 << ctx);
+        if (1..=self.shadow.ctx_ceiling()).contains(&ctx) {
+            self.lock().vcpu_mask &= !(1u64 << ctx);
         }
     }
 
@@ -464,7 +408,7 @@ impl SharedFiberTable {
     /// shadow-SPs, which can be a sparse/gappy set after recycling), so a post-thaw spawn allocates into a
     /// genuinely-free context instead of colliding with a re-attached sibling. Called by the concurrent
     /// `thaw_reattach_and_run`.
-    pub(crate) fn seed_vcpu_mask(&self, mask: u16) {
+    pub(crate) fn seed_vcpu_mask(&self, mask: u64) {
         self.lock().vcpu_mask = mask;
     }
 
@@ -499,7 +443,7 @@ impl SharedFiberTable {
             running_on: AtomicU64::new(NOT_RUNNING),
             fiber: Mutex::new(Some(fiber)),
             // Fresh/reused: the shadow region starts empty (SP at the region base).
-            shadow_sp: AtomicU64::new(fiber_region_base(slot) + REGION_HEADER_LEN), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
+            shadow_sp: AtomicU64::new(self.shadow.frame_base(slot + 1)), // §12.8 4A.5: empty = frame base (past the SP + thaw words)
             func,
             sp,
             event_park: AtomicBool::new(false),
@@ -665,6 +609,7 @@ impl FiberRuntime {
         fn_table_mask: u64,
     ) -> FiberRuntime {
         let me = table.next_owner.fetch_add(1, Ordering::Relaxed);
+        let root_shadow_sp = table.shadow.frame_base(0); // §12.8 4A.5: root empty SP = frame base
         FiberRuntime {
             table,
             me,
@@ -676,7 +621,7 @@ impl FiberRuntime {
             root_entry_sp: 0,
             durable: false,
             mem_base: 0,
-            root_shadow_sp: shadow_frame_base(0), // §12.8 4A.5: root empty SP = frame base (past its SP word)
+            root_shadow_sp,
             cur_shadow: None,
             frozen: Vec::new(),
         }
@@ -944,7 +889,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             None => rtm.root_shadow_sp = cur_sp,
             Some(rs) => rs.shadow_sp.store(cur_sp, Ordering::Relaxed),
         }
-        let fiber_region = fiber_region_base(slot_idx);
+        let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
         write_shadow_sp(
             mem_base,
             fiber_region,
@@ -984,7 +929,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
     // Save the fiber's now-current shadow-SP to its slot and restore the resumer's region (+ register).
     if let Some((resumer, resumer_region)) = resumer {
         let rtm = &mut *current();
-        let fiber_region = fiber_region_base(slot_idx);
+        let fiber_region = rtm.table.shadow.region_base(slot_idx + 1);
         slot.shadow_sp
             .store(read_shadow_sp(mem_base, fiber_region), Ordering::Relaxed);
         let restore = match &resumer {
@@ -1030,7 +975,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
             // first 8 bytes); an empty stack sits exactly at the frame base.
             let flat_sp = slot.shadow_sp.load(Ordering::Relaxed);
             if durable
-                && flat_sp > fiber_region_base(slot_idx) + REGION_HEADER_LEN
+                && flat_sp > (&*current()).table.shadow.frame_base(slot_idx + 1)
                 && window_is_unwinding(mem_base)
             {
                 (*current()).frozen.push(crate::FrozenFiber {
@@ -1572,22 +1517,25 @@ pub(crate) unsafe extern "C" fn temen_gc_roots_flush(args: *const GcRootsArgs) -
 
 #[cfg(all(test, not(loom)))]
 mod vcpu_ctx_tests {
-    use super::{shadow_region_fits, SharedFiberTable, MAX_FIBERS, MAX_SHADOW_CTX};
+    use super::{SharedFiberTable, MAX_FIBERS};
+    use temen_ir::durable_abi::ShadowArena;
 
-    /// The highest context whose shadow region still fits the reserve — #1094 pushed `SHADOW_BASE` up a
-    /// guard, so the top few of `MAX_SHADOW_CTX` no longer fit and the allocator starts below them.
+    /// The arena these tests place contexts in: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+    const TEST_ARENA: ShadowArena = ShadowArena {
+        base: 16448,
+        end: 65536,
+    };
+
+    /// The highest context the allocator hands out — the arena's ceiling (every index up to it fits).
     fn top_ctx() -> usize {
-        (1..=MAX_SHADOW_CTX)
-            .rev()
-            .find(|&c| shadow_region_fits(c))
-            .unwrap()
+        TEST_ARENA.ctx_ceiling()
     }
 
     // The durable vCPU-context allocator (slice 3.3): top-down reservation above the fiber pool, with
     // free-then-reuse (recycling) and a thaw-seed — the JIT mirror of the interp registry's `vcpu_mask`.
     #[test]
     fn reserve_is_top_down_and_recycles() {
-        let t = SharedFiberTable::new(MAX_FIBERS);
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
         // Spawned vCPUs grow down from the highest fitting context.
         let top = top_ctx();
         assert_eq!(t.reserve_vcpu_context(), Some(top));
@@ -1608,7 +1556,7 @@ mod vcpu_ctx_tests {
     // post-thaw spawn reuses the freed gap while still avoiding the re-attached siblings (no collision).
     #[test]
     fn thaw_seed_with_gaps_reuses_the_recycled_context() {
-        let t = SharedFiberTable::new(MAX_FIBERS);
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
         let top = top_ctx();
         let (hi, mid, lo) = (top, top - 1, top - 2);
         // Re-attach two live children at `hi` and `lo`; `mid` is the recycled gap between them.
@@ -1628,12 +1576,9 @@ mod vcpu_ctx_tests {
 
     #[test]
     fn reserve_exhausts_cleanly() {
-        let t = SharedFiberTable::new(MAX_FIBERS);
-        // A fresh table has no fibers, so every *fitting* non-root context is free (#1094 dropped the
-        // top few of `MAX_SHADOW_CTX` below `DURABLE_RESERVE` once `SHADOW_BASE` moved up a guard).
-        let fitting = (1..=MAX_SHADOW_CTX)
-            .filter(|&c| shadow_region_fits(c))
-            .count();
+        let t = SharedFiberTable::new(MAX_FIBERS, TEST_ARENA);
+        // A fresh table has no fibers, so every non-root context up to the arena's ceiling is free.
+        let fitting = TEST_ARENA.ctx_ceiling();
         for _ in 0..fitting {
             assert!(t.reserve_vcpu_context().is_some());
         }

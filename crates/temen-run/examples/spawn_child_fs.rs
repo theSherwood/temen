@@ -58,6 +58,10 @@ fn seed_dir(dir: &Path) -> Vec<(String, Vec<u8>)> {
 fn parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[String]) -> String {
     let parent_sl = child_sl + 1;
     let argv_off = carve_off + args_base;
+    // The parent is guarded too (#1094): its records/cap-names sit above the NULL guard, as in
+    // `tests/nifler_child_asset.rs` (records at guard + 1024.., names at guard + 2048..).
+    let guard = temen_ir::POWERBOX_NULL_GUARD;
+    let (rb, nb) = (guard + 1024, guard + 2048);
     let mut blob = Vec::new();
     blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
     blob.extend_from_slice(&0u32.to_le_bytes()); // envc
@@ -74,23 +78,23 @@ fn parent_src(child_sl: u32, carve_off: u64, args_base: u64, argv: &[String]) ->
     };
     format!(
         r#"memory {parent_sl}
-data 2048 "fs"
-data 2064 "stdout"
-data 2080 "exit"
+data {nb} "fs"
+data {nb1} "stdout"
+data {nb2} "exit"
 data {argv_off} "{argv_esc}"
 func (i32, i32, i32, i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
 {r0}  hf = i64.extend_i32_u v2
-  ohf = i64.const 1032
+  ohf = i64.const {rec8}
   i64.store ohf hf
 {r1}  hs = i64.extend_i32_u v3
-  ohs = i64.const 1048
+  ohs = i64.const {rec24}
   i64.store ohs hs
 {r2}  he = i64.extend_i32_u v4
-  ohe = i64.const 1064
+  ohe = i64.const {rec40}
   i64.store ohe he
   vmh = i64.extend_i32_u v1
-  vgptr = i64.const 1024
+  vgptr = i64.const {rb}
   vgn = i64.const 3
   ventry = i64.const 0
   voff = i64.const {carve_off}
@@ -102,9 +106,14 @@ block 0 (v0: i32, v1: i32, v2: i32, v3: i32, v4: i32) {{
   }}
 }}
 "#,
-        r0 = rec(1024, 2048, 2),
-        r1 = rec(1040, 2064, 6),
-        r2 = rec(1056, 2080, 4),
+        r0 = rec(rb, nb, 2),
+        r1 = rec(rb + 16, nb + 16, 6),
+        r2 = rec(rb + 32, nb + 32, 4),
+        nb1 = nb + 16,
+        nb2 = nb + 32,
+        rec8 = rb + 8,
+        rec24 = rb + 24,
+        rec40 = rb + 40,
     )
 }
 

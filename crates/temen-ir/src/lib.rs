@@ -267,8 +267,8 @@ pub mod durable_abi {
     ///
     /// #1094: the whole durable control region is based one [`super::POWERBOX_NULL_GUARD`] up — the
     /// unconditional NULL guard unmaps `[0, guard)`, so the state word, shadow-SP, arm countdowns and
-    /// shadow stack live in `[guard, DURABLE_RESERVE)` (below guest memory, which stays at
-    /// `DURABLE_RESERVE`). `[0, guard)` is the reserved NULL region.
+    /// shadow arena live in `[guard, ShadowArena::end)` (below guest memory). `[0, guard)` is the
+    /// reserved NULL region.
     pub const STATE_OFF: u64 = super::POWERBOX_NULL_GUARD;
     /// Window byte offset of the `i64` shadow-stack pointer (itself a window byte offset). One guard up
     /// (#1094 — see [`STATE_OFF`]).
@@ -296,16 +296,8 @@ pub mod durable_abi {
     /// §12.8: bytes reserved at a context region's base before its shadow frames — the SP word plus
     /// the thaw state word at [`STATE_IN_REGION_OFF`], padded to 8 to keep frames 8-aligned.
     pub const REGION_HEADER_LEN: u64 = 16;
-    /// Window byte offset where the shadow stack begins (grows upward, bounded by [`DURABLE_RESERVE`]).
-    /// One guard up (#1094 — see [`STATE_OFF`]); the shadow stack occupies `[guard+64, DURABLE_RESERVE)`.
-    pub const SHADOW_BASE: u64 = super::POWERBOX_NULL_GUARD + 64;
-    /// Per-context shadow-region stride: context `i` owns `[SHADOW_BASE + i*SHADOW_STRIDE, +stride)`.
+    /// Per-context shadow-region stride: context `i` owns `[ShadowArena::region_base(i), +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;
-    /// Size of the reserved low region (one 64 KiB wasm page): `[0, DURABLE_RESERVE)` holds the NULL
-    /// guard `[0, POWERBOX_NULL_GUARD)` (#1094) then the state word, shadow-SP, and shadow stack in
-    /// `[POWERBOX_NULL_GUARD, DURABLE_RESERVE)`; the guest's memory is `[DURABLE_RESERVE, window)`.
-    pub const DURABLE_RESERVE: u64 = 1 << 16;
-
     /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
     pub const STATE_NORMAL: i32 = 0;
     /// A stop-the-world freeze is in progress (unwinding shadow frames).
@@ -319,6 +311,92 @@ pub mod durable_abi {
     /// quiesce-freeze arming (`ARM_QUIESCE_OFF`) keys on.
     pub const SVC_POLL_OP: u32 = 9;
     pub const SVC_WAIT_OP: u32 = 10;
+
+    /// End of the **always-live** durable control words: the state word, shadow-SP and arm
+    /// countdowns occupy `[guard, guard+64)` and are polled at every safepoint, so their offsets
+    /// are fixed ABI. Everything the durable runtime keeps in the window *beyond* this line — the
+    /// per-context shadow regions — is live only during freeze/thaw and is placed by the
+    /// [`ShadowArena`], not by a constant.
+    pub const DURABLE_CONTROL_END: u64 = super::POWERBOX_NULL_GUARD + 64;
+
+    /// The **shadow arena**: the window byte range `[base, end)` holding a durable domain's
+    /// per-context shadow regions (context `i` owns `[base + i*SHADOW_STRIDE, +SHADOW_STRIDE)`).
+    /// This is the one durable-runtime structure whose *placement* is not a fixed ABI offset —
+    /// the instrumented IR addresses it through `durable.shadow_base`, so where it sits is a
+    /// property of the module, not of the substrate (INVARIANTS.md #16). The intra-region shape
+    /// ([`SHADOW_STRIDE`], [`REGION_HEADER_LEN`], [`STATE_IN_REGION_OFF`]) stays ABI.
+    ///
+    /// **One definition of placement.** Every consumer — the transform's overflow guard and window
+    /// seed, both interpreter tiers' fiber registries, the Cranelift fiber runtime, the snapshot
+    /// codec — computes a region through these methods, replacing the three hand-synced
+    /// `shadow_region_base`/`shadow_region_fits`/`MAX_SHADOW_CTX` copies that used to have to
+    /// "MUST match" each other.
+    #[repr(C)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct ShadowArena {
+        /// First byte of the arena (context 0's region base). 8-aligned, `>= DURABLE_CONTROL_END`.
+        pub base: u64,
+        /// One past the last byte; the shadow-overflow trap line (a push that would cross it traps).
+        pub end: u64,
+    }
+
+    impl ShadowArena {
+        /// Bytes in the arena (mirrors [`Memory::size`]).
+        pub const fn size(self) -> u64 {
+            self.end - self.base
+        }
+
+        /// The shadow-region base (window offset) of context `ctx` (root = 0; a fiber in registry
+        /// slot `s` is context `s + 1`).
+        pub const fn region_base(self, ctx: usize) -> u64 {
+            self.base + ctx as u64 * SHADOW_STRIDE
+        }
+
+        /// Whether context `ctx`'s whole region lies inside the arena — the capacity bound a fiber
+        /// or vCPU allocator checks before handing the context out.
+        pub const fn region_fits(self, ctx: usize) -> bool {
+            self.region_base(ctx) + SHADOW_STRIDE <= self.end
+        }
+
+        /// The empty shadow-SP / frame base of context `ctx`: just past its in-region SP + thaw
+        /// words. Frames grow upward from here.
+        pub const fn frame_base(self, ctx: usize) -> u64 {
+            self.region_base(ctx) + REGION_HEADER_LEN
+        }
+
+        /// Window offset of context `ctx`'s per-context **thaw** state word.
+        pub const fn thaw_state_off(self, ctx: usize) -> u64 {
+            self.region_base(ctx) + STATE_IN_REGION_OFF
+        }
+
+        /// A module that declared **no** arena: zero regions at the control-word boundary. Nothing
+        /// can be placed in it ([`Self::region_fits`] is false for every context), so a durable run
+        /// of such a module is refused at setup rather than defaulted — there is no default
+        /// placement (INVARIANTS.md #16).
+        pub const EMPTY: ShadowArena = ShadowArena {
+            base: DURABLE_CONTROL_END,
+            end: DURABLE_CONTROL_END,
+        };
+
+        /// How many whole regions the arena holds (context indices `0..contexts()`).
+        pub const fn contexts(self) -> usize {
+            (self.size() / SHADOW_STRIDE) as usize
+        }
+
+        /// The highest context index an allocator may hand out — the top of the spawned-vCPU
+        /// pool, which grows down from here while fibers grow up from 1. `contexts() - 1`, so
+        /// every index up to it fits ([`Self::region_fits`]); 0 (root only) for [`Self::EMPTY`].
+        pub const fn ctx_ceiling(self) -> usize {
+            self.contexts().saturating_sub(1)
+        }
+
+        /// The context whose region contains shadow-SP `sp` — the inverse of
+        /// [`Self::region_base`], for a runtime recovering a frozen fiber's context from its
+        /// saved SP.
+        pub const fn ctx_of_sp(self, sp: u64) -> usize {
+            ((sp - self.base) / SHADOW_STRIDE) as usize
+        }
+    }
 }
 
 /// The **op-17 spawn config record** (CONSOLIDATION.md §3/§3c/§3d): the fixed 56-byte little-endian
@@ -3298,6 +3376,12 @@ impl Func {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Memory {
     pub size_log2: u8,
+    /// The durable **shadow arena** (`durable_abi::ShadowArena`): where a freeze/thaw run keeps
+    /// its per-context shadow regions inside this window. Declared by the module — placement is
+    /// the guest's (INVARIANTS.md #16) — and verified (`temen-verify`): above the always-live
+    /// control words, 8-aligned, at least one region, inside the window, overlapping no data
+    /// segment. `None` means the module is **not freezable**: the durable transform fails closed.
+    pub shadow: Option<durable_abi::ShadowArena>,
 }
 
 impl Memory {
@@ -3372,7 +3456,7 @@ pub const POWERBOX_HEAP_TOP: u64 = 40;
 /// Both sit in page 0's reserved scratch, in the gap between the heap-state words above and the
 /// args buffer at [`POWERBOX_ARGS_BASE`] — and, under the guarded layout, in the gap between the
 /// durable control words (`durable::ARM_QUIESCE_OFF`, +32) and the shadow stack
-/// (`durable::SHADOW_BASE`, +64), so they collide with neither.
+/// (`durable_abi::DURABLE_CONTROL_END`, +64), so they collide with neither.
 pub const POWERBOX_EMPTY_ARGV: u64 = 48;
 /// The `envp` twin of [`POWERBOX_EMPTY_ARGV`]; see it for why an empty vector is a pointer to NULL
 /// rather than NULL itself.
@@ -3609,7 +3693,10 @@ pub fn synth_manifest_start(
     let size_log2 = module
         .memory
         .map_or(need_log2, |m| m.size_log2.max(need_log2));
-    module.memory = Some(Memory { size_log2 });
+    module.memory = Some(Memory {
+        size_log2,
+        shadow: None,
+    });
     // The guest heap (when the program allocates) begins at the window's mapped boundary and grows
     // up into the reserved tail via `Memory.map`.
     let heap_base = seed_heap.then(|| 1u64 << size_log2);
@@ -4834,6 +4921,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
                 };
                 Memory {
                     size_log2: declared.max(need),
+                    shadow: None,
                 }
             }),
         data,
@@ -5681,7 +5769,10 @@ mod link_layout_tests {
                 data_funcrefs: Vec::new(),
                 types: vec![],
                 funcs: vec![],
-                memory: Some(Memory { size_log2: 16 }),
+                memory: Some(Memory {
+                    size_log2: 16,
+                    shadow: None,
+                }),
                 data: vec![Data {
                     offset: seg_offset,
                     readonly,
@@ -5789,7 +5880,10 @@ mod link_layout_tests {
                         term: Terminator::Return(vec![]),
                     }],
                 }],
-                memory: Some(Memory { size_log2: 16 }), // small declared window (64 KiB)
+                memory: Some(Memory {
+                    size_log2: 16,
+                    shadow: None,
+                }), // small declared window (64 KiB)
                 data: vec![Data {
                     offset: 0,
                     readonly: false,

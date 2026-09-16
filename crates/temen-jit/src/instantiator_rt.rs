@@ -372,6 +372,9 @@ pub(crate) struct Nursery {
     /// overlapping `[0, guard)` of the window is refused `-EINVAL` — the host seeds/copies a
     /// child's carve outside the guarded call, so an mprotect-guarded carve would fault the host.
     null_guard: std::sync::atomic::AtomicU64,
+    /// The parent module's declared shadow arena — a same-module (op-0 self) child places its
+    /// contexts in *its own* window at the same declared offsets.
+    shadow: temen_ir::durable_abi::ShadowArena,
 }
 
 // SAFETY: the raw `cap_ctx` is the run's host pointer, valid for the whole run; the `Nursery` is
@@ -396,11 +399,13 @@ impl Nursery {
         task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         frozen_nested_sink: std::sync::Arc<Mutex<Vec<crate::FrozenNested>>>,
         serve_handlers: Box<[u32]>,
+        shadow: temen_ir::durable_abi::ShadowArena,
     ) -> Nursery {
         Nursery {
             funcs,
             types,
             serve_handlers,
+            shadow,
             cap_thunk,
             cap_ctx,
             resolve_module,
@@ -646,9 +651,15 @@ impl Nursery {
         &self,
         module: i64,
         trap_out: *mut i64,
-    ) -> Option<(&[Func], &[TypeEntry], Option<i32>, &[Data])> {
+    ) -> Option<(
+        &[Func],
+        &[TypeEntry],
+        Option<i32>,
+        &[Data],
+        temen_ir::durable_abi::ShadowArena,
+    )> {
         if module < 0 {
-            return Some((&self.funcs, &self.types, None, &[]));
+            return Some((&self.funcs, &self.types, None, &[], self.shadow));
         }
         let Some(resolver) = self.resolve_module else {
             *trap_out = TrapKind::CapFault as i64;
@@ -671,7 +682,7 @@ impl Nursery {
         } else {
             std::slice::from_raw_parts(rm.types, rm.n_types)
         };
-        Some((funcs, types, Some(rm.memory_log2), data))
+        Some((funcs, types, Some(rm.memory_log2), data, rm.shadow))
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
@@ -782,7 +793,8 @@ pub(crate) unsafe extern "C" fn instantiate(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
-    let Some((child_funcs, child_types, mod_mem, child_data)) = rt.resolve_child(module, trap_out)
+    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
+        rt.resolve_child(module, trap_out)
     else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
@@ -858,6 +870,7 @@ pub(crate) unsafe extern "C" fn instantiate(
             rt.epoch_addr, // §5: the child polls the parent's kill-path cell, so one interrupt kills both
             child_fuel_addr, // §5 fuel: the child decrements its own clamped budget cell
             durable, // §4: seed the child's carve control words + give it an Instantiator powerbox
+            child_shadow,
             false, // not a thaw re-attach — a live `instantiate` (seed fresh / inherit the parent phase)
             child_task,
             rt.nested_sink(),
@@ -912,7 +925,8 @@ pub(crate) unsafe extern "C" fn instantiate(
             size_log2 as u8,
             rt.epoch_addr, // §5: the child polls the parent's kill-path cell (one interrupt kills both)
             child_fuel_addr, // §5 fuel: 0 ⇒ un-metered (cacheable); nonzero ⇒ per-spawn (not cached)
-            rt.futex_sched,  // wait/notify against the parent domain's shared futex
+            rt.futex_sched,  // wait/notify against the parent domain's shared futex,,
+            child_shadow,
         )
     };
     let code = if child_fuel_addr != 0 {
@@ -1108,7 +1122,8 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
         &rt.serve_handlers,
-        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
+        rt.shadow,
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1357,7 +1372,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         return 0; // `*trap_out` already holds the CapFault
     };
     // Resolve the granted separate module (op 5): its funcs, declared memory, and data segments.
-    let Some((child_funcs, child_types, mod_mem, child_data)) = rt.resolve_child(module, trap_out)
+    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
+        rt.resolve_child(module, trap_out)
     else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
@@ -1454,7 +1470,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         rt.futex_sched,  // wait/notify against the parent domain's shared futex
         crate::InstEnv::null(),
         &rt.serve_handlers,
-        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
+        child_shadow,
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1654,7 +1671,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     if rt.resolve(mem_base, handle, trap_out).is_none() {
         return 0;
     }
-    let Some((child_funcs, child_types, mod_mem, child_data)) = rt.resolve_child(module, trap_out)
+    let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
+        rt.resolve_child(module, trap_out)
     else {
         return 0;
     };
@@ -1784,7 +1802,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         rt.futex_sched,
         crate::InstEnv::null(),
         &rt.serve_handlers,
-        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs
+        gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,
+        child_shadow,
     );
     let code = match compiled {
         Ok(code) => code,

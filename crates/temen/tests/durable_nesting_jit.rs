@@ -42,6 +42,12 @@ use temen_jit::{
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 18;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -49,7 +55,7 @@ const WINDOW: usize = 1 << SIZE_LOG2;
 /// sub-window, `join`s it, and returns the child's result. Func 1 sums 0..100 = 4950 — pure compute
 /// (no `call.cap`), so it is not may-suspend and runs atomically in the carve. (Identical in shape to
 /// `durable_nesting.rs::PARENT_SELF_LOOP`.)
-const PARENT_SELF_LOOP: &str = "memory 18
+const PARENT_SELF_LOOP: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -107,7 +113,7 @@ fn jit_durable_same_module_child_matches_interp() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         SIZE_LOG2,
         &mut hi,
     );
@@ -126,7 +132,7 @@ fn jit_durable_same_module_child_matches_interp() {
     let mut hj = Host::new();
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, WINDOW as u64);
-    let win = init_durable_window(WINDOW);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
     let (jo, _jmem, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
         0,
@@ -153,7 +159,7 @@ const D2_WINDOW: usize = 1 << D2_SIZE_LOG2;
 /// (it does a `call.cap`), so this exercises the child's **Instantiator powerbox** (it resolves its own
 /// window and carves the grandchild) and the carve control-word seeding. All `NORMAL` (no freeze).
 /// (Identical in shape to `durable_nesting.rs::PARENT_DEPTH2`.)
-const PARENT_DEPTH2: &str = "memory 19
+const PARENT_DEPTH2: &str = "memory 19 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -217,7 +223,7 @@ fn jit_durable_depth2_grandchild_matches_interp() {
         0,
         &[Value::I32(ih)],
         &mut fuel,
-        &init_durable_window(D2_WINDOW),
+        &init_durable_window(D2_WINDOW, TEST_ARENA),
         D2_SIZE_LOG2,
         &mut hi,
     );
@@ -234,7 +240,7 @@ fn jit_durable_depth2_grandchild_matches_interp() {
     let mut hj = Host::new();
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
-    let win = init_durable_window(D2_WINDOW);
+    let win = init_durable_window(D2_WINDOW, TEST_ARENA);
     let (jo, _jmem, _residue) = compile_and_run_capture_reserved_with_host_durable(
         &inst,
         0,
@@ -261,7 +267,7 @@ fn jit_durable_depth2_grandchild_matches_interp() {
 /// freeze must capture — *and* (b) **thaws + runs uninterrupted cleanly** to 4950 (the dead branch is
 /// never reached, so no `CapFault`). A *pure-compute* loop like `PARENT_SELF_LOOP`'s child has no poll
 /// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model").
-const FREEZE_PARENT: &str = "memory 18
+const FREEZE_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -325,7 +331,7 @@ fn jit_freeze_captures_live_nested_child_matching_interp() {
     let mut hi = Host::new();
     hi.set_durable(true);
     let ih = hi.grant_instantiator(0, WINDOW as u64);
-    let mut iwin = init_durable_window(WINDOW);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut iwin, STATE_UNWINDING);
     let mut fuel = 50_000_000u64;
     let (ir, isnap) = run_capture_reserved_with_host(
@@ -358,7 +364,7 @@ fn jit_freeze_captures_live_nested_child_matching_interp() {
     let mut hj = Host::new();
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, WINDOW as u64);
-    let mut jwin = init_durable_window(WINDOW);
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
         &jinst,
@@ -408,7 +414,7 @@ fn jit_nested_freeze_thaw_round_trips() {
         &inst,
         0,
         &[ih0 as i64],
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         &[], // init_prots
         &[], // fiber seed
         &[], // nested seed
@@ -426,7 +432,7 @@ fn jit_nested_freeze_thaw_round_trips() {
     let mut hf = Host::new();
     hf.set_durable(true);
     let ihf = hf.grant_instantiator(0, WINDOW as u64);
-    let mut fwin = init_durable_window(WINDOW);
+    let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
     let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
         &inst,
@@ -447,7 +453,7 @@ fn jit_nested_freeze_thaw_round_trips() {
     // (2) Thaw the artifact with the nested seed: the child rewinds to completion, the parent's join
     // resolves, and the round-trip delivers the uninterrupted total.
     let mut twin = artifact.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, WINDOW as u64);
@@ -476,7 +482,7 @@ fn jit_nested_freeze_thaw_round_trips() {
 /// (func 2, an instrumented dead-branch loop like `FREEZE_PARENT`'s child). Born `UNWINDING`, the child
 /// executes `instantiate(grandchild)` then spills at its trailing poll, and the grandchild spills at its
 /// first loop-header poll — so a freeze captures **two** live `FrozenNested` records.
-const FREEZE_DEPTH2: &str = "memory 19
+const FREEZE_DEPTH2: &str = "memory 19 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = i64.const 1
@@ -545,7 +551,7 @@ fn jit_depth2_freeze_coalesces_grandchild_at_root() {
     let mut hj = Host::new();
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
-    let mut jwin = init_durable_window(D2_WINDOW);
+    let mut jwin = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
     let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
         &inst,
@@ -606,7 +612,7 @@ fn jit_depth2_freeze_thaw_round_trips() {
         &inst,
         0,
         &[ih0 as i64],
-        &init_durable_window(D2_WINDOW),
+        &init_durable_window(D2_WINDOW, TEST_ARENA),
         &[],
         &[],
         &[],
@@ -624,7 +630,7 @@ fn jit_depth2_freeze_thaw_round_trips() {
     let mut hf = Host::new();
     hf.set_durable(true);
     let ihf = hf.grant_instantiator(0, D2_WINDOW as u64);
-    let mut fwin = init_durable_window(D2_WINDOW);
+    let mut fwin = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
     let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
         &inst,
@@ -645,7 +651,7 @@ fn jit_depth2_freeze_thaw_round_trips() {
     // (2) Thaw with the nested seed: the child rewinds, the grandchild is recursively re-attached under
     // it, both joins resolve, and the round-trip delivers the uninterrupted total.
     let mut twin = artifact.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, D2_WINDOW as u64);
@@ -688,7 +694,7 @@ fn jit_pure_child_freeze_thaw_round_trips() {
     let mut hf = Host::new();
     hf.set_durable(true);
     let ihf = hf.grant_instantiator(0, WINDOW as u64);
-    let mut fwin = init_durable_window(WINDOW);
+    let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
     let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
         &inst,
@@ -712,7 +718,7 @@ fn jit_pure_child_freeze_thaw_round_trips() {
 
     // Thaw: re-run the child → 4950, the parent's join resolves, round-trip ≡ uninterrupted.
     let mut twin = artifact.clone();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, WINDOW as u64);

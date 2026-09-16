@@ -15,7 +15,7 @@ use temen_interp::{run_with_host, Host, OffloadOutcome, StreamRole, Value};
 /// `WAIT_WOKEN` (0) status as its return. Composite: s1*100_000 + s2*10_000 + woken*1_000 +
 /// s3*100 + value = 3*100_000 + 3*10_000 + 1*1_000 + 1*100 + 0 = 331_100.
 const FUTEX_FIBER_PARK: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func () -> (i64) {
 block 0 () {
   v0 = ref.func 1
@@ -79,7 +79,7 @@ fn a_fiber_futex_park_parks_the_fiber_not_the_vcpu() {
 /// errno (`-EBADF`), which it returns. Composite: s1*10_000 + s2*100 + (-value) =
 /// 3*10_000 + 1*100 + 9 = 30_109.
 const REVOKE_INTO_FIBER: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vf = ref.func 1
@@ -134,7 +134,7 @@ fn the_root_revokes_a_read_its_own_fiber_is_parked_in() {
 /// `FIBER_PARKED` (the transient set-aside), and the next resume completes the wait with
 /// `WAIT_NOT_EQUAL` (1). Composite: 3*10_000 + 1*100 + 1 = 30_101.
 const NOT_EQUAL_INSTA_WAKE: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func () -> (i64) {
 block 0 () {
   vaddr = i64.const 16392
@@ -190,7 +190,7 @@ fn a_prechanged_cell_wakes_the_parking_fiber_immediately() {
 /// s2*100 + v2 = 3*10_000 + 1*100 + 2 = 30_102. The cross-backend pinning (and the poll-fires-
 /// the-deadline rule) lives in `temen/tests/fiber_timed_wait.rs`.
 const TIMED_WAIT_TIMES_OUT: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func () -> (i64) {
 block 0 () {
   v0 = ref.func 1
@@ -246,7 +246,7 @@ fn a_timed_fiber_wait_fires_its_deadline_and_completes() {
 /// completes the wait right there (rather than starving until a worker idles — the regression's
 /// tree-walker leg). Result: the fiber's `WAIT_TIMED_OUT` status (2).
 const POLL_LOOP_TIMES_OUT: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func () -> (i64) {
 block 0 () {
   v0 = ref.func 1
@@ -307,7 +307,7 @@ fn mix(arg: i64) -> i64 {
 /// handler that always punts `arg + 100`; the root records the first resume status (must be the
 /// park, 3) then polls to completion. Composite: s1*10_000 + value = 3*10_000 + 105 = 30_105.
 const PUNT_IN_FIBER: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vf = ref.func 1
@@ -373,7 +373,7 @@ fn a_punted_host_call_parks_the_fiber_not_the_vcpu() {
 /// unwinds the transient `FIBER_PARKED` once). Composite: mix(0) + mix(1) + (sA*10 + sB) =
 /// mix-sum + 33, wrapping.
 const TWO_FIBER_OVERLAP: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh64 = i64.extend_i32_u v0
@@ -459,7 +459,7 @@ fn two_fibers_on_one_vcpu_overlap_their_punts() {
 /// releases the latch (op 1, inline `Done`) and polls both to completion. Composite:
 /// parked_polls*1_000_000 + v1*1_000 + v2 = 50*1_000_000 + 111_000 + 222 = 50_111_222.
 const ORDERED_FIBER_DELIVERY: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vh64 = i64.extend_i32_u v0
@@ -540,7 +540,7 @@ block 0 (vsp: i64, varg: i64) {
 /// Durable: the F1 predicate excludes durable callers, so the punt takes the slice-1 degenerate
 /// blocking wait INSIDE the resume and the fiber completes → 1*10_000 + 105.
 const RESUME_ONCE: &str = r#"
-memory 16
+memory 16 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   vf = ref.func 1

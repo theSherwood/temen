@@ -23,7 +23,7 @@
 //! which is exactly what this asserts does *not* happen.
 
 use std::sync::{Arc, Mutex};
-use temen_interp::bytecode::DebugRun;
+use temen_interp::bytecode::ScheduledDebugRun;
 use temen_interp::{run_with_host, GuestMem, Host, RegionMinter, Value};
 use temen_text::parse_module;
 
@@ -111,12 +111,12 @@ fn grant_counter(host: &mut Host, named: bool) {
     );
 }
 
-fn session(named: bool) -> DebugRun {
+fn session(named: bool) -> ScheduledDebugRun {
     let m = module();
     let mut host = Host::new();
     host.set_self_module(&m);
     grant_counter(&mut host, named);
-    DebugRun::new_with_host(&m, 0, &[Value::I64(ITERS)], host)
+    ScheduledDebugRun::new_with_host(&m, 0, &[Value::I64(ITERS)], host)
         .expect("the bytecode debug engine accepts the cap loop")
 }
 
@@ -130,9 +130,9 @@ fn oracle_result() -> Vec<Value> {
     run_with_host(&m, 0, &[Value::I64(ITERS)], &mut fuel, &mut host).expect("tree-walker runs")
 }
 
-/// A per-op observation: the clock, the call stack, and the accumulator the loop stores — enough that a
+/// A per-op observation: the turn, the call stack, and the accumulator the loop stores — enough that a
 /// capability restored to the wrong count shows up on the next iteration.
-fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
+fn obs(run: &ScheduledDebugRun) -> (u64, String, Vec<u8>) {
     let mut frames = Vec::new();
     for d in 0..run.depth() {
         if let Some(pc) = run.frame_pc(d) {
@@ -140,7 +140,7 @@ fn obs(run: &DebugRun) -> (u64, String, Vec<u8>) {
         }
     }
     (
-        run.op_clock(),
+        run.op_turn(),
         frames.join(","),
         run.read_window(16384, 8).unwrap_or_default(),
     )
@@ -171,14 +171,14 @@ fn a_named_host_capability_checkpoints_and_restores() {
     for c in 0..=total {
         let mut at_c = session(true);
         let mut f = FUEL;
-        while at_c.op_clock() < c as u64 && at_c.tick(&mut f) {}
+        while at_c.op_turn() < c as u64 && at_c.tick(&mut f) {}
         let Some(snap) = at_c.snapshot() else {
             continue;
         };
         checkpoints += 1;
 
         let mut warm = session(true);
-        warm.restore(at_c.op_clock(), &snap);
+        warm.restore(at_c.op_turn(), &snap);
         let mut i = c;
         assert_eq!(
             obs(&warm),

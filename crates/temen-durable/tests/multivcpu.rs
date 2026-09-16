@@ -17,6 +17,12 @@ use temen_durable::{
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
 
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
+
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
 
@@ -57,6 +63,7 @@ fn instrument() -> Module {
     let mut m = temen_text::parse_module(SRC).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     // The guest uses linear memory (the handle stash above the reserve), so transform on the
     // cooperating-toolchain path.
@@ -82,7 +89,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -98,7 +105,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -133,7 +140,7 @@ fn two_vcpu_domain_freezes_and_thaws() {
     // 43), not re-issue (which would give 44, 45 → 99). Re-spawn the child + re-enter under REWINDING.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -209,6 +216,7 @@ fn instrument_src(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
@@ -231,7 +239,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -246,7 +254,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -279,7 +287,7 @@ fn vcpu_and_fiber_coexist_through_freeze_thaw() {
     // clock_after). The fiber re-seeds and the child re-spawns into non-overlapping regions.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -371,7 +379,7 @@ fn child_owns_fiber_through_freeze_thaw() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -386,7 +394,7 @@ fn child_owns_fiber_through_freeze_thaw() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -423,7 +431,7 @@ fn child_owns_fiber_through_freeze_thaw() {
     // re-seeds and the child re-spawns; forward execution reproduces the uninterrupted 147.
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = clock_after;
@@ -513,7 +521,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
             0,
             &[Value::I32(clk)],
             &mut fuel,
-            &init_durable_window(WINDOW),
+            &init_durable_window(WINDOW, TEST_ARENA),
             SIZE_LOG2,
             &mut h,
         );
@@ -529,7 +537,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let mut win = init_durable_window(WINDOW);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
         write_state(&mut win, STATE_UNWINDING);
         let mut fuel = 1_000_000u64;
         let (r, snap) = run_capture_reserved_with_host(
@@ -573,7 +581,7 @@ fn nested_spawn_tree_freezes_and_thaws() {
     // (which would read 99,100,101 → 300).
     let r_thaw = {
         let mut win = snap.clone();
-        begin_thaw(&mut win, 0);
+        begin_thaw(&mut win, TEST_ARENA, 0);
         let mut h = Host::new();
         h.set_durable(true);
         h.clock_ns = 99;

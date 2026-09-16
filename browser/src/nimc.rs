@@ -247,17 +247,8 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
             jit: None,
             stderr: None,
         };
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| match granted.bind(&im.name) {
-                Some((cap, handle)) => {
-                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                }
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            })
-            .collect();
-        host.set_import_bindings(bindings);
+        // The one shared powerbox binder (#1524).
+        host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
     }
     // Seed argv at the module's args base (the on-ramp `_start` parses argc/argv from it). #964/#1094:
     // a phase guest reads its args one guard up, at `module_args_base` (guard + POWERBOX_ARGS_BASE) —
@@ -446,7 +437,9 @@ pub(crate) fn drive_op13<'p>(
                 fuel,
             } => {
                 if base.is_null() {
-                    return Err(Trap::Malformed); // a nested carve needs an addressable parent window
+                    // A nested carve needs an addressable parent window — the driver's decline
+                    // (see `crate::declined_child`), not a trap for the parent.
+                    return crate::declined_child();
                 }
                 let granted = vcpu.take_granted_host();
                 let declared = child
@@ -498,7 +491,16 @@ pub(crate) fn drive_op13<'p>(
                     Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
                 }
             }
-            _ => return Err(Trap::Malformed),
+            // A phase is single-threaded and non-interactive: no threads, no tier-up (this is the
+            // interpreter path), no cap or stdin park. The driver's decline — a value at the parent's
+            // join, never a parent-killing trap (see `crate::declined_child`). Named rather than `_`
+            // (see `VcpuEvent`).
+            bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Spawn { .. }
+            | bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::CapPending { .. }
+            | bytecode::VcpuEvent::StdinPark => return crate::declined_child(),
         }
     }
 }

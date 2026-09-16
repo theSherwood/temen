@@ -606,9 +606,26 @@ twins of `nested_paged`/`pagestate`/`live_mapped`/`paged_walk` and re-plumbs
 - **Memory-per-page** (raised and dismissed): a memory per 64 KiB page would turn every
   access into a memory-select — software paging on the fast path. Not viable; a memory per
   *child* is the right granularity.
-- **Decline-path cost over `Region::Foreign`.** Measured per access ×4–7 (§3.3); the end-to-end
+- **Decline-path cost over `Region::Foreign`.** ~~Measured per access ×4–7 (§3.3); the end-to-end
   cost on a real declined body is slice 2's to measure. How often do the real phases decline,
-  and does it matter?
+  and does it matter?~~ **Answered (2026-09-17, #1417, real Chromium, the shipped threads cdylib,
+  `bench_nim_wholecard.mjs` — the one card that takes the emitted detached path):**
+
+  | phase (4 modules) | wall | bounces | inside bounces | Foreign accesses (scalar) | Foreign tax |
+  |---|---:|---:|---:|---:|---:|
+  | nimsem | 44.2 s | 3,859 | 35.1 s (79%) | 5.33 M | **0.3–0.5 s** |
+  | hexer | 6.2 s | 1,402 | 2.3 s (37%) | 4.62 M | **0.3–0.4 s** |
+
+  Whole card: 56.4 s tiered vs 215.2 s all-interpreter (0.26×), byte-identical; two runs within 1%.
+  Per access on that machine: ×4.0 word (29.5 → 117 ns), ×3.4 byte — the low end of slice 1's
+  range. The tax is `accesses × Δ`, and every access to a detached child's memory is one import
+  call by construction, so the bound holds without attributing the rest of the bounce time:
+  charging the *whole* import time, ≤ 0.62 s of 56 s — **≈1 %**. Bulk (`read_bytes`) traffic is
+  negligible (0.6 MB). **Does it matter: no.** What the run *did* surface is that 79 % of nimsem's
+  wall-clock is inside bounces — declined helpers plus the nifler grandchild `exec`, interpreted —
+  which is a tier-up *coverage* cost the nested path pays identically, not a Decision B cost. The
+  fourth answer (a second artifact in the child's memory, no interpreter fallback) is not
+  approached. Counters: `bounceStats` (wasmjit-module.js), `foreignStats` (foreign-mem.js).
 - **Non-shared child memories.** A detached child that never threads could use a non-shared,
   no-`maximum` `Memory` (grows to the wasm32 ceiling with no eager reservation) — but that is
   a second emit cache key (`shared` flag) and is unusable on the Worker path. Deferred until

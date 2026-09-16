@@ -10,14 +10,14 @@
 //! Like [`crate::vcpu_tls`] it is a baked thunk over a thread-local — substrate-independent and unable
 //! to fault — but **runtime-private**: the runtime seeds it (per dispatch / per child) and there is no
 //! guest write thunk, so a guest cannot redirect its own shadow stack (unlike the guest-overwritable
-//! `vcpu.tls`). Seeded at vCPU entry to `shadow_region_base(ctx)` (root = `SHADOW_BASE`).
+//! `vcpu.tls`). Seeded at vCPU entry to `shadow_region_base(ctx)` (root = `ShadowArena::region_base(0)`).
 
 use std::cell::Cell;
 
-/// Default: the root context's region base (`shadow_region_base(0)` = `SHADOW_BASE`). The runtime
+/// Default: the root context's region base (`ShadowArena::region_base(0)`). The runtime
 /// re-seeds at every root entry / inline child / fiber switch before any instrumented code runs, so
 /// this default is only a never-stale fallback.
-const ROOT_SHADOW_BASE: u64 = temen_ir::durable_abi::SHADOW_BASE;
+const ROOT_SHADOW_BASE: u64 = temen_ir::durable_abi::ShadowArena::EMPTY.region_base(0);
 
 thread_local! {
     /// This OS thread's (vCPU's) active durable shadow-SP **word address** — the base of the region

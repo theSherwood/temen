@@ -17,7 +17,7 @@ use temen_durable::{
     begin_thaw, init_durable_window, read_state, transform_module_assume_confined, STATE_NORMAL,
     STATE_UNWINDING,
 };
-use temen_interp::{Host, SHADOW_BASE};
+use temen_interp::Host;
 use temen_ir::{Memory, Module};
 use temen_jit::{
     compile_and_run_capture_reserved_with_host_durable_mv,
@@ -25,6 +25,12 @@ use temen_jit::{
     FrozenFiber, FrozenVCpu, JitError, JitOutcome, TrapKind,
 };
 use temen_snapshot::{freeze as codec_freeze, restore as codec_restore};
+
+/// The arena every durable test module declares: the pre-#1503 fixed placement `[guard+64, 1<<16)`.
+const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
+    base: 16448,
+    end: 65536,
+};
 
 const SIZE_LOG2: u8 = 17;
 const WINDOW: usize = 1 << SIZE_LOG2;
@@ -48,6 +54,7 @@ fn instrument(src: &str) -> Module {
     let mut m = temen_text::parse_module(src).expect("parse");
     m.memory = Some(Memory {
         size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
     });
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("instrumented concurrent multi-vCPU IR verifies");
@@ -95,11 +102,11 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
         inst,
         0,
         &[clk as i64, hf as i64],
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
@@ -122,7 +129,7 @@ fn thaw(
     root_sp: u64,
 ) -> (JitOutcome, Vec<u8>) {
     let mut twin = snap.to_vec();
-    begin_thaw(&mut twin, 0);
+    begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
@@ -655,11 +662,11 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
         &inst,
         0,
         &[0],
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
@@ -1104,11 +1111,11 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
         inst,
         0,
         &[clk as i64, 0],
-        &init_durable_window(WINDOW),
+        &init_durable_window(WINDOW, TEST_ARENA),
         &[],
         &[],
         &[],
-        SHADOW_BASE + 8,
+        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,

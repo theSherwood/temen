@@ -446,6 +446,31 @@ window image, so the encoding is just the re-attach record. Pinned by
 live child → serialize → restore into a fresh host → **§12.6 canonical re-freeze byte-identical**
 → thaw completes the child's loop and the join delivers the uninterrupted total — the full
 `freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
+
+**Detached children — completed-result residue (v23, #1361 step 2).** The §14 **detached** spawn (op
+15, `instantiate_detached`) gives a child its *own* window rather than a carve in the parent's, so a
+**live** one at a freeze stays fail-closed: the subtree STW broadcasts `UNWINDING` only into carves
+within *this* window image, never reaching a detached child's separate window (the O6 mid-flight
+capture — step 3). A **completed-but-unjoined** one, though, needs nothing of that separate window:
+only its `thread.join` result crosses, exactly as for a completed nested child. It rides as a
+`FrozenDetached { parent_task, slot, completed_result }` in **Section 2**, trailing the nested block
+(which is emitted with count 0 when only detached residue is present, so the decoder always reads a
+nested count first); a domain that froze no detached child is byte-identical to v22 but for the
+version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
+edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (op 15 is a
+`call.cap` checkpoint, so the rewind reloads its spilled slot handle rather than re-running the
+spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
+refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
+completed-result path above; the codec round-trip is pinned by
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. The capture and thaw-delivery are
+**inert behind two prerequisites**, so they ship correct-but-unexercised (the #1501/#1502 pattern):
+(1) op 15's `!durable` **admission gate** (a durable parent cannot yet spawn a detached child — step
+4), and (2) **`Binding::Module` non-durability** — op 15 takes a *module handle*, which
+`capture_durable_handles` refuses, so a durable parent that spawned a detached child cannot be frozen
+at all until module handles become durable (or a post-spawn cap-close lands). Under a scratch
+gate-lift the admission path and the still-running fail-closed refusal both check out; a completed
+capture at freeze is the scheduling-fragile "child must finish during a parent park" case Finding 1
+flagged, deferred with step 4.
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
@@ -828,9 +853,10 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
     scope and rejected/ignored: `call.dyn` (and indirect tail calls) to may-suspend
     targets; direct tail calls into may-suspend callees; guest linear-memory use (R9).
   - **Hazards introduced by the as-built transform: R8–R11 (§11).** R9 is **placement,
-    not isolation**: the durable region is a budget-accounted reserved slice `[0,
-    DURABLE_RESERVE)` of the domain's own window (guest memory above it, wasm
-    `__heap_base`-style). Memory-using guests work via `transform_module_assume_confined`
+    not isolation**: the control words and the module-**declared** shadow arena
+    (`Memory::shadow`, #1503 / INVARIANTS.md #16) are budget-accounted bytes of the domain's own
+    window (guest memory around them, wasm `__heap_base`-style: a toolchain points the arena at a
+    BSS array). Memory-using guests work via `transform_module_assume_confined`
     on a cooperating-toolchain contract; corruption is self-contained and fails safe.
     Hard isolation against adversarial guests (guard-paged §12.7) is optional
     defense-in-depth.
@@ -906,7 +932,7 @@ than miscompiling, so these are latent/extension hazards, not silent-miscompile 
 | # | Risk / question | Where | Status |
 | --- | --- | --- | --- |
 | R8 | **Call-chain propagation landed; deepest-frame assumption resolved.** The transform now instruments any may-suspend function (transitive `call.cap` closure over the direct-call graph) whose single block suspends on one op: a leaf `call.cap` (reload result + flip `NORMAL`) **or** a propagated `Call` (reload pre-call live set + **re-issue the call**, leaving the state `REWINDING` so the callee rewinds). Real multi-frame stacks; only the innermost leaf flips to `NORMAL`. Covered by `tests/chain.rs` (2-/3-level chains, live-value-across-call) and the generator now emits depth-`1..=4` chains, so the interp (`durable_fuzz`) and cross-backend (`durable_jit`) properties exercise it. **Multiple resume points** and **multi-block CFGs** (branches, loops, joins) now land too — each block is split at its suspend ops, branch targets are remapped, and a global `br_table` dispatch routes the thaw (`tests/multipoint.rs`, `tests/multiblock.rs`; the generator emits multi-frame/multi-point/multi-block modules). **`call.dyn` to a may-suspend target now lands (the fork-critical case — bash dispatches builtins through function-pointer tables).** The target is a runtime table index, so the analysis taints **by signature** (§6): a `call.dyn` of type `T` is may-suspend iff some function of type `T` is — the ceiling of static precision (the natural table maps every function into a slot; there is no element/table section to narrow it, and `Jit.install` can add targets at run time). The site instruments as a `PropagatedIndirect` suspend kind — the indirect twin of a propagated `Call`: spill the live set **including the reloaded table index**, and on thaw **re-issue the `call.dyn`**; because the taint rule instruments *every* function of the signature, the reloaded index can only re-select a `REWINDING`-aware callee, which rewinds in turn. This also **flips R8 from fail-open to sound** — a suspend-only-through-`call.dyn` module was previously accepted and silently under-instrumented; it is now instrumented (or, for indirect **tail** calls where there is no poll to unwind at, rejected fail-closed like direct tail calls). Covered by `tests/indirect.rs` (round-trip, live-across-indirect, mixed direct/indirect chain, tail-call rejection); the generator mixes direct and indirect chain links, so `durable_fuzz` (interp) and `durable_jit` (cross-backend, plus a deterministic `indirect_call_freeze_thaw_cross_backend`) exercise it automatically. The by-signature rule's breadth cost is R7. A chain deeper than the reserve holds traps cleanly on freeze (R9 overflow guard), rather than overflowing. | §2, §6, §12.7, `temen-durable` | addressed |
-| R9 | **Placement, not an isolation boundary — cheap for MVP.** The control state + shadow stack are a reserved low slice `[0, DURABLE_RESERVE)` (one 64 KiB page) of the domain's *own* window; guest memory is `[DURABLE_RESERVE, window)`, part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap is based at `DURABLE_RESERVE` (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `temen-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
+| R9 | **Placement, not an isolation boundary — cheap for MVP.** The control words sit at `[guard, guard+64)` and the shadow arena wherever the module **declares** it (`Memory::shadow`, #1503 / INVARIANTS.md #16 — before that a fixed `[0, 1<<16)` slice), both inside the domain's *own* window and part of the same budget-accounted allotment (the wasm shadow-stack / `__heap_base` convention: a toolchain points the arena at a BSS array). Because the window is per-domain and runtime-masked, a guest that writes the reserve corrupts only **its own** durability — never another domain or the host — and it **fails safe**: a forged resume id hits the `br_table` default → `Unreachable`; a wild shadow-SP stays masked in-window; the host validates the artifact (module hash) on restore. **Placement is declared and verified (#1503, INVARIANTS.md #16 — see §12.7):** the arena is `Memory::shadow`, and the verifier rejects any data segment overlapping it. **MVP path:** `transform_module_assume_confined` instruments memory-using guests on the cooperating-toolchain contract that the guest's data/heap stay clear of the control words and its declared arena (`tests/guest_memory.rs` shows guest memory round-tripping). Strict `transform_module` still fails closed (`GuestUsesMemory`) for untrusted modules. **Optional defense-in-depth (not MVP):** hard isolation against an *adversarial* guest — guard-paged per-fiber placement (§12.7) or per-access confinement. The shadow stack now **traps on overflow**: the freeze-path `UNWIND` check refuses a push whose top would cross `DURABLE_RESERVE`, so a too-deep call chain fails safe (a clean trap) instead of growing into guest memory (`tests/overflow.rs`). See **[DECISION D-shadow-overflow]** below for why this lives in the transform rather than a unified backend recursion ceiling. | §12.7, `temen-durable` | mitigated (placement + fail-safe + overflow trap; hard isolation optional) |
 | R10 | **No concurrency protection on the in-window control state** (state word, shadow-SP). Fine at single-vCPU; a hazard once fibers/multi-vCPU arrive (relates to R1, but specifically about the control words racing). *Mitigated for slice 3.2.1:* a freeze/thaw run (state ≠ `NORMAL`) is forced **single-worker**, and the runtime swaps both control words per-vCPU per dispatch — so the words are never touched concurrently. A lock-free parallel STW for the shadow-SP is **planned via per-context SP** (4A.5 — each context keeps its SP in its own region, addressed through a runtime-private per-context register, so the shared word and its lock both disappear; `FORMAT_VERSION` 4→5). The state word stays per-context-swapped (only flipped, not accumulated, so it needs no lock). | §3, §12.7 | mitigated (single-worker STW); 4A.5 = lock-free SP |
 | R11 | **Equivalence now fuzzed (Phase-1 scope), both single-backend and cross-backend.** The §7/§12.6 property runs over a generator of **in-scope** durable modules: (a) interpreter-only — *inert in `NORMAL`* (instrumented == un-instrumented) and *round-trip* (freeze→serialize→restore→thaw ≡ uninterrupted, reload-not-reissue) — `crates/temen-durable/tests/durable_fuzz.rs` + libFuzzer `fuzz/fuzz_targets/durable.rs`; (b) cross-backend — interp vs Cranelift JIT agree on the NORMAL result, leave a **byte-identical freeze artifact**, and a JIT thaw of the **interpreter-frozen** artifact under a different host clock reproduces the result — `crates/temen/tests/durable_jit.rs` + libFuzzer `fuzz/fuzz_targets/durable_jit.rs`. Both stable drivers run in CI without nightly. Coverage broadens automatically as the transform generalizes (R8). | §7, §12.6 | addressed (Phase-1 scope) |
 
@@ -1183,6 +1209,26 @@ including the §12.6 canonical re-serialize invariant). Remaining Phase-3 contro
 **multi-vCPU** (per-context state words) and the **dispatch table** (a module-derived no-op today).
 
 ### 12.7 Shadow-frame layout
+
+**Placement is the module's declaration (2026-09-16, #1503; INVARIANTS.md #16).** Where the
+per-context shadow regions sit is `Memory::shadow: Option<ShadowArena { base, end }>` — declared in the
+module (`memory N shadow BASE END` in text; the memory descriptor on the wire, module format v11) and
+held by `temen-verify` to the geometry every backend assumes: `base ≥ DURABLE_CONTROL_END` (the
+always-polled control words end at guard+64), 8-aligned, at least one `SHADOW_STRIDE` region and at
+most 64, `end ≤ window`, and **no data segment overlaps it** (the R9 "guest bytes never alias the
+arena" contract, now static). `temen_ir::durable_abi::ShadowArena` is the one implementation of the
+placement arithmetic (`region_base`/`region_fits`/`frame_base`/`thaw_state_off`/`ctx_of_sp`/
+`ctx_ceiling`); the transform's overflow guard bakes the declared `end`, both interpreter tiers carry
+the arena on the window (`Mem`), the Cranelift runtime on `CompiledModule`/`SharedFiberTable`, the §14
+resolver on `ResolvedModule`, and the snapshot codec derives the empty root extent from the module.
+A module that declares none is not freezable: `transform_module*` fails closed (`NoShadowArena`) and a
+runtime treats it as `ShadowArena::EMPTY` (zero regions — nothing can be placed). The former
+`SHADOW_BASE`/`DURABLE_RESERVE` constants, the three hand-synced `shadow_region_base`/`MAX_SHADOW_CTX`
+copies, and the #1094 residue where the base moved but the context ceiling did not, are all gone. A
+toolchain guest points the arena at a BSS array (the allocator never manages it); the Forth kernel
+declares `[0x74000, 0x80000)` and its data block at `0x8000` needed no move. Note the `+8` root-SP value
+quoted in the 4A.5 "Helpers / format" entry below predates the §12.8 stage-1 thaw word: the empty root
+extent is `frame_base(0)` = base+16.
 
 The transform's spill/reload code and the suspended representation meet here. Two
 properties drive the whole design:

@@ -534,6 +534,35 @@ different things depending on which pair you compare:
   `ThreadFault` on the production engine too — an invalid VM combination — so the scheduled coverage uses a
   coroutine driven through the scheduler on its own vCPU.)
 
+  **`DebugRun` collapsed into `ScheduledDebugRun` (#1517 slice 4).** The two bytecode debug engines
+  were one behaviour on two routes: a single-vCPU run *is* a scheduled run with one task. Once the
+  scheduled engine carried every capability the single one had — the host-completed cap park (slice 1),
+  value watches (slice 2), and `Jit.invoke` step-into (slice 3) — `DebugRun` was **deleted**, not
+  aliased (INVARIANTS #15; the acceptance of #1517). `Engine` no longer exists; the DAP `BytecodeBackend`
+  holds one `ScheduledDebugRun` and its ~76 two-arm matches became straight calls. A spawn-free guest is
+  simply a one-task schedule: it steps, watches, checkpoints, and traces its turns identically, so
+  `module_spawns_threads` now only gates whether a schedule *seed* is meaningful (it is not, with one
+  vCPU). The one time coordinate is the global `turn`. The historical slice entries above say "the
+  single-vCPU `DebugRun`" for what, at the time, was a distinct engine; that engine is now the one-task
+  case of the scheduled one.
+
+  **The continuation enum (#1517 slice 5, closing #1460).** The three time-travel routes — the
+  tree-walk `Inspector`'s seek checkpoints, the bytecode `ScheduledDebugRun`'s snapshots, and the
+  reactor scrub moments — shared one `Moment`/`Ladder` (the window image + host substate + a keyframe
+  ring) but kept the continuation as a *type parameter*, one instantiation each, because collapsing
+  them into one restore path was the same work as collapsing the engines. With `DebugRun` gone (slice
+  4) that work is done, so `Moment<C>`/`Ladder<C>` drop the parameter for one `Continuation` enum:
+  `None` (a reactor resumes nothing between frames), `Bytecode(ScheduledContinuation)` (the scheduled
+  debug engine's task set + fibers + child envs), and `ShadowStack` (the tree-walk oracle's call stack
+  + fuel, kept as the differential per INVARIANTS #15). Each engine matches the variant it captured; the
+  ladder is variant-agnostic (proved directly by `moment::ladder_is_continuation_agnostic`, the one
+  parameterised property over the three, in place of trusting the three engine harnesses to). A §12
+  durable artifact is the serialized form of a `ShadowStack` moment — window image = the moment's `mem`
+  half, handle table = its host half — except the durable shadow stack is **window-resident** where the
+  checkpoint moment's is a host-side frame vector for a non-durable run; `temen-snapshot`'s module doc
+  draws the correspondence. Bridging a non-durable checkpoint moment *to* an artifact needs the
+  `temen-durable` shadow schema for that run, which is an owner-level question, not part of this slice.
+
   **Direction — the tree-walker is the differential oracle only (far too slow for any user-facing
   path); every user-facing surface lands on the bytecode engine, differential-checked against it.**
   The bytecode debug engines now cover the full `Inspector` forward/reverse/watch surface plus
@@ -544,11 +573,11 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the
-  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on the single-vCPU
-  `DebugRun` (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into): a
-  breakpoint fires *inside* the unit and the backtrace descends into its module-≥1 frames, over the
-  caller's shared window — while the scheduled engine keeps invoke an opaque leaf (as it does
-  coroutines). Two boundaries stay forward-first (as every seam landed): **source-variable** names
+  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on both engines
+  (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into; the scheduled
+  engine since #1517 slice 3 — it kept invoke an opaque leaf before): a breakpoint fires *inside* the
+  unit and the backtrace descends into its module-≥1 frames, over the caller's shared window. Two
+  boundaries stay forward-first (as every seam landed): **source-variable** names
   inside an invoked/installed unit's frame resolve to `None` (its module-≥1 SSA metadata is not plumbed;
   `IrPc`s/stepping/backtrace are exact), and **reverse-replay across a §22 op** is out-of-subset (an
   `install` mutates the shared dispatch table, and an in-flight `invoke` holds a transient `Vm` — both

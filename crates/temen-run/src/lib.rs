@@ -1115,7 +1115,34 @@ pub fn jit_blob_validator_durable(
     let Some(table) = decode_symbol_table(symtab) else {
         return Err(EINVAL);
     };
-    jit_resolve_and_validate_impl(bytes, mem_log2, |name| table.get(name).copied(), true)
+    jit_resolve_and_validate_impl(
+        bytes,
+        mem_log2,
+        |name| table.get(name).copied(),
+        UnitDurability::Strict,
+    )
+}
+
+/// [`jit_blob_validator_durable`] for a durable domain whose program went through
+/// `temen_durable::transform_module_assume_confined` — a **cooperating toolchain** whose units may use
+/// linear memory (its own regions, never the durable control words or its declared arena) on the same
+/// guarantee the program gave. The Forth kernel's REPL line-units are the case: a line that resumes a
+/// fiber also loads/stores the REPL data stack, which the strict path rightly refuses for an
+/// untrusted unit. Installed by [`grant_jit_durable_confined`].
+pub fn jit_blob_validator_durable_confined(
+    bytes: &[u8],
+    mem_log2: Option<u8>,
+    symtab: &[u8],
+) -> Result<Arc<[temen_ir::Func]>, i64> {
+    let Some(table) = decode_symbol_table(symtab) else {
+        return Err(EINVAL);
+    };
+    jit_resolve_and_validate_impl(
+        bytes,
+        mem_log2,
+        |name| table.get(name).copied(),
+        UnitDurability::Confined,
+    )
 }
 
 /// The canonical [`temen_interp::ModuleValidator`] — the decode+verify gate for
@@ -1252,7 +1279,20 @@ pub fn jit_resolve_and_validate(
     mem_log2: Option<u8>,
     resolve: impl FnMut(&str) -> Option<Resolved>,
 ) -> Result<Arc<[temen_ir::Func]>, i64> {
-    jit_resolve_and_validate_impl(bytes, mem_log2, resolve, false)
+    jit_resolve_and_validate_impl(bytes, mem_log2, resolve, UnitDurability::None)
+}
+
+/// Which durable instrumentation a `Jit` domain's validator applies to a submitted unit
+/// ([`jit_resolve_and_validate_impl`]): none, the strict transform, or the confined one.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnitDurability {
+    /// Not a durable domain: the unit runs as submitted.
+    None,
+    /// `temen_durable::transform_module` — fails closed on any guest-memory op (R9, untrusted units).
+    Strict,
+    /// `temen_durable::transform_module_assume_confined` — the unit may use linear memory, on the
+    /// same guarantee its program gave (a cooperating toolchain confined to its own regions).
+    Confined,
 }
 
 /// The shared body of [`jit_blob_validator`] (non-durable) and [`jit_blob_validator_durable`]. When
@@ -1260,12 +1300,12 @@ pub fn jit_resolve_and_validate(
 /// **before** verify — the §4 "host runs the pass on submitted IR" composition (DURABILITY.md §12.5,
 /// CONSOLIDATION.md §6). The transform emits ordinary verifier-passing IR (no new TCB surface), so the
 /// verify below is the safety re-check; the strict path fails a memory-touching unit closed (admitting
-/// confined memory use is a later refinement). `durable = false` is byte-for-byte the pre-existing path.
+/// confined memory use is a later refinement). [`UnitDurability::None`] is byte-for-byte the pre-existing path.
 fn jit_resolve_and_validate_impl(
     bytes: &[u8],
     mem_log2: Option<u8>,
     resolve: impl FnMut(&str) -> Option<Resolved>,
-    durable: bool,
+    durable: UnitDurability,
 ) -> Result<Arc<[temen_ir::Func]>, i64> {
     let Ok(m) = temen_encode::decode_module(bytes) else {
         return Err(EINVAL);
@@ -1277,13 +1317,16 @@ fn jit_resolve_and_validate_impl(
     };
     // §4 durability: instrument the (import-free) unit for freeze/thaw before verify. A unit outside the
     // transform's Phase-1 scope (guest-memory op under the strict path, unsupported shape) fails closed.
-    let m = if durable {
-        match temen_durable::transform_module(&m) {
+    let m = match durable {
+        UnitDurability::None => m,
+        UnitDurability::Strict => match temen_durable::transform_module(&m) {
             Ok(t) => t,
             Err(_) => return Err(EINVAL),
-        }
-    } else {
-        m
+        },
+        UnitDurability::Confined => match temen_durable::transform_module_assume_confined(&m) {
+            Ok(t) => t,
+            Err(_) => return Err(EINVAL),
+        },
     };
     if temen_verify::verify_module(&m).is_err() {
         return Err(EINVAL);
@@ -1372,8 +1415,39 @@ pub fn grant_jit_threads(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
 /// Handles still drain before a snapshot (JIT handles staying non-durable is the Slice-2 follow-on).
 /// Same handle value + memory-match precondition as [`grant_jit`]; the caller sets `host.set_durable(true)`.
 pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    grant_jit_durable_with(host, m, table_log2, jit_blob_validator_durable)
+}
+
+/// [`grant_jit_durable`] for a program instrumented through
+/// `temen_durable::transform_module_assume_confined`: its units get the same confined transform
+/// ([`jit_blob_validator_durable_confined`]) — a unit that uses linear memory is admitted on the
+/// program's own confinement guarantee instead of failing closed. Everything else (the install fence,
+/// the taint set, the memory-match precondition) is identical.
+pub fn grant_jit_durable_confined(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
+    grant_jit_durable_with(host, m, table_log2, jit_blob_validator_durable_confined)
+}
+
+fn grant_jit_durable_with(
+    host: &mut Host,
+    m: &Module,
+    table_log2: u8,
+    validator: temen_interp::JitValidator,
+) -> i32 {
+    set_jit_durable_policy_with(host, m, validator);
+    host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
+}
+
+/// The durable-`Jit` **policy** of [`grant_jit_durable_confined`] without the grant: the validator,
+/// the `jit_hosts_durable` flag, the install fence and the taint fn. For a host that receives its
+/// `Jit` domain from a **restored artifact** (a thaw) rather than a fresh grant — the handle table
+/// re-pins the domain, but the policy is host configuration the artifact does not carry.
+pub fn set_jit_durable_policy_confined(host: &mut Host, m: &Module) {
+    set_jit_durable_policy_with(host, m, jit_blob_validator_durable_confined);
+}
+
+fn set_jit_durable_policy_with(host: &mut Host, m: &Module, validator: temen_interp::JitValidator) {
     host.set_jit_hosts_durable(true);
-    host.set_jit_validator(jit_blob_validator_durable);
+    host.set_jit_validator(validator);
     // Install fence (DURABILITY.md §12.5, R8 fork-critical case): stash the program's tainted
     // signatures + the gate predicate so a later `Jit.compile` of a *suspendable* unit whose entry
     // signature the program does not taint fails closed (an un-instrumented `call.dyn` could
@@ -1387,7 +1461,6 @@ pub fn grant_jit_durable(host: &mut Host, m: &Module, table_log2: u8) -> i32 {
     // `regrant_into_child` before its module is bound) can resolve its *own* tainted set from its
     // module at compile time — the parent's eager set above is for the parent's program only.
     host.set_jit_durable_taint_fn(temen_durable::tainted_signatures_of);
-    host.grant_jit_with_table(m.memory.map(|mc| mc.size_log2), table_log2)
 }
 
 /// Run `m` on the **JIT** with the `Jit` capability live: the long-lived compile→run split
@@ -1453,14 +1526,16 @@ pub fn jit_cap_run(
         {
             let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
             reconstruct_jit_units(&mut cm, &mut hg)?;
+            jit_durable_enter(&mut cm, &mut hg);
         }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
         // above); all of the run's vCPU threads serialize their `call.cap`s through `host_mutex`.
         let r = unsafe { CompiledModule::run_raw(&mut cm, args, Some(init_mem), Some(1 << 18)) };
-        host_mutex
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_jit_native_ctx(0);
+        {
+            let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
+            hg.set_jit_native_ctx(0);
+            jit_durable_leave(&mut cm, &mut hg);
+        }
         *host = host_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
         return r;
     }
@@ -1489,6 +1564,7 @@ pub fn jit_cap_run(
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
     reconstruct_jit_units(&mut cm, host)?;
+    jit_durable_enter(&mut cm, host);
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
@@ -1496,7 +1572,49 @@ pub fn jit_cap_run(
     // The module dies with this call — leave no dangling registration behind.
     host.set_jit_native_ctx(0);
     host.set_serve_native_ctx(0);
+    jit_durable_leave(&mut cm, host);
     r
+}
+
+/// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
+/// durable, seeded with the fibers a restore re-created (`Host::frozen_fibers`, taken — the
+/// interp's thaw consumes them the same way). A plain host leaves the run byte-identical.
+fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) {
+    if host.is_durable() {
+        let seed = host
+            .frozen_fibers()
+            .iter()
+            .map(|f| temen_jit::FrozenFiber {
+                slot: f.slot,
+                func: f.func,
+                sp: f.sp,
+                shadow_sp: f.shadow_sp,
+                generation: f.generation,
+            })
+            .collect();
+        host.set_frozen_fibers(Vec::new());
+        cm.set_durable(seed);
+    }
+}
+
+/// The freeze residue of a durable [`jit_cap_run`]: the fibers the freeze flattened, handed to the
+/// embedder on the `Host` exactly where the interp's freeze driver leaves them, so one
+/// `temen_snapshot::freeze(module, window, host)` serves both engines.
+fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
+    let frozen: Vec<temen_interp::FrozenFiber> = cm
+        .take_frozen_fibers()
+        .into_iter()
+        .map(|f| temen_interp::FrozenFiber {
+            slot: f.slot,
+            func: f.func,
+            sp: f.sp,
+            shadow_sp: f.shadow_sp,
+            generation: f.generation,
+        })
+        .collect();
+    if !frozen.is_empty() {
+        host.set_frozen_fibers(frozen);
+    }
 }
 
 /// **Code-memory compaction** for a guest-driven `Jit` domain (DESIGN.md §22): rebuild the domain's
@@ -1989,7 +2107,7 @@ pub unsafe extern "C" fn module_resolver(
 ) -> i32 {
     let host = &*(ctx as *const Host);
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -1998,6 +2116,7 @@ pub unsafe extern "C" fn module_resolver(
                 n_data,
                 types,
                 n_types,
+                shadow,
             };
             1
         }
@@ -2019,7 +2138,7 @@ pub unsafe extern "C" fn module_resolver_locked(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -2028,6 +2147,7 @@ pub unsafe extern "C" fn module_resolver_locked(
                 n_data,
                 types,
                 n_types,
+                shadow,
             };
             1
         }
@@ -6265,7 +6385,10 @@ impl Instance {
     fn window_override(&self, config: &RunConfig) -> Option<Module> {
         config.memory_size_log2.map(|size_log2| {
             let mut m = self.module.clone();
-            m.memory = Some(temen_ir::Memory { size_log2 });
+            m.memory = Some(temen_ir::Memory {
+                size_log2,
+                shadow: None,
+            });
             m
         })
     }
@@ -6433,20 +6556,15 @@ impl Instance {
                         jit: Some(jit),
                         stderr: Some(stderr),
                     };
-                    let bindings = self
-                        .module
-                        .imports
-                        .iter()
-                        .map(|im| match granted.bind(&im.name) {
-                            Some((cap, handle)) => {
-                                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                            }
-                            // Unknown name, or a capability this host did not grant: declared but
-                            // unbound — fail-closed at dispatch.
-                            None => temen_interp::BoundImport::rebindable(0, 0, None),
-                        })
-                        .collect();
-                    h.set_import_bindings(bindings);
+                    // The one shared powerbox binder (#1524). An unknown name, a capability
+                    // this host did not grant, or a declared signature that is not the
+                    // capability op's: declared but unbound — fail-closed at dispatch.
+                    h.bind_powerbox_manifest(
+                        &self.module.imports,
+                        &self.module.types,
+                        &granted,
+                        &[],
+                    );
                 }
             }
         }

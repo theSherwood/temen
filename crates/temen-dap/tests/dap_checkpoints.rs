@@ -1,4 +1,4 @@
-//! Warm≡cold oracle for the bytecode `DebugRun` time-travel **checkpoint ladder** (DEBUGGING.md W1) —
+//! Warm≡cold oracle for the bytecode engine's time-travel **checkpoint ladder** (DEBUGGING.md W1) —
 //! the `BytecodeBackend` port of the tree-walker `crates/temen/tests/debug_checkpoints.rs`.
 //!
 //! A **warm** backend (its ladder populated by a prior deep `seek`, so `seek` *restores* from the
