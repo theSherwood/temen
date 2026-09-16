@@ -6976,6 +6976,10 @@ pub enum SchedStop {
     /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
     /// input prompt instead of a dead end.
     StdinPark { pc: super::IrPc },
+    /// #1366 — a thread is parked on a host-completed cap call `id` (at `pc`): live, resumable once
+    /// the embedder [`deliver_cap`](ScheduledDebugRun::deliver_cap)s the value. The cap twin of
+    /// `StdinPark`.
+    CapPark { id: u64, pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
     /// coroutines (step-into, with the coroutine's vCPU pinned across the body) are all handled.
@@ -7021,6 +7025,16 @@ enum DbgTaskState {
     /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
     /// and the single-vCPU `DebugRun::stdin_parked` — invariant 14's debugger axis.
     BlockedStdin,
+    /// #1366 — parked on a **host-completed** cap call: the embedder services it asynchronously and
+    /// [`ScheduledDebugRun::deliver_cap`] resumes. `dst` is the awaiting result slot; `at` the call's
+    /// pc (the stop location). The scheduled twin of `DebugRun`'s `cap_parked`; not runnable until
+    /// delivered, and cleared to `Runnable` on a checkpoint restore (a replay serves the call from
+    /// the tape, exactly as a restored stdin park re-issues its read).
+    CapParked {
+        id: u64,
+        dst: u32,
+        at: Option<super::IrPc>,
+    },
     /// Finished — result (or trap) retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -7250,7 +7264,8 @@ pub enum SchedTraceEvent {
 
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
 /// (aux = child), 2 = blocked-wait (aux = key), 3 = done, 4 = blocked-stdin (a park/wake the differ
-/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act).
+/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act),
+/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the embedder's `deliver_cap`).
 fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
     tasks
         .iter()
@@ -7260,6 +7275,7 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
             DbgTaskState::BlockedWait { key, .. } => (2, key),
             DbgTaskState::Done(_) => (3, 0),
             DbgTaskState::BlockedStdin => (4, 0),
+            DbgTaskState::CapParked { id, .. } => (5, id),
         })
         .collect()
 }
@@ -7472,11 +7488,12 @@ fn service_advance(
             *turn += 1;
             dbg_complete(tasks, ti, Err(t));
         }
-        // #1366: a host-completed cap park has no completer on the scheduled engine (no
-        // `cap_parked` there yet) — fail closed, exactly like a trap.
-        FiberStep::CapParked { .. } => {
-            *turn += 1;
-            dbg_complete(tasks, ti, Err(Trap::CapFault));
+        // #1366 — a host-completed cap park: the call did not run and the turn holds (as a stdin
+        // park); `drive` reports `SchedStop::CapPark` once nothing else can run, and `deliver_cap`
+        // lands the value and re-admits the task. Until #1517 this engine failed closed here — and
+        // could not in fact reach it, since it never admitted host-completed punts at all.
+        FiberStep::CapParked { id, dst, at } => {
+            tasks[ti].state = DbgTaskState::CapParked { id, dst, at };
         }
         // A scheduler seam: the ones this engine dispatches, else `Declined`.
         FiberStep::Other(outcome) => match outcome {
@@ -8456,6 +8473,11 @@ impl ScheduledDebugRun {
             ..
         } = self;
         *stopped = None;
+        // #1366: admit host-completed punts on this run's host, so an offloadable cap the embedder
+        // services asynchronously parks the thread (`CapParked`) instead of being waited inline.
+        // The single-vCPU engine does the same at the top of every advance; without it
+        // `wait_unless_host_owned` never yields `None` and this engine could not park at all.
+        host.completions().allow_host_completed();
         loop {
             if let DbgTaskState::Done(res) = &tasks[0].state {
                 return SchedStop::Finished(res.clone());
@@ -8485,6 +8507,24 @@ impl ScheduledDebugRun {
                         // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
                         // lowest-index one), else a true deadlock.
                         None => {
+                            // #1366: a thread parked on a host-completed cap is a live `CapPark`
+                            // stop on that thread (lowest-index), resumable via `deliver_cap`.
+                            if let Some((p, id, at)) =
+                                tasks.iter().enumerate().find_map(|(i, t)| match t.state {
+                                    DbgTaskState::CapParked { id, at, .. } => Some((i, id, at)),
+                                    _ => None,
+                                })
+                            {
+                                // The stop location is the call itself (the position after it may
+                                // be a terminator), falling back to the live pc.
+                                let pc =
+                                    at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
+                                if let Some(pc) = pc {
+                                    *stopped = Some(p);
+                                    *focus = p;
+                                    return SchedStop::CapPark { id, pc };
+                                }
+                            }
                             let parked = tasks
                                 .iter()
                                 .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
@@ -8675,9 +8715,11 @@ impl ScheduledDebugRun {
             write_cursor,
             ..
         } = self;
-        // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
-        // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
-        // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
+        host.completions().allow_host_completed(); // #1366: see `drive`
+                                                   // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
+                                                   // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
+                                                   // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
+                                                   // A `CapParked` task is not runnable, so a parked run refuses to tick — as the single engine's.
         let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
         let Some(ti) = dbg_pinned_coro(tasks)
             .or_else(|| dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn))
@@ -8763,6 +8805,62 @@ impl ScheduledDebugRun {
                 t.state = DbgTaskState::Runnable;
             }
         }
+    }
+
+    /// #1366 — the completion id some thread is parked on (a host-completed cap call), if any: the
+    /// lowest-index parked thread's. The backend reports it as `StopReason::CapPark { id }`;
+    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it. The scheduled twin of
+    /// `DebugRun::cap_parked`.
+    pub fn cap_parked(&self) -> Option<u64> {
+        self.tasks.iter().find_map(|t| match t.state {
+            DbgTaskState::CapParked { id, .. } => Some(id),
+            _ => None,
+        })
+    }
+
+    /// #1366 — the pc of the host-completed cap call the parked thread is on (the stop location), if
+    /// parked and the call had a source position.
+    pub fn cap_park_pc(&self) -> Option<super::IrPc> {
+        self.tasks.iter().find_map(|t| match t.state {
+            DbgTaskState::CapParked { at, .. } => at,
+            _ => None,
+        })
+    }
+
+    /// #1366 — finish the host-completed cap call a thread is parked on: `value` lands in the call's
+    /// result slot, the completion settles, the delivered value joins the cap tape as the call's record
+    /// (so a reverse `seek` replays it without re-parking), the thread is re-admitted, and the op
+    /// counts on the turn. `false` if no thread is parked on `id`. The twin of `provide_stdin`, and
+    /// op-for-op the same delivery the single-vCPU engine performs.
+    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
+        let Some((ti, dst)) = self
+            .tasks
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| match t.state {
+                DbgTaskState::CapParked { id: pid, dst, .. } if pid == id => Some((i, dst)),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let comps = self.host.completions();
+        let prefix = comps.complete_host(id, value);
+        let _ = comps.try_take(id);
+        if let Some((type_id, op, handle, args)) = prefix {
+            self.host.tape_cap_record(super::CapRecord {
+                type_id,
+                op,
+                handle,
+                args,
+                result: Ok(vec![value]),
+                mem_writes: Vec::new(),
+            });
+        }
+        self.tasks[ti].vt.active.set(dst, Reg::from_i64(value));
+        self.tasks[ti].state = DbgTaskState::Runnable;
+        self.turn += 1;
+        true
     }
 
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
@@ -8909,7 +9007,9 @@ impl ScheduledDebugRun {
                     // re-admits, and the re-executed read is served from the cap tape (or re-parks
                     // at the frontier) — the scheduled twin of `DebugRun::restore`'s rule.
                     state: match &ts.state {
-                        DbgTaskState::BlockedStdin => DbgTaskState::Runnable,
+                        DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. } => {
+                            DbgTaskState::Runnable
+                        }
                         s => s.clone(),
                     },
                     at_bp: ts.at_bp,
