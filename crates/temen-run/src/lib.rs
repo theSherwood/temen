@@ -4754,6 +4754,9 @@ fn canonical_cap_name(import: &str) -> Option<&'static str> {
     Some(match import {
         "write" => "stdout",
         "read" => "stdin",
+        // Aliases of the two above — see `temen_ir::default_cap_resolver`.
+        "stream_write" => "stdout",
+        "stream_read" => "stdin",
         "stderr" => "stderr",
         "exit" => "exit",
         "vm_map" | "vm_unmap" | "vm_protect" | "vm_page_size" => "addrspace",

@@ -4488,6 +4488,13 @@ pub fn playground_include_files() -> Vec<(String, Vec<u8>)> {
             "include/unistd.h",
             include_str!("../playground-include/unistd.h"),
         ),
+        // The `open` flags for the fs-cap syscalls `unistd.h` declares. Absent until c_interpret#28
+        // cluster F: a program doing `#include <fcntl.h>` failed at the preprocessor, which read as a
+        // capability gap and was a missing header.
+        (
+            "include/fcntl.h",
+            include_str!("../playground-include/fcntl.h"),
+        ),
         (
             "include/time.h",
             include_str!("../playground-include/time.h"),

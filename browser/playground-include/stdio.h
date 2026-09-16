@@ -13,26 +13,11 @@
 #include <stdarg.h>
 #include <stdlib.h> // malloc/realloc — the growable buffer behind open_memstream
 
-// Ambient powerbox syscalls (the frontend lowers these to `cap.call` on the stashed handles).
-int write(int fd, char *buf, long n);
-int read(int fd, char *buf, long n);
+// The powerbox syscall edge — `write`/`read`/`open`/`close`/`lseek`, the `__vm_fs` fs seam and its
+// `__FS_*` protocol constants, and `SEEK_*`. One definition site, in <unistd.h>; this header used to
+// carry a second copy of the declarations, which is exactly the kind of duplicate that drifts.
+#include <unistd.h>
 void exit(int code);
-
-// #1323 (c_interpret #16, file I/O): file access over the powerbox `fs` capability. `__vm_fs(op,…)`
-// is the on-ramp fs seam recognized by the frontend (it lowers to `call.sym "vm_fs"`, with the op
-// selected by arg0), so one call carries the whole open/read/write/seek/close protocol — the same
-// `temen-fs` backend Postgres/chibicc use. The on-ramp mounts a private, in-memory read-write memfs
-// (`grant_onramp_caps`). fd 0/1/2 stay on the ambient Stream (`write`/`read` above); *file* fds
-// (>= 3, minted by FS_OPEN) reach the memfs. A plain compile-and-run card with no fs cap simply
-// never calls these (a program that only writes stdout goes through `write`).
-extern long __vm_fs(long op, long a, long b, long c, long d);
-enum { __FS_OPEN = 0, __FS_READ = 1, __FS_WRITE = 2, __FS_SEEK = 3, __FS_CLOSE = 4 };
-enum { __FS_O_READ = 1, __FS_O_WRITE = 2, __FS_O_APPEND = 4, __FS_O_TRUNC = 8, __FS_O_CREATE = 16 };
-#ifndef SEEK_SET
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2
-#endif
 
 typedef unsigned long size_t;
 typedef long ssize_t;

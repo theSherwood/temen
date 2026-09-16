@@ -19627,9 +19627,18 @@ impl Host {
         // guest that compiles code can spawn a confined copy of itself that can too — the Forth
         // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
         // is what confers the authority; this list only lets the child's manifest *reach* it.
+        // `stream_write`/`stream_read` are the *same two caps* as `write`/`read` — the frontend's raw
+        // stream spelling (`__vm_stream_write`/`__vm_stream_read`), which `default_cap_resolver` maps
+        // onto the identical `(type_id, op)` and handle. They are listed because this table is keyed by
+        // name: a confined child compiled against the seeded libc reaches stdout through the raw
+        // spelling (its `<unistd.h>` `write` is a real fd-dispatching definition, not the frontend
+        // builtin), and a name missing here does not widen or narrow authority — it fails closed, as a
+        // `CapFault` on the child's first `printf`, with nothing to say which spelling was the problem.
         const CHILD_BINDABLE: &[&str] = &[
             "write",
             "read",
+            "stream_write",
+            "stream_read",
             "exit",
             "vm_map",
             "vm_unmap",

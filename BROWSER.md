@@ -448,6 +448,24 @@ The seeded headers are now split so the libc can be compiled **once** as its own
   not behind an `#ifdef` in place. chibicc tokenizes a header in full before the preprocessor drops
   skipped groups, so body text left in place is still *tokenized* by a decls-only compile: moving it
   out took that compile from 370 ms to 108 ms.
+- **One deliberate exception: the POSIX fd surface stays inline.** `<unistd.h>`'s
+  `write`/`read`/`open`/`close`/`lseek` are `static inline` in *all three* modes, and `write`/`read`
+  force it. chibicc substitutes its fd-less `write`/`read` builtins for a name that is declared and
+  **not defined** in the translation unit (`codegen_ir.c`), and those builtins ignore the fd and always
+  use the stdout/stdin handle. A decls-only program unit is exactly the case where a linked body leaves
+  nothing behind but a prototype — so deferring these would make `write(fd, …)` to a file land on the
+  console instead, with the file left empty and no error anywhere. The dispatchers reach stdout/stdin
+  through `__vm_stream_write`/`__vm_stream_read` (`call.sym "stream_write"/"stream_read"`) rather than
+  `write`/`read`, because their own definitions shadow the builtins of those names and a dispatcher
+  calling `write` would recurse into itself. `default_cap_resolver` binds the two `stream_*` names as
+  exact aliases of `write`/`read` — same interface, same op, same handle, no added authority.
+  `<fcntl.h>` then defines the `O_*` names **as the fs cap's own bit values**, so `open` passes `flags`
+  through untranslated and there is no mapping to drift; that matters because on Linux `O_RDONLY` is
+  `0` while `temen-fs` gates `readable: flags & O_READ != 0`, so glibc's numbers would yield a fd that
+  is open but unreadable and a first `read` that quietly returns nothing.
+  `browser/tests/playground_fcntl.rs` pins it with round trips (write, reopen read-only, read back;
+  `O_TRUNC`; `lseek` overwrite in place) rather than a compile, because every one of those failures is
+  silent.
 - `browser/playground-include/__pg_libc.c` is the libc unit's TU (`temen_browser::playground_libc_tu`),
   and `PG_DECLS_ONLY_ARGV` (`-include __pg_decls_only.h`) is what puts a program unit in decls-only
   mode. A seeded header rather than a `-D`, because the committed `chibicc.temen` asset predates
@@ -601,7 +619,7 @@ answers both from `Module::imports`, stashed one line per import as `served<TAB>
 
 ```
 1	vm_fs        ← the on-ramp powerbox binds this name
-1	write
+1	stream_write ← the seeded libc's stdout edge
 0	fb_poll      ← the embedder must serve this one
 ```
 
