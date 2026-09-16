@@ -861,6 +861,48 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("builtinFetchSub", sig(&[I64, I32, I32], &[I32]), 68),
     ("builtinFetchAdd", sig(&[I64, I64, I32], &[I64]), 69),
     ("builtinFetchSub", sig(&[I64, I64, I32], &[I64]), 70),
+    // **The epoll trio** `std/threadpool` and `std/parfor` declare, and the last thing keeping those
+    // two modules from linking (#1443's residue: the `{.emit.}` half was fixed, this half was not).
+    // Same fail-closed posture as the posix rows above, and for the same reason — a sandboxed guest
+    // is granted no ambient I/O multiplexer.
+    //
+    // **All three report failure, including `epoll_wait`.** The tempting alternative is to have it
+    // return 0, "no events ready", which reads like the harmless-success rows (`close`, `nanosleep`).
+    // It is not the same: 0 claims a *successful poll of an epoll set*, and there is no set — the
+    // `epoll_create1` that would have made one returned -1. A poller that answers "nothing ready"
+    // forever is precisely the silent-wrong-answer shape this table exists to avoid; -1 says the
+    // facility is absent, which is true.
+    //
+    // A program that only *imports* these modules now links, which is the point. One that calls
+    // `initPool()` gets nim's own `assert gIoFd >= 0, "epoll_create1 failed"` (threadpool.nim:355) —
+    // a named, immediate failure rather than a pool that looks initialized and silently runs nothing.
+    // Its worker threads were already inert: `pthread_create` is the fail-closed stub at row 53.
+    ("epoll_create1", ANY, 71),
+    ("epoll_ctl", ANY, 72),
+    ("epoll_wait", ANY, 73),
+    // **`std/ioring`'s posix/socket edge.** Same fail-closed posture again: a guest is granted no
+    // sockets and no host descriptors. Every use sits inside an explicit proc (`initIoRing`,
+    // `listenTcp`, `submitRead`), never at module scope, so importing the module is safe and a
+    // program that actually opens a socket gets -1 from `socket` before it reaches anything else.
+    //
+    // `posixClose` and `sched_yield` succeed instead: closing a descriptor that was never opened is
+    // harmlessly done, and on one vCPU a yield has nothing to yield to — the same reasoning as
+    // `close` (row 21) and `nanosleep` (row 47).
+    ("posixRead", ANY, 74),
+    ("posixWrite", ANY, 75),
+    ("posixClose", ANY, 76),
+    ("sched_yield", ANY, 77),
+    ("fcntl", ANY, 78),
+    ("socket", ANY, 79),
+    ("setsockopt", ANY, 80),
+    ("bindAddr", ANY, 81),
+    ("listen", ANY, 82),
+    ("accept", ANY, 83),
+    // **`htons` is not a syscall and is not stubbed.** It is a pure 16-bit byte swap, and it is the
+    // one name in this block that a guest can legitimately compute for itself. Handing it a -1 (or a
+    // 0) would be exactly the silent-wrong-answer this table is careful about everywhere else: the
+    // call would succeed and quietly produce a wrong port number. Row 84 does the swap.
+    ("htons", ANY, 84),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
