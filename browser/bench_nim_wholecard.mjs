@@ -107,6 +107,12 @@ console.log(`${'compile'.padEnd(20)} ${'wall-clock'.padStart(12)}`);
 console.log(`${'all-interpreter'.padEnd(20)} ${fmt(res.interpMs).padStart(12)}`);
 console.log(`${'op-13 emitted tier'.padEnd(20)} ${fmt(res.tieredMs).padStart(12)}`);
 console.log(`\ntiered per-phase:  crawl ${fmt(tm.crawlMs)}   nimsem ${fmt(tm.nimsemMs)}   hexer ${fmt(tm.hexerMs)}   (+link/run)`);
+// #1417: how much of each phase ran INTERPRETED over the detached child's foreign memory — the bounce
+// count is "how often the phase declined", bounceMs/phaseMs is "does it matter".
+const pct = (b, t) => (t ? `${((100 * b) / t).toFixed(1)}%` : '—');
+console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / ${fmt(tm.crawlBounceMs)} (${pct(tm.crawlBounceMs, tm.crawlMs)})` +
+  `   nimsem ${tm.nimsemBounces ?? '—'} / ${fmt(tm.nimsemBounceMs)} (${pct(tm.nimsemBounceMs, tm.nimsemMs)})` +
+  `   hexer ${tm.hexerBounces ?? '—'} / ${fmt(tm.hexerBounceMs)} (${pct(tm.hexerBounceMs, tm.hexerMs)})`);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;
   console.log(`\ntiered / interpreter = ${ratio.toFixed(2)}× ${ratio < 1 ? '(tiered faster)' : '(interpreter faster — emit overhead dominates for this small program)'}`);
