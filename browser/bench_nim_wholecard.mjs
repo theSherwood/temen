@@ -113,6 +113,12 @@ const pct = (b, t) => (t ? `${((100 * b) / t).toFixed(1)}%` : '—');
 console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / ${fmt(tm.crawlBounceMs)} (${pct(tm.crawlBounceMs, tm.crawlMs)})` +
   `   nimsem ${tm.nimsemBounces ?? '—'} / ${fmt(tm.nimsemBounceMs)} (${pct(tm.nimsemBounceMs, tm.nimsemMs)})` +
   `   hexer ${tm.hexerBounces ?? '—'} / ${fmt(tm.hexerBounceMs)} (${pct(tm.hexerBounceMs, tm.hexerMs)})`);
+// The Foreign tax itself: scalar (≤8 B) accesses × the per-access delta. The delta is this machine's
+// `browser-foreign-mem-test.mjs` number (Foreign − Shared): ~56 ns/byte .. ~88 ns/word at last measure;
+// both bounds printed, since the interpreter's mix of byte and word accesses is not recorded.
+const DELTA_LO_NS = 56, DELTA_HI_NS = 88;
+const tax = (f) => f ? `${f.small.toLocaleString()} scalar + ${f.bulk.toLocaleString()} bulk (${(f.bulkBytes / 1e6).toFixed(1)} MB) → est. tax ${((f.small * DELTA_LO_NS) / 1e6).toFixed(0)}–${((f.small * DELTA_HI_NS) / 1e6).toFixed(0)}ms` : '—';
+console.log(`foreign accesses:     nimsem ${tax(tm.nimsemForeign)}\n                      hexer  ${tax(tm.hexerForeign)}`);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;
   console.log(`\ntiered / interpreter = ${ratio.toFixed(2)}× ${ratio < 1 ? '(tiered faster)' : '(interpreter faster — emit overhead dominates for this small program)'}`);

@@ -19,7 +19,7 @@
 // fresh instance, window, and env cell are built per Run, so no guest state crosses Runs. A missing
 // key (undefined) disables caching for that call. Bounded so a session that Runs many distinct modules
 // can't grow it without limit.
-import { foreignMemory } from './foreign-mem.js';
+import { foreignMemory, foreignStats } from './foreign-mem.js';
 const jitModuleCache = new Map();
 const JIT_MODULE_CACHE_MAX = 16;
 function cacheGet(key) {
@@ -1221,6 +1221,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const now = () => (typeof performance !== 'undefined' ? performance.now() : 0);
   const t0 = now(); // per-phase wall-clock for the bench (`bench_nim_wholecard.mjs`)
   bounceStats.reset();
+  foreignStats.reset();
   const mods = new Map(); // stem -> { file, deps: [stem], role }
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   let crawled = 0;
@@ -1286,7 +1287,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tCrawl = now();
-  const bCrawl = bounceStats.take();
+  const bCrawl = bounceStats.take(), fCrawl = foreignStats.take();
   // ---- dependency order (DFS postorder, System first) — mirrors nimc::toposort ----------------------
   const order = [], mark = new Map();
   const visit = (s) => {
@@ -1332,7 +1333,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tNimsem = now();
-  const bNimsem = bounceStats.take();
+  const bNimsem = bounceStats.take(), fNimsem = foreignStats.take();
   // ---- phase 3: hexer per module (tiered, 3-cap) — main gets the app-entry glue --------------------
   let hexed = 0;
   const outdir = `nimcache/${mainStem}`;
@@ -1359,7 +1360,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   }
 
   const tHexer = now();
-  const bHexer = bounceStats.take();
+  const bHexer = bounceStats.take(), fHexer = foreignStats.take();
   return {
     crawled, semmed, hexed, produced,
     timings: {
@@ -1368,6 +1369,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       crawlBounces: bCrawl.bounces, crawlBounceMs: bCrawl.bounceMs,
       nimsemBounces: bNimsem.bounces, nimsemBounceMs: bNimsem.bounceMs,
       hexerBounces: bHexer.bounces, hexerBounceMs: bHexer.bounceMs,
+      // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
+      crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
     },
   };
 }

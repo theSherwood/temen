@@ -31,6 +31,21 @@ export function foreignMemory(id) {
 }
 
 /** The `temen_host` import entries for an engine instance whose linear memory is `engineMemory`. */
+// #1417 — access accounting for the decline path. Every interpreter memory access on a detached child
+// arrives here as one import call; counting them per phase (alongside `bounceStats` in
+// wasmjit-module.js) is what turns the per-access factor into an end-to-end number: the Foreign tax
+// on a phase is `small × (foreign − shared)` ns for the ≤8-byte scalar accesses the interpreter makes,
+// plus the bulk copies. A few integer increments per ~30 ns call; unconditional so the count is
+// always the real one.
+export const foreignStats = {
+  small: 0, bulk: 0, bulkBytes: 0, fill: 0, copy: 0, atomic: 0,
+  reset() { this.small = 0; this.bulk = 0; this.bulkBytes = 0; this.fill = 0; this.copy = 0; this.atomic = 0; },
+  take() {
+    const r = { small: this.small, bulk: this.bulk, bulkBytes: this.bulkBytes, fill: this.fill, copy: this.copy, atomic: this.atomic };
+    this.reset(); return r;
+  },
+};
+
 export function foreignImports(engineMemory) {
   // Views are cached and NEVER refreshed through `.buffer` on the hot path: measured in Chromium, the
   // `WebAssembly.Memory.buffer` getter costs ~90 ns, more than the whole wasm↔JS call. A view over
@@ -60,22 +75,26 @@ export function foreignImports(engineMemory) {
   const RMW = [null, null, 'add', 'sub', 'and', 'or', 'xor', 'exchange'];
   return {
     foreign_read: (id, off, dst, len) => {
+      if (len <= 8) foreignStats.small++; else { foreignStats.bulk++; foreignStats.bulkBytes += len; }
       off += mems[id].base;
       const e = eng(dst + len), c = child(id, off + len);
       if (len <= 16) for (let i = 0; i < len; i++) e[dst + i] = c[off + i];
       else e.set(c.subarray(off, off + len), dst);
     },
     foreign_write: (id, off, src, len) => {
+      if (len <= 8) foreignStats.small++; else { foreignStats.bulk++; foreignStats.bulkBytes += len; }
       off += mems[id].base;
       const e = eng(src + len), c = child(id, off + len);
       if (len <= 16) for (let i = 0; i < len; i++) c[off + i] = e[src + i];
       else c.set(e.subarray(src, src + len), off);
     },
     foreign_fill: (id, off, len, b) => {
+      foreignStats.fill++;
       off += mems[id].base;
       child(id, off + len).fill(b, off, off + len);
     },
     foreign_copy: (id, dst, src, len) => {
+      foreignStats.copy++;
       const base = mems[id].base;
       dst += base; src += base;
       child(id, Math.max(dst, src) + len).copyWithin(dst, src, src + len);
@@ -99,6 +118,7 @@ export function foreignImports(engineMemory) {
       try { m.grow(Math.ceil((need - have) / 65536)); return 1; } catch { return 0; }
     },
     foreign_atomic: (id, kind, off, width, ab) => {
+      foreignStats.atomic++;
       off += mems[id].base;
       eng(ab + 16);
       child(id, off + width);
