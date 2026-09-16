@@ -19,8 +19,8 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc onramp shell forth uxn nifler nim_hello nim_phases nim_driver_guest
-#           lua_snapshot
+#   Steps:  leng chibicc pg_libc onramp shell coreutils forth uxn nifler nim_hello nim_phases
+#           nim_driver_guest lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
 # llvm-link (onramp also fetches QuickJS/SQLite/Lua sources — skipped offline); shell needs the
@@ -134,6 +134,16 @@ if want shell; then
   cargo test -p temen --test c_shell -- --ignored --exact gen_browser_shell_fixture \
     && note "shell ✓ (shell/stage_runner/primes/upper fixtures)" \
     || note "shell ✗ (in-tree chibicc?)"
+fi
+
+# --- 4a) bin_*.temen (the 28 repo-owned coreutils bash runs from /bin — #1080 slice 2) ---------------
+# Same toolchain as the shell fixtures (in-tree chibicc, no external deps); `browser/tests/bash.rs`
+# and `browser/build-bash-assets.mjs` read them from `browser/tests/fixtures/`.
+if want coreutils; then
+  echo "=== [coreutils] cargo test -p temen --test c_shell -- --ignored gen_browser_bash_coreutils ==="
+  cargo test -p temen --test c_shell -- --ignored --exact gen_browser_bash_coreutils \
+    && note "coreutils ✓ (browser/tests/fixtures/bin_*.temen)" \
+    || note "coreutils ✗ (in-tree chibicc?)"
 fi
 
 # --- 4b) forth.temen (the sectorforth-class Forth kernel, hand-written text IR — issue #1214) ----------
