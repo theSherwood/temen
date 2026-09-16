@@ -40,6 +40,14 @@ use irgen::{fuzz_one, Gen};
 ///   the C `memcpy` non-overlap contract (its only frontend source is `llvm.memcpy`), so an
 ///   overlapping one is an out-of-contract program, not a miscompile. Fixed by having the differential
 ///   generator emit only the overlap-safe `MemMove` for arbitrary-address bulk copies (irgen.rs §26).
+/// - `[0xc0, 0x8a, 0xbf, 0xcf]` (nightly `diff`, Sep 15): an `AddressSpace` `map(off=8192, len=4096)`
+///   — inside the `[0, 16384)` NULL guard. The interpreter refuses it (`-EINVAL`, #964: the reserved
+///   region takes no page op), but the JIT's window backend took its guard extent from
+///   `Host::null_guard()`, which only became non-zero as a side effect of `set_self_module` — so a run
+///   that never registered a self module enforced no guard and *mapped* it, returning `0`. An
+///   unconditional layout invariant (INVARIANTS #13) that held on one tier and not the other. Fixed by
+///   reading `module_null_guard()` — the single chokepoint — in the thunk, and deleting the host-side
+///   copy that made it look like per-run state.
 const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0xad, 0xa9, 0xac],
     &[0xe8, 0x01, 0xde, 0xcd],
@@ -48,6 +56,7 @@ const DIFF_REGRESSIONS: &[&[u8]] = &[
     &[0x54],
     &[0x79, 0x7c, 0x00, 0x02],
     &[0x17, 0xa4, 0x17, 0x1b],
+    &[0xc0, 0x8a, 0xbf, 0xcf],
 ];
 
 #[test]

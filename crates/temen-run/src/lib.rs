@@ -420,11 +420,18 @@ unsafe fn cap_thunk_impl(
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
-    // #964: carry the running module's NULL guard into the window backend (recorded on the host
-    // at `set_self_module` time — the thunk has no module in reach), so `[0, guard)` is refused
-    // to page ops and reads as unmapped to borrow checks, matching the interpreter oracle.
+    // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to page
+    // ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
+    // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
+    // #13: the guard is UNCONDITIONAL, a constant of the layout, not per-run state). It used to come
+    // from `Host::null_guard()`, which only became non-zero as a side effect of `set_self_module` —
+    // so an embedder that never registered a self module (nothing else about page ops needs one) ran
+    // the JIT with guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
+    // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is `-EINVAL` on
+    // the interpreter and `0` on the JIT, the two tiers disagreeing about an invariant that is
+    // supposed to hold on all of them.
     #[cfg(any(unix, windows))]
-    wm.set_null_guard(host.null_guard());
+    wm.set_null_guard(temen_ir::module_null_guard());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
@@ -2941,8 +2948,26 @@ impl MprotectWindow {
         }
     }
 
-    /// #964: install the running module's NULL guard (see the `null_guard` field). No-op at `0`.
+    /// #964: install the NULL guard (see the `null_guard` field) — the twin of
+    /// [`temen_interp::Mem::seed_null_guard`], engage rule included, so the two tiers guard and
+    /// disengage over exactly the same windows. The guard engages only when it is page-exact and
+    /// fits the window; three cases leave it at `0`:
+    ///
+    /// - `guard == 0` — nothing to install.
+    /// - not a multiple of the host page (e.g. a 64 KiB-page aarch64 host against the 16 KiB guard):
+    ///   a page-map seed would swallow live scratch above the guard, so both tiers disengage and keep
+    ///   per-platform trap parity.
+    /// - larger than the window (a tiny §14 sub-window): seeding would unmap the whole carve, and
+    ///   this tier could not mirror it without protecting past the carve — so a small child stays
+    ///   usable on both tiers.
+    ///
+    /// Assigning the constant *unconditionally* here is what broke `jit_instantiate_granted`: a
+    /// granted child's carve is smaller than the guard, the interpreter left it unguarded, and this
+    /// tier refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
+        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
+            return;
+        }
         self.null_guard = guard;
     }
 
