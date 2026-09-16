@@ -180,6 +180,157 @@ block 3 (vi2: i64) {
   }
 }";
 
+/// #1455 — a guest that holds a **host capability**: it opens a scratch file through the `vm_fs` seam
+/// (chibicc's `__vm_fs` builtin shape — a flat `call.sym` with the fs op in arg0) and appends one byte
+/// per iteration, accumulating the bytes written at 16384. Every iteration therefore crosses the
+/// capability boundary, on both sides of every stride boundary.
+///
+/// Before #1455's ladder half this run was **not checkpointable at all**: `Host::checkpoint_safe`
+/// required `host_procs.is_empty()`, so the ladder self-disabled the moment the powerbox granted
+/// `vm_fs` and every `seek`/`step_back` replayed from clock 0. That is the class, not the corner: a
+/// debugged C program that does file I/O is in it, and so is every playground reactor.
+const FILE_WRITE_LOOP: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vzero = i64.const 0
+  vpath = i64.const 16400
+  vcf = i32.const 102
+  i32.store8 vpath vcf
+  vnp = i64.const 16420
+  vcv = i32.const 118
+  i32.store8 vnp vcv
+  vn1 = i64.const 16421
+  vcm = i32.const 109
+  i32.store8 vn1 vcm
+  vn2 = i64.const 16422
+  vcu = i32.const 95
+  i32.store8 vn2 vcu
+  vn3 = i64.const 16423
+  vcf2 = i32.const 102
+  i32.store8 vn3 vcf2
+  vn4 = i64.const 16424
+  vcs = i32.const 115
+  i32.store8 vn4 vcs
+  vwbuf = i64.const 16440
+  vbA = i32.const 65
+  i32.store8 vwbuf vbA
+  vnl = i64.const 5
+  vh = self.resolve vnp vnl
+  vopen = i64.const 0
+  vplen = i64.const 1
+  vflags = i64.const 19
+  vfd = call.sym "vm_fs" (i64, i64, i64, i64, i64) -> (i64) vh (vopen, vpath, vplen, vflags, vzero)
+  vacc0 = i64.const 0
+  br 1(vn, vacc0, vfd)
+}
+block 1 (vi: i64, vacc: i64, vfd: i64) {
+  vz = i64.eqz vi
+  br_if vz 2(vacc) 3(vi, vacc, vfd)
+}
+block 2 (vsum: i64) {
+  return vsum
+}
+block 3 (vi2: i64, vacc2: i64, vfd2: i64) {
+  vnp2 = i64.const 16420
+  vnl2 = i64.const 5
+  vh2 = self.resolve vnp2 vnl2
+  vwbuf2 = i64.const 16440
+  vone2 = i64.const 1
+  vzero2 = i64.const 0
+  vwrite = i64.const 2
+  vwn = call.sym "vm_fs" (i64, i64, i64, i64, i64) -> (i64) vh2 (vwrite, vfd2, vwbuf2, vone2, vzero2)
+  vsum = i64.add vacc2 vwn
+  vcell = i64.const 16384
+  i64.store vcell vsum
+  vm1 = i64.const -1
+  vnext = i64.add vi2 vm1
+  br 1(vnext, vsum, vfd2)
+  }
+}
+"#;
+
+/// The **threaded** twin of [`FILE_WRITE_LOOP`]: the root opens nothing, each of two spawned workers
+/// opens the scratch file through `vm_fs` and appends bytes in a loop, accumulating into the shared
+/// counter at 16384. The scheduled engine's `checkpointable` consults the *same* `Host::checkpoint_safe`
+/// — over the root host and every `extra_envs` child — so admitting a named capability admits it here
+/// too; this pins that rather than assuming it (INVARIANTS #14).
+const FILE_WRITE_THREADS: &str = r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (vn: i64) {
+  vpath = i64.const 16400
+  vcf = i32.const 102
+  i32.store8 vpath vcf
+  vnp = i64.const 16420
+  vcv = i32.const 118
+  i32.store8 vnp vcv
+  vn1 = i64.const 16421
+  vcm = i32.const 109
+  i32.store8 vn1 vcm
+  vn2 = i64.const 16422
+  vcu = i32.const 95
+  i32.store8 vn2 vcu
+  vn3 = i64.const 16423
+  vcf2 = i32.const 102
+  i32.store8 vn3 vcf2
+  vn4 = i64.const 16424
+  vcs = i32.const 115
+  i32.store8 vn4 vcs
+  vwbuf = i64.const 16440
+  vbA = i32.const 65
+  i32.store8 vwbuf vbA
+  vsp = i64.const 0
+  vh0 = thread.spawn 1 vsp vn
+  vh1 = thread.spawn 1 vsp vn
+  vj0 = thread.join vh0
+  vj1 = thread.join vh1
+  vaddr = i64.const 16384
+  vr = i64.load vaddr
+  return vr
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, vn: i64) {
+  vnp = i64.const 16420
+  vnl = i64.const 5
+  vh = self.resolve vnp vnl
+  vzero = i64.const 0
+  vopen = i64.const 0
+  vpath = i64.const 16400
+  vplen = i64.const 1
+  vflags = i64.const 19
+  vfd = call.sym "vm_fs" (i64, i64, i64, i64, i64) -> (i64) vh (vopen, vpath, vplen, vflags, vzero)
+  br 1(vn, vfd)
+}
+block 1 (vi: i64, vfd: i64) {
+  vz = i64.eqz vi
+  br_if vz 2() 3(vi, vfd)
+}
+block 2 () {
+  vr = i64.const 0
+  return vr
+}
+block 3 (vi2: i64, vfd2: i64) {
+  vnp2 = i64.const 16420
+  vnl2 = i64.const 5
+  vh2 = self.resolve vnp2 vnl2
+  vwbuf2 = i64.const 16440
+  vone = i64.const 1
+  vzero2 = i64.const 0
+  vwrite = i64.const 2
+  vwn = call.sym "vm_fs" (i64, i64, i64, i64, i64) -> (i64) vh2 (vwrite, vfd2, vwbuf2, vone, vzero2)
+  vaddr = i64.const 16384
+  vc = i64.load vaddr
+  vsum = i64.add vc vwn
+  i64.store vaddr vsum
+  vm1 = i64.const -1
+  vnext = i64.add vi2 vm1
+  br 1(vnext, vfd2)
+  }
+}
+"#;
+
 /// A stable per-`seek` observation: the logical clock, the call stack (each frame's IR pc), and the
 /// running-sum window bytes. Identical between a from-0 replay and a checkpoint-restored replay iff
 /// restore is faithful.
@@ -515,4 +666,139 @@ fn bytecode_checkpoint_reverse_sweep_is_bounded() {
         cold_ms / warm_ms,
     );
     assert!(warm_ckpts > 0, "the warm run laid down a ladder");
+}
+
+/// #1455 (the ladder half) — the warm≡cold oracle on a guest that **holds a host capability**.
+///
+/// This is the acceptance case the issue names. The powerbox grants `vm_fs` as a `HostProc`, which used
+/// to disqualify the whole run from checkpointing (`host_procs.is_empty()`), so `checkpoint_count()` was
+/// forced to `0` and every reverse step paid O(t). A named capability is now admitted, and the property
+/// that has to survive is the same one the capability-free cases assert: a checkpoint-restored `seek`
+/// observes exactly what a from-0 replay observes, forwards and backwards.
+///
+/// What makes it sound is the `CapTape`: every `HOST_PROC` crossing is recorded, so a replay — from a
+/// checkpoint or from zero — serves them from the tape rather than re-entering the closure. The
+/// capability's own declared state rides the checkpoint alongside (`Host::capture_cap_states`), which is
+/// the half that matters once a replay runs past the tape's end.
+#[test]
+fn bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
+    let m = parse_module(FILE_WRITE_LOOP).expect("parses");
+    let args = [Value::I64(600)]; // ~8k ops ⇒ several stride boundaries, ~600 cap crossings
+    let mk = || {
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            true, // the on-ramp I/O powerbox — this is what grants `vm_fs`
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("the bytecode engine accepts the file-writing loop")
+    };
+
+    let probes: Vec<u64> = (0..=6000).step_by(137).collect();
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs(&mut b, t)
+        })
+        .collect();
+    // Sanity: the run really does cross the capability boundary and the accumulator really moves —
+    // otherwise "warm ≡ cold" would be a statement about a guest that never touched its powerbox.
+    assert!(
+        cold.iter()
+            .map(|(_, _, mem)| mem)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] != w[1]),
+        "the guest's byte count advances across the probes",
+    );
+
+    let mut warm = mk();
+    warm.seek(6000);
+    assert!(
+        warm.checkpoint_count() > 0,
+        "a cap-holding guest now lays down checkpoints — before #1455 the ladder self-disabled the \
+         moment the powerbox granted `vm_fs`, and this count was forced to 0",
+    );
+
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm (checkpoint-restored) seek ≡ cold (replay-from-0) at every forward probe",
+    );
+
+    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(
+        warm_back, cold_back,
+        "warm backward sweep ≡ cold (restore is faithful seeking in either direction)",
+    );
+
+    assert!(
+        warm.checkpoint_count() > 0,
+        "checkpointing stays on for the whole run — holding a named capability never leaves the subset",
+    );
+}
+
+/// The scheduled (multi-vCPU) twin of the case above: two workers driving the same `vm_fs` capability
+/// across global turns. One predicate governs both engines, so this is the propagation pin rather than
+/// a second mechanism.
+#[test]
+fn scheduled_checkpoint_warm_seek_matches_cold_with_a_host_capability() {
+    let m = parse_module(FILE_WRITE_THREADS).expect("parses");
+    let args = [Value::I64(300)];
+    let mk = || {
+        BytecodeBackend::new(
+            m.clone(),
+            0,
+            &args,
+            u64::MAX,
+            true, // the on-ramp I/O powerbox — this is what grants `vm_fs`
+            Vec::new(),
+            false,
+            None,
+            None,
+        )
+        .expect("the scheduled engine accepts the threaded file-writing loop")
+    };
+
+    let probes: Vec<u64> = (0..=6000).step_by(139).collect();
+    let cold: Vec<_> = probes
+        .iter()
+        .map(|&t| {
+            let mut b = mk();
+            obs(&mut b, t)
+        })
+        .collect();
+    assert!(
+        cold.iter()
+            .map(|(_, _, mem)| mem)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| w[0] != w[1]),
+        "the workers' byte count advances across the probes",
+    );
+
+    let mut warm = mk();
+    warm.seek(6000);
+    assert!(
+        warm.checkpoint_count() > 0,
+        "the scheduled ladder admits a cap-holding run too — same `checkpoint_safe`, over the root \
+         host and every child env",
+    );
+
+    let warm_fwd: Vec<_> = probes.iter().map(|&t| obs(&mut warm, t)).collect();
+    assert_eq!(
+        warm_fwd, cold,
+        "warm (checkpoint-restored) seek ≡ cold (replay-from-turn-0) at every forward probe",
+    );
+
+    let warm_back: Vec<_> = probes.iter().rev().map(|&t| obs(&mut warm, t)).collect();
+    let cold_back: Vec<_> = cold.iter().rev().cloned().collect();
+    assert_eq!(warm_back, cold_back, "warm backward sweep ≡ cold");
 }
