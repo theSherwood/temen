@@ -59,8 +59,44 @@ mkdir -p "$NIM_ROOT/dist"
 rm -rf "$NIM_ROOT/dist/nimony"
 ln -sf "$WORK/nimony" "$NIM_ROOT/dist/nimony"
 
-# Build all the tools (C backend; the E2E harness invokes `nimony c`).
-( cd nimony && nim c -r src/hastur --release build all )
+# Build all the tools (C backend; the E2E harness invokes `nimony c`) — unless a cache restore
+# already brought them back. This build is ~4 min and is the whole cost of this step; CI caches
+# `nimony/bin` for it but, until now, rebuilt regardless of whether the cache hit.
+#
+# The check USES the toolchain rather than listing files. `nimony c` shells out to nimsem, hexer,
+# nifler, lengc, niflink, nifmake, validator and shoggoth (hastur's `BootSelfTools` +
+# `BootCarryTools`), so a file-existence test here would be a second copy of that list, free to
+# drift from hastur's whenever a tool is added. A trivial compile exercises the chain end to end,
+# which is the actual precondition, and it self-heals: anything partial or broken falls through to
+# the build below instead of being served to the tests.
+#
+# It also closes a gap the tests cannot see. `nim_e2e.rs` / `nim_conformance.rs` decide to SKIP on
+# whether `nimony` *exists* — so a half-restored or broken cache would not skip, it would surface
+# as confusing failures in the suite proper. Verifying here means the toolchain is either good or
+# rebuilt before a test looks at it.
+toolchain_works() {
+  [ -x nimony/bin/nimony ] || return 1
+  local probe rc
+  probe="$(mktemp -d)"
+  # Mirrors the smallest shape in `crates/temen-leng/tests/nim_diff/` — `echo` lives in
+  # `std/syncio` under nimony, so a bare `echo` would fail to compile and quietly pin this to
+  # "always rebuild". Same `c --isMain` the harness uses, so a passing probe means the invocation
+  # the tests make works, not merely that a binary is present.
+  printf 'import std/syncio\necho "ok"\n' > "$probe/probe.nim"
+  if ( cd "$probe" && "$WORK/nimony/bin/nimony" c --isMain probe.nim ) >/dev/null 2>&1; then
+    rc=0
+  else
+    rc=1
+  fi
+  rm -rf "$probe"
+  return "$rc"
+}
+
+if toolchain_works; then
+  echo "provision-nimony: restored nimony/bin compiles a probe — skipping the hastur build." >&2
+else
+  ( cd nimony && nim c -r src/hastur --release build all )
+fi
 
 echo "NIMONY_BIN=$WORK/nimony/bin" >&3
 echo "NIM_BIN=$NIM_BIN" >&3
