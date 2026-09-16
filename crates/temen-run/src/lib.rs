@@ -2948,8 +2948,26 @@ impl MprotectWindow {
         }
     }
 
-    /// #964: install the running module's NULL guard (see the `null_guard` field). No-op at `0`.
+    /// #964: install the NULL guard (see the `null_guard` field) — the twin of
+    /// [`temen_interp::Mem::seed_null_guard`], engage rule included, so the two tiers guard and
+    /// disengage over exactly the same windows. The guard engages only when it is page-exact and
+    /// fits the window; three cases leave it at `0`:
+    ///
+    /// - `guard == 0` — nothing to install.
+    /// - not a multiple of the host page (e.g. a 64 KiB-page aarch64 host against the 16 KiB guard):
+    ///   a page-map seed would swallow live scratch above the guard, so both tiers disengage and keep
+    ///   per-platform trap parity.
+    /// - larger than the window (a tiny §14 sub-window): seeding would unmap the whole carve, and
+    ///   this tier could not mirror it without protecting past the carve — so a small child stays
+    ///   usable on both tiers.
+    ///
+    /// Assigning the constant *unconditionally* here is what broke `jit_instantiate_granted`: a
+    /// granted child's carve is smaller than the guard, the interpreter left it unguarded, and this
+    /// tier refused its low pages as unmapped — a `CapFault` where the oracle joins cleanly.
     pub fn set_null_guard(&mut self, guard: u64) {
+        if guard == 0 || !guard.is_multiple_of(self.page) || guard > self.mapped {
+            return;
+        }
         self.null_guard = guard;
     }
 
