@@ -16242,14 +16242,18 @@ pub use temen_ir::cap_id;
 /// ([`Host::resolve_op`]) — pre-seeding only lets a structurally-equal declaration name the same
 /// type, never mint the capability.
 ///
-/// Only **specific** shapes are pre-seeded. `Stream`'s read/write/close triple is a genuine
-/// interface identity. A generic single-op shape — `Clock`'s `(i64) -> (i64)`, say — is *not*: an
-/// unrelated capability could share it by accident, so canonicalizing it would over-claim (and
-/// `(i64) -> (i64)` is exactly the shape an ordinary guest offer uses). Handle-typed built-ins,
-/// whose ops pass or return capabilities where the `cap`-vs-`i32` signature convention for
-/// built-ins is unsettled, and `HOST_PROC`, whose semantics are per-registration with no canonical
-/// shape, are the deliberate exceptions — see IMPORTS.md §3.5.
-fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
+/// A built-in is seeded once its **op-signature convention is pinned** (#1515). The original
+/// "a generic single-op shape could over-claim" worry no longer applies — names are half the
+/// intern key since #1109, so `Clock {now}` cannot unify with an unrelated `{frob}` — but most
+/// built-ins are still called with more than one signature in the tree (`Clock.now` as both
+/// `(i32) -> (i64)` and `() -> (i64)`), and a seeded shape picks a winner that every other caller
+/// then fails coverage against. `HOST_PROC` stays unseeded on purpose: its semantics are
+/// per-registration, with no canonical shape. See IMPORTS.md §3.5 and #1515 for the per-built-in
+/// decisions still open.
+///
+/// A seeded shape is also the interface's **op registry**: `cap_dispatch_slots` derives its
+/// unknown-op `CapFault` from `shape.len()`, so an interface with a shape needs no `_ =>` arm.
+fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
     let rw = FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
@@ -16258,10 +16262,23 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
         params: vec![],
         results: vec![],
     };
-    [(
-        cap_id::STREAM,
-        vec![("read", rw.clone()), ("write", rw), ("close", unit)],
-    )]
+    // `exit(code: i32)` — noreturn. The one built-in besides `Stream` whose signature every
+    // caller in the tree already agrees on (every `call.cap EXIT 0` site is `(i32) -> ()`, and it
+    // is the `sig_exit` the manifest tests declare), so it can be seeded without pinning a
+    // convention first. `Clock` and `SharedRegion` are *not* seeded for exactly that reason:
+    // `Clock.now` is called both as `(i32) -> (i64)` and `() -> (i64)`, `SharedRegion.map` both
+    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost.
+    let exit = FuncType {
+        params: vec![ValType::I32],
+        results: vec![],
+    };
+    [
+        (
+            cap_id::STREAM,
+            vec![("read", rw.clone()), ("write", rw), ("close", unit)],
+        ),
+        (cap_id::EXIT, vec![("exit", exit)]),
+    ]
 }
 
 /// The pre-seeded built-in id whose canonical shape equals `(names, sigs)` — **name-strict**
@@ -23640,6 +23657,19 @@ impl Host {
                 }
             }
         };
+        // An op the interface does not have, decided by the interface's **shape** where one is
+        // seeded ([`builtin_iface_shape`]) rather than restated per binding arm below. A `CapFault`,
+        // not an errno: `op` is an immediate in the instruction, so an unknown op is a property of
+        // the program (or of a host's `BoundImport`), never of a runtime request — the "typing
+        // violation on a live handle" INVARIANTS #5 puts in the trap column, and the same answer
+        // the import layer already gives an out-of-range consumer op above. Interfaces with no
+        // seeded shape keep their per-arm answer until their signature convention is pinned and
+        // they are seeded; then this one check covers them with no arm to touch.
+        if let Some(shape) = builtin_iface_shape(type_id) {
+            if op as usize >= shape.len() {
+                return Err(Trap::CapFault);
+            }
+        }
         match resolved {
             // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
             // host-side dispatch cannot park). Reaching it here means a backend tier without
