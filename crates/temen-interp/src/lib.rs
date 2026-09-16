@@ -2232,6 +2232,7 @@ fn drive_arc(
     // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
     let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
     let thaw_nested = std::mem::take(&mut host.frozen_nested);
+    let thaw_detached = std::mem::take(&mut host.frozen_detached);
     let thaw_child_state = std::mem::take(&mut host.frozen_child_state);
     // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
     // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
@@ -2258,6 +2259,7 @@ fn drive_arc(
         thaw_fibers,
         thaw_vcpus,
         thaw_nested,
+        thaw_detached,
         thaw_child_state,
         thaw_root_sp,
         handoff,
@@ -2342,6 +2344,7 @@ fn drive_arc_shared(
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        Vec::new(),
         None,
         handoff,
         jit_reapply,
@@ -2370,6 +2373,7 @@ fn drive_over_cell(
     thaw_fibers: Vec<FrozenFiber>,
     thaw_vcpus: Vec<FrozenVCpu>,
     thaw_nested: Vec<FrozenNested>,
+    thaw_detached: Vec<FrozenDetached>,
     thaw_child_state: Vec<FrozenChildState>,
     thaw_root_sp: Option<u64>,
     handoff: bool,
@@ -2942,6 +2946,41 @@ fn drive_over_cell(
                         hhost
                             .lock_unpoisoned()
                             .relink_live_impl(idx, Arc::clone(chost), export);
+                    }
+                }
+            }
+            // #1361 step 2 — deliver each completed-but-unjoined **detached** child: post its result
+            // into the scheduler and map it to the recording parent's join slot, so the parent's
+            // re-executed `thread.join` reloads it (reload-not-reissue). Mirrors the completed-nested
+            // branch above; a detached child owns a separate window that (being completed) need not
+            // ride, so unlike a nested child nothing is re-created — only the join edge is rebuilt.
+            {
+                let mut dseed: Vec<FrozenDetached> = thaw_detached;
+                dseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+                for fd in dseed {
+                    let parent = fd.parent_task as TaskId;
+                    let cid = s.next_task;
+                    s.next_task += 1;
+                    s.results.insert(
+                        cid,
+                        Outcome {
+                            result: Ok(vec![Value::I64(fd.completed_result)]),
+                            mem: None,
+                            fuel: *fuel,
+                            trap_bt: Vec::new(),
+                            trap_fiber: None,
+                        },
+                    );
+                    if parent == id {
+                        while root.threads.len() <= fd.slot {
+                            root.threads.push(None);
+                        }
+                        root.threads[fd.slot] = Some(cid);
+                    } else if let Some(p) = children.get_mut(&parent) {
+                        while p.threads.len() <= fd.slot {
+                            p.threads.push(None);
+                        }
+                        p.threads[fd.slot] = Some(cid);
                     }
                 }
             }
@@ -6916,11 +6955,59 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // capture lands (the detached-durable freeze slices). Unlike `nested_refused` this
                 // fires even with no live nested child. A completed-and-reaped child (its `threads`
                 // slot cleared) left nothing to capture and does not refuse.
-                let detached_live_refused = froze
-                    && v.child_hosts.keys().any(|slot| {
-                        !v.nested_children.iter().any(|c| c.slot == *slot)
-                            && v.threads.get(*slot).and_then(|t| *t).is_some()
-                    });
+                // #1361 step 2 — a detached §14 child (own window: a `child_hosts` entry with NO
+                // carve in `nested_children`, so not a nested child; and not a `thread.spawn`
+                // sibling, which is in neither map). A **completed-but-unjoined** one rides via
+                // `completed_result` — its result is taken from the scheduler and its separate window
+                // need not ride (reload-not-reissue on thaw, exactly like a completed nested child).
+                // A **still-running** one stays fail-closed: the STW never reaches its separate
+                // window, so it could not self-unwind — the O6 mid-flight capture is step 3. A
+                // completed-**trapped** one is not representable yet either. Inert behind op 15's
+                // `!durable` admission gate (a durable parent cannot yet spawn a detached child);
+                // load-bearing when step 4 lifts it.
+                let detached_live_refused = froze && {
+                    let detached: Vec<usize> = v
+                        .child_hosts
+                        .keys()
+                        .copied()
+                        .filter(|slot| {
+                            !v.nested_children.iter().any(|c| c.slot == *slot)
+                                && v.threads.get(*slot).and_then(|t| *t).is_some()
+                        })
+                        .collect();
+                    let mut refuse = false;
+                    for slot in detached {
+                        let cid = v.threads[slot].expect("filtered to Some");
+                        if v.sched.has_result(cid) {
+                            match v.sched.take_result(cid).map(|o| o.result) {
+                                Some(Ok(vals)) => {
+                                    let r = match vals.first() {
+                                        Some(Value::I64(x)) => *x,
+                                        Some(Value::I32(x)) => *x as i64,
+                                        _ => 0,
+                                    };
+                                    let sink = v
+                                        .freeze_sink
+                                        .clone()
+                                        .unwrap_or_else(|| Arc::clone(&v.host));
+                                    sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
+                                        parent_task: v.id as usize,
+                                        slot,
+                                        completed_result: r,
+                                    });
+                                }
+                                _ => {
+                                    refuse = true; // completed-with-trap: not representable yet
+                                    break;
+                                }
+                            }
+                        } else {
+                            refuse = true; // still running: the O6 mid-flight case (step 3)
+                            break;
+                        }
+                    }
+                    refuse
+                };
                 let result = if nested_refused || child_state_refused || detached_live_refused {
                     Err(Trap::ThreadFault)
                 } else if froze {
@@ -8792,6 +8879,29 @@ pub struct FrozenNested {
     /// gets no `UNWINDING` broadcast (nothing to unwind). `None` for a still-running child (re-attached
     /// + rewound on thaw). Mirrors [`FrozenVCpu::completed_result`] for `thread.spawn` children.
     pub completed_result: Option<i64>,
+}
+
+/// #1361 step 2 — a **completed-but-unjoined detached §14 child** captured at a subtree freeze. A
+/// detached child owns a *separate* window (it holds a `child_hosts` entry but has NO carve in
+/// `nested_children`), so a **live** one stays fail-closed: the freeze STW broadcasts `UNWINDING`
+/// only into carves within *this* window image, never reaching a detached child's own window (the O6
+/// mid-flight case — step 3). A **completed** one has nothing to unwind — only its `thread.join`
+/// result crosses the boundary, exactly like a completed [`FrozenNested`]'s `completed_result`
+/// (reload-not-reissue). On thaw the runtime posts the result into the scheduler and maps it to the
+/// recording parent's join `slot`, so the parent's re-executed `thread.join` delivers it without
+/// re-spawning the child: op 15 is a `call.cap` checkpoint, so the rewind reloads its spilled slot
+/// handle (the transform instruments every `call.cap`) rather than re-running the spawn. Inert behind
+/// op 15's `!durable` admission gate today (a durable parent cannot yet spawn a detached child);
+/// load-bearing when the gate lifts (#1361 step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrozenDetached {
+    /// The task that spawned this child (op 15): `0` for a direct child of the root; a deeper
+    /// parent carries its own task id, so the thaw rebuilds the join edge in the right table.
+    pub parent_task: usize,
+    /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
+    pub slot: usize,
+    /// The child's clean `thread.join` result (an `i64`; an `i32` result is sign-extended at capture).
+    pub completed_result: i64,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -18718,6 +18828,11 @@ pub struct Host {
     frozen_vcpus: Vec<FrozenVCpu>,
     /// §14 nested-child residue of a subtree freeze (DURABILITY.md §4) — see [`FrozenNested`].
     frozen_nested: Vec<FrozenNested>,
+    /// #1361 step 2 — completed-but-unjoined **detached** §14 child residue of a subtree freeze:
+    /// **out** of a freeze (a finished detached child records its join result here instead of being
+    /// refused) and **in** to a thaw (the seeding posts each result and rebuilds the join edge).
+    /// See [`FrozenDetached`]. Empty for every run that froze no completed detached child.
+    frozen_detached: Vec<FrozenDetached>,
     /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
     /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
     /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
@@ -19127,6 +19242,7 @@ impl Host {
             frozen_fibers: Vec::new(),
             frozen_vcpus: Vec::new(),
             frozen_nested: Vec::new(),
+            frozen_detached: Vec::new(),
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
@@ -19197,6 +19313,7 @@ impl Host {
             && self.frozen_fibers.is_empty()
             && self.frozen_vcpus.is_empty()
             && self.frozen_nested.is_empty()
+            && self.frozen_detached.is_empty()
             && self.frozen_child_state.is_empty();
         if !simple {
             return None;
@@ -20028,6 +20145,18 @@ impl Host {
     /// [`Host::set_durable`] (the in-memory counterpart of [`Host::set_frozen_vcpus`]).
     pub fn set_frozen_nested(&mut self, frozen: Vec<FrozenNested>) {
         self.frozen_nested = frozen;
+    }
+
+    /// #1361 step 2 — the completed detached children a freeze captured (see [`FrozenDetached`]),
+    /// read by the codec's control-section encoder.
+    pub fn frozen_detached(&self) -> &[FrozenDetached] {
+        &self.frozen_detached
+    }
+
+    /// Seed the completed detached children a **thaw** must deliver, alongside the restored window
+    /// (the in-memory counterpart of [`Host::set_frozen_nested`]).
+    pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
+        self.frozen_detached = frozen;
     }
 
     /// §13.4 slice 4c — the per-child host-state residue of the last subtree freeze (serve trio +

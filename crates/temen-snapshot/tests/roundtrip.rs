@@ -6,7 +6,7 @@ use temen_durable::{
     arm_freeze_after, begin_thaw, init_durable_window, transform_module,
     transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Attestation, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Attestation, FrozenDetached, Host, Value};
 use temen_ir::{Memory, Module};
 use temen_snapshot::{freeze, restore, FreezeError, RestoreError};
 
@@ -1705,4 +1705,55 @@ fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
             "{what}: a refused restore pins nothing"
         );
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// #1361 step 2 — a completed-but-unjoined **detached** §14 child rides the control section. A
+// detached child owns a separate window; a completed one has nothing to unwind, so only its
+// `thread.join` result crosses the freeze boundary (reload-not-reissue), the same shape a completed
+// nested child uses. This exercises the codec half end to end. The freeze-**capture** and
+// thaw-**delivery** halves are inert behind op 15's `!durable` admission gate (a durable parent
+// cannot yet spawn a detached child, #1361 step 4), so they are validated by a scratch gate-lift
+// rather than shipped here — see the PR description.
+// ---------------------------------------------------------------------------------------------
+
+/// A detached residue — `(parent_task, slot, join-result)` per child — round-trips through the codec
+/// and re-freezes byte-identically. A negative result exercises the two's-complement uleb, and two
+/// records exercise the canonical `(parent_task, slot)` sort + the trailing-block framing.
+#[test]
+fn a_completed_detached_child_rides_the_control_section() {
+    let inst = instrument(SRC);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+
+    let mut host = Host::new();
+    host.set_durable(true);
+    host.set_frozen_detached(vec![
+        FrozenDetached {
+            parent_task: 0,
+            slot: 0,
+            completed_result: 33,
+        },
+        FrozenDetached {
+            parent_task: 0,
+            slot: 2,
+            completed_result: -7,
+        },
+    ]);
+    let artifact = freeze(&inst, &win, &host).expect("a detached residue is freezable");
+
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    restore(&artifact, &inst, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_detached(),
+        host.frozen_detached(),
+        "the detached residue round-trips exactly: (parent_task, slot, result), negative included",
+    );
+
+    let win2 = init_durable_window(WINDOW, TEST_ARENA);
+    assert_eq!(
+        freeze(&inst, &win2, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze is byte-identical",
+    );
 }

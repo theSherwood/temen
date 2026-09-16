@@ -446,6 +446,31 @@ window image, so the encoding is just the re-attach record. Pinned by
 live child → serialize → restore into a fresh host → **§12.6 canonical re-freeze byte-identical**
 → thaw completes the child's loop and the join delivers the uninterrupted total — the full
 `freeze → serialize → restore → thaw ≡ uninterrupted` contract across the nesting boundary.
+
+**Detached children — completed-result residue (v23, #1361 step 2).** The §14 **detached** spawn (op
+15, `instantiate_detached`) gives a child its *own* window rather than a carve in the parent's, so a
+**live** one at a freeze stays fail-closed: the subtree STW broadcasts `UNWINDING` only into carves
+within *this* window image, never reaching a detached child's separate window (the O6 mid-flight
+capture — step 3). A **completed-but-unjoined** one, though, needs nothing of that separate window:
+only its `thread.join` result crosses, exactly as for a completed nested child. It rides as a
+`FrozenDetached { parent_task, slot, completed_result }` in **Section 2**, trailing the nested block
+(which is emitted with count 0 when only detached residue is present, so the decoder always reads a
+nested count first); a domain that froze no detached child is byte-identical to v22 but for the
+version field. On thaw the runtime posts the result into the scheduler and rebuilds the parent's join
+edge — the parent's re-executed `thread.join` reloads it **without re-spawning** the child (op 15 is a
+`call.cap` checkpoint, so the rewind reloads its spilled slot handle rather than re-running the
+spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
+refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
+completed-result path above; the codec round-trip is pinned by
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. The capture and thaw-delivery are
+**inert behind two prerequisites**, so they ship correct-but-unexercised (the #1501/#1502 pattern):
+(1) op 15's `!durable` **admission gate** (a durable parent cannot yet spawn a detached child — step
+4), and (2) **`Binding::Module` non-durability** — op 15 takes a *module handle*, which
+`capture_durable_handles` refuses, so a durable parent that spawned a detached child cannot be frozen
+at all until module handles become durable (or a post-spawn cap-close lands). Under a scratch
+gate-lift the admission path and the still-running fail-closed refusal both check out; a completed
+capture at freeze is the scheduling-fragile "child must finish during a parent park" case Finding 1
+flagged, deferred with step 4.
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared

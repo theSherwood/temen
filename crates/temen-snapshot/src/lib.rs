@@ -42,8 +42,9 @@
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedProt, DurableBinding, DurableHandle,
-    DurableJitTable, DurableJitUnit, DurableNamedCap, FrozenChildState, FrozenFiber, FrozenNested,
-    FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
+    DurableJitTable, DurableJitUnit, DurableNamedCap, FrozenChildState, FrozenDetached,
+    FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena,
+    StreamRole, SvcDispatch,
 };
 use temen_ir::Module;
 
@@ -167,10 +168,14 @@ use temen_ir::Module;
 /// returns the handler to install or refuses. Before this, *any* live host capability made the freeze
 /// refuse outright (`NonDurableKind::HostProc`), which is to say every capability-using guest. Emitted
 /// only when the domain holds a named host capability, so an artifact without one keeps the v20 layout.
+/// v23 (#1361 step 2): a completed-but-unjoined **detached** §14 child rides the control section —
+/// its `(parent_task, slot, join-result)` trails the nested-child block (which is emitted with count
+/// 0 when only detached residue is present, so the decoder always reads a nested count first). An
+/// artifact that froze no completed detached child is byte-identical to v22 but for the version field.
 /// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
 /// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
 /// whose domain holds no `Budget` is byte-identical to v21.
-const FORMAT_VERSION: u16 = 22;
+const FORMAT_VERSION: u16 = 23;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -447,6 +452,9 @@ pub fn freeze_with_prots(
     // artifact (every `parent_task == 0`) this reduces to ascending slot, as in v8–v11.
     let mut nested = host.frozen_nested().to_vec();
     nested.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+    // #1361 step 2 — the completed detached-child residue, same canonical `(parent_task, slot)` order.
+    let mut detached = host.frozen_detached().to_vec();
+    detached.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
     // §13.4 slice 4c: per-child host state, merged into each nested record by (parent_task, slot).
     let child_state = host.frozen_child_state().to_vec();
     let root_sp = host.frozen_root_sp().unwrap_or(
@@ -507,7 +515,7 @@ pub fn freeze_with_prots(
     // this records the small host-side residue needed to re-enter it on thaw. Emitted only when there
     // are fibers or spawned vCPUs. The vCPU residue is **appended** after the fiber residue and only
     // when present, so a fiber-only (or single-vCPU no-fiber) artifact is byte-identical to before.
-    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() {
+    if !fibers.is_empty() || !vcpus.is_empty() || !nested.is_empty() || !detached.is_empty() {
         section(&mut out, TAG_CONTROL, |b| {
             write_uleb(b, fibers.len() as u64);
             for f in &fibers {
@@ -543,7 +551,9 @@ pub fn freeze_with_prots(
             // §4 subtree freeze (v8): the nested-child re-attach residue is **appended** after the
             // fiber + vCPU residue and only when present, so fiber-/vCPU-only artifacts keep the
             // pre-nesting Section-2 byte layout (only the container version differs).
-            if !nested.is_empty() {
+            // #1361 step 2: emitted when nested OR detached residue is present — a nested count
+            // (possibly 0) must precede the detached block so the decoder's positional read lines up.
+            if !nested.is_empty() || !detached.is_empty() {
                 write_uleb(b, nested.len() as u64);
                 for n in &nested {
                     write_uleb(b, n.slot as u64);
@@ -596,6 +606,18 @@ pub fn freeze_with_prots(
                             }
                         }
                     }
+                }
+            }
+            // #1361 step 2 — the completed detached-child residue trails the nested block: each is
+            // `(parent_task, slot, join-result)`. A detached child's separate window need not ride (it
+            // is completed), so unlike a nested record there is no carve/entry/digest — only the join
+            // edge and its result. Present iff bytes remain after the nested block on decode.
+            if !detached.is_empty() {
+                write_uleb(b, detached.len() as u64);
+                for d in &detached {
+                    write_uleb(b, d.parent_task as u64);
+                    write_uleb(b, d.slot as u64);
+                    write_uleb(b, d.completed_result as u64);
                 }
             }
         });
@@ -972,7 +994,7 @@ pub fn restore_with_prots(
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
     // thaw. The section is present iff there are fibers or spawned vCPUs (canonical); restore re-seeds
     // the Host so the next (REWINDING) run re-creates the fibers and re-spawns the vCPUs. ----
-    let (fibers, vcpus, root_sp, nested, child_state) = decode_control(
+    let (fibers, vcpus, root_sp, nested, child_state, detached) = decode_control(
         control_body,
         fiber_count,
         spawned_count,
@@ -989,6 +1011,9 @@ pub fn restore_with_prots(
     }
     if !nested.is_empty() {
         host.set_frozen_nested(nested);
+    }
+    if !detached.is_empty() {
+        host.set_frozen_detached(detached);
     }
     if !child_state.is_empty() {
         host.set_frozen_child_state(child_state);
@@ -1059,12 +1084,20 @@ fn decode_control(
         u64,
         Vec<FrozenNested>,
         Vec<FrozenChildState>,
+        Vec<FrozenDetached>,
     ),
     RestoreError,
 > {
     let body = match (body, fiber_count, spawned_count) {
         (None, 0, 0) => {
-            return Ok((Vec::new(), Vec::new(), root_default, Vec::new(), Vec::new()));
+            return Ok((
+                Vec::new(),
+                Vec::new(),
+                root_default,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ));
             // no residue ⇒ no section
         }
         (None, _, _) => return Err(RestoreError::MissingSection(TAG_CONTROL)),
@@ -1231,10 +1264,34 @@ fn decode_control(
             });
         }
     }
+    // #1361 step 2 — the detached residue trails the nested block, present iff bytes remain after it.
+    // A nested count (possibly 0) always precedes it (see the encoder), so reaching here means the
+    // nested block was consumed and any remaining bytes are the detached block.
+    let mut detached = Vec::new();
+    if !cr.at_end() {
+        let nd = cr.uleb()?;
+        let mut last: Option<(u64, u64)> = None; // (parent_task, slot)
+        for _ in 0..nd {
+            let parent_task_raw = cr.uleb()?;
+            let slot = cr.uleb()?;
+            let key = (parent_task_raw, slot);
+            if last.is_some_and(|p| key <= p) {
+                return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
+            }
+            last = Some(key);
+            let completed_result = cr.uleb()? as i64;
+            detached.push(FrozenDetached {
+                parent_task: usize::try_from(parent_task_raw)
+                    .map_err(|_| RestoreError::Malformed)?,
+                slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
+                completed_result,
+            });
+        }
+    }
     if !cr.at_end() {
         return Err(RestoreError::Malformed);
     }
-    Ok((fibers, vcpus, root_sp, nested, child_state))
+    Ok((fibers, vcpus, root_sp, nested, child_state, detached))
 }
 
 /// Decode Section 5: the `table_log2` header and the durable guest-JIT domains (v17). A `None` body
