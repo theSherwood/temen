@@ -12391,7 +12391,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         }));
                                     }
                                 }
-                                if ch.bind_child_manifest(&cm.imports, &cm.types).is_err() {
+                                // A child of the running module itself binds leniently (#1234
+                                // — its manifest is the parent's whole import surface).
+                                let bound = if host.lock_unpoisoned().is_self_module(mh) {
+                                    ch.bind_same_module_manifest(&cm.imports, &cm.types)
+                                } else {
+                                    ch.bind_child_manifest(&cm.imports, &cm.types)
+                                };
+                                if bound.is_err() {
                                     frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                                 } else {
                                     ch.self_module = Some(Arc::clone(&cm.module));
@@ -19714,13 +19721,25 @@ impl Host {
             })
     }
 
-    pub fn set_import_bindings(&mut self, bindings: Vec<BoundImport>) {
+    pub fn set_import_bindings(&mut self, mut bindings: Vec<BoundImport>) {
         debug_assert!(
             bindings
                 .iter()
                 .all(|b| b.type_id != temen_ir::CAP_IMPORT_TYPE_ID),
             "an import binding can never target the import-dispatch pseudo-type_id"
         );
+        // A binding to an op its interface does not have — a host's `(type_id, op)` choice, the one
+        // route to an unknown built-in op that is not the guest's own program (#1515). Decided by
+        // the interface's seeded shape, like the dispatch-time check, and at this one sink rather
+        // than in each constructor: the slot becomes **unbound**, so a call through it gets the
+        // same fail-closed `CapFault` an never-attached rebindable slot gets. No new mechanism.
+        for b in &mut bindings {
+            if let Some(shape) = builtin_iface_shape(b.type_id) {
+                if b.op as usize >= shape.len() {
+                    b.bound = false;
+                }
+            }
+        }
         self.import_remaps = vec![None; bindings.len()];
         self.import_reqs = vec![None; bindings.len()];
         self.import_bindings = bindings;
@@ -22293,6 +22312,38 @@ impl Host {
         self.grant_module_inner(m, false)
     }
 
+    /// The two **by-name grants a detached spawn needs** beyond `"instantiator"` itself, so a guest
+    /// can reach `Instantiator` op 15 from a plain powerbox: `"module"` — a `Module` handle for the
+    /// **running module**, letting a program spawn one of its own functions as the child (a child
+    /// that is a *different* module is a host grant, as the shell's PATH registry); and `"budget"`
+    /// — the detached-window allowance, `win` bytes of `Budget.mem` (a detached window is minted
+    /// *outside* this window, so this is a quota, not a carve: one child as large as the parent, or
+    /// several smaller). Both reference powerboxes (`temen-run`'s and the browser on-ramp's) grant
+    /// them beside `"instantiator"` — one frontier (INVARIANTS #14) — to a guest that can spawn
+    /// detached ([`temen_ir::spawns_detached`]): least authority, and a `Module` grant is
+    /// non-durable, so a guest that never spawns keeps a powerbox a warm snapshot can freeze. Spawn authority
+    /// stays a subset of the guest's own reach: the child runs this guest's code, on this budget.
+    ///
+    /// Requires [`Host::set_self_module`] first (both powerboxes register the running module before
+    /// granting anything); with no running module registered, nothing is granted.
+    /// [`temen_ir::spawns_detached`] over the running module ([`Host::set_self_module`]); `false`
+    /// with none registered.
+    pub fn self_module_spawns_detached(&self) -> bool {
+        self.self_module
+            .as_ref()
+            .is_some_and(|m| temen_ir::spawns_detached(m))
+    }
+
+    pub fn grant_detached_spawn_caps(&mut self, win: u64) {
+        let Some(m) = self.self_module.clone() else {
+            return;
+        };
+        let module = self.grant_module_shared(m, false);
+        self.register_cap_name("module", module);
+        let budget = self.grant_budget(0, win as i64, 0);
+        self.register_cap_name("budget", budget);
+    }
+
     /// [`Host::grant_module`], additionally attesting the module is **freezable** (DURABILITY.md
     /// §4): the host ran `temen_durable::transform_module` on `m` before granting, so a *durable*
     /// domain may instantiate it as a child (an unmarked grant is refused there — the child could
@@ -22325,6 +22376,13 @@ impl Host {
     }
 
     fn grant_module_inner(&mut self, m: &Module, durable: bool) -> i32 {
+        self.grant_module_shared(Arc::new(m.clone()), durable)
+    }
+
+    /// [`grant_module_inner`](Self::grant_module_inner) over an already-shared module — the grant
+    /// keeps `m` itself, so a grant of the **running** module (`set_self_module`'s Arc) stays
+    /// recognizable as such ([`Host::is_self_module`]).
+    fn grant_module_shared(&mut self, m: Arc<Module>, durable: bool) -> i32 {
         let id = self.modules.len() as u32;
         self.modules.push(ModuleGrant {
             funcs: m.funcs.clone().into(),
@@ -22335,10 +22393,22 @@ impl Host {
             imports: m.imports.clone().into(),
             types: m.types.clone().into(),
             durable,
-            digest: module_digest(m),
-            module: Arc::new(m.clone()),
+            digest: module_digest(&m),
+            module: m,
         });
         self.grant(cap_id::MODULE, Binding::Module(id))
+    }
+
+    /// Whether `handle` names the **running module** — the [`SELF_MODULE`] sentinel, or a `Module`
+    /// grant of the very module [`Host::set_self_module`] registered (a `"module"` by-name grant,
+    /// [`Host::grant_detached_spawn_caps`]). A child spawned from it runs the parent's own program,
+    /// so the spawn arms bind its manifest leniently ([`Host::bind_same_module_manifest`]).
+    pub fn is_self_module(&self, handle: i32) -> bool {
+        handle == SELF_MODULE
+            || match (self.resolve_module(handle), &self.self_module) {
+                (Ok(g), Some(s)) => Arc::ptr_eq(&g.module, s),
+                _ => false,
+            }
     }
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore

@@ -460,4 +460,4 @@ pub use catalog::{catalog, Focus, Op};
 
 pub mod frontier;
 mod render;
-pub use render::{render_frontier_markdown, render_json, render_markdown};
+pub use render::{render_frontier_json, render_frontier_markdown, render_json, render_markdown};

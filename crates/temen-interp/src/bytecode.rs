@@ -7026,6 +7026,10 @@ pub enum SchedStop {
     /// re-issues the read. Distinct from `Blocked` (a true deadlock) so the backend can show an
     /// input prompt instead of a dead end.
     StdinPark { pc: super::IrPc },
+    /// #1366 — a thread is parked on a host-completed cap call `id` (at `pc`): live, resumable once
+    /// the embedder [`deliver_cap`](ScheduledDebugRun::deliver_cap)s the value. The cap twin of
+    /// `StdinPark`.
+    CapPark { id: u64, pc: super::IrPc },
     /// A thread reached an op outside the debug scheduler's subset — only JIT tier-up (never enabled on
     /// this engine). Threads, `wait`/`notify`, fibers, `instantiate`/`instantiate_module`, and §14
     /// coroutines (step-into, with the coroutine's vCPU pinned across the body) are all handled.
@@ -7071,6 +7075,16 @@ enum DbgTaskState {
     /// at the frontier). The debug-scheduler twin of the cooperative driver's `TaskState::BlockedStdin`
     /// and the single-vCPU `DebugRun::stdin_parked` — invariant 14's debugger axis.
     BlockedStdin,
+    /// #1366 — parked on a **host-completed** cap call: the embedder services it asynchronously and
+    /// [`ScheduledDebugRun::deliver_cap`] resumes. `dst` is the awaiting result slot; `at` the call's
+    /// pc (the stop location). The scheduled twin of `DebugRun`'s `cap_parked`; not runnable until
+    /// delivered, and cleared to `Runnable` on a checkpoint restore (a replay serves the call from
+    /// the tape, exactly as a restored stdin park re-issues its read).
+    CapParked {
+        id: u64,
+        dst: u32,
+        at: Option<super::IrPc>,
+    },
     /// Finished — result (or trap) retained for a joiner.
     Done(Result<Vec<Value>, Trap>),
 }
@@ -7300,7 +7314,8 @@ pub enum SchedTraceEvent {
 
 /// A compact `(state-tag, aux)` per task for the trace differ: 0 = runnable, 1 = blocked-join
 /// (aux = child), 2 = blocked-wait (aux = key), 3 = done, 4 = blocked-stdin (a park/wake the differ
-/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act).
+/// records as no timeline edge: the wake is the embedder's `provide_stdin`, not another task's act),
+/// 5 = cap-parked (aux = completion id; likewise no edge — the wake is the embedder's `deliver_cap`).
 fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
     tasks
         .iter()
@@ -7310,6 +7325,7 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
             DbgTaskState::BlockedWait { key, .. } => (2, key),
             DbgTaskState::Done(_) => (3, 0),
             DbgTaskState::BlockedStdin => (4, 0),
+            DbgTaskState::CapParked { id, .. } => (5, id),
         })
         .collect()
 }
@@ -7522,11 +7538,12 @@ fn service_advance(
             *turn += 1;
             dbg_complete(tasks, ti, Err(t));
         }
-        // #1366: a host-completed cap park has no completer on the scheduled engine (no
-        // `cap_parked` there yet) — fail closed, exactly like a trap.
-        FiberStep::CapParked { .. } => {
-            *turn += 1;
-            dbg_complete(tasks, ti, Err(Trap::CapFault));
+        // #1366 — a host-completed cap park: the call did not run and the turn holds (as a stdin
+        // park); `drive` reports `SchedStop::CapPark` once nothing else can run, and `deliver_cap`
+        // lands the value and re-admits the task. Until #1517 this engine failed closed here — and
+        // could not in fact reach it, since it never admitted host-completed punts at all.
+        FiberStep::CapParked { id, dst, at } => {
+            tasks[ti].state = DbgTaskState::CapParked { id, dst, at };
         }
         // A scheduler seam: the ones this engine dispatches, else `Declined`.
         FiberStep::Other(outcome) => match outcome {
@@ -8507,6 +8524,11 @@ impl ScheduledDebugRun {
             ..
         } = self;
         *stopped = None;
+        // #1366: admit host-completed punts on this run's host, so an offloadable cap the embedder
+        // services asynchronously parks the thread (`CapParked`) instead of being waited inline.
+        // The single-vCPU engine does the same at the top of every advance; without it
+        // `wait_unless_host_owned` never yields `None` and this engine could not park at all.
+        host.completions().allow_host_completed();
         loop {
             if let DbgTaskState::Done(res) = &tasks[0].state {
                 return SchedStop::Finished(res.clone());
@@ -8536,6 +8558,24 @@ impl ScheduledDebugRun {
                         // read (#1146 deeper) makes this a live `StdinPark` stop on that thread (the
                         // lowest-index one), else a true deadlock.
                         None => {
+                            // #1366: a thread parked on a host-completed cap is a live `CapPark`
+                            // stop on that thread (lowest-index), resumable via `deliver_cap`.
+                            if let Some((p, id, at)) =
+                                tasks.iter().enumerate().find_map(|(i, t)| match t.state {
+                                    DbgTaskState::CapParked { id, at, .. } => Some((i, id, at)),
+                                    _ => None,
+                                })
+                            {
+                                // The stop location is the call itself (the position after it may
+                                // be a terminator), falling back to the live pc.
+                                let pc =
+                                    at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
+                                if let Some(pc) = pc {
+                                    *stopped = Some(p);
+                                    *focus = p;
+                                    return SchedStop::CapPark { id, pc };
+                                }
+                            }
                             let parked = tasks
                                 .iter()
                                 .position(|t| matches!(t.state, DbgTaskState::BlockedStdin));
@@ -8726,9 +8766,11 @@ impl ScheduledDebugRun {
             write_cursor,
             ..
         } = self;
-        // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
-        // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
-        // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
+        host.completions().allow_host_completed(); // #1366: see `drive`
+                                                   // A task mid-coroutine is pinned (atomic resume — the same vCPU runs the whole body); the same
+                                                   // pin on replay reconstructs the coroutine's op sequence deterministically. The policy pick
+                                                   // (seed + forced) matches `drive`'s, so a tick-replay reproduces the interactive schedule.
+                                                   // A `CapParked` task is not runnable, so a parked run refuses to tick — as the single engine's.
         let pre_pick = sched_trace.as_ref().map(|_| trace_tags(tasks));
         let Some(ti) = dbg_pinned_coro(tasks)
             .or_else(|| dbg_pick_runnable(tasks, clock, *sched_seed, forced, *turn))
@@ -8814,6 +8856,62 @@ impl ScheduledDebugRun {
                 t.state = DbgTaskState::Runnable;
             }
         }
+    }
+
+    /// #1366 — the completion id some thread is parked on (a host-completed cap call), if any: the
+    /// lowest-index parked thread's. The backend reports it as `StopReason::CapPark { id }`;
+    /// [`deliver_cap`](ScheduledDebugRun::deliver_cap) resumes it. The scheduled twin of
+    /// `DebugRun::cap_parked`.
+    pub fn cap_parked(&self) -> Option<u64> {
+        self.tasks.iter().find_map(|t| match t.state {
+            DbgTaskState::CapParked { id, .. } => Some(id),
+            _ => None,
+        })
+    }
+
+    /// #1366 — the pc of the host-completed cap call the parked thread is on (the stop location), if
+    /// parked and the call had a source position.
+    pub fn cap_park_pc(&self) -> Option<super::IrPc> {
+        self.tasks.iter().find_map(|t| match t.state {
+            DbgTaskState::CapParked { at, .. } => at,
+            _ => None,
+        })
+    }
+
+    /// #1366 — finish the host-completed cap call a thread is parked on: `value` lands in the call's
+    /// result slot, the completion settles, the delivered value joins the cap tape as the call's record
+    /// (so a reverse `seek` replays it without re-parking), the thread is re-admitted, and the op
+    /// counts on the turn. `false` if no thread is parked on `id`. The twin of `provide_stdin`, and
+    /// op-for-op the same delivery the single-vCPU engine performs.
+    pub fn deliver_cap(&mut self, id: u64, value: i64) -> bool {
+        let Some((ti, dst)) = self
+            .tasks
+            .iter()
+            .enumerate()
+            .find_map(|(i, t)| match t.state {
+                DbgTaskState::CapParked { id: pid, dst, .. } if pid == id => Some((i, dst)),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let comps = self.host.completions();
+        let prefix = comps.complete_host(id, value);
+        let _ = comps.try_take(id);
+        if let Some((type_id, op, handle, args)) = prefix {
+            self.host.tape_cap_record(super::CapRecord {
+                type_id,
+                op,
+                handle,
+                args,
+                result: Ok(vec![value]),
+                mem_writes: Vec::new(),
+            });
+        }
+        self.tasks[ti].vt.active.set(dst, Reg::from_i64(value));
+        self.tasks[ti].state = DbgTaskState::Runnable;
+        self.turn += 1;
+        true
     }
 
     /// Position the session at the current schedule point after a raw `tick`-replay `seek`: the stopped +
@@ -8960,7 +9058,9 @@ impl ScheduledDebugRun {
                     // re-admits, and the re-executed read is served from the cap tape (or re-parks
                     // at the frontier) — the scheduled twin of `DebugRun::restore`'s rule.
                     state: match &ts.state {
-                        DbgTaskState::BlockedStdin => DbgTaskState::Runnable,
+                        DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. } => {
+                            DbgTaskState::Runnable
+                        }
                         s => s.clone(),
                     },
                     at_bp: ts.at_bp,
@@ -13010,10 +13110,222 @@ impl CoopSched {
                     tasks[ti].threads.push(Some(cidx));
                     tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
-                // §5 `instantiate_detached` (op 15, #1286): the cooperative scheduler hosts no fresh
-                // window yet — decline probeably, never a trap ([`Vm::decline_unsupported`]).
-                Ok(VcpuStop::InstantiateDetached { dst, .. }) => {
-                    tasks[ti].vt.active.decline_unsupported(dst);
+                // §5 `instantiate_detached` (op 15): the child is a task of this executor over a
+                // **fresh window of its own** (`Mem::with_reservation`, its own guard) — not a carve —
+                // the tree-walk oracle's spawn (`run_with_host`'s op-15 arm) on the cooperative
+                // driver. Admission first (entry shape, the window = the module's declared memory,
+                // the args payload, `premap_admit`, no durable domain, then the `Budget.mem` take —
+                // a refused spawn lands `-EINVAL` and charges nothing); then the child powerbox:
+                // starter `Instantiator`/`AddressSpace` over the reservation, the by-name re-grants
+                // (the op-11 record format, fail-closed), and a pre-mapped `SharedRegion` staged and
+                // applied to the window before the child runs an op. `join` is the shared seam below.
+                Ok(VcpuStop::InstantiateDetached {
+                    budget,
+                    mh,
+                    entry,
+                    size_log2,
+                    quota,
+                    dst,
+                    grants,
+                    args,
+                    premap,
+                }) => {
+                    let (cfuncs, cmem_log2, cdata, cimports, ctypes, cmodule, cshadow) =
+                        match host.resolve_module(mh) {
+                            Ok(g) => (
+                                g.funcs.clone(),
+                                g.memory_log2,
+                                g.data.clone(),
+                                g.imports.clone(),
+                                g.types.clone(),
+                                std::sync::Arc::clone(&g.module),
+                                g.shadow,
+                            ),
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        };
+                    let child_compiled = match compile_module(&cfuncs, &ctypes, cshadow) {
+                        Some(c) => c.with_manifest(cimports, ctypes),
+                        None => {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    };
+                    let want_as = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let ok_entry = child_compiled
+                        .sigs
+                        .get(entry as usize)
+                        .is_some_and(|(p, r)| child_entry_ok(p, r));
+                    let child_size = if (0..64).contains(&size_log2) {
+                        1u64 << size_log2
+                    } else {
+                        0
+                    };
+                    let mod_ok = cmem_log2 == Some(size_log2 as u8);
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let payload: Vec<u8> = match args {
+                        Some((ptr, len)) => match pm
+                            .ok_or(Trap::Malformed)
+                            .and_then(|m| m.read_window(ptr, len as usize))
+                        {
+                            Ok(p) => p,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    let payload_ok = payload.len() as u64
+                        <= temen_ir::module_args_end() - temen_ir::module_args_base();
+                    let glist: Result<Vec<(String, i32)>, Trap> = (|| {
+                        let Some((gptr, gn)) = grants else {
+                            return Ok(Vec::new());
+                        };
+                        let m = pm.ok_or(Trap::Malformed)?;
+                        let mut list: Vec<(String, i32)> = Vec::new();
+                        for i in 0..gn {
+                            let rec = m.read_window(gptr + i * 16, 16)?;
+                            let name_off =
+                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                            let name_len =
+                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                            let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                            let name = String::from_utf8(m.read_window(name_off, name_len)?)
+                                .map_err(|_| Trap::CapFault)?;
+                            if !host.can_regrant(gh) {
+                                return Err(Trap::CapFault);
+                            }
+                            list.push((name, gh));
+                        }
+                        Ok(list)
+                    })();
+                    let glist = match glist {
+                        Ok(l) => l,
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
+                    let premap_ok = match premap {
+                        Some((r, o)) => match host.premap_admit(r, o, child_size) {
+                            Ok(ok) => ok,
+                            Err(t) => {
+                                complete(tasks, ti, Err(t));
+                                continue;
+                            }
+                        },
+                        None => true,
+                    };
+                    if !ok_entry
+                        || child_size == 0
+                        || !mod_ok
+                        || !payload_ok
+                        || !premap_ok
+                        || host.is_durable()
+                        || !host.budget_mem_take(budget, child_size)
+                    {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let live = tasks
+                        .iter()
+                        .filter(|t| !matches!(t.state, TaskState::Done(_)))
+                        .count();
+                    if live >= super::MAX_VCPUS {
+                        complete(tasks, ti, Err(Trap::ThreadFault));
+                        continue;
+                    }
+                    let mut fm =
+                        Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow);
+                    fm.init_data(&cdata);
+                    fm.seed_null_guard(temen_ir::module_null_guard());
+                    if !payload.is_empty() {
+                        let _ = fm.write_bytes(temen_ir::module_args_base(), &payload);
+                    }
+                    let mut child_host = Host::new();
+                    child_host.set_attestation(host.detached_child_attestation());
+                    let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
+                    let cinst = child_host.grant_instantiator(0, reservation);
+                    let cas = child_host.grant_address_space(0, reservation);
+                    for (name, gh) in &glist {
+                        if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
+                            child_host.register_cap_name(name, cg);
+                        }
+                    }
+                    if let Some((r, o)) = premap {
+                        if !(host.stage_premap(r, o, &mut child_host)
+                            && child_host.apply_premap(&mut fm) >= 0)
+                        {
+                            complete(tasks, ti, Err(Trap::Malformed));
+                            continue;
+                        }
+                    }
+                    child_host.set_self_module(&cmodule);
+                    // A child of the running module itself binds leniently (#1234 — its manifest
+                    // is the parent's whole import surface, not one written for the child).
+                    let bound = if host.is_self_module(mh) {
+                        child_host.bind_same_module_manifest(&cmodule.imports, &cmodule.types)
+                    } else {
+                        child_host.bind_child_manifest(&cmodule.imports, &cmodule.types)
+                    };
+                    if bound.is_err() {
+                        tasks[ti]
+                            .vt
+                            .active
+                            .set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    let child_args = if want_as {
+                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                    } else {
+                        vec![Value::I64(cinst as i64)]
+                    };
+                    let pfuel = match tasks[ti].env {
+                        None => *fuel,
+                        Some(k) => extra_envs[k].fuel,
+                    };
+                    let child_fuel = if quota <= 0 {
+                        pfuel
+                    } else {
+                        (quota as u64).min(pfuel)
+                    };
+                    let progs_len = child_compiled.progs.len();
+                    let cm = dom.source.push(child_compiled);
+                    let child_table =
+                        build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
+                    let cunit = dom.source.get(cm).ok_or(Trap::Malformed)?;
+                    let mut child_vt = VTask::new(&cunit, entry as usize, &child_args)?;
+                    child_vt.active.module = cm;
+                    child_vt.active.home = cm;
+                    let eidx = extra_envs.len();
+                    extra_envs.push(ChildEnv {
+                        mem: Some(fm),
+                        host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
+                        table: child_table,
+                        fuel: child_fuel,
+                    });
+                    let cidx = tasks.len();
+                    tasks.push(TaskSlot {
+                        vt: child_vt,
+                        threads: Vec::new(),
+                        env: Some(eidx),
+                        state: TaskState::Runnable,
+                    });
+                    let handle = tasks[ti].threads.len() as i32;
+                    tasks[ti].threads.push(Some(cidx));
+                    tasks[ti].vt.active.set(dst, Reg::from_i32(handle));
                 }
                 Ok(VcpuStop::InstantiateModule {
                     ibase,

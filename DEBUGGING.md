@@ -793,6 +793,22 @@ playground's reactor keyframes use — keyed on the op clock or the global turn;
 `C` is the engine's own. The tree-walk checkpoint's window is a `MemLayout` now rather than raw bytes
 (under `snapshot_safe` the two capture the same bytes; it is the one image form, #1456).
 
+*Toward one bytecode debug engine (#1517).* A single-vCPU `DebugRun` is a `ScheduledDebugRun` with
+one task, and the two continuation shapes are the last thing standing between the engines' snapshots
+and one `Continuation` enum — but the single engine carries capabilities the scheduled one lacked, and
+a collapse that dropped one would be a fiction (INVARIANTS #9c). So they are being ported onto the
+scheduled engine one at a time, each gated on both before the single one goes. **Slice 1, the
+host-completed cap park** (#1366's protocol): `DbgTaskState::CapParked`, `SchedStop::CapPark`, and
+`ScheduledDebugRun::{cap_parked, cap_park_pc, deliver_cap}` mirror `DebugRun`'s op for op — including
+the delivered value joining the cap tape, so a reverse `seek` replays it without re-parking. The
+surprising part was what the scheduled engine had been doing: it never called
+`Completions::allow_host_completed`, so a host-completed punt was *waited inline* and the `CapParked`
+arm it declined on was unreachable; the admission at the top of every advance is what makes the park
+exist at all. The DAP backend's `Engine::Threaded` arms for `provideCap`, the `cap` stop and the
+request stop answering `false`/`None` — "single-vCPU sessions only" — now call through. Gated by
+`debug_run_cap_park.rs` (both engines, same cases) and `dap_cap_park.rs`'s threaded twin, which makes
+the declared call from a spawned thread and gets its value back through the join.
+
 ---
 
 ## 4. W2 — Interpreter stepping / breakpoints / watchpoints

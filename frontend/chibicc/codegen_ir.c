@@ -1509,6 +1509,38 @@ static int gen_builtin_instantiator(Node *node, int op, const char *who) {
   return r;
 }
 
+// A static `call.cap <iface> <op>` on the caller's handle with `n` i64 operation args — the general
+// form `gen_builtin_instantiator` is the 1-arg case of. `__vm_instantiate_detached(inst, budget,
+// module, grants_ptr, grants_n, entry, size_log2, quota, args_ptr, args_len, region, child_off)` is
+// `Instantiator` op 15 (the §5 detached spawn, 11-arg pre-mapped form) — an executor op, so it must
+// be a static `call.cap` for the same reason as the record spawn above; `__vm_budget_read(budget,
+// field)` is `Budget` op 1 (iface 14): how much of a quota field remains (0 fuel, 1 mem, 2 spawn).
+// Every operation arg widens to the host-ABI i64; the result is the `long` the prototype declares.
+static int gen_builtin_cap_call(Node *node, int iface, int op, int n, const char *who) {
+  Node *a = node->args;
+  if (!a)
+    error_tok(node->tok, "codegen_ir: %s expects a handle and %d arguments", who, n);
+  int h = gen_expr(a); // i32 capability handle
+  int argv[16];
+  int k = 0;
+  for (Node *p = a->next; p; p = p->next) {
+    if (k == n)
+      error_tok(node->tok, "codegen_ir: %s expects %d arguments after the handle", who, n);
+    argv[k++] = widen_i64(gen_expr(p), p->ty);
+  }
+  if (k != n)
+    error_tok(node->tok, "codegen_ir: %s expects %d arguments after the handle", who, n);
+  int r = nv++;
+  cg("  v%d = call.cap %d %d (", r, iface, op);
+  for (int i = 0; i < n; i++)
+    cg("%si64", i ? ", " : "");
+  cg(") -> (i64) v%d (", h);
+  for (int i = 0; i < n; i++)
+    cg("%sv%d", i ? ", " : "", argv[i]);
+  cg(")\n");
+  return r;
+}
+
 // FORK.md §8.6 — `__vm_pipe(int *fds)`: POSIX `pipe`. Lowers to the self-namespace op
 // `call.cap 4294967295 16`, which mints a pipe into this domain's powerbox and writes `fds[0]` = read
 // end, `fds[1]` = write end. `fds` is an `int[2]` pointer; returns 0 / -errno (int).
@@ -1991,6 +2023,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_instantiator(node, 17, "__vm_instantiate_rec");
         if (!strcmp(fname, "__vm_instantiate_join"))
           return gen_builtin_instantiator(node, 1, "__vm_instantiate_join");
+        if (!strcmp(fname, "__vm_instantiate_detached"))
+          return gen_builtin_cap_call(node, 6, 15, 11, "__vm_instantiate_detached");
+        if (!strcmp(fname, "__vm_budget_read"))
+          return gen_builtin_cap_call(node, 14, 1, 1, "__vm_budget_read");
         if (!strcmp(fname, "__vm_pipe"))
           return gen_builtin_pipe(node);
         if (!strcmp(fname, "__vm_close"))
