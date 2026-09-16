@@ -164,14 +164,25 @@ jobs:
         with:
           path: nim
           version: devel
+      # provision-nimony.sh now SKIPS its ~4-min build when the restored `nimony/bin` compiles a
+      # probe, so this key has to track the vendored frontend: serving a toolchain built from a
+      # different nimony commit than the checkout's `lib/` would be a silent stale-toolchain bug,
+      # where before the worst case was only wasted time. `HEAD:<path>` reads the gitlink — the exact
+      # pinned commit — so a submodule bump invalidates the cache by construction, rather than by
+      # someone remembering to edit the hand-written `096de9a` that used to sit here.
+      - name: Pin the nimony cache to the vendored commits
+        id: nimony-rev
+        run: echo "sha=$(git rev-parse HEAD:nimony)-$(git rev-parse HEAD:nativenif)" >> "$GITHUB_OUTPUT"
       - name: Cache nimony toolchain build
         uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
         with:
           path: |
             nimony/bin
             ~/.cache/nim
-          key: nimony-${{ runner.os }}-096de9a-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
-          restore-keys: nimony-${{ runner.os }}-096de9a-
+          # No `restore-keys`: a prefix fallback restores a toolchain built by a DIFFERENT script
+          # revision (an `NIM_SRC_REV` bump, say), which is precisely the staleness the skip now
+          # makes consequential. Exact key or rebuild.
+          key: nimony-${{ runner.os }}-${{ steps.nimony-rev.outputs.sha }}-${{ hashFiles('scripts/ci/provision-nimony.sh') }}
       - name: Build nimony toolchain
         run: scripts/ci/provision-nimony.sh "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: Nim end-to-end tests (both engines)
