@@ -83,6 +83,7 @@
 ;   63 do_fiber(id)     64 do_defining(id)  65 next_num()      66 tramp(xt,x)    67 spawn(xt,x)
 ;   68 join(t)          69 wait(addr,exp)   70 notify(addr,n)  71 emit_execute(ni,no)
 ;   72 find_do(skip)    73 do_loop(id)   74 prompt(ptr,len)  75 child_start(x)  76 sandbox(p,n)
+;   77 key()
 
 ; The durable shadow arena (INVARIANTS.md #16): 0x74000..0x80000 — 48 KiB = 12 contexts, inside the
 ; `sandbox` spawn-scratch page (which uses only its first 0x78 bytes) and clear of every data segment.
@@ -123,6 +124,7 @@ data 33144 "jit"
 data 33152 "instantiator"
 data 33168 "no sandbox capability"
 data 33192 "sandbox: program too large"
+data 33224 "expected a number"
 
 ; ---- the prelude (0x9000 = 36864, NUL-terminated): the primitive table + the library, in Forth ----
 data 36864 "prim : 2 0 0 1
@@ -172,6 +174,7 @@ prim r> 2 0 0 44
 prim r@ 2 0 0 45
 prim char 2 0 0 46
 prim [char] 2 0 0 47
+prim pick 2 0 0 48
 prim + 1 2 1 64
 prim - 1 2 1 65
 prim * 1 2 1 66
@@ -208,6 +211,7 @@ prim atomic+! 7 2 1 0
 prim atomic-xchg 7 2 1 5
 prim cas 9 3 1 0
 prim sandbox 0 2 1 76
+prim key 0 0 1 77
 : negate ( n -- n ) 0 swap - ;
 : invert ( n -- n ) -1 xor ;
 : 1+ ( n -- n ) 1 + ;
@@ -2039,7 +2043,7 @@ block 14 (ni: i64, no: i64, pay: i64) {
 func (i64) -> () {
 block 0 (id: i64) {
   id32 = i32.wrap_i64 id
-  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34(), 40(id), 40(id), 40(id), 40(id), 40(id), 40(id), 41(), 43(), 46(), 48(), 48()] 16()
+  br_table id32 [16(), 1(), 2(), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 3(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 4(id), 5(), 8(), 12(id), 12(id), 15(id), 15(id), 15(id), 17(id), 17(id), 17(id), 18(), 19(), 20(id), 20(id), 20(id), 24(), 27(), 30(), 34(), 40(id), 40(id), 40(id), 40(id), 40(id), 40(id), 41(), 43(), 46(), 48(), 48(), 51()] 16()
   }
 block 1 () {
   call 45 ()
@@ -2423,6 +2427,54 @@ block 50 () {
   t = i64.load tp
   ch = i64.load8_u t
   v = call 22 (ch)
+  call 10 (v)
+  return
+  }
+; pick(48) `pick <n>` ( x_n … x_0 -- x_n … x_0 x_n ): copy the (n+1)-th virtual-stack value from
+; the top. `n` is a compile-time literal (the next token), so this is a permutation like `over`
+; (`pick 0` = dup, `pick 1` = over) and emits nothing; a runtime `n` needs a runtime data stack
+; and stays out.
+block 51 () {
+  ok = call 65 ()
+  z = i64.const 0
+  bad = i64.eq ok z
+  br_if bad 52() 53()
+  }
+block 52 () {
+  m = i64.const 33224
+  n = i64.const 17
+  call 38 (m, n)
+  return
+  }
+block 53 () {
+  np = i64.const 65760
+  k = i64.load np
+  z = i64.const 0
+  neg = i64.lt_s k z
+  br_if neg 52() 54(k)
+  }
+block 54 (k: i64) {
+  one = i64.const 1
+  k1 = i64.add k one
+  call 11 (k1)
+  ep = i64.const 65712
+  err = i64.load ep
+  z = i64.const 0
+  bad = i64.ne err z
+  br_if bad 55() 56(k1)
+  }
+block 55 () {
+  return
+  }
+block 56 (k1: i64) {
+  dp = i64.const 65576
+  d = i64.load dp
+  i = i64.sub d k1
+  eight = i64.const 8
+  off = i64.mul i eight
+  base = i64.const 66560
+  a = i64.add base off
+  v = i64.load a
   call 10 (v)
   return
   }
@@ -4353,5 +4405,34 @@ block 5 (ch: i32) {
 block 6 (hinst: i32, ch: i32) {
   st = call.cap 6 1 (i32) -> (i64) hinst (ch)
   return st
+  }
+}
+
+; 77 key() -> c: the next unconsumed input byte at the tokenizer cursor (IN_POS, advanced), or -1 at
+; the end of the input. It runs at run time, after its line was compiled, so a top-level `key` reads
+; the bytes that follow its line; the tokenizer resumes after whatever `key` consumed.
+func () -> (i64) {
+block 0 () {
+  pp = i64.const 65544
+  pos = i64.load pp
+  lp = i64.const 65552
+  len = i64.load lp
+  atend = i64.ge_s pos len
+  br_if atend 1() 2(pos)
+  }
+block 1 () {
+  neg1 = i64.const -1
+  return neg1
+  }
+block 2 (pos: i64) {
+  bp = i64.const 65752
+  base = i64.load bp
+  a = i64.add base pos
+  ch = i64.load8_u a
+  one = i64.const 1
+  pos1 = i64.add pos one
+  pp = i64.const 65544
+  i64.store pp pos1
+  return ch
   }
 }
