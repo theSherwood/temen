@@ -60,10 +60,13 @@ budgets. The cascade is **transactional**: if no ancestor can cover the shortfal
 anywhere and the request fails closed (`-ENOMEM`), exactly as an over-asking `split` deducts nothing.
 This is Genode's quota-transfer applied to VA — `split` pushes budget down eagerly at spawn,
 `transfer` pushes it down lazily on demand — so every byte a descendant holds stays traceable to a
-grant from above (the invariant), and nothing becomes ambient-under-`Instantiator`. *Caveat recorded:*
-`Budget` is a `NonDurableKind` today, so minting authority does not survive a freeze — under R1
-(freeze authority) that is harmless for a platform-driven freeze (the platform re-grants on thaw) and
-a prerequisite to lift for an ancestor-driven one.
+grant from above (the invariant), and nothing becomes ambient-under-`Instantiator`. *Caveat closed (2026-09-16, #1502):* `Budget` is
+**durable** — the artifact carries a budget's *remaining* quotas verbatim and the thaw re-mints them,
+so what a domain already minted before a freeze stays deducted after it (a fresh re-grant would have
+let it spend that again — the conservation break the earlier "harmless for a platform-driven freeze"
+note missed). The thaw may **attenuate** a carried budget through an embedder hook
+(`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
+⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
 
 ## 4. Host = mechanism, guest = policy
 

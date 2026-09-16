@@ -41,9 +41,9 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    Attestation, CapturedProt, DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit,
-    DurableNamedCap, FrozenChildState, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
-    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
+    Attestation, BudgetState, BudgetThawRefused, CapturedProt, DurableBinding, DurableHandle,
+    DurableJitTable, DurableJitUnit, DurableNamedCap, FrozenChildState, FrozenFiber, FrozenNested,
+    FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena, StreamRole, SvcDispatch,
 };
 use temen_ir::Module;
 
@@ -167,7 +167,10 @@ use temen_ir::Module;
 /// returns the handler to install or refuses. Before this, *any* live host capability made the freeze
 /// refuse outright (`NonDurableKind::HostProc`), which is to say every capability-using guest. Emitted
 /// only when the domain holds a named host capability, so an artifact without one keeps the v20 layout.
-const FORMAT_VERSION: u16 = 21;
+/// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
+/// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
+/// whose domain holds no `Budget` is byte-identical to v21.
+const FORMAT_VERSION: u16 = 22;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -212,6 +215,9 @@ const B_JIT_CODE: u8 = 9;
 /// A named embedder host capability (#1455). Index-only payload — the name and the provider's
 /// captured state ride [`TAG_NAMED`], exactly as a §22 domain's units ride [`TAG_JIT`].
 const B_NAMED: u8 = 10;
+/// #1502 — a `Budget`'s remaining quotas, four `i64`s (`-1` = unbounded) each written as its
+/// two's-complement `u64` uleb.
+const B_BUDGET: u8 = 11;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -287,6 +293,10 @@ pub enum RestoreError {
     /// capability, it never carries one. What gets granted is whatever the restoring host chooses to
     /// grant, exactly as on a fresh run (INVARIANTS #3).
     NamedCapRefused(String),
+    /// #1502 — the restoring host's budget hook refused a carried `Budget`, or offered more than was
+    /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
+    /// the thaw may narrow that, never widen it (INVARIANTS #3).
+    BudgetRefused(BudgetThawRefused),
 }
 
 /// An `AddressSpace`/`Instantiator` binding carries a `[base, base+size)` sub-range that the §14 JIT
@@ -952,6 +962,11 @@ pub fn restore_with_prots(
     // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
     // padding the re-applied installs land in (a fresh host defaults to 0).
     host.set_jit_table_log2(jit_table_log2);
+    // #1502: offer every carried `Budget` to the embedder's hook before the table is pinned — the
+    // budget twin of the named-cap registrar step above. Attenuate-only; a refusal fails the restore
+    // here, with nothing granted.
+    host.attenuate_budgets_for_thaw(&mut handles)
+        .map_err(RestoreError::BudgetRefused)?;
     host.restore_durable_handles(&handles);
 
     // ---- Control state (§12.4): decode the frozen-fiber + spawned-vCPU residue and seed it for the
@@ -1416,6 +1431,12 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, domain as u64);
             write_uleb(b, unit as u64);
         }
+        DurableBinding::Budget(q) => {
+            b.push(B_BUDGET);
+            for f in [q.fuel, q.mem, q.spawn, q.channel] {
+                write_uleb(b, f as u64);
+            }
+        }
     }
 }
 
@@ -1454,6 +1475,23 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             domain: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             unit: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
         },
+        B_BUDGET => {
+            // A field is `-1` (unbounded) or a non-negative remaining; anything else is not a state
+            // `Host` ever produces, so it is a malformed artifact, not a quota to trust.
+            let mut field = || -> Result<i64, RestoreError> {
+                let v = r.uleb()? as i64;
+                if v < -1 {
+                    return Err(RestoreError::Malformed);
+                }
+                Ok(v)
+            };
+            DurableBinding::Budget(BudgetState {
+                fuel: field()?,
+                mem: field()?,
+                spawn: field()?,
+                channel: field()?,
+            })
+        }
         _ => return Err(RestoreError::Malformed),
     })
 }
