@@ -12156,6 +12156,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 p.len() as u64
                                     <= temen_ir::module_args_end() - temen_ir::module_args_base()
                             });
+                            // Optional **pre-mapped region** `(region, child_off)` (args 9–10): a
+                            // `SharedRegion` of this domain aliased whole, read-write, into the
+                            // child's window at `child_off` before it starts — the same alias the
+                            // child would get by `map`ping a granted handle itself, minus the
+                            // ceremony (`Host::premap_admit` / `stage_premap` / `apply_premap`). The
+                            // 9-arg form pre-maps nothing.
+                            let premap: Option<(i32, u64)> = match (args.get(9), args.get(10)) {
+                                (Some(&r), Some(&o)) => Some((
+                                    get(&frames[top].vals, r)?.i64() as i32,
+                                    get(&frames[top].vals, o)?.i64() as u64,
+                                )),
+                                _ => None,
+                            };
                             // The module grant (a forged module handle is a CapFault, as ops
                             // 5/13); the child runs it as its own program + self module.
                             let cm = {
@@ -12205,6 +12218,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // §14 transparency: the detached window equals the module's
                             // declared memory (a module with no memory can't spawn).
                             let mod_ok = cm.memory_log2 == Some(size_log2 as u8);
+                            let premap_ok = match premap {
+                                Some((r, o)) => {
+                                    host.lock_unpoisoned().premap_admit(r, o, child_size)?
+                                }
+                                None => true,
+                            };
                             // #1412 — a **durable** domain refuses op 15, matching the resumable
                             // engine (`bytecode.rs` `event_instantiate_detached`) and the native thunk
                             // (`instantiator_rt.rs`). This is an **interim** gate, and it reverses.
@@ -12237,6 +12256,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 && child_size != 0
                                 && mod_ok
                                 && payload_ok
+                                && premap_ok
                                 && !durable
                                 && host.lock_unpoisoned().budget_mem_take(budget, child_size);
                             if !admitted {
@@ -12273,6 +12293,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let Some(cg) = cg {
                                         ch.register_cap_name(name, cg);
                                     }
+                                }
+                                // The pre-mapped region: staged into the child powerbox (a re-grant,
+                                // as the list above) and aliased onto its window through the child's
+                                // own `map` path, before it starts. Admitted above, so a miss here is
+                                // an engine fault, never a guest-reachable refusal.
+                                if let Some((r, o)) = premap {
+                                    let staged = host.lock_unpoisoned().stage_premap(r, o, &mut ch);
+                                    (staged && ch.apply_premap(&mut fm) >= 0)
+                                        .then_some(())
+                                        .ok_or(Trap::Malformed)?;
                                 }
                                 // #863 slice 3 — a child that inherited a personality signal door
                                 // via the re-grant above gets its own **domain-scoped, weak**
@@ -16255,14 +16285,18 @@ pub use temen_ir::cap_id;
 /// ([`Host::resolve_op`]) — pre-seeding only lets a structurally-equal declaration name the same
 /// type, never mint the capability.
 ///
-/// Only **specific** shapes are pre-seeded. `Stream`'s read/write/close triple is a genuine
-/// interface identity. A generic single-op shape — `Clock`'s `(i64) -> (i64)`, say — is *not*: an
-/// unrelated capability could share it by accident, so canonicalizing it would over-claim (and
-/// `(i64) -> (i64)` is exactly the shape an ordinary guest offer uses). Handle-typed built-ins,
-/// whose ops pass or return capabilities where the `cap`-vs-`i32` signature convention for
-/// built-ins is unsettled, and `HOST_PROC`, whose semantics are per-registration with no canonical
-/// shape, are the deliberate exceptions — see IMPORTS.md §3.5.
-fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
+/// A built-in is seeded once its **op-signature convention is pinned** (#1515). The original
+/// "a generic single-op shape could over-claim" worry no longer applies — names are half the
+/// intern key since #1109, so `Clock {now}` cannot unify with an unrelated `{frob}` — but most
+/// built-ins are still called with more than one signature in the tree (`Clock.now` as both
+/// `(i32) -> (i64)` and `() -> (i64)`), and a seeded shape picks a winner that every other caller
+/// then fails coverage against. `HOST_PROC` stays unseeded on purpose: its semantics are
+/// per-registration, with no canonical shape. See IMPORTS.md §3.5 and #1515 for the per-built-in
+/// decisions still open.
+///
+/// A seeded shape is also the interface's **op registry**: `cap_dispatch_slots` derives its
+/// unknown-op `CapFault` from `shape.len()`, so an interface with a shape needs no `_ =>` arm.
+fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
     let rw = FuncType {
         params: vec![ValType::I64, ValType::I64],
         results: vec![ValType::I64],
@@ -16271,10 +16305,23 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 1] {
         params: vec![],
         results: vec![],
     };
-    [(
-        cap_id::STREAM,
-        vec![("read", rw.clone()), ("write", rw), ("close", unit)],
-    )]
+    // `exit(code: i32)` — noreturn. The one built-in besides `Stream` whose signature every
+    // caller in the tree already agrees on (every `call.cap EXIT 0` site is `(i32) -> ()`, and it
+    // is the `sig_exit` the manifest tests declare), so it can be seeded without pinning a
+    // convention first. `Clock` and `SharedRegion` are *not* seeded for exactly that reason:
+    // `Clock.now` is called both as `(i32) -> (i64)` and `() -> (i64)`, `SharedRegion.map` both
+    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost.
+    let exit = FuncType {
+        params: vec![ValType::I32],
+        results: vec![],
+    };
+    [
+        (
+            cap_id::STREAM,
+            vec![("read", rw.clone()), ("write", rw), ("close", unit)],
+        ),
+        (cap_id::EXIT, vec![("exit", exit)]),
+    ]
 }
 
 /// The pre-seeded built-in id whose canonical shape equals `(names, sigs)` — **name-strict**
@@ -18273,6 +18320,12 @@ pub struct Host {
     /// `PageProt::Backed` already canonicalizes) and on any host with no recorder installed.
     #[allow(clippy::type_complexity)]
     region_hook: Option<Arc<dyn Fn(u64, u64, Option<(u64, u64)>) + Send + Sync>>,
+    /// Op-15 **pre-mapped region** staged into this (child) powerbox at spawn ([`Host::stage_premap`]):
+    /// `(this host's region id, window offset)`. Applied once, onto the child's freshly minted window,
+    /// by [`Host::apply_premap`] — the whole region aliased read-write at the offset, exactly what the
+    /// child would get by `map`ping the handle itself. `None` for every root and every child spawned
+    /// without one.
+    premap: Option<(u32, u64)>,
     /// §15 / PROCESS.md §5 `Budget` states, indexed by the id a [`Binding::Budget`] carries. Each is a
     /// remaining resource-quota vector; `split` moves quota from a parent's entry into a fresh child
     /// entry (append-only, like `regions` — a split budget's index stays valid for the run).
@@ -18499,10 +18552,6 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
-    /// #964: the running module's NULL guard (`0` = unguarded), recorded by
-    /// [`Host::set_self_module`] so the JIT cap path's window backend can enforce the reserved
-    /// region without the module in reach.
-    null_guard: u64,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
@@ -18944,6 +18993,7 @@ impl Host {
             clock_ns: 0,
             regions: Vec::new(),
             region_hook: None,
+            premap: None,
             budgets: Vec::new(),
             pipes: Vec::new(),
             channel_used: Arc::new(std::sync::atomic::AtomicI64::new(0)), // #989
@@ -18987,7 +19037,6 @@ impl Host {
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
             cap_pages: None,
-            null_guard: 0,
             quota: Quota::default(),
             jit_tables: Vec::new(),
             jit_validator: None,
@@ -21468,17 +21517,7 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
-        // #964/#1094: every module's window reserves `[0, guard)` (the unconditional guard). Recording
-        // it here — the one place every run path registers the running module — lets the native JIT's
-        // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
-        // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
-        self.null_guard = temen_ir::module_null_guard();
         self.self_module = Some(Arc::clone(m));
-    }
-
-    /// #964: the running module's NULL guard (`0` = unguarded) — see [`Host::set_self_module`].
-    pub fn null_guard(&self) -> u64 {
-        self.null_guard
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served
@@ -22252,6 +22291,99 @@ impl Host {
         let id = self.regions.len() as u32;
         self.regions.push(backing);
         self.grant(cap_id::SHARED_REGION, Binding::SharedRegion(id))
+    }
+
+    /// §13 `SharedRegion.map` — **the one region-aliasing path**: alias `backing`'s
+    /// `[region_off, region_off+len)` into `mem` at `[win_off, win_off+len)` with `prot`, then tell the
+    /// futex region hook (a JIT run's canonical-key recorder; none on the interpreter) which pages now
+    /// alias which region bytes. The guest's own `map` op (dispatch op 0) and the op-15 pre-map
+    /// ([`Host::apply_premap`]) both go through here, so a pre-mapped page is indistinguishable from a
+    /// self-mapped one on every backend. `0` or a negative errno (the backend's).
+    #[allow(clippy::too_many_arguments)]
+    fn region_map(
+        &self,
+        mem: &mut dyn GuestMem,
+        win_off: u64,
+        region_off: u64,
+        len: u64,
+        prot: i32,
+        region: u32,
+        backing: RegionBacking,
+    ) -> i64 {
+        // The backing's OS identity, stable across every alias of one region: the memfd on unix, the
+        // section HANDLE on Windows (`MapViewOfFile3`). Either makes two aliases key on the same
+        // `(backing, offset)` — a software-only region (no OS handle) can't be canonicalized on the
+        // JIT, so it stays `Anon`.
+        let backing_id = backing
+            .os_fd()
+            .map(|fd| fd as u64)
+            .or_else(|| backing.os_section().map(|s| s as u64));
+        let r = mem.map_region(win_off, region_off, len, prot, region, backing);
+        // S1b/S1c: on a successful map of an OS-fd-backed region, tell the JIT futex registry which
+        // pages now alias which region bytes (a no-op on the interp).
+        if r >= 0 {
+            if let (Some(hook), Some(id)) = (&self.region_hook, backing_id) {
+                hook(win_off, len, Some((region_off, id)));
+            }
+        }
+        r
+    }
+
+    /// Op-15 **pre-map admission** (the parent side): may `region` — a `SharedRegion` handle in THIS
+    /// powerbox — be aliased whole into a child window of `child_size` bytes at `child_off`? A forged /
+    /// wrong-kind handle is a `CapFault` (invariant 5: forgery traps); bad geometry is `Ok(false)` — the
+    /// spawn refuses `-EINVAL`, charging nothing. The geometry is exactly what the child's own
+    /// `SharedRegion.map` accepts on every backend (`prot_pages`): region-granularity aligned, clear of
+    /// the NULL guard, and `[child_off, child_off + len)` inside the declared window.
+    pub fn premap_admit(&self, region: i32, child_off: u64, child_size: u64) -> Result<bool, Trap> {
+        let len = self.resolve_region(region)?.size();
+        Ok(len > 0
+            && child_off.is_multiple_of(host_region_granularity())
+            && child_off >= temen_ir::module_null_guard()
+            && child_off
+                .checked_add(len)
+                .is_some_and(|end| end <= child_size))
+    }
+
+    /// Op-15 **pre-map staging** (after admission and the grant list): re-grant `region` from this
+    /// (parent) powerbox into `child` and record the pending alias at `child_off` for
+    /// [`Host::apply_premap`]. The child ends up holding the region handle (unnamed) exactly as if it
+    /// were in the grant list, so it can `unmap` / size it. `false` only for a handle
+    /// [`premap_admit`](Self::premap_admit) would have refused.
+    pub fn stage_premap(&mut self, region: i32, child_off: u64, child: &mut Host) -> bool {
+        let Ok(backing) = self.resolve_region(region) else {
+            return false;
+        };
+        let Some(h) = child.try_grant_shared_region_backed(backing) else {
+            return false;
+        };
+        let Ok(Binding::SharedRegion(id)) = child.resolve(h, cap_id::SHARED_REGION) else {
+            return false;
+        };
+        child.premap = Some((id, child_off));
+        true
+    }
+
+    /// Whether an op-15 pre-map is staged and not yet applied (a driver whose emitted tier cannot
+    /// honour a §13 alias — the wasm-JIT — declines such a child to the interpreter, as it does a child
+    /// that `map`s for itself).
+    pub fn has_premap(&self) -> bool {
+        self.premap.is_some()
+    }
+
+    /// Op-15 **pre-map apply** (the child side, once): alias the staged region whole, read-write, into
+    /// `mem` at the staged offset through [`region_map`](Self::region_map) — the child's own
+    /// `SharedRegion.map` path. `0` with nothing staged; otherwise the map's result (`< 0` only where
+    /// the backend cannot alias this backing, e.g. a software-only region on the native JIT).
+    pub fn apply_premap(&mut self, mem: &mut dyn GuestMem) -> i64 {
+        let Some((id, off)) = self.premap.take() else {
+            return 0;
+        };
+        let Some(backing) = self.regions.get(id as usize).cloned() else {
+            return EINVAL;
+        };
+        let len = backing.size();
+        self.region_map(mem, off, 0, len, PROT_READ | PROT_WRITE, id, backing)
     }
 
     /// PROCESS.md S1b/S1c — install (or clear, with `None`) the **canonical-key futex** region hook.
@@ -23978,6 +24110,19 @@ impl Host {
                 }
             }
         };
+        // An op the interface does not have, decided by the interface's **shape** where one is
+        // seeded ([`builtin_iface_shape`]) rather than restated per binding arm below. A `CapFault`,
+        // not an errno: `op` is an immediate in the instruction, so an unknown op is a property of
+        // the program (or of a host's `BoundImport`), never of a runtime request — the "typing
+        // violation on a live handle" INVARIANTS #5 puts in the trap column, and the same answer
+        // the import layer already gives an out-of-range consumer op above. Interfaces with no
+        // seeded shape keep their per-arm answer until their signature convention is pinned and
+        // they are seeded; then this one check covers them with no arm to touch.
+        if let Some(shape) = builtin_iface_shape(type_id) {
+            if op as usize >= shape.len() {
+                return Err(Trap::CapFault);
+            }
+        }
         match resolved {
             // §3.6 slice 3: a live-callee offer is serviced by the eval loop (enqueue + park —
             // host-side dispatch cannot park). Reaching it here means a backend tier without
@@ -24337,23 +24482,7 @@ impl Host {
                         let region_off = *args.get(1).unwrap_or(&0) as u64;
                         let len = *args.get(2).unwrap_or(&0) as u64;
                         let prot = *args.get(3).unwrap_or(&0) as i32;
-                        // The backing's OS identity, stable across every alias of one region: the
-                        // memfd on unix, the section HANDLE on Windows (`MapViewOfFile3`). Either makes
-                        // two aliases key on the same `(backing, offset)` — a software-only region (no
-                        // OS handle) can't be canonicalized on the JIT, so it stays `Anon`.
-                        let backing_id = backing
-                            .os_fd()
-                            .map(|fd| fd as u64)
-                            .or_else(|| backing.os_section().map(|s| s as u64));
-                        let r = mem.map_region(win_off, region_off, len, prot, region, backing);
-                        // S1b/S1c: on a successful map of an OS-fd-backed region, tell the JIT futex
-                        // registry which pages now alias which region bytes (a no-op on the interp).
-                        if r >= 0 {
-                            if let (Some(hook), Some(id)) = (&self.region_hook, backing_id) {
-                                hook(win_off, len, Some((region_off, id)));
-                            }
-                        }
-                        r
+                        self.region_map(mem, win_off, region_off, len, prot, region, backing)
                     }
                     1 => {
                         let win_off = *args.first().unwrap_or(&0) as u64;

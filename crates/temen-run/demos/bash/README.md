@@ -336,9 +336,22 @@ it lands before or after bash re-parks its prompt read is a genuine race on the 
 (`/tmp/temen_bash_cache_rl`): `--disable-readline` dropped, bash's bundled `lib/readline` and
 `lib/termcap` linked in (`bash_cv_termcap_lib=gnutermcap` — a host ncurses/tinfo cannot be linked
 into the bitcode, and pinning the oracle to the same bundled library keeps the differential honest;
-the K&R-era `tparam.c` gets `-include unistd.h`). With no termcap database in-guest readline runs
-in its `TERM=dumb` fallback on both sides: echo and editing are readline's own (`rl_outstream` =
-fd 2), erase is `\b \b`, no cursor addressing, bracketed paste off.
+the K&R-era `tparam.c` gets `-include unistd.h`). The rung first ran readline in its `TERM=dumb`
+fallback (no termcap database in-guest: backspace-based editing, no cursor motion, a long line
+horizontally scrolled with `<`/`>` markers). **#1496** replaced that with the personality's **fixed
+termcap entry** — `temen_posix::TERM_NAME`/`TERMCAP_ENTRY`, exported as `TERM`/`TERMCAP` by every
+interactive embedder (the transcript harness, the playground's `bash_host_build`) and by the pty
+oracle: GNU termcap takes a `TERMCAP` value that does not start with `/` as the entry itself, so
+nothing lives at `/etc/termcap`. The entry is 80×24 with `cr`/`le`/`nd`/`up`/`ce` and deliberately
+**no `am`/`xn`**: readline then assumes a non-wrapping terminal, keeps its rows at 79 columns and
+moves down with an explicit `\n\r`, so the playground pane's row/cursor model (`\b`, `\r`, `\n`,
+`ESC [ A/B/C/D/K`; the bracketed-paste toggles readline now emits are dropped) renders a wrapped
+line edited at its start without emulating autowrap glitches. The entry is fixed rather than "real"
+so the differential stays byte-for-byte; echo and editing remain readline's own (`rl_outstream` =
+fd 2). One shim gap surfaced on the way: a WRAPPED line's redisplay diffs the old and new
+rows char-by-char (`update_line` → `_rl_compare_chars` → `_rl_get_char_len` → `mbrlen`), and `mbrlen`
+was an unprovided extern (trap-stubbed → `Unreachable`) — the single-row cases never reach it, so the
+`dumb` rung never hit it. Added to the shim's `MB_CUR_MAX = 1` band (with the glibc `__mbrlen` alias).
 
 One shim gap closed the whole rung: readline's `rl_getc` waits in `pselect(fd, NULL timeout)`
 BEFORE every `read` and treats a negative result as EOF, so the old `-1` stub ended a readline
@@ -384,10 +397,10 @@ and async delivery, the terminal, job control, blocking parks with `-EINTR`, a r
 next terminal read re-arms the writer, so an EOF meant for the foreground job is never consumed by
 the shell's next prompt read. What is left is surface, not mechanism:
 
-- **readline beyond the `dumb` fallback** — a termcap entry in-guest (`TERMCAP` env or a memfs
-  `/etc/termcap`) plus a pane that interprets cursor motion would unlock readline's full redisplay
-  (the rung below runs it as a dumb terminal: backspace-based editing, no cursor addressing), and a
-  real readiness op behind `select`'s finite-timeout probe would let readline batch typeahead.
+- **Typeahead batching** — `select`'s finite-timeout probe answers "nothing pending" (there is no
+  readiness op), so readline processes keystrokes one read at a time: correct, just un-batched on a
+  large paste. Deliberately out of scope for #1496 — a "bytes pending" query would be a core-side
+  pipe accessor or personality shadow-counting for a cosmetic win; revisit only for bracketed paste.
 - **#797 rung 2** — a PTY pair (`openpty`); deferred until a consumer needs one (bash does not).
 - Known band-0 papering (revisit when a differential trips over one): `fstat` synthesizes a
   chr-device for fds 0-2 and re-stats the recorded open path otherwise; `st_ino` is a path hash

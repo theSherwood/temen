@@ -259,7 +259,10 @@ Nothing here removes zero-copy sharing. Two mechanisms exist, both **explicit gr
   Stays exactly as built, as the *opt-in* placement for tightly-coupled children.
 - **§13 `SharedRegion`**: lend a region *into* a detached child at some offset; pointers are
   region-relative. This is the designed way for a detached parent and child to share bulk
-  data without giving up the child's private window.
+  data without giving up the child's private window. **Built ergonomically as op 15's optional
+  `(region, child_off)` pre-map** (PROCESS.md §5): the host grants the region and maps it whole into
+  the child's window before start, so the child needs no cap call to find it — see
+  `temen-interp/tests/detached_premap.rs`.
 
 So "sharing is a capability, not a mode" is already how the design is structured; this note
 adds no new primitive for it.

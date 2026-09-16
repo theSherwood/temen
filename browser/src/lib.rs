@@ -3974,13 +3974,23 @@ fn bash_host_build(
     // packed NUL strings), where the synthesized `_start` reads it. `PATH=/bin` lets bash resolve an
     // external command (`seq` → `/bin/seq`, registered above) for fork → execve; `HOME=/` is the
     // conventional minimum (the `bash_probe` env).
-    let env: &[&[u8]] = if interactive {
-        // The interactive session's prompt: bash prints PS1 on fd 2 between commands.
-        &[b"PATH=/bin", b"HOME=/", b"PS1=$ "]
+    // The interactive session's prompt (bash prints PS1 on fd 2 between commands) and the
+    // #1496 terminal description: readline runs its real redisplay against the personality's
+    // fixed termcap entry (80×24, no auto-margin — the CSI subset the playground pane renders).
+    let term = format!("TERM={}", temen_posix::TERM_NAME);
+    let termcap = format!("TERMCAP={}", temen_posix::TERMCAP_ENTRY);
+    let env: Vec<&[u8]> = if interactive {
+        vec![
+            b"PATH=/bin",
+            b"HOME=/",
+            b"PS1=$ ",
+            term.as_bytes(),
+            termcap.as_bytes(),
+        ]
     } else {
-        &[b"PATH=/bin", b"HOME=/"]
+        vec![b"PATH=/bin", b"HOME=/"]
     };
-    let blob = temen_ir::write_args_blob(argv, env);
+    let blob = temen_ir::write_args_blob(argv, &env);
     let base = temen_ir::module_args_base() as usize;
     let mut init_mem = vec![0u8; base + blob.len()];
     init_mem[base..].copy_from_slice(&blob);
@@ -12372,42 +12382,51 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     None
                 };
                 let had_cache = cached.is_some();
-                let emit = match cached {
-                    Some(c) => c,
-                    None => match JitOnrampRun::emit_for_run(&d.child, true) {
-                        Ok(e) => e,
-                        Err(_) => {
-                            // #1151 decline → the interpreter twin over a private sparse backing (the
-                            // child never enters the emitted tier, so it needs no JS-owned memory): seed
-                            // the segments + payload, run it to completion, bank the result.
-                            let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
-                            let back = std::sync::Arc::new(temen_interp::Region::paged(
-                                1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
-                                temen_interp::host_page_size(),
-                            ));
-                            for seg in &d.child.data {
-                                back.write_from(seg.offset, &seg.bytes);
-                            }
-                            back.write_from(0, &init_mem);
-                            let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
-                                prog,
-                                module,
-                                entry,
-                                back,
-                                size_log2,
-                                temen_ir::DEFAULT_RESERVED_LOG2,
-                                fuel,
-                                host,
-                            ) {
-                                Ok(c) => drive_detached_leaf(c),
-                                Err(t) => Err(t),
-                            };
-                            let handle = d.children.len() as i32;
-                            d.children.push(r);
-                            d.root.deliver_handle(handle);
-                            continue;
+                // An op-15 pre-mapped region is a §13 alias the emitted tier cannot honour (its
+                // loads/stores reach the child's own `Memory`, never the region's bytes) — exactly a
+                // child that `map`s for itself (`func_uses_region_ops`), so it declines the same way:
+                // whole-child, to the interpreter twin below, whose `Mem` aliases in software.
+                let emitted = if host.has_premap() {
+                    None
+                } else {
+                    match cached {
+                        Some(c) => Some(c),
+                        None => JitOnrampRun::emit_for_run(&d.child, true).ok(),
+                    }
+                };
+                let emit = match emitted {
+                    Some(e) => e,
+                    None => {
+                        // #1151 decline → the interpreter twin over a private sparse backing (the
+                        // child never enters the emitted tier, so it needs no JS-owned memory): seed
+                        // the segments + payload, run it to completion, bank the result.
+                        let prog: &'static bytecode::VcpuProgram = unsafe { &*d.prog };
+                        let back = std::sync::Arc::new(temen_interp::Region::paged(
+                            1u64 << temen_ir::DEFAULT_RESERVED_LOG2,
+                            temen_interp::host_page_size(),
+                        ));
+                        for seg in &d.child.data {
+                            back.write_from(seg.offset, &seg.bytes);
                         }
-                    },
+                        back.write_from(0, &init_mem);
+                        let r = match bytecode::Vcpu::new_confined_child_grow_over_host(
+                            prog,
+                            module,
+                            entry,
+                            back,
+                            size_log2,
+                            temen_ir::DEFAULT_RESERVED_LOG2,
+                            fuel,
+                            host,
+                        ) {
+                            Ok(c) => drive_detached_leaf(c),
+                            Err(t) => Err(t),
+                        };
+                        let handle = d.children.len() as i32;
+                        d.children.push(r);
+                        d.root.deliver_handle(handle);
+                        continue;
+                    }
                 };
                 let Some(mem_id) = foreign_mem::mint(
                     DETACHED_HEADER_BYTES + child_size,
