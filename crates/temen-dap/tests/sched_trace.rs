@@ -80,7 +80,6 @@ fn traced_run(src: &str) -> (BytecodeBackend, String) {
     let m = parse_module(src).expect("parses");
     let mut b = BytecodeBackend::new(m, 0, &[], u64::MAX, false, Vec::new(), false, None, None)
         .expect("subset");
-    assert!(b.is_threaded(), "a thread.spawn guest");
     assert!(Debuggee::set_sched_trace(&mut b, true), "trace armed");
     loop {
         match Debuggee::run_until_stop(&mut b) {
@@ -301,23 +300,46 @@ block 0 () {
             .expect("a response")
             .clone()
     };
-    for (name, engine) in [("treewalk", None), ("bytecode-single", Some("bytecode"))] {
+    // The tree-walker has no schedule to trace, so `schedTrace` fails its launch closed.
+    {
         let mut s = DapServer::new();
         s.handle(&req(1, "initialize", Json::obj(vec![])));
-        let mut launch = vec![
-            ("programText", Json::s(SINGLE)),
-            ("function", Json::i(0)),
-            ("args", Json::Arr(vec![])),
-            ("schedTrace", Json::Bool(true)),
-        ];
-        if let Some(e) = engine {
-            launch.push(("engine", Json::s(e)));
-        }
-        let out = s.handle(&req(2, "launch", Json::obj(launch)));
+        let out = s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(SINGLE)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("schedTrace", Json::Bool(true)),
+            ]),
+        ));
         assert_eq!(
             response(&out).get("success"),
             Some(&Json::Bool(false)),
-            "{name} + schedTrace fails the launch"
+            "treewalk + schedTrace fails the launch"
+        );
+    }
+    // A spawn-free bytecode guest is a **one-task schedule** (#1517 slice 4): `schedTrace` arms and
+    // its launch succeeds — the tape simply records that one task's turns.
+    {
+        let mut s = DapServer::new();
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        let out = s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(SINGLE)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+                ("schedTrace", Json::Bool(true)),
+            ]),
+        ));
+        assert_eq!(
+            response(&out).get("success"),
+            Some(&Json::Bool(true)),
+            "bytecode + schedTrace arms on a one-task schedule"
         );
     }
     // A threaded session without arming: the request fails cleanly.

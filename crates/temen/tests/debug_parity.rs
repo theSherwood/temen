@@ -13,6 +13,23 @@ use temen_ir::{Module, DEFAULT_RESERVED_LOG2};
 use temen_jit::{CompiledModule, Quota, INERT_CAP_THUNK};
 use temen_text::parse_module;
 
+/// The stop pc of a bytecode-engine (`ScheduledDebugRun`) stop, `None` once finished — for the
+/// `Option<IrPc>` comparisons against the tree-walker below. Panics on a park/decline (the parity
+/// fixtures are single-threaded, seam-free).
+fn sched_pc(s: bytecode::SchedStop) -> Option<IrPc> {
+    match s {
+        bytecode::SchedStop::Break { pc, .. } => Some(pc),
+        bytecode::SchedStop::Finished(_) => None,
+        other => panic!("unexpected bytecode-engine stop {other:?}"),
+    }
+}
+
+/// Arm `bps` and run the bytecode debug session to its next stop (the tree-walker `run_to` shape).
+fn run_to(dbg: &mut bytecode::ScheduledDebugRun, bps: &[IrPc], fuel: &mut u64) -> Option<IrPc> {
+    dbg.set_breakpoints(bps.to_vec());
+    sched_pc(dbg.run_until_stop(fuel))
+}
+
 /// The tree-walker's executed-instruction `IrPc` sequence, via logical-time `seek` (terminators don't
 /// tick, so each `t` is one executed instruction), plus the run result — the reference the other two
 /// engines are checked against.
@@ -508,7 +525,7 @@ debug.var 0 "acc" ssa 1 "int"
 "#;
 
 /// G3 foundation — **runtime** debug parity on a second engine, the piece G1/G2's one-shot traces
-/// don't exercise: the tree-walker `Inspector` and the resumable `bytecode::DebugRun` are driven
+/// don't exercise: the tree-walker `Inspector` and the resumable `bytecode::ScheduledDebugRun` are driven
 /// through the *same loop-body breakpoint* and must report identical stop locations and inspected
 /// `(i, acc)` at **every hit** (resume included), plus the same result. This is the load-bearing
 /// behavior a DAP-over-bytecode backend would wire into.
@@ -543,10 +560,10 @@ fn breakpoint_runtime_parity_across_loop_iterations() {
     };
 
     // Bytecode engine: the resumable debug session, same breakpoint, same inspection.
-    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).expect("bytecode debug session");
     let mut fuel = 100_000u64;
     let mut bc_hits: Vec<(Value, Value)> = Vec::new();
-    while let Some(pc) = dbg.run_to(&[bp], &mut fuel) {
+    while let Some(pc) = run_to(&mut dbg, &[bp], &mut fuel) {
         assert_eq!(
             pc, bp,
             "bytecode engine stopped at the loop-body breakpoint"
@@ -593,8 +610,8 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// Cross-frame runtime parity (G3 follow-up — multi-function `DebugRun`): stopped at a breakpoint
-/// *inside a callee*, the tree-walker `Inspector` and the bytecode `DebugRun` must report the **same
+/// Cross-frame runtime parity (G3 follow-up — multi-function debug session): stopped at a breakpoint
+/// *inside a callee*, the tree-walker `Inspector` and the bytecode `ScheduledDebugRun` must report the **same
 /// call-stack depth, the same per-frame location, and the same inspected locals in every frame** —
 /// the call stack a DAP `stackTrace`/`scopes`/`variables` exposes, now matched on the second engine.
 #[test]
@@ -619,10 +636,10 @@ fn breakpoint_runtime_parity_across_call_frames() {
     let bt = insp.backtrace();
 
     // Bytecode: the resumable session, same breakpoint.
-    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).expect("bytecode debug session");
     let mut fuel = 100_000u64;
     assert_eq!(
-        dbg.run_to(&[bp], &mut fuel),
+        run_to(&mut dbg, &[bp], &mut fuel),
         Some(bp),
         "bytecode stopped in the callee"
     );
@@ -653,7 +670,7 @@ fn breakpoint_runtime_parity_across_call_frames() {
 
 /// Stepping-verb parity (G3 follow-up): `step_over` and `step_out` exercise call-frame control the
 /// linear traces don't reach — `step_over` runs a call to completion, `step_out` returns from a frame.
-/// The tree-walker `Inspector` and the bytecode `DebugRun` must land at the same op and agree on the
+/// The tree-walker `Inspector` and the bytecode `ScheduledDebugRun` must land at the same op and agree on the
 /// (now-defined) call result. Uses `CALL_DBG` (caller `func 0` calls callee `func 1`).
 #[test]
 fn stepping_parity_over_and_out_at_a_call() {
@@ -688,11 +705,14 @@ fn stepping_parity_over_and_out_at_a_call() {
         let mut insp = Inspector::attach(&m, 0, &args, 100_000);
         insp.set_breakpoint(call);
         assert_eq!(stop_pc(insp.run_until_stop()), Some(call));
-        let mut dbg = bytecode::DebugRun::new(&m, 0, &args).unwrap();
+        let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).unwrap();
         let mut fuel = 100_000u64;
-        assert_eq!(dbg.run_to(&[call], &mut fuel), Some(call));
+        assert_eq!(run_to(&mut dbg, &[call], &mut fuel), Some(call));
 
-        assert_eq!(dbg.step_over(&mut fuel), stop_pc(insp.step_over()));
+        assert_eq!(
+            sched_pc(dbg.step_over(&mut fuel)),
+            stop_pc(insp.step_over())
+        );
         assert_eq!(
             dbg.frame_pc(0),
             Some(after_call),
@@ -709,12 +729,12 @@ fn stepping_parity_over_and_out_at_a_call() {
         let mut insp = Inspector::attach(&m, 0, &args, 100_000);
         insp.set_breakpoint(in_callee);
         assert_eq!(stop_pc(insp.run_until_stop()), Some(in_callee));
-        let mut dbg = bytecode::DebugRun::new(&m, 0, &args).unwrap();
+        let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).unwrap();
         let mut fuel = 100_000u64;
-        assert_eq!(dbg.run_to(&[in_callee], &mut fuel), Some(in_callee));
+        assert_eq!(run_to(&mut dbg, &[in_callee], &mut fuel), Some(in_callee));
         assert_eq!(dbg.depth(), 2, "stopped inside the callee");
 
-        assert_eq!(dbg.step_out(&mut fuel), stop_pc(insp.step_out()));
+        assert_eq!(sched_pc(dbg.step_out(&mut fuel)), stop_pc(insp.step_out()));
         assert_eq!(
             dbg.frame_pc(0),
             Some(after_call),
@@ -783,12 +803,12 @@ fn stepout_runs_to_completion_when_caller_immediately_returns() {
     );
 
     // Bytecode engine: identical outcome (this is the parity claim, not a divergence).
-    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).expect("bytecode debug session");
     let mut fuel = 100_000u64;
-    assert_eq!(dbg.run_to(&[in_callee], &mut fuel), Some(in_callee));
+    assert_eq!(run_to(&mut dbg, &[in_callee], &mut fuel), Some(in_callee));
     assert_eq!(dbg.depth(), 2, "stopped inside the callee");
     assert_eq!(
-        dbg.step_out(&mut fuel),
+        sched_pc(dbg.step_out(&mut fuel)),
         None,
         "bytecode step_out reports no stop — the run finished"
     );
@@ -821,9 +841,9 @@ debug.var 0 "s" ssa 2 "int"
 "#;
 
 /// Name-based variable read parity (the engine-side prerequisite for a DAP `variables` backend):
-/// `DebugRun::read_var` resolves the same `VarLoc`s as `Inspector::read_var` — a window var from
+/// `ScheduledDebugRun::read_var` resolves the same `VarLoc`s as `Inspector::read_var` — a window var from
 /// window memory, an SSA var from the typed value slot — and returns identical `VarValue`s at the same
-/// stop. With this, `DebugRun` mirrors the Inspector's full forward-debug API (breakpoints, stepping,
+/// stop. With this, the bytecode engine mirrors the Inspector's full forward-debug API (breakpoints, stepping,
 /// backtrace, indexed + named inspection), all parity-tested.
 #[test]
 fn read_var_by_name_parity() {
@@ -840,9 +860,9 @@ fn read_var_by_name_parity() {
     insp.set_breakpoint(bp);
     assert!(matches!(insp.run_until_stop(), Stop::Break { pc, .. } if pc == bp));
 
-    let mut dbg = bytecode::DebugRun::new(&m, 0, &args).expect("bytecode debug session");
+    let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).expect("bytecode debug session");
     let mut fuel = 100_000u64;
-    assert_eq!(dbg.run_to(&[bp], &mut fuel), Some(bp));
+    assert_eq!(run_to(&mut dbg, &[bp], &mut fuel), Some(bp));
 
     for name in ["w", "s"] {
         let tw = insp.read_var(0, name, 4);

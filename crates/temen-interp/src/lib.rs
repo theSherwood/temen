@@ -20462,7 +20462,7 @@ impl Host {
         submit: HostCompletion,
         pending: Option<&mut Option<u64>>,
     ) -> Result<Vec<i64>, Trap> {
-        // Only a driver that surfaces the park (`Vcpu`, `DebugRun`) can ever finish this call:
+        // Only a driver that surfaces the park (`Vcpu`, `ScheduledDebugRun`) can ever finish this call:
         // decline before the submit hook runs under any other, so the embedder never records a
         // dead request.
         if !self.completions.host_completed_allowed() {

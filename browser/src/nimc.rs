@@ -498,7 +498,14 @@ pub(crate) fn drive_op13<'p>(
                     Err(t) => vcpu.deliver_jit_invoke(Err(t), std::sync::Arc::from(Vec::new())),
                 }
             }
-            _ => return Err(Trap::Malformed),
+            // A phase is single-threaded and non-interactive: no threads, no tier-up (this is the
+            // interpreter path), no cap or stdin park. Named rather than `_` (see `VcpuEvent`).
+            bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Spawn { .. }
+            | bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::CapPending { .. }
+            | bytecode::VcpuEvent::StdinPark => return Err(Trap::Malformed),
         }
     }
 }
