@@ -16447,12 +16447,14 @@ fn preseeded_iface_shapes() -> [(u32, Vec<(&'static str, FuncType)>); 2] {
         params: vec![],
         results: vec![],
     };
-    // `exit(code: i32)` — noreturn. The one built-in besides `Stream` whose signature every
-    // caller in the tree already agrees on (every `call.cap EXIT 0` site is `(i32) -> ()`, and it
-    // is the `sig_exit` the manifest tests declare), so it can be seeded without pinning a
-    // convention first. `Clock` and `SharedRegion` are *not* seeded for exactly that reason:
+    // `exit(code)` — noreturn. Seeded at `(i32) -> ()`, which is the *arity* every caller in the
+    // tree agrees on; the width does not agree (five sites declare `(i32) -> ()`, `temen-dap`'s
+    // `exit_code` manifest declares `(i64) -> ()`), which is why the bind check compares arity —
+    // see `sig_binds_as_capability`. `Clock` and `SharedRegion` are *not* seeded because their
+    // *arity* disagrees, which no amount of width tolerance papers over:
     // `Clock.now` is called both as `(i32) -> (i64)` and `() -> (i64)`, `SharedRegion.map` both
-    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost.
+    // 4-arg and 2-arg — seeding either would silently fail coverage for whichever form lost, and
+    // would make the bind check refuse it.
     let exit = FuncType {
         params: vec![ValType::I32],
         results: vec![],
@@ -16482,6 +16484,49 @@ fn preseeded_iface_id(names: &[String], sigs: &[FuncType]) -> Option<u32> {
                 .all(|(((cn, s), t), n)| s == t && cn == n))
         .then_some(id)
     })
+}
+
+/// One import the powerbox binder ([`Host::bind_powerbox_manifest`]) refused although its **name**
+/// resolved to a capability: the declared signature is not that capability op's, so binding it
+/// would dispatch with the wrong calling convention (#1524). The slot is left unbound (fail-closed
+/// `CapFault` at use); this record is returned so an embedder can say *why* rather than leaving a
+/// silent hole. Not an error type — a refusal is a legitimate outcome for a program whose extern
+/// merely collided with a capability name.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShapeRefusal {
+    /// Index into the module's import table.
+    pub import: u32,
+    pub name: String,
+    /// What the module declared (a `TypeEntry::Func` behind [`temen_ir::ImportShape::Func`]).
+    pub declared: FuncType,
+    /// What the capability op's pinned shape says it must be.
+    pub expected: FuncType,
+}
+
+/// The pinned signature of one built-in capability op, or `None` when that built-in's convention is
+/// not pinned yet (#1515 decision 1 — seven of nine) or the op is out of range. The single source
+/// is [`preseeded_iface_shapes`], so this cannot drift from what `coverage_remap` and
+/// `cap_dispatch_slots` already derive from the same table.
+fn canonical_op_sig(type_id: u32, op: u32) -> Option<FuncType> {
+    builtin_iface_shape(type_id)?
+        .into_iter()
+        .nth(op as usize)
+        .map(|(_, ft)| ft)
+}
+
+/// Does `declared` bind as the capability whose pinned signature is `expected`?
+///
+/// **Arity, not exact types.** The hazard this discriminates (#1524) is the retained
+/// *function-symbol* import, whose C list is led by the data stack pointer — so the wrong form
+/// always carries at least one extra parameter, and arity is what separates them. Scalar width is
+/// *not* a discriminator: the tree legitimately declares the same capability at both widths
+/// (`exit` is `(i32) -> ()` at five sites and `(i64) -> ()` in `temen-dap`'s `exit_code` manifest),
+/// the dispatcher reads the code the same way either way, and rejecting one of them would refuse a
+/// well-formed capability import to catch nothing. Comparing exact `FuncType`s here did exactly
+/// that — it broke that manifest on every platform.
+fn sig_binds_as_capability(declared: &FuncType, expected: &FuncType) -> bool {
+    declared.params.len() == expected.params.len()
+        && declared.results.len() == expected.results.len()
 }
 
 /// The canonical op names + signatures of a pre-seeded built-in interface
@@ -19860,6 +19905,93 @@ impl Host {
         self.import_remaps = vec![None; bindings.len()];
         self.import_reqs = vec![None; bindings.len()];
         self.import_bindings = bindings;
+    }
+
+    /// Bind a **root module's manifest against the powerbox grants** — the one binder every
+    /// embedder uses (#1524). Import `i`'s name resolves through the shared name→cap table
+    /// ([`temen_ir::PowerboxHandles::bind`]) to a `(type_id, op)` and the handle this host granted
+    /// for it; a name outside the table, or a capability this host chose not to grant, leaves the
+    /// slot **unbound** — a dispatch through it is a fail-closed `CapFault`.
+    ///
+    /// `host_procs` is consulted first: names this host serves as a raw [`cap_id::HOST_PROC`]
+    /// (the `vm_fs` memfs seam, the debugger's host-completed caps), bound flat at op 0 with the
+    /// guest's own op riding in arg0. Passing a name here overrides the powerbox table for it.
+    ///
+    /// **Why this is one function.** It replaced eight hand-copied
+    /// `imports.iter().map(|im| granted.bind(&im.name))` blocks (browser ×3, temen-run, temen-dap,
+    /// three tests) — INVARIANTS #15's "second route through a behaviour that already has one",
+    /// once per embedder. The shape check below had to land in all eight or none.
+    ///
+    /// **The shape check (#1524).** A name resolving to a capability is *not* sufficient to bind
+    /// it: the import must also be *shaped* like that capability's op. A frontend emits two
+    /// different things through the same `call.sym` syntax —
+    ///
+    /// * a **capability** import — the handle operand is a real granted handle, the args are the
+    ///   op's args (chibicc's `gen_builtin_import`, the `<temen.h>` §7 late-binding pattern);
+    /// * a **function-symbol** import — a cross-TU call to a declared-but-undefined function,
+    ///   whose args are the C list *led by the data stack pointer* (chibicc `--emit-object`).
+    ///
+    /// Both intern as [`temen_ir::ImportShape::Func`], so the shape *enum* cannot tell them apart —
+    /// only the signature can. When the retained function-symbol import's name happens to be a
+    /// powerbox row (`extern long vm_map(long, long)` in a program unit that no linked unit
+    /// defines), binding it by name alone dispatches the capability with every argument shifted by
+    /// one: the data-SP arrives where the length belongs. So an import whose declared signature does
+    /// not bind as the capability op's ([`sig_binds_as_capability`] — **arity**, since the data-SP
+    /// is what changes it, and scalar width legitimately varies) is refused here and left unbound,
+    /// and the refusal is returned for the embedder to surface.
+    ///
+    /// This is only as strong as the *pinned* signatures: [`builtin_iface_shape`] is seeded for
+    /// `Stream` and `Exit` (#1515 slice 1), so those two are checked. The other seven built-ins
+    /// have no canonical signature yet — #1515's decision 1 is exactly that, and is the owner's to
+    /// make — so a name resolving to one binds unchecked, as before. The gap is narrowed here, not
+    /// closed; #1524 records what closing it needs.
+    pub fn bind_powerbox_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        types: &[temen_ir::TypeEntry],
+        granted: &temen_ir::PowerboxHandles,
+        host_procs: &[(&str, i32)],
+    ) -> Vec<ShapeRefusal> {
+        if imports.is_empty() {
+            return Vec::new();
+        }
+        let mut refusals = Vec::new();
+        let bindings = imports
+            .iter()
+            .enumerate()
+            .map(|(i, im)| {
+                if let Some((_, h)) = host_procs.iter().find(|(n, _)| *n == im.name) {
+                    return BoundImport::required(cap_id::HOST_PROC, 0, *h);
+                }
+                let Some((cap, handle)) = granted.bind(&im.name) else {
+                    return BoundImport::rebindable(0, 0, None);
+                };
+                // Only a *flat* import can be a mis-shaped function-symbol import; a grouped
+                // (`Interface`) one is coverage-bound elsewhere and never carries the C list.
+                if let (temen_ir::ImportShape::Func(t), Some(expected)) =
+                    (im.shape, canonical_op_sig(cap.type_id, cap.op))
+                {
+                    match types.get(t as usize) {
+                        Some(temen_ir::TypeEntry::Func(declared))
+                            if sig_binds_as_capability(declared, &expected) => {}
+                        Some(temen_ir::TypeEntry::Func(declared)) => {
+                            refusals.push(ShapeRefusal {
+                                import: i as u32,
+                                name: im.name.clone(),
+                                declared: declared.clone(),
+                                expected,
+                            });
+                            return BoundImport::rebindable(0, 0, None);
+                        }
+                        // A malformed type reference (an unverified module): fail closed too.
+                        _ => return BoundImport::rebindable(0, 0, None),
+                    }
+                }
+                BoundImport::required(cap.type_id, cap.op, handle)
+            })
+            .collect();
+        self.set_import_bindings(bindings);
+        refusals
     }
 
     /// Mark this domain **durable**: its module has been freeze/thaw-instrumented, so the runtime

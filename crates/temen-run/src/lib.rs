@@ -6438,20 +6438,15 @@ impl Instance {
                         jit: Some(jit),
                         stderr: Some(stderr),
                     };
-                    let bindings = self
-                        .module
-                        .imports
-                        .iter()
-                        .map(|im| match granted.bind(&im.name) {
-                            Some((cap, handle)) => {
-                                temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                            }
-                            // Unknown name, or a capability this host did not grant: declared but
-                            // unbound — fail-closed at dispatch.
-                            None => temen_interp::BoundImport::rebindable(0, 0, None),
-                        })
-                        .collect();
-                    h.set_import_bindings(bindings);
+                    // The one shared powerbox binder (#1524). An unknown name, a capability
+                    // this host did not grant, or a declared signature that is not the
+                    // capability op's: declared but unbound — fail-closed at dispatch.
+                    h.bind_powerbox_manifest(
+                        &self.module.imports,
+                        &self.module.types,
+                        &granted,
+                        &[],
+                    );
                 }
             }
         }

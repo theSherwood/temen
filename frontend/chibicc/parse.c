@@ -45,6 +45,8 @@ typedef struct {
   bool is_extern;
   bool is_inline;
   bool is_tls;
+  // #1524: `__attribute__((temen_cap))` seen on this declaration — see `Obj::is_temen_cap`.
+  bool is_temen_cap;
   int align;
 } VarAttr;
 
@@ -3290,12 +3292,16 @@ static Token *function(Token *tok, Type *basety, VarAttr *attr) {
     if (!fn->is_static && attr->is_static)
       error_tok(tok, "static declaration follows a non-static declaration");
     fn->is_definition = fn->is_definition || equal(tok, "{");
+    // #1524: a later declaration may be the one carrying the attribute (a call site that
+    // includes the capability header after a bare forward declaration) — sticky, never cleared.
+    fn->is_temen_cap = fn->is_temen_cap || attr->is_temen_cap;
   } else {
     fn = new_gvar(name_str, ty);
     fn->is_function = true;
     fn->is_definition = equal(tok, "{");
     fn->is_static = attr->is_static || (attr->is_inline && !attr->is_extern);
     fn->is_inline = attr->is_inline;
+    fn->is_temen_cap = attr->is_temen_cap;
   }
 
   fn->is_root = !(fn->is_static && fn->is_inline);
@@ -3414,6 +3420,42 @@ static void declare_builtin_functions(void) {
 }
 
 // program = (typedef | function-definition | global-variable)*
+// A **leading** attribute list on a top-level declaration:
+//   `__attribute__((temen_cap)) extern long now(int h, int clk);`
+//
+// Distinct from `attribute_list`, which decorates a *type* (`packed`/`aligned` on a struct or
+// enum); this one decorates the *declaration*, so it fills a `VarAttr`. Only `temen_cap` (#1524)
+// is recognized — every other attribute is skipped, the way a real C compiler tolerates an
+// attribute it does not implement. Skipping is also the conservative choice here: before this
+// existed a leading top-level attribute was a hard parse error, so nothing in the tree can
+// depend on it being rejected, and chibicc's own sources reach the self-host build with
+// `__attribute__` macro-erased by `chibicc.h` regardless.
+static Token *decl_attribute_list(Token *tok, VarAttr *attr) {
+  while (equal(tok, "__attribute__")) {
+    tok = skip(tok->next, "(");
+    tok = skip(tok, "(");
+    int depth = 1; // we are inside the inner `(`
+    while (depth > 0) {
+      if (tok->kind == TK_EOF)
+        error_tok(tok, "unterminated __attribute__");
+      if (equal(tok, "(")) {
+        depth++;
+      } else if (equal(tok, ")")) {
+        depth--;
+        if (depth == 0)
+          break;
+      } else if (depth == 1 &&
+                 (equal(tok, "temen_cap") || equal(tok, "__temen_cap__"))) {
+        attr->is_temen_cap = true;
+      }
+      tok = tok->next;
+    }
+    tok = skip(tok, ")"); // the inner `)`
+    tok = skip(tok, ")"); // the outer `)`
+  }
+  return tok;
+}
+
 Obj *parse(Token *tok) {
   declare_builtin_functions();
   globals = NULL;
@@ -3425,6 +3467,7 @@ Obj *parse(Token *tok) {
     }
 
     VarAttr attr = {};
+    tok = decl_attribute_list(tok, &attr);
     Type *basety = declspec(&tok, tok, &attr);
 
     // Typedef

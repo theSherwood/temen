@@ -247,17 +247,8 @@ fn run_phase(m: &Module, argv: &[&str], fs: HostProc, exec: Option<HostProc>) ->
             jit: None,
             stderr: None,
         };
-        let bindings = m
-            .imports
-            .iter()
-            .map(|im| match granted.bind(&im.name) {
-                Some((cap, handle)) => {
-                    temen_interp::BoundImport::required(cap.type_id, cap.op, handle)
-                }
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            })
-            .collect();
-        host.set_import_bindings(bindings);
+        // The one shared powerbox binder (#1524).
+        host.bind_powerbox_manifest(&m.imports, &m.types, &granted, &[]);
     }
     // Seed argv at the module's args base (the on-ramp `_start` parses argc/argv from it). #964/#1094:
     // a phase guest reads its args one guard up, at `module_args_base` (guard + POWERBOX_ARGS_BASE) —
