@@ -509,7 +509,9 @@ enum Op {
     /// size_log2, quota[, args_ptr, args_len])` (op 15, #1286): a separate-module child in a **fresh
     /// window** minted through a `Budget` — no carve, no alias; the host owns the window. The
     /// optional trailing `(args_ptr, args_len)` is the spawn-time args payload copied to the child's
-    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve").
+    /// `module_args_base()` (the detached twin of the op-13 "parent data segment in the carve"); the
+    /// further optional `(region, child_off)` pre-maps a `SharedRegion` whole into the child's window
+    /// at `child_off` before it starts (the 11-arg form).
     InstantiateDetached {
         handle: u32,
         budget: u32,
@@ -519,6 +521,7 @@ enum Op {
         size_log2: u32,
         quota: u32,
         args: Option<(u32, u32)>,
+        premap: Option<(u32, u32)>,
         dst: u32,
     },
     /// CONSOLIDATION.md §3d — `instantiate_rec(record_ptr)` (op 17): the config-record spawn.
@@ -1761,6 +1764,7 @@ fn compile_inst(
                     size_log2: g(args[5]),
                     quota: g(args[6]),
                     args: (args.len() >= 9).then(|| (g(args[7]), g(args[8]))),
+                    premap: (args.len() >= 11).then(|| (g(args[9]), g(args[10]))),
                     dst,
                 },
                 // CONSOLIDATION.md §3d — instantiate_rec (op 17): the record pointer is the one
@@ -3058,7 +3062,10 @@ pub enum VcpuEvent {
     /// starter caps span the reservation, as a root's do, so `vm_map` grows it — the tree-walker's
     /// op-15 arm grants the same), and
     /// [`Vcpu::deliver_handle`]s the join handle — the [`VcpuEvent::Instantiate`] protocol minus the
-    /// carve.
+    /// carve. A spawn with a grant list and/or a pre-mapped region stashes the child powerbox
+    /// ([`Vcpu::take_granted_host`] is `Some`); the pre-map rides it and the child constructor applies
+    /// it, so a driver needs no extra step — a driver whose emitted tier cannot honour a §13 alias
+    /// checks `Host::has_premap` and runs such a child on the interpreter.
     InstantiateDetached {
         module: u32,
         entry: u32,
@@ -3598,6 +3605,11 @@ impl<'p> Vcpu<'p> {
         // compare is unconditional). `seed_null_guard` skips a carve smaller than the guard, so a tiny
         // sub-window (a 1-KiB grandchild) stays fully usable.
         mm.seed_null_guard(temen_ir::module_null_guard());
+        // Op-15 pre-map: the region staged into this powerbox is aliased onto the fresh window before
+        // the child starts, through its own `map` path. Nothing staged ⇒ no-op.
+        if host.apply_premap(&mut mm) < 0 {
+            return Err(Trap::Malformed);
+        }
         let mem = Some(mm);
         let mut vt = VTask::new(&cunit, entry as usize, &args)?;
         vt.active.module = module as usize;
@@ -4030,6 +4042,7 @@ impl<'p> Vcpu<'p> {
                     dst,
                     grants,
                     args,
+                    premap,
                 }) => {
                     let glist = match grants {
                         Some((gptr, gn)) => match self.read_grant_list(gptr, gn) {
@@ -4039,14 +4052,30 @@ impl<'p> Vcpu<'p> {
                         None => None,
                     };
                     match self.event_instantiate_detached(
-                        budget, mh, entry, size_log2, quota, args, dst,
+                        budget, mh, entry, size_log2, quota, args, premap, dst,
                     ) {
                         Ok(Some(ev)) => {
-                            if let Some(list) = glist {
-                                match self.regrant_list_into_child(&list) {
-                                    Ok(h) => self.pending_granted_host = Some(h),
+                            // A grant list and/or a pre-mapped region ride the stashed child powerbox
+                            // (the driver builds the child over it; the constructor applies the map).
+                            if glist.is_some() || premap.is_some() {
+                                let mut child = match self
+                                    .regrant_list_into_child(glist.as_deref().unwrap_or(&[]))
+                                {
+                                    Ok(h) => h,
                                     Err(t) => return VcpuEvent::Trapped(t),
+                                };
+                                if let Some((r, o)) = premap {
+                                    let staged = match self.shared_host {
+                                        Some(m) => {
+                                            m.lock_unpoisoned().stage_premap(r, o, &mut child)
+                                        }
+                                        None => self.host.stage_premap(r, o, &mut child),
+                                    };
+                                    if !staged {
+                                        return VcpuEvent::Trapped(Trap::CapFault);
+                                    }
                                 }
+                                self.pending_granted_host = Some(child);
                             }
                             return ev;
                         }
@@ -4279,6 +4308,7 @@ impl<'p> Vcpu<'p> {
         size_log2: i64,
         quota: i64,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
         dst: u32,
     ) -> Result<Option<VcpuEvent>, Trap> {
         let (cfuncs, cmem_log2, cimports, ctypes, cdata) = match self.shared_host {
@@ -4329,6 +4359,14 @@ impl<'p> Vcpu<'p> {
         };
         let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
         let payload_ok = payload.len() as u64 <= args_room;
+        // The pre-mapped region's geometry (a forged handle traps, as the tree-walker's arm).
+        let premap_ok = match premap {
+            Some((r, o)) => match self.shared_host {
+                Some(m) => m.lock_unpoisoned().premap_admit(r, o, child_size)?,
+                None => self.host.premap_admit(r, o, child_size)?,
+            },
+            None => true,
+        };
         // A **durable** domain refuses op 15 outright (PROCESS.md §5): a detached window is outside
         // the subtree snapshot, and a child no freeze can see is worse than a probeable `-EINVAL`.
         // The tree-walker and the native thunk gate the same way; this arm must too (#1299) — and
@@ -4337,7 +4375,7 @@ impl<'p> Vcpu<'p> {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
         };
-        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || durable {
+        if !ok_entry || child_size == 0 || !mod_ok || !payload_ok || !premap_ok || durable {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }
@@ -9422,7 +9460,8 @@ enum Outcome {
     },
     /// §5 `Instantiator.instantiate_detached` (op 15, #1286): a separate-module child in a fresh
     /// host-minted window. `budget` is the `Budget` handle (admission = quota take), `grants`
-    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window.
+    /// the by-name list, `args` the optional spawn-time payload `(ptr, len)` in this vCPU's window,
+    /// `premap` the optional `(region, child_off)` pre-mapped `SharedRegion`.
     InstantiateDetached {
         budget: i32,
         mh: i32,
@@ -9432,6 +9471,7 @@ enum Outcome {
         dst: u32,
         grants: Option<(u64, u64)>,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
     },
     /// `memory.wait`: futex wait on confined address `base` (already validated); `dst` gets the
     /// status (0 woken / 1 not-equal / 2 timed-out).
@@ -10346,6 +10386,7 @@ enum VcpuStop {
         dst: u32,
         grants: Option<(u64, u64)>,
         args: Option<(u64, u64)>,
+        premap: Option<(i32, u64)>,
     },
     Wait {
         base: u64,
@@ -10855,6 +10896,7 @@ fn step_vcpu(
                 dst,
                 grants,
                 args,
+                premap,
             } => {
                 return Ok(VcpuStop::InstantiateDetached {
                     budget,
@@ -10865,6 +10907,7 @@ fn step_vcpu(
                     dst,
                     grants,
                     args,
+                    premap,
                 })
             }
             Outcome::CapPending { id, dst } => return Ok(VcpuStop::CapPending { id, dst }),
@@ -16877,6 +16920,7 @@ impl Vm {
                     size_log2,
                     quota,
                     args,
+                    premap,
                     dst,
                 } => {
                     let ih = r!(*handle).i32();
@@ -16890,6 +16934,7 @@ impl Vm {
                         .map(|(pr, nr)| (r!(pr).i64() as u64, r!(nr).i64() as u64))
                         .filter(|(_, n)| *n != 0);
                     let args = args.map(|(pr, lr)| (r!(pr).i64() as u64, r!(lr).i64() as u64));
+                    let premap = premap.map(|(rr, or)| (r!(rr).i64() as i32, r!(or).i64() as u64));
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
@@ -16904,6 +16949,7 @@ impl Vm {
                         dst,
                         grants,
                         args,
+                        premap,
                     });
                 }
                 // CONSOLIDATION.md §3d — `instantiate_rec` (op 17): read the 56-byte record from
