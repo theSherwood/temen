@@ -727,7 +727,7 @@ pub struct Inspector {
     /// nearest one (`clock ≤ t`) instead of clock 0 — turning a backward sweep from O(t²) into
     /// ~O(t·stride). Keyed on the op clock; unbounded. Empty in scheduled mode or once `checkpointing`
     /// is off.
-    checkpoints: moment::Ladder<SeekContinuation>,
+    checkpoints: moment::Ladder,
     /// Whether this run is eligible for checkpointing — the single-threaded, **root-only, non-fiber,
     /// non-durable, simple-memory** subset where `frames` + window bytes fully capture the
     /// continuation. Starts `true`; the first replay that observes state outside the subset clears it
@@ -776,17 +776,6 @@ struct HostReplaySubstate {
     /// the artifact cannot drift apart. `None` for a provider that declared none, which is the common
     /// case (`display` is pure output; `keyboard` is a queue the guest refills).
     cap_states: Vec<Option<Vec<u8>>>,
-}
-
-/// The tree-walker's half of a single-threaded time-travel **checkpoint** (W1): the sole vCPU's call
-/// stack and fuel, so [`Inspector::seek`] can restart a replay at the checkpoint's clock rather than
-/// from clock 0. Captured only for the root-only / non-fiber / non-durable / simple-memory subset (see
-/// [`VCpu::checkpointable`]), where these plus the window image fully determine the continuation. The
-/// window image and the host substate are the [`Moment`](moment::Moment)'s own halves, shared with
-/// every other engine's checkpoint; the clock is the ladder's key, not the checkpoint's.
-struct SeekContinuation {
-    frames: Vec<Frame>,
-    fuel: u64,
 }
 
 /// The inputs a single-threaded run was started with, kept so [`Inspector::seek`] can re-execute it
@@ -1375,8 +1364,11 @@ impl Inspector {
             init.null_guard,
         );
         if let Some((clock, cp)) = start {
-            let c = cp.continuation();
-            root.restore_continuation(c.frames.clone(), c.fuel, cp.mem(), clock);
+            let c = cp
+                .continuation()
+                .as_shadow_stack()
+                .expect("a single-threaded seek ladder holds only ShadowStack moments");
+            root.restore_continuation(c.frames().to_vec(), c.fuel(), cp.mem(), clock);
             cp.restore_host(&mut host.lock_unpoisoned());
         }
         self.host = host;
@@ -1462,10 +1454,10 @@ impl Inspector {
             moment::Moment::new(
                 root.mem.as_ref().map(|m| m.layout_snapshot()),
                 &h,
-                SeekContinuation {
-                    frames: root.frames.clone(),
-                    fuel: root.fuel,
-                },
+                moment::Continuation::ShadowStack(moment::ShadowStack::new(
+                    root.frames.clone(),
+                    root.fuel,
+                )),
             )
         };
         self.checkpoints.take(clock, cp);
@@ -4017,7 +4009,7 @@ fn run_one_schedule(
 /// fiber's continuation is exactly its `Vec<Frame>`, which `suspend` pauses and
 /// `cont.resume` restarts.
 #[derive(Clone)]
-struct Frame {
+pub(crate) struct Frame {
     /// The function this activation is executing — stored as an **index** (not a borrow) so a
     /// `Frame` (hence a whole vCPU continuation) is self-contained and movable between worker
     /// threads. Resolved against [`Frame::module`]'s `Arc<[Func]>` at each use.
