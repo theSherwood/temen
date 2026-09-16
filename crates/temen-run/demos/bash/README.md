@@ -348,7 +348,10 @@ moves down with an explicit `\n\r`, so the playground pane's row/cursor model (`
 `ESC [ A/B/C/D/K`; the bracketed-paste toggles readline now emits are dropped) renders a wrapped
 line edited at its start without emulating autowrap glitches. The entry is fixed rather than "real"
 so the differential stays byte-for-byte; echo and editing remain readline's own (`rl_outstream` =
-fd 2).
+fd 2). One shim gap surfaced on the way: a WRAPPED line's redisplay diffs the old and new
+rows char-by-char (`update_line` → `_rl_compare_chars` → `_rl_get_char_len` → `mbrlen`), and `mbrlen`
+was an unprovided extern (trap-stubbed → `Unreachable`) — the single-row cases never reach it, so the
+`dumb` rung never hit it. Added to the shim's `MB_CUR_MAX = 1` band (with the glibc `__mbrlen` alias).
 
 One shim gap closed the whole rung: readline's `rl_getc` waits in `pselect(fd, NULL timeout)`
 BEFORE every `read` and treats a negative result as EOF, so the old `-1` stub ended a readline

@@ -730,6 +730,18 @@ unsigned long wcrtomb(char *s, int wc, void *ps) {
   *s = (char)wc;
   return 1;
 }
+/* mbrlen — the length-only twin of mbrtowc (== mbrtowc(NULL, s, n, ps)). readline's redisplay
+ * reaches it through `_rl_get_char_len`/`_rl_compare_chars` when it must diff a WRAPPED line char
+ * by char (the single-row cases never call it, which is why the dumb-fallback rung never hit this).
+ * MB_CUR_MAX = 1: every byte is a complete char, so it never returns -1. clang emits the glibc
+ * alias `__mbrlen`, so define both. */
+unsigned long mbrlen(const char *s, unsigned long n, void *ps) {
+  (void)ps;
+  if (!s) return 0;
+  if (n == 0) return (unsigned long)-2;
+  return *s ? 1 : 0;
+}
+unsigned long __mbrlen(const char *s, unsigned long n, void *ps) { return mbrlen(s, n, ps); }
 int mbsinit(const void *ps) { (void)ps; return 1; }
 unsigned long mbstowcs(int *dst, const char *src, unsigned long n) {
   unsigned long i = 0;

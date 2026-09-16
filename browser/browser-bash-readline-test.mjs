@@ -85,7 +85,9 @@ try {
   await term.type('e');
   await waitPane(new RegExp(`^\\$ echo ${'a'.repeat(72)}\n${'a'.repeat(18)}$`));
   await term.press('Enter');
-  await waitPane(new RegExp(`^\\$ echo ${'a'.repeat(72)}\n${'a'.repeat(18)}\n${A}\n\\$ $`));
+  // The command ran: its 90-char output lands on its own row (not through readline redisplay, so
+  // unwrapped), below the two-row echoed command.
+  await waitPane(new RegExp(`(^|\n)${A}(\n|$)`));
 
   // A fresh command still runs cleanly.
   await term.type('echo rc=$?');

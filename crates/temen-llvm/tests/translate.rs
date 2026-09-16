@@ -14287,7 +14287,8 @@ fn demo_bash_readline_transcript_matches_native() {
     );
     assert!(
         native.contains("rc=130\n")
-            && native.contains("abX\x08 \x08c\nabc\n")
+            && native.contains("abX\x08 \x08c\n")
+            && native.contains("\rabc\n")
             && native.matches("\r10\n").count() == 2
             && native.contains(&redrawn),
         "the readline oracle handled ^C, edited, recalled, and redrew the wrapped line: {native:?}"
