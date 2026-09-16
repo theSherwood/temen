@@ -125,32 +125,7 @@ pub fn render_json() -> String {
         s.push_str(&format!("\"{}\"", b.short()));
     }
     s.push_str("],\n");
-    s.push_str("  \"statuses\": {\n");
-    // One list, so adding a status cannot leave the JSON map and the trailing-comma logic out of
-    // step (the index was hard-coded to 3 before `Unaudited` existed).
-    const ALL_STATUSES: [Status; 5] = [
-        Status::Full,
-        Status::Declines,
-        Status::NotYet,
-        Status::Conditional,
-        Status::Unaudited,
-    ];
-    for (i, st) in ALL_STATUSES.iter().enumerate() {
-        s.push_str(&format!(
-            "    \"{}\": {{ \"glyph\": \"{}\", \"label\": \"{}\" }}{}\n",
-            st.id(),
-            st.glyph(),
-            match st {
-                Status::Full => "Full",
-                Status::Declines => "Declines (parity not expected)",
-                Status::NotYet => "Not yet (parity not achieved)",
-                Status::Conditional => "Conditional",
-                Status::Unaudited => "Unaudited (nobody has established this cell)",
-            },
-            if i + 1 == ALL_STATUSES.len() { "" } else { "," }
-        ));
-    }
-    s.push_str("  },\n");
+    write_statuses(&mut s);
     s.push_str("  \"ops\": [\n");
     for (i, op) in ops.iter().enumerate() {
         let cells = op.cells();
@@ -181,6 +156,105 @@ pub fn render_json() -> String {
         }
         s.push_str("] }");
         s.push_str(if i + 1 == ops.len() { "\n" } else { ",\n" });
+    }
+    s.push_str("  ]\n}\n");
+    s
+}
+
+/// The `"statuses"` map both JSON views carry — one vocabulary, written by one function, so the
+/// playground page renders either matrix with the same glyphs, ids and labels (INVARIANTS #15).
+/// One list, so adding a status cannot leave the map and the trailing-comma logic out of step (the
+/// index was hard-coded to 3 before `Unaudited` existed).
+fn write_statuses(s: &mut String) {
+    const ALL_STATUSES: [Status; 5] = [
+        Status::Full,
+        Status::Declines,
+        Status::NotYet,
+        Status::Conditional,
+        Status::Unaudited,
+    ];
+    s.push_str("  \"statuses\": {\n");
+    for (i, st) in ALL_STATUSES.iter().enumerate() {
+        s.push_str(&format!(
+            "    \"{}\": {{ \"glyph\": \"{}\", \"label\": \"{}\" }}{}\n",
+            st.id(),
+            st.glyph(),
+            match st {
+                // Worded for both matrices: on the op matrix a decline is a fold to the oracle,
+                // on the frontier it is a capability that deliberately does not cross an axis —
+                // "by design, and the note says why" is true of each.
+                Status::Full => "Full",
+                Status::Declines => "Declines (by design — the note says why)",
+                Status::NotYet => "Not yet (a real gap)",
+                Status::Conditional => "Conditional (holds where the note's condition does)",
+                Status::Unaudited => "Unaudited (nobody has established this cell)",
+            },
+            if i + 1 == ALL_STATUSES.len() { "" } else { "," }
+        ));
+    }
+    s.push_str("  },\n");
+}
+
+/// Render the frontier matrix as JSON for the playground's parity page — the **second matrix** that
+/// page was designed to host (#1418), from the one classifier `render_frontier_markdown` reads.
+///
+/// Shape: `axes` are the columns (with each one's question and whether a conformance test checks
+/// it), `rows` are capabilities with one status id per axis and the non-empty notes keyed by axis.
+/// The page counts coverage from the cells itself, so no derived totals ride here to drift.
+pub fn render_frontier_json() -> String {
+    use crate::frontier::{capability_axes, Axis, Capability};
+    let mut s = String::new();
+    s.push_str("{\n");
+    s.push_str("  \"_generated\": \"do not edit by hand — `cargo run -p temen-parity`\",\n");
+    s.push_str("  \"axes\": [\n");
+    for (i, a) in Axis::ALL.iter().enumerate() {
+        s.push_str("    { \"short\": ");
+        json_str(&mut s, a.short());
+        s.push_str(", \"question\": ");
+        json_str(&mut s, a.question());
+        s.push_str(&format!(", \"conformed\": {} }}", a.is_conformed()));
+        s.push_str(if i + 1 == Axis::ALL.len() {
+            "\n"
+        } else {
+            ",\n"
+        });
+    }
+    s.push_str("  ],\n");
+    write_statuses(&mut s);
+    s.push_str("  \"rows\": [\n");
+    for (i, c) in Capability::ALL.iter().enumerate() {
+        let cells = capability_axes(*c);
+        s.push_str("    { \"capability\": ");
+        json_str(&mut s, c.name());
+        s.push_str(", \"cells\": [");
+        for (j, cell) in cells.iter().enumerate() {
+            if j > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("\"{}\"", cell.status.id()));
+        }
+        s.push_str("], \"notes\": [");
+        let mut first = true;
+        for (a, cell) in Axis::ALL.iter().zip(cells.iter()) {
+            if cell.note.is_empty() {
+                continue;
+            }
+            if !first {
+                s.push_str(", ");
+            }
+            first = false;
+            s.push_str("{ \"axis\": ");
+            json_str(&mut s, a.short());
+            s.push_str(", \"text\": ");
+            json_str(&mut s, cell.note);
+            s.push_str(" }");
+        }
+        s.push_str("] }");
+        s.push_str(if i + 1 == Capability::ALL.len() {
+            "\n"
+        } else {
+            ",\n"
+        });
     }
     s.push_str("  ]\n}\n");
     s

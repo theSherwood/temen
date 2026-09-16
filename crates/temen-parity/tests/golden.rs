@@ -38,6 +38,19 @@ fn frontier_md_is_up_to_date() {
 }
 
 #[test]
+fn frontier_json_is_up_to_date() {
+    assert_fresh(
+        repo_root()
+            .join("browser")
+            .join("web")
+            .join("assets")
+            .join("frontier.json"),
+        temen_parity::render_frontier_json(),
+        "browser/web/assets/frontier.json",
+    );
+}
+
+#[test]
 fn ops_parity_md_is_up_to_date() {
     assert_fresh(
         repo_root().join("OPS_PARITY.md"),

@@ -3,9 +3,9 @@
   "backends": ["temen-tree-walk", "temen-bytecode", "temen-jit", "temen-wasm-jit"],
   "statuses": {
     "full": { "glyph": "✅", "label": "Full" },
-    "declines": { "glyph": "⛔", "label": "Declines (parity not expected)" },
-    "notyet": { "glyph": "🚧", "label": "Not yet (parity not achieved)" },
-    "conditional": { "glyph": "🔶", "label": "Conditional" },
+    "declines": { "glyph": "⛔", "label": "Declines (by design — the note says why)" },
+    "notyet": { "glyph": "🚧", "label": "Not yet (a real gap)" },
+    "conditional": { "glyph": "🔶", "label": "Conditional (holds where the note's condition does)" },
     "unaudited": { "glyph": "❔", "label": "Unaudited (nobody has established this cell)" }
   },
   "ops": [
