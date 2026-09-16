@@ -544,11 +544,11 @@ different things depending on which pair you compare:
   on both the single-vCPU and scheduled engines (slice 17), and the **§22 guest-JIT `Jit` capability**
   (`compile`/`install`/`uninstall`/`invoke`) — serviced inline in `debug_advance_fiber`, so a guest-JIT
   program steps op-by-op on both engines with breakpoints firing around the ops, bit-identical to the
-  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on the single-vCPU
-  `DebugRun` (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into): a
-  breakpoint fires *inside* the unit and the backtrace descends into its module-≥1 frames, over the
-  caller's shared window — while the scheduled engine keeps invoke an opaque leaf (as it does
-  coroutines). Two boundaries stay forward-first (as every seam landed): **source-variable** names
+  oracle (`bytecode_debug_jit.rs`). `Jit.invoke` **steps into** the invoked unit on both engines
+  (`active_invoke`/`step_active_invoke`, the §22 counterpart of coroutine step-into; the scheduled
+  engine since #1517 slice 3 — it kept invoke an opaque leaf before): a breakpoint fires *inside* the
+  unit and the backtrace descends into its module-≥1 frames, over the caller's shared window. Two
+  boundaries stay forward-first (as every seam landed): **source-variable** names
   inside an invoked/installed unit's frame resolve to `None` (its module-≥1 SSA metadata is not plumbed;
   `IrPc`s/stepping/backtrace are exact), and **reverse-replay across a §22 op** is out-of-subset (an
   `install` mutates the shared dispatch table, and an in-flight `invoke` holds a transient `Vm` — both

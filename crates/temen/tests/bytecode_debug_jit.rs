@@ -11,7 +11,7 @@
 //! production `run_invoke`); `install` + `call.dyn` steps op-by-op like any module-≥1 frame.
 
 use temen_encode::encode_module;
-use temen_interp::bytecode::{DebugRun, SchedStop, ScheduledDebugRun};
+use temen_interp::bytecode::{DebugRun, SchedBreak, SchedStop, ScheduledDebugRun};
 use temen_interp::{run_with_host, Host, IrPc, Trap, Value};
 use temen_ir::Data;
 use temen_run::grant_jit;
@@ -151,11 +151,11 @@ fn debug_install_then_call_indirect_agrees() {
 }
 
 /// **`invoke` under the debugger — result agreement.** Guest `(jit, a, b)`: compile a unit and `invoke`
-/// it with `(a, b)`. The unit is `(a,b) -> a+b`, so `(6,7) → 13`. Run to completion: the single-vCPU
-/// engine steps *into* the invoked unit (see `debug_invoke_step_into_breakpoint`) and the scheduled
-/// engine runs it as an opaque leaf — either way the result matches the oracle.
+/// it with `(a, b)`. The unit is `(a,b) -> a+b`, so `(6,7) → 13`. Run to completion: both engines step
+/// *into* the invoked unit (see `debug_invoke_step_into_breakpoint`) and the result matches the oracle
+/// (the unit is a seam-free leaf over the caller's window either way).
 #[test]
-fn debug_invoke_leaf_agrees() {
+fn debug_invoke_agrees() {
     let b = blob(
         "memory 16\nfunc (i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32) {\n  \
          v2 = i32.add v0 v1\n  return v2\n  }\n}\n",
@@ -192,12 +192,13 @@ fn debug_invoke_leaf_agrees() {
     assert_eq!(sched_to_end(&mut sched, &mut fuel2), want);
 }
 
-/// **Step *into* an invoked unit** (single-vCPU `DebugRun`). A breakpoint set at an op **inside** the
-/// invoked unit (module ≥ 1 — the unit is `source.push`ed at invoke time) must fire, and the reported
-/// stop `IrPc` must be in the unit's module, not the caller's — i.e. the debugger descends into
-/// `Jit.invoke` rather than treating it as an opaque leaf. The unit is `(a,b) -> a + b + 100`
-/// (inst 0 `add`, inst 1 `const 100`, inst 2 `add`), so a breakpoint at inst 1 fires only if inst 0
-/// executed *inside* the unit; continuing yields `6 + 7 + 100 = 113`, matching the oracle.
+/// **Step *into* an invoked unit** — on both engines (#1517 slice 3: the scheduled engine used to keep
+/// invoke an opaque leaf). A breakpoint set at an op **inside** the invoked unit (module ≥ 1 — the unit
+/// is `source.push`ed at invoke time) must fire, and the reported stop `IrPc` must be in the unit's
+/// module, not the caller's — i.e. the debugger descends into `Jit.invoke`. The unit is
+/// `(a,b) -> a + b + 100` (inst 0 `add`, inst 1 `const 100`, inst 2 `add`), so a breakpoint at inst 1
+/// fires only if inst 0 executed *inside* the unit; continuing yields `6 + 7 + 100 = 113`, matching
+/// the oracle. A `step_out` from inside the unit lands back in the caller (the cumulative depth).
 #[test]
 fn debug_invoke_step_into_breakpoint() {
     let b = blob(
@@ -208,15 +209,16 @@ fn debug_invoke_step_into_breakpoint() {
         "memory 16\nfunc (i32, i32, i32) -> (i32) {\nblock 0 (v0: i32, v1: i32, v2: i32) {\n  \
          v3 = i64.const 20480\n  v4 = i64.const BLOBLEN\n  \
          v5 = call.cap 11 0 (i64, i64) -> (i64) v0 (v3, v4)\n  \
-         v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  return v6\n  }\n}\n";
+         v6 = call.cap 11 1 (i64, i32, i32) -> (i32) v0 (v5, v1, v2)\n  \
+         v7 = i32.add v6 v2\n  return v7\n  }\n}\n";
     let m = guest_module(guest_src, &b);
     let (host, jit) = jit_host(&m, 0);
     let args = [Value::I32(jit), Value::I32(6), Value::I32(7)];
 
     let want = oracle(&m, &args);
     assert!(
-        matches!(&want, Ok(v) if v.as_slice() == [Value::I32(113)]),
-        "oracle: 6+7+100 = 113, got {want:?}"
+        matches!(&want, Ok(v) if v.as_slice() == [Value::I32(120)]),
+        "oracle: (6+7+100) + 7 = 120, got {want:?}"
     );
 
     // The invoked unit is pushed to module 1 (the guest is module 0, no installs). Break at inst 1
@@ -242,9 +244,39 @@ fn debug_invoke_step_into_breakpoint() {
         Some(1),
         "the running frame at the breakpoint is the invoked unit's (module 1)"
     );
-    // Continuing runs the unit + caller to completion, matching the oracle.
+    // Step out of the unit: back in the caller (module 0), then to completion, matching the oracle.
+    assert_eq!(
+        run.step_out(&mut fuel).map(|pc| pc.module),
+        Some(0),
+        "step_out from inside the unit lands in the caller"
+    );
     assert_eq!(run.run_to(&[], &mut fuel), None);
-    assert_eq!(run.result().cloned(), Some(want));
+    assert_eq!(run.result().cloned(), Some(want.clone()));
+
+    // The scheduled engine: the same breakpoint inside the unit fires on the (sole) thread, the top
+    // frame is the unit's, step_out lands in the caller, and the run completes with the same result.
+    let (host2, _) = jit_host(&m, 0);
+    let mut sched = ScheduledDebugRun::new_with_host(&m, 0, &args, host2)
+        .expect("scheduled debug engine drives §22 invoke");
+    let mut fuel2 = 50_000_000u64;
+    sched.set_breakpoints(vec![inside_unit]);
+    assert!(
+        matches!(
+            sched.run_until_stop(&mut fuel2),
+            SchedStop::Break { pc, reason: SchedBreak::Breakpoint } if pc == inside_unit
+        ),
+        "breakpoint INSIDE the invoked unit fires on the scheduled engine too"
+    );
+    assert_eq!(sched.frame_pc(0).map(|pc| pc.module), Some(1));
+    assert!(
+        matches!(
+            sched.step_out(&mut fuel2),
+            SchedStop::Break { pc, reason: SchedBreak::Step } if pc.module == 0
+        ),
+        "scheduled step_out from inside the unit lands in the caller"
+    );
+    sched.set_breakpoints(Vec::new());
+    assert_eq!(sched_to_end(&mut sched, &mut fuel2), want);
 }
 
 /// **Fail-closed under the debugger.** A `Jit.install` / `Jit.invoke` of a **forged** code handle
