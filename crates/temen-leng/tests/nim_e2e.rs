@@ -1345,12 +1345,51 @@ fn real_threadpool_and_parfor_link_and_run() {
     }
 }
 
+/// **`std/ioring` links and runs**, the last module the posix/socket edge was holding back. Same
+/// shape as `threadpool`: every descriptor call sits inside an explicit proc (`initIoRing`,
+/// `listenTcp`, `submitRead`), so importing is safe and a program that opens a socket gets -1.
+#[test]
+fn real_ioring_links_and_runs() {
+    let src = "import std/syncio\nimport std/ioring\n\nwrite(stdout, \"ok\")\n";
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_ioring_links_and_runs (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "ok");
+}
+
+/// **`htons` computes, it does not stub.** It rides in with `std/ioring`'s socket leaves but is not
+/// one of them: it is a pure 16-bit byte swap a guest is perfectly entitled to perform, so binding it
+/// to the -1 its neighbours return would silently hand `listenTcp` a wrong port rather than fail.
+/// Values are checked against the swap itself — `80 -> 0x5000`, `0x1234 -> 0x3412` — so a regression
+/// to a constant stub cannot pass.
+#[test]
+fn real_htons_byte_swaps() {
+    let src = concat!(
+        "import std/syncio\n",
+        "\n",
+        "proc htons(x: uint16): uint16 {.importc, header: \"<arpa/inet.h>\".}\n",
+        "\n",
+        "let a = htons(80\'u16)\n",
+        "let b = htons(0x1234\'u16)\n",
+        "let c = htons(0\'u16)\n",
+        "write(stdout, $a & \"|\" & $b & \"|\" & $c)\n",
+    );
+    let Some(out) = run_libc_program(src) else {
+        eprintln!("SKIP real_htons_byte_swaps (no toolchain / libc asset)");
+        return;
+    };
+    assert_eq!(String::from_utf8_lossy(&out), "20480|13330|0");
+}
+
 /// **#1422 stage-3 runnability sweep.** The `#760` sweep above answers "does it *translate*?"; this
 /// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
 /// [`discovered_std_modules`] it compiles a driver that imports the module, links it through the real
-/// `link_nim_powerbox` **with the guest libc**, and checks the result verifies and asks for nothing
-/// beyond the one `write` stream cap. A module that links with an extra manifest entry has an
-/// unbound bottom-edge leaf: it would fail to instantiate in the playground, so it is not runnable.
+/// `link_nim_powerbox` **with the guest libc**, checks the result verifies and asks for nothing
+/// beyond the one `write` stream cap, and then **runs it and requires the driver's "ok"**. A module
+/// that links with an extra manifest entry has an unbound bottom-edge leaf and would fail to
+/// instantiate in the playground; a module that links and then dies in its own start-up is no more
+/// runnable, and only running it says so.
 ///
 /// This is a **diagnostic, not a gate** — it drives the whole nimony toolchain once per module
 /// (~20 minutes for the full list), so it is gated on `NIM_RUN_SWEEP=1` and stays out of CI. What
@@ -1436,16 +1475,47 @@ fn runnability_sweep() {
             Ok(module) => match temen_verify::verify_module(&module) {
                 Err(e) => unrunnable.push((m, format!("verify: {e:?}"))),
                 Ok(()) => {
-                    let extra: Vec<&str> = module
+                    // Report each unbound leaf **with its signature**: the name alone says a
+                    // provider is missing, the shape says what to write. Binding one means adding a
+                    // shim func of exactly this type, so printing it here is the difference between
+                    // "go read the nim source" and "write this func".
+                    let extra: Vec<String> = module
                         .imports
                         .iter()
-                        .map(|i| i.name.as_str())
-                        .filter(|n| *n != "write")
+                        .filter(|i| i.name != "write")
+                        .map(|i| match i.shape {
+                            temen_ir::ImportShape::Func(t) => match module.types.get(t as usize) {
+                                Some(temen_ir::TypeEntry::Func(f)) => {
+                                    format!("{} {:?} -> {:?}", i.name, f.params, f.results)
+                                }
+                                _ => format!("{} (bad type ref)", i.name),
+                            },
+                            _ => format!("{} (grouped)", i.name),
+                        })
                         .collect();
-                    if extra.is_empty() {
-                        runnable.push(m);
-                    } else {
+                    if !extra.is_empty() {
                         unrunnable.push((m, format!("unbound leaves: {}", extra.join(", "))));
+                    } else {
+                        // **Then actually run it.** Linking with no extra manifest entry says the
+                        // bottom edge is covered; it does not say the module survives its own
+                        // start-up. `std/encodings` is the case in point: its `Dl.…` global is
+                        // initialized by a `nimLoadLibrary` call chain ending in `nimDynlibCheck`,
+                        // which `die(1)`s when the handle is nil — and the `dlopen` stub always
+                        // returns nil. The moment leng can lower a call-initialized global,
+                        // `encodings` would link cleanly and abort on every run, and a sweep that
+                        // stopped at the manifest would report it green. Running the driver and
+                        // requiring its "ok" closes that gap for every module at once.
+                        match temen_run::run_powerbox(&module, &[]) {
+                            Err(e) => unrunnable.push((m, format!("run: {e}"))),
+                            Ok(run) if run.stdout != b"ok" => unrunnable.push((
+                                m,
+                                format!(
+                                    "ran but printed {:?}",
+                                    String::from_utf8_lossy(&run.stdout)
+                                ),
+                            )),
+                            Ok(_) => runnable.push(m),
+                        }
                     }
                 }
             },
@@ -1565,6 +1635,8 @@ const STD_MODULES: &[&str] = &[
     // `{.emit.}` half fixed the other four threading modules and left these two on `epoll_*`.
     "parfor",
     "threadpool",
+    // Runnable since its posix/socket edge was stubbed and `htons` given a real byte swap.
+    "ioring",
     "strutils",
     "sequtils",
     "algorithm",
