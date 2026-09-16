@@ -13183,6 +13183,9 @@ fn py_escape(bytes: &[u8]) -> String {
 fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("python3");
     cmd.arg(bash_demo_dir().join("pty_oracle.py")).arg(oracle);
+    // #1496 — the personality's fixed terminal description, on both sides of the differential.
+    cmd.env("TERM", temen_posix::TERM_NAME)
+        .env("TERMCAP", temen_posix::TERMCAP_ENTRY);
     for c in chunks {
         cmd.arg(py_escape(c.as_bytes()));
     }
@@ -13241,7 +13244,8 @@ fn bash_temen_transcript(
             b"PATH=/bin".to_vec(),
             b"HOME=/".to_vec(),
             b"PS1=$ ".to_vec(),
-            b"TERM=dumb".to_vec(),
+            format!("TERM={}", temen_posix::TERM_NAME).into_bytes(),
+            format!("TERMCAP={}", temen_posix::TERMCAP_ENTRY).into_bytes(),
             b"HISTFILE=".to_vec(),
         ],
         ..Default::default()
@@ -13273,7 +13277,8 @@ fn bash_temen_transcript_session(
             b"PATH=/bin".to_vec(),
             b"HOME=/".to_vec(),
             b"PS1=$ ".to_vec(),
-            b"TERM=dumb".to_vec(),
+            format!("TERM={}", temen_posix::TERM_NAME).into_bytes(),
+            format!("TERMCAP={}", temen_posix::TERMCAP_ENTRY).into_bytes(),
             b"HISTFILE=".to_vec(),
         ],
         ..Default::default()
@@ -14174,12 +14179,13 @@ fn demo_bash_translates_and_verifies() {
 /// missing): the `TEMEN_BASH_READLINE=1` build variant (bundled readline + bundled termcap linked in,
 /// `--disable-readline` dropped) translates, verifies, still runs `bash -c` byte-identical to its own
 /// native oracle, and — the point — an interactive `bash -i` session with LINE EDITING (backspace,
-/// arrow-up history recall) produces the same interleaved terminal transcript as native readline
-/// under a real pty, on the tree-walker and both bytecode drivers. Readline runs in its
-/// `TERM=dumb` fallback on both sides (no termcap database in-guest; `bash_cv_termcap_lib=gnutermcap`
-/// pins the oracle to the same bundled library), so the editing output is backspace-based, no cursor
-/// motion. `#[ignore]`d for wall-clock (a second configure + native build of bash); skips loudly
-/// without the toolchain or `python3`.
+/// arrow-up history recall, a wrapped line edited at its start) produces the same interleaved
+/// terminal transcript as native readline under a real pty, on the tree-walker and both bytecode
+/// drivers. Both sides run the bundled termcap (`bash_cv_termcap_lib=gnutermcap`) over the
+/// personality's fixed `TERMCAP` entry (#1496, [`temen_posix::TERMCAP_ENTRY`]: 80×24, no
+/// auto-margin), so readline does its real redisplay — cursor-up, carriage-return, clear-to-eol —
+/// rather than the `TERM=dumb` fallback. `#[ignore]`d for wall-clock (a second configure + native
+/// build of bash); skips loudly without the toolchain or `python3`.
 #[test]
 #[ignore = "capstone: builds the readline variant of bash (minutes); run with --ignored"]
 fn demo_bash_readline_transcript_matches_native() {
@@ -14248,9 +14254,13 @@ fn demo_bash_readline_transcript_matches_native() {
     // cleans up — `rl_restart_output` → `tcflow`, a trap stub before the shim grew it — re-raises
     // into bash's handler, and bash reprints the prompt with `$? = 130`), a backspace (`\x7f` =
     // readline's rubout → `\b \b`), arrow-up (`ESC [ A` — previous-history recalls and re-runs the
-    // `x=5` line), and `^D`. Readline's handler makes the `^C` outcome deterministic on this feed
-    // path (unlike the canonical-mode race, #1252): parked or not, the pending SIGINT lands in
+    // `x=5` line), a line WIDER than the terminal edited at its start (#1496: `cho aaa…` wraps at
+    // 79 columns onto a second row; Home (`ESC [ H`) then `e` redraws both rows in place with
+    // cursor-up + carriage-return — one chunk, since the prompt-wait protocol types a chunk only at
+    // a fresh prompt), and `^D`. Readline's handler makes the `^C` outcome deterministic on this
+    // feed path (unlike the canonical-mode race, #1252): parked or not, the pending SIGINT lands in
     // `rl_getc`'s `RL_CHECK_SIGNALS`.
+    let wide = format!("cho {}\x1b[He\n", "a".repeat(90));
     let chunks: &[&str] = &[
         "echo hi\n",
         "\x03",
@@ -14259,6 +14269,7 @@ fn demo_bash_readline_transcript_matches_native() {
         "x=5; echo $((x*2))\n",
         "\x1b[A\n",
         "false; echo rc=$?\n",
+        &wide,
         "\x04",
     ];
     let Some(native) = bash_pty_oracle_transcript(&oracle, chunks) else {
@@ -14266,11 +14277,20 @@ fn demo_bash_readline_transcript_matches_native() {
         return;
     };
     let native = String::from_utf8_lossy(&native).into_owned();
+    // The oracle's own shape (readline's bracketed-paste toggles ride along on a non-dumb
+    // terminal): ^C → rc=130, the rubout, the recall, and the wrapped line's final redraw — the
+    // 79-column first row, `\n\r` down to the 18-char tail, `ESC [ A` back up, `\r$ e`.
+    let redrawn = format!(
+        "$ echo {}\n\r{}\x1b[A\r$ e\n",
+        "a".repeat(72),
+        "a".repeat(18)
+    );
     assert!(
-        native.contains("$ \n$ echo rc=$?\nrc=130\n")
+        native.contains("rc=130\n")
             && native.contains("abX\x08 \x08c\nabc\n")
-            && native.matches("\n10\n").count() == 2,
-        "the readline oracle handled ^C, edited, and recalled as expected: {native:?}"
+            && native.matches("\r10\n").count() == 2
+            && native.contains(&redrawn),
+        "the readline oracle handled ^C, edited, recalled, and redrew the wrapped line: {native:?}"
     );
     for (label, backend) in [
         ("tree-walker", None),

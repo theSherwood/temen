@@ -5,8 +5,9 @@
 // (readline erases with `\b \b`, which the pane interprets instead of printing raw control bytes).
 //
 // The session: type `echo abX`, Backspace, `c`, Enter → the pane's committed line is `$ echo abc`
-// and the output `abc`; ArrowUp + Enter re-runs it (a second `abc`); `echo rc=$?` → `rc=0`; ^D ends
-// the session with bash's `exit` farewell. Needs the deploy-built assets (bash.temen; GPLv3, never
+// and the output `abc`; ArrowUp + Enter re-runs it (a second `abc`); a 94-column line wraps onto two
+// rows and is edited at its start (#1496 — the real termcap redisplay); `echo rc=$?` → `rc=0`; ^D
+// ends the session with bash's `exit` farewell. Needs the deploy-built assets (bash.temen; GPLv3, never
 // committed) and Playwright — SKIPs cleanly when they are absent. Run: node browser-bash-readline-test.mjs
 import { startServer } from './serve.mjs';
 import { benignAssetMiss } from './play-test-errors.mjs';
@@ -71,6 +72,20 @@ try {
   await page.waitForFunction(
     (sel) => (document.querySelector(sel).textContent.match(/(?:^|\n)abc\n/g)?.length ?? 0) >= 2,
     `${CARD} pre.stdout`, { timeout: 60000 });
+
+  // #1496 — readline's real redisplay against the personality's TERMCAP entry (80×24, no
+  // auto-margin): a line wider than the terminal wraps at 79 columns onto a second row, and editing
+  // at its start (Home, insert `e`) redraws both rows in place with cursor-up + carriage-return.
+  // The pane's row/cursor model must show the final state — the echoed command on two rows and the
+  // 90-char output on one — with no stale `cho aaa…` row and no duplicated tail.
+  const A = 'a'.repeat(90);
+  await term.type(`cho ${A}`);
+  await waitPane(new RegExp(`^\\$ cho ${'a'.repeat(73)}\n${'a'.repeat(17)}$`));
+  await term.press('Home');
+  await term.type('e');
+  await waitPane(new RegExp(`^\\$ echo ${'a'.repeat(72)}\n${'a'.repeat(18)}$`));
+  await term.press('Enter');
+  await waitPane(new RegExp(`^\\$ echo ${'a'.repeat(72)}\n${'a'.repeat(18)}\n${A}\n\\$ $`));
 
   // A fresh command still runs cleanly.
   await term.type('echo rc=$?');
