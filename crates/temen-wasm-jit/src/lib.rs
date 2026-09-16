@@ -3979,13 +3979,7 @@ fn emit_module(
         section(&mut out, 9, &sec);
     }
 
-    let mut sec = Vec::new(); // code section (10)
-    uleb(&mut sec, bodies.len() as u64);
-    for b in &bodies {
-        uleb(&mut sec, b.len() as u64);
-        sec.extend_from_slice(b);
-    }
-    section(&mut out, 10, &sec);
+    code_section(&mut out, bodies);
 
     // Name section (custom id 0, "name", function-names subsection) — names each emitted wasm function by
     // its **export symbol name** (`lua_checkstack`, `JS_CallInternal` …), plus the cross-tier trampolines
@@ -4283,6 +4277,37 @@ fn section(out: &mut Vec<u8>, id: u8, payload: &[u8]) {
     out.push(id);
     uleb(out, payload.len() as u64);
     out.extend_from_slice(payload);
+}
+
+/// Encoded length of `v` as a uleb128.
+fn uleb_len(mut v: u64) -> usize {
+    let mut n = 1;
+    while v >= 0x80 {
+        v >>= 7;
+        n += 1;
+    }
+    n
+}
+
+/// The code section (10), written **straight into `out`**: `out` is reserved to the exact section
+/// size up front and each body is freed as soon as it is copied, so the peak is one copy of the code
+/// rather than three (`bodies` + a staged section payload + `out`). The code of a large child (a
+/// nimony phase) is hundreds of MB, and the emit runs inside the browser's 1 GiB linear memory —
+/// the staged copy is what tipped the real-browser nifler gate into `rust_oom`.
+fn code_section(out: &mut Vec<u8>, bodies: Vec<Vec<u8>>) {
+    let payload_len = uleb_len(bodies.len() as u64)
+        + bodies
+            .iter()
+            .map(|b| uleb_len(b.len() as u64) + b.len())
+            .sum::<usize>();
+    out.reserve(1 + uleb_len(payload_len as u64) + payload_len);
+    out.push(10);
+    uleb(out, payload_len as u64);
+    uleb(out, bodies.len() as u64);
+    for b in bodies {
+        uleb(out, b.len() as u64);
+        out.extend_from_slice(&b);
+    }
 }
 
 fn import_name(out: &mut Vec<u8>, module: &str, name: &str) {
@@ -5221,14 +5246,7 @@ pub fn compile_split_fn(
     uleb(&mut sec, WIN_GLOBAL_IDX as u64);
     section(&mut out, 7, &sec);
 
-    // Code section (10).
-    let mut sec = Vec::new();
-    uleb(&mut sec, bodies.len() as u64);
-    for b in &bodies {
-        uleb(&mut sec, b.len() as u64);
-        sec.extend_from_slice(b);
-    }
-    section(&mut out, 10, &sec);
+    code_section(&mut out, bodies);
 
     Ok(out)
 }
