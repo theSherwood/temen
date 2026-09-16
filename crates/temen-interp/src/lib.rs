@@ -18501,10 +18501,6 @@ pub struct Host {
     /// mirrors how the interpreter's `Mem` keeps its page map across calls. Page index → state code
     /// (`temen_run` owns the encoding); absent ⇒ region default. Reset when a new window base appears.
     cap_pages: Option<(usize, CapPageMap)>,
-    /// #964: the running module's NULL guard (`0` = unguarded), recorded by
-    /// [`Host::set_self_module`] so the JIT cap path's window backend can enforce the reserved
-    /// region without the module in reach.
-    null_guard: u64,
     /// §15 spawn quota (fiber/vCPU ceilings) the embedder sets for this domain ([`Host::set_quota`]);
     /// default = the hard anti-bomb ceilings, so an unconfigured run is unchanged. `drive` reads it to
     /// size the executor's live-vCPU cap and each vCPU's fiber cap.
@@ -18989,7 +18985,6 @@ impl Host {
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
             cap_pages: None,
-            null_guard: 0,
             quota: Quota::default(),
             jit_tables: Vec::new(),
             jit_validator: None,
@@ -21470,17 +21465,7 @@ impl Host {
     /// `self.type_id`, `self.covers`, and `export.handle` resolve through one host-side
     /// entry on all three backends. Unregistered, those ops fail closed (probeable `CapFault`).
     pub fn set_self_module(&mut self, m: &Arc<Module>) {
-        // #964/#1094: every module's window reserves `[0, guard)` (the unconditional guard). Recording
-        // it here — the one place every run path registers the running module — lets the native JIT's
-        // Memory-cap backend (`temen-run`'s `MprotectWindow`, rebuilt per `call.cap` with no module
-        // in reach) mirror the interpreter's refusal/unmapped semantics for the reserved region.
-        self.null_guard = temen_ir::module_null_guard();
         self.self_module = Some(Arc::clone(m));
-    }
-
-    /// #964: the running module's NULL guard (`0` = unguarded) — see [`Host::set_self_module`].
-    pub fn null_guard(&self) -> u64 {
-        self.null_guard
     }
 
     /// §3.6 slice 2 — enqueue a dispatch onto this domain's bounded inbound queue, to be served

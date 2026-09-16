@@ -420,11 +420,18 @@ unsafe fn cap_thunk_impl(
     let pages = host.cap_window_pages(mem_base as usize);
     #[cfg(any(unix, windows))]
     let mut wm = MprotectWindow::new_shared(mem_base, mem_size, mem_reserved, pages);
-    // #964: carry the running module's NULL guard into the window backend (recorded on the host
-    // at `set_self_module` time — the thunk has no module in reach), so `[0, guard)` is refused
-    // to page ops and reads as unmapped to borrow checks, matching the interpreter oracle.
+    // #964/#1094: carry the NULL guard into the window backend, so `[0, guard)` is refused to page
+    // ops and reads as unmapped to borrow checks, matching the interpreter oracle. Read from
+    // `module_null_guard()` — the single chokepoint every tier reads the extent from (INVARIANTS
+    // #13: the guard is UNCONDITIONAL, a constant of the layout, not per-run state). It used to come
+    // from `Host::null_guard()`, which only became non-zero as a side effect of `set_self_module` —
+    // so an embedder that never registered a self module (nothing else about page ops needs one) ran
+    // the JIT with guard `0` and let a guest `map`/`unmap`/`protect` inside the reserved region the
+    // interpreter refuses. The `diff` fuzz target found it: `map(off=8192, len=4096)` is `-EINVAL` on
+    // the interpreter and `0` on the JIT, the two tiers disagreeing about an invariant that is
+    // supposed to hold on all of them.
     #[cfg(any(unix, windows))]
-    wm.set_null_guard(host.null_guard());
+    wm.set_null_guard(temen_ir::module_null_guard());
     #[cfg(any(unix, windows))]
     let gm: Option<&mut dyn GuestMem> = if mem_base.is_null() {
         None
