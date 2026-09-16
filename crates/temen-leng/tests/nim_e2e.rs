@@ -1274,7 +1274,7 @@ fn real_envvars_report_an_empty_environment() {
 
 /// **#1422 stage-3 runnability sweep.** The `#760` sweep above answers "does it *translate*?"; this
 /// one answers "does it *run*?" — the question stage 3 is about. For every stdlib module in
-/// [`STD_MODULES_ALL`] it compiles a driver that imports the module, links it through the real
+/// [`discovered_std_modules`] it compiles a driver that imports the module, links it through the real
 /// `link_nim_powerbox` **with the guest libc**, and checks the result verifies and asks for nothing
 /// beyond the one `write` stream cap. A module that links with an extra manifest entry has an
 /// unbound bottom-edge leaf: it would fail to instantiate in the playground, so it is not runnable.
@@ -1300,12 +1300,51 @@ fn runnability_sweep() {
         eprintln!("SKIP runnability_sweep (no guest libc asset)");
         return;
     };
+    let Some(stdlib) = nimony_stdlib_dir() else {
+        eprintln!("SKIP runnability_sweep (cannot locate nimony lib/std)");
+        return;
+    };
     let strict = std::env::var("NIM_RUN_SWEEP_STRICT").is_ok();
-    let mods: &[&str] = if strict { STD_MODULES } else { STD_MODULES_ALL };
+    let all = discovered_std_modules(&stdlib);
+    // A name in the green list that is not in `lib/std/` is a stale entry, not a passing module:
+    // before #1490 seven of them sat in `STD_MODULES` and were silently counted as green because a
+    // missing file fails at the nimony step and strict mode only asserted on `unrunnable`.
+    let missing_green: Vec<&str> = STD_MODULES
+        .iter()
+        .copied()
+        .filter(|m| !all.iter().any(|a| a == m))
+        .collect();
+    assert!(
+        missing_green.is_empty(),
+        "STD_MODULES names modules that are not in {stdlib:?}: {missing_green:?} \
+         — remove them or fix the spelling; they are not green, they are absent"
+    );
+    let mut mods: Vec<&str> = if strict {
+        STD_MODULES.to_vec()
+    } else {
+        all.iter().map(|s| s.as_str()).collect()
+    };
+    // `NIM_SWEEP_ONLY=a,b,c` narrows the run to a few modules. The full sweep drives the whole
+    // toolchain once per module (~25 min); when you are chasing one bottom-edge change you want the
+    // three modules it touches, not all of them.
+    let only = std::env::var("NIM_SWEEP_ONLY").unwrap_or_default();
+    if !only.is_empty() {
+        let want: Vec<&str> = only
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        mods.retain(|m| want.contains(m));
+        assert!(
+            !mods.is_empty(),
+            "NIM_SWEEP_ONLY={only:?} matched no module in {stdlib:?}"
+        );
+    }
     let mut runnable: Vec<&str> = Vec::new();
     let mut unrunnable: Vec<(&str, String)> = Vec::new();
     let mut nim_fail: Vec<(&str, String)> = Vec::new();
     for (i, m) in mods.iter().enumerate() {
+        let m: &str = m;
         eprintln!("[{}/{}] std/{m} …", i + 1, mods.len());
         let src = format!("import std/syncio\nimport std/{m}\n\nwrite(stdout, \"ok\")\n");
         let leng = match try_compile_to_leng(&path, m, &src) {
@@ -1353,10 +1392,27 @@ fn runnability_sweep() {
     }
     eprintln!("  runnable: {}", runnable.join(" "));
     eprintln!("===== end runnability sweep =====\n");
+    if !STD_EXCLUDED.is_empty() {
+        eprintln!(
+            "  excluded: {}",
+            STD_EXCLUDED
+                .iter()
+                .map(|(n, why)| format!("{n} ({why})"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     if strict {
+        // Both buckets are failures for a module we claim to hold green: `unrunnable` means it
+        // links but cannot run, `nim_fail` means the toolchain rejected it. Before #1490 only the
+        // first was asserted, so a green-list entry that stopped resolving passed silently.
         assert!(
             unrunnable.is_empty(),
             "modules that compile but cannot run: {unrunnable:?}"
+        );
+        assert!(
+            nim_fail.is_empty(),
+            "green-list modules the nimony toolchain rejected: {nim_fail:?}"
         );
     }
 }
@@ -1374,75 +1430,54 @@ const FEATURE_PROBES: &[(&str, &str)] = &[
     ("float_math", "import std/syncio\nimport std/math\nlet x = sqrt(2.0)\nwrite(stdout, $x)\n"),
 ];
 
-/// Stdlib modules the sweep exercises via `import std/<m>` drivers (NIM_SWEEP_STD=1). A spread across
-/// strings, containers, numerics, and parsing — the constructs a real program (and nimony itself) hit.
-/// **Every** `std/` module in the vendored nimony stdlib — the denominator the stage-3 runnability
-/// sweep reports against. [`STD_MODULES`] is the subset we hold green; this is the full surface, so
-/// the sweep's "unrunnable"/"nimony-fail" lists say what is left rather than silently omitting it.
-const STD_MODULES_ALL: &[&str] = &[
-    "algorithm",
-    "appdirs",
-    "assertions",
-    "atomics",
-    "base64",
-    "bitops",
-    "cmdline",
-    "complex",
-    "cpuinfo",
-    "deques",
-    "dirs",
-    "editdistance",
-    "encodings",
-    "envvars",
-    "fenv",
-    "formatfloat",
-    "hashes",
-    "heapqueue",
-    "intsets",
-    "ioring",
-    "json",
-    "lexbase",
-    "locks",
-    "math",
-    "md5",
-    "memfiles",
-    "monotimes",
-    "options",
-    "os",
-    "oserrors",
-    "osproc",
-    "parsejson",
-    "parseopt",
-    "parseutils",
-    "pathnorm",
-    "paths",
-    "random",
-    "rationals",
-    "rawthreads",
-    "result",
-    "rlocks",
-    "sequtils",
-    "sets",
-    "setutils",
-    "sha1",
-    "smartcli",
-    "streams",
-    "strtabs",
-    "strutils",
-    "sugar",
-    "syncio",
-    "tables",
-    "terminal",
-    "threadpool",
-    "ticketlocks",
-    "times",
-    "typetraits",
-    "unicode",
-    "varints",
-    "widestrs",
-    "wordwrap",
-];
+/// Modules present in `lib/std/` that the sweep deliberately does **not** drive, each with the
+/// reason. #1490: the denominator used to be a hand-written list, which drifted from the stdlib in
+/// both directions — three names that no longer existed (reported every run as "nimony failed",
+/// which reads like a front-end bug to chase) and seven real modules silently omitted while the doc
+/// comment claimed the list was "every" module. It is now derived from the filesystem, so the only
+/// way to leave something out is to say so here.
+const STD_EXCLUDED: &[(&str, &str)] = &[(
+    "system",
+    "implicitly imported by every module; `import std/system` is not a thing",
+)];
 
+/// Every module in the vendored nimony `lib/std/`, minus [`STD_EXCLUDED`] — the denominator the
+/// stage-3 runnability sweep reports against. Derived from the filesystem (#1490) so it cannot drift
+/// from the stdlib it claims to enumerate, the same "the directory *is* the expectation" property
+/// the `nim_diff` corpus relies on.
+fn discovered_std_modules(dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "nim"))
+        .map(|e| e.path().file_stem().unwrap().to_string_lossy().to_string())
+        .filter(|m| !STD_EXCLUDED.iter().any(|(n, _)| n == m))
+        .collect();
+    out.sort();
+    out
+}
+
+/// The vendored nimony stdlib's `lib/std/`, derived from `NIMONY_BIN` (`<dist>/bin`) or from
+/// wherever `nimony` sits on `PATH`. `None` when no toolchain is present — the callers already skip.
+fn nimony_stdlib_dir() -> Option<std::path::PathBuf> {
+    let bin = std::env::var("NIMONY_BIN")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var("PATH").ok().and_then(|p| {
+                p.split(':')
+                    .map(std::path::PathBuf::from)
+                    .find(|d| d.join("nimony").exists())
+            })
+        })?;
+    let dir = bin.parent()?.join("lib").join("std");
+    dir.is_dir().then_some(dir)
+}
+
+/// The subset the sweep **holds green** under `NIM_RUN_SWEEP_STRICT=1` — a spread across strings,
+/// containers, numerics and parsing, the constructs a real program (and nimony itself) hits. Every
+/// entry must exist in `lib/std/`; the sweep asserts that up front (#1490) rather than letting an
+/// absent module read as a pass.
 const STD_MODULES: &[&str] = &[
     "strutils",
     "sequtils",
@@ -1457,7 +1492,6 @@ const STD_MODULES: &[&str] = &[
     "intsets",
     "bitops",
     "parseutils",
-    "strformat",
     "unicode",
     "times",
     "json",
@@ -1466,14 +1500,8 @@ const STD_MODULES: &[&str] = &[
     "md5",
     "monotimes",
     "complex",
-    "rationals",
     "assertions",
-    "typetraits",
-    "enumutils",
-    "sugar",
     "setutils",
-    "lists",
-    "packedsets",
 ];
 
 /// **#1375 — the rest of `std/math` runs, not just the trigonometric family.** `LIBC_SERVED` first
