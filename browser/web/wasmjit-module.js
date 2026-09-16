@@ -102,8 +102,21 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // both bounce sites; `jitNimWholeCardOp13` reads it per phase into `timings`.
 export const bounceStats = {
   n: 0, ms: 0,
-  reset() { this.n = 0; this.ms = 0; },
-  take() { const r = { bounces: this.n, bounceMs: this.ms }; this.reset(); return r; },
+  // Per emitted-function attribution (#1359 / #1068): which declined functions the time inside
+  // bounces actually goes to — a few huge bounces (an `exec`ed grandchild running interpreted) and
+  // thousands of small ones (declined helpers) call for different fixes.
+  byFunc: new Map(),
+  add(func, ms) {
+    this.n++; this.ms += ms;
+    const e = this.byFunc.get(func);
+    if (e) { e.n++; e.ms += ms; if (ms > e.max) e.max = ms; } else this.byFunc.set(func, { n: 1, ms, max: ms });
+  },
+  reset() { this.n = 0; this.ms = 0; this.byFunc = new Map(); },
+  take() {
+    const top = [...this.byFunc].map(([func, e]) => ({ func, ...e })).sort((a, b) => b.ms - a.ms).slice(0, 8);
+    const r = { bounces: this.n, bounceMs: this.ms, top };
+    this.reset(); return r;
+  },
 };
 
 export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
@@ -147,7 +160,7 @@ export async function driveJitRun(ex, memory, cacheKey, afterFinish) {
       (func, argsPtr) => {
         const tb = performance.now();
         const st = ex.temen_onramp_jit_run_call_interp(func, argsPtr);
-        bounceStats.n++; bounceStats.ms += performance.now() - tb;
+        bounceStats.add(func, performance.now() - tb);
         if (st !== 0) throw new Error('cross-tier stop');
         // A `vm_map` grow in the bounce advanced the run's committed extent — re-sync the emitted
         // `"mapped"` (the `driveCoopTierupRun` scalar pattern; on-ramp guests grow scalar, no paged
@@ -250,7 +263,7 @@ export async function driveDetachedRun(ex, memory, childMemory, cacheKey, afterF
         const st = ex.temen_onramp_jit_run_call_interp(func, scratch + (argsPtr - env));
         // Copy back even on a stop: the cell is the child's, and a later read must see the results.
         cu8().set(eu8().subarray(scratch, scratch + envBytes), env);
-        bounceStats.n++; bounceStats.ms += performance.now() - tb;
+        bounceStats.add(func, performance.now() - tb);
         if (st !== 0) throw new Error('cross-tier stop');
         syncGlobals();
       },
@@ -1369,6 +1382,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       crawlBounces: bCrawl.bounces, crawlBounceMs: bCrawl.bounceMs,
       nimsemBounces: bNimsem.bounces, nimsemBounceMs: bNimsem.bounceMs,
       hexerBounces: bHexer.bounces, hexerBounceMs: bHexer.bounceMs,
+      // Top bounced functions per phase by time (emitted-module function index, count, ms, max ms).
+      nimsemTop: bNimsem.top, hexerTop: bHexer.top,
       // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
       crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
     },

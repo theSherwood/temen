@@ -119,6 +119,15 @@ console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / $
 const DELTA_LO_NS = 56, DELTA_HI_NS = 88;
 const tax = (f) => f ? `${f.small.toLocaleString()} scalar + ${f.bulk.toLocaleString()} bulk (${(f.bulkBytes / 1e6).toFixed(1)} MB) → est. tax ${((f.small * DELTA_LO_NS) / 1e6).toFixed(0)}–${((f.small * DELTA_HI_NS) / 1e6).toFixed(0)}ms` : '—';
 console.log(`foreign accesses:     nimsem ${tax(tm.nimsemForeign)}\n                      hexer  ${tax(tm.hexerForeign)}`);
+// Where the time inside bounces goes (#1359 / #1068): the top emitted functions by bounce time.
+const topTable = (name, top, total) => {
+  if (!top || !top.length) return;
+  console.log(`\n${name}: top bounced functions (of ${fmt(total)} inside bounces)`);
+  console.log(`  ${'func'.padStart(6)} ${'bounces'.padStart(8)} ${'total'.padStart(10)} ${'share'.padStart(7)} ${'max one'.padStart(10)}`);
+  for (const e of top) console.log(`  ${String(e.func).padStart(6)} ${String(e.n).padStart(8)} ${fmt(e.ms).padStart(10)} ${pct(e.ms, total).padStart(7)} ${fmt(e.max).padStart(10)}`);
+};
+topTable('nimsem', tm.nimsemTop, tm.nimsemBounceMs);
+topTable('hexer', tm.hexerTop, tm.hexerBounceMs);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;
   console.log(`\ntiered / interpreter = ${ratio.toFixed(2)}× ${ratio < 1 ? '(tiered faster)' : '(interpreter faster — emit overhead dominates for this small program)'}`);
