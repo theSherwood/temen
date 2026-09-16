@@ -104,12 +104,13 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'T'); eb(&e, 'E'); eb(&e, 'M'); eb(&e, 'E'); eb(&e, 'N');
   eb(&e, 0); eb(&e, 0); eb(&e, 0);
   eb(&e, 0); eb(&e, 0);                 // kind = module
-  eb(&e, (10) & 0xff); eb(&e, (10) >> 8); // version (u16)
+  eb(&e, (11) & 0xff); eb(&e, (11) >> 8); // version (u16)
   eb(&e, 0); eb(&e, 0); eb(&e, 0); eb(&e, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.
   eb(&e, 1);
   eb(&e, 17);
+  eb(&e, 0); // no shadow arena (v11: the durable arena is module-declared; this unit spawns nothing)
   eb(&e, 0); // no data segments
   eb(&e, 0); // no imports — self-contained unit (v2 import section)
   eb(&e, 0); // no exports — invoked by handle, not by name (v3 export section)

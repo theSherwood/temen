@@ -13333,8 +13333,14 @@ pub extern "C" fn temen_durable_freeze(
         set(STATUS_VERIFY_ERR);
         return STATUS_VERIFY_ERR;
     }
-    let size_log2 = match m.memory.as_ref() {
-        Some(mc) => mc.size_log2,
+    let (size_log2, arena) = match m.memory.as_ref() {
+        Some(mc) => match mc.shadow {
+            Some(a) => (mc.size_log2, a),
+            None => {
+                set(STATUS_UNSUPPORTED);
+                return STATUS_UNSUPPORTED;
+            }
+        },
         None => {
             set(STATUS_UNSUPPORTED);
             return STATUS_UNSUPPORTED;
@@ -13347,7 +13353,7 @@ pub extern "C" fn temen_durable_freeze(
         set(STATUS_UNSUPPORTED);
         return STATUS_UNSUPPORTED;
     };
-    let init = temen_durable::init_durable_window(1usize << size_log2);
+    let init = temen_durable::init_durable_window(1usize << size_log2, arena);
     let Some(back) =
         temen_interp::Region::owned_zeroed(1u64 << reserved_log2, temen_snapshot::PAGE as u64)
     else {
@@ -13495,7 +13501,11 @@ pub extern "C" fn temen_durable_thaw_resume(
         set(STATUS_UNSUPPORTED);
         return 0;
     };
-    temen_durable::begin_thaw(&mut rwin, 0); // clear the freeze word, set context 0 REWINDING
+    let Some(arena) = m.memory.and_then(|mc| mc.shadow) else {
+        set(STATUS_UNSUPPORTED);
+        return 0;
+    };
+    temen_durable::begin_thaw(&mut rwin, arena, 0); // clear the freeze word, set context 0 REWINDING
                                              // A fresh owned backing sized to the restored reservation, pre-filled with the restored (grown)
                                              // window image — the bytes `run_over_grown` resumes over; `seed_pages` re-establishes the map.
     let Some(back) =
@@ -13803,7 +13813,7 @@ block 0 (v0: i64) {
 /// emitted IR runs on this target. Returns `-1` on any mismatch.
 #[no_mangle]
 pub extern "C" fn run_durable() -> i64 {
-    const SRC: &str = r#"memory 17
+    const SRC: &str = r#"memory 17 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
   v1 = call.cap 2 0 () -> (i64) v0 ()
@@ -13819,7 +13829,10 @@ block 0 (v0: i32) {
     let Ok(inst) = temen_durable::transform_module(&m) else {
         return -1;
     };
-    let mut win = temen_durable::init_durable_window(1 << 17);
+    let Some(arena) = inst.memory.and_then(|mc| mc.shadow) else {
+        return -1;
+    };
+    let mut win = temen_durable::init_durable_window(1 << 17, arena);
     temen_durable::write_state(&mut win, temen_durable::STATE_NORMAL);
     match durable_run(&inst, &win, 1000) {
         (STATUS_OK, v, _, _) => v,
