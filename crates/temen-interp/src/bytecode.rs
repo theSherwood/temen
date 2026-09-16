@@ -2839,7 +2839,20 @@ impl VcpuReactor {
             match vcpu.run() {
                 VcpuEvent::Done(_) => {}
                 VcpuEvent::Trapped(t) => return Err(t),
-                _ => return Err(Trap::Malformed),
+                // Out of a reactor's scope, named rather than `_` (see `VcpuEvent`): a `_start` that
+                // spawns, joins, waits, JITs, tiers up, parks on a cap or on stdin is not a reactor.
+                VcpuEvent::TierUp { .. }
+                | VcpuEvent::Spawn { .. }
+                | VcpuEvent::Join { .. }
+                | VcpuEvent::Wait { .. }
+                | VcpuEvent::Notify { .. }
+                | VcpuEvent::JitInstall { .. }
+                | VcpuEvent::JitUninstall { .. }
+                | VcpuEvent::JitInvoke { .. }
+                | VcpuEvent::Instantiate { .. }
+                | VcpuEvent::InstantiateDetached { .. }
+                | VcpuEvent::CapPending { .. }
+                | VcpuEvent::StdinPark => return Err(Trap::Malformed),
             }
             mem = vcpu.take_mem();
         }
@@ -2957,6 +2970,11 @@ impl VcpuReactor {
 /// becomes one of these; the host performs the effect (spawn a Worker, futex-wait, …) and resumes the
 /// vCPU with the result. Mirrors the cooperative `drive`'s `VcpuStop` arms, but handed to an external
 /// orchestrator instead of serviced in-process.
+///
+/// **A driver matches this exhaustively — no `_` arm** (#1414). A driver that services a subset names
+/// the rest, grouped with the reason it declines them, so adding a variant here fails to build in
+/// every driver until each has said what it does with it. A `_` would make a new host-facing event
+/// compile clean and silently do nothing in that driver — the #1347/#1339 class at its source.
 pub enum VcpuEvent {
     /// The vCPU finished with these results.
     Done(Vec<Value>),

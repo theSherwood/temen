@@ -36,6 +36,9 @@ mod webgpu;
 // A powerbox whose capabilities are **defined in JS** (`temen_jspb_*`): the page names them, the
 // module's import manifest binds them, one wasm import services every call. Built on both targets —
 // natively the JS side is a test hook, so the binding path is testable off-browser (`tests/jspb.rs`).
+/// The JS ↔ Rust export ABI as data (#1414) — host-side tooling, kept out of the cdylib.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod exports_abi;
 pub mod jspb;
 
 // ---- self-contained smoke probe (no host imports) --------------------------------------------
@@ -5594,7 +5597,19 @@ fn pg_pump(s: &mut PgSession) -> i32 {
             s.ended = true;
             STATUS_TRAP
         }
-        _ => {
+        // A `--single` backend spawns, JITs and nests nothing; named rather than `_` (see
+        // `VcpuEvent`) so a new event is a decision here, not a silent `STATUS_UNSUPPORTED`.
+        bytecode::VcpuEvent::TierUp { .. }
+        | bytecode::VcpuEvent::Spawn { .. }
+        | bytecode::VcpuEvent::Join { .. }
+        | bytecode::VcpuEvent::Wait { .. }
+        | bytecode::VcpuEvent::Notify { .. }
+        | bytecode::VcpuEvent::JitInstall { .. }
+        | bytecode::VcpuEvent::JitUninstall { .. }
+        | bytecode::VcpuEvent::JitInvoke { .. }
+        | bytecode::VcpuEvent::Instantiate { .. }
+        | bytecode::VcpuEvent::InstantiateDetached { .. }
+        | bytecode::VcpuEvent::CapPending { .. } => {
             s.ended = true;
             STATUS_UNSUPPORTED
         }
@@ -12479,6 +12494,13 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                     Err(_) => return OP13JIT_TRAP,
                 }
             }
+            // Without `atomics` the page cannot mint a shareable detached window (`foreign_mint` /
+            // `driveDetachedRun` need a `SharedArrayBuffer`-backed `WebAssembly.Memory`), so a
+            // detached spawn fails closed here. Named rather than `_` (see `VcpuEvent`): the wildcard
+            // gave this same answer invisibly in every non-atomics build, which is how a cfg-gated arm
+            // above could come to exist with nobody having decided what the other build does.
+            #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
+            bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Join { handle } => {
                 let banked = d
                     .children
@@ -12488,7 +12510,18 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
-            _ => return OP13JIT_TRAP,
+            // The op-13 driver is a 64 KiB root that only spawns phases and joins them: no threads,
+            // no tier-up of its own, no §22 units, no cap or stdin park. Named rather than `_` (see
+            // `VcpuEvent`) so a new event fails to build here instead of trapping the crawl.
+            bytecode::VcpuEvent::TierUp { .. }
+            | bytecode::VcpuEvent::Spawn { .. }
+            | bytecode::VcpuEvent::Wait { .. }
+            | bytecode::VcpuEvent::Notify { .. }
+            | bytecode::VcpuEvent::JitInstall { .. }
+            | bytecode::VcpuEvent::JitUninstall { .. }
+            | bytecode::VcpuEvent::JitInvoke { .. }
+            | bytecode::VcpuEvent::CapPending { .. }
+            | bytecode::VcpuEvent::StdinPark => return OP13JIT_TRAP,
         }
     }
 }
@@ -12501,7 +12534,20 @@ fn drive_detached_leaf(mut vcpu: bytecode::Vcpu<'_>) -> Result<Vec<Value>, Trap>
     match vcpu.run() {
         bytecode::VcpuEvent::Done(v) => Ok(v),
         bytecode::VcpuEvent::Trapped(t) => Err(t),
-        _ => Err(Trap::Malformed),
+        // A leaf: anything that would need the host again is out of this fallback's scope and
+        // fails closed. Named rather than `_` (see `VcpuEvent`).
+        bytecode::VcpuEvent::TierUp { .. }
+        | bytecode::VcpuEvent::Spawn { .. }
+        | bytecode::VcpuEvent::Join { .. }
+        | bytecode::VcpuEvent::Wait { .. }
+        | bytecode::VcpuEvent::Notify { .. }
+        | bytecode::VcpuEvent::JitInstall { .. }
+        | bytecode::VcpuEvent::JitUninstall { .. }
+        | bytecode::VcpuEvent::JitInvoke { .. }
+        | bytecode::VcpuEvent::Instantiate { .. }
+        | bytecode::VcpuEvent::InstantiateDetached { .. }
+        | bytecode::VcpuEvent::CapPending { .. }
+        | bytecode::VcpuEvent::StdinPark => Err(Trap::Malformed),
     }
 }
 
