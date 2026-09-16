@@ -17687,6 +17687,12 @@ pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
 /// page through it.
 pub type StdoutTee = Box<dyn FnMut(&[u8]) + Send>;
 
+/// A **lazy stdin source** ([`Host::set_stdin_source`]): called when a `Stream(In)` `read` finds the
+/// stdin buffer exhausted, to fetch more bytes — a CLI reads the next line of the real stdin here, so
+/// an interactive guest sees input as it is typed. An empty return is end of input (the read returns
+/// 0, as an exhausted buffer always did). The dual of [`StdoutTee`].
+pub type StdinSource = Box<dyn FnMut() -> Vec<u8> + Send>;
+
 /// The two handler shapes one [`HostProcEntry`] can carry — the *registration* decides
 /// (CONSOLIDATION §7 per-entry powers, extended by §12 parking): `Sync` is today's full-powered
 /// synchronous closure; `Offloadable` declares blockingness and trades window/minter access for
@@ -18512,6 +18518,11 @@ pub struct Host {
     /// every other host leaves it `None` (zero cost — one `Option` check per write). Not carried into
     /// forked/twin child hosts (a child's output routes through its own powerbox / shared sink).
     out_tee: Option<StdoutTee>,
+    /// The lazy stdin refill ([`Host::set_stdin_source`]): consulted only when a `read` finds the
+    /// buffer empty and the run is not [`Self::stdin_block`]ing. `None` (every host but an interactive
+    /// CLI) costs one `Option` check per exhausted read and keeps EOF semantics byte-identical. Not
+    /// carried into forked/twin child hosts, like the tee.
+    stdin_source: Option<StdinSource>,
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
     sinks: Vec<Arc<Mutex<Vec<u8>>>>,
@@ -19212,6 +19223,7 @@ impl Host {
             out_sink: None,
             err_sink: None,
             out_tee: None,
+            stdin_source: None,
             sinks: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
@@ -21554,6 +21566,13 @@ impl Host {
     /// playground uses it to stream output to the page mid-run; it does not affect the captured bytes.
     pub fn set_stdout_tee(&mut self, tee: StdoutTee) {
         self.out_tee = Some(tee);
+    }
+
+    /// Install a **lazy stdin source** (see [`Host::stdin_source`]): `src` is asked for more bytes
+    /// each time a `Stream(In)` `read` exhausts the buffer; an empty answer is end of input. The CLI's
+    /// interactive mode reads the real stdin a line at a time through it.
+    pub fn set_stdin_source(&mut self, src: StdinSource) {
+        self.stdin_source = Some(src);
     }
 
     /// S2 — the stderr analogue of [`Host::shared_stdout`].
@@ -25410,6 +25429,15 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                // Lazy refill (an interactive CLI): an exhausted buffer asks the source for more before
+                // it means EOF. Orthogonal to the blocking park below (a driver that parks pushes its
+                // own bytes), so a parking host never consults it.
+                if self.stdin_pos >= self.stdin.len() && !self.stdin_block {
+                    if let Some(src) = self.stdin_source.as_mut() {
+                        let more = src();
+                        self.stdin.extend_from_slice(&more);
+                    }
+                }
                 let avail = &self.stdin[self.stdin_pos.min(self.stdin.len())..];
                 // Blocking stdin (opt-in, e.g. a persistent REPL session): an exhausted buffer parks
                 // the vCPU at this read rather than returning EOF. Signal the driver (which re-issues

@@ -253,6 +253,30 @@ const RSTACK: &str = ": rot3 ( a b c -- b c a ) >r swap r> swap ;\n\
     10 20 30 rsum3 . cr\n";
 const RSTACK_OUT: &str = "1 3 2 \n7 7 \n65 122 \n2 1 4 3 \n2 1 4 3 2 1 \n60 \n";
 
+/// #1237 — `pick <n>` (a compile-time literal `n`: a virtual-stack permutation like `over`, inside a
+/// word or at top level where it pulls from the REPL stack) and runtime `key` (the next unconsumed
+/// input byte — a top-level `key` reads what follows its line, `-1` at the end of input).
+#[test]
+fn forth_pick_and_key() {
+    let out = forth(PICK_KEY);
+    assert_eq!(out, PICK_KEY_OUT);
+}
+
+const PICK_KEY: &str = "1 2 3 pick 2 . . . . cr\n\
+    : third ( a b c -- a b c a ) pick 2 ;\n\
+    4 5 6 third . . . . cr\n\
+    7 8 pick 0 pick 2 . . . . cr\n\
+    9 pick 1 . cr\n\
+    pick x\n\
+    key . key . cr\n\
+    AB\n\
+    : two-keys ( -- a b ) key key ;\n\
+    two-keys . . cr\n\
+    xy\n\
+    key . cr\n";
+const PICK_KEY_OUT: &str = "1 3 2 1 \n4 6 5 4 \n7 8 8 7 \nline 5: stack underflow near 1\n\
+    line 6: expected a number near x\n65 66 \n121 120 \n-1 \n";
+
 /// A whole program, not one feature: the sieve of Eratosthenes counts the primes below N. It leans on
 /// everything at once — `variable`/`here`/`allot` for a byte array, a nested `do` loop whose inner
 /// bound is `+loop`-stepped by the outer prime (`j`), `i`/`c@`/`c!` to mark multiples, and `if`/`0=`.
@@ -335,6 +359,7 @@ fn forth_on_the_bytecode_engine() {
         (DEFER, DEFER_OUT),
         (DO_LOOP, DO_LOOP_OUT),
         (RSTACK, RSTACK_OUT),
+        (PICK_KEY, PICK_KEY_OUT),
         (SIEVE, SIEVE_OUT),
         (FIBER_LOOP, FIBER_LOOP_OUT),
         (ARRAY_REV, ARRAY_REV_OUT),
