@@ -7873,11 +7873,7 @@ struct WarmSession {
     /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
     /// deterministic powerbox handles match the snapshot's window-relative state.
     module: temen_ir::Module,
-    /// The warmup image's explicit page-state entries (#816, the `Mem::map_info` encoding): the
-    /// on-ramp's `protect`ed rodata inside the prefix and the `vm_map`-grown heap tail alike.
-    /// Re-established (without zeroing) before every eval, so the guest restores to the same
-    /// mapped geometry — and the same write protections — instead of faulting.
-    prots: Vec<(u64, u8)>,
+
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
     entry_sp: u64,
     eval_fn: temen_ir::FuncIdx,
@@ -7886,10 +7882,22 @@ struct WarmSession {
     /// it instead of `-EINVAL`ing, and extending it *reallocates*, so the base moves — read it through
     /// [`WarmSession::win_ptr`] / [`WarmSession::win`] at every use, never cached.
     back: std::sync::Arc<temen_interp::Region>,
-    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
-    image: Vec<u8>,
-    /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
-    /// `[image.len(), dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`,
+    /// together with the warmup's explicit page-state entries (#816): the on-ramp's `protect`ed rodata
+    /// inside the prefix and the `vm_map`-grown heap tail alike.
+    ///
+    /// **One window-image form** (#1456). These were a `Vec<u8>` and a `Vec<(u64, u8)>` side by side,
+    /// which is the private pair-of-fields `MemLayout` exists to replace — the checkpoint ladder, the
+    /// reactor moment and the §12 codec's window section all describe this same datum
+    /// (INVARIANTS #13/#15). Re-established (without zeroing) before every eval, so the guest restores
+    /// to the same mapped geometry — and the same write protections — instead of faulting.
+    warm: temen_interp::MemLayout,
+    /// High-water of bytes any prior eval may have dirtied (≥ the image length): the restore zeroes
+    /// `[image, dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    ///
+    /// Deliberately *not* folded into `warm`: it is a property of what previous runs did to this
+    /// session's window, not of the captured image, and a `MemLayout` that carried it would be
+    /// describing two different things.
     dirty_end: usize,
     /// #964: the module's NULL guard (`0` = legacy layout) — a marked module's powerbox low scratch
     /// (heap bump words included) sits one guard up, so every brk read/seed offsets by this.
@@ -7913,6 +7921,23 @@ struct WarmSession {
 }
 
 impl WarmSession {
+    /// Restore the warm image and zero the tail any prior eval grew the heap into, so this Run sees
+    /// byte-identical warm state (fresh-per-Run isolation).
+    ///
+    /// One body, three callers (batch eval, streaming eval, warm+JIT eval). It was three identical
+    /// copies, which is the second position INVARIANTS #15 is about — and the kind that bites quietly,
+    /// since a fourth entry point would have been written by copying a third.
+    fn restore_warm_window(&self) {
+        let image = self.warm.bytes();
+        // SAFETY: `win_ptr` owns `win >= dirty_end` bytes; no engine run is in flight (every caller
+        // is between runs, which is what makes the whole-window overwrite sound).
+        unsafe {
+            let w = core::slice::from_raw_parts_mut(self.win_ptr(), self.win() as usize);
+            w[..image.len()].copy_from_slice(image);
+            w[image.len()..self.dirty_end].fill(0);
+        }
+    }
+
     /// The window's base address **right now**. A `vm_map` grow inside an eval reallocates the
     /// backing, so this can differ from one call to the next (#1312) — never cache it across a run.
     fn win_ptr(&self) -> *mut u8 {
@@ -8058,16 +8083,24 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         let live = warm_read_brk(w, scratch).min(win as usize);
         (w[..live].to_vec(), live)
     };
+    // Bytes + page map as the one form. `from_parts` rejects a §13 `Backed` entry, which is the same
+    // fail-closed rule the `pages` match above applies — an alias cannot be reproduced from an image.
+    let Some(warm) =
+        temen_interp::MemLayout::from_parts(image, temen_interp::host_page_size(), win, &prots)
+    else {
+        drop(back);
+        set(STATUS_TRAP);
+        return -1;
+    };
     // SAFETY: single-threaded wasm; the session is read back only via the warm exports.
     unsafe {
         *core::ptr::addr_of_mut!(WARM_SESSION) = Some(WarmSession {
             prog,
             module: m,
-            prots,
             entry_sp,
             eval_fn,
             back,
-            image,
+            warm,
             dirty_end: live,
             scratch,
             jit: None,
@@ -8099,12 +8132,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     };
     // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
     // byte-identical warm state (fresh-per-Run isolation).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     // Live-stream stdout as the eval writes it (#1142). The tee fires the `stdout_chunk` host import,
@@ -8131,7 +8159,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         // clamped to `WARM_MAPPED_LOG2` — it defines the image geometry, which is captured as a flat
         // byte prefix, so growth there would have nothing to restore into.
         temen_ir::DEFAULT_RESERVED_LOG2,
-        Some(&s.prots),
+        Some(&s.warm.page_entries()),
     );
     let (status, value, exit_code) = match ran {
         Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
@@ -8303,12 +8331,7 @@ pub extern "C" fn temen_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize)
     }
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into — byte-identical
     // warm state each Run (identical to [`temen_warm_eval`]'s restore).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
@@ -8547,12 +8570,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     };
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into —
     // byte-identical warm state each Run (identical to [`temen_warm_eval`]'s restore).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let mut host = Host::new();
     host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
@@ -8588,7 +8606,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         Some(tierup),
         s.back.clone(),
         temen_ir::DEFAULT_RESERVED_LOG2,
-        &s.prots,
+        &s.warm.page_entries(),
     ) {
         Ok(r) => r,
         Err(_) => {
