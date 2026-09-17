@@ -78,3 +78,59 @@ fn and_in_expression_position() {
     assert_eq!(run(&m, 0, &[1, 0]), 0);
     assert_eq!(run(&m, 0, &[0, 1]), 0);
 }
+
+/// A short-circuit in a **`while` header** — the shape `if` tests do not reach. The `while` lowering
+/// allocates its header block before evaluating the condition and points the back-edge at it, while
+/// the `and`/`or` lowering *splits* that block, so the loop must still re-test the whole condition
+/// on every iteration. Fuel is bounded: a wrong back-edge spins, and this reports it instead of
+/// hanging the suite.
+#[test]
+fn short_circuit_in_a_while_header() {
+    // count(n, flag) { i = 0; while i < n and flag != 0: i += 1; return i }
+    let leng = "\
+(stmts
+ (proc :count.0 (params (param :n.0 . (i +64)) (param :flag.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :i.0 . (i +64) 0)
+   (while (and (lt i.0 n.0) (lt 0 flag.0))
+     (stmts . (asgn i.0 (add (i +64) i.0 1))))
+   (ret i.0))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    for (n, flag, want) in [(0i64, 1i64, 0i64), (5, 1, 5), (5, 0, 0), (1, 1, 1)] {
+        let mut fuel = 5_000_000u64;
+        let got = temen_interp::run(&m, 0, &[Value::I64(n), Value::I64(flag)], &mut fuel)
+            .unwrap_or_else(|t| panic!("count({n},{flag}) trapped: {t:?} (fuel left {fuel})"));
+        assert!(
+            fuel > 0,
+            "count({n},{flag}) exhausted fuel — the loop does not terminate"
+        );
+        assert_eq!(got.as_slice(), &[Value::I64(want)], "count({n},{flag})");
+    }
+}
+
+/// The same, with `or` in the header.
+#[test]
+fn or_in_a_while_header() {
+    // count(n, m) { i = 0; while i < n or i < m: i += 1; return i }  -> max(n, m), floored at 0
+    let leng = "\
+(stmts
+ (proc :count2.0 (params (param :n.0 . (i +64)) (param :m.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :i.0 . (i +64) 0)
+   (while (or (lt i.0 n.0) (lt i.0 m.0))
+     (stmts . (asgn i.0 (add (i +64) i.0 1))))
+   (ret i.0))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    for (a, b, want) in [(0i64, 0i64, 0i64), (3, 1, 3), (1, 4, 4), (2, 2, 2)] {
+        let mut fuel = 5_000_000u64;
+        let got = temen_interp::run(&m, 0, &[Value::I64(a), Value::I64(b)], &mut fuel)
+            .unwrap_or_else(|t| panic!("count2({a},{b}) trapped: {t:?} (fuel left {fuel})"));
+        assert!(
+            fuel > 0,
+            "count2({a},{b}) exhausted fuel — the loop does not terminate"
+        );
+        assert_eq!(got.as_slice(), &[Value::I64(want)], "count2({a},{b})");
+    }
+}
