@@ -2305,3 +2305,47 @@ end-to-end by every producer and both consumers.
   knows exactly where each slot's value changes.
 - *Uninitialized / out-of-scope (S2)*: a `LocList` gap (no range covers the `IrPc`) reports
   `<not yet live>`; reuse the same honest-unavailable path as JIT `<optimized out>`.
+
+## 14. The undo journal — incremental history instead of replay (#1556)
+
+§11's sequencing and INTERACTIVE_EMBEDDING.md direction item 2 both put v1 time travel on
+**snapshot-at-intervals + deterministic replay**: `seek(t)` restores the nearest §13 `Ladder` rung and
+re-executes forward, and `step_back` is `seek(t−1)`. Both also flagged an **undo log** as the later
+alternative, "if replay-cost ever matters; it changes nothing observable". `crates/temen-interp/src/journal.rs`
+is that log. It is **additive**: nothing is removed from the replay path, which remains the fallback
+and the differential oracle.
+
+The design in one paragraph. Pre-op, in the debug driver only, the journal records the **pre-image**
+of every byte range the op is about to overwrite. Spans come from `watch_accesses` — the same per-op
+analysis the watchpoint check already runs — so bulk `mem.copy`/`mem.fill`/`mem.move` and v128 stores
+are covered on one definition, and **no store path, no `Mem` method, and no emitted code is touched**
+(INVARIANTS #2: confinement stays the access lowering; this is not the write barrier #1454 declined).
+Undo is re-applying the pre-images in reverse.
+
+Three things must go back, and each has its own shape:
+
+| what | how | why not the obvious thing |
+| --- | --- | --- |
+| window bytes | pre-images, keyed by turn | — |
+| the continuation | a `ScheduledContinuation` per op | small next to the window; reuses the shape the ladder already captures and `restore` already installs |
+| host run-mutable state | a compact `HostCursor` (scalars + append-only buffer lengths) | a full `HostReplaySubstate` clone per op would copy `stdout` and the cap tape — quadratic on a `printf` guest |
+
+Because the cursor carries `cap_consumed`, **the cap tape rewinds with the journal by construction**:
+`undo_to` arms `replay_cap_tape` before restoring the cursor, so re-execution re-serves the recorded
+answers rather than calling the host again. There is no second structure to keep in step.
+
+**Fail-closed, not approximately right.** The §3.6 serve queue drains (not append-only) and a
+capability's opaque declared state has no inverse. A run using either journals no state entries, so
+the engine *declines* to undo and the checkpoint+replay path serves that seek exactly as today.
+
+**Compaction is policy (#1558).** Level 1 is per-write (stop anywhere). Level 2 keeps, per address,
+only the **earliest** pre-image in a segment — sized by *distinct addresses touched*, hence bounded
+above by the window, so **a compacted segment is never worse than a snapshot**; it costs stopping
+*inside* the segment, where the level-3 `Moment` rung still serves. `JournalPolicy { fine_turns,
+byte_budget }` is applied once per op; it is deliberately static, and a later adaptive policy swaps
+fixed values for computed ones at the same call sites without changing the shape. A compaction is
+never revisited.
+
+Open: wiring journal-backed `step_back` into the DAP backend, DURABILITY.md **R4** (§13 shared-region
+edges — a design call, since a `Backed`/`SharedRegion` page has writers the journal cannot see), and
+real-program cost measurements (the bail criteria on #1557).

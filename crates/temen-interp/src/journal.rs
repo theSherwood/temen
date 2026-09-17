@@ -34,14 +34,32 @@
 //!
 //! Level 3 is the existing [`Moment`](crate::moment::Moment) rung and is unchanged by this module.
 //!
-//! # Scope of this slice
+//! # The three things an undo must put back
 //!
-//! Window bytes only. The continuation (registers, frames, fiber chain, task states) is small next to
-//! the window and is not inverted here; until it is journaled too, [`Journal::undo_window_to`] restores
-//! *guest memory* and the caller supplies the continuation, which is what the differential against the
-//! replay path checks. Cap-input entries and continuation deltas are the remainder of #1557.
+//! - **Window bytes** — the pre-images above, keyed by the op's turn.
+//! - **The continuation** — the task set's `Vm`s, fiber chain and task states, journaled per op as a
+//!   [`ScheduledContinuation`], the same shape the checkpoint ladder already captures and
+//!   `ScheduledDebugRun::restore` already installs. It is small next to the window, which is the whole
+//!   reason a journal beats a snapshot: the window is what a snapshot copies and a journal does not.
+//! - **The host's run-mutable state** — a compact [`HostCursor`], not a substate clone. Every field an
+//!   ordinary op moves is a scalar or the length of an **append-only** buffer, so lengths plus
+//!   truncation invert it in O(1). Taking a full `HostReplaySubstate` every op would clone `stdout` and
+//!   the cap tape, which is quadratic on a `printf` guest.
+//!
+//! Because the cursor carries `cap_consumed`, **the cap tape rewinds with the journal by
+//! construction** — there is no second structure to keep in step, which is what an undo log carrying
+//! the tape was supposed to buy.
+//!
+//! # Fail-closed
+//!
+//! Two kinds of host state cannot be inverted by a cursor: the §3.6 serve queue (it drains, so it is
+//! not append-only) and a capability's **opaque declared state** (an embedder capture/restore blob has
+//! no inverse). A run using either records no state entries, so [`Journal::state_at`] finds nothing and
+//! the engine declines to undo, leaving the checkpoint-plus-replay path to serve it exactly as it does
+//! today. Refusing is the point: restoring such a run from a cursor would be quietly wrong.
 
-use crate::Mem;
+use crate::bytecode::ScheduledContinuation;
+use crate::{HostCursor, Mem};
 
 /// One journaled mutation, tagged with the coordinate (the scheduler turn) of the op that made it.
 ///
@@ -62,8 +80,10 @@ pub struct Entry {
 /// criteria on #1556.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct JournalStats {
-    /// Entries currently held.
+    /// Window pre-image entries currently held.
     pub entries: usize,
+    /// Per-op state entries (continuation + host cursor) currently held.
+    pub states: usize,
     /// Pre-image bytes currently held.
     pub bytes: usize,
     /// Entries ever appended, including those since coalesced away.
@@ -73,7 +93,48 @@ pub struct JournalStats {
     pub appended_bytes: usize,
 }
 
-/// An ordered journal of window pre-images (see the module docs).
+/// The engine state as it stood **before** the op at `coord` ran: the continuation plus the compact
+/// host cursor. Journaled once per op while armed, and coalesced to the earliest in a segment (see
+/// [`Journal::coalesce`]) because that is the only one "undo to the segment start" needs.
+pub(crate) struct StateEntry {
+    pub(crate) coord: u64,
+    pub(crate) cont: ScheduledContinuation,
+    pub(crate) cursor: HostCursor,
+}
+
+/// **The retention policy** (#1558) — static, and deliberately a parameter struct rather than
+/// constants at the call sites, so a later adaptive policy is the same shape with computed values.
+///
+/// The rule that keeps that true: a policy decides granularity **going forward only** and never
+/// revisits a past compaction. Level 2 has discarded the intra-segment positions, so un-compacting is
+/// impossible anyway; holding the rule is what makes static-to-dynamic a parameter change instead of an
+/// architectural one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JournalPolicy {
+    /// Turns behind the live position kept at **level 1** — the window in which `step_back` can stop
+    /// anywhere. Older history is coalesced to level 2 and can then only be undone to a segment
+    /// boundary.
+    pub fine_turns: u64,
+    /// Ceiling on retained pre-image bytes. Past it the **oldest** history is dropped, which bounds how
+    /// far back undo reaches without ever making a reachable position wrong: a dropped turn simply has
+    /// no state entry, so [`Journal::can_undo_to`] declines it and the checkpoint-plus-replay path
+    /// serves. `0` means unbounded.
+    pub byte_budget: usize,
+}
+
+impl Default for JournalPolicy {
+    /// A fine window wide enough that ordinary interactive stepping never leaves it, and no byte
+    /// ceiling — the conservative default, since dropping history is a capability loss and should be
+    /// something an embedder opts into.
+    fn default() -> JournalPolicy {
+        JournalPolicy {
+            fine_turns: 4096,
+            byte_budget: 0,
+        }
+    }
+}
+
+/// An ordered journal of window pre-images and per-op engine state (see the module docs).
 ///
 /// Disarmed by default and inert when disarmed: [`record_write`](Self::record_write) returns immediately, so
 /// a run that never arms one pays a single boolean test per op (INVARIANTS #9b — observation never
@@ -81,6 +142,7 @@ pub struct JournalStats {
 #[derive(Default)]
 pub struct Journal {
     entries: Vec<Entry>,
+    states: Vec<StateEntry>,
     armed: bool,
     appended: usize,
     appended_bytes: usize,
@@ -103,11 +165,14 @@ impl Journal {
         self.armed
     }
 
-    /// What this journal is holding.
+    /// What this journal is holding. `bytes` counts window pre-images only — the per-op continuations
+    /// are counted by [`states`](JournalStats::states), since their cost is a `Vm` clone rather than a
+    /// byte count and the two do not usefully add up.
     pub fn stats(&self) -> JournalStats {
         JournalStats {
             entries: self.entries.len(),
             bytes: self.entries.iter().map(|e| e.pre.len()).sum(),
+            states: self.states.len(),
             appended: self.appended,
             appended_bytes: self.appended_bytes,
         }
@@ -138,6 +203,40 @@ impl Journal {
         });
     }
 
+    /// Record the engine state as it stands **before** the op at `coord` — the continuation and the
+    /// compact host cursor. A no-op while disarmed. The caller is responsible for only calling this
+    /// when the state is invertible (`Host::journal_invertible` and the checkpointable subset); a turn
+    /// with no state entry is one [`state_at`](Self::state_at) will decline, so undo fails closed.
+    pub(crate) fn record_state(
+        &mut self,
+        coord: u64,
+        cont: ScheduledContinuation,
+        cursor: HostCursor,
+    ) {
+        if !self.armed {
+            return;
+        }
+        self.states.push(StateEntry {
+            coord,
+            cont,
+            cursor,
+        });
+    }
+
+    /// The state entry recorded exactly at `coord`, or `None` if that turn has none — which is how a
+    /// run outside the invertible subset, or one whose history has been compacted past `coord`,
+    /// declines to be undone there.
+    pub(crate) fn state_at(&self, coord: u64) -> Option<&StateEntry> {
+        let i = self.states.partition_point(|s| s.coord < coord);
+        self.states.get(i).filter(|s| s.coord == coord)
+    }
+
+    /// Whether [`state_at`](Self::state_at) can serve `coord` — the engine's precondition for undoing
+    /// there at all.
+    pub(crate) fn can_undo_to(&self, coord: u64) -> bool {
+        self.state_at(coord).is_some()
+    }
+
     /// Undo every entry at a coordinate `>= coord`, restoring the window to the state it held *before*
     /// the op at `coord` ran. Entries are re-applied newest-first, so an address written several times
     /// ends at its oldest pre-image, and the undone entries are dropped.
@@ -154,6 +253,9 @@ impl Journal {
             applied += 1;
         }
         self.entries.truncate(first);
+        // The state entries from `coord` forward describe turns that no longer happened.
+        let s_first = self.states.partition_point(|s| s.coord <= coord);
+        self.states.truncate(s_first);
         applied
     }
 
@@ -161,6 +263,38 @@ impl Journal {
     /// reports what it recorded).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.states.clear();
+    }
+
+    /// Apply `policy` at live position `now`: coalesce history that has aged out of the fine window,
+    /// then drop the oldest segments until the byte budget is met.
+    ///
+    /// Cheap to call every op — the common case is a bounds check and no work. Dropping is fail-closed
+    /// by construction: a turn whose state entry is gone is one [`can_undo_to`](Self::can_undo_to)
+    /// declines, never one it answers wrongly.
+    pub(crate) fn apply_policy(&mut self, now: u64, policy: &JournalPolicy) {
+        if !self.armed {
+            return;
+        }
+        if let Some(cut) = now.checked_sub(policy.fine_turns) {
+            // Only worth walking if something has actually aged out of the fine window.
+            if self.entries.first().is_some_and(|e| e.coord < cut) {
+                self.coalesce(cut);
+            }
+        }
+        if policy.byte_budget == 0 {
+            return;
+        }
+        // Drop oldest-first. Undo reaching a given turn needs only the entries from that turn forward,
+        // so shedding the tail of history shortens the reach without corrupting what remains.
+        let mut held: usize = self.entries.iter().map(|e| e.pre.len()).sum();
+        while held > policy.byte_budget && !self.entries.is_empty() {
+            let dropped = self.entries.remove(0);
+            held -= dropped.pre.len();
+            // Any state entry no longer backed by a full pre-image history is unusable.
+            let keep_from = self.entries.first().map_or(u64::MAX, |e| e.coord);
+            self.states.retain(|s| s.coord >= keep_from);
+        }
     }
 
     /// **Level 2**: coalesce every entry with a coordinate `< before` down to one pre-image per
@@ -206,5 +340,11 @@ impl Journal {
         }
         out.extend(tail);
         self.entries = out;
+        // The same earliest-wins rule for state: a coalesced segment can only be undone to its start,
+        // so exactly one continuation — the earliest — survives it. The fine tail keeps per-op state.
+        let s_split = self.states.partition_point(|s| s.coord < before);
+        if s_split > 1 {
+            self.states.drain(1..s_split);
+        }
     }
 }

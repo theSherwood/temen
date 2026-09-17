@@ -12,11 +12,10 @@
 
 use temen_interp::bytecode::ScheduledDebugRun;
 
-/// A loop that rewrites the same 8-byte cell many times, then writes a spread of distinct cells, then
-/// a bulk `mem.fill` over a wide span. The three phases are the three cases the journal has to get
-/// right: repeated writes to one address (what coalescing collapses), distinct addresses (what it
-/// cannot), and a bulk op (whose span comes from `watch_accesses`, not a plain store width).
-/// `iters` rewrites of one hot cell, then two distinct cells, then a 4 KiB `mem.fill`.
+/// `iters` rewrites of one hot cell, then two distinct cells, then a 4 KiB `mem.fill`. The three
+/// phases are the three cases the journal has to get right: repeated writes to one address (what
+/// coalescing collapses), distinct addresses (what it cannot), and a bulk op (whose span comes from
+/// `watch_accesses`, not a plain store width).
 fn writer_src(iters: i32) -> String {
     format!(
         r#"memory 17
@@ -78,14 +77,6 @@ fn run() -> ScheduledDebugRun {
     run_with(DIFF_ITERS)
 }
 
-/// The window bytes of a fresh run ticked to `t` — the oracle an undo must match.
-fn window_at(t: u64) -> Vec<u8> {
-    let mut r = run();
-    let mut fuel = FUEL;
-    while r.op_turn() < t && r.tick(&mut fuel) {}
-    r.read_window(0, WIN_LEN).expect("readable window")
-}
-
 /// Drive a journaling run to completion, returning it and the turn it finished at.
 fn armed_run_to_end() -> (ScheduledDebugRun, u64) {
     armed_run_of(DIFF_ITERS)
@@ -100,9 +91,29 @@ fn armed_run_of(iters: i32) -> (ScheduledDebugRun, u64) {
     (r, end)
 }
 
-/// **The headline differential**: undoing to any turn reproduces the window a fresh run reaches by
-/// ticking there. Walked backward from the end, so each step exercises undo from the state the
-/// previous undo left, not from a fresh capture.
+/// The full observable state of a run at a stop: window, position, and call depth. Comparing all
+/// three is what makes the differential cover the continuation as well as memory.
+fn observe(r: &ScheduledDebugRun) -> (Vec<u8>, Option<temen_interp::IrPc>, usize, u64) {
+    (
+        r.read_window(0, WIN_LEN).expect("readable"),
+        r.frame_pc(0),
+        r.depth(),
+        r.op_turn(),
+    )
+}
+
+/// A fresh run ticked to `t` — the oracle an undo must match, observed in full.
+fn state_at(t: u64) -> (Vec<u8>, Option<temen_interp::IrPc>, usize, u64) {
+    let mut r = run();
+    let mut fuel = FUEL;
+    while r.op_turn() < t && r.tick(&mut fuel) {}
+    observe(&r)
+}
+
+/// **The headline differential**: undoing to any turn reproduces what a fresh run reaches by ticking
+/// there — not just the window, but the position and call depth too, now that the continuation and
+/// host cursor rewind with it. Walked backward from the end, so each undo starts from the state the
+/// previous one left rather than from a fresh capture.
 #[test]
 fn undo_to_every_turn_matches_a_replayed_run() {
     let (mut r, end) = armed_run_to_end();
@@ -111,13 +122,42 @@ fn undo_to_every_turn_matches_a_replayed_run() {
         "the fixture should run a good number of turns, got {end}"
     );
     for t in (0..=end).rev() {
-        r.undo_to(t);
+        assert!(r.can_undo_to(t), "turn {t} should be undoable");
+        assert!(r.undo_to(t), "undo_to({t}) should succeed");
         assert_eq!(
-            r.read_window(0, WIN_LEN).expect("readable"),
-            window_at(t),
+            observe(&r),
+            state_at(t),
             "undo_to({t}) must equal a fresh run ticked to {t}"
         );
     }
+}
+
+/// **Undo then step forward re-executes identically.** This is what the continuation rewind buys: after
+/// undoing, the run is genuinely back at that turn, so driving forward again reproduces the same
+/// subsequent states rather than diverging.
+#[test]
+fn undo_then_replay_forward_reproduces_the_run() {
+    let (mut r, end) = armed_run_to_end();
+    let mid = end / 2;
+    assert!(r.undo_to(mid), "undo to the midpoint");
+    let mut fuel = FUEL;
+    while r.op_turn() < end && r.tick(&mut fuel) {}
+    assert_eq!(
+        observe(&r),
+        state_at(end),
+        "stepping forward after an undo lands where the original run did"
+    );
+}
+
+/// **Undo declines rather than half-rewinds.** A turn the journal never recorded — past the end, or
+/// before the armed window — must be refused, leaving the run untouched for `seek` to serve.
+#[test]
+fn undo_declines_a_turn_it_does_not_hold() {
+    let (mut r, end) = armed_run_to_end();
+    let before = observe(&r);
+    assert!(!r.can_undo_to(end + 100));
+    assert!(!r.undo_to(end + 100), "a turn past the end is refused");
+    assert_eq!(observe(&r), before, "a refused undo changes nothing");
 }
 
 /// **Inertness** (INVARIANTS #9b): arming the journal changes nothing the guest or the engine can
@@ -161,7 +201,7 @@ fn a_bulk_fill_is_journaled_by_its_whole_span() {
         "the fixture's fill should have run"
     );
     // Undo the whole run: the fill's 4 KiB must come back as the zeros it overwrote.
-    r.undo_to(0);
+    assert!(r.undo_to(0));
     let restored = r.read_window(49152, 4096).expect("readable");
     assert!(
         restored.iter().all(|&b| b == 0),
@@ -189,10 +229,10 @@ fn coalescing_collapses_repeated_writes_and_stays_under_the_window() {
         after.bytes
     );
     // And the compacted segment still undoes to its start exactly.
-    r.undo_to(0);
+    assert!(r.undo_to(0), "the segment start survives coalescing");
     assert_eq!(
-        r.read_window(0, WIN_LEN).expect("readable"),
-        window_at(0),
+        observe(&r),
+        state_at(0),
         "a coalesced segment still undoes to the segment start"
     );
 }
@@ -216,4 +256,175 @@ fn report_journal_volume() {
         l1.bytes as f64 / l2.bytes.max(1) as f64
     );
     assert!(l2.bytes <= WIN_LEN, "the bound holds");
+}
+
+// ---- cap crossings: the tape rides the journal (#1557) -------------------------------------------
+
+/// A guest that calls a `HOST_PROC` twice and sums the answers. The capability is **nondeterministic**
+/// on purpose — it answers with an incrementing counter — so re-invoking it would give a different
+/// answer than the first pass. That is exactly what must not happen after an undo.
+const CAP_CALLER: &str = r#"memory 16
+func (i32) -> (i64) {
+block 0 (vh: i32) {
+  vz = i64.const 0
+  va = call.cap 13 0 (i64) -> (i64) vh (vz)
+  vb = call.cap 13 0 (i64) -> (i64) vh (vz)
+  vk = i64.const 1000
+  vm = i64.mul va vk
+  vsum = i64.add vm vb
+  return vsum
+  }
+}
+"#;
+
+/// A host whose capability answers 1, 2, 3, … on successive calls, with recording armed.
+fn counting_host() -> (temen_interp::Host, i32) {
+    use std::sync::{Arc, Mutex};
+    let mut host = temen_interp::Host::new();
+    host.record_caps();
+    let n = Arc::new(Mutex::new(0i64));
+    let h = host.grant_host_proc(Box::new(move |_op, _args, _mem, _minter| {
+        let mut g = n.lock().unwrap();
+        *g += 1;
+        Ok(vec![*g])
+    }));
+    (host, h)
+}
+
+fn cap_module() -> temen_ir::Module {
+    let m = temen_text::parse_module(CAP_CALLER).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// **The tape rides the journal.** Run a guest across two nondeterministic cap crossings, undo back to
+/// before the first, and step forward again: the answers must be the *recorded* 1 and 2, not a fresh 3
+/// and 4 from the live counter. Nothing here rewinds a cursor by hand — the journal's host cursor
+/// carries `cap_consumed`, so the tape comes back in step by construction.
+#[test]
+fn undoing_across_cap_calls_re_serves_the_recorded_inputs() {
+    let m = cap_module();
+    let (host, h) = counting_host();
+    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
+        .expect("in the debug subset");
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    // First pass: the capability answered 1 then 2, so 1*1000 + 2.
+    assert_eq!(
+        r.result().cloned(),
+        Some(Ok(vec![temen_interp::Value::I64(1002)])),
+        "the live capability answers 1 then 2 on the first pass"
+    );
+    let end = r.op_turn();
+
+    assert!(
+        r.undo_to(0),
+        "undo the whole run, back across both crossings"
+    );
+    let mut fuel = FUEL;
+    while r.op_turn() < end && r.tick(&mut fuel) {}
+    assert_eq!(
+        r.result().cloned(),
+        Some(Ok(vec![temen_interp::Value::I64(1002)])),
+        "re-execution must re-serve the taped 1 and 2 — a live re-invoke would give 3 and 4"
+    );
+}
+
+/// **Fail-closed on state a cursor cannot invert.** A capability with opaque declared state
+/// (`set_cap_state_capture`) has no inverse, so the journal records nothing for those turns and undo
+/// declines, leaving the checkpoint-plus-replay path to serve. Refusing beats rewinding wrongly.
+#[test]
+fn a_stateful_capability_makes_the_run_decline_to_undo() {
+    use std::sync::{Arc, Mutex};
+    let m = cap_module();
+    let mut host = temen_interp::Host::new();
+    host.record_caps();
+    let n = Arc::new(Mutex::new(0i64));
+    let cap = Arc::clone(&n);
+    let h = host.grant_host_proc(Box::new(move |_op, _args, _mem, _minter| {
+        let mut g = cap.lock().unwrap();
+        *g += 1;
+        Ok(vec![*g])
+    }));
+    // Declare the capability's own state: now it is opaque-with-state, outside the invertible subset.
+    let get = Arc::clone(&n);
+    host.set_cap_state_capture(
+        h,
+        Box::new(move || get.lock().unwrap().to_le_bytes().to_vec()),
+    );
+
+    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
+        .expect("in the debug subset");
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+    assert!(
+        !r.can_undo_to(end / 2),
+        "a run holding a stateful capability must decline to undo, not rewind it wrongly"
+    );
+    assert!(!r.undo_to(end / 2));
+}
+
+// ---- the static retention policy (#1558) ----------------------------------------------------------
+
+/// **The fine window is what it says.** With a narrow `fine_turns`, recent turns stay undoable to the
+/// exact turn while older ones have been coalesced into a segment, so they are reachable only at the
+/// segment boundary. That is the granularity trade the policy exists to make.
+#[test]
+fn the_policy_keeps_recent_history_fine_and_ages_the_rest() {
+    let mut r = run_with(DIFF_ITERS);
+    r.set_journal_armed(true);
+    r.set_journal_policy(temen_interp::journal::JournalPolicy {
+        fine_turns: 8,
+        byte_budget: 0,
+    });
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+
+    // A turn inside the fine window undoes exactly, and still agrees with a replayed run.
+    let recent = end - 3;
+    assert!(
+        r.can_undo_to(recent),
+        "a turn inside the fine window is undoable"
+    );
+    assert!(r.undo_to(recent));
+    assert_eq!(
+        observe(&r),
+        state_at(recent),
+        "an undo inside the fine window still matches the replay oracle"
+    );
+}
+
+/// **The byte budget bounds the journal, and does so fail-closed.** Past the ceiling the oldest history
+/// is dropped: the journal stays under budget, and the turns that went away simply decline to be
+/// undone rather than coming back wrong.
+#[test]
+fn the_byte_budget_bounds_the_journal_and_fails_closed() {
+    let mut r = run_with(REPORT_ITERS);
+    r.set_journal_armed(true);
+    let budget = 2048;
+    r.set_journal_policy(temen_interp::journal::JournalPolicy {
+        fine_turns: 16,
+        byte_budget: budget,
+    });
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+
+    let s = r.journal_stats();
+    assert!(
+        s.bytes <= budget,
+        "the journal must respect its byte budget: {} > {budget}",
+        s.bytes
+    );
+    // Turn 0's history is long gone, so undo declines it — and leaves the run untouched.
+    let before = observe(&r);
+    assert!(
+        !r.can_undo_to(0),
+        "dropped history declines rather than lies"
+    );
+    assert!(!r.undo_to(0));
+    assert_eq!(observe(&r), before, "a declined undo changes nothing");
 }
