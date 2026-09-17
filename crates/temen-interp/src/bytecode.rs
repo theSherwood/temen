@@ -7109,7 +7109,33 @@ fn service_advance(
             | Outcome::JitInvoke { .. } => return Serviced::Declined,
 
             // §GC root scan: walks the live fiber stacks via the fiber runtime.
-            Outcome::GcRoots { .. } => return Serviced::Declined,
+            // §GC `gc.roots` (#1563): scanned, not declined. A decline here is not a skip — `drive`
+            // turns it into `SchedStop::Declined` without ticking the clock, so a guest that
+            // collects could not be stepped past its first collection, i.e. a GC'd language runtime
+            // was undebuggable. Everything the op needs is already in hand: the same continuation
+            // `step_vcpu` scans (this task's `vt`, the run's `fibers`) and the window every other
+            // seam here selects the same way. The scan itself is [`gc_scan`], shared with
+            // production, so the debug tier reports the same roots rather than a second answer
+            // (INVARIANTS #9's observability corollary).
+            Outcome::GcRoots {
+                lo,
+                hi,
+                mask,
+                buf,
+                cap,
+                dst,
+            } => {
+                *turn += 1;
+                let roots = gc_scan(&tasks[ti].vt, fibers, source, lo, hi, mask);
+                let m: &mut Option<Mem> = match tasks[ti].env {
+                    None => mem,
+                    Some(k) => &mut extra_envs[k].mem,
+                };
+                match gc_write(m, buf, cap, roots) {
+                    Ok(total) => tasks[ti].vt.active.set(dst, Reg::from_i64(total)),
+                    Err(t) => dbg_complete(tasks, ti, Err(t)),
+                }
+            }
         },
     }
     Serviced::Ran
@@ -9743,6 +9769,47 @@ fn scan_vm_roots(vm: &Vm, source: &ModuleSource, consider: &mut impl FnMut(u64))
 /// Emit a §GC `gc.roots` result: write the first `cap` roots (ascending, already deduplicated by the
 /// `BTreeSet`) as little-endian `i64`s into guest memory at `buf` — reusing the confined buffer-write
 /// path (a forged/unmapped/RO buffer is a `MemoryFault`) — and return the **total** found.
+/// §GC — the candidate root set of one vCPU: its active `Vm` and call stack, every resume-chain
+/// ancestor, and every parked fiber in the run's registry, masked and range-filtered to
+/// `[lo, hi)`. The **one** definition of "what `gc.roots` scans on this engine", shared by the
+/// production drivers (`step_vcpu`) and the debug scheduler (`service_advance`, #1563) — the scope
+/// is a property of the op (GC.md §3.1's coverage invariant), not of who is driving, and two copies
+/// of it would be two answers to the same question (INVARIANTS #15).
+fn gc_scan(
+    vt: &VTask,
+    fibers: &[FiberState],
+    source: &ModuleSource,
+    lo: u64,
+    hi: u64,
+    mask: u64,
+) -> std::collections::BTreeSet<u64> {
+    let mut roots = std::collections::BTreeSet::new();
+    {
+        let mut consider = |w: u64| {
+            let m = w & mask;
+            if m >= lo && m < hi {
+                roots.insert(m);
+            }
+        };
+        scan_vm_roots(&vt.active, source, &mut consider);
+        for (_, vm, _) in &vt.chain {
+            scan_vm_roots(vm, source, &mut consider);
+        }
+        for fib in fibers.iter() {
+            // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
+            // completion) holds live frames exactly like a suspended one — scan all three, or a
+            // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
+            if let FiberState::Parked { vm, .. }
+            | FiberState::WaitParked { vm, .. }
+            | FiberState::CapParked { vm, .. } = fib
+            {
+                scan_vm_roots(vm, source, &mut consider);
+            }
+        }
+    }
+    roots
+}
+
 fn gc_write(
     mem: &mut Option<Mem>,
     buf: u64,
@@ -10887,31 +10954,7 @@ fn step_vcpu(
                 cap,
                 dst,
             } => {
-                let mut roots = std::collections::BTreeSet::new();
-                {
-                    let mut consider = |w: u64| {
-                        let m = w & mask;
-                        if m >= lo && m < hi {
-                            roots.insert(m);
-                        }
-                    };
-                    scan_vm_roots(&vt.active, &dom.source, &mut consider);
-                    for (_, vm, _) in &vt.chain {
-                        scan_vm_roots(vm, &dom.source, &mut consider);
-                    }
-                    for fib in fibers.iter() {
-                        // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex,
-                        // `CapParked` punt completion) holds live frames exactly like a
-                        // suspended one — scan all three, or a root held across a fiber's
-                        // blocking point would be missed (unsound for GC.md §3.2).
-                        if let FiberState::Parked { vm, .. }
-                        | FiberState::WaitParked { vm, .. }
-                        | FiberState::CapParked { vm, .. } = fib
-                        {
-                            scan_vm_roots(vm, &dom.source, &mut consider);
-                        }
-                    }
-                }
+                let roots = gc_scan(vt, fibers, &dom.source, lo, hi, mask);
                 let total = gc_write(ctx.mem, buf, cap, roots)?;
                 vt.active.set(dst, Reg::from_i64(total));
             }

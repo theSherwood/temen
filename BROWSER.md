@@ -1439,10 +1439,15 @@ Readings:
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
-whether `gc.roots`-bearing functions bail at function or module granularity — **settled as
-effectively module-granular** (#1546): per-function was what shipped, and it was unsound, because a
-bounce into such a function leaves the emitted caller's frame unscanned. The op is now excluded from
-both cross-tier sets and the fixpoint cascades its callers off. Revisit fibers when JSPI / core stack-switching ships.
+whether `gc.roots`-bearing functions bail at function or module granularity — **settled: module**
+(#1546): per-function was what shipped, and it was unsound, because a bounce into such a function
+leaves the emitted caller's frame unscanned. Excluding the op from both cross-tier sets closes the
+*direct* route (the emit fixpoint cascades its callers off), but not the indirect one: in B2 mode an
+in-subset function that makes a `call.dyn` is emitted regardless, and the host fills **every** program
+slot of the shared table with a bounce shim built from the slot's signature alone
+(`temen_coop_shim_wasm`), so that emitted `call.dyn` still reaches the collector. Hence the module
+veto — `module_uses_gc_roots`, at every entry in `temen-wasm-jit`. Revisit fibers when JSPI / core
+stack-switching ships.
 
 ## Verification
 
