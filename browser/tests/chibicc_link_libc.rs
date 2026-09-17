@@ -432,3 +432,60 @@ fn read_out() -> Vec<u8> {
     // SAFETY: the accessor pair describes a live stash owned by the cdylib.
     unsafe { core::slice::from_raw_parts(temen_browser::temen_stdout_ptr(), n) }.to_vec()
 }
+
+/// **Every `main` spelling links** (#1536), not just `int main(void)`.
+///
+/// chibicc threads a data-stack pointer as an implicit leading argument, so `main`'s emitted
+/// signature depends on its C parameter list: `(i64)` for `main(void)`, `(i64, i64)` for `main()`
+/// (`()` in C is "parameters unspecified", not "none"), `(i64, i32, i64)` for `main(int, char **)`.
+/// The link used to enter at `main` and synthesize a call to it, and `synth_manifest_start` accepts
+/// only an entry taking the data-stack pointer alone — so the latter two were rejected with a bare
+/// `STATUS_UNSUPPORTED`, and separate compilation was closed to the spelling nearly every program
+/// uses. It now enters at the program unit's own `_start`, which is where knowledge of `main`'s shape
+/// already lives.
+///
+/// Each variant is *run*, not merely linked: entering at the wrong function, or calling `main` with a
+/// mis-shaped argument list, is the kind of thing that produces a program that links and then prints
+/// nothing.
+#[test]
+fn every_main_spelling_links_against_the_prebuilt_libc() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        false,
+    );
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+
+    for (label, main_decl) in [
+        ("main(void)", "int main(void)"),
+        ("main()", "int main()"),
+        ("main(argc, argv)", "int main(int argc, char **argv)"),
+    ] {
+        let src = format!("#include <stdio.h>\n{main_decl} {{ printf(\"MARK\\n\"); return 0; }}\n");
+        let prog_ir = emit_object_flags(
+            &chibicc,
+            "in.c",
+            &[("in.c", src.as_str())],
+            false,
+            temen_browser::PG_DECLS_ONLY_ARGV,
+        );
+        let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
+        let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+        assert!(
+            out.status == STATUS_OK || out.status == STATUS_EXIT,
+            "{label}: link+run status {} — stderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "MARK\n",
+            "{label}: the program linked but did not print"
+        );
+    }
+}

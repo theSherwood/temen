@@ -9759,6 +9759,14 @@ pub fn link_program(
     link_program_multi(&[lib], program, entry)
 }
 
+/// The public manifest entry name. A frontend's program unit exports its own bootstrap under this
+/// name; [`link_program_multi`] moves it aside so the synthesized manifest `_start` can take it.
+const PROG_START_ALIAS: &str = "_start";
+/// Where a program unit's own bootstrap goes (#1536). Private by convention, not by mechanism: it
+/// stays exported so the linked module can still be entered there, and it is what
+/// [`link_program_multi`] resolves as the entry funcidx.
+const PROG_START_PRIVATE: &str = "__temen_prog_start";
+
 /// [`link_program`] against **several** libraries at once (#1408) — the units are laid out in the
 /// order given, with the program last, so a later library may resolve against an earlier one. One
 /// library is the common case and has its own name above.
@@ -9768,7 +9776,24 @@ pub fn link_program_multi(
     entry: &str,
 ) -> Result<temen_ir::Module, i32> {
     let mut prog_exports = link_lib_exports(program);
-    prog_exports.retain(|(n, _)| n != "_start");
+    // **Enter at the program unit's own `_start`, not at `main`** (#1536). The frontend's bootstrap is
+    // the only thing that knows how to call *this* `main`: chibicc threads a data-stack pointer as an
+    // implicit leading argument, so `int main(void)` is `(i64) -> (i32)` but `int main()` is
+    // `(i64, i64) -> (i32)` and `int main(int, char **)` is `(i64, i32, i64) -> (i32)`, and for the
+    // last one `_start` parses `argc`/`argv` out of the §3e args buffer (`emit_start` in
+    // `codegen_ir.c`). Entering at `main` and synthesizing a call to it only ever worked for
+    // `main(void)`: the other two were rejected outright by `synth_manifest_start`, which is to say
+    // the whole separate-compilation path was closed to the `main` spelling nearly every program uses.
+    //
+    // It is *renamed* rather than kept, because the public `_start` belongs to the manifest bootstrap
+    // `synth_manifest_start` prepends — which is also what #1392 slice 2 was avoiding when it dropped
+    // this export instead. Renaming keeps that collision impossible while keeping the body.
+    let has_prog_start = prog_exports.iter().any(|(n, _)| n == PROG_START_ALIAS);
+    for (n, _) in prog_exports.iter_mut() {
+        if n == PROG_START_ALIAS {
+            *n = PROG_START_PRIVATE.to_string();
+        }
+    }
     if !prog_exports.iter().any(|(n, _)| n == entry) {
         prog_exports.push((entry.to_string(), 0));
     }
@@ -9780,7 +9805,19 @@ pub fn link_program_multi(
         data_exports: &prog_data,
     });
     let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
-    let entry_idx = linked.resolve_export(entry).ok_or(STATUS_UNSUPPORTED)?;
+    // The frontend bootstrap when the program unit had one, else `entry` itself — a hand-written unit
+    // with no `_start` still gets the old behaviour, a synthesized call to its entry.
+    let boot = if has_prog_start {
+        PROG_START_PRIVATE
+    } else {
+        entry
+    };
+    let entry_idx = linked.resolve_export(boot).ok_or(STATUS_UNSUPPORTED)?;
+    // A *library* unit's bootstrap is not this program's entry, and `synth_manifest_start` refuses a
+    // module that already exports `_start`. The DCE branch below would drop it as a side effect of
+    // retaining only `prog_exports`, but that branch is conditional — do it unconditionally so the
+    // outcome does not depend on whether some unit happened to bake a funcidx into its data image.
+    linked.exports.retain(|e| e.name != PROG_START_ALIAS);
     // **Drop what nothing reaches** (#1407). The link merges whole modules, so a program that calls
     // `printf` also carries the prebuilt libc's `<string.h>` and the whole series-based libm — dead
     // weight every launch pays to verify and bytecode-compile.
@@ -9799,6 +9836,9 @@ pub fn link_program_multi(
         linked
             .exports
             .retain(|e| prog_exports.iter().any(|(n, _)| *n == e.name));
+        // One root: the bootstrap. `entry` (`main`) is reachable *through* it — that is the whole
+        // point of entering there — so it needs no separate root, and anything neither reaches is
+        // genuinely dead.
         let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
     }
     let module =
