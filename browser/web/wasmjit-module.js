@@ -100,6 +100,18 @@ async function cachedInstanceF0(memory, cacheKey, readEmitted, callInterp, entry
 // them, per phase, is the direct measurement of what a declined body costs on the shipped path
 // (DETACHED_JIT.md §8: "how often do the real phases decline, and does it matter?"). One counter for
 // both bounce sites; `jitNimWholeCardOp13` reads it per phase into `timings`.
+/// Mean bounce ms per decile of one function's bounces, each with the committed extent at that
+/// decile's end: a fixed per-crossing cost reads flat, a cost proportional to the heap rises.
+function decilesOf(s) {
+  const out = [];
+  for (let d = 0; d < 10; d++) {
+    const a = Math.floor((d * s.length) / 10), b = Math.floor(((d + 1) * s.length) / 10);
+    const chunk = s.slice(a, b);
+    out.push({ meanMs: chunk.reduce((x, e) => x + e[1], 0) / chunk.length, mapped: chunk[chunk.length - 1][2] });
+  }
+  return out;
+}
+
 export const bounceStats = {
   n: 0, ms: 0,
   // Per emitted-function attribution (#1359 / #1068): which declined functions the time inside
@@ -119,7 +131,16 @@ export const bounceStats = {
   reset() { this.n = 0; this.ms = 0; this.byFunc = new Map(); this.series = []; },
   take() {
     const top = [...this.byFunc].map(([func, e]) => ({ func, ...e })).sort((a, b) => b.ms - a.ms).slice(0, 8);
-    const r = { bounces: this.n, bounceMs: this.ms, top, series: this.series };
+    // Summarize each hot function here rather than shipping the series: a phase can bounce thousands
+    // of times, and a caller that returns `timings` verbatim (the whole-card test prints its result as
+    // JSON) would carry every one of them. A function with few bounces keeps them all — that is how
+    // the exec wrapper's 21 line up with the exec log; a busy one becomes deciles.
+    for (const [i, e] of top.entries()) {
+      const mine = this.series.filter((x) => x[0] === e.func);
+      if (mine.length <= 64) e.times = mine.map((x) => x[1]); // e.g. the exec wrapper's 21
+      else if (i < 3) e.deciles = decilesOf(mine);
+    }
+    const r = { bounces: this.n, bounceMs: this.ms, top };
     this.reset(); return r;
   },
 };
@@ -1244,6 +1265,12 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   const includes = []; // files reached by `include`, drained after the module walk (see below)
   let crawled = 0, included = 0;
+  // Where a phase's wall-clock goes now that its bounces are ~10% of it: `open` is the cdylib-side
+  // emit (decode, outline, `emit_for_run`), `drive` is the guest actually running on emitted wasm.
+  // Split per phase so a repeated emit shows up as an emit, not as compiler work (#1562 follow-up).
+  const split = { nimsemOpenMs: 0, nimsemDriveMs: 0, hexerOpenMs: 0, hexerDriveMs: 0,
+    crawlFirstMs: 0, crawlRestMs: 0, crawlParses: 0 };
+  jitCacheStats.compiles = 0; jitCacheStats.hits = 0;
   const dirOf = (f) => f.slice(0, f.lastIndexOf('/'));
   // The `include` edges in a `.p.deps.nif`, through the same parser the Rust driver uses.
   const parseIncludes = (deps, dir) => {
@@ -1265,6 +1292,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   // The fallback is its documented contract, and still the right answer on a host that gave itself a
   // small ceiling: a throw means the emit declined or trapped, never a wrong parse.
   const parseOne = async (file, stem, src) => {
+    const tParse = now();
     const out = `/nimcache/${stem}.p.nif`;
     let pnif, deps;
     try {
@@ -1279,6 +1307,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     if (!pnif.length) return null;
     fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
     putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
+    // The first parse carries nifler's one-time emit; the rest are the marginal per-file cost.
+    if (split.crawlParses++ === 0) split.crawlFirstMs = now() - tParse; else split.crawlRestMs += now() - tParse;
     return { pnif, deps };
   };
   while (work.length) {
@@ -1380,10 +1410,14 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     // (exec) cap, so it works; the crawl above already seeded every module's `.p.nif`, so the exec is a
     // rare fallback. `.p.nif` byte-identical either way (`exec_op13_nifler_matches_inline`).
     const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const tOpen = now();
     const opened = ex.temen_op13jit_nimsem_open_inline(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
+    split.nimsemOpenMs += now() - tOpen;
     ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
+    const tDrive = now();
     const r = await drive(`${cacheKey}-nimsem`);
+    split.nimsemDriveMs += now() - tDrive;
     if (r === null || r !== 0) { if (r !== null) ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem ${r === null ? 'trapped (' + lastTrap + ')' : 'status ' + r} on ${stem}` }; }
     // nimsem writes TWO products per module: the semchecked `.s.nif` AND its `.s.idx.nif` index (the
     // same pair the headless hexer gate seeds). A dependent module's nimsem reads BOTH of its imports'
@@ -1417,10 +1451,14 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const key = isMain ? `${outdir}/${stem}.x.nif` : `nimcache/${stem}.x.nif`;
     const out = enc.encode(key), seed = packFiles(fs);
     const cp = pushBytes(hexerCe), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const tOpen = now();
     const opened = ex.temen_op13jit_phase_open_argv(cp, hexerCe.length, ap, argv.length, sp, seed.length, op, out.length);
+    split.hexerOpenMs += now() - tOpen;
     ex.temen_dealloc(cp, hexerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, hexed, error: `hexer open ${stem}: ${opened}` }; }
+    const tDrive = now();
     const r = await drive(`${cacheKey}-hexer`);
+    split.hexerDriveMs += now() - tDrive;
     if (r === null) return { crawled, semmed, hexed, error: `hexer trapped on ${stem}` };
     const xnif = phaseRead(key);
     const diag = xnif.length ? '' : phaseDiag(); // read before close tears the driver down
@@ -1442,8 +1480,9 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       hexerBounces: bHexer.bounces, hexerBounceMs: bHexer.bounceMs,
       // Top bounced functions per phase by time (emitted-module function index, count, ms, max ms).
       nimsemTop: bNimsem.top, hexerTop: bHexer.top,
-      nimsemSeries: bNimsem.series, hexerSeries: bHexer.series,
       nimsemExecLog,
+      ...split,
+      wasmCompiles: jitCacheStats.compiles, wasmHits: jitCacheStats.hits,
       // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
       crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
     },

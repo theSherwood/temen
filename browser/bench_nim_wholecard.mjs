@@ -119,6 +119,12 @@ console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / $
 const DELTA_LO_NS = 56, DELTA_HI_NS = 88;
 const tax = (f) => f ? `${f.small.toLocaleString()} scalar + ${f.bulk.toLocaleString()} bulk (${(f.bulkBytes / 1e6).toFixed(1)} MB) → est. tax ${((f.small * DELTA_LO_NS) / 1e6).toFixed(0)}–${((f.small * DELTA_HI_NS) / 1e6).toFixed(0)}ms` : '—';
 console.log(`foreign accesses:     nimsem ${tax(tm.nimsemForeign)}\n                      hexer  ${tax(tm.hexerForeign)}`);
+// Emit vs run, per phase: `open` is the cdylib-side emit (decode, outline, `emit_for_run`), `drive` is
+// the guest running on emitted wasm. Four modules, so an emit that repeats per module shows up here.
+console.log(`\nemit vs run:          nimsem open ${fmt(tm.nimsemOpenMs)} / drive ${fmt(tm.nimsemDriveMs)}` +
+  `   hexer open ${fmt(tm.hexerOpenMs)} / drive ${fmt(tm.hexerDriveMs)}` +
+  `   (V8 module compiles ${tm.wasmCompiles ?? '—'}, cache hits ${tm.wasmHits ?? '—'})`);
+console.log(`crawl:                first parse (incl. nifler emit) ${fmt(tm.crawlFirstMs)} + ${(tm.crawlParses ?? 1) - 1} more in ${fmt(tm.crawlRestMs)}`);
 // Where the time inside bounces goes (#1359 / #1068): the top emitted functions by bounce time.
 const topTable = (name, top, total) => {
   if (!top || !top.length) return;
@@ -133,31 +139,23 @@ topTable('hexer', tm.hexerTop, tm.hexerBounceMs);
 // a line that rises with `mapped` is a per-bounce cost proportional to the heap (page-map rebuild).
 const grow = (f) => f && f.grow ? `${f.grow} grows / ${f.growPages} pages (${(f.growPages * 65536 / 1e6).toFixed(0)} MB) in ${fmt(f.growMs)}` : '—';
 console.log(`\nforeign grows:        nimsem ${grow(tm.nimsemForeign)}\n                      hexer  ${grow(tm.hexerForeign)}`);
-const deciles = (name, series, func) => {
-  const s = (series || []).filter((e) => e[0] === func);
-  if (s.length < 20) return;
-  console.log(`\n${name} f${func}: mean bounce ms by decile of its ${s.length} bounces (mapped extent at decile end)`);
-  const row = [];
-  for (let d = 0; d < 10; d++) {
-    const a = Math.floor((d * s.length) / 10), b = Math.floor(((d + 1) * s.length) / 10);
-    const chunk = s.slice(a, b), mean = chunk.reduce((x, e) => x + e[1], 0) / chunk.length;
-    row.push(`${mean.toFixed(2)}ms@${(chunk[chunk.length - 1][2] / 1048576).toFixed(0)}MB`);
-  }
-  console.log(`  ${row.join('  ')}`);
+const deciles = (name, e) => {
+  if (!e.deciles) return;
+  console.log(`\n${name} f${e.func}: mean bounce ms by decile of its ${e.n} bounces (mapped extent at decile end)`);
+  console.log(`  ${e.deciles.map((d) => `${d.meanMs.toFixed(2)}ms@${(d.mapped / 1048576).toFixed(0)}MB`).join('  ')}`);
 };
-for (const e of (tm.nimsemTop || []).slice(0, 3)) deciles('nimsem', tm.nimsemSeries, e.func);
+for (const e of (tm.nimsemTop || []).slice(0, 3)) deciles('nimsem', e);
 // Name nimsem's exec bounces: the exec log's lines pair 1:1, in order, with the bounces of the wrapper
 // that made them — the top nimsem function whose bounce count equals the line count.
 {
   const lines = (tm.nimsemExecLog || '').split('\n').filter(Boolean);
-  const top = (tm.nimsemTop || []).find((e) => e.n === lines.length);
+  const top = (tm.nimsemTop || []).find((e) => e.n === lines.length && e.times);
   if (lines.length && top) {
-    const s = (tm.nimsemSeries || []).filter((e) => e[0] === top.func);
     console.log(`\nnimsem f${top.func}: the ${lines.length} execs it wrapped`);
-    lines.forEach((l, i) => console.log(`  ${fmt(s[i]?.[1] ?? NaN).padStart(8)}  ${l}`));
+    lines.forEach((l, i) => console.log(`  ${fmt(top.times[i] ?? NaN).padStart(8)}  ${l}`));
   }
 }
-for (const e of (tm.hexerTop || []).slice(0, 3)) deciles('hexer', tm.hexerSeries, e.func);
+for (const e of (tm.hexerTop || []).slice(0, 3)) deciles('hexer', e);
 if (res.interpMs && res.tieredMs) {
   const ratio = res.tieredMs / res.interpMs;
   console.log(`\ntiered / interpreter = ${ratio.toFixed(2)}× ${ratio < 1 ? '(tiered faster)' : '(interpreter faster — emit overhead dominates for this small program)'}`);
