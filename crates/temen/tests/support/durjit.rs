@@ -352,6 +352,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
                 sp: f.sp,
                 shadow_sp: f.shadow_sp,
                 generation: f.generation,
+                consumed: f.consumed,
             })
             .collect(),
     );
@@ -375,6 +376,7 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
             sp: f.sp,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
+            consumed: f.consumed,
         })
         .collect();
     assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");

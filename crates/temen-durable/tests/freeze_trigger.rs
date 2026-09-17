@@ -179,16 +179,15 @@ const SRC_REDELIVERY: &str = "memory 18 shadow 16448 65536\n\
       }\n\
     }\n";
 
-/// **Known gap, pinned (#1538).** Arming at the `cont.resume` of an *already-parked* fiber
-/// (safepoint 3 here) promotes to `UNWINDING` before the resume is performed, so the fiber's
-/// `suspend` returns the delivered `10` and its trailing poll unwinds it at the `Yield` point —
-/// which spills `out − nres`, dropping the delivered value. On thaw the root re-issues the resume
-/// and the fiber's `Yield` arm **re-parks** with its old value, so the resumer sees `(SUSPENDED, 1)`
-/// a second time instead of the fiber running forward with `10`: the thaw returns `(1, 1)`, not the
-/// uninterrupted `(1, 11)`. Arming at a `suspend` safepoint (2 or 4) or freezing from the start is
-/// correct. This asserts the *current* behaviour so the fix flips it deliberately.
+/// #1538 — arming at the `cont.resume` of an *already-parked* fiber (safepoint 3 here) promotes to
+/// `UNWINDING` before the resume is performed: the fiber's `suspend` returns the delivered `10`, and
+/// its trailing poll unwinds it at that `Yield` point — whose spill excludes the delivered value. The
+/// park it unwound at was **consumed** (the resumer took `1` and ran on to issue this resume), so the
+/// residue records it as such, and on thaw the root's re-issued resume makes the rewound `suspend`
+/// *return* `10` (the fiber runs on and yields `11`) instead of re-parking with the stale `1`. Before
+/// the fix this thawed to `(1, 1)`.
 #[test]
-fn a_resume_of_a_parked_fiber_frozen_mid_delivery_replays_the_old_yield() {
+fn a_resume_of_a_parked_fiber_frozen_mid_delivery_continues_with_the_delivered_value() {
     use temen_durable::begin_thaw;
 
     let mut m = temen_text::parse_module(SRC_REDELIVERY).expect("parse");
@@ -221,7 +220,7 @@ fn a_resume_of_a_parked_fiber_frozen_mid_delivery_replays_the_old_yield() {
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &thaw_win, SIZE_LOG2, &mut thost);
     assert_eq!(
         r,
-        Ok(vec![Value::I64(1), Value::I64(1)]),
-        "#1538: the thaw replays the old yield (fixed ⇒ (1, 11); flip this assertion)"
+        Ok(vec![Value::I64(1), Value::I64(11)]),
+        "the thawed fiber continues with the re-delivered 10 (#1538: it used to re-yield 1)"
     );
 }

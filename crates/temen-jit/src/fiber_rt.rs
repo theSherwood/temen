@@ -317,6 +317,14 @@ pub(crate) struct FiberSlot {
     /// (a thaw re-creates the fiber from them). Immutable after creation.
     func: i32,
     sp: i64,
+    /// #1538 — the fiber's last `suspend` value was **consumed** (see `FrozenFiber::consumed`): set at
+    /// each park (`!UNWINDING`) and at each guest claim of a suspended fiber (`UNWINDING`: the delivery
+    /// is dropped by the freeze unwind); recorded into the freeze residue; restored by `seed_frozen`.
+    consumed: AtomicBool,
+    /// #1538 — the argument a **thaw** claim of a seeded, consumed fiber queued for the fiber's
+    /// rewound `suspend` to return (the fiber runs on instead of re-parking). `Some` only between
+    /// that claim and that suspend.
+    pending: Mutex<Option<i64>>,
     /// §3.6 slice 5a — **event-park marker**: set by the futex thunk around its park-yield
     /// ([`fiber_event_park`]) so the resume seam reports that yield as `FIBER_PARKED` — the
     /// suspend the guest didn't write — instead of a guest `suspend`'s `(0, value)`. Written by
@@ -447,6 +455,8 @@ impl SharedFiberTable {
             func,
             sp,
             event_park: AtomicBool::new(false),
+            consumed: AtomicBool::new(false),
+            pending: Mutex::new(None),
         });
         if reuse.is_some() {
             t.free.pop();
@@ -474,6 +484,7 @@ impl SharedFiberTable {
         sp: i64,
         shadow_sp: u64,
         generation: u64,
+        consumed: bool,
     ) -> usize {
         let mut t = self.lock();
         let slot = t.slots.len();
@@ -487,6 +498,8 @@ impl SharedFiberTable {
             func,
             sp,
             event_park: AtomicBool::new(false),
+            consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
+            pending: Mutex::new(None),
         }));
         slot
     }
@@ -600,6 +613,10 @@ pub(crate) struct FiberRuntime {
     /// (`fiber_resume`'s `Complete` arm records each that unwound). Read back by `run_code_raw` into
     /// the durable entry's returned residue. Empty on a non-freeze run.
     frozen: Vec<crate::FrozenFiber>,
+    /// #1538 — `true` while [`freeze_drive`] resumes idle parked fibers to flatten them: those
+    /// resumes are the driver's placeholder deliveries, not guest claims, so they leave each fiber's
+    /// `consumed` mark as its park set it.
+    flattening: bool,
 }
 
 impl FiberRuntime {
@@ -624,6 +641,7 @@ impl FiberRuntime {
             root_shadow_sp,
             cur_shadow: None,
             frozen: Vec::new(),
+            flattening: false,
         }
     }
 
@@ -833,10 +851,26 @@ pub(crate) unsafe extern "C" fn fiber_resume(
         // **generation-checked** (recycling step 1): the generation carried in the guest handle must
         // match the slot's, so a stale handle to a recycled slot's former occupant faults. All
         // generations are 0 until recycling is wired, so this equals the old `claim()` (handle == slot).
+        // #1538: read before the claim — a suspended (`RUNNABLE`) fiber's park is what this
+        // delivery consumes; a fresh (`OWNED`) one may be a thaw-seeded consumed fiber.
+        let was_runnable = slot.own.is_runnable();
         if !slot.own.claim_gen(fiber_handle_generation(handle)) {
             fault(trap_out);
             *status_out = 1;
             return 0;
+        }
+        if rt.durable {
+            let unwinding = window_is_unwinding(rt.mem_base);
+            if was_runnable {
+                // A guest claim under `UNWINDING` delivers into a park the freeze unwind drops: the park
+                // counts as consumed. The freeze driver's own flattening resumes are not guest claims.
+                if !rt.flattening {
+                    slot.consumed.store(unwinding, Ordering::Relaxed);
+                }
+            } else if slot.consumed.load(Ordering::Relaxed) {
+                // A thaw claim of a seeded consumed fiber: its rewound `suspend` returns `arg`.
+                *slot.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(arg);
+            }
         }
         // Runtime single-owner assert (empirical net #3): a won claim must find the seam clear.
         // `RUNNING` slots are unclaimable, so a non-sentinel here means the protocol wiring is
@@ -986,6 +1020,7 @@ pub(crate) unsafe extern "C" fn fiber_resume(
                     // Recorded before the `finish` below bumps it — the freeze-time generation, so a
                     // thaw re-seeds this (possibly recycled) fiber at the generation its handle carries.
                     generation: slot.own.generation(),
+                    consumed: slot.consumed.load(Ordering::Relaxed),
                 });
             }
             // Drop the fiber (unmapping its stack) and free the slot — `finish` bumps the
@@ -1017,6 +1052,24 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
     // fiber parks (suspend's own trailing poll is deferred to the fiber's next resume).
     if (*rt).durable {
         window_tick_arm((*rt).mem_base);
+    }
+    // #1538: a thawed fiber whose park was already consumed re-executes its `suspend` in the `Yield`
+    // rewind arm — return the argument its thaw claim queued and run on (no re-park: the resumer took
+    // the old value before the freeze). Otherwise mark the park fresh (under `UNWINDING`, the resumer's
+    // trailing poll unwinds before it observes the value) or consumed (`NORMAL`).
+    if let Some(slot) = current_fiber_slot() {
+        if let Some(arg) = slot
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            return arg;
+        }
+        if (*rt).durable {
+            slot.consumed
+                .store(!window_is_unwinding((*rt).mem_base), Ordering::Relaxed);
+        }
     }
     // pop-before-switch / push-after keeps the yielder stack consistent so a resumer reached by the
     // switch sees *its* yielder on top.
@@ -1111,11 +1164,13 @@ pub(crate) unsafe fn freeze_drive(rt: *mut FiberRuntime, trap_out: u64) {
     let prev = set_current(rt);
     let table = Arc::clone(&(*rt).table);
     let mut status: i64 = 0;
+    (*rt).flattening = true; // #1538: these resumes are placeholder deliveries, not guest claims
     for handle in table.runnable_handles() {
         // Resume under the in-progress UNWINDING state word: the fiber flattens itself, returns, and
         // its `Complete` arm records the residue into `rt.frozen`.
         fiber_resume(handle, 0, &mut status as *mut i64, trap_out);
     }
+    (*rt).flattening = false;
     set_current(prev);
 }
 
@@ -1171,9 +1226,14 @@ pub(crate) unsafe fn seed_frozen_fibers(
             fault(trap_out);
             return false;
         };
-        let got = r
-            .table
-            .seed_frozen(Box::new(fiber), f.func, f.sp, f.shadow_sp, f.generation);
+        let got = r.table.seed_frozen(
+            Box::new(fiber),
+            f.func,
+            f.sp,
+            f.shadow_sp,
+            f.generation,
+            f.consumed,
+        );
         debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
         debug_assert_eq!(got, f.slot, "re-seeded slot matches the recorded handle");
     }

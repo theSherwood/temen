@@ -1367,6 +1367,12 @@ single-fiber round-trip works** (slice 3.1.5): freeze exports each flattened fib
 (`temen_interp::FrozenFiber` via the `Host`), and a thaw re-seeds the registry and re-enters the
 root under `REWINDING` — the resumer re-issues `cont.resume`, the fiber rewinds and re-parks,
 then runs forward to the same result as the uninterrupted run (`temen-durable/tests/fiber.rs`).
+**Consumed parks (#1538).** The re-park is right only while the resumer's in-flight `cont.resume`
+has yet to observe the park's value (the park happened under `UNWINDING`). A park whose value a
+resumer already took under `NORMAL` — and a fiber re-claimed under `UNWINDING`, whose delivery the
+freeze unwind drops — is **consumed**: each runtime tracks that per fiber, the residue carries it
+(`FrozenFiber::consumed`, format v24), and a thaw claim of such a fiber makes its rewound `suspend`
+*return the claim's argument* so the fiber runs on, instead of re-parking with the stale value.
 The byte-level snapshot **Section-2 codec** lands too: `temen-snapshot` serializes the
 `FrozenFiber` residue (slot/funcref/sp/shadow-SP) into a TLV control section (elided when there
 are no fibers, so no-fiber artifacts stay byte-identical) and `restore` re-seeds the `Host`, so a

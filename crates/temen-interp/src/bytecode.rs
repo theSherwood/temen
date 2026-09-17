@@ -5781,7 +5781,11 @@ fn debug_advance_fiber(
                 return FiberStep::Trapped(Trap::FiberFault);
             }
             let h = fibers.len() as i32;
-            fibers.push(FiberState::Pending { funcref, sp });
+            fibers.push(FiberState::Pending {
+                funcref,
+                sp,
+                consumed: false,
+            });
             vt.active.set(dst, Reg::from_i32(h));
             FiberStep::Stepped
         }
@@ -5798,11 +5802,26 @@ fn debug_advance_fiber(
             let k = kh as usize;
             let target = match fibers.get_mut(k) {
                 Some(slot @ FiberState::Pending { .. }) => {
-                    let (funcref, sp) =
-                        match std::mem::replace(slot, FiberState::Running { blocking_ip: None }) {
-                            FiberState::Pending { funcref, sp } => (funcref, sp),
-                            _ => unreachable!(),
+                    let (funcref, sp, consumed) = match std::mem::replace(
+                        slot,
+                        FiberState::Running {
+                            blocking_ip: None,
+                            pending: None,
+                        },
+                    ) {
+                        FiberState::Pending {
+                            funcref,
+                            sp,
+                            consumed,
+                        } => (funcref, sp, consumed),
+                        _ => unreachable!(),
+                    };
+                    if consumed {
+                        *slot = FiberState::Running {
+                            blocking_ip: None,
+                            pending: Some(arg), // #1538
                         };
+                    }
                     let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
                     else {
                         return FiberStep::Trapped(Trap::FiberFault);
@@ -5816,10 +5835,17 @@ fn debug_advance_fiber(
                     }
                 }
                 Some(slot @ FiberState::Parked { .. }) => {
-                    match std::mem::replace(slot, FiberState::Running { blocking_ip: None }) {
+                    match std::mem::replace(
+                        slot,
+                        FiberState::Running {
+                            blocking_ip: None,
+                            pending: None,
+                        },
+                    ) {
                         FiberState::Parked {
                             mut vm,
                             suspend_dst,
+                            consumed: _,
                         } => {
                             vm.set(suspend_dst, Reg::from_i64(arg));
                             vm
@@ -5835,6 +5861,11 @@ fn debug_advance_fiber(
             FiberStep::Stepped
         }
         Ok(Outcome::FiberSuspend { value, dst }) => {
+            // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
+            if let Some(arg) = take_pending(fibers, vt.active_id) {
+                vt.active.set(dst, Reg::from_i64(arg));
+                return FiberStep::Stepped;
+            }
             // Pop the resumer to switch back to; an empty chain means the root tried to `suspend`.
             let Some((rid, resumer, rdst)) = vt.chain.pop() else {
                 return FiberStep::Trapped(Trap::FiberFault);
@@ -5843,6 +5874,7 @@ fn debug_advance_fiber(
             fibers[vt.active_id] = FiberState::Parked {
                 vm: suspended,
                 suspend_dst: dst,
+                consumed: !is_unwinding(mem),
             };
             vt.active_id = rid;
             vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
@@ -9080,10 +9112,22 @@ fn sched_wall_deadline(_timeout: u64) -> u64 {
 /// fiber `Vm` shares the one window (snapshotted separately), so a clone is a faithful deep copy.
 #[derive(Clone)]
 enum FiberState {
-    /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`.
-    Pending { funcref: i32, sp: i64 },
+    /// Created by `cont.new` but never resumed: starts by calling `funcref(sp, arg)`. `consumed`
+    /// (#1538) is set only for a **thaw-seeded** fiber whose frozen park was already consumed: its
+    /// first resume queues the argument for the rewound `suspend` to return instead of re-parking.
+    Pending {
+        funcref: i32,
+        sp: i64,
+        consumed: bool,
+    },
     /// Suspended mid-run; resuming delivers the new `arg` into `suspend_dst` and continues `vm`.
-    Parked { vm: Vm, suspend_dst: u32 },
+    /// `consumed` (#1538): the park happened under `NORMAL`, so its value was taken by a resumer that
+    /// ran on — recorded into the freeze residue (see `FrozenFiber::consumed`).
+    Parked {
+        vm: Vm,
+        suspend_dst: u32,
+        consumed: bool,
+    },
     /// §3.6 slice 5a — **event-parked on a futex wait**: the fiber's `memory.wait` parked the
     /// FIBER, not its vCPU (the tree-walk oracle's fiber-park routing, `fiber_parks.rs`). Not
     /// resumable until an event sets `woken`; a `cont.resume` meanwhile reports `FIBER_PARKED`
@@ -9135,9 +9179,30 @@ enum FiberState {
     /// `blocking_ip` (I48): `Some(ip)` if this fiber's current resume used `cont.resume.block`, so a
     /// park inside it idles the resumer (rewinding the resumer's cursor to `ip`) instead of returning
     /// `FIBER_PARKED`; `None` for a plain `cont.resume`. Set at the claim, read when the fiber parks.
-    Running { blocking_ip: Option<usize> },
+    /// `pending` (#1538): the argument a thaw claim of a seeded, consumed fiber queued for its rewound
+    /// `suspend` to return (the fiber runs on instead of re-parking); `None` otherwise.
+    Running {
+        blocking_ip: Option<usize>,
+        pending: Option<i64>,
+    },
     /// Returned; resuming again is a `FiberFault`.
     Done,
+}
+
+/// #1538 — take the argument a thaw claim queued for fiber `slot`'s rewound `suspend` (see
+/// [`FiberState::Running::pending`]); `None` for an ordinary park.
+fn take_pending(fibers: &mut [FiberState], slot: usize) -> Option<i64> {
+    match fibers.get_mut(slot) {
+        Some(FiberState::Running { pending, .. }) => pending.take(),
+        _ => None,
+    }
+}
+
+/// #1538 — whether a durable freeze is in progress (the global freeze word reads `UNWINDING`): a park
+/// under it is **fresh** (the resumer's trailing poll unwinds before it observes the value), one under
+/// `NORMAL` is consumed by the resumer that runs on.
+fn is_unwinding(mem: &Option<Mem>) -> bool {
+    mem.as_ref().map(|m| m.durable_state()) == Some(super::STATE_UNWINDING)
 }
 
 /// F2 (FIBER_PARK.md) — the ordered completion drain over the fiber registry: claim ready punt
@@ -9328,13 +9393,18 @@ fn freeze_drive(
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
     for slot in 0..fibers.len() {
-        let (vm, suspend_dst) = match std::mem::replace(&mut fibers[slot], FiberState::Done) {
-            FiberState::Parked { vm, suspend_dst } => (vm, suspend_dst),
-            other => {
-                fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
-                continue;
-            }
-        };
+        let (vm, suspend_dst, consumed) =
+            match std::mem::replace(&mut fibers[slot], FiberState::Done) {
+                FiberState::Parked {
+                    vm,
+                    suspend_dst,
+                    consumed,
+                } => (vm, suspend_dst, consumed),
+                other => {
+                    fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
+                    continue;
+                }
+            };
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
@@ -9371,6 +9441,7 @@ fn freeze_drive(
             sp,
             shadow_sp,
             generation: 0,
+            consumed,
         });
     }
     // Leave the active shadow-SP at the root's region: the root rewinds first on thaw.
@@ -9573,7 +9644,11 @@ fn drive_nested(
                     return Err(Trap::FiberFault);
                 }
                 let h = fibers.len() as i32;
-                fibers.push(FiberState::Pending { funcref, sp });
+                fibers.push(FiberState::Pending {
+                    funcref,
+                    sp,
+                    consumed: false,
+                });
                 // Run-registry mode (#880): keep the parallel arrays index-aligned with the run's
                 // (`step_vcpu`'s ContNew arm, minus the durable shadow bookkeeping — see the
                 // `run_meta` doc above).
@@ -9605,13 +9680,26 @@ fn drive_nested(
                 let k = kh as usize;
                 let target = match fibers.get_mut(k) {
                     Some(slot @ FiberState::Pending { .. }) => {
-                        let (funcref, sp) = match std::mem::replace(
+                        let (funcref, sp, consumed) = match std::mem::replace(
                             slot,
-                            FiberState::Running { blocking_ip: None },
+                            FiberState::Running {
+                                blocking_ip: None,
+                                pending: None,
+                            },
                         ) {
-                            FiberState::Pending { funcref, sp } => (funcref, sp),
+                            FiberState::Pending {
+                                funcref,
+                                sp,
+                                consumed,
+                            } => (funcref, sp, consumed),
                             _ => unreachable!(),
                         };
+                        if consumed {
+                            *slot = FiberState::Running {
+                                blocking_ip: None,
+                                pending: Some(arg), // #1538
+                            };
+                        }
                         // Resolve through the shared dispatch table (module-aware, exactly as
                         // `Op::CallIndirect`), so a fiber over an installed §22 unit runs (#1226).
                         let Some((tmod, tfunc, tm)) = resolve_fiber_entry(source, table, funcref)
@@ -9623,10 +9711,17 @@ fn drive_nested(
                         fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
-                        match std::mem::replace(slot, FiberState::Running { blocking_ip: None }) {
+                        match std::mem::replace(
+                            slot,
+                            FiberState::Running {
+                                blocking_ip: None,
+                                pending: None,
+                            },
+                        ) {
                             FiberState::Parked {
                                 mut vm,
                                 suspend_dst,
+                                consumed: _,
                             } => {
                                 vm.set(suspend_dst, Reg::from_i64(arg));
                                 vm
@@ -9641,6 +9736,11 @@ fn drive_nested(
                 active_id = k;
             }
             Outcome::FiberSuspend { value, dst } => {
+                // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
+                if let Some(arg) = take_pending(fibers, active_id) {
+                    active.set(dst, Reg::from_i64(arg));
+                    continue;
+                }
                 // An empty chain means the unit entry itself tried to `suspend` — that would park
                 // the synchronous invoke, the seam the §22 contract forbids.
                 let Some((rid, resumer, rdst)) = chain.pop() else {
@@ -9650,6 +9750,7 @@ fn drive_nested(
                 fibers[active_id] = FiberState::Parked {
                     vm: suspended,
                     suspend_dst: dst,
+                    consumed: !is_unwinding(mem),
                 };
                 active_id = rid;
                 active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
@@ -10060,7 +10161,11 @@ fn step_vcpu(
                     return Err(Trap::FiberFault);
                 }
                 let h = fibers.len() as i32;
-                fibers.push(FiberState::Pending { funcref, sp });
+                fibers.push(FiberState::Pending {
+                    funcref,
+                    sp,
+                    consumed: false,
+                });
                 // A fresh fiber (registry slot `h`) is shadow context `h + 1`; its saved shadow-SP
                 // starts at its region base (empty shadow stack) — so a later switch into it points
                 // the active word there (DURABILITY.md §12.8).
@@ -10108,11 +10213,26 @@ fn step_vcpu(
                 // (forged / already running on a vCPU / done) is inert.
                 let target = match fibers.get_mut(k) {
                     Some(slot @ FiberState::Pending { .. }) => {
-                        let (funcref, sp) =
-                            match std::mem::replace(slot, FiberState::Running { blocking_ip }) {
-                                FiberState::Pending { funcref, sp } => (funcref, sp),
-                                _ => unreachable!(),
+                        let (funcref, sp, consumed) = match std::mem::replace(
+                            slot,
+                            FiberState::Running {
+                                blocking_ip,
+                                pending: None,
+                            },
+                        ) {
+                            FiberState::Pending {
+                                funcref,
+                                sp,
+                                consumed,
+                            } => (funcref, sp, consumed),
+                            _ => unreachable!(),
+                        };
+                        if consumed {
+                            *slot = FiberState::Running {
+                                blocking_ip,
+                                pending: Some(arg), // #1538
                             };
+                        }
                         // Resolve the fiber entry through the shared dispatch table (module-aware,
                         // exactly as `Op::CallIndirect` / the tree-walker's `dispatch_indirect` / the
                         // JIT's shared `fn_table`): a fiber may start on an **installed §22 unit**
@@ -10137,10 +10257,17 @@ fn step_vcpu(
                         fvm
                     }
                     Some(slot @ FiberState::Parked { .. }) => {
-                        match std::mem::replace(slot, FiberState::Running { blocking_ip }) {
+                        match std::mem::replace(
+                            slot,
+                            FiberState::Running {
+                                blocking_ip,
+                                pending: None,
+                            },
+                        ) {
                             FiberState::Parked {
                                 mut vm,
                                 suspend_dst,
+                                consumed: _,
                             } => {
                                 vm.set(suspend_dst, Reg::from_i64(arg));
                                 vm
@@ -10179,7 +10306,13 @@ fn step_vcpu(
                             vt.active.set(dst + 1, Reg::from_i64(0));
                             continue;
                         };
-                        match std::mem::replace(slot, FiberState::Running { blocking_ip }) {
+                        match std::mem::replace(
+                            slot,
+                            FiberState::Running {
+                                blocking_ip,
+                                pending: None,
+                            },
+                        ) {
                             FiberState::WaitParked {
                                 mut vm, wait_dst, ..
                             } => {
@@ -10209,7 +10342,13 @@ fn step_vcpu(
                             vt.active.set(dst + 1, Reg::from_i64(0));
                             continue;
                         };
-                        match std::mem::replace(slot, FiberState::Running { blocking_ip }) {
+                        match std::mem::replace(
+                            slot,
+                            FiberState::Running {
+                                blocking_ip,
+                                pending: None,
+                            },
+                        ) {
                             FiberState::CapParked {
                                 mut vm,
                                 dst: cap_dst,
@@ -10237,6 +10376,11 @@ fn step_vcpu(
                 vt.active_id = k;
             }
             Outcome::FiberSuspend { value, dst } => {
+                // #1538: a thawed consumed fiber's rewound `suspend` returns the queued argument.
+                if let Some(arg) = take_pending(fibers, vt.active_id) {
+                    vt.active.set(dst, Reg::from_i64(arg));
+                    continue;
+                }
                 // Pop the resumer to switch back to; an empty chain means the root tried to
                 // `suspend`, which is a `FiberFault` (the root has no resumer).
                 let (rid, resumer, rdst) = vt.chain.pop().ok_or(Trap::FiberFault)?;
@@ -10253,6 +10397,7 @@ fn step_vcpu(
                 fibers[vt.active_id] = FiberState::Parked {
                     vm: suspended,
                     suspend_dst: dst,
+                    consumed: !is_unwinding(ctx.mem),
                 };
                 vt.active_id = rid;
                 vt.active.set(rdst, Reg::from_i32(super::FIBER_SUSPENDED));
@@ -10910,6 +11055,7 @@ impl CoopSched {
                 fibers.push(FiberState::Pending {
                     funcref: ff.func,
                     sp: ff.sp,
+                    consumed: ff.consumed, // #1538: its first resume delivers at the rewound suspend
                 });
                 fiber_sp.push(ff.shadow_sp);
                 fiber_meta.push((ff.func, ff.sp));
@@ -11618,7 +11764,7 @@ impl CoopSched {
                         // I48: read the blocking-resume marker off the parking fiber's `Running` state
                         // before it is overwritten with `CapParked`.
                         let blocking_ip = match fibers.get(k) {
-                            Some(FiberState::Running { blocking_ip }) => *blocking_ip,
+                            Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
                             _ => None,
                         };
                         let vt = &mut tasks[ti].vt;
@@ -12842,7 +12988,7 @@ impl CoopSched {
                         // I48: read the blocking-resume marker off the parking fiber's `Running` state
                         // (set at the claim) before it is overwritten with `WaitParked` below.
                         let blocking_ip = match fibers.get(k) {
-                            Some(FiberState::Running { blocking_ip }) => *blocking_ip,
+                            Some(FiberState::Running { blocking_ip, .. }) => *blocking_ip,
                             _ => None,
                         };
                         let vt = &mut tasks[ti].vt;

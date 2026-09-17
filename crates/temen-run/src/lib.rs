@@ -1590,6 +1590,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) {
                 sp: f.sp,
                 shadow_sp: f.shadow_sp,
                 generation: f.generation,
+                consumed: f.consumed,
             })
             .collect();
         host.set_frozen_fibers(Vec::new());
@@ -1610,6 +1611,7 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
             sp: f.sp,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
+            consumed: f.consumed,
         })
         .collect();
     if !frozen.is_empty() {

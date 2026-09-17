@@ -1447,6 +1447,7 @@ fn recycled_context_artifact_canonical_re_freeze_through_the_codec() {
             sp: f.sp,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
+            consumed: f.consumed,
         })
         .collect();
     let i_vcpus: Vec<temen_interp::FrozenVCpu> = fvcpus

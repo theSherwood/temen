@@ -416,6 +416,10 @@ pub struct FrozenFiber {
     /// recycled fiber still resolves. 0 for a non-recycled fiber. Mirrors `temen_interp::FrozenFiber`
     /// (48-bit field — the `i64` handle's generation bits).
     pub generation: u64,
+    /// #1538 — the fiber's last `suspend` value was already consumed by a resumer that ran on, so a
+    /// thaw claim delivers its argument at the rewound `suspend` instead of re-parking. Mirrors
+    /// `temen_interp::FrozenFiber::consumed`.
+    pub consumed: bool,
 }
 
 /// The host-side residue of a **spawned vCPU** (a `thread.spawn` child) flattened by a multi-vCPU
