@@ -2391,6 +2391,34 @@ byte_budget }` is applied once per op; it is deliberately static, and a later ad
 fixed values for computed ones at the same call sites without changing the shape. A compaction is
 never revisited.
 
-Open: wiring journal-backed `step_back` into the DAP backend, DURABILITY.md **R4** (§13 shared-region
-edges — a design call, since a `Backed`/`SharedRegion` page has writers the journal cannot see), and
-real-program cost measurements (the bail criteria on #1557).
+**Measured, and the measurement moved the design.** `cargo run --release -p temen-run --example
+journal_cost` runs real guests on the debug engine armed and unarmed and reports the #1556 bail
+criteria. The first run said the journal cost **124.9×** on chibicc and **13.4×** on forth — far past
+any defensible factor. Turning per-op state capture off and re-running attributed **94%** and **83%**
+of that to one thing: a `ScheduledContinuation` clone per op, whose cost scales with **frame depth**,
+not with the window. #1556 had said not to do that — *"the continuation is snapshotted at segment
+boundaries rather than inverted per-op"* — and the first implementation did it per op anyway.
+
+`JournalPolicy::state_stride` is that boundary, and `undo_to(t)` now restores the nearest boundary at
+or before `t` and re-executes the remainder (bounded by the stride, using `tick`, which honours no
+breakpoint or watch checks because this is re-execution of turns that already happened). Window
+pre-images stay per-op, so the window is exact at every turn and only the continuation needs the short
+replay. At the chosen stride of 256:
+
+| guest | slowdown | level 2 held | vs window | undo vs replay |
+| --- | --- | --- | --- | --- |
+| gradient (bulk framebuffer) | 1.23× | 13.9 KiB | 5.43% | — |
+| mandelzoom | 1.00× | 0.1 KiB | 0.02% | 7× |
+| forth (real interpreter) | 1.23× | 3.1 KiB | 0.31% | **422×** |
+| chibicc (real compiler) | 1.62× | 13.4 KiB | 0.66% | **556×** |
+
+Both bail criteria pass: the level-2 bound holds everywhere (a compacted segment is never worse than
+the snapshot it replaces), and the slowdown is 1.0–1.6×. Journaling is armed by default in the DAP
+backend on that basis, and `backward_counts()` reports which path served each backward step so the
+wiring cannot silently stop being used.
+
+Open: DURABILITY.md **R4** (§13 shared-region edges — a design call, since a `Backed`/`SharedRegion`
+page has writers the journal cannot see); a byte budget below one `state_stride` of writes leaves every
+anchor under the floor and turns undo off quietly rather than shortening it (#1558); and the
+level-2 measured bound against #1459's per-moment page-scan cost, which #1556 asks for and which needs
+#1459 to exist first.

@@ -6293,6 +6293,50 @@ impl Instance {
         })
     }
 
+    /// Build a **debug run** of the powerbox entry, over the same granted `Host` that
+    /// [`run_with_caps`](Instance::run_with_caps) would build — same capability set, same names, same
+    /// quota and handoff, and the same argv/env blob seeded at `module_args_base`.
+    ///
+    /// This is what makes the debug engine usable on a *real* guest rather than on hand-written test
+    /// modules. #1455 lifted `Host::checkpoint_safe`'s refusal of cap-using guests (it reads
+    /// `every_host_proc_named()` now), but nothing assembled the powerbox for a `ScheduledDebugRun`,
+    /// so the "debug-tier time travel on cap-using guests" cell of #1454 stayed theoretical. The host
+    /// setup here is deliberately the *same code path* as `run_with_caps_and_host`'s — a second way to
+    /// grant a powerbox would be a second answer to what a guest is allowed to do (INVARIANTS #15).
+    ///
+    /// `None` when the module is outside the bytecode debug engine's subset (`ScheduledDebugRun::new_with_host`
+    /// declines), in which case the tree-walk `Inspector` is the engine that serves it.
+    pub fn debug_run_with_caps(
+        &self,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+    ) -> Result<Option<temen_interp::bytecode::ScheduledDebugRun>, String> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let init_mem = config.init_mem()?;
+
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        host.set_handoff(config.handoff);
+        self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
+
+        let Some(mut run) =
+            temen_interp::bytecode::ScheduledDebugRun::new_with_host(m, 0, &[], host)
+        else {
+            return Ok(None);
+        };
+        if let Some(init) = init_mem.as_deref() {
+            run.seed_mem(init);
+        }
+        Ok(Some(run))
+    }
+
     /// Run the powerbox entry under the **parallel** driver (THREADS.md 4c): one OS thread per vCPU
     /// over a single shared window, with the powerbox `host` shared across them (host I/O serialized
     /// per call). This is the opt-in parallel execution mode — real races, *not* the deterministic

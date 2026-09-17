@@ -27473,7 +27473,10 @@ impl Mem {
 
     /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
     /// window size are ignored — confinement only concerns `[0, size)`.
-    fn seed(&mut self, init: &[u8]) {
+    ///
+    /// `pub(crate)` so the debug engine can seed an argv blob the same way the production entries do
+    /// (`ScheduledDebugRun::seed_mem`) rather than growing a second seeding path.
+    pub(crate) fn seed(&mut self, init: &[u8]) {
         let n = (init.len() as u64).min(self.window.mapped()) as usize;
         // Bulk fast path: with no §13 region mapped, no page is `Backed`, so the whole prefix writes
         // straight through to `back` — one `memcpy` (flat) or a single-lock page-wise copy (`Paged`),

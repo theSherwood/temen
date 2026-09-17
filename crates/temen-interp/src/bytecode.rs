@@ -5837,8 +5837,17 @@ fn journal_state(
     host: &Host,
     clock: u64,
     turn: u64,
+    policy: &super::journal::JournalPolicy,
 ) {
     if !journal.is_armed() {
+        return;
+    }
+    // **Segment boundaries, not every op.** The clone below is every task's `Vm`, the fiber chain and
+    // the task states; its cost scales with frame depth and it dominated the journal on real guests
+    // (`JournalPolicy::state_stride` carries the measurements). Turn 0 is always a boundary so a run
+    // can always be undone to its start.
+    let stride = policy.state_stride.max(1);
+    if !turn.is_multiple_of(stride) {
         return;
     }
     let invertible = host.journal_invertible()
@@ -7963,6 +7972,23 @@ impl ScheduledDebugRun {
         })
     }
 
+    /// Seed the low bytes of the window before stepping — the argv/env blob a powerbox entry expects
+    /// at [`module_args_base`](temen_ir::module_args_base), which every non-trivial guest reads on the
+    /// way into `main`.
+    ///
+    /// Without this a debug run of an argv-taking guest starts with an empty args region and takes a
+    /// different path than the same guest under `run_with_caps` — so it is the difference between the
+    /// debug engine running toy modules and running the real ones. Call it before the first step;
+    /// afterwards it would be a write the journal never saw.
+    ///
+    /// Bytes past the window are ignored, exactly as the production seed does — confinement only
+    /// concerns `[0, size)`.
+    pub fn seed_mem(&mut self, init: &[u8]) {
+        if let Some(m) = self.mem.as_mut() {
+            m.seed(init);
+        }
+    }
+
     /// Replace the run-shared breakpoint set (fires in whichever thread reaches a pc in it).
     pub fn set_breakpoints(&mut self, bps: Vec<super::IrPc>) {
         self.breakpoints = bps;
@@ -8013,7 +8039,12 @@ impl ScheduledDebugRun {
     pub fn can_undo_to(&self, turn: u64) -> bool {
         // Undoing to where the run already stands is vacuously possible, and has no state entry of its
         // own: entries are recorded *before* each op, so the current turn's op has not run.
-        turn == self.turn || self.journal.can_undo_to(turn)
+        if turn == self.turn {
+            return true;
+        }
+        // Undo only goes backward. A turn past the run's own position is not history, and the
+        // nearest-at-or-before anchor lookup would otherwise happily answer with the last boundary.
+        turn < self.turn && self.journal.can_undo_to(turn)
     }
 
     /// Undo back to `turn`, putting the run where it stood **before** that turn's op ran: the window
@@ -8030,12 +8061,19 @@ impl ScheduledDebugRun {
         let Some(st) = self.journal.state_at(turn) else {
             return false;
         };
+        // Continuations ride segment boundaries, so the entry found is the boundary **at or before**
+        // the target. Undo lands there and re-executes the remainder forward — bounded by
+        // `JournalPolicy::state_stride`, and the window pre-images are per-op either way, so nothing
+        // about the *window* is approximated by this.
+        let anchor = st.coord;
         let cont = st.cont.clone();
         let cursor = st.cursor;
         // Window first: the pre-images are keyed on the turns being undone, and installing the
-        // continuation does not touch guest memory.
+        // continuation does not touch guest memory. Undo all the way to the anchor — the forward
+        // replay below re-runs the ops between it and the target, which re-writes exactly what was
+        // just reverted, so the window ends correct at `turn` either way.
         if let Some(m) = self.mem.as_mut() {
-            self.journal.undo_window_to(turn, m);
+            self.journal.undo_window_to(anchor, m);
         }
         // Verbatim (`readmit_parks = false`): an undo rewinds in place rather than re-executing, so a
         // task parked at that turn comes back parked.
@@ -8051,11 +8089,30 @@ impl ScheduledDebugRun {
             self.host.replay_cap_tape(taped);
         }
         self.host.restore_journal_cursor(&cursor);
-        self.turn = turn;
+        self.turn = anchor;
         self.clock = cont.clock;
         self.locate();
         self.last_watch = None;
-        true
+        // Re-execute the remainder of the segment. The journal stays armed, so the re-run re-records
+        // the same pre-images for those turns and the history is whole again afterwards — an undo to
+        // a position inside this stretch, next time, works exactly as this one did.
+        //
+        // Breakpoints and watchpoints are suppressed across the replay: it is *re-execution of turns
+        // that already happened*, not the user continuing, and a stop here would strand the run
+        // short of the position it was asked for. The same reasoning the DAP backend's `seek` replay
+        // applies to its own drive.
+        if anchor < turn {
+            // `tick` is the right primitive here and the reason this is sound: it advances the
+            // schedule by exactly one visible op, honouring no breakpoint / watch / step checks. This
+            // is re-execution of turns that already happened, not the user continuing, so a stop
+            // would strand the run short of the position it was asked for — and a `step` would
+            // advance by a *step*, which is not the same quantum as a turn.
+            let mut fuel = u64::MAX;
+            while self.turn < turn && self.tick(&mut fuel) {}
+            self.locate();
+            self.last_watch = None;
+        }
+        self.turn == turn
     }
 
     /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
@@ -8350,7 +8407,15 @@ impl ScheduledDebugRun {
                 mem,
             );
             journal_state(
-                journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+                journal,
+                tasks,
+                extra_envs,
+                fibers,
+                source,
+                host,
+                *clock,
+                *turn,
+                journal_policy,
             );
             journal.apply_policy(*turn, journal_policy);
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
@@ -8487,7 +8552,15 @@ impl ScheduledDebugRun {
             mem,
         );
         journal_state(
-            journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+            journal,
+            tasks,
+            extra_envs,
+            fibers,
+            source,
+            host,
+            *clock,
+            *turn,
+            journal_policy,
         );
         journal.apply_policy(*turn, journal_policy);
         let trace_turn = *turn;
