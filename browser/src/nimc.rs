@@ -742,7 +742,11 @@ pub(crate) fn make_exec(
                 log,
                 "{} → {exit}{}",
                 argv.join(" "),
-                if served { " (the crawl already parsed it)" } else { "" }
+                if served {
+                    " (the crawl already parsed it)"
+                } else {
+                    ""
+                }
             );
         }
         Ok(vec![jobs.push(temen_exec::Job {
@@ -1349,7 +1353,12 @@ mod tests {
                 vec!["nimcache".into()],
             );
             let factory: FsFactory = Arc::new(factory);
-            let mut exec = make_exec(ExecNifler::Shared(top_m.clone()), ce, factory, handle.clone());
+            let mut exec = make_exec(
+                ExecNifler::Shared(top_m.clone()),
+                ce,
+                factory,
+                handle.clone(),
+            );
             let mut mem = VecMem(vec![0u8; AP + blob.len()]);
             mem.0[AP..].copy_from_slice(&blob);
             let args = [AP as i64, blob.len() as i64, 0, 0];
