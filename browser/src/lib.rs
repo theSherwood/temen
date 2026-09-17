@@ -11816,7 +11816,7 @@ unsafe fn nimsem_open_common(
     seed_len: usize,
     out_ptr: *const u8,
     out_len: usize,
-    exec_of: fn(std::sync::Arc<temen_ir::Module>) -> ExecMode,
+    exec_of: fn(std::sync::Arc<nimc::Phase>) -> ExecMode,
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
@@ -11826,7 +11826,10 @@ unsafe fn nimsem_open_common(
     if temen_verify::verify_module(&nifler).is_err() {
         return -STATUS_VERIFY_ERR;
     }
-    let exec = exec_of(std::sync::Arc::new(nifler));
+    // The `Phase` lives as long as this open: every `exec` inside this nimsem run shares one compiled
+    // nifler program (the #1540 finding — 21 compiles per card), and it is freed at `close` rather
+    // than held page-wide, because nifler resident is 338 MB of a 1 GiB engine (#1543).
+    let exec = exec_of(nimc::Phase::new(std::sync::Arc::new(nifler)));
     let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
         return -STATUS_DECODE_ERR;
     };
@@ -11984,10 +11987,10 @@ enum ExecMode {
     None,
     /// 4-cap: `exec` runs the given top-level nifler **inline** on the interpreter (#1364) — no
     /// nifler_ce decode+emit, so the tiered nimsem's engine footprint stays far under the 1 GiB ceiling.
-    Inline(std::sync::Arc<temen_ir::Module>),
+    Inline(std::sync::Arc<nimc::Phase>),
     /// 4-cap: `exec` spawns the given child-entry `nifler_ce` as a **confined §14 op-13 grandchild**
     /// (#1025 3d, `run_phase_op13`) — more isolated, but pays the ~13 MB guest decode+emit.
-    Grandchild(std::sync::Arc<temen_ir::Module>),
+    Grandchild(std::sync::Arc<nimc::Phase>),
 }
 
 /// # Safety
@@ -12068,20 +12071,24 @@ unsafe fn op13_phase_open_impl(
     let exec_nifler = match &exec {
         ExecMode::None => None,
         ExecMode::Inline(n) => Some((std::sync::Arc::clone(n), None)),
-        ExecMode::Grandchild(ce) => {
-            Some((std::sync::Arc::clone(ce), Some(std::sync::Arc::clone(ce))))
-        }
+        ExecMode::Grandchild(ce) => Some((
+            std::sync::Arc::clone(ce),
+            Some(std::sync::Arc::clone(ce.module())),
+        )),
     };
     if let Some((first, ce)) = exec_nifler {
-        let exec_init: temen_interp::HostProc =
-            nimc::make_exec(first.clone(), ce.clone(), std::sync::Arc::clone(&factory));
+        let exec_init: temen_interp::HostProc = nimc::make_exec(
+            nimc::ExecNifler::Shared(first.clone()),
+            ce.clone(),
+            std::sync::Arc::clone(&factory),
+        );
         let exec_fork: temen_interp::HostProcFork = {
             let first = std::sync::Arc::clone(&first);
             let ce = ce.clone();
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    first.clone(),
+                    nimc::ExecNifler::Shared(first.clone()),
                     ce.clone(),
                     std::sync::Arc::clone(&factory),
                 ))
@@ -12184,6 +12191,23 @@ pub extern "C" fn temen_op13jit_phase_diag() -> usize {
         })
         .unwrap_or_default();
     let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
+/// The `exec` calls the card's phases serviced since the last take — one `argv → exit` line each, in
+/// order ([`nimc::EXEC_LOG`]) — onto [`OUT`]; returns the length and clears the log. The lines pair 1:1
+/// with the `exec` wrapper's entries in the JS driver's bounce series, which is how the bench names
+/// each exec bounce (#1540 follow-up).
+#[no_mangle]
+pub extern "C" fn temen_op13jit_exec_log() -> usize {
+    let bytes = nimc::EXEC_LOG
+        .lock()
+        .map(|mut l| std::mem::take(&mut *l))
+        .unwrap_or_default()
+        .into_bytes();
+    let len = bytes.len();
+    // SAFETY: single-threaded wasm; exclusive access to the OUT stash.
     unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
     len
 }
