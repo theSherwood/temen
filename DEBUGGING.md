@@ -488,6 +488,20 @@ different things depending on which pair you compare:
   tree-walker, a child breakpoint on a distinct thread, confined-window inspection, deterministic
   tick-replay).
 
+  **§GC `gc.roots` on the multi-vCPU engine (#1563).** `gc.roots` is no longer declined. A decline
+  here was never a skip — `drive` turned it into `SchedStop::Declined` without ticking the clock, so a
+  collecting guest stopped dead at its first collection and a GC'd language runtime could not be
+  stepped at all, which is un-wired support behind a decline on the axis INVARIANTS #14 names
+  ("Debugger — it stays observable under the debug tier"). Every input was already in
+  `service_advance`'s hands: the task's own `VTask` (active `Vm` + resume chain), the run's fiber
+  registry, and the window each seam selects through `tasks[ti].env`. The scan itself is factored out
+  as `gc_scan` and **shared with production** (`step_vcpu`), so the debug tier reports the same
+  candidate set rather than a second approximation of it (invariant 9's observability corollary,
+  invariant 15's one path), and `tick`-replay inherits it because both drive through
+  `service_advance`. Covered by `debug_gc_roots.rs`: the session runs to completion, the set equals
+  the cooperative driver's on the same guest, and a **parked fiber's** root is reached — the §3.1
+  coverage a frame-only implementation would miss.
+
   **§14 `instantiate_module` + depth-2 nesting on the multi-vCPU engine (slices 15b/15c).**
   `instantiate_module` (op 5) is no longer declined: `dbg_instantiate_module` (mirroring the production
   `drive`'s `InstantiateModule` arm) resolves the host-granted `Module` from the powerbox, compiles it,
