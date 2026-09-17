@@ -268,6 +268,22 @@ pub struct TranslateOptions {
     /// program keeps its paramless entry. Only meaningful when a `_start` is synthesized at all (a
     /// program that uses the powerbox); an argv-taking `main` under this mode is not yet supported.
     pub child_entry: bool,
+    /// Reserve a **durable shadow arena** of this many per-context regions and declare it in the
+    /// memory descriptor (`memory N shadow BASE END`), making the guest freezable (#1534).
+    ///
+    /// #1503 made arena placement the module's (INVARIANTS.md #16): the durable transform fails
+    /// closed with `NoShadowArena` on a module that declares none, so without this a C guest cannot
+    /// be a durable domain. The arena is reserved as BSS on top of whatever the window already holds
+    /// (data-stack reserve, float scratch, EH region) and below the heap — allocator-neutral by
+    /// construction (`malloc` never manages it), page-aligned so a shadow push never lands in a
+    /// read-only global's D40-protected page, and clear of every data segment, which is R9's "guest
+    /// bytes never alias the arena" as a static check.
+    ///
+    /// `None` (the default) declares no arena, which is correct for a non-durable guest: it reserves
+    /// nothing and its window is byte-identical to before. `Some(n)` is verified `1..=`
+    /// [`temen_ir::durable_abi::MAX_SHADOW_CONTEXTS`]; a durable run needs one region for the root
+    /// plus one per concurrent fiber or vCPU.
+    pub shadow_contexts: Option<u32>,
 }
 
 impl Default for TranslateOptions {
@@ -278,6 +294,7 @@ impl Default for TranslateOptions {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
             child_entry: false,
+            shadow_contexts: None,
         }
     }
 }
@@ -786,17 +803,20 @@ fn translate_impl(
             i
         })
     };
-    // The float scratch sits just above the data-stack reserve (computed here so it can ride in
-    // `Helpers` to the printf lowering, and drive the window sizing + helper append below).
-    let float_scratch_base = need_dtoa.then_some(entry_sp + STACK_RESERVE);
-    // The C++ EH region sits just above the float scratch (or directly above the stack reserve when
-    // there is no float scratch), reserved only when `need_eh`. Rides in `Helpers` to the
-    // `invoke`/`landingpad`/`resume`/`__cxa_*` lowerings.
+    // The fixed low-window **reserves** stack up above the data stack in order — float scratch, then
+    // the C++ EH region — each present only if needed. One cursor places both, so adding a reserve
+    // cannot forget to skip an earlier one. They ride in `Helpers` to the printf and
+    // `invoke`/`landingpad`/`resume`/`__cxa_*` lowerings. (The durable shadow arena is reserved with
+    // the window sizing below, where the data stack's own presence is known.)
+    let mut reserve_top = entry_sp + STACK_RESERVE;
+    let float_scratch_base = need_dtoa.then(|| {
+        let b = reserve_top;
+        reserve_top += FLOAT_SCRATCH_SIZE;
+        b
+    });
     let eh_base = need_eh.then(|| {
-        let mut b = entry_sp + STACK_RESERVE;
-        if need_dtoa {
-            b += FLOAT_SCRATCH_SIZE;
-        }
+        let b = reserve_top;
+        reserve_top += EH_REGION_SIZE;
         b
     });
     let helpers = Helpers {
@@ -1000,30 +1020,61 @@ fn translate_impl(
     // globals plus a stack reserve, with a faulting guard beyond (reserved > mapped, §5). Declared if
     // any function uses the data stack, the module has globals, or it uses the powerbox (the handle
     // stash / heap state live in the reserved low window).
+    // Where the window ends before any durable arena: the data-stack reserve when some function (or
+    // the argv `_start`) uses the data stack, else just the globals, raised past whichever fixed
+    // reserves are present.
+    let mut top = if any_frame || wants_argv {
+        entry_sp + STACK_RESERVE
+    } else {
+        globals_end
+    }
+    .max(1);
+    if let Some(fsb) = float_scratch_base {
+        top = top.max(fsb + FLOAT_SCRATCH_SIZE);
+    }
+    if let Some(eb) = eh_base {
+        top = top.max(eb + EH_REGION_SIZE);
+    }
+    // The durable **shadow arena** (#1534): where a freeze/thaw run of this guest keeps its
+    // per-context shadow regions. Reserved only when the caller asks for one — placement is the
+    // module's to declare (INVARIANTS.md #16), and a non-durable guest reserves nothing, keeping its
+    // window byte-identical. It goes on top of everything else the window holds and below the heap,
+    // so it is BSS the allocator never manages and no data segment can alias it (R9, which the
+    // verifier then checks statically). Sitting on `top` rather than on a fixed offset keeps a guest
+    // that reserves no data stack from paying for one.
+    let shadow_arena = match opts.shadow_contexts {
+        None => None,
+        Some(n) => {
+            if !(1..=temen_ir::durable_abi::MAX_SHADOW_CONTEXTS as u32).contains(&n) {
+                return Err(Error::Unsupported(format!(
+                    "shadow arena of {n} contexts: must be 1..={}",
+                    temen_ir::durable_abi::MAX_SHADOW_CONTEXTS
+                )));
+            }
+            // Page-align it, for the reason `entry_sp` is page-aligned: the arena is *written*
+            // during freeze/thaw, D40 protects read-only segments page-granularly, and `top` can
+            // land inside the last read-only global's page — a shadow push there faults. `stack_page`
+            // is the target host's page, so the isolation holds on whatever host runs the artifact.
+            let base = top.next_multiple_of(stack_page);
+            Some(temen_ir::durable_abi::ShadowArena {
+                base,
+                end: base + n as u64 * temen_ir::durable_abi::SHADOW_STRIDE,
+            })
+        }
+    };
     let need_window = any_frame
         || !globals.is_empty()
         || synth
         || ctype.any()
         || eh_base.is_some()
+        || shadow_arena.is_some()
         || locale_addr.is_some();
     let memory = need_window.then(|| {
-        // Reserve stack when any function (or the argv `_start`) uses the data stack.
-        let mut top = if any_frame || wants_argv {
-            entry_sp + STACK_RESERVE
-        } else {
-            globals_end
-        }
-        .max(1);
-        if let Some(fsb) = float_scratch_base {
-            top = top.max(fsb + FLOAT_SCRATCH_SIZE);
-        }
-        if let Some(eb) = eh_base {
-            top = top.max(eb + EH_REGION_SIZE);
-        }
+        let top = shadow_arena.map_or(top, |a| a.end);
         let log2 = (64 - (top - 1).leading_zeros()) as u8;
         temen_ir::Memory {
             size_log2: log2,
-            shadow: None,
+            shadow: shadow_arena,
         }
     });
     // The guest heap begins at the window's mapped boundary (the first reserved page) and grows up

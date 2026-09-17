@@ -298,6 +298,11 @@ pub mod durable_abi {
     pub const REGION_HEADER_LEN: u64 = 16;
     /// Per-context shadow-region stride: context `i` owns `[ShadowArena::region_base(i), +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;
+    /// The most shadow contexts a declared arena may hold (`(end - base) / SHADOW_STRIDE`): one
+    /// machine word of allocator occupancy bits, and far above any fiber quota in the tree. The
+    /// verifier holds a declared arena to it; a producer that *places* an arena (the LLVM on-ramp's
+    /// `--shadow-arena`, #1534) sizes against the same number rather than a copy of it.
+    pub const MAX_SHADOW_CONTEXTS: usize = 64;
     /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
     pub const STATE_NORMAL: i32 = 0;
     /// A stop-the-world freeze is in progress (unwinding shadow frames).

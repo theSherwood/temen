@@ -23,6 +23,11 @@ temen-encode = { path = "../temen-encode" }
 [dev-dependencies]
 temen-verify = { path = "../temen-verify" }
 temen-interp = { path = "../temen-interp" }
+# The durable transform + shadow-arena window helpers, and the freeze/thaw codec: `--shadow-arena`
+# (#1534) exists to make an on-ramp C guest a durable domain, so the test that proves it freezes and
+# thaws a real translated guest (`tests/durable_shadow_arena.rs`).
+temen-durable = { path = "../temen-durable" }
+temen-snapshot = { path = "../temen-snapshot" }
 # The JIT, so every translation test is also an interp↔JIT differential (the §18 oracle).
 temen-jit = { path = "../temen-jit" }
 # The partial evaluator (§20c): the end-to-end Futamura demo specializes a real LLVM-translated
