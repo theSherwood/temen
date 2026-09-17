@@ -4596,9 +4596,16 @@ impl<'a> FuncGen<'a> {
     /// This keeps every sub-word integer **canonical** — already truncated and correctly extended —
     /// which is the invariant the rest of the lowering needs: `div_u`/`rem_u`/`shr_u` are only right
     /// on a zero-extended operand, `div_s`/`shr_s` only on a sign-extended one, and comparisons only
-    /// on both. The other producers already hold it up (`i32.load8_u`/`load16_s` extend on the way
-    /// in, constants are in range, and a callee's params come from narrowed arguments), so the
-    /// property is inductive once the operators maintain it.
+    /// on both.
+    ///
+    /// **The producers do not make that inductive on their own** — this comment used to claim they
+    /// did, and #1544 is what the claim cost. They disagree for a *signed* sub-word type: a constant
+    /// `int16` is materialized zero-extended (`0x0000D83D`), while the same value loaded from memory
+    /// is `i32.load16_s` and arrives sign-extended (`0xFFFFD83D`). Both satisfy the signed consumers,
+    /// so the difference is invisible right up until something reads the value as unsigned. Anything
+    /// that changes a sub-word value's signedness therefore has to re-canonicalize rather than assume
+    /// — see [`narrow_to_target`], which is where `conv`/`cast` now does it. Keep that in mind before
+    /// adding a consumer that relies on the extension it is handed.
     ///
     /// A no-op at full width — 32-bit and 64-bit ops are already wrapped by the machine op, which is
     /// exactly why they were the widths that looked correct.
