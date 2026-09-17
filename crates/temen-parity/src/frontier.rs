@@ -238,7 +238,11 @@ impl Axis {
     pub fn is_conformed(self) -> bool {
         matches!(
             self,
-            Axis::Nesting | Axis::Durability | Axis::Debugger | Axis::ConcurrencyModel
+            Axis::Nesting
+                | Axis::Durability
+                | Axis::Debugger
+                | Axis::ConcurrencyModel
+                | Axis::RuntimeBackend
         )
     }
 }
@@ -265,6 +269,28 @@ const K: Cell = Cell {
 /// guest probing a stale child handle survives on one driver and dies on the other — INVARIANTS #5
 /// (errors are values) and #9 (refuse probeably, never diverge). A `NotYet`, not a `Declines`: the
 /// op works, the two drivers disagree about how it fails.
+/// `Full` on the **backend** axis: every engine that runs cap calls answers as the oracle does.
+/// `tests/backend_conformance.rs` drives each of the row's ops on the tree-walk oracle, the bytecode
+/// tier and Cranelift (through `temen_run::cap_thunk`, the reference host trampoline) and compares
+/// the answers shape by shape. The wasm-JIT is a leaf accelerator that does not emit `call.cap` at
+/// all, so it folds every capability to the interpreter underneath — a decline in invariant 9's
+/// sense, pinned by that test rather than restated per row.
+const B: Cell = Cell {
+    status: Status::Full,
+    note: "",
+};
+
+/// The divergence the **backend** column's first rendering found: `join` (op 1) traps `ThreadFault`
+/// on the oracle and `CapFault` under the Cranelift thunk for the same forged child handle, on 18
+/// call shapes. Invariant 9 lets a backend decline to the oracle; it does not let one run the op and
+/// report a different failure. `instantiator_rt.rs` documents its arm as "matching the interpreter",
+/// which the measurement contradicts — so this is a `NotYet`, not a `Declines`.
+const JOIN_TRAP_DIVERGES: Cell = Cell {
+    status: Status::NotYet,
+    note:
+        "join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)",
+};
+
 const CHILD_OFFER_DIVERGES: Cell = Cell {
     status: Status::NotYet,
     note: "child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)",
@@ -293,7 +319,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
     match c {
         // Coordinate-free value caps: copyable into a child (`resolve_copyable`) and value-typed, so
         // they ride a freeze. The only rows that are unconditionally `Full` on both audited axes.
-        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, K, U, F],
+        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, B, U, K, U, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
         // FIFO into the child (the cross-domain `cmd1 | cmd2` grant), while a freeze cannot carry the
@@ -301,12 +327,11 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::PipeEnd => [
             F,
             declines("the live FIFO backing cannot be serialized (NonDurableKind::Pipe)"),
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
 
         // Re-granting aliases the SAME backing into the child (the explicit data plane); a byte
         // snapshot cannot reproduce a live alias into shared backing — INVARIANTS #14's one recorded
@@ -314,15 +339,14 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::SharedRegion => [
             F,
             declines("a snapshot cannot reproduce a live alias into shared backing (#14 exception)"),
-            U,
+            B,
             U,
             K,
             U,
             conditional(
                 "map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by \
                  name in the bytecode lowering",
-            ),
-        ],
+            )],
 
         // Window-coordinate authority: a child is minted its OWN `AddressSpace`/`Instantiator` over
         // its own window, never handed the parent's — the parent's names coordinates meaningless in
@@ -331,19 +355,18 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::AddressSpace => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
         // Identical to `AddressSpace` on both predicate-audited axes, and deliberately its own arm
         // because the **debugger** axis splits them: the memory half of the §14 pair compiles whole
         // for the debug tier, the spawn half does not.
         Capability::Instantiator => [
             declines("the child is minted its own over its own window; the parent's names coordinates the child cannot use"),
             F,
-            U,
+            JOIN_TRAP_DIVERGES,
             U,
             CHILD_OFFER_DIVERGES,
             U,
@@ -351,8 +374,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
                  coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches \
                  the debug scheduler and is declined",
-            ),
-        ],
+            )],
 
         // Declines on nesting (its index into `Host::budgets` is meaningless in another table — a child
         // is granted a *sub*-budget by `split`/`transfer`, never the handle) but **durable** since
@@ -362,33 +384,30 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::Budget => [
             declines("index-carrying: the child is granted a sub-budget by split/transfer, not the handle"),
             F,
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
 
         // An immutable instantiable artifact: shared into the child (FORK.md §8.6), but its host-side
         // registration cannot be serialized, so the embedder re-grants after restore.
         Capability::Module => [
             F,
             declines("NonDurableKind::Module — re-granted by the embedder after restore"),
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
         Capability::ModuleLoader => [
             declines("not in `can_regrant`: a child that may mint modules must be granted one explicitly"),
             declines("NonDurableKind::ModuleLoader — a live loader makes the domain non-snapshottable"),
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
 
         // #1296 — a §22 `Jit` grant crosses into a §14 child with a FRESH, empty unit table (sharing
         // one across the boundary would let either side's `install` alias into the other's
@@ -403,18 +422,16 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
-        ],
+            U],
 
         Capability::Blocking => [
             declines("not in `can_regrant`: index-carrying into the parent's blocking table"),
             declines("NonDurableKind::Blocking"),
-            U,
+            B,
             U,
             K,
             U,
-            F,
-        ],
+            F],
         // Only a *forkable* host proc crosses (one carrying a provider fork factory); a factory-less
         // opaque closure cannot be re-minted over the shared provider state.
         Capability::HostProc => [
@@ -423,7 +440,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                 note: "only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot",
             },
             declines("NonDurableKind::HostProc — the host closure cannot be serialized"),
-            U,
+            B,
             U,
             K,
             U,
@@ -441,8 +458,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
-        ],
+            U],
         Capability::LiveImpl => [
             F,
             declines("NonDurableKind::LiveImpl — points at a *running* domain's powerbox"),
@@ -450,7 +466,6 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             U,
-            U,
-        ],
+            U],
     }
 }

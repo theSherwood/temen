@@ -4,7 +4,7 @@
 
 INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `OPS_PARITY.md` machine-checks one of them at op granularity; this matrix is the machine for the rest (#1413). Rows are powerbox capability kinds; columns are the seven axes.
 
-**56 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. 4 of the seven columns (nesting, durability, concurrency, debugger) are checked against live predicates by the conformance tests in `crates/temen-parity/tests/`; the rest state the manifest's belief and nothing more.
+**68 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. 5 of the seven columns (nesting, durability, backend, concurrency, debugger) are checked against live predicates by the conformance tests in `crates/temen-parity/tests/`; the rest state the manifest's belief and nothing more.
 
 ## Legend
 
@@ -18,7 +18,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 - **nesting** — can a §14 child hold it? (`Host::can_regrant`) *(conformance-tested)*
 - **durability** — does it survive a freeze? (`capture_durable_handles`) *(conformance-tested)*
-- **backend** — same on every engine? (see OPS_PARITY.md for op-level detail)
+- **backend** — same on every engine? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
 - **target** — same on native / wasm32 / Windows?
 - **concurrency** — carried by both the coop and per-Worker drivers? *(conformance-tested)*
 - **code origin** — usable from a §22 guest-JIT unit as from the base module?
@@ -28,20 +28,20 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 | capability | nesting | durability | backend | target | concurrency | code origin | debugger |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| `Stream` | ✅ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `Exit` | ✅ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `Clock` | ✅ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `PipeEnd` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | 🔶 |
-| `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | 🚧 | ❔ | 🔶 |
-| `Budget` | ⛔ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `Module` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
+| `Stream` | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `Exit` | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `Clock` | ✅ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `PipeEnd` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | 🔶 |
+| `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | 🚧 | ❔ | 🔶 |
+| `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `Module` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `ModuleLoader` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `JitCode` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Blocking` | ⛔ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `HostProc` | 🔶 | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
+| `Blocking` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `HostProc` | 🔶 | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `Offer` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `LiveImpl` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 
@@ -59,6 +59,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
+- *backend* 🚧 — join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)
 - *concurrency* 🚧 — child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)
 - *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
