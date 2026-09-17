@@ -1244,6 +1244,11 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
   const includes = []; // files reached by `include`, drained after the module walk (see below)
   let crawled = 0, included = 0;
+  // Where a phase's wall-clock goes now that its bounces are ~10% of it: `open` is the cdylib-side
+  // emit (decode, outline, `emit_for_run`), `drive` is the guest actually running on emitted wasm.
+  // Split per phase so a repeated emit shows up as an emit, not as compiler work (#1562 follow-up).
+  const split = { nimsemOpenMs: 0, nimsemDriveMs: 0, hexerOpenMs: 0, hexerDriveMs: 0 };
+  jitCacheStats.compiles = 0; jitCacheStats.hits = 0;
   const dirOf = (f) => f.slice(0, f.lastIndexOf('/'));
   // The `include` edges in a `.p.deps.nif`, through the same parser the Rust driver uses.
   const parseIncludes = (deps, dir) => {
@@ -1380,10 +1385,14 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     // (exec) cap, so it works; the crawl above already seeded every module's `.p.nif`, so the exec is a
     // rare fallback. `.p.nif` byte-identical either way (`exec_op13_nifler_matches_inline`).
     const cp = pushBytes(nimsemCe), np = pushBytes(nifler), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const tOpen = now();
     const opened = ex.temen_op13jit_nimsem_open_inline(cp, nimsemCe.length, np, nifler.length, ap, argv.length, sp, seed.length, op, out.length);
+    split.nimsemOpenMs += now() - tOpen;
     ex.temen_dealloc(cp, nimsemCe.length); ex.temen_dealloc(np, nifler.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem open ${stem}: ${opened}` }; }
+    const tDrive = now();
     const r = await drive(`${cacheKey}-nimsem`);
+    split.nimsemDriveMs += now() - tDrive;
     if (r === null || r !== 0) { if (r !== null) ex.temen_op13jit_close(); return { crawled, semmed, error: `nimsem ${r === null ? 'trapped (' + lastTrap + ')' : 'status ' + r} on ${stem}` }; }
     // nimsem writes TWO products per module: the semchecked `.s.nif` AND its `.s.idx.nif` index (the
     // same pair the headless hexer gate seeds). A dependent module's nimsem reads BOTH of its imports'
@@ -1417,10 +1426,14 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const key = isMain ? `${outdir}/${stem}.x.nif` : `nimcache/${stem}.x.nif`;
     const out = enc.encode(key), seed = packFiles(fs);
     const cp = pushBytes(hexerCe), ap = pushBytes(argv), sp = pushBytes(seed), op = pushBytes(out);
+    const tOpen = now();
     const opened = ex.temen_op13jit_phase_open_argv(cp, hexerCe.length, ap, argv.length, sp, seed.length, op, out.length);
+    split.hexerOpenMs += now() - tOpen;
     ex.temen_dealloc(cp, hexerCe.length); ex.temen_dealloc(ap, argv.length); ex.temen_dealloc(sp, seed.length); ex.temen_dealloc(op, out.length);
     if (opened !== 0) { ex.temen_op13jit_close(); return { crawled, semmed, hexed, error: `hexer open ${stem}: ${opened}` }; }
+    const tDrive = now();
     const r = await drive(`${cacheKey}-hexer`);
+    split.hexerDriveMs += now() - tDrive;
     if (r === null) return { crawled, semmed, hexed, error: `hexer trapped on ${stem}` };
     const xnif = phaseRead(key);
     const diag = xnif.length ? '' : phaseDiag(); // read before close tears the driver down
@@ -1444,6 +1457,8 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       nimsemTop: bNimsem.top, hexerTop: bHexer.top,
       nimsemSeries: bNimsem.series, hexerSeries: bHexer.series,
       nimsemExecLog,
+      ...split,
+      wasmCompiles: jitCacheStats.compiles, wasmHits: jitCacheStats.hits,
       // Foreign-memory accesses inside those bounces (see foreign-mem.js `foreignStats`).
       crawlForeign: fCrawl, nimsemForeign: fNimsem, hexerForeign: fHexer,
     },

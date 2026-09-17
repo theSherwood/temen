@@ -119,6 +119,11 @@ console.log(`declined-body share:  crawl ${tm.crawlBounces ?? '—'} bounces / $
 const DELTA_LO_NS = 56, DELTA_HI_NS = 88;
 const tax = (f) => f ? `${f.small.toLocaleString()} scalar + ${f.bulk.toLocaleString()} bulk (${(f.bulkBytes / 1e6).toFixed(1)} MB) → est. tax ${((f.small * DELTA_LO_NS) / 1e6).toFixed(0)}–${((f.small * DELTA_HI_NS) / 1e6).toFixed(0)}ms` : '—';
 console.log(`foreign accesses:     nimsem ${tax(tm.nimsemForeign)}\n                      hexer  ${tax(tm.hexerForeign)}`);
+// Emit vs run, per phase: `open` is the cdylib-side emit (decode, outline, `emit_for_run`), `drive` is
+// the guest running on emitted wasm. Four modules, so an emit that repeats per module shows up here.
+console.log(`\nemit vs run:          nimsem open ${fmt(tm.nimsemOpenMs)} / drive ${fmt(tm.nimsemDriveMs)}` +
+  `   hexer open ${fmt(tm.hexerOpenMs)} / drive ${fmt(tm.hexerDriveMs)}` +
+  `   (V8 module compiles ${tm.wasmCompiles ?? '—'}, cache hits ${tm.wasmHits ?? '—'})`);
 // Where the time inside bounces goes (#1359 / #1068): the top emitted functions by bounce time.
 const topTable = (name, top, total) => {
   if (!top || !top.length) return;

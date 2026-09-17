@@ -11509,6 +11509,26 @@ struct Op13ChildEmit {
 }
 static mut OP13_CHILD_EMIT: Option<Op13ChildEmit> = None;
 
+/// Cross-`phase_open` cache of the child's **decoded + verified** module, keyed like [`Op13ChildEmit`]
+/// and holding exactly one entry (a different blob replaces it). The nim card opens a phase once per
+/// module — four times on the bench card, with the same 5.7 MB `nimsem_ce` blob each time — and
+/// decoding and verifying it again was most of every open: 1.7 s of a 12.9 s card spent re-deriving a
+/// module the driver was about to wrap in an `Arc` anyway. The emitted products beside it were already
+/// cached this way; the IR was not.
+static mut OP13_CHILD_MODULE: Option<(u64, std::sync::Arc<temen_ir::Module>)> = None;
+
+/// The same, for the **inline-exec nifler** (#1364) each nimsem open is handed: decoded, verified and
+/// [`nimc::Phase`]-wrapped once per distinct blob instead of once per module.
+///
+/// #1543 removed exactly this cache, because holding nifler cost 338 MB against a 1 GiB engine. Both
+/// halves of that have since changed. The ceiling is the host's now and 2 GiB by default (#1561), and
+/// of those 338 MB the 195 MB was the *compiled program*, which a `Phase` only builds when something
+/// runs it — and since #1562 nothing does: the crawl parses the includes, so every exec is served from
+/// what it wrote. What is held is 144 MB of IR for a module that is decoded and then, normally, never
+/// used. Keeping it costs one card's worth of decode instead of four.
+static NIFLER_PHASE: std::sync::Mutex<Option<(u64, std::sync::Arc<nimc::Phase>)>> =
+    std::sync::Mutex::new(None);
+
 /// A minimal op-13 driver that grants one cap (`"fs"`) to a confined child in a **buddy-half** carve
 /// (`voff == 1<<vsl == 32768`, the upper half of the `memory 16` window) and returns the child's join
 /// result. `v0`=Instantiator, `v1`=Module, `v2`=the `fs` handle it writes into the single grant record
@@ -11884,16 +11904,32 @@ unsafe fn nimsem_open_common(
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
-        return -STATUS_DECODE_ERR;
+    let nifler_bytes = sl(nifler_ptr, nifler_len);
+    let nifler_key = nifler_module_key(nifler_bytes);
+    let cached = NIFLER_PHASE.lock().ok().and_then(|c| {
+        c.as_ref()
+            .filter(|(k, _)| *k == nifler_key)
+            .map(|(_, p)| std::sync::Arc::clone(p))
+    });
+    // One `Phase` per distinct blob, shared by every open and every exec inside them (see
+    // `NIFLER_PHASE`): the program is compiled only if an exec is not served from the crawl.
+    let phase = match cached {
+        Some(p) => p,
+        None => {
+            let Ok(nifler) = temen_encode::decode_module(nifler_bytes) else {
+                return -STATUS_DECODE_ERR;
+            };
+            if temen_verify::verify_module(&nifler).is_err() {
+                return -STATUS_VERIFY_ERR;
+            }
+            let p = nimc::Phase::new(std::sync::Arc::new(nifler));
+            if let Ok(mut c) = NIFLER_PHASE.lock() {
+                *c = Some((nifler_key, std::sync::Arc::clone(&p)));
+            }
+            p
+        }
     };
-    if temen_verify::verify_module(&nifler).is_err() {
-        return -STATUS_VERIFY_ERR;
-    }
-    // The `Phase` lives as long as this open: every `exec` inside this nimsem run shares one compiled
-    // nifler program (the #1540 finding — 21 compiles per card), and it is freed at `close` rather
-    // than held page-wide, because nifler resident is 338 MB of a 1 GiB engine (#1543).
-    let exec = exec_of(nimc::Phase::new(std::sync::Arc::new(nifler)));
+    let exec = exec_of(phase);
     let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
         return -STATUS_DECODE_ERR;
     };
@@ -12067,12 +12103,28 @@ unsafe fn op13_phase_open_impl(
     exec: ExecMode,
 ) -> i32 {
     let child_key = nifler_module_key(child_bytes);
-    let Ok(child) = temen_encode::decode_module(child_bytes) else {
-        return -STATUS_DECODE_ERR;
+    // SAFETY: single-threaded wasm; exclusive access to the cache.
+    let cached = unsafe { (*core::ptr::addr_of!(OP13_CHILD_MODULE)).as_ref() }
+        .filter(|(k, _)| *k == child_key)
+        .map(|(_, m)| std::sync::Arc::clone(m));
+    let child: std::sync::Arc<temen_ir::Module> = match cached {
+        Some(m) => m,
+        None => {
+            let Ok(m) = temen_encode::decode_module(child_bytes) else {
+                return -STATUS_DECODE_ERR;
+            };
+            if temen_verify::verify_module(&m).is_err() {
+                return -STATUS_VERIFY_ERR;
+            }
+            let m = std::sync::Arc::new(m);
+            // SAFETY: single-threaded wasm; exclusive access to the cache.
+            unsafe {
+                *core::ptr::addr_of_mut!(OP13_CHILD_MODULE) =
+                    Some((child_key, std::sync::Arc::clone(&m)));
+            }
+            m
+        }
     };
-    if temen_verify::verify_module(&child).is_err() {
-        return -STATUS_VERIFY_ERR;
-    }
     let Some(decl) = child.memory.as_ref().map(|m| m.size_log2) else {
         return -STATUS_UNSUPPORTED;
     };
@@ -12199,7 +12251,7 @@ unsafe fn op13_phase_open_impl(
         *core::ptr::addr_of_mut!(OP13_JIT) = Some(Op13JitDriver {
             prog,
             root,
-            child: std::sync::Arc::new(child),
+            child: std::sync::Arc::clone(&child),
             mem_base,
             layout,
             children: Vec::new(),
