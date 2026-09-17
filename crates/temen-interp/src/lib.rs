@@ -2803,7 +2803,7 @@ fn drive_over_cell(
                 // (A *detached* durable child — not reconstructible on this carve path yet — will carry
                 // its own captured attestation instead, since `window_exposed = false` cannot be
                 // re-derived from "nested"; that lands with the detached-durable freeze plumbing.)
-                ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true));
+                ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true, None));
                 // §13.4 slice 4c: a child with recorded host state restores it **verbatim** —
                 // the captured handle table (slots/generations preserved, so guest handle
                 // values reloaded from its spilled frames still resolve) and its serve trio —
@@ -11850,9 +11850,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_durable(durable);
                                 // §6: stamp the child's attestation — nested (its carve is a superset
                                 // the parent reads), freezable iff durable, tier inherited from us.
+                                let carve = (ibase.saturating_add(off), child_size);
                                 let catt = {
-                                    let hg = host.lock_unpoisoned();
-                                    hg.child_attestation(durable)
+                                    let mut hg = host.lock_unpoisoned();
+                                    // #1440: R1's "for a nested carve child the grant is implied by
+                                    // the aliasing" written as an actual grant. Minted over the whole
+                                    // **instantiator** range, not this one carve: authority is
+                                    // containment-based, so one grant covers every child carved from
+                                    // it — which also keeps a guest that spawns hundreds of children
+                                    // from spending a handle-table slot per spawn. `holds_` makes it
+                                    // idempotent, and the fallible grant means a full table costs the
+                                    // exposure bit's precision, never the run.
+                                    if durable && !hg.holds_freeze_authority_over(carve.0, carve.1)
+                                    {
+                                        let _ = hg.try_grant_freeze_authority(ibase, isize);
+                                    }
+                                    hg.child_attestation(durable, Some(carve))
                                 };
                                 ch.set_attestation(catt);
                                 let cinst = ch.grant_instantiator(0, child_size);
@@ -16958,6 +16971,22 @@ enum Binding {
         base: u64,
         size: u64,
     },
+    /// **Freeze authority** over the window sub-range `[base, base+size)` — the authority to snapshot
+    /// the domain living there (#1440, INVARIANTS #14 R1, PROCESS.md O14).
+    ///
+    /// Same `(base, size)` shape as [`Binding::Instantiator`] and [`Binding::AddressSpace`], and for
+    /// the same reason: a §14 **nested carve** child *is* a sub-range of its parent's window, so the
+    /// range names the child, attenuates through the existing discipline, and is value-typed enough to
+    /// ride the durable re-grant path — a thawed parent must still hold authority over its thawed
+    /// child, or a freeze/thaw round trip would quietly launder exposure away.
+    ///
+    /// A **detached** child owns its own window and so has no sub-range here to be named by; granting
+    /// authority over one needs a value-typed name for a domain that this shape cannot express. That
+    /// is the open half of #1440 and the reason the op-15 gate still refuses outright.
+    FreezeAuthority {
+        base: u64,
+        size: u64,
+    },
     /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
     /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
     /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
@@ -17085,6 +17114,13 @@ pub enum DurableBinding {
         size: u64,
     },
     Instantiator {
+        base: u64,
+        size: u64,
+    },
+    /// Freeze authority over `[base, base+size)` (#1440). Value-typed, so a thawed parent holds the
+    /// same authority over its thawed child that it held before the freeze — without this, a round
+    /// trip would launder a domain's exposure away and `attest` would start lying.
+    FreezeAuthority {
         base: u64,
         size: u64,
     },
@@ -21074,6 +21110,9 @@ impl Host {
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
+                Binding::FreezeAuthority { base, size } => {
+                    DurableBinding::FreezeAuthority { base, size }
+                }
                 Binding::SharedRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
@@ -21160,6 +21199,7 @@ impl Host {
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
                 | Binding::Instantiator { .. }
+                | Binding::FreezeAuthority { .. }
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
@@ -21214,6 +21254,9 @@ impl Host {
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+                DurableBinding::FreezeAuthority { base, size } => {
+                    Binding::FreezeAuthority { base, size }
+                }
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
                     // patched once the §14 child at `slot` is re-created — see
@@ -22734,6 +22777,50 @@ impl Host {
         self.grant(cap_id::INSTANTIATOR, Binding::Instantiator { base, size })
     }
 
+    /// Grant **freeze authority** over the window sub-range `[base, base+size)` — the authority to
+    /// snapshot the domain living there (#1440).
+    ///
+    /// For a §14 nested carve the range is the child's carve, which is what makes the R1 rule
+    /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
+    /// rather than an inference from placement: the spawn path mints this, and
+    /// [`holds_freeze_authority_over`](Host::holds_freeze_authority_over) is how a later freeze asks.
+    pub fn grant_freeze_authority(&mut self, base: u64, size: u64) -> i32 {
+        self.grant(
+            cap_id::FREEZE_AUTHORITY,
+            Binding::FreezeAuthority { base, size },
+        )
+    }
+
+    /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
+    /// table is full. The spawn path uses this rather than the panicking form: a guest chooses how
+    /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
+    /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
+    /// a lot of legitimate work).
+    pub fn try_grant_freeze_authority(&mut self, base: u64, size: u64) -> Option<i32> {
+        self.try_grant(
+            cap_id::FREEZE_AUTHORITY,
+            Binding::FreezeAuthority { base, size },
+        )
+    }
+
+    /// Whether this host holds freeze authority covering `[base, base+size)` — i.e. may snapshot the
+    /// domain living there.
+    ///
+    /// Covering, not equal: authority over a range includes authority over anything inside it, the
+    /// same containment `AddressSpace`/`Instantiator` sub-ranges use. A domain nobody holds authority
+    /// over is **confidential** — that is the whole of the confidential/ancestor-freezable distinction
+    /// (INVARIANTS #14 R1 §6), derived rather than tracked as a state of its own.
+    pub fn holds_freeze_authority_over(&self, base: u64, size: u64) -> bool {
+        let end = base.saturating_add(size);
+        self.table.iter().any(|slot| {
+            matches!(
+                slot.entry,
+                Some(Binding::FreezeAuthority { base: b, size: n })
+                    if b <= base && end <= b.saturating_add(n)
+            )
+        })
+    }
+
     /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
     /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
     /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
@@ -23174,11 +23261,23 @@ impl Host {
         }
     }
 
-    fn child_attestation(&self, durable: bool) -> Attestation {
+    /// `freeze_exposed` is **derived** when the caller can name the child's carve: an ancestor may
+    /// snapshot it iff someone holds freeze authority covering that range *and* the subtree is
+    /// durable. The two are different questions the single bit had been conflating — authority is
+    /// *who may*, durability is *whether a snapshot is possible at all* — and separating them is what
+    /// lets a detached child be platform-durable and ancestor-confidential at once (PROCESS.md §6).
+    ///
+    /// `carve = None` keeps the old placement reading (durable ⇒ exposed) for the two callers with no
+    /// range in hand: a non-durable child, where the answer is `false` either way, and the thaw
+    /// re-stamp, whose parent's authority rode the freeze but whose carve the restore path does not
+    /// thread through yet. A parameter rather than a second function, so there is one answer to what a
+    /// child's report says (INVARIANTS #15); threading the carve through the thaw closes the `None`.
+    fn child_attestation(&self, durable: bool, carve: Option<(u64, u64)>) -> Attestation {
         Attestation {
             tier: self.attestation.tier,
             window_exposed: true,
-            freeze_exposed: durable,
+            freeze_exposed: durable
+                && carve.is_none_or(|(base, size)| self.holds_freeze_authority_over(base, size)),
         }
     }
 
@@ -23895,7 +23994,7 @@ impl Host {
         // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
         ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation(false));
+        ch.set_attestation(self.child_attestation(false, None));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         let cg = self.regrant_into_child(grant_handle, &mut ch)?;
@@ -24109,7 +24208,7 @@ impl Host {
         child_size: u64,
     ) -> Option<(Host, i32, i32)> {
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        let attestation = self.child_attestation(false);
+        let attestation = self.child_attestation(false, None);
         self.spawn_child_powerbox(grants, child_size, attestation)
     }
 
@@ -24831,6 +24930,10 @@ impl Host {
             // host-side dispatch cannot park). Reaching it here means a backend tier without
             // the servicing arm: answer probeable, never trap.
             Binding::LiveImpl(_) => Ok(vec![EINVAL]),
+            // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
+            // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
+            // traps are for forgery, and the handle here is genuine).
+            Binding::FreezeAuthority { .. } => Ok(vec![EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
             // argument), not a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
