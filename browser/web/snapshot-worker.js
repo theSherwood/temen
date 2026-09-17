@@ -9,6 +9,7 @@
 // a fresh memory of its own and allocates only there, so its warm session can't race the main thread's
 // allocator. Main ↔ worker communicate only by messages (source string in; stdout/status/value out).
 import { foreignImports } from './foreign-mem.js';
+import { engineMemory } from './engine-mem.js';
 import { runWarmJit, runWarmCoop, primeWarmJit, jitCacheStats, runJitModule, jitNimCrawl, jitNimWholeCardOp13 } from './wasmjit-module.js';
 
 let ex = null; // the worker's own engine exports
@@ -145,7 +146,9 @@ self.onmessage = async (e) => {
       // The main thread posts the already-compiled engine `WebAssembly.Module` (structured-cloneable),
       // so the worker skips a second fetch+compile. It instantiates over its OWN shared memory (threads
       // build imports one) with the no-op webgpu stub (a compute guest never presents).
-      memory = new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true });
+      // The ceiling the spawning engine settled on (`web/engine-mem.js`). A client that sends none is
+      // an older one: fall back to the historical 1 GiB, which every build declares at least.
+      ({ memory } = engineMemory(null, { maxPages: msg.maxPages ?? 16384 }));
       ({ exports: ex } = await WebAssembly.instantiate(msg.module, {
         env: { memory },
         temen_host: {

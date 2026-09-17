@@ -5723,7 +5723,7 @@ async function main() {
   // to idle so it doesn't compete with initial page setup, and the 4 MiB snapshot fetch stays off the
   // critical path. Each pre-warming card shows a "warming up…" indicator until its session is ready.
   try {
-    snapshotClient = new SnapshotClient(eng.module);
+    snapshotClient = new SnapshotClient(eng.module, eng.maxPages);
     globalThis.__snapshotClient = snapshotClient; // test/telemetry hook (harmless): inspect prewarm state
     const warmCards = cards.filter((c) => c.ex.warm);
     // #1120 hot-function outlining, opt-in (default off ⇒ shipping cards byte-identical). `?warmsplit=1`

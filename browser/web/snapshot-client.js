@@ -7,9 +7,12 @@
 // nor a compute-heavy eval ever blocks the UI.
 export class SnapshotClient {
   // `engineModule` is the already-compiled engine `WebAssembly.Module` (from `loadEngine`), posted to
-  // each worker so it need not re-fetch/compile.
-  constructor(engineModule) {
+  // each worker so it need not re-fetch/compile. `maxPages` is that engine's effective memory ceiling
+  // (`loadEngine`'s, already clamped to the build) — a worker holds only the compiled module, never the
+  // bytes, so it cannot work the ceiling out for itself and is told.
+  constructor(engineModule, maxPages) {
     this._engineModule = engineModule;
+    this._maxPages = maxPages;
     this._workers = new Map(); // url -> worker record
   }
 
@@ -52,7 +55,7 @@ export class SnapshotClient {
       for (const [id, resolve] of w.pending) resolve({ ok: false, error: err.message });
       w.pending.clear();
     };
-    worker.postMessage({ type: 'init', module: this._engineModule });
+    worker.postMessage({ type: 'init', module: this._engineModule, maxPages: this._maxPages });
     this._workers.set(url, w);
     return w;
   }
