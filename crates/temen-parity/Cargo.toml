@@ -18,6 +18,9 @@ temen-ir.workspace = true
 [dev-dependencies]
 temen-verify.workspace = true
 temen-text.workspace = true
+# #1413 slice 4: the code-origin probe installs a §22 unit, and a unit blob must be a real
+# wire-encoded module — the host re-decodes it for the unit's type section (#922 interning).
+temen-encode.workspace = true
 temen-interp.workspace = true
 temen-jit.workspace = true
 temen-wasm-jit.workspace = true
