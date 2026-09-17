@@ -142,6 +142,13 @@ const LEAF: &str = "leaf accelerator: folds to the bytecode interp underneath (D
 const HOST_OP: &str = "host cap/handle op — serviced by the oracle, not emitted";
 const FIBER_RT: &str = "Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere";
 const SETJMP_RT: &str = "Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere";
+/// #1546 — the wasm tier's `gc.roots` posture is **module**-granular, not the family's leaf fold: an
+/// emitted frame's locals are unscannable, so a module that can reach the op emits nothing at all
+/// (`module_uses_gc_roots`, every entry in `temen-wasm-jit`). #1563 — and the debug tier services it,
+/// sharing production's scan rather than declining.
+const GC_ROOTS_WASM: &str =
+    "module-granular: a module that can reach it emits nothing (#1546), since an emitted frame's \
+     roots are invisible to the scan; serviced on the debug engine too (#1563)";
 const NO_WASM_OP: &str = "no core-wasm opcode (relaxed-SIMD / scalar-fma only)";
 const SERVE: &str =
     "native serve-loop core (svc.poll/svc.wait) for a serve-qualified module; else folds to the oracle";
@@ -335,10 +342,15 @@ pub fn parity(inst: &Inst) -> [Cell; 4] {
         | Inst::ThreadSpawn { .. }
         | Inst::ThreadJoin { .. }
         | Inst::MemoryWait { .. }
-        | Inst::MemoryNotify { .. }
-        | Inst::GcRoots { .. } => row(
+        | Inst::MemoryNotify { .. } => row(
             cell(Status::Conditional, FIBER_RT),
             cell(Status::Declines, LEAF),
+        ),
+        // §GC `gc.roots`: Cranelift as the family, but the wasm tier's decline is its own posture —
+        // module-granular, and for a different reason than the leaf fold (see [`GC_ROOTS_WASM`]).
+        Inst::GcRoots { .. } => row(
+            cell(Status::Conditional, FIBER_RT),
+            cell(Status::Declines, GC_ROOTS_WASM),
         ),
         // setjmp/longjmp: Cranelift on the setjmp_rt targets; the wasm-JIT leaf folds them.
         Inst::SetJmp { .. } | Inst::LongJmp { .. } => row(
