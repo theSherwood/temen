@@ -12,7 +12,8 @@
 //! rejected the spawn `-EINVAL`, and the parent's `join` on that forged handle surfaced as the
 //! `CapFault` (the child never ran). Relaxing the JIT gate to `declared <= carve`
 //! (`instantiator_rt::instantiate_module_named`) brings it into lockstep with the interpreter; the
-//! `child_entry_io_jit` minimal repro (a `malloc`-then-`vm_map` child) is the unit that pins it. This
+//! `child_entry_multicap_jit` fast repro is what pins the grant-marshaling half per-PR — the
+//! `child_entry_io_jit` this line used to name was never written (#1221). This
 //! is the enabler for the browser wasm-JIT compile card (which bounces op-13 to the same host path).
 
 #![cfg(target_os = "linux")]
@@ -112,8 +113,9 @@ fn grant_hooks(host: *mut temen_interp::Host) -> GrantChildHooks {
 
 #[test]
 #[ignore = "PASSES — on-demand gate: Cranelift-compiling nifler's 100+ funcs takes ~250s in debug, too \
-            slow for the default run. The fast `child_entry_io_jit` malloc repro guards the same fix; \
-            run `--ignored` to exercise the full real-phase child on the JIT."]
+            slow for the default run. `child_entry_multicap_jit` is the fast per-PR stand-in for the \
+            multi-record grant marshaling this exercises (#1221); run `--ignored` here to exercise the \
+            full real-phase child on the JIT."]
 fn nifler_child_runs_on_the_jit_byte_identical() {
     let Some(temen) = inflate() else {
         eprintln!("SKIP: gzip unavailable");
