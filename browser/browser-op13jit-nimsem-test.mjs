@@ -93,9 +93,9 @@ try {
     // `SharedProgram` + emitted wasm compile peaks ~700 MiB on top — over the default 1 GiB threads-module
     // ceiling (`web/par.js` `maxPages` == the build's `--max-memory`). Check the ceiling up front (a
     // non-destructive read — pre-*growing* would burn address space dlmalloc can't reclaim and OOM the
-    // run itself): SKIP cleanly unless the memory can reach ~1.4 GiB. The byte-exact gate below activates
-    // once the ceiling is raised to 2 GiB (the build's `--max-memory=2147483648` + `par.js`'s
-    // `maxPages: 32768`). Headless `nim_phase_tierup_eligible.rs` already gates that nimsem *emits*
+    // run itself): SKIP cleanly unless the memory can reach ~1.4 GiB. The ceiling is now the host's
+    // (`web/engine-mem.js` `ENGINE_MAX_PAGES`, 2 GiB), bounded by the build's declared `--max-memory`.
+    // Headless `nim_phase_tierup_eligible.rs` already gates that nimsem *emits*
     // WasmDriven at zero memory cost — this is the end-to-end byte-exact leg.
     // #1288: nimsem runs DETACHED in its own minted WebAssembly.Memory (1 GiB max, its ~256 MiB peak
     // inside it), so the ENGINE's shared-memory ceiling no longer bounds the phase — no ceiling SKIP.

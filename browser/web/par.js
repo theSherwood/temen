@@ -9,6 +9,7 @@
 // `/<repo>/`). The deployed site keeps the same `web/` + `target/…` layout, so `../target/…`
 // resolves correctly under either base.
 import { foreignImports } from './foreign-mem.js';
+import { engineMemory } from './engine-mem.js';
 const WASM = new URL('../target/wasm32-unknown-unknown/release/temen_browser.wasm', import.meta.url);
 const STACK = 1 << 20, SLOT = 16;
 const roundUp = (n, a) => (a > 1 ? Math.ceil(n / a) * a : n);
@@ -22,12 +23,15 @@ export async function fetchBytes(url) {
 // Compile + instantiate the threads wasm build over a fresh shared memory. Requires cross-origin
 // isolation (the caller checks `self.crossOriginIsolated` first for a friendlier message).
 export async function loadEngine() {
-  const module = await WebAssembly.compile(await fetchBytes(WASM));
+  const bytes = await fetchBytes(WASM);
+  const module = await WebAssembly.compile(bytes);
   if (!WebAssembly.Module.imports(module).some((i) => i.kind === 'memory')) {
     throw new Error('not a threads build (no imported memory)');
   }
-  const maxPages = 16384; // shared-memory ceiling (× 64 KiB = 1 GiB); mirror the build's `--max-memory`.
-  const memory = new WebAssembly.Memory({ initial: 2048, maximum: maxPages, shared: true });
+  // The engine's ceiling is the host's call, not the build's (`web/engine-mem.js`): the requested
+  // maximum is clamped to the `--max-memory` this build declares, so asking for more than an older
+  // build allows yields that build's ceiling instead of a `LinkError`.
+  const { memory, maxPages } = engineMemory(bytes);
   // The wasm imports `temen_host.webgpu_op` (the `webgpu` capability's host seam). It is a no-op unless a
   // page installs a real servicer on `globalThis.__temen_webgpu_op` (play.js does, backed by the page's
   // <canvas> + `navigator.gpu`). i64 args arrive as BigInt; the handler gets the shared `memory` so it

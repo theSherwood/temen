@@ -1011,7 +1011,7 @@ jobs:
         run: |
           cargo run --bin gencorpus
           RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
-            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=4294967296 \
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
@@ -1078,6 +1078,11 @@ jobs:
           # warm tiers *through the worker* (not a silent main-thread fallback) and isolation holds. Committed
           # assets; skips cleanly if absent.
           node snapshot-worker-test.mjs
+          # `web/engine-mem.js`: the engine's memory ceiling is the host's, bounded by the build's
+          # declared `--max-memory`. Pure node (no browser) — parses the declaration out of the module
+          # bytes and checks the clamp both ways, then instantiates the real build over the memory it
+          # picks (a wrong clamp is a LinkError here rather than in every browser test).
+          node engine-mem-test.mjs
           # slice-2 mainline tier-up over a live window (WASM_AOT.md + the slice-0 JACL residual): an
           # TEMEN-text compute guest whose root loops calling a window-round-tripping leaf must return the
           # same value with tier-up on as all-interp, and tier-up must actually fire (the shape the
@@ -1283,7 +1288,7 @@ jobs:
           # `cargo run` over an already-built workspace, so both shards just do it.
           cargo run --bin gencorpus
           RUSTFLAGS="-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals \
-            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=1073741824 \
+            -Clink-arg=--shared-memory -Clink-arg=--import-memory -Clink-arg=--max-memory=4294967296 \
             -Clink-arg=--export=__stack_pointer -Clink-arg=--export=__tls_base \
             -Clink-arg=--export=__tls_size -Clink-arg=--export=__tls_align \
             -Clink-arg=--export=__wasm_init_tls" \
@@ -1324,7 +1329,7 @@ jobs:
           # Seeds the syslib closure + the parsed system module; the `.s.nif` it writes is byte-identical to the
           # committed expected (`rust_driver_nimsem.rs`'s oracle). SELF-SKIPS under the 1 GiB threads-module
           # ceiling — nimsem's 512 MiB window + 5.7 MB compile peaks ~1.3 GiB, so the byte-exact leg gates only
-          # once `--max-memory`/`par.js maxPages` are raised to 2 GiB (the `nim_phase_tierup_eligible.rs` headless
+          # once the host asks for 2 GiB (`web/engine-mem.js` `ENGINE_MAX_PAGES`; the `nim_phase_tierup_eligible.rs` headless
           # gate already covers the WasmDriven-emit question at zero memory cost). Reuses the threads module.
           node browser-op13jit-nimsem-test.mjs
           # #1025 Path 1 (whole card): drive the WHOLE nim card through the op-13 loop — the compile's phase-1

@@ -54,7 +54,7 @@ const EXPECT = 'i=1\ni=2\ni=3\npi=3.14\nand stdout\n';
 // job builds, and what `web/par.js` gives the page), the plain one owns its own.
 const mod = await WebAssembly.compile(readFileSync(WASM));
 const shared = WebAssembly.Module.imports(mod).some((i) => i.kind === 'memory')
-  ? new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }) // mirrors par.js / the build's --max-memory
+  ? new WebAssembly.Memory({ initial: 2048, maximum: 16384, shared: true }) // this harness's own 1 GiB (the engine's ceiling is `web/engine-mem.js`'s)
   : null;
 const { exports: ex } = await WebAssembly.instantiate(mod, engineImports(shared));
 const memory = shared || ex.memory;
