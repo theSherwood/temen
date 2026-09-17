@@ -94,6 +94,33 @@ try {
     ? ok('detached child over a pre-mapped region (Temen text, on-ramp recipe) → 42082')
     : fail(`detached run: ${JSON.stringify(det)}`);
 
+  // #1528 — the same card under the **debugger**. The debug scheduler used to decline op 15
+  // (`-EINVAL`), so the spawn refused and the card could not be stepped at all; it now spawns the
+  // child as a task of its own and joins it through the shared seam, and the DAP session runs under
+  // the on-ramp powerbox so `self.resolve` finds `instantiator` / `module` / `budget` exactly as the
+  // Run path does. A breakpoint sits just past the join, so pausing there with `vj = 42` is the
+  // proof: the parent reached it only by spawning the child, running it, and joining its result.
+  await page.click(`${card('detached')} .debug`);
+  await page.waitForFunction((sel) => document.querySelector(`${sel} .state`).textContent.includes('paused'),
+    card('detached'), { timeout: 30_000 });
+  const detDbg = await page.evaluate((sel) => ({
+    active: document.querySelector(`${sel} .dbg`).classList.contains('active'),
+    stopLine: !!document.querySelector(`${sel} .cm-stop-line`),
+    vars: document.querySelector(`${sel} .dbg-vars`).textContent,
+  }), card('detached'));
+  detDbg.active && detDbg.stopLine && /vj\s*=\s*42\b/.test(detDbg.vars)
+    ? ok('debugger stepped the detached spawn — paused past the join with vj = 42')
+    : fail(`detached debug: ${JSON.stringify(detDbg)}`);
+
+  // Continue runs the rest under the debugger and the session ends cleanly.
+  await page.click(`${card('detached')} .dbg-controls button[data-cmd="continue"]`);
+  await page.waitForFunction((sel) => !document.querySelector(`${sel} .dbg`).classList.contains('active'),
+    card('detached'), { timeout: 20_000 });
+  const detDone = await page.evaluate((sel) => document.querySelector(`${sel} .state`).textContent, card('detached'));
+  /finished/.test(detDone)
+    ? ok('debugged detached run ran to completion')
+    : fail(`detached debug finish: ${detDone}`);
+
   // The "JS powerbox" card: the page defines the guest's capabilities in JavaScript (`web/powerbox.js`
   // over the `temen_jspb_*` seam). Two editors — the Temen guest and the powerbox implementing it.
   // Running it proves the whole loop through the DOM: a capability reads the guest's window (the

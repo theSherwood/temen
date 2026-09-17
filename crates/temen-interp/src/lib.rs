@@ -23385,6 +23385,13 @@ impl Host {
             }
         }
         d.units_left -= 1;
+        // #1529: [`temen_ir::spawns_detached`] scans the **root** module, so the two reference
+        // powerboxes never granted the by-name spawn set to a guest whose only `call.cap 6 15` lives
+        // in a §22 submitted unit — its op 15 then refused `-EINVAL` for want of a `"module"` /
+        // `"budget"` it could not ask for. Noted here, granted below: the grant appears exactly when
+        // a spawner appears, which is the same least-authority rule, just evaluated at install
+        // instead of at powerbox build.
+        let unit_spawns_detached = funcs.iter().any(temen_ir::Func::spawns_detached);
         let unit = d.units.len() as u32;
         // No wasm yet: the browser tier emits a unit **lazily**, on its first read through
         // [`Self::jit_unit_wasm_or_emit`] — the one emit path for a `compile`d, a `compile_linked`,
@@ -23397,6 +23404,30 @@ impl Host {
             install_type_id: 0,
             wasm: None,
         });
+        // #1529 (see above): the unit installed and it spawns detached, so grant the set now —
+        // once (a later spawning unit finds `"module"` already registered). Three conditions keep it
+        // a strict subset of what this guest already holds, never a new frontier:
+        //
+        // - a named `"instantiator"` must be present — the embedder's own decision to hand this
+        //   guest §14 spawn authority over its window; its size is the budget, exactly as both
+        //   reference powerboxes pass one `win` to both calls. No instantiator, no grant.
+        // - `"module"` is the **running module** ([`Host::set_self_module`]), i.e. this guest's own
+        //   code, and `grant_detached_spawn_caps` no-ops with none registered.
+        // - **not durable**: a `Module` grant is non-durable (a freeze fails `NonDurableKind::Module`),
+        //   so granting it mid-run would silently make a snapshot-taking domain unfreezable. A durable
+        //   domain refuses op 15 at admission anyway, so this forgoes nothing.
+        //
+        // The decision lives here, not in the powerbox tier, because this is the only point that sees
+        // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.
+        if unit_spawns_detached && !self.durable && self.resolve_cap_name("module").is_none() {
+            if let Some(win) = self
+                .resolve_cap_name("instantiator")
+                .and_then(|h| self.resolve_instantiator(h).ok())
+                .map(|(_, size)| size)
+            {
+                self.grant_detached_spawn_caps(win);
+            }
+        }
         // Guest-minting: a full handle table is -EMFILE, never a panic (§3c / audit #1). The
         // stored unit stays (append-only storage; harmless without a handle).
         match self.try_grant(cap_id::JIT_CODE, Binding::JitCode { domain, unit }) {
