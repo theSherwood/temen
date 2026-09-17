@@ -11820,30 +11820,16 @@ unsafe fn nimsem_open_common(
 ) -> i32 {
     temen_op13jit_close();
     let sl = |p: *const u8, n: usize| unsafe { core::slice::from_raw_parts(p, n) };
-    let nifler_bytes = sl(nifler_ptr, nifler_len);
-    let key = nifler_module_key(nifler_bytes);
-    let cached = NIFLER_PHASE.lock().ok().and_then(|c| {
-        c.as_ref()
-            .filter(|(k, _)| *k == key)
-            .map(|(_, p)| std::sync::Arc::clone(p))
-    });
-    let phase = match cached {
-        Some(p) => p,
-        None => {
-            let Ok(nifler) = temen_encode::decode_module(nifler_bytes) else {
-                return -STATUS_DECODE_ERR;
-            };
-            if temen_verify::verify_module(&nifler).is_err() {
-                return -STATUS_VERIFY_ERR;
-            }
-            let p = nimc::Phase::new(std::sync::Arc::new(nifler));
-            if let Ok(mut c) = NIFLER_PHASE.lock() {
-                *c = Some((key, std::sync::Arc::clone(&p)));
-            }
-            p
-        }
+    let Ok(nifler) = temen_encode::decode_module(sl(nifler_ptr, nifler_len)) else {
+        return -STATUS_DECODE_ERR;
     };
-    let exec = exec_of(phase);
+    if temen_verify::verify_module(&nifler).is_err() {
+        return -STATUS_VERIFY_ERR;
+    }
+    // The `Phase` lives as long as this open: every `exec` inside this nimsem run shares one compiled
+    // nifler program (the #1540 finding — 21 compiles per card), and it is freed at `close` rather
+    // than held page-wide, because nifler resident is 338 MB of a 1 GiB engine (#1543).
+    let exec = exec_of(nimc::Phase::new(std::sync::Arc::new(nifler)));
     let Some(argv) = parse_packed_strs(sl(argv_ptr, argv_len)) else {
         return -STATUS_DECODE_ERR;
     };
@@ -12007,13 +11993,6 @@ enum ExecMode {
     Grandchild(std::sync::Arc<nimc::Phase>),
 }
 
-/// The inline-exec nifler (#1364) — decoded, verified and [`nimc::Phase`]-wrapped **once per distinct
-/// blob** and reused across the card's nimsem opens (one per module) and every `exec` inside them, so
-/// its bytecode program compiles once per card rather than once per `exec` (#1540 follow-up). Keyed
-/// like the child cache ([`nifler_module_key`]); single-threaded wasm ⇒ one slot.
-static NIFLER_PHASE: std::sync::Mutex<Option<(u64, std::sync::Arc<nimc::Phase>)>> =
-    std::sync::Mutex::new(None);
-
 /// # Safety
 /// `child_bytes` must be a live slice for the duration of the call.
 unsafe fn op13_phase_open_impl(
@@ -12098,15 +12077,18 @@ unsafe fn op13_phase_open_impl(
         )),
     };
     if let Some((first, ce)) = exec_nifler {
-        let exec_init: temen_interp::HostProc =
-            nimc::make_exec(first.clone(), ce.clone(), std::sync::Arc::clone(&factory));
+        let exec_init: temen_interp::HostProc = nimc::make_exec(
+            nimc::ExecNifler::Shared(first.clone()),
+            ce.clone(),
+            std::sync::Arc::clone(&factory),
+        );
         let exec_fork: temen_interp::HostProcFork = {
             let first = std::sync::Arc::clone(&first);
             let ce = ce.clone();
             let factory = std::sync::Arc::clone(&factory);
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
-                    first.clone(),
+                    nimc::ExecNifler::Shared(first.clone()),
                     ce.clone(),
                     std::sync::Arc::clone(&factory),
                 ))

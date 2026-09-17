@@ -202,6 +202,11 @@ type FsFactory = Arc<dyn Fn() -> HostProc + Send + Sync>;
 /// that only ever spawns as an op-13 child ([`run_phase_op13`] compiles its own child program) never
 /// pays it; `None` once compiled means the module is outside the bytecode subset ([`run_phase`]'s
 /// "declined" arm, as before).
+///
+/// **A `Phase` is held only while its phase runs.** Decoded IR plus compiled program is 338 MB for
+/// nifler, 149 MB for nimsem, 87 MB for hexer, against a 1 GiB browser engine — holding all three at
+/// once overflowed it (#1543). Retention is the caller's business: keep one for as long as its runs
+/// repeat, drop it when they stop.
 pub(crate) struct Phase {
     module: Arc<Module>,
     program: std::sync::OnceLock<Option<Arc<bytecode::Compiled>>>,
@@ -613,6 +618,28 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     }
 }
 
+/// How the `exec` cap gets the nifler it runs — the one knob that decides whether a compiled nifler
+/// program (195 MB) is resident alongside whatever else the engine is holding.
+pub(crate) enum ExecNifler {
+    /// One compiled program shared by every exec of this run. The op-13 card: its nimsem runs detached
+    /// in its **own** `WebAssembly.Memory`, so the engine heap carries nifler and little else, and the
+    /// card's execs (21 on the bench program, all inside the system module's sema) compile once.
+    Shared(Arc<Phase>),
+    /// Compiled per exec. The in-engine card ([`compile_nim_ce_impl`]): nimsem runs on the interpreter
+    /// with its window in the **same** heap, growing past 200 MB, and nifler's program resident across
+    /// that overflows the 1 GiB browser engine (#1543). Repeated compiles are the price of the ceiling.
+    PerCall(Arc<Module>),
+}
+
+impl ExecNifler {
+    fn phase(&self) -> Arc<Phase> {
+        match self {
+            ExecNifler::Shared(p) => Arc::clone(p),
+            ExecNifler::PerCall(m) => Phase::new(Arc::clone(m)),
+        }
+    }
+}
+
 /// The wasm-native `exec` cap: `nimsem`'s `system("nifler … parse …")` (routed by the shim to the
 /// `exec` capability) runs `nifler` as a nested guest over the **same** memfs. Only `nifler` is in the
 /// registry (argv[0] `nifler` or `/bin/nifler`); anything else is refused. Non-`run` ops
@@ -631,7 +658,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
 pub(crate) static EXEC_LOG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 
 pub(crate) fn make_exec(
-    nifler: Arc<Phase>,
+    nifler: ExecNifler,
     nifler_ce: Option<Arc<Module>>,
     fs_factory: FsFactory,
 ) -> HostProc {
@@ -653,7 +680,7 @@ pub(crate) fn make_exec(
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
         let (stdout, exit) = match &nifler_ce {
             Some(ce) => (vec![], run_phase_op13(ce, &argv_refs, &fs_factory)),
-            None => run_phase(&nifler, &argv_refs, (fs_factory)(), None),
+            None => run_phase(&nifler.phase(), &argv_refs, (fs_factory)(), None),
         };
         if let Ok(mut log) = EXEC_LOG.lock() {
             use std::fmt::Write;
@@ -729,9 +756,7 @@ fn compile_nim_ce_impl(
     files: Vec<(String, Vec<u8>)>,
     main_nim: &str,
 ) -> Result<Module, String> {
-    let nifler_m = Phase::new(Arc::new(
-        temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?,
-    ));
+    let nifler_ir = Arc::new(temen_encode::decode_module(nifler).map_err(|_| "decode nifler")?);
     let nifler_ce_m: Option<Arc<Module>> = match nifler_ce {
         Some(bytes) => {
             let m = temen_encode::decode_module(bytes).map_err(|_| "decode nifler_ce")?;
@@ -743,14 +768,17 @@ fn compile_nim_ce_impl(
     let nimsem_m = Phase::new(Arc::new(
         temen_encode::decode_module(nimsem).map_err(|_| "decode nimsem")?,
     ));
-    let hexer_m = Phase::new(Arc::new(
-        temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?,
-    ));
+    // hexer is decoded where phase 3 starts, not here: a phase's decoded IR plus its compiled program
+    // is 87 MB (hexer) / 149 MB (nimsem) / 338 MB (nifler), and the browser engine's whole heap is
+    // 1 GiB — so the card holds only the phases it is currently running (#1543).
 
     let (factory, handle) = temen_fs::mem_fs_shared_factory(files, vec!["nimcache".into()]);
     let factory: FsFactory = Arc::new(factory);
 
     // ---- phase 1: parse + crawl the import closure with nifler ------------------------------------
+    // One compiled nifler for the crawl's runs (one per imported module); freed before phase 2, where
+    // nimsem's own window needs the room.
+    let nifler_m = Phase::new(Arc::clone(&nifler_ir));
     let mut mods: BTreeMap<String, Mod> = BTreeMap::new();
     let mut work = vec![
         ("/lib/std/system.nim".to_string(), Role::System),
@@ -801,6 +829,8 @@ fn compile_nim_ce_impl(
         .map(|m| m.stem.clone())
         .ok_or("no main module")?;
 
+    drop(nifler_m); // the crawl's compiled nifler — phase 2 compiles per exec instead
+
     // ---- phase 2: nimsem (dependency-ordered), driving nifler via exec ----------------------------
     for stem in &order {
         // #1025 3e (route A, extended): if the JS whole-card orchestrator already ran nimsem on the
@@ -824,7 +854,11 @@ fn compile_nim_ce_impl(
             Role::Import => {}
         }
         argv.push(&pnif);
-        let exec = make_exec(nifler_m.clone(), nifler_ce_m.clone(), factory.clone());
+        let exec = make_exec(
+            ExecNifler::PerCall(Arc::clone(&nifler_ir)),
+            nifler_ce_m.clone(),
+            factory.clone(),
+        );
         let (o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
             return Err(format!(
@@ -837,7 +871,16 @@ fn compile_nim_ce_impl(
         }
     }
 
+    // Phases 1-2 are done with nifler and nimsem — free them (487 MB of IR and compiled programs)
+    // before hexer decodes and compiles its own.
+    drop(nifler_ir);
+    drop(nifler_ce_m);
+    drop(nimsem_m);
+
     // ---- phase 3: hexer (main gets the app-entry glue) -------------------------------------------
+    let hexer_m = Phase::new(Arc::new(
+        temen_encode::decode_module(hexer).map_err(|_| "decode hexer")?,
+    ));
     let outdir = format!("nimcache/{main_stem}");
     let mut leng: Vec<(String, String)> = Vec::new();
     for stem in &order {
@@ -1246,7 +1289,7 @@ mod tests {
                 vec!["nimcache".into()],
             );
             let factory: FsFactory = Arc::new(factory);
-            let mut exec = make_exec(top_m.clone(), ce, factory);
+            let mut exec = make_exec(ExecNifler::Shared(top_m.clone()), ce, factory);
             let mut mem = VecMem(vec![0u8; AP + blob.len()]);
             mem.0[AP..].copy_from_slice(&blob);
             let args = [AP as i64, blob.len() as i64, 0, 0];
