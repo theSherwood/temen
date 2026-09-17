@@ -4342,7 +4342,8 @@ impl<'a> FuncGen<'a> {
                     let ty = val_ty(&a[0])?;
                     let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
-                    Ok(self.convert(x, ty, u))
+                    let v = self.convert(x, ty, u);
+                    Ok(self.narrow_to_target(v, &a[0]))
                 }
                 Some("cast") => {
                     // A C-style cast — for the scalar/pointer subset, a width reinterpretation
@@ -4351,7 +4352,8 @@ impl<'a> FuncGen<'a> {
                     let ty = val_ty(&a[0])?;
                     let u = self.operand_unsigned(&a[1]);
                     let x = self.expr(&a[1])?;
-                    Ok(self.convert(x, ty, u))
+                    let v = self.convert(x, ty, u);
+                    Ok(self.narrow_to_target(v, &a[0]))
                 }
                 Some("par") => self.expr(&e.args()[0]),
                 // Literals: booleans are `i32` 0/1; `nil` is a null `i64` pointer.
@@ -4549,6 +4551,36 @@ impl<'a> FuncGen<'a> {
         };
         let v = self.emit_bin(name, ty, l, r);
         Ok(self.narrow_result(v, bits, signed))
+    }
+
+    /// Re-canonicalize a `conv`/`cast` result to the **target** type's declared width (#1544).
+    ///
+    /// [`convert`] decides by machine slot, so a conversion whose target shares the operand's slot —
+    /// every sub-word one — returned the operand untouched. That was load-bearing on the assumption
+    /// [`narrow_result`] documents: that a sub-word integer is always already canonical, because
+    /// "the other producers hold it up". They do not agree for a *signed* sub-word type. A constant
+    /// `int16` is materialized zero-extended (`0x0000D83D`); the same value loaded from memory is
+    /// `i32.load16_s`, so it arrives sign-extended (`0xFFFFD83D`). Both are fine for `shr_s`/`div_s`,
+    /// and the difference is invisible until something converts to the *unsigned* sibling — at which
+    /// point the missing mask let `0xFFFFD83D` straight through and `int(uint16(p[0]))` answered
+    /// 4294957117 for a value native nim reports as 55357.
+    ///
+    /// So narrow on the conversion itself rather than inferring it can be skipped: the target names
+    /// the width and the signedness, which is exactly what canonical means, and it holds whichever
+    /// producer the operand came from. Redundant when the operand was already canonical — one `and`
+    /// or one `shl`/`shr_s` pair on a cold path, and the optimizer folds the common cases.
+    ///
+    /// `None` for floats, pointers, aggregates, `bool` and full-width integers: nothing there needs
+    /// re-canonicalizing, and `arith_ty` rejects the non-integer targets outright.
+    fn narrow_to_target(&mut self, v: Val, target: &Node) -> Val {
+        let Ok((vt, signed, bits)) = self.arith_ty(target) else {
+            return v;
+        };
+        let slot = if vt == ValType::I64 { 64 } else { 32 };
+        if bits >= slot {
+            return v;
+        }
+        self.narrow_result(v, bits, signed)
     }
 
     /// Wrap an integer result to the **declared width** its op node carries (#1488).
