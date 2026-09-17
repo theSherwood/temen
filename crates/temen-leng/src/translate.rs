@@ -2672,6 +2672,11 @@ impl Translator {
         }
         slots.extend(params.clone());
         slots.extend(ssa_vars);
+        // One i32 temp per short-circuit nesting level (#763). Reserved here, before any block is
+        // rendered, because the slot set is every block's parameter list.
+        for i in 0..body.map(max_and_or_depth).unwrap_or(0) {
+            slots.push((format!("$sc{i}"), ValType::I32));
+        }
         let nparams = usize::from(needs_frame) + usize::from(has_sret) + params.len();
         let sret = sret_desc.map(|d| (usize::from(needs_frame), d));
 
@@ -2781,6 +2786,10 @@ struct FuncGen<'a> {
     cur_buf: String,
     cur_next: u32, // value counter within the block
     cur: Vec<u32>, // slot → current value id
+    // Nesting depth of the `and`/`or` short-circuit currently being lowered — the index into the
+    // `$sc*` temp slots [`max_and_or_depth`] reserved. Bumped for the operands, so a nested
+    // `(or A (and B C))` gets its own live temp per level.
+    sc_depth: usize,
     terminated: bool,
 }
 
@@ -2832,6 +2841,7 @@ impl<'a> FuncGen<'a> {
             cur_next: 0,
             cur: Vec::new(),
             terminated: false,
+            sc_depth: 0,
         }
     }
 
@@ -4438,6 +4448,63 @@ impl<'a> FuncGen<'a> {
                         "non-aggregate constructor in expression position".into(),
                     )),
                 },
+                // **Boolean `and`/`or` (#763).** `leng_tags` spells these `AndC`/`OrC`, and nim's
+                // semantics are **short-circuiting**: the right operand must not be evaluated once
+                // the left decides the answer. v0.4.0's hexer never emitted them in expression
+                // position, so this fell through to the error below; v0.6.2's does, everywhere.
+                //
+                // Evaluating both eagerly and folding with `i32.and`/`i32.or` would give the right
+                // *value* — `0 and x` is 0 and `1 or x` is 1 whatever `x` is — and it is tempting,
+                // because every operand in the stdlib sample is a pure comparison. It is still
+                // wrong: `(and (ne p nil) (pat p 0))` is the ordinary nil guard, and evaluating the
+                // right operand eagerly dereferences a null pointer, which the #964 NULL guard
+                // turns into a MemoryFault. Bounds guards (`i < len and s[i] == c`) have the same
+                // shape. So this branches.
+                //
+                // The result travels in a reserved `$sc{depth}` slot rather than a block result:
+                // every block's parameters *are* the slot set, so writing the slot in each arm
+                // makes the join block's `v{k}` the phi. `Y+` operands fold left, each fold its own
+                // pair of blocks.
+                Some(t @ ("and" | "or")) => {
+                    let a = e.args();
+                    if a.len() < 2 {
+                        return Err(LengError::Malformed(format!("`{t}` needs two operands")));
+                    }
+                    let Some(k) = self.sc_slot(self.sc_depth) else {
+                        return Err(LengError::Unsupported(format!(
+                            "`{t}` nested deeper than the reserved short-circuit slots"
+                        )));
+                    };
+                    let is_or = t == "or";
+                    self.sc_depth += 1;
+                    let first = self.expr(&a[0])?;
+                    let mut acc = self.as_bool(first);
+                    for operand in &a[1..] {
+                        // The decided answer is this arm's contribution; the join reads it back.
+                        self.cur[k] = acc.id;
+                        let rhs = self.new_block_id();
+                        let join = self.new_block_id();
+                        let args = self.branch_args();
+                        // `or` short-circuits when true, `and` when false — only the target order
+                        // differs.
+                        let (t_lbl, f_lbl) = if is_or { (join, rhs) } else { (rhs, join) };
+                        self.finish_block(
+                            format!("br_if v{} {t_lbl}{args} {f_lbl}{args}", acc.id),
+                            rhs,
+                        );
+                        let rv = self.expr(operand)?;
+                        let rv = self.as_bool(rv);
+                        self.cur[k] = rv.id;
+                        let jargs = self.branch_args();
+                        self.finish_block(format!("br {join}{jargs}"), join);
+                        acc = Val {
+                            id: k as u32,
+                            ty: ValType::I32,
+                        };
+                    }
+                    self.sc_depth -= 1;
+                    Ok(acc)
+                }
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
                     other.unwrap_or("<headless>")
@@ -5315,6 +5382,26 @@ impl<'a> FuncGen<'a> {
 
     /// Emit a relational compare `v = <ty>.<op> l r` (result an `i32` bool). Used by the case
     /// comparison-chain fallback; `op` ∈ {`eq`, `le_s`, …}.
+    /// The slot reserved for short-circuit nesting level `depth` (see [`max_and_or_depth`]).
+    fn sc_slot(&self, depth: usize) -> Option<usize> {
+        let want = format!("$sc{depth}");
+        self.slots.iter().position(|(n, _)| *n == want)
+    }
+
+    /// Normalize a condition to a canonical i32 0/1. Leng bools already are one; an `i64`-slotted
+    /// operand (a pointer-typed truth test) becomes `!= 0` so `br_if` and the fold see 0/1.
+    fn as_bool(&mut self, v: Val) -> Val {
+        if v.ty == ValType::I32 {
+            return v;
+        }
+        let z = self.emit_const(v.ty, 0);
+        let id = self.emit_rel("ne", v.ty, v.id, z.id);
+        Val {
+            id,
+            ty: ValType::I32,
+        }
+    }
+
     fn emit_rel(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
         let id = self.fresh();
         self.cur_buf
@@ -5576,6 +5663,19 @@ fn collect_labels(node: &Node, out: &mut Vec<String>) {
 }
 
 /// Collect the names of locals whose address is taken (`(addr name)`).
+/// Deepest nesting of a boolean `and`/`or` in this subtree, i.e. how many short-circuit results can
+/// be live at once. Each level needs its own `$sc*` slot: lowering `(or A (and B C))` still holds the
+/// outer `or`'s partial result while the inner `and` computes its own.
+///
+/// Counted up front because the slot set **is** every block's parameter list ([`block_params`]), and
+/// blocks render as they are finished — appending a slot mid-translation would leave already-rendered
+/// blocks with a shorter signature than their predecessors pass arguments for.
+fn max_and_or_depth(n: &Node) -> usize {
+    let here = usize::from(matches!(n.tag(), Some("and" | "or")));
+    let deepest = n.args().iter().map(max_and_or_depth).max().unwrap_or(0);
+    here + deepest
+}
+
 fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
     if let Node::List(_) = node {
         if node.tag() == Some("addr") {
