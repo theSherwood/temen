@@ -1074,7 +1074,8 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   `trap_capture.c` thread-local across the resume seam (`temen_set_current_fiber`, save/restore-bracketed
   around `(*fib).resume` exactly like the durable shadow-SP swap — stack-disciplined for nested
   resumes), and every capture path stashes it: unix memory-fault (`temen_store_trap_frame`) + explicit
-  (`temen_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`temen_current_fiber`).
+  (`temen_capture_explicit_trap`) read it directly; the Windows VEH gets it for free now that its
+  memory-fault capture goes through the same C helper.
   It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
   (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
   names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
@@ -1134,6 +1135,36 @@ so div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type traps capture 
 (ISSUES I5 — **resolved**, `windows-latest` confirmed green). Per-fiber naming under work-stealing
 migration (ISSUES I6) landed as Stage 4 above (`temen_set_current_fiber` / `last_trap_fiber()`,
 `jit_per_fiber_trap.rs`).
+
+**The walk carries its own fault recovery (#1487).** Its loop bounds the *arithmetic* — aligned,
+non-null, strictly-increasing links, an 8 MiB span, the frame cap — but nothing there establishes that
+a link is **mapped**, and nothing can: the walk reads the guest's own stack and the guest chooses what
+is in it. The bad link is not hypothetical — the JIT entry trampoline spills `mem_base` into a frame
+slot, so where the walk steps out of guest frames it can read the *window base*, whose first page is
+the `PROT_NONE` null guard. That fault used to kill the **host**: on unix the walk runs from the
+SIGSEGV handler *after* it has disarmed, so the nested fault fell through to `SIG_DFL`. A best-effort
+backtrace must never be able to take down the run it describes, still less hand a guest an
+availability break on the confinement *recovery* path. So `temen_guarded_walk` brackets the walk
+(`sigsetjmp` on unix, `__try`/`__except` under MSVC) and each trap detector asks
+`temen_walk_in_progress()` **before** its own range test and stands down; the capture publishes `pc`,
+the fiber and each frame *as it goes*, so an aborted walk yields a truncated backtrace rather than
+none. Bounding the walk to the thread's stack instead would be wrong here: fibers switch stacks, and
+`g_current_fiber` exists precisely so a trap is attributed across that seam — the clamp would silently
+truncate every backtrace taken on a fiber.
+
+The walk is fuzzed (`fuzz/fuzz_targets/trap_walk.rs`, `cargo +nightly fuzz run trap_walk`) against the
+property the bracket exists for: for *arbitrary* chain contents the host survives, the walk terminates,
+and the capture stays within the frame cap. Arbitrary is the right input because the guest writes its
+own stack. Measured at ~3% of executions taking a recovered fault, so the target reaches the path it
+gates rather than passing trivially.
+
+**The recovery is unix-only for now, and windows still keeps two walks.** The VEH's memory-fault
+capture has its own Rust `walk_fp_chain` and its own capture thread-locals, while explicit traps go
+through the C helper — one behaviour, two paths (INVARIANTS #15), so the guard above reaches only the
+second of them there. Collapsing the two (routing the VEH's capture through `temen_store_trap_frame`,
+as unix does) was tried and reverted: it aborts `pal_guard_catches_tail_fault_not_in_window` with
+`0xc0000005` under `cargo nextest` — one process per test — while the *same commit* passes all 25 lib
+tests under `cargo test`, where they share a process. That difference is the lead; #1575 carries it.
 
 ---
 

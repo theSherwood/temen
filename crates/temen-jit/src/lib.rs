@@ -161,6 +161,11 @@ mod instantiator_rt;
 #[cfg(windows)]
 pub use mem::win_commit_rw;
 
+// The §5 W3 frame-pointer walk, under its own fault recovery — the `trap_walk` fuzz target's entry
+// (#1487). See `mem::walk_trap_frame_chain`.
+#[cfg(all(unix, fiber_rt))]
+pub use mem::walk_trap_frame_chain;
+
 /// Whether this build's JIT lowers the §12 fiber/thread/futex ops (`cont.*`, `thread.*`,
 /// `atomic.wait`/`notify`) instead of bailing [`JitError::Unsupported`]. True on the targets where
 /// `temen-fiber` provides a real stack switch — the `fiber_rt` cfg derived in `build.rs`, kept in
