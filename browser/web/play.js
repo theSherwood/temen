@@ -501,6 +501,8 @@ block 2 (vh2: i32) {
 
   detached: {
     mode: 'onramp',
+    debug: true, // steppable: the debug scheduler services op 15 (#1528), under the on-ramp powerbox
+    bp: 37, // a breakpoint just past the join, where `vj` holds what the detached child returned
     desc: '§5 detached child + a **pre-mapped SharedRegion** (op 15, 11-arg form): the parent mints a ' +
       '64 KiB region, maps it at 65536 in its own window and stores 41 there, then spawns **its own func 1** ' +
       'as a DETACHED child — a fresh 128 KiB window of its own, nothing of the parent addressable — with ' +
@@ -4815,9 +4817,11 @@ async function startDebug(c) {
   if (c.ex.kind === 'chibicc') c.el.stdout.textContent = '';
   dapClient.send('initialize', {});
   // A chibicc C program runs under the on-ramp I/O powerbox, so a `printf` (a `write` cap) runs and its
-  // output streams back as `output` events instead of trapping; a hand-written Temen card stays deny-all.
+  // output streams back as `output` events instead of trapping; so does an `onramp`-recipe Temen card,
+  // which resolves its powerbox by name (`instantiator`/`module`/`budget`, #1528) exactly as its Run
+  // does. Every other hand-written Temen card stays deny-all.
   const launchArgs = { programText, function: 0, args: [], engine: 'bytecode' };
-  if (c.ex.kind === 'chibicc') launchArgs.powerbox = 'onramp';
+  if (c.ex.kind === 'chibicc' || c.ex.mode === 'onramp') launchArgs.powerbox = 'onramp';
   const launch = dapClient.send('launch', launchArgs);
   if (!launch.response.success) {
     endDebug(c, null);

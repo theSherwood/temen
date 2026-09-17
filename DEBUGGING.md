@@ -54,7 +54,7 @@ Design invariants every workstream inherits (do not relitigate; see §19/§2a):
 | Source-level debugging — chibicc `-g` → `debug.var` + `debug.loc` → named locals & `file:line` (interpreter `source_loc` nearest-preceding) | **Built — W4 slices 5–6** | `codegen_ir.c`, `temen-text`, `temen-interp` |
 | Backtrace *materialization* (unwind tables → frames) | **Built** — gdb-facing DWARF CFI (`.debug_frame`) + a host-side fiber-rooted walk of a *suspended* fiber (W5 JIT/DWARF Stage 4), **and** the always-on **trap-time** backtrace: a JIT trap (memory fault *or* explicit check) symbolizes its stack into `last_trap_backtrace()`, folded into the host kill message (W3 Stages 0–3, unix) | §5, `temen-jit` `trap_backtrace`/`fiber_backtrace`/`dwarf` |
 | Debug-info ABI (frontend-neutral IR waist; source locs + var locs + structured types) | **Built — neutral core + structured `TypeRef` table (text **and** binary); chibicc `-g` emits the full waist; **wasm ingests embedded DWARF (source lines + vars + aggregate/pointer/array types)**; **LLVM ingests `!DILocation` source lines + (`-O0`) `dbg.declare` variables/types from the textual `.ll` metadata (`ll::debug`)** — three independent producers on both halves; DAP consumes types** (D-DBG-7/§6) | `temen-ir` `DebugInfo`/`TypeDef`, `temen-text`, `temen-encode`, `temen-interp`, `codegen_ir.c`, `temen-wasm`, `temen-llvm` |
-| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
+| DAP server (interpreter-backed: source breakpoints + **conditions**, **data breakpoints** (watchpoints, incl. cross-thread), frames, locals, **source-line** stepping (in/over/out), **reverse debugging** (single + multithreaded), **multithreaded** per-thread stacks, **`evaluate`** expressions/hover incl. **member/index/arrow** (`a.b`, `arr[i]`, `p->x`), **Variables-pane struct/array/pointer expansion**, **`powerbox` launch mode** — run a capability-using guest (a chibicc `printf`) under the on-ramp I/O powerbox, streaming its captured stdout as `output` events that **rewind on reverse** via the CapTape replay; #1528: it grants the same §14 by-name set the two Run paths do — `instantiator`, plus `module`/`budget` for a guest that spawns detached — so a §5/§14 guest is debuggable at all) | **Built — W5 slices 1–6 + W4 slices 8, 10, 11** | `temen-dap` (`DapServer` / `backend` / `expr` / `run_stdio`) |
 | DWARF emission (gdb/lldb on JIT native code) | **Built — W5 JIT/DWARF tier, Stages 0–4** — source-line breakpoints, `print` of register **and** spilled variables, `bt` across guest frames, type DIEs, GDB JIT registration, and a fiber-rooted backtrace; all confirmed under gdb 15.1 (Stage 5 DAP-over-JIT + guest-window-memory var forms deferred) | `temen-jit` `dwarf`/`gdb`/`symbolize`/`var_locations` |
 | `Inspector`/`Monitor` capability *type* | **Missing** (pattern only) | — |
 | DRF-or-trap hardened race-detection tier | **Missing** (designed, §12) | — |
@@ -240,7 +240,8 @@ different things depending on which pair you compare:
   `dap_checkpoints.rs::scheduled_checkpoint_warm_seek_matches_cold_with_live_fibers` (backend ladder, two
   worker vCPUs each driving a fiber body) and
   `bytecode_debug_scheduled_coroutine.rs::scheduled_coroutine_checkpoint_snapshot_restore_round_trips`
-  (`ScheduledDebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every*
+  (`ScheduledDebugRun`-level — granting its own Instantiator, as the DAP powerbox now does too
+  (#1528) — restoring at *every*
   checkpointable turn, including inside the coroutine body, with a live `instantiate` child env).
 
   **Subset extended to §14 separate-module coroutines + `instantiate_module` children (slice 5-perf, both
@@ -312,7 +313,8 @@ different things depending on which pair you compare:
   the coroutine's own `snapshot_safe`) and **separate-module** coroutines (`vm.module != 0` — they push a
   unit into the shared source, which a fresh restore lacks). Oracles: `dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_live_fiber`
   (backend ladder, fiber active across the strides) and `bytecode_debug_coroutines.rs::coroutine_checkpoint_snapshot_restore_round_trips`
-  (`DebugRun`-level — the DAP powerbox grants no Instantiator — restoring at *every* checkpointable clock,
+  (`DebugRun`-level — granting its own Instantiator, as the DAP powerbox now does too (#1528) —
+  restoring at *every* checkpointable clock,
   including inside the coroutine body, replays forward identically to the from-0 run).
 
   **Watchpoints landed on the bytecode engine (slice 5).** `DebugRun` gained a `set_watchpoints`
