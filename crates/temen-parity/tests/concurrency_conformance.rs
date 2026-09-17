@@ -32,7 +32,7 @@
 
 mod support;
 use std::sync::Arc;
-use support::capability_probe::{probe_module_typed, rows, Row, MAX_ARGC, PROBE_BEYOND};
+use support::capability_probe::{probe_module_with, rows, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::{bytecode, Host, Region, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
@@ -65,8 +65,16 @@ fn verdict(out: Option<Result<Vec<Value>, Trap>>) -> Verdict {
 }
 
 /// The cooperative driver: one thread, every vCPU multiplexed onto it.
-fn coop(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str) -> Verdict {
-    let m = probe_module_typed(iface, op, argc, res);
+fn coop(
+    mut host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     let mut fuel = 1_000_000u64;
     verdict(bytecode::compile_and_run_with_host(
         &m,
@@ -80,8 +88,16 @@ fn coop(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str
 /// The OS-thread parallel driver, over a shared window it can hand to a second vCPU. The `unsafe` of
 /// borrowing host memory lives here in the test embedder, as it does in every parallel harness — the
 /// engine stays `#![forbid(unsafe_code)]` and just takes the `Arc<Region>`.
-fn parallel(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str) -> Verdict {
-    let m = probe_module_typed(iface, op, argc, res);
+fn parallel(
+    mut host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     let size = 1u64 << 16;
     let layout = std::alloc::Layout::from_size_align(size as usize, 8).unwrap();
     // SAFETY: non-zero, 8-aligned layout; freed below, after the run has joined every vCPU.
@@ -112,12 +128,20 @@ fn shapes() -> impl Iterator<Item = (usize, &'static str)> {
 
 /// The call shapes of `op` on which the two drivers disagree, as `(shape, coop, parallel)`.
 fn divergences(row: &Row, op: u32) -> Vec<(String, Verdict, Verdict)> {
+    // Real argument values this row declares for `op` (see `Row::real_args`): a handle the sweep's
+    // zeros cannot stand in for, because a zero handle is forged and never reaches the code the two
+    // drivers actually differ in.
     let mut out = Vec::new();
     for (argc, res) in shapes() {
-        let (h, x) = (row.mint)();
-        let c = coop(h, x, row.iface, op, argc, res);
-        let (h, x) = (row.mint)();
-        let p = parallel(h, x, row.iface, op, argc, res);
+        let (h, x, real) = (row.mint)();
+        let real: Vec<(usize, i64)> = real
+            .iter()
+            .filter(|(o, _, _)| *o == op)
+            .map(|(_, idx, v)| (*idx, *v))
+            .collect();
+        let c = coop(h, x, row.iface, op, argc, res, &real);
+        let (h, x, _) = (row.mint)();
+        let p = parallel(h, x, row.iface, op, argc, res, &real);
         // Neither driver found an arm: the harness miscalled this shape, so there is nothing to
         // compare. A cap fault on exactly one side *is* a divergence and is kept.
         if c == Verdict::CapFault && p == Verdict::CapFault {
@@ -175,50 +199,49 @@ fn the_concurrency_column_matches_what_the_two_drivers_actually_do() {
     }
 }
 
-/// The column's first rendering found two divergences on the `Instantiator` row, and this pins both
-/// halves as *specific* facts rather than leaving the cell a bare `NotYet`.
+/// The two divergences the column's first rendering found, now both closed — pinned as *specific*
+/// facts so a regression names itself instead of just reddening a cell.
 ///
 /// `child_offer` (op 14) answered `-EINVAL` on the cooperative driver and **trapped** on the
 /// parallel one, so a guest probing a stale child handle survived on one driver and had its domain
 /// killed on the other — INVARIANTS #5 (errors are values, traps are for forgery) and #9 (refuse
-/// probeably, never diverge). Fixed in #1566: both now answer `-EINVAL`.
+/// probeably, never diverge). Fixed in #1566.
 ///
-/// `instantiate_module_named` (op 13) remains (#1570): the parallel driver's named-grant decline is
-/// a `Trap::Malformed`, and it fires before the module handle is resolved, so a forged handle gets
-/// that instead of the `CapFault` the cooperative driver correctly gives. Both drivers kill the
-/// domain here, which is why it is milder — but it is still one op with two answers.
+/// `instantiate_module_named` (op 13) was worse than the issue that filed it claimed. Its lowering
+/// passes `grants: Some((ptr, n))` unconditionally, so the parallel driver's `grants.is_some()`
+/// guard declined **every** op-13 spawn there with `Trap::Malformed`, grant-free ones included; the
+/// guard also preceded the module resolve, so a forged handle got that trap instead of the
+/// `CapFault` the cooperative driver gives; and that arm never called `bind_child_manifest`, so a
+/// child's imports went unbound where the cooperative driver bound them. Fixed in #1570 by giving
+/// both drivers one `named_child_host`.
+///
+/// Reaching op 13's admission at all needs a real `Module` handle and a matching `size_log2` — see
+/// `Row::mint`. With the sweep's zeros it dies at the handle resolve, which is why the original
+/// probe saw the two drivers "agree" on this op while they disagreed one step further in.
 #[test]
-fn the_instantiator_rows_two_divergences_are_where_they_are_claimed_to_be() {
+fn the_two_instantiator_divergences_stay_closed() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
-
-    assert!(
-        divergences(&row, 14).is_empty(),
-        "child_offer diverges again — #1566 regressed. Both drivers must answer -EINVAL: {:?}",
-        divergences(&row, 14),
-    );
-
-    let op13 = divergences(&row, 13);
-    assert!(
-        !op13.is_empty(),
-        "op 13 no longer diverges — if #1570 was fixed, this pin and the Instantiator cell should \
-         move together (and the cell can go Full only once the probe supplies a real Module \
-         handle, so the valid-handle case is covered rather than assumed)"
-    );
-    // On this shape the coop side's `CapFault` is the **genuine answer** — the arm lowered, the
-    // driver resolved `mh = 0`, and a forged handle traps (INVARIANTS #5) — not the harness
-    // miscalling, which is the other thing that verdict can mean. `divergences` keeps a cap fault on
-    // exactly one side for precisely this reason: it skips a shape only when *both* drivers give it.
-    for (shape, c, p) in &op13 {
+    for op in [13, 14] {
+        let found = divergences(&row, op);
         assert!(
-            matches!(c, Verdict::CapFault),
-            "{shape}: the coop driver traps CapFault on the forged handle, got {c:?}"
-        );
-        assert!(
-            matches!(p, Verdict::Trapped(t) if t.contains("Malformed")),
-            "{shape}: the parallel driver's feature check fires first and names Malformed, got {p:?}"
+            found.is_empty(),
+            "op {op} diverges again — the drivers must give one answer per call shape: {found:?}"
         );
     }
+    // Non-vacuity: op 13 really does reach admission, rather than agreeing by faulting early on
+    // both sides. `-EINVAL` is the answer for a carve that cannot hold the child module.
+    let (h, x, real) = (row.mint)();
+    let real: Vec<(usize, i64)> = real
+        .iter()
+        .filter(|(o, _, _)| *o == 13)
+        .map(|(_, i, v)| (*i, *v))
+        .collect();
+    assert_eq!(
+        coop(h, x, row.iface, 13, 7, "i32", &real),
+        Verdict::Answered(-22),
+        "the op-13 sweep must get past the handle resolve into admission"
+    );
 }
