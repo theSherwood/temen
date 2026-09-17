@@ -34,7 +34,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `PipeEnd` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
 | `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
-| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | 🚧 | ❔ | 🔶 |
+| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | ✅ | ❔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ❔ | ❔ | ✅ | ❔ | ✅ |
 | `Module` | ✅ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
 | `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ✅ | ❔ | ✅ |
@@ -59,7 +59,6 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
-- *concurrency* 🚧 — instantiate_module_named (op 13): the parallel driver's named-grant decline traps, and precedes the handle resolve (#1570); child_offer was fixed in #1566
 - *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
