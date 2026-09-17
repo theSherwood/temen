@@ -249,3 +249,50 @@ block 0 (v0: i64) {
         "an unreachable non-subset function is irrelevant"
     );
 }
+
+/// #1546 — a `gc.roots`-bearing function is **not** an interp leaf, even when it is otherwise
+/// leaf-shaped (marshallable signature, no calls, no memory ops, no caps, no concurrency).
+///
+/// It would run fine inside a cross-tier bounce, which is the danger: GC.md §3.1 requires coverage
+/// of the *caller* of `gc.roots`, and at a bounce the caller chain runs down into the emitted wasm
+/// frame that called `env.call_interp`. That frame's live values are wasm locals — unscannable by
+/// guest or host — so the scan would answer with them omitted and a non-moving collector would free
+/// a live object. Every other leaf exclusion fails closed; this one would fail open.
+///
+/// Note `Func::uses_concurrency` does not cover `gc.roots` (that predicate is the single-thread
+/// guarantee behind the atomics lowering), so the exclusion is explicit rather than incidental.
+#[test]
+fn gc_roots_callee_is_not_an_interp_leaf() {
+    let a = analyze(&m(r#"
+memory 16
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = call 1 (v0)
+  return v1
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 4096
+  v3 = i64.const -1
+  v4 = i64.const 8
+  v5 = gc.roots v1 v2 v3 v0 v4
+  return v5
+  }
+}"#));
+    assert_eq!(
+        a.in_subset,
+        vec![true, false],
+        "the caller is plain integer compute; the scan is not in the emitter's subset"
+    );
+    assert_eq!(
+        a.interp_leaf,
+        vec![false, false],
+        "a gc.roots callee is not leaf-safe — the bounce cannot expose its emitted caller's frame"
+    );
+    assert!(
+        !a.mixed_ok,
+        "so a guest that can collect falls back to the full interpreter, where the scan is sound"
+    );
+}

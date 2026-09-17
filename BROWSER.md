@@ -806,7 +806,15 @@ Three classes, all with existing precedent in this repo:
    `temen-jit` already bails these `Unsupported` where the fiber substrate is missing ("the
    interpreter covers it" — module-granular fallback); the wasm tier inherits the posture.
    `gc.roots` bails unconditionally on this tier (natively it thunks into a runtime stack-walk;
-   on wasm even a thunk can't see JITted locals). Atomics: wasm atomics are all seq-cst — a safe
+   on wasm even a thunk can't see JITted locals), and the bail has to be **module-granular** rather
+   than per-function (#1546). Per-function is not enough because the op is reachable *through a
+   cross-tier bounce*: GC.md §3.1 requires coverage of the caller of `gc.roots`, and at a bounce the
+   caller chain runs into the emitted frame that called `env.call_interp`, whose locals no one can
+   enumerate. So a scan serviced inside a bounce **completes with an incomplete answer** and a
+   non-moving collector frees a live object — the one execution-model feature on this list that
+   fails *open* instead of declining. It is excluded from both cross-tier sets (the strict
+   `interp_leaf` and the #888 widened `bounce_serviceable` seeds), and the emit fixpoint cascades
+   its callers off, so a `gc.roots`-bearing guest runs wholly on the interpreter. Atomics: wasm atomics are all seq-cst — a safe
    over-approximation of Temen's acquire/release. Tail calls: wasm `return_call` shipped (V8 stable);
    maps directly.
 
@@ -817,7 +825,7 @@ Three classes, all with existing precedent in this repo:
 | §13 aliasing, page protection | fast path + deopt on the `call.cap` that creates it | zero until used |
 | atomics orderings | wasm seq-cst (safe over-approx) | negligible |
 | fibers / suspend / durable unwind | interp fallback (`Unsupported`, temen-jit precedent) | n/a |
-| `gc.roots` | interp fallback (locals unscannable) | n/a |
+| `gc.roots` | interp fallback, **module-granular** (locals unscannable; #1546) | n/a |
 | debug / single-step | interp tier | n/a |
 | `thread.spawn`/`join`/`wait` | end region, return to the vCPU event loop | boundary only |
 
@@ -1431,8 +1439,10 @@ Readings:
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
-whether `gc.roots`-bearing functions bail at function or module granularity (function, if the
-partitioning is per-function anyway). Revisit fibers when JSPI / core stack-switching ships.
+whether `gc.roots`-bearing functions bail at function or module granularity — **settled as
+effectively module-granular** (#1546): per-function was what shipped, and it was unsound, because a
+bounce into such a function leaves the emitted caller's frame unscanned. The op is now excluded from
+both cross-tier sets and the fixpoint cascades its callers off. Revisit fibers when JSPI / core stack-switching ships.
 
 ## Verification
 

@@ -726,3 +726,86 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
          stands: {widened_clean:?}"
     );
 }
+
+/// #1546 — the third seed shape, and the one that fails **open** rather than closed.
+///
+/// A bounce into a `gc.roots`-bearing callee *completes*. That is the problem. GC.md §3.1 requires
+/// coverage of "every fiber not actively executing guest mutator code **+ the caller of
+/// `gc.roots`**", and at a cross-tier bounce the caller chain runs down into the **emitted wasm
+/// frame** that called `env.call_interp`. That frame's live values are wasm locals and operand-stack
+/// entries, which neither the guest nor the host can enumerate (BROWSER.md: "on wasm even a thunk
+/// can't see JITted locals"). So the scan returns a set with those roots missing, and the guest's
+/// non-moving collector frees a live object — silent heap corruption, where the futex seed above
+/// merely traps.
+///
+/// This is the JACL shape again: `f1` is guest code holding a heap pointer across an allocation,
+/// `f2` is `jacl_gc_collect` → `jacl_gc_collect_stw`. Two sets had to change, so this pins both:
+///
+/// * the **local** table's strict `interp_leaf` — a `gc.roots` body is marshallable, call-free,
+///   cap-free and `Inst::Store`-free, so it qualified as a leaf on the predicate's own terms (the
+///   `gc.roots` write is not a `Store`, and `uses_concurrency` does not cover the op);
+/// * the **B2** widened `cross` set, via [`bounce_serviceable`]'s fourth seed.
+const GC_ROOTS_CALLEE: &str = r#"
+memory 16
+func () -> (i64) {
+block 0 () {
+  vh = i32.const 0
+  vp = i64.const 0
+  vl = i64.const 8
+  vw = call.cap 0 1 (i64, i64) -> (i64) vh (vp, vl)
+  vx = i64.const 3
+  vr = call 1 (vx)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vk = i64.const 100
+  vsum = i64.add v0 vk
+  vr = call 2 (vsum)
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vlo = i64.const 0
+  vhi = i64.const 4096
+  vmask = i64.const -1
+  vbuf = i64.const 128
+  vcap = i64.const 8
+  vn = gc.roots vlo vhi vmask vbuf vcap
+  return vn
+  }
+}
+"#;
+
+#[test]
+fn gc_roots_callee_is_not_a_cross_tier_leaf_on_either_table() {
+    let m = build(GC_ROOTS_CALLEE);
+    // Sanity: f2 really is the scanning callee this gate is about, and it is NOT caught by the
+    // concurrency predicate that already excluded the futex case above.
+    assert!(
+        m.funcs[2].uses_gc_roots(),
+        "f2 must carry gc.roots for this test to mean anything"
+    );
+    assert!(
+        !m.funcs[2].uses_concurrency(),
+        "and uses_concurrency must NOT cover it — that is why an explicit exclusion was needed"
+    );
+    // Local table: f2 is not a leaf, so f1 cascades off. Before #1546 this was `[false, true,
+    // false]` — the strict leaf set admitted a gc.roots body, which is the sharper half of the bug.
+    let (_, local) = compile_module_tierup(&m, false).expect("local tier-up emit");
+    assert_eq!(
+        local,
+        vec![false, false, false],
+        "local table: a gc.roots body is not a strict interp_leaf, so f1 cascades off"
+    );
+    // B2 widened table: same verdict by the bounce-serviceable seed. Before #1546: `[false, true,
+    // false]`.
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    assert_eq!(
+        widened,
+        vec![false, false, false],
+        "B2 widened cross-tier: gc.roots is not bounce-serviceable, so f1 cascades off too"
+    );
+}

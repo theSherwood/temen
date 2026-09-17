@@ -221,7 +221,13 @@ fibers, suspended coroutines; `temen-interp/src/bytecode.rs`), and a module comb
 `thread.spawn` falls back to the reference interp, since only the calling vCPU's continuation is
 scannable there. The **wasm-JIT** tier does not realize it at all: `gc.roots` is outside its v1
 subset, so `gc.roots`-bearing functions fail closed onto the interpreter (natively the op thunks
-into a runtime stack-walk; on wasm even a thunk cannot see JITted locals).
+into a runtime stack-walk; on wasm even a thunk cannot see JITted locals). That fallback must be
+**module-granular**, not per-function (#1546): the op is reachable through a cross-tier bounce, and
+§3.1's coverage of *the caller* then runs into an emitted wasm frame whose locals nothing can
+enumerate — so a bounced scan would return an under-approximation, which §3.2's
+over-approximation argument does **not** license. Under-approximation frees live objects. It is
+therefore excluded from both cross-tier callee sets, and the emit fixpoint cascades its callers off
+the emitted tier.
 
 ### 3.3. Soundness preconditions (caller obligations temen cannot cheaply enforce)
 
