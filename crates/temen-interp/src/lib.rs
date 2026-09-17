@@ -25932,6 +25932,35 @@ impl MemLayout {
         })
     }
 
+    /// The page-protection entries back in the [`Mem::map_info`] encoding — the inverse of
+    /// [`from_parts`](Self::from_parts), for a holder that has to hand the map to a run entry that
+    /// speaks that encoding (`run_over_grown`'s `prots` argument).
+    ///
+    /// Without this a holder that stores a `MemLayout` still has to keep the raw `Vec<(u64, u8)>`
+    /// beside it to feed the run, which is the duplicated pair-of-fields this type exists to remove
+    /// (#1456).
+    pub fn page_entries(&self) -> Vec<(u64, u8)> {
+        self.prot
+            .iter()
+            .map(|(&page, prot)| {
+                let kind = match prot {
+                    PageProt::Ro => 0,
+                    PageProt::Rw => 1,
+                    PageProt::Unmapped => 2,
+                    // `from_parts` rejects `Backed` and `layout_snapshot_safe` excludes it, so a
+                    // layout never holds one; encode it faithfully rather than inventing a kind.
+                    PageProt::Backed { .. } => 3,
+                };
+                (page * self.page, kind)
+            })
+            .collect()
+    }
+
+    /// The committed prefix this layout was captured over — what an absent protection entry means.
+    pub fn mapped(&self) -> u64 {
+        self.mapped
+    }
+
     /// Build a layout from the §12 codec's **dense** form — one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over `bytes` — for a window whose committed prefix is `mapped` (the
     /// module's declared memory). The inverse of [`dense_prots`](Self::dense_prots), and the same
