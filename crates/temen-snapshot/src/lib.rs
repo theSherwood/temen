@@ -58,9 +58,9 @@
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedProt, DurableBinding, DurableHandle,
-    DurableJitTable, DurableJitUnit, DurableNamedCap, FrozenChildState, FrozenDetached,
-    FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena,
-    StreamRole, SvcDispatch,
+    DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope, FrozenChildState,
+    FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle,
+    ShadowArena, StreamRole, SvcDispatch,
 };
 use temen_ir::Module;
 
@@ -194,10 +194,14 @@ use temen_ir::Module;
 /// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
 /// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
 /// whose domain holds no `Budget` is byte-identical to v21.
+/// v26 (#1440): `B_FREEZE_DETACHED` — the all-or-nothing authority over a holder's **detached**
+/// children, which a carve range cannot name. A separate tag rather than a scope byte on
+/// `B_FREEZE_AUTHORITY`, so a v25 artifact decodes unchanged; one holding no detached-progeny
+/// authority is byte-identical to v25 but for the version field.
 /// v25 (#1440): `B_FREEZE_AUTHORITY` — freeze authority is a durable binding, so a thawed parent
 /// still holds it over its thawed child. An artifact whose domain holds none is byte-identical to
 /// v24 but for the version field.
-const FORMAT_VERSION: u16 = 25;
+const FORMAT_VERSION: u16 = 26;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -250,6 +254,10 @@ const B_BUDGET: u8 = 11;
 /// thawed child what it held before, or a freeze/thaw would quietly launder a domain's exposure away
 /// and `attest.freeze_exposed` would start lying.
 const B_FREEZE_AUTHORITY: u8 = 12;
+/// `FreezeAuthority(DetachedProgeny)` (#1440): all-or-nothing authority over the holder's detached
+/// children. Its own tag rather than a scope byte on `B_FREEZE_AUTHORITY`, so a v25 artifact — whose
+/// only scope was the carve — still decodes unchanged.
+const B_FREEZE_DETACHED: u8 = 13;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -352,10 +360,11 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
         } => return true,
         DurableBinding::AddressSpace { base, size }
         | DurableBinding::Instantiator { base, size }
-        // #1440: a freeze authority names a window sub-range too, so it takes the same bounds check.
-        // Falling through to the permissive arm would let an artifact carry authority over a range
-        // outside the window it restores into — laundering exposure past the very check this is.
-        | DurableBinding::FreezeAuthority { base, size } => (base, size),
+        // #1440: a carve-scoped freeze authority names a window sub-range too, so it takes the same
+        // bounds check. Falling through to the permissive arm would let an artifact carry authority
+        // over a range outside the window it restores into — laundering exposure past the very check
+        // this is. `DetachedProgeny` names no range, so it has nothing to bound and falls through.
+        | DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => (base, size),
         _ => return true,
     };
     size != 0
@@ -1508,10 +1517,13 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
-        DurableBinding::FreezeAuthority { base, size } => {
+        DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => {
             b.push(B_FREEZE_AUTHORITY);
             write_uleb(b, base);
             write_uleb(b, size);
+        }
+        DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny) => {
+            b.push(B_FREEZE_DETACHED);
         }
         DurableBinding::LiveImpl { slot, export } => {
             b.push(B_LIVE_IMPL);
@@ -1557,10 +1569,11 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             base: r.uleb()?,
             size: r.uleb()?,
         },
-        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority {
+        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority(FreezeScope::Carve {
             base: r.uleb()?,
             size: r.uleb()?,
-        },
+        }),
+        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny),
         B_INSTANTIATOR => DurableBinding::Instantiator {
             base: r.uleb()?,
             size: r.uleb()?,

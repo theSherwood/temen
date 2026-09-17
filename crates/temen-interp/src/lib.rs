@@ -11861,9 +11861,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // from spending a handle-table slot per spawn. `holds_` makes it
                                     // idempotent, and the fallible grant means a full table costs the
                                     // exposure bit's precision, never the run.
-                                    if durable && !hg.holds_freeze_authority_over(carve.0, carve.1)
+                                    if durable
+                                        && !hg.holds_freeze_authority(FreezeScope::Carve {
+                                            base: carve.0,
+                                            size: carve.1,
+                                        })
                                     {
-                                        let _ = hg.try_grant_freeze_authority(ibase, isize);
+                                        let _ = hg.try_grant_freeze_authority(FreezeScope::Carve {
+                                            base: ibase,
+                                            size: isize,
+                                        });
                                     }
                                     hg.child_attestation(durable, Some(carve))
                                 };
@@ -16911,6 +16918,41 @@ pub enum StreamRole {
 /// The host-side object a handle-table entry dispatches to — the mock equivalent of
 /// §3c's `(methods, object)`. The guest never names or writes this (it lives in host
 /// memory); it is selected only by a *granted* handle index.
+/// What a [`Binding::FreezeAuthority`] covers.
+///
+/// Two scopes because the two kinds of child are named differently, and that difference is the whole
+/// of #1440's hard half. A §14 **nested carve** child *is* a sub-range of its parent's window, so an
+/// address range names it. A **detached** child owns a separate window and has no address in its
+/// parent's frame at all — there is nothing to point at.
+///
+/// One binding parameterized by scope rather than two bindings: "may this holder snapshot that
+/// domain?" is one question, and two variants would be two places to keep the answer (INVARIANTS #15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeScope {
+    /// The window sub-range `[base, base+size)` — a §14 nested carve, where the range *is* the child.
+    /// Covers by **containment**: authority over a range covers anything inside it, the same rule
+    /// [`Binding::AddressSpace`]/[`Binding::Instantiator`] sub-ranges use. One grant over an
+    /// instantiator's range therefore covers every carve from it, instead of costing a handle-table
+    /// slot per spawn.
+    Carve { base: u64, size: u64 },
+    /// Every **detached** child the holder spawns — all of them or none.
+    ///
+    /// Deliberately not per-child (owner decision): a detached child has no sub-range to be named by,
+    /// and the per-child alternatives both have costs worth deferring — a domain id would have to be
+    /// recorded in the artifact and re-linked on thaw first, and naming a child by its spawn edge
+    /// rebinds silently when a join slot is recycled. All-or-nothing needs none of that and is the
+    /// granularity the blocking question actually wants.
+    ///
+    /// **This one must never be self-minted.** A nested parent already reads its child's carve, so
+    /// granting itself authority there documents a fact. A detached child's window is *not* readable
+    /// by its parent — that is what detached means — so authority over one is a real new power, and a
+    /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
+    /// from above (the embedder, or an ancestor re-granting downward) or not at all, which holds by
+    /// construction: no guest-reachable op mints a capability, and the §14 spawn path mints only the
+    /// [`Carve`](FreezeScope::Carve) form.
+    DetachedProgeny,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream {
@@ -16971,22 +17013,9 @@ enum Binding {
         base: u64,
         size: u64,
     },
-    /// **Freeze authority** over the window sub-range `[base, base+size)` — the authority to snapshot
-    /// the domain living there (#1440, INVARIANTS #14 R1, PROCESS.md O14).
-    ///
-    /// Same `(base, size)` shape as [`Binding::Instantiator`] and [`Binding::AddressSpace`], and for
-    /// the same reason: a §14 **nested carve** child *is* a sub-range of its parent's window, so the
-    /// range names the child, attenuates through the existing discipline, and is value-typed enough to
-    /// ride the durable re-grant path — a thawed parent must still hold authority over its thawed
-    /// child, or a freeze/thaw round trip would quietly launder exposure away.
-    ///
-    /// A **detached** child owns its own window and so has no sub-range here to be named by; granting
-    /// authority over one needs a value-typed name for a domain that this shape cannot express. That
-    /// is the open half of #1440 and the reason the op-15 gate still refuses outright.
-    FreezeAuthority {
-        base: u64,
-        size: u64,
-    },
+    /// **Freeze authority** — the authority to snapshot a domain (#1440, INVARIANTS #14 R1,
+    /// PROCESS.md O14). What it covers is the [`FreezeScope`].
+    FreezeAuthority(FreezeScope),
     /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
     /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
     /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
@@ -17117,13 +17146,10 @@ pub enum DurableBinding {
         base: u64,
         size: u64,
     },
-    /// Freeze authority over `[base, base+size)` (#1440). Value-typed, so a thawed parent holds the
-    /// same authority over its thawed child that it held before the freeze — without this, a round
-    /// trip would launder a domain's exposure away and `attest` would start lying.
-    FreezeAuthority {
-        base: u64,
-        size: u64,
-    },
+    /// Freeze authority, and what it covers (#1440). Value-typed, so a thawed parent holds the same
+    /// authority over its thawed child that it held before the freeze — without this, a round trip
+    /// would launder a domain's exposure away and `attest` would start lying.
+    FreezeAuthority(FreezeScope),
     /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
     /// **structurally** by the callee's join `slot` in the holder's own table + the offer
     /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
@@ -21110,9 +21136,7 @@ impl Host {
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
-                Binding::FreezeAuthority { base, size } => {
-                    DurableBinding::FreezeAuthority { base, size }
-                }
+                Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
                 Binding::SharedRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
@@ -21199,7 +21223,7 @@ impl Host {
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
                 | Binding::Instantiator { .. }
-                | Binding::FreezeAuthority { .. }
+                | Binding::FreezeAuthority(_)
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
@@ -21254,9 +21278,7 @@ impl Host {
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
-                DurableBinding::FreezeAuthority { base, size } => {
-                    Binding::FreezeAuthority { base, size }
-                }
+                DurableBinding::FreezeAuthority(scope) => Binding::FreezeAuthority(scope),
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
                     // patched once the §14 child at `slot` is re-created — see
@@ -22784,11 +22806,8 @@ impl Host {
     /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
     /// rather than an inference from placement: the spawn path mints this, and
     /// [`holds_freeze_authority_over`](Host::holds_freeze_authority_over) is how a later freeze asks.
-    pub fn grant_freeze_authority(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(
-            cap_id::FREEZE_AUTHORITY,
-            Binding::FreezeAuthority { base, size },
-        )
+    pub fn grant_freeze_authority(&mut self, scope: FreezeScope) -> i32 {
+        self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
     }
 
     /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
@@ -22796,28 +22815,30 @@ impl Host {
     /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
     /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
     /// a lot of legitimate work).
-    pub fn try_grant_freeze_authority(&mut self, base: u64, size: u64) -> Option<i32> {
-        self.try_grant(
-            cap_id::FREEZE_AUTHORITY,
-            Binding::FreezeAuthority { base, size },
-        )
+    pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
+        self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
     }
 
-    /// Whether this host holds freeze authority covering `[base, base+size)` — i.e. may snapshot the
-    /// domain living there.
+    /// Whether this host holds freeze authority covering `scope` — i.e. may snapshot what it names.
     ///
-    /// Covering, not equal: authority over a range includes authority over anything inside it, the
-    /// same containment `AddressSpace`/`Instantiator` sub-ranges use. A domain nobody holds authority
-    /// over is **confidential** — that is the whole of the confidential/ancestor-freezable distinction
-    /// (INVARIANTS #14 R1 §6), derived rather than tracked as a state of its own.
-    pub fn holds_freeze_authority_over(&self, base: u64, size: u64) -> bool {
-        let end = base.saturating_add(size);
-        self.table.iter().any(|slot| {
-            matches!(
-                slot.entry,
-                Some(Binding::FreezeAuthority { base: b, size: n })
-                    if b <= base && end <= b.saturating_add(n)
-            )
+    /// A [`Carve`](FreezeScope::Carve) matches by **containment**: authority over a range covers
+    /// anything inside it. [`DetachedProgeny`](FreezeScope::DetachedProgeny) matches exactly — it is
+    /// all-or-nothing by construction, so there is nothing to contain.
+    ///
+    /// A domain nobody holds authority over is **confidential**; that is the whole of the
+    /// confidential/ancestor-freezable distinction (INVARIANTS #14 R1 §6), derived from the absence of
+    /// a grant rather than tracked as a state of its own.
+    pub fn holds_freeze_authority(&self, scope: FreezeScope) -> bool {
+        self.table.iter().any(|slot| match (slot.entry, scope) {
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::Carve { base: b, size: n })),
+                FreezeScope::Carve { base, size },
+            ) => b <= base && base.saturating_add(size) <= b.saturating_add(n),
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::DetachedProgeny)),
+                FreezeScope::DetachedProgeny,
+            ) => true,
+            _ => false,
         })
     }
 
@@ -23257,7 +23278,17 @@ impl Host {
         Attestation {
             tier: self.attestation.tier,
             window_exposed: false,
-            freeze_exposed: false,
+            // Derived, like the nested case (#1440): an ancestor may snapshot this child iff the
+            // spawner holds `DetachedProgeny` *and* the subtree is durable. Both conjuncts matter —
+            // authority is *who may*, durability is *whether a snapshot is possible at all*.
+            //
+            // In practice this is still `false` today, because op 15's `!durable` gate refuses a
+            // durable parent a detached child at all (#1412, restored on all three engines until
+            // #1361's capture lands). Written as the derivation anyway so the gate lift is a change to
+            // the gate and nothing else — and so this stops being a hardcoded `false` that would have
+            // to be remembered.
+            freeze_exposed: self.durable
+                && self.holds_freeze_authority(FreezeScope::DetachedProgeny),
         }
     }
 
@@ -23277,7 +23308,9 @@ impl Host {
             tier: self.attestation.tier,
             window_exposed: true,
             freeze_exposed: durable
-                && carve.is_none_or(|(base, size)| self.holds_freeze_authority_over(base, size)),
+                && carve.is_none_or(|(base, size)| {
+                    self.holds_freeze_authority(FreezeScope::Carve { base, size })
+                }),
         }
     }
 
@@ -24933,7 +24966,7 @@ impl Host {
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
             // traps are for forgery, and the handle here is genuine).
-            Binding::FreezeAuthority { .. } => Ok(vec![EINVAL]),
+            Binding::FreezeAuthority(_) => Ok(vec![EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
             // argument), not a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
