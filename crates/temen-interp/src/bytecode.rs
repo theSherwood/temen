@@ -5709,6 +5709,57 @@ fn emit_access(
     }
 }
 
+/// Journal the pre-images of every range the op about to run would **write** (#1557), so stepping
+/// backward can undo it instead of replaying to it. Mirrors [`emit_access`]'s decode — module-0 ops
+/// only — and takes its spans from [`watch_accesses`](super::watch_accesses), the same per-op analysis
+/// the watchpoint check runs, so bulk `mem.copy`/`mem.fill` and v128 stores are covered on the one
+/// definition and no store path is touched. Inert while the journal is disarmed.
+fn journal_op(
+    journal: &mut super::journal::Journal,
+    vm: &Vm,
+    source: &ModuleSource,
+    funcs: &[Func],
+    fn_block_base: &[Vec<u32>],
+    turn: u64,
+    mem: &Option<Mem>,
+) {
+    if !journal.is_armed() {
+        return;
+    }
+    let Some(m) = mem.as_ref() else {
+        return;
+    };
+    let Some(pc) = vm.cur_ir_pc(source) else {
+        return;
+    };
+    if pc.module != 0 {
+        return;
+    }
+    let Some(ir_inst) = funcs
+        .get(pc.func as usize)
+        .and_then(|f| f.blocks.get(pc.block))
+        .and_then(|b| b.insts.get(pc.inst))
+    else {
+        return;
+    };
+    let Some(base_off) = fn_block_base
+        .get(pc.func as usize)
+        .and_then(|v| v.get(pc.block))
+    else {
+        return;
+    };
+    let Some(vals) = vm.regs.get(vm.base + *base_off as usize..) else {
+        return;
+    };
+    for acc in super::watch_accesses(ir_inst, vals, mem) {
+        if let super::MemAccess::Range { base, width, write } = acc {
+            if write {
+                journal.record_write(turn, base, width, m);
+            }
+        }
+    }
+}
+
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
 enum FiberStep {
     /// One op ran (a normal op, or a `cont.*` / fiber-return switch) — the clock ticks, keep going.
@@ -6508,6 +6559,10 @@ pub struct ScheduledDebugRun {
     /// Run-shared window watchpoints (DEBUGGING.md W2, cross-thread): `(addr, len, kind)`. Empty in the
     /// common case, so the per-op `access_of` computation is skipped entirely.
     watchpoints: Vec<(u64, u64, super::WatchKind)>,
+    /// The **undo journal** (#1556/#1557): pre-images of the window ranges each op overwrites, so
+    /// `step_back` can undo rather than restore-and-replay. Disarmed by default and inert then, so a
+    /// session that never arms it pays one boolean test per op (INVARIANTS #9b).
+    journal: super::journal::Journal,
     /// Run-shared **value watchpoints** (#1229, #1517 slice 2): stop when a watched SSA-held source
     /// variable's holding value changes, in whichever thread's top frame runs the variable's function
     /// — cross-thread exactly like `watchpoints` (a target is `(func, site)`, not a task). Empty in
@@ -7733,6 +7788,7 @@ impl ScheduledDebugRun {
             funcs: std::sync::Arc::from(m.funcs.clone()),
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
+            journal: super::journal::Journal::new(),
             value_watches: Vec::new(),
             access_sink: None,
             sched_trace: None,
@@ -7760,6 +7816,45 @@ impl ScheduledDebugRun {
     /// with a matching read/write kind.
     pub fn set_watchpoints(&mut self, ranges: Vec<(u64, u64, super::WatchKind)>) {
         self.watchpoints = ranges;
+    }
+
+    /// Arm or disarm the **undo journal** (#1556/#1557): while armed, every op's about-to-be-written
+    /// window ranges are recorded as pre-images, so [`undo_to`](Self::undo_to) can step backward
+    /// without replaying. Disarmed (the default) it is one boolean test per op.
+    pub fn set_journal_armed(&mut self, armed: bool) {
+        self.journal.set_armed(armed);
+    }
+
+    /// What the journal is holding — the volume numbers #1557/#1558 report.
+    pub fn journal_stats(&self) -> super::journal::JournalStats {
+        self.journal.stats()
+    }
+
+    /// The earliest turn [`undo_to`](Self::undo_to) can reach, or `None` when the journal is empty.
+    pub fn journal_earliest(&self) -> Option<u64> {
+        self.journal.earliest()
+    }
+
+    /// **Level 2 compaction** (#1558): coalesce journal entries before `turn` to one pre-image per
+    /// address. The segment can then only be undone to its start, and its size becomes the count of
+    /// distinct addresses it touched rather than its write count.
+    pub fn coalesce_journal(&mut self, before: u64) {
+        self.journal.coalesce(before);
+    }
+
+    /// Undo the journal back to `turn`, restoring the **window** to the state it held before that
+    /// turn's op ran, and rewinding the clock. Returns the number of pre-images applied.
+    ///
+    /// This slice journals window bytes only, so the continuation is not rewound here: the caller
+    /// pairs this with its own continuation restore (see [`crate::journal`] on scope). The
+    /// differential against `seek` is what pins the memory half.
+    pub fn undo_to(&mut self, turn: u64) -> usize {
+        let Some(m) = self.mem.as_mut() else {
+            return 0;
+        };
+        let applied = self.journal.undo_window_to(turn, m);
+        self.turn = turn;
+        applied
     }
 
     /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
@@ -7874,6 +7969,7 @@ impl ScheduledDebugRun {
             breakpoints,
             watchpoints,
             value_watches,
+            journal,
             access_sink,
             sched_trace,
             sched_seed,
@@ -8040,6 +8136,17 @@ impl ScheduledDebugRun {
                 let cur_vm = tasks[ti].vt.debug_active();
                 emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
             }
+            // #1557: pre-images of what this op is about to overwrite, so a later `undo_to` can put
+            // them back without replaying. Must precede the advance — the bytes are gone after it.
+            journal_op(
+                journal,
+                tasks[ti].vt.debug_active(),
+                source,
+                funcs,
+                fn_block_base,
+                *turn,
+                mem,
+            );
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
             let trace_turn = *turn;
             let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
@@ -8123,6 +8230,7 @@ impl ScheduledDebugRun {
             fn_block_base,
             fn_block_types,
             debug,
+            journal,
             access_sink,
             sched_trace,
             sched_seed,
@@ -8160,6 +8268,17 @@ impl ScheduledDebugRun {
             let cur_vm = tasks[ti].vt.debug_active();
             emit_access(cur_vm, source, funcs, fn_block_base, *turn, ti, sink);
         }
+        // #1557: the raw replay quantum journals too, so a `tick`-driven replay builds the identical
+        // history a `drive`-driven run does (the two must not disagree — DEBUGGING.md, `service_advance`).
+        journal_op(
+            journal,
+            tasks[ti].vt.debug_active(),
+            source,
+            funcs,
+            fn_block_base,
+            *turn,
+            mem,
+        );
         let trace_turn = *turn;
         let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
         if let Some(trace) = sched_trace.as_mut() {
