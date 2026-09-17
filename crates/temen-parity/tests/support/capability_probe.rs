@@ -1,14 +1,18 @@
-//! **The shared capability probe** — one fixture, two axis conformance tests (#1413).
+//! **The shared capability probe** — one fixture, three axis conformance tests (#1413).
 //!
 //! `debugger_conformance.rs` asks what the *debug tier* does with each powerbox capability's ops;
-//! `concurrency_conformance.rs` asks what the **OS-thread parallel driver** does with the same ops.
-//! Both questions need the identical scaffolding — how to mint a handle for each capability, which
-//! ops its ABI declares, and how to build a one-call module around them — so that scaffolding lives
-//! here once and each test supplies only its own driver and verdict vocabulary.
+//! `concurrency_conformance.rs` asks what the **OS-thread parallel driver** does with the same ops;
+//! `code_origin_conformance.rs` asks whether the same ops answer the same way when the caller is a
+//! §22 guest-JIT **unit** rather than the host-translated base module. All three need the identical
+//! scaffolding — how to mint a handle for each capability, which ops its ABI declares, and how to
+//! build a one-call module around them — so that scaffolding lives here once and each test supplies
+//! only its own driver and verdict vocabulary.
 //!
 //! That is INVARIANTS #15 applied to the matrix's own machinery: the row set is a *parameter* of one
-//! structure, not a copy per column. A second copy would let the two columns drift apart on what
-//! "the `Instantiator` row" even means, which is exactly the drift the matrix exists to catch.
+//! structure, not a copy per column. A second copy would let the columns drift apart on what "the
+//! `Instantiator` row" even means, which is exactly the drift the matrix exists to catch. The same
+//! rule is why the code-origin column's *unit* module is [`Entry`] — a parameter of the one probe
+//! generator — rather than a second copy of it with a different signature line.
 
 #![allow(dead_code)] // each consumer uses a subset
 
@@ -241,6 +245,19 @@ pub fn rows() -> Vec<Row> {
 /// unsupported when it is merely miscalled. The widest arm takes 9.
 pub const MAX_ARGC: usize = 10;
 
+/// Which entry shape the generated probe wears — the parameter the **code-origin** column varies,
+/// and the reason there is one probe generator rather than two.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Entry {
+    /// `f0(handle: i32) -> i64` — a host-translated base module, run by a driver with the handle
+    /// passed in as an argument.
+    Base,
+    /// `f0(handle: i64) -> i64` — a §22 unit, reached through `Jit.invoke`, whose marshalling ABI is
+    /// i64-only. The handle therefore arrives widened and is narrowed back before the cap call; the
+    /// call itself, argument for argument, is the one [`Entry::Base`] makes.
+    Unit,
+}
+
 /// The one-call probe module: `f0(handle)` calls `call.cap iface op` with `argc` zero arguments and
 /// returns its result. Argument *values* are all zero deliberately — a `-EINVAL` or a trap is a
 /// serviced answer (the op reached its seam and a driver drove it), so only a driver's own gates
@@ -250,7 +267,7 @@ pub fn probe_module(iface: u32, op: u32, argc: usize) -> temen_ir::Module {
 }
 
 /// [`probe_module_typed`] with `overrides` replacing individual zero arguments — `(index, value)`
-/// pairs from a [`Row::real_args`] entry. See that field for why zeros alone are not enough.
+/// pairs from a [`Row::mint`] entry. See that field for why zeros alone are not enough.
 pub fn probe_module_with(
     iface: u32,
     op: u32,
@@ -258,7 +275,19 @@ pub fn probe_module_with(
     result: &str,
     overrides: &[(usize, i64)],
 ) -> temen_ir::Module {
-    build_probe(iface, op, argc, result, overrides)
+    build_probe(Entry::Base, iface, op, argc, result, overrides)
+}
+
+/// [`probe_module_with`]'s twin as a §22 **unit** — the identical call behind an
+/// [`Entry::Unit`] signature, for `code_origin_conformance.rs` to compile and invoke.
+pub fn unit_module_with(
+    iface: u32,
+    op: u32,
+    argc: usize,
+    result: &str,
+    overrides: &[(usize, i64)],
+) -> temen_ir::Module {
+    build_probe(Entry::Unit, iface, op, argc, result, overrides)
 }
 
 /// [`probe_module`] with the call's declared **result type** chosen by the caller. The lowering's
@@ -267,10 +296,11 @@ pub fn probe_module_with(
 /// some interfaces is rejected at compile time rather than at the call. A sweep that fixes the
 /// result type therefore mistakes "miscalled" for "unsupported".
 pub fn probe_module_typed(iface: u32, op: u32, argc: usize, result: &str) -> temen_ir::Module {
-    build_probe(iface, op, argc, result, &[])
+    build_probe(Entry::Base, iface, op, argc, result, &[])
 }
 
 fn build_probe(
+    entry: Entry,
     iface: u32,
     op: u32,
     argc: usize,
@@ -299,8 +329,17 @@ fn build_probe(
         "i32" => ("i32", "  vw = i64.extend_i32_s vr\n  return vw"),
         _ => ("i64", "  return vr"),
     };
+    // The only difference between the two entry shapes: a unit is handed its handle widened (the
+    // `Jit.invoke` marshalling ABI is i64-only), so it narrows it back before the call.
+    let (sig, narrow) = match entry {
+        Entry::Base => ("(i32) -> (i64) {\nblock 0 (vh: i32) {", String::new()),
+        Entry::Unit => (
+            "(i64) -> (i64) {\nblock 0 (vh64: i64) {",
+            "  vh = i32.wrap_i64 vh64\n".to_string(),
+        ),
+    };
     let src = format!(
-        "memory 16\nfunc (i32) -> (i64) {{\nblock 0 (vh: i32) {{\n{body}  \
+        "memory 16\nfunc {sig}\n{narrow}{body}  \
          vr = call.cap {iface} {op} ({params}) -> ({call_res}) vh ({args})\n{tail}\n  }}\n}}\n"
     );
     let m = temen_text::parse_module(&src).expect("the generated module parses");

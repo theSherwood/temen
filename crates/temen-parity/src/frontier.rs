@@ -3,7 +3,7 @@
 //! INVARIANTS #14 says an accepted capability must hold across **seven axes** — runtime backend,
 //! host target, concurrency model, code origin, nesting, debugger, durability. Exactly one of those
 //! had a machine-checked matrix ([`crate::catalog`], `op × backend`). This is the machine for the
-//! rest, and #1413 tracks filling it in.
+//! rest, and #1413 tracks filling it in; five of the seven are now driven.
 //!
 //! ## Why a second matrix rather than a second crate
 //!
@@ -41,7 +41,8 @@
 //! Four rows on that column stay [`Status::Unaudited`] — `Jit` (its `invoke` needs a unit only a
 //! running guest can mint), `JitCode`, `Offer` and `LiveImpl` (a live peer). A row is scored only
 //! when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
-//! wish the matrix exists to avoid.
+//! wish the matrix exists to avoid. The same four stay unaudited on every driven column since, for
+//! the same reason.
 //!
 //! **Concurrency** is the third shape again. There is no predicate to read at all: whether a
 //! capability is "carried by both drivers" is only answerable by running it on both, so the column
@@ -57,9 +58,30 @@
 //! `Full`. The same four rows that need a live unit or peer stay `Unaudited` here as on the debugger
 //! column.
 //!
-//! The remaining three axes are populated as their predicates become locatable; until then their
-//! cells read `Unaudited`, which is the point — an unaudited cell is visible, countable, and cannot
-//! be mistaken for a passing one.
+//! **Code origin** is the fourth, and the cheapest of the driven columns to make honest, because
+//! both halves of its question are programs: it asks whether a capability answers the same from a
+//! §22 guest-JIT unit as from the host-translated base module, so
+//! `tests/code_origin_conformance.rs` makes the *identical* `call.cap` from each and compares. The
+//! axis has one variable, so the harness frees nothing else: same engine, same window, same fuel,
+//! and the same grant table — the base side compiles the very same unit and just never invokes it,
+//! because otherwise every handle-minting op "diverges" by returning a different (equally correct)
+//! handle number.
+//!
+//! Its first rendering found one gap, on the `Instantiator` row again. `drive_nested` — the
+//! synchronous `Jit.invoke` seam — has no arm for any of the spawn family, so they all land on its
+//! catch-all `CapFault`, while `instantiate`, `instantiate_module_named` and `child_offer` each
+//! answer `-EINVAL` *probeably* from the base module on the same host with the same handle. Whether
+//! a completed spawn belongs at an invoke seam is a design question (there is no scheduler to hand a
+//! task to, and nobody to park for); the decline *shape* is not — #9 wants an absent seam declined
+//! probeably, and a `CapFault` kills the domain. #1578 tracks it. Note what the column deliberately
+//! does **not** count: a call shape the bytecode subset has no arm for is refused at compile on one
+//! side and as `Trap::Malformed` out of the invoke on the other, which is one decision reported at
+//! the only point each path has — and which shapes the subset covers is `OPS_PARITY.md`'s question,
+//! not this column's.
+//!
+//! The remaining two axes — host target and runtime backend — are populated as their predicates
+//! become locatable; until then their cells read `Unaudited`, which is the point — an unaudited cell
+//! is visible, countable, and cannot be mistaken for a passing one.
 //!
 //! ## What the first rendering already showed
 //!
@@ -171,7 +193,7 @@ impl Capability {
     }
 }
 
-/// The INVARIANTS #14 axes, in matrix-column order. All seven are listed even though only two are
+/// The INVARIANTS #14 axes, in matrix-column order. All seven are listed even though not all are
 /// populated: an axis missing from the enum is an axis nobody remembers to ask about, which is the
 /// failure this matrix exists to prevent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -233,7 +255,8 @@ impl Axis {
 
     /// Whether this column's cells are checked against a live predicate — `nesting` and
     /// `durability` by `tests/frontier_conformance.rs`, `debugger` by
-    /// `tests/debugger_conformance.rs`. An unconformed column states the manifest's belief and
+    /// `tests/debugger_conformance.rs`, `concurrency` by `tests/concurrency_conformance.rs`,
+    /// `code origin` by `tests/code_origin_conformance.rs`. An unconformed column states the manifest's belief and
     /// nothing more — worth saying out loud in the rendered matrix.
     ///
     /// A conformed column may still hold `Unaudited` cells (`debugger` holds four): the claim is
@@ -241,7 +264,11 @@ impl Axis {
     pub fn is_conformed(self) -> bool {
         matches!(
             self,
-            Axis::Nesting | Axis::Durability | Axis::Debugger | Axis::ConcurrencyModel
+            Axis::Nesting
+                | Axis::Durability
+                | Axis::Debugger
+                | Axis::ConcurrencyModel
+                | Axis::CodeOrigin
         )
     }
 }
@@ -263,10 +290,26 @@ const K: Cell = Cell {
     status: Status::Full,
     note: "",
 };
+/// `Full` on the **code origin** axis: a §22 guest-JIT unit and the host-translated base module get
+/// the same answer out of every one of the row's ops. `tests/code_origin_conformance.rs` makes the
+/// identical `call.cap` from each and compares them shape by shape.
+const O: Cell = Cell {
+    status: Status::Full,
+    note: "",
+};
 
 const fn declines(note: &'static str) -> Cell {
     Cell {
         status: Status::Declines,
+        note,
+    }
+}
+
+/// A **known** gap on this axis, with an issue tracking it. Distinct from [`U`]: this cell has been
+/// driven and found wanting, rather than never asked.
+const fn not_yet(note: &'static str) -> Cell {
+    Cell {
+        status: Status::NotYet,
         note,
     }
 }
@@ -287,7 +330,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
     match c {
         // Coordinate-free value caps: copyable into a child (`resolve_copyable`) and value-typed, so
         // they ride a freeze. The only rows that are unconditionally `Full` on both audited axes.
-        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, K, U, F],
+        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, K, O, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
         // FIFO into the child (the cross-domain `cmd1 | cmd2` grant), while a freeze cannot carry the
@@ -298,7 +341,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
 
@@ -311,7 +354,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             conditional(
                 "map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by \
                  name in the bytecode lowering",
@@ -328,7 +371,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
         // Identical to `AddressSpace` on both predicate-audited axes, and deliberately its own arm
@@ -340,7 +383,11 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            not_yet(
+                "the spawn family reaches `drive_nested`'s catch-all `CapFault` inside a \
+                 `Jit.invoke`: instantiate/instantiate_module_named/child_offer each answer -EINVAL \
+                 probeably from the base module, and join's forgery trap differs too (#1578)",
+            ),
             conditional(
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
                  coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches \
@@ -359,7 +406,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
 
@@ -371,7 +418,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
         Capability::ModuleLoader => [
@@ -380,7 +427,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
 
@@ -406,7 +453,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
         // Only a *forkable* host proc crosses (one carrying a provider fork factory); a factory-less
@@ -420,7 +467,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             U,
             K,
-            U,
+            O,
             F,
         ],
 

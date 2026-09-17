@@ -17,9 +17,12 @@
 //! | nesting | `Host::can_regrant` (via `Host::regrant_into_child`, its only public route) |
 //! | durability | the `NonDurableKind` match in `Host::capture_durable_handles` |
 //!
-//! The other five state the manifest's belief and are rendered `Unaudited` until their predicate is
-//! locatable. That is deliberate: an unaudited cell is visible and countable, and this test asserts
-//! the count only moves in one direction.
+//! Three more axes — `debugger`, `concurrency`, `code origin` — have no single predicate to read, so
+//! they are driven by their own tests beside this one (`debugger_conformance.rs`,
+//! `concurrency_conformance.rs`, `code_origin_conformance.rs`). The remaining two state the
+//! manifest's belief and are rendered `Unaudited` until their predicate is locatable. That is
+//! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
+//! moves in one direction.
 
 use temen_interp::{Host, NonDurableKind, StreamRole};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
@@ -197,10 +200,11 @@ fn the_uncheckable_rows_are_exactly_the_ones_that_need_a_live_peer_or_a_host_clo
 /// Coverage may only improve. A cell that was audited must not silently revert to `Unaudited`, and
 /// the two axes whose predicate classifies *every* row must stay fully audited.
 ///
-/// The third conformance-tested axis, `debugger`, is not in that loop on purpose: its predicate is
-/// reached by running the capability's ops, and four rows hold ops only a running guest or a live
-/// peer can reach. `tests/debugger_conformance.rs` pins which four, so those cells cannot quietly
-/// spread — the count floor below is what stops the column from emptying out.
+/// The three driven axes — `debugger`, `concurrency`, `code origin` — are not in that loop on
+/// purpose: their predicates are reached by *running* the capability's ops, and four rows hold ops
+/// only a running guest or a live peer can reach. `tests/debugger_conformance.rs` pins which four,
+/// so those cells cannot quietly spread — the count floor below is what stops a column from
+/// emptying out.
 #[test]
 fn audited_coverage_does_not_regress() {
     let (n, d) = (col(Axis::Nesting), col(Axis::Durability));
@@ -223,9 +227,31 @@ fn audited_coverage_does_not_regress() {
         .filter(|cell| cell.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 56,
+        audited >= 68,
         "audited cell count fell to {audited}; it was 32 when the matrix landed, 44 once the \
-         `debugger` column was driven, and 56 once `concurrency` was. Filling axes in is the work \
-         (#1413) — emptying them is a regression."
+         `debugger` column was driven, 56 once `concurrency` was, and 68 once `code origin` was. \
+         Filling axes in is the work (#1413) — emptying them is a regression."
     );
+}
+
+/// A **known gap** must name the issue tracking it. `NotYet` says "we drove this and it is wrong",
+/// which is only actionable if the reader can find out what is being done about it; a gap with no
+/// ticket is how an in-flight axis quietly becomes a parked one, which is exactly what INVARIANTS
+/// #14 forbids ("closed, in flight, or a recorded exception — never parked").
+#[test]
+fn every_known_gap_names_its_issue() {
+    for c in Capability::ALL {
+        for (cell, axis) in capability_axes(c).into_iter().zip(Axis::ALL) {
+            if cell.status != Status::NotYet {
+                continue;
+            }
+            assert!(
+                cell.note.contains('#'),
+                "{}/{}: a `NotYet` cell must cite the issue tracking the gap, got {:?}",
+                c.name(),
+                axis.short(),
+                cell.note,
+            );
+        }
+    }
 }
