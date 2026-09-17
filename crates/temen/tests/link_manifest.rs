@@ -177,10 +177,15 @@ fn plain_link_still_fails_closed_on_capability_imports() {
     assert_eq!(err, LinkError::Unresolved("write".into()));
 }
 
-/// `synth_manifest_start` validates its contract fail-closed: the entry must exist, take a single
-/// `i64` (the data-stack pointer), and the module must not already carry a `_start` bootstrap.
+/// `synth_manifest_start` validates its contract fail-closed: the entry must exist, take the
+/// data-stack pointer **or nothing**, and the module must not already carry a `_start` bootstrap.
+///
+/// The paramless form was an error until #1536 and is now accepted: a separately-compiled program
+/// keeps its own frontend-emitted `_start` as the entry, and that bootstrap establishes `sp` itself.
+/// What stays rejected is an entry with *extra* parameters — a `main` the frontend would have called
+/// through its own bootstrap, which this function has no way to supply arguments for.
 #[test]
-fn synth_rejects_bad_entries() {
+fn synth_accepts_an_sp_or_paramless_entry_and_rejects_the_rest() {
     let m = temen_text::parse_module(PROGRAM_UNIT).expect("parse");
     assert!(
         synth_manifest_start(m.clone(), 9, false)
@@ -188,13 +193,26 @@ fn synth_rejects_bad_entries() {
             .contains("out of range"),
         "entry index is validated"
     );
+    // A frontend `_start`: no params, establishes its own `sp`.
     let no_sp = temen_text::parse_module("func () -> () {\nblock 0 () {\n  return\n  }\n}\n")
         .expect("parse");
+    let wrapped =
+        synth_manifest_start(no_sp, 0, false).expect("a paramless entry is the #1536 shape");
     assert!(
-        synth_manifest_start(no_sp, 0, false)
+        wrapped.exports.iter().any(|e| e.name == "_start"),
+        "the synthesized bootstrap is exported"
+    );
+    // chibicc's `int main()` / `int main(int, char **)`: the data-stack pointer plus C parameters.
+    // Only the frontend's own `_start` knows what belongs in those, so this still fails closed.
+    let extra_params = temen_text::parse_module(
+        "func (i64, i64) -> () {\nblock 0 (v0: i64, v1: i64) {\n  return\n  }\n}\n",
+    )
+    .expect("parse");
+    assert!(
+        synth_manifest_start(extra_params, 0, false)
             .expect_err("wrong entry signature")
-            .contains("single i64"),
-        "entry must take the data-stack pointer"
+            .contains("or nothing"),
+        "an entry with parameters beyond the data-stack pointer is rejected"
     );
     let synthesized = synth_manifest_start(m, 0, false).expect("first synth");
     assert!(
