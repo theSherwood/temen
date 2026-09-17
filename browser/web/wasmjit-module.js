@@ -1266,17 +1266,25 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
     if (!src.length) { continue; } // unresolved import — the interpreter card redoes phase-1 for it
 
-    // nifler --deps parse <file> <out> on the INTERPRETER (#1364): emitting the ~13 MB nifler guest peaks
-    // the engine near the 1 GiB ceiling, so a constrained tab traps the grow and the whole card silently
-    // falls back to the multi-minute tree-walker. The crawl is cheap interpreted (its footprint is the
-    // nifler decode, a fraction of the emit's) — so we keep the tier-up budget for nimsem/hexer, where the
-    // time and the smaller emit actually are. `.p.nif` rides OUT, `.p.deps.nif` rides ERR.
+    // nifler --deps parse <file> <out> on the EMITTED tier, falling back to the interpreter.
+    //
+    // #1364 pinned this to the interpreter: emitting the ~13 MB nifler guest peaked the engine near its
+    // 1 GiB ceiling, and a constrained tab that trapped the grow dropped the whole card to the
+    // multi-minute tree-walker. The ceiling is the host's now (#1561, `web/engine-mem.js`), so the emit
+    // has room — and `runJitNiflerCrawl` is emit-cached, so the whole crawl pays for one nifler compile.
+    // The fallback is its documented contract, and still the right answer on a host that gave itself a
+    // small ceiling: a throw here means the emit declined or trapped, never a wrong parse.
     const out = `/nimcache/${stem}.p.nif`;
-    const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
-    const fp = pushBytes(fb), op = pushBytes(ob);
-    ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
-    const pnif = readOut(), deps = readErr();
-    ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
+    let pnif, deps;
+    try {
+      ({ pnif, deps } = await runJitNiflerCrawl(ex, memory, nifler, file, out, src, `${cacheKey}-crawl`));
+    } catch {
+      const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
+      const fp = pushBytes(fb), op = pushBytes(ob);
+      ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
+      pnif = readOut(); deps = readErr();
+      ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
+    }
     // nifler parsed nothing. This used to `continue` silently, which is the worst possible outcome:
     // the module never gets a `.p.nif`, so it is never semmed, and a *dependent* module's nimsem dies
     // much later with `cannot open <stem>.s.nif` — a message that names the wrong module and says
