@@ -5279,6 +5279,30 @@ pub unsafe extern "C" fn temen_nim_parse_imports(
     len
 }
 
+/// The active `include` targets in `deps` (a `.p.deps.nif`) for includer directory `dir`
+/// ([`nimc::parse_includes`]), **newline-joined**, onto [`OUT`]; returns its length. The JS crawl
+/// follows these exactly as it follows [`temen_nim_parse_imports`], so both edge kinds are discovered
+/// by the same parser.
+///
+/// # Safety
+/// Each `(ptr, len)` must be a live `temen_alloc`ation the host just filled.
+#[no_mangle]
+pub unsafe extern "C" fn temen_nim_parse_includes(
+    deps_ptr: *const u8,
+    deps_len: usize,
+    dir_ptr: *const u8,
+    dir_len: usize,
+) -> usize {
+    let deps = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(deps_ptr, deps_len) })
+        .into_owned();
+    let dir = String::from_utf8_lossy(unsafe { core::slice::from_raw_parts(dir_ptr, dir_len) })
+        .into_owned();
+    let bytes = nimc::parse_includes(&deps, &dir).join("\n").into_bytes();
+    let len = bytes.len();
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(OUT), bytes) };
+    len
+}
+
 /// Pre-crawled phase-1 outputs (`nimcache/<stem>.p.nif` + `.p.deps.nif`) the JS crawl loop produced by
 /// running nifler on the **wasm-JIT** (#1025 route A). [`temen_compile_nim_fs`] seeds these into the
 /// compile's memfs, so `nimc::compile_nim`'s phase-1 skips the (interpreter) nifler run for any module a
@@ -12121,16 +12145,19 @@ unsafe fn op13_phase_open_impl(
             nimc::ExecNifler::Shared(first.clone()),
             ce.clone(),
             std::sync::Arc::clone(&factory),
+            handle.clone(),
         );
         let exec_fork: temen_interp::HostProcFork = {
             let first = std::sync::Arc::clone(&first);
             let ce = ce.clone();
             let factory = std::sync::Arc::clone(&factory);
+            let handle = handle.clone();
             std::sync::Arc::new(move |_pid| {
                 temen_interp::ForkedProc::shared(nimc::make_exec(
                     nimc::ExecNifler::Shared(first.clone()),
                     ce.clone(),
                     std::sync::Arc::clone(&factory),
+                    handle.clone(),
                 ))
             })
         };

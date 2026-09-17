@@ -191,6 +191,44 @@ pub(crate) fn parse_imports(deps_nif: &str, importer_dir: &str) -> Vec<String> {
     out
 }
 
+/// Active `include` targets as absolute memfs file paths — `(include "system/basic_types")` in
+/// `/lib/std/system.nim` is `/lib/std/system/basic_types.nim`. An `include` is **not** a module: nim
+/// splices the file into the includer, so it is never semchecked, hexed or linked. It is still *parsed*,
+/// and nimsem parses it by shelling out to nifler — unconditionally, whether or not the `.p.nif` is
+/// already there (measured: seeding all of them changes nothing, and it is not an mtime check either).
+/// On the bench card that is 21 `exec`s and 5.9 s of an 18 s compile, all nifler on the interpreter.
+///
+/// Three shapes appear, and the target is always the operand **outside** any nested group: a quoted
+/// path (`(include "system/basic_types")`), a bare identifier (`(include osalloc)`), and a guarded one
+/// where the condition comes first (`(include (when …)"alloc")` — `system.nim`'s allocator pick).
+/// Unlike an import, a guarded include is **followed** rather than skipped: the crawl only needs to have
+/// parsed the file, so parsing one the guest never includes costs a `.p.nif` nobody reads, while
+/// missing one puts the parse back on the slow path.
+pub(crate) fn parse_includes(deps_nif: &str, includer_dir: &str) -> Vec<String> {
+    let mut out = vec![];
+    let mut rest = deps_nif;
+    while let Some(block) = balanced(rest, "include") {
+        let adv = rest.find(&block).unwrap() + block.len();
+        rest = &rest[adv..];
+        // Everything at depth 0 inside the block: the operand, with any `(when …)` guard skipped.
+        let inner = &block["(include".len()..block.len() - 1];
+        let (mut depth, mut target) = (0i32, String::new());
+        for c in inner.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth == 0 => target.push(c),
+                _ => {}
+            }
+        }
+        let target = target.trim().trim_matches('"');
+        if !target.is_empty() {
+            out.push(format!("{includer_dir}/{target}.nim"));
+        }
+    }
+    out
+}
+
 // ---- run a phase guest (nifler/nimsem/hexer) on the bytecode engine, granting the powerbox + caps --
 
 /// A fresh `fs` `HostProc` over the shared memfs store (a new grant per phase run / per exec spawn).
@@ -661,6 +699,7 @@ pub(crate) fn make_exec(
     nifler: ExecNifler,
     nifler_ce: Option<Arc<Module>>,
     fs_factory: FsFactory,
+    fs: temen_fs::MemFsHandle,
 ) -> HostProc {
     let mut jobs = temen_exec::JobTable::default();
     Box::new(move |op, args, mem, _minter| {
@@ -678,13 +717,33 @@ pub(crate) fn make_exec(
             return Ok(vec![temen_ir::errno::EPERM]);
         }
         let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let (stdout, exit) = match &nifler_ce {
-            Some(ce) => (vec![], run_phase_op13(ce, &argv_refs, &fs_factory)),
-            None => run_phase(&nifler.phase(), &argv_refs, (fs_factory)(), None),
+        // Already parsed. nimsem shells out for each `include` unconditionally — it does not look for
+        // the `.p.nif` first — but the crawl parses the same files, with the same nifler and the same
+        // argv, on the emitted tier, and its output is byte-identical (19/19 measured). So when the
+        // `.p.nif` this run would write is already there, the run has nothing to add: return the
+        // success nimsem would have got and let it read what the crawl wrote. Phase 1 already applies
+        // this reasoning to modules the JS crawl seeded.
+        let served = argv_refs
+            .last()
+            .filter(|out| argv_refs.contains(&"parse") && out.ends_with(".p.nif"))
+            .and_then(|out| read(&fs, out.trim_start_matches('/')))
+            .is_some_and(|b| !b.is_empty());
+        let (stdout, exit) = if served {
+            (vec![], 0)
+        } else {
+            match &nifler_ce {
+                Some(ce) => (vec![], run_phase_op13(ce, &argv_refs, &fs_factory)),
+                None => run_phase(&nifler.phase(), &argv_refs, (fs_factory)(), None),
+            }
         };
         if let Ok(mut log) = EXEC_LOG.lock() {
             use std::fmt::Write;
-            let _ = writeln!(log, "{} → {exit}", argv.join(" "));
+            let _ = writeln!(
+                log,
+                "{} → {exit}{}",
+                argv.join(" "),
+                if served { " (the crawl already parsed it)" } else { "" }
+            );
         }
         Ok(vec![jobs.push(temen_exec::Job {
             stdout,
@@ -858,6 +917,7 @@ fn compile_nim_ce_impl(
             ExecNifler::PerCall(Arc::clone(&nifler_ir)),
             nifler_ce_m.clone(),
             factory.clone(),
+            handle.clone(),
         );
         let (o, code) = run_phase(&nimsem_m, &argv, (factory)(), Some(exec));
         if code != 0 && code != 5 {
@@ -1289,7 +1349,7 @@ mod tests {
                 vec!["nimcache".into()],
             );
             let factory: FsFactory = Arc::new(factory);
-            let mut exec = make_exec(ExecNifler::Shared(top_m.clone()), ce, factory);
+            let mut exec = make_exec(ExecNifler::Shared(top_m.clone()), ce, factory, handle.clone());
             let mut mem = VecMem(vec![0u8; AP + blob.len()]);
             mem.0[AP..].copy_from_slice(&blob);
             let args = [AP as i64, blob.len() as i64, 0, 0];
