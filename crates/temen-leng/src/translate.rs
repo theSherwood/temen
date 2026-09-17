@@ -4380,7 +4380,13 @@ impl<'a> FuncGen<'a> {
                 Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
                 #[cfg(feature = "float")]
                 Some("nan") => Ok(self.emit_fconst(ValType::F64, f64::NAN)),
-                Some("addr") => {
+                // `haddr` rides with `addr`: per `leng_tags.HaddrC`, "everywhere else it lowers
+                // exactly like `(addr X)`". The distinction it preserves is for a consumer that can
+                // bind an `(instr …)` `inout` operand slot to a local's home instead of forcing it
+                // to memory — an optimization we do not take, so both spellings mean the same
+                // address here. The one thing not to get wrong is the addr-taken scan above, which
+                // has to see `haddr` or there is no address to take.
+                Some("addr" | "haddr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
                     let (id, _desc) = self.lvalue_addr(&e.args()[0])?;
                     Ok(Val {
@@ -5678,7 +5684,12 @@ fn max_and_or_depth(n: &Node) -> usize {
 
 fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
     if let Node::List(_) = node {
-        if node.tag() == Some("addr") {
+        // `haddr` counts as address-taken exactly like `addr` (#763). It is hexer's *hidden*
+        // address — inserted by `derefs.nim` where a `var`/`out` parameter needs the argument's
+        // location — and we lower it as a plain address-of, so the local has to live in the frame
+        // for `lvalue_addr` to have an address to give. Scanning only `addr` left it in an SSA slot
+        // and the lowering then failed with "is not an addressable lvalue".
+        if matches!(node.tag(), Some("addr" | "haddr")) {
             if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
                 out.insert(name.to_string());
             }
