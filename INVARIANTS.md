@@ -304,8 +304,12 @@ safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap:
 platform lifecycle action the guest cannot see coming, killing the domain, which invariant 5 forbids in
 terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
 three engines is therefore the resting state until (a) freeze authority is **represented in code** —
-today it is implicit in nesting and `freeze_authority` is doc-only (PROCESS.md O14) — and (b) the
-per-child-artifact capture lands (#1361). Then the gate comes out everywhere at once and the rule is
+`Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
+carve names it: granted at spawn, containment-covering so one grant serves every child of an
+instantiator range, durable so a thawed parent holds what it held, and askable through
+`Host::holds_freeze_authority_over` (#1440). What it cannot yet name is a **detached** child, which
+owns its own window and so has no sub-range to be named by; that is the open half, and it is precisely
+the half this gate needs — and (b) the per-child-artifact capture lands (#1361). Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
 

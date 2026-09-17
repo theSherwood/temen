@@ -188,6 +188,22 @@ pub mod cap_id {
     /// `15` (`WINDOW_MINTER`) is **retired** (#1289 R2): minting a detached window is not a
     /// separate authority — it spends `Budget.mem` (iface 14). The id stays reserved (not reused)
     /// so old wire never collides.
+    /// **Freeze authority** (INVARIANTS #14 R1, PROCESS.md O14, #1440) — the authority to snapshot a
+    /// domain, carried as a capability rather than inferred from placement.
+    ///
+    /// A snapshot is a complete read of a window, so "may an ancestor freeze me?" is an exposure
+    /// question, and `self.attest`'s `freeze_exposed` bit is meant to answer it truthfully. It could
+    /// not: authority was implicit in nesting, so the bit reported a *placement* and the report was
+    /// conservative rather than true. Holding it as a `(base, size)` sub-range grant makes it
+    /// attenuate down the grant graph like every other authority (#3), survive freeze/thaw through the
+    /// value-typed re-grant path, and be *askable* — which is what the op-15 gate needs before it can
+    /// become "refuse unless a freeze-authority holder is registered" instead of refusing outright.
+    ///
+    /// Confers no operations: like `Module`, it is pure authority that other paths consult, so a
+    /// `call.cap` on it is an inert `CapFault`.
+    ///
+    /// `15` is retired (#1289 R2), so this takes `16`.
+    pub const FREEZE_AUTHORITY: u32 = 16;
     /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
     /// are interned per-`Host` from this base upward (`intern_interface` — the id ≡
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
