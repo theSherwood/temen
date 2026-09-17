@@ -5760,6 +5760,74 @@ fn journal_op(
     }
 }
 
+/// Journal the engine state as it stands **before** the op about to run (#1557): the continuation and
+/// the compact host cursor, so `undo_to` can put the run back here without replaying.
+///
+/// Built from the driver's destructured parts rather than through
+/// [`ScheduledDebugRun::build_continuation`], which needs `&self`; the shape it produces is identical.
+///
+/// **Fail-closed.** Nothing is recorded — so `undo_to` will decline this turn — when the state is not
+/// invertible in place: a host using the §3.6 serve queue or holding a capability with opaque declared
+/// state (`Host::journal_invertible`), a task stepping inside a §22 invoke (its transient `Vm` is not
+/// captured, the same exclusion `checkpointable` makes), or an event-parked fiber (a non-deterministic
+/// wall-clock deadline). Those runs still time-travel by checkpoint-plus-replay, exactly as today.
+#[allow(clippy::too_many_arguments)]
+fn journal_state(
+    journal: &mut super::journal::Journal,
+    tasks: &[DbgTask],
+    extra_envs: &[DbgEnv],
+    fibers: &[FiberState],
+    source: &ModuleSource,
+    host: &Host,
+    clock: u64,
+    turn: u64,
+) {
+    if !journal.is_armed() {
+        return;
+    }
+    let invertible = host.journal_invertible()
+        && tasks.iter().all(|t| t.vt.active_invoke.is_none())
+        && !fibers.iter().any(|f| {
+            matches!(
+                f,
+                FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+            )
+        });
+    if !invertible {
+        return;
+    }
+    let cont = ScheduledContinuation {
+        clock,
+        tasks: tasks
+            .iter()
+            .map(|t| DbgTaskSnapshot {
+                active: t.vt.active.clone(),
+                active_id: t.vt.active_id,
+                chain: t.vt.chain.clone(),
+                root_shadow_sp: t.vt.root_shadow_sp,
+                threads: t.threads.clone(),
+                env: t.env,
+                state: t.state.clone(),
+                at_bp: t.at_bp,
+            })
+            .collect(),
+        fibers: fibers.to_vec(),
+        extra_envs: extra_envs
+            .iter()
+            .enumerate()
+            .map(|(k, e)| {
+                let module = tasks
+                    .iter()
+                    .find(|t| t.env == Some(k))
+                    .map_or(0, |t| t.vt.active.module);
+                env_snapshot(e, module)
+            })
+            .collect(),
+        extra_units: source.extra_units(),
+    };
+    journal.record_state(turn, cont, host.journal_cursor());
+}
+
 /// The outcome of advancing a debug session's active continuation by one op ([`debug_advance_fiber`]).
 enum FiberStep {
     /// One op ran (a normal op, or a `cont.*` / fiber-return switch) — the clock ticks, keep going.
@@ -6437,6 +6505,7 @@ struct DbgEnv {
 /// child — see [`ScheduledSnapshot::extra_envs`]), the run state, and the breakpoint-skip flag. The
 /// fiber `Vm`s share the run's window(s), and each coroutine's window is a `nested_view` sharing the
 /// parent backing, so their bytes ride in the snapshot's window bytes; `restore` rebuilds the `VTask`.
+#[derive(Clone)]
 struct DbgTaskSnapshot {
     active: Vm,
     active_id: usize,
@@ -6456,6 +6525,7 @@ struct DbgTaskSnapshot {
 /// bytes + the host substate + the scheduler clocks fully determine the continuation. The scheduled
 /// Opaque to the DAP backend, which stores the moment in a
 /// ladder keyed on the global turn and hands it back to [`ScheduledDebugRun::restore`].
+#[derive(Clone)]
 pub struct ScheduledContinuation {
     /// The scheduled-mode op clock (visible ops across all vCPUs) — continuation state, unlike the
     /// turn, which is the ladder's key.
@@ -6504,6 +6574,7 @@ pub type ScheduledSnapshot = super::moment::Moment;
 /// sub-allocated `fuel` complete it. The child's own page-protection map (`prot`) is captured alongside,
 /// admitting a child that `map`/`unmap`/`protect`ed its own window; its bytes still ride in the shared
 /// snapshot. A §13 region-aliased child stays outside the checkpointable subset.
+#[derive(Clone)]
 struct EnvSnapshot {
     win_base: u64,
     size_log2: u8,
@@ -6563,6 +6634,9 @@ pub struct ScheduledDebugRun {
     /// `step_back` can undo rather than restore-and-replay. Disarmed by default and inert then, so a
     /// session that never arms it pays one boolean test per op (INVARIANTS #9b).
     journal: super::journal::Journal,
+    /// The journal's static retention policy (#1558) — how much history stays at level 1, and the
+    /// ceiling past which the oldest is dropped. Consulted once per op while armed.
+    journal_policy: super::journal::JournalPolicy,
     /// Run-shared **value watchpoints** (#1229, #1517 slice 2): stop when a watched SSA-held source
     /// variable's holding value changes, in whichever thread's top frame runs the variable's function
     /// — cross-thread exactly like `watchpoints` (a target is `(func, site)`, not a task). Empty in
@@ -7789,6 +7863,7 @@ impl ScheduledDebugRun {
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
             journal: super::journal::Journal::new(),
+            journal_policy: super::journal::JournalPolicy::default(),
             value_watches: Vec::new(),
             access_sink: None,
             sched_trace: None,
@@ -7825,6 +7900,13 @@ impl ScheduledDebugRun {
         self.journal.set_armed(armed);
     }
 
+    /// Replace the journal's retention policy (#1558). Static: it decides granularity going forward
+    /// and never revisits a past compaction, which is what keeps a later adaptive policy a parameter
+    /// change rather than a reshape.
+    pub fn set_journal_policy(&mut self, policy: super::journal::JournalPolicy) {
+        self.journal_policy = policy;
+    }
+
     /// What the journal is holding — the volume numbers #1557/#1558 report.
     pub fn journal_stats(&self) -> super::journal::JournalStats {
         self.journal.stats()
@@ -7842,19 +7924,56 @@ impl ScheduledDebugRun {
         self.journal.coalesce(before);
     }
 
-    /// Undo the journal back to `turn`, restoring the **window** to the state it held before that
-    /// turn's op ran, and rewinding the clock. Returns the number of pre-images applied.
+    /// Whether the journal can undo to `turn` — i.e. it holds the engine state recorded before that
+    /// turn's op. False for a turn outside the recorded history, one already compacted past, or one in
+    /// a run outside the invertible subset (see [`crate::journal`] on fail-closed). The caller falls
+    /// back to `seek`, which is always available.
+    pub fn can_undo_to(&self, turn: u64) -> bool {
+        // Undoing to where the run already stands is vacuously possible, and has no state entry of its
+        // own: entries are recorded *before* each op, so the current turn's op has not run.
+        turn == self.turn || self.journal.can_undo_to(turn)
+    }
+
+    /// Undo back to `turn`, putting the run where it stood **before** that turn's op ran: the window
+    /// from the journal's pre-images, the continuation and host cursor from the state recorded there.
+    /// `false` (changing nothing) when [`can_undo_to`](Self::can_undo_to) is false — undo never
+    /// half-rewinds, it declines and leaves `seek` to serve.
     ///
-    /// This slice journals window bytes only, so the continuation is not rewound here: the caller
-    /// pairs this with its own continuation restore (see [`crate::journal`] on scope). The
-    /// differential against `seek` is what pins the memory half.
-    pub fn undo_to(&mut self, turn: u64) -> usize {
-        let Some(m) = self.mem.as_mut() else {
-            return 0;
+    /// This is the counterpart of `seek(turn)` and must agree with it; `undo_journal.rs` is the
+    /// differential that pins that.
+    pub fn undo_to(&mut self, turn: u64) -> bool {
+        if turn == self.turn {
+            return true; // already here; see `can_undo_to`
+        }
+        let Some(st) = self.journal.state_at(turn) else {
+            return false;
         };
-        let applied = self.journal.undo_window_to(turn, m);
+        let cont = st.cont.clone();
+        let cursor = st.cursor;
+        // Window first: the pre-images are keyed on the turns being undone, and installing the
+        // continuation does not touch guest memory.
+        if let Some(m) = self.mem.as_mut() {
+            self.journal.undo_window_to(turn, m);
+        }
+        // Verbatim (`readmit_parks = false`): an undo rewinds in place rather than re-executing, so a
+        // task parked at that turn comes back parked.
+        self.install_continuation(&cont, false);
+        // The tape has to serve whatever is re-executed after this. The crossings between `turn` and
+        // where the run stood have already happened once, and a *nondeterministic* input capability
+        // must not be asked again — the live closure would answer differently and the timeline would
+        // fork. Arming replay from the run's own recorded tape is the same pairing `build_run` uses on
+        // a seek rebuild, and it is why the cursor belongs in the journal: rewinding `cap_consumed`
+        // (below) is what makes the re-execution re-serve exactly the recorded answers.
+        let taped = self.host.cap_tape();
+        if !taped.records.is_empty() {
+            self.host.replay_cap_tape(taped);
+        }
+        self.host.restore_journal_cursor(&cursor);
         self.turn = turn;
-        applied
+        self.clock = cont.clock;
+        self.locate();
+        self.last_watch = None;
+        true
     }
 
     /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
@@ -7970,6 +8089,7 @@ impl ScheduledDebugRun {
             watchpoints,
             value_watches,
             journal,
+            journal_policy,
             access_sink,
             sched_trace,
             sched_seed,
@@ -8147,6 +8267,10 @@ impl ScheduledDebugRun {
                 *turn,
                 mem,
             );
+            journal_state(
+                journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+            );
+            journal.apply_policy(*turn, journal_policy);
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
             let trace_turn = *turn;
             let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
@@ -8231,6 +8355,7 @@ impl ScheduledDebugRun {
             fn_block_types,
             debug,
             journal,
+            journal_policy,
             access_sink,
             sched_trace,
             sched_seed,
@@ -8279,6 +8404,10 @@ impl ScheduledDebugRun {
             *turn,
             mem,
         );
+        journal_state(
+            journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+        );
+        journal.apply_policy(*turn, journal_policy);
         let trace_turn = *turn;
         let pre_adv = sched_trace.as_ref().map(|_| trace_tags(tasks));
         if let Some(trace) = sched_trace.as_mut() {
@@ -8456,7 +8585,21 @@ impl ScheduledDebugRun {
         if !self.checkpointable() {
             return None;
         }
-        let continuation = ScheduledContinuation {
+        let continuation = self.build_continuation();
+        Some(super::moment::Moment::new(
+            self.mem.as_ref().map(|m| m.layout_snapshot()),
+            &self.host,
+            super::moment::Continuation::Bytecode(continuation),
+        ))
+    }
+
+    /// The continuation half of a capture: every task's `Vm` + join table + state, the run-shared fiber
+    /// registry, the §14 child envs, and the pushed source units. Shared by the checkpoint ladder
+    /// ([`snapshot`](Self::snapshot), which pairs it with the window image and the host substate) and by
+    /// the **undo journal** (#1557), which pairs it with a compact [`HostCursor`](crate::HostCursor)
+    /// and the window pre-images instead — one definition of "what the continuation is", two costs.
+    fn build_continuation(&self) -> ScheduledContinuation {
+        ScheduledContinuation {
             clock: self.clock,
             tasks: self
                 .tasks
@@ -8489,12 +8632,7 @@ impl ScheduledDebugRun {
                 })
                 .collect(),
             extra_units: self.source.extra_units(),
-        };
-        Some(super::moment::Moment::new(
-            self.mem.as_ref().map(|m| m.layout_snapshot()),
-            &self.host,
-            super::moment::Continuation::Bytecode(continuation),
-        ))
+        }
     }
 
     /// Restore a [`snapshot`](ScheduledDebugRun::snapshot) into this **freshly built** run (its
@@ -8510,16 +8648,33 @@ impl ScheduledDebugRun {
             .continuation()
             .as_bytecode()
             .expect("a scheduled seek ladder holds only Bytecode moments");
+        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
+            m.restore_layout(layout);
+        }
+        self.install_continuation(c, true);
+        snap.restore_host(&mut self.host);
+        self.turn = turn;
+        self.clock = c.clock;
+        self.locate(); // stepping-ready: the stop state rederives from the restored task states
+        self.last_watch = None;
+    }
+
+    /// Install a [`build_continuation`](Self::build_continuation) capture: the fiber registry, the
+    /// pushed source units, the §14 child envs, and every task's `VTask`.
+    ///
+    /// `readmit_parks` is the one place the two callers differ. A **checkpoint restore** rebuilds the
+    /// run and replays forward, so a captured blocking-stdin / host-completed park is re-admitted
+    /// (`Runnable`) and its read re-executes, served from the cap tape (#1146 deeper). An **undo**
+    /// rewinds in place rather than re-executing, so it installs task states **verbatim** — a run that
+    /// was parked at that turn must come back parked, not silently runnable.
+    fn install_continuation(&mut self, c: &ScheduledContinuation, readmit_parks: bool) {
         self.fibers = c.fibers.clone();
         // Re-push any separate-module units before rebuilding envs/coroutines (their `module` indices
         // resolve against the source).
         self.source.reset_extra(&c.extra_units);
-        if let (Some(m), Some(layout)) = (self.mem.as_mut(), snap.mem()) {
-            m.restore_layout(layout);
-        }
         // Rebuild each task's full `VTask` and each §14 `instantiate`-child env. Coroutine and child
-        // windows are `nested_view`s over the just-reseeded shared window (their bytes — shared via the
-        // backing region — are already correct); each table is rebuilt over the child's own module.
+        // windows are `nested_view`s over the shared window (their bytes — shared via the backing
+        // region — are already correct); each table is rebuilt over the child's own module.
         let shared_mem = self.mem.as_ref();
         let source = &*self.source;
         self.extra_envs = c
@@ -8530,35 +8685,25 @@ impl ScheduledDebugRun {
         self.tasks = c
             .tasks
             .iter()
-            .map(|ts| {
-                DbgTask {
-                    vt: VTask {
-                        active: ts.active.clone(),
-                        active_id: ts.active_id,
-                        chain: ts.chain.clone(),
-                        root_shadow_sp: ts.root_shadow_sp,
-                        active_invoke: None, // never captured mid-invoke (`checkpointable`)
-                    },
-                    threads: ts.threads.clone(),
-                    env: ts.env,
-                    // A restored run is not parked (#1146 deeper): a captured blocking-stdin park
-                    // re-admits, and the re-executed read is served from the cap tape (or re-parks
-                    // at the frontier).
-                    state: match &ts.state {
-                        DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. } => {
-                            DbgTaskState::Runnable
-                        }
-                        s => s.clone(),
-                    },
-                    at_bp: ts.at_bp,
-                }
+            .map(|ts| DbgTask {
+                vt: VTask {
+                    active: ts.active.clone(),
+                    active_id: ts.active_id,
+                    chain: ts.chain.clone(),
+                    root_shadow_sp: ts.root_shadow_sp,
+                    active_invoke: None, // never captured mid-invoke (`checkpointable`)
+                },
+                threads: ts.threads.clone(),
+                env: ts.env,
+                state: match (&ts.state, readmit_parks) {
+                    (DbgTaskState::BlockedStdin | DbgTaskState::CapParked { .. }, true) => {
+                        DbgTaskState::Runnable
+                    }
+                    (s, _) => s.clone(),
+                },
+                at_bp: ts.at_bp,
             })
             .collect();
-        snap.restore_host(&mut self.host);
-        self.turn = turn;
-        self.clock = c.clock;
-        self.locate(); // stepping-ready: the stop state rederives from the restored task states
-        self.last_watch = None;
     }
 
     /// The run's result once the root has finished (`None` while still running).

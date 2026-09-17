@@ -740,6 +740,20 @@ pub struct Inspector {
 /// tail, large enough that the per-checkpoint snapshot (frames + window bytes) amortizes well.
 const SEEK_CHECKPOINT_STRIDE: u64 = 1024;
 
+/// The undo journal's compact record of the host's run-mutable state at one op (#1557) — a handful of
+/// scalars plus the lengths of the append-only buffers, so it is `Copy` and O(1) to take and to put
+/// back. See [`Host::journal_cursor`] for why this exists rather than a [`HostReplaySubstate`] clone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostCursor {
+    pub(crate) stdin_pos: usize,
+    pub(crate) stdout_len: usize,
+    pub(crate) stderr_len: usize,
+    pub(crate) clock_ns: i64,
+    pub(crate) cap_consumed: usize,
+    pub(crate) cap_record_len: usize,
+    pub(crate) mem_mapped_bytes: u64,
+}
+
 /// The run-mutable host substate a time-travel checkpoint restores — see [`Host::replay_substate`].
 #[derive(Clone)]
 struct HostReplaySubstate {
@@ -20485,6 +20499,63 @@ impl Host {
             && self.blockings.is_empty()
             && self.every_host_proc_named()
             && self.jit_tables.is_empty()
+    }
+
+    /// The **undo journal's** compact host cursor (#1557): the few scalars and append-only lengths
+    /// that, together with the window pre-images and the continuation, put the host back exactly as it
+    /// was before an op ran.
+    ///
+    /// This is deliberately *not* [`replay_substate`](Host::replay_substate). That clones `stdout`,
+    /// `stderr` and the whole cap tape, which is O(output) per capture and therefore quadratic if taken
+    /// every op — ruinous for a `printf` guest. Every field a normal op can move is either a scalar or
+    /// the **length of an append-only buffer**, so recording lengths and truncating back inverts them in
+    /// O(1). What is *not* invertible this way — the §3.6 serve queue (it drains, so it is not
+    /// append-only) and each capability's opaque declared state — is excluded by
+    /// [`journal_invertible`](Host::journal_invertible) instead of being restored wrongly.
+    pub(crate) fn journal_cursor(&self) -> HostCursor {
+        HostCursor {
+            stdin_pos: self.stdin_pos,
+            stdout_len: self.stdout.len(),
+            stderr_len: self.stderr.len(),
+            clock_ns: self.clock_ns,
+            cap_consumed: self.cap_consumed,
+            cap_record_len: self.cap_record.as_ref().map_or(0, |v| v.len()),
+            mem_mapped_bytes: self.mem_mapped_bytes,
+        }
+    }
+
+    /// Put back a [`journal_cursor`](Host::journal_cursor): truncate the append-only buffers to the
+    /// lengths they had and restore the scalars. The cap-replay cursor moves with `cap_consumed`, so a
+    /// forward step after an undo re-serves the identical taped input — the tape stays in step with the
+    /// journal by construction rather than by separate bookkeeping.
+    pub(crate) fn restore_journal_cursor(&mut self, c: &HostCursor) {
+        self.stdin_pos = c.stdin_pos;
+        self.stdout.truncate(c.stdout_len);
+        self.stderr.truncate(c.stderr_len);
+        self.clock_ns = c.clock_ns;
+        self.cap_consumed = c.cap_consumed;
+        if let Some(slot) = self.cap_replay.as_mut() {
+            slot.1 = c.cap_consumed;
+        }
+        if let Some(rec) = self.cap_record.as_mut() {
+            rec.truncate(c.cap_record_len);
+        }
+        self.mem_mapped_bytes = c.mem_mapped_bytes;
+    }
+
+    /// Whether this host's run-mutable state is invertible by a [`HostCursor`] alone — the journal's
+    /// fail-closed gate (#1557).
+    ///
+    /// False when the guest is using the §3.6 **serve** path (its queue drains rather than appends, so a
+    /// length cannot restore it) or holds a capability with **opaque declared state** (an embedder
+    /// capture/restore blob has no inverse — the case #1556 resolves by segmenting rather than guessing).
+    /// A run that answers false still time-travels: the journal declines to undo across such a point and
+    /// the checkpoint-plus-replay path serves it, exactly as it does today.
+    pub(crate) fn journal_invertible(&self) -> bool {
+        let (queue, results, _) = self.svc_state();
+        queue.is_empty()
+            && results.is_empty()
+            && self.capture_cap_states().iter().all(Option::is_none)
     }
 
     /// Whether every **live** host capability carries a registered name — the same reconstruction rule
