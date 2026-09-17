@@ -9520,28 +9520,29 @@ fn gc_scan(
     mask: u64,
 ) -> std::collections::BTreeSet<u64> {
     let mut roots = std::collections::BTreeSet::new();
-    let mut consider = |w: u64| {
-        let m = w & mask;
-        if m >= lo && m < hi {
-            roots.insert(m);
-        }
-    };
-    scan_vm_roots(&vt.active, source, &mut consider);
-    for (_, vm, _) in &vt.chain {
-        scan_vm_roots(vm, source, &mut consider);
-    }
-    for fib in fibers.iter() {
-        // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
-        // completion) holds live frames exactly like a suspended one — scan all three, or a root
-        // held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
-        if let FiberState::Parked { vm, .. }
-        | FiberState::WaitParked { vm, .. }
-        | FiberState::CapParked { vm, .. } = fib
-        {
+    {
+        let mut consider = |w: u64| {
+            let m = w & mask;
+            if m >= lo && m < hi {
+                roots.insert(m);
+            }
+        };
+        scan_vm_roots(&vt.active, source, &mut consider);
+        for (_, vm, _) in &vt.chain {
             scan_vm_roots(vm, source, &mut consider);
         }
+        for fib in fibers.iter() {
+            // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
+            // completion) holds live frames exactly like a suspended one — scan all three, or a
+            // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
+            if let FiberState::Parked { vm, .. }
+            | FiberState::WaitParked { vm, .. }
+            | FiberState::CapParked { vm, .. } = fib
+            {
+                scan_vm_roots(vm, source, &mut consider);
+            }
+        }
     }
-    drop(consider);
     roots
 }
 
