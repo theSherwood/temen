@@ -946,21 +946,27 @@ export async function runJitNiflerCrawl(ex, memory, moduleBytes, filePath, outPa
   return { status, pnif, deps };
 }
 
-// The **JS-orchestrated nifler import crawl on the wasm-JIT** (#1025 route A). nimony's phase-1 walks the
-// `import` graph, running `nifler --deps parse` on each module in the closure; here that walk lives in JS
-// so every step runs on the emitted-wasm tier (`runJitNiflerCrawl`, one nifler JIT compile reused across
-// all modules) instead of the interpreter. Each `.p.nif` + `.p.deps.nif` it produces is handed to the Rust
-// side via `temen_nim_precrawl_put`, which `temen_compile_nim_fs` seeds into the compile's memfs so
-// phase-1 skips re-running nifler for that module. Best-effort: a step that traps, or a module whose source
-// we can't resolve, is simply left for the (interpreter) phase-1 to redo — correctness holds regardless.
-// `mainPath`/`mainSrc` are the editor's Nim; stdlib module sources come from the opened `stdlibImage`.
-export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath, mainSrc, cacheKey) {
+// The nim **import walk** the two single-purpose crawls share (#1025 route A). nimony's phase-1 walks
+// the `import` graph running `nifler --deps parse` on each module in the closure; here that walk lives
+// in JS, and what differs between the crawls is only how one module gets parsed — emitted directly
+// (`jitNimCrawl`) or as a confined op-13 child (`jitNimCrawlOp13`). So the walk is written once and
+// takes `parse(file, out, src) -> {pnif, deps} | null` as its parameter.
+//
+// It also follows `include` edges, which are not modules — nim splices them into the includer — but
+// which nimsem parses by shelling out to nifler for each, unconditionally (#1562). Parsing them here
+// means `nimc::make_exec` serves those execs from what we seeded instead of running nifler again.
+//
+// Every product goes to the Rust accumulator (`temen_nim_precrawl_put`), which `temen_compile_nim_fs`
+// seeds into the compile's memfs. Best-effort throughout: a module whose source will not resolve, or
+// whose parse fails, is simply left for the (interpreter) phase-1 to redo — correctness holds either
+// way, only speed changes.
+async function crawlNimImports(ex, memory, stdlibImage, mainPath, mainSrc, parse) {
   const u8 = () => new Uint8Array(memory.buffer);
   const enc = new TextEncoder(), dec = new TextDecoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
   // Push one string through a scratch alloc into a `(ptr,len)->len`-stashing FFI, return its `OUT` readback.
-  const call1 = (fn, s) => {
-    const b = enc.encode(s);
+  const call1 = (fn, str) => {
+    const b = enc.encode(str);
     const p = Number(ex.temen_alloc(b.length));
     u8().set(b, p);
     ex[fn](p, b.length);
@@ -978,6 +984,19 @@ export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath
     ex.temen_dealloc(pp, pb.length);
     ex.temen_dealloc(bp, bytes.length);
   };
+  // One module's edges of `kind`, through the same parser the Rust driver uses.
+  const edges = (fn, deps, dir) => {
+    if (!deps.length) return [];
+    const dirB = enc.encode(dir);
+    const dp = Number(ex.temen_alloc(deps.length));
+    const drp = Number(ex.temen_alloc(dirB.length));
+    { const v = u8(); v.set(deps, dp); v.set(dirB, drp); }
+    ex[fn](dp, deps.length, drp, dirB.length);
+    const out = dec.decode(readOut());
+    ex.temen_dealloc(dp, deps.length);
+    ex.temen_dealloc(drp, dirB.length);
+    return out.split('\n').filter(Boolean);
+  };
 
   // Open the stdlib image (so `temen_nim_stdlib_read` serves module sources) and clear the accumulator.
   {
@@ -990,39 +1009,48 @@ export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath
 
   const seen = new Set();
   const work = ['/lib/std/system.nim', mainPath]; // same seeds as nimc::compile_nim's phase-1
-  let crawled = 0;
-  while (work.length) {
-    const file = work.pop();
+  const includes = [];
+  let crawled = 0, included = 0;
+  const step = async (file) => {
     const stem = dec.decode(call1('temen_nim_module_suffix', file));
-    if (seen.has(stem)) continue;
+    if (seen.has(stem)) return null;
     seen.add(stem);
-
     // Resolve this module's source: the editor's Nim for the main file, else the stdlib image.
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
-    if (!src.length) continue; // unresolved (non-stdlib import) — leave it for interpreter phase-1
-
+    if (!src.length) return null; // unresolved (non-stdlib import) — interpreter phase-1 redoes it
     let r;
     try {
-      r = await runJitNiflerCrawl(ex, memory, niflerBytes, file, `/nimcache/${stem}.p.nif`, src, cacheKey);
-    } catch { continue; } // JIT step trapped — interpreter phase-1 redoes this module
-    if (!r.pnif.length) continue;
+      r = await parse(file, `/nimcache/${stem}.p.nif`, src);
+    } catch {
+      return null; // the step trapped or declined — likewise left for phase-1
+    }
+    if (!r || !r.pnif.length) return null;
     putFile(`nimcache/${stem}.p.nif`, r.pnif);
     putFile(`nimcache/${stem}.p.deps.nif`, r.deps);
-    crawled++;
-
-    // Queue this module's imports, exactly as the Rust driver's parse_imports does.
     const dir = file.slice(0, file.lastIndexOf('/'));
-    const dirB = enc.encode(dir);
-    const dp = Number(ex.temen_alloc(r.deps.length));
-    const drp = Number(ex.temen_alloc(dirB.length));
-    { const v = u8(); v.set(r.deps, dp); v.set(dirB, drp); }
-    ex.temen_nim_parse_imports(dp, r.deps.length, drp, dirB.length);
-    const imports = dec.decode(readOut());
-    ex.temen_dealloc(dp, r.deps.length);
-    ex.temen_dealloc(drp, dirB.length);
-    for (const imp of imports.split('\n')) if (imp) work.push(imp);
+    includes.push(...edges('temen_nim_parse_includes', r.deps, dir));
+    return { deps: r.deps, dir };
+  };
+  while (work.length) {
+    const r = await step(work.pop());
+    if (!r) continue;
+    crawled++;
+    work.push(...edges('temen_nim_parse_imports', r.deps, r.dir));
   }
-  return { crawled };
+  while (includes.length) {
+    const r = await step(includes.pop());
+    if (r) included++; // an include's own includes were queued by `step`
+  }
+  return { crawled, included };
+}
+
+// The **JS-orchestrated nifler import crawl on the wasm-JIT** (#1025 route A): [`crawlNimImports`]
+// with each module parsed directly on the emitted tier (`runJitNiflerCrawl`, one nifler JIT compile
+// reused across every module). Used when a page ships without the child-entry guests the whole-card
+// orchestrator needs, so phase-1 still runs emitted.
+export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath, mainSrc, cacheKey) {
+  return crawlNimImports(ex, memory, stdlibImage, mainPath, mainSrc, (file, out, src) =>
+    runJitNiflerCrawl(ex, memory, niflerBytes, file, out, src, cacheKey));
 }
 
 // The **op-13 nested** variant of `jitNimCrawl` (#1025 Path 1 — drive the whole nim card through the op-13
@@ -1035,26 +1063,8 @@ export async function jitNimCrawl(ex, memory, niflerBytes, stdlibImage, mainPath
 // ~one nifler compile once. Best-effort: any module the op-13 step traps on is left for interpreter phase-1.
 export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, mainPath, mainSrc, cacheKey) {
   const u8 = () => new Uint8Array(memory.buffer);
-  const enc = new TextEncoder(), dec = new TextDecoder();
+  const enc = new TextEncoder();
   const readOut = () => u8().slice(Number(ex.temen_stdout_ptr()), Number(ex.temen_stdout_ptr()) + ex.temen_stdout_len());
-  const call1 = (fn, s) => {
-    const b = enc.encode(s);
-    const p = Number(ex.temen_alloc(b.length));
-    u8().set(b, p);
-    ex[fn](p, b.length);
-    const out = readOut();
-    ex.temen_dealloc(p, b.length);
-    return out;
-  };
-  const putFile = (path, bytes) => {
-    const pb = enc.encode(path);
-    const pp = Number(ex.temen_alloc(pb.length));
-    const bp = Number(ex.temen_alloc(bytes.length));
-    { const v = u8(); v.set(pb, pp); v.set(bytes, bp); }
-    ex.temen_nim_precrawl_put(pp, pb.length, bp, bytes.length);
-    ex.temen_dealloc(pp, pb.length);
-    ex.temen_dealloc(bp, bytes.length);
-  };
   const phaseRead = (key) => {
     const b = enc.encode(key);
     const p = Number(ex.temen_alloc(b.length));
@@ -1102,43 +1112,7 @@ export async function jitNimCrawlOp13(ex, memory, niflerCeBytes, stdlibImage, ma
     return { pnif, deps };
   };
 
-  // Open the stdlib image (module-source resolver) + clear the pre-crawl accumulator.
-  {
-    const ip = pushBytes(stdlibImage);
-    ex.temen_nim_stdlib_open(ip, stdlibImage.length);
-    ex.temen_dealloc(ip, stdlibImage.length);
-  }
-  ex.temen_nim_precrawl_reset();
-
-  const seen = new Set();
-  const work = ['/lib/std/system.nim', mainPath];
-  let crawled = 0;
-  while (work.length) {
-    const file = work.pop();
-    const stem = dec.decode(call1('temen_nim_module_suffix', file));
-    if (seen.has(stem)) continue;
-    seen.add(stem);
-    const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
-    if (!src.length) continue;
-
-    const r = await op13Step(file, `/nimcache/${stem}.p.nif`, src);
-    if (!r || !r.pnif.length) continue;
-    putFile(`nimcache/${stem}.p.nif`, r.pnif);
-    putFile(`nimcache/${stem}.p.deps.nif`, r.deps);
-    crawled++;
-
-    const dir = file.slice(0, file.lastIndexOf('/'));
-    const dirB = enc.encode(dir);
-    const dp = Number(ex.temen_alloc(r.deps.length));
-    const drp = Number(ex.temen_alloc(dirB.length));
-    { const v = u8(); v.set(r.deps, dp); v.set(dirB, drp); }
-    ex.temen_nim_parse_imports(dp, r.deps.length, drp, dirB.length);
-    const imports = dec.decode(readOut());
-    ex.temen_dealloc(dp, r.deps.length);
-    ex.temen_dealloc(drp, dirB.length);
-    for (const imp of imports.split('\n')) if (imp) work.push(imp);
-  }
-  return { crawled };
+  return crawlNimImports(ex, memory, stdlibImage, mainPath, mainSrc, op13Step);
 }
 
 // The **whole nim card on the op-13 tier** (#1025 3e): extends `jitNimCrawlOp13` past phase-1 so
