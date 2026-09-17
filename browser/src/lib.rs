@@ -6598,10 +6598,17 @@ pub struct JitOnrampRun {
     /// warm+JIT path leaves it `false` and keeps its pre-sized `run_over` bounce byte-for-byte, so this
     /// slice touches only the single-shot tier.
     grow: bool,
-    prots: Option<Vec<(u64, u8)>>,
-    /// The committed prefix `prots` is relative to (the previous bounce's `MemMapInfo.1`): a grown
-    /// tail the seed folded into the prefix lives here, not in `prots` (#1540).
-    prots_mapped: u64,
+    /// The page map carried forward between cross-tier bounces: the on-ramp's `protect`ed rodata and
+    /// any `vm_map`-grown tail, together with the committed prefix those entries are relative to (the
+    /// previous bounce's `MemMapInfo.1` — a grown tail the seed folded into the prefix lives there,
+    /// not in the entries, #1540).
+    ///
+    /// One `PageMap` rather than a `Vec<(u64, u8)>` plus a `prots_mapped` beside it (#1456): the two
+    /// had to be kept in step by hand across every bounce, and passing them out of step is precisely
+    /// the lossy shape `run_over_grown.rs::the_folded_prefix_carries_across_bounces_only_when_passed_back`
+    /// pins. It is a `PageMap` and not a `MemLayout` because there is no image to put in one — the
+    /// window is live in `back`.
+    prots: Option<temen_interp::PageMap>,
     mapped: u64,
     /// #1201 — the run emits **paged** (`module_uses_unmap_protect`, see `emit_for_run`): `pagestate`
     /// is the #750 page-state table rebuilt from each bounce's live map
@@ -7222,8 +7229,7 @@ impl JitOnrampRun {
             trapped: false,
             fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
-            prots: Some(Vec::new()),
-            prots_mapped: 0,
+            prots: Some(temen_interp::PageMap::empty()),
             mapped,
             paged,
             pagestate,
@@ -7319,8 +7325,7 @@ impl JitOnrampRun {
             // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
             // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
             grow: false,
-            prots: Some(Vec::new()),
-            prots_mapped: 0,
+            prots: Some(temen_interp::PageMap::empty()),
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
@@ -7402,8 +7407,7 @@ impl JitOnrampRun {
                 &mut self.host,
                 false,
                 temen_ir::DEFAULT_RESERVED_LOG2,
-                self.prots.as_deref(),
-                self.prots_mapped,
+                self.prots.as_ref(),
                 Some(&self.table), // #1296: installs persist across this run's bounces
             );
             match info {
@@ -7419,8 +7423,16 @@ impl JitOnrampRun {
                     } else {
                         self.mapped = mapped;
                     }
-                    self.prots_mapped = info.1;
-                    self.prots = Some(info.3);
+                    // Rebuild the carry with the prefix its entries are now relative to — one value,
+                    // so the two cannot drift apart.
+                    self.prots = temen_interp::PageMap::from_entries(
+                        temen_interp::host_page_size(),
+                        info.1,
+                        &info.3,
+                    );
+                    if self.prots.is_none() {
+                        return Err(Trap::CapFault); // a §13 `Backed` entry — unrestorable, fail closed
+                    }
                 }
                 None => {
                     self.prots = None;
@@ -8085,8 +8097,13 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
     };
     // Bytes + page map as the one form. `from_parts` rejects a §13 `Backed` entry, which is the same
     // fail-closed rule the `pages` match above applies — an alias cannot be reproduced from an image.
+    //
+    // The map's prefix is **0**, not `win`: it is the committed extent the entries are *relative to*,
+    // and these came from the warmup's own `map_info` with nothing carried in front of them. Both warm
+    // eval entries passed a hardcoded `0` for it before the two were folded into one value (#1456), so
+    // this is that behaviour written down rather than left implicit at the call sites.
     let Some(warm) =
-        temen_interp::MemLayout::from_parts(image, temen_interp::host_page_size(), win, &prots)
+        temen_interp::MemLayout::from_parts(image, temen_interp::host_page_size(), 0, &prots)
     else {
         drop(back);
         set(STATUS_TRAP);
@@ -8159,7 +8176,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         // clamped to `WARM_MAPPED_LOG2` — it defines the image geometry, which is captured as a flat
         // byte prefix, so growth there would have nothing to restore into.
         temen_ir::DEFAULT_RESERVED_LOG2,
-        Some(&s.warm.page_entries()),
+        Some(s.warm.page_map()),
     );
     let (status, value, exit_code) = match ran {
         Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
@@ -8606,7 +8623,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         Some(tierup),
         s.back.clone(),
         temen_ir::DEFAULT_RESERVED_LOG2,
-        &s.warm.page_entries(),
+        s.warm.page_map(),
     ) {
         Ok(r) => r,
         Err(_) => {
@@ -14084,7 +14101,7 @@ pub extern "C" fn temen_durable_thaw_resume(
         &mut host,
         false, // bytes already restored into the backing — do not re-init data segments
         rreserved,
-        Some(&entries),
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &entries).as_ref(),
     );
     match r {
         Ok(vals) => match vals.first() {

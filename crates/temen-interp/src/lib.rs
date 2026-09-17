@@ -25877,21 +25877,132 @@ pub fn host_region_granularity() -> u64 {
 /// frames, whose window is a bare `Region`; a run driver carrying the page list a previous run handed
 /// back) builds one with [`MemLayout::from_parts`], which speaks the [`Mem::map_info`] page encoding
 /// every FFI and run entry already uses.
+/// A window's **page map**: which pages deviate from the region default, in what page unit, over what
+/// committed prefix. The half of a [`MemLayout`] that is not bytes.
+///
+/// It is its own type because three things carry a page map with **no image** and had been carrying it
+/// as loose parts: a §14 child window's map (its bytes ride the parent's capture), the on-ramp run
+/// driver's carry-forward between cross-tier bounces, and `MemLayout` itself. Loose parts means the
+/// decode, the encode and the page-unit conversion live wherever each holder happens to need them, and
+/// means a holder keeps `prots` and `prots_mapped` as two fields that must agree — the pair-of-fields
+/// shape `MemLayout` was introduced to remove (#1456, INVARIANTS #13/#15).
+///
+/// A `MemLayout` is then exactly `bytes + PageMap`, which is also the honest answer to why the on-ramp
+/// driver could not simply hold a `MemLayout`: it has no image to put in one.
 #[derive(Clone)]
-pub struct MemLayout {
-    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
-    /// uncommitted pages read zero).
-    bytes: Vec<u8>,
+pub struct PageMap {
     /// The guest-visible page-protection entries (window-relative page index ⇒ state), in `page`-byte
     /// pages: every `Rw`/`Ro`/`Unmapped` deviation from the region default. A page absent here is
     /// read-write below `mapped` and unmapped above it — [`Mem`]'s own convention.
     prot: BTreeMap<u64, PageProt>,
     /// The page size those indices are in — the capturing window's protection granularity, which is
     /// not always the reader's (the §12 codec's page is a fixed 4 KiB; a native host's can be 16 KiB).
-    /// [`Mem::restore_layout`] converts against it rather than assuming its own.
+    /// [`rebased_to`](PageMap::rebased_to) converts against it rather than assuming its own.
     page: u64,
     /// The committed prefix `[0, mapped)` — the boundary that gives an *absent* entry its meaning.
     mapped: u64,
+}
+
+impl PageMap {
+    /// A map with no deviations from the region default and no carried prefix — what a driver starts a
+    /// session with, and what a flat window hands back.
+    ///
+    /// The page unit is `1` rather than a real page size because there are no entries for it to scale:
+    /// it is deliberately not `Default`, so a caller states that it means *empty* instead of picking up
+    /// a zero page size that would be silently wrong the moment an entry existed.
+    pub fn empty() -> PageMap {
+        PageMap {
+            prot: BTreeMap::new(),
+            page: 1,
+            mapped: 0,
+        }
+    }
+
+    /// Decode a page list in the [`Mem::map_info`] encoding: `(page_base_byte_offset, kind)` with kind
+    /// `0 = Ro`, `1 = Rw`, `2 = Unmapped`. A `3` (§13 `Backed`) entry is **rejected** — its bytes live
+    /// in a shared region, so an image cannot reproduce it ([`Mem::layout_snapshot_safe`]) — and so is
+    /// an unknown kind, both as `None` rather than a silently dropped protection.
+    pub fn from_entries(page: u64, mapped: u64, entries: &[(u64, u8)]) -> Option<PageMap> {
+        if page == 0 {
+            return None;
+        }
+        let prot = entries
+            .iter()
+            .map(|&(off, kind)| {
+                let p = match kind {
+                    0 => PageProt::Ro,
+                    1 => PageProt::Rw,
+                    2 => PageProt::Unmapped,
+                    _ => return None, // 3 = Backed, or a kind this encoding never had
+                };
+                Some((off / page, p))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        Some(PageMap { prot, page, mapped })
+    }
+
+    /// The entries back in the [`Mem::map_info`] encoding — the inverse of
+    /// [`from_entries`](Self::from_entries), for handing the map to a run entry that speaks it.
+    pub fn entries(&self) -> Vec<(u64, u8)> {
+        self.prot
+            .iter()
+            .map(|(&page, prot)| {
+                let kind = match prot {
+                    PageProt::Ro => 0,
+                    PageProt::Rw => 1,
+                    PageProt::Unmapped => 2,
+                    // `from_entries` rejects `Backed` and `layout_snapshot_safe` excludes it, so a map
+                    // built either way never holds one; encode it faithfully rather than invent a kind.
+                    PageProt::Backed { .. } => 3,
+                };
+                (page * self.page, kind)
+            })
+            .collect()
+    }
+
+    /// The page unit the indices are in.
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// The committed prefix — what an absent entry means.
+    pub fn mapped(&self) -> u64 {
+        self.mapped
+    }
+
+    /// Whether the map carries no deviation from the region default.
+    pub fn is_empty(&self) -> bool {
+        self.prot.is_empty()
+    }
+
+    /// This map re-expressed in `page`-byte pages. Identity when the units already agree; otherwise
+    /// every page of the target unit an entry covers takes that entry, last one winning — a finer
+    /// entry into a coarser page marks the whole page, the same rounding [`Mem::apply_prots`] does.
+    ///
+    /// The conversion lives here rather than at the restore site because it is a property of the map,
+    /// not of who is installing it — and because the §12 codec's fixed 4 KiB, a 16 KiB native capture
+    /// and a wasm host's 4 KiB all meet at this one function.
+    pub(crate) fn rebased_to(&self, page: u64) -> BTreeMap<u64, PageProt> {
+        if page == self.page {
+            return self.prot.clone();
+        }
+        self.prot
+            .iter()
+            .flat_map(|(&pg, &p)| {
+                let (lo, hi) = (pg * self.page, (pg + 1) * self.page - 1);
+                (lo / page..=hi / page).map(move |hp| (hp, p))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct MemLayout {
+    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
+    /// uncommitted pages read zero).
+    bytes: Vec<u8>,
+    /// Which pages deviate, in what unit, over what committed prefix.
+    map: PageMap,
 }
 
 impl MemLayout {
@@ -25909,56 +26020,25 @@ impl MemLayout {
         mapped: u64,
         prot: &[(u64, u8)],
     ) -> Option<MemLayout> {
-        if page == 0 {
-            return None;
-        }
-        let prot = prot
-            .iter()
-            .map(|&(off, kind)| {
-                let p = match kind {
-                    0 => PageProt::Ro,
-                    1 => PageProt::Rw,
-                    2 => PageProt::Unmapped,
-                    _ => return None, // 3 = Backed, or a kind this encoding never had
-                };
-                Some((off / page, p))
-            })
-            .collect::<Option<BTreeMap<_, _>>>()?;
         Some(MemLayout {
             bytes,
-            prot,
-            page,
-            mapped,
+            map: PageMap::from_entries(page, mapped, prot)?,
         })
     }
 
-    /// The page-protection entries back in the [`Mem::map_info`] encoding — the inverse of
-    /// [`from_parts`](Self::from_parts), for a holder that has to hand the map to a run entry that
-    /// speaks that encoding (`run_over_grown`'s `prots` argument).
-    ///
-    /// Without this a holder that stores a `MemLayout` still has to keep the raw `Vec<(u64, u8)>`
-    /// beside it to feed the run, which is the duplicated pair-of-fields this type exists to remove
-    /// (#1456).
+    /// The page map's entries in the [`Mem::map_info`] encoding — see [`PageMap::entries`].
     pub fn page_entries(&self) -> Vec<(u64, u8)> {
-        self.prot
-            .iter()
-            .map(|(&page, prot)| {
-                let kind = match prot {
-                    PageProt::Ro => 0,
-                    PageProt::Rw => 1,
-                    PageProt::Unmapped => 2,
-                    // `from_parts` rejects `Backed` and `layout_snapshot_safe` excludes it, so a
-                    // layout never holds one; encode it faithfully rather than inventing a kind.
-                    PageProt::Backed { .. } => 3,
-                };
-                (page * self.page, kind)
-            })
-            .collect()
+        self.map.entries()
     }
 
-    /// The committed prefix this layout was captured over — what an absent protection entry means.
+    /// The committed prefix this layout was captured over.
     pub fn mapped(&self) -> u64 {
-        self.mapped
+        self.map.mapped()
+    }
+
+    /// The page map half, for a holder that wants the map without the image.
+    pub fn page_map(&self) -> &PageMap {
+        &self.map
     }
 
     /// Build a layout from the §12 codec's **dense** form — one [`CapturedProt`] per
@@ -25969,9 +26049,11 @@ impl MemLayout {
     pub fn from_dense(bytes: Vec<u8>, prots: &[CapturedProt], mapped: u64) -> MemLayout {
         MemLayout {
             bytes,
-            prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped).collect(),
-            page: DURABLE_SNAPSHOT_PAGE,
-            mapped,
+            map: PageMap {
+                prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped).collect(),
+                page: DURABLE_SNAPSHOT_PAGE,
+                mapped,
+            },
         }
     }
 
@@ -25981,7 +26063,12 @@ impl MemLayout {
     /// under a grown high-water stays a hole), and an entry in a coarser page unit covers every codec
     /// page it spans.
     pub fn dense_prots(&self) -> Vec<CapturedProt> {
-        dense_prots(&self.prot, self.page, self.mapped, self.bytes.len() as u64)
+        dense_prots(
+            &self.map.prot,
+            self.map.page,
+            self.map.mapped,
+            self.bytes.len() as u64,
+        )
     }
 
     /// The captured window bytes `[0, len)`.
@@ -27686,9 +27773,11 @@ impl Mem {
         };
         MemLayout {
             bytes,
-            prot: space.prot.clone(),
-            page: self.page,
-            mapped: self.window.mapped(),
+            map: PageMap {
+                prot: space.prot.clone(),
+                page: self.page,
+                mapped: self.window.mapped(),
+            },
         }
     }
 
@@ -27714,24 +27803,11 @@ impl Mem {
         // moment) must drop the pages the guest has `map`-grown since, or they would survive as
         // addressable memory the moment never had. A fresh window (the checkpoint ladder's target) has
         // an empty map, so this is unchanged there.
-        if !layout.prot.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
+        if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
-            space.prot = if layout.page == self.page {
-                layout.prot.clone()
-            } else {
-                // The layout is in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB
-                // native capture): re-express each entry over every page of *this* window it
-                // covers. A finer entry into a coarser page marks the whole page, last one winning —
-                // the same rounding `apply_prots` performs.
-                layout
-                    .prot
-                    .iter()
-                    .flat_map(|(&pg, &p)| {
-                        let (lo, hi) = (pg * layout.page, (pg + 1) * layout.page - 1);
-                        (lo / self.page..=hi / self.page).map(move |hp| (hp, p))
-                    })
-                    .collect()
-            };
+                                                // The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB native
+                                                // capture); `rebased_to` is identity when they already agree.
+            space.prot = layout.map.rebased_to(self.page);
         }
     }
 

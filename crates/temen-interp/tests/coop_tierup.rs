@@ -1010,7 +1010,7 @@ block 0 (vx: i64) {
     temen_verify::verify_module(&m).expect("verify");
     let prog = bytecode::SharedProgram::compile(&m).expect("in subset");
     let eligible: std::sync::Arc<[bool]> = std::sync::Arc::from(vec![false, true]);
-    let run_with = |prots: &[(u64, u8)]| -> (Result<Vec<Value>, Trap>, u32) {
+    let run_with = |prots: &temen_interp::PageMap| -> (Result<Vec<Value>, Trap>, u32) {
         let back = std::sync::Arc::new(temen_interp::Region::new(1 << 17, 4096));
         // "Restore the warm image": plant the marker bytes directly in the backing, exactly what
         // the warm session's memcpy restore does before arming the run.
@@ -1052,7 +1052,10 @@ block 0 (vx: i64) {
     };
 
     // Seeded (one Rw entry for the grown page): the marker reads back and the leaf tiers up.
-    let (got, tierups) = run_with(&[(65536, 1)]);
+    let seeded =
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &[(65536, 1)])
+            .expect("a plain Rw entry decodes");
+    let (got, tierups) = run_with(&seeded);
     assert_eq!(
         got,
         Ok(vec![Value::I64(MARKER + 16)]),
@@ -1062,7 +1065,7 @@ block 0 (vx: i64) {
 
     // Unseeded: the same bytes are in the backing, but with no page-state entry the grown-page
     // load faults — the restore is the page MAP, not just the bytes (fail-closed).
-    let (got, _) = run_with(&[]);
+    let (got, _) = run_with(&temen_interp::PageMap::empty());
     assert!(
         got.is_err(),
         "an unseeded run must fault on the grown-page load, got {got:?}"

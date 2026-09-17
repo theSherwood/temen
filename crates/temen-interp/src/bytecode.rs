@@ -2648,7 +2648,7 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
         reserved_log2: u8,
-        prots: Option<&[(u64, u8)]>,
+        prots: Option<&super::PageMap>,
     ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>, u64) {
         let (out, info, mapped) = self.run_over_grown_info(
             func,
@@ -2659,7 +2659,6 @@ impl SharedProgram {
             seed_data,
             reserved_log2,
             prots,
-            0,    // no carried prefix — the seed's own contiguous tail still folds
             None, // no persistent table — the install-less legacy bounce
         );
         (out, info.map(|i| i.3), mapped)
@@ -2697,8 +2696,7 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
         reserved_log2: u8,
-        prots: Option<&[(u64, u8)]>,
-        mapped: u64,
+        prots: Option<&super::PageMap>,
         table: Option<&std::sync::Arc<SharedSlots>>,
     ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
@@ -2716,8 +2714,11 @@ impl SharedProgram {
                 mm.init_data(&self.data);
             }
             mm.seed_null_guard(self.null_guard); // #964
-            if let Some(entries) = prots {
-                mm.seed_pages(mapped, entries);
+            if let Some(map) = prots {
+                // The map carries the prefix its entries are relative to, so the two cannot disagree —
+                // they were a `prots` slice and a `mapped` argument that had to be kept in step by
+                // every caller (#1456).
+                mm.seed_pages(map.mapped(), &map.entries());
             }
             mm
         });
@@ -2769,7 +2770,7 @@ impl SharedProgram {
         tierup: Option<TierUpConfig>,
         back: std::sync::Arc<super::Region>,
         reserved_log2: u8,
-        prots: &[(u64, u8)],
+        prots: &super::PageMap,
     ) -> Result<CoopRun, Trap> {
         if entry as usize >= self.n_funcs {
             return Err(Trap::Malformed);
@@ -2781,7 +2782,7 @@ impl SharedProgram {
         let mut mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
             mm.seed_null_guard(self.null_guard); // #964
-            mm.seed_pages(0, prots);
+            mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
