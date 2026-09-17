@@ -1849,6 +1849,12 @@ fn nim_differential_corpus() {
     for case in &cases {
         let name = case.file_stem().unwrap().to_string_lossy().to_string();
         let src = std::fs::read_to_string(case).expect("read case");
+        // Announce the case **before** running it, and time it. Reporting only on success makes a
+        // slow or non-terminating case invisible: the suite just stops producing output, which reads
+        // as "hung on the first case" no matter which case it actually is. That cost real debugging
+        // time on the v0.6.2 bump.
+        eprintln!("  {name}: …");
+        let started = std::time::Instant::now();
         let want = match native_output(&path, &name, &src) {
             Ok(s) => s,
             // Outside nimony's own subset: the corpus program is wrong, not Temen. Say so loudly —
@@ -1859,7 +1865,13 @@ fn nim_differential_corpus() {
             }
         };
         match temen_output(&path, &libc, &name, &src) {
-            Ok(got) if got == want => eprintln!("  {name}: ok ({:?})", elide(&got)),
+            Ok(got) if got == want => {
+                eprintln!(
+                    "  {name}: ok in {}ms ({:?})",
+                    started.elapsed().as_millis(),
+                    elide(&got)
+                )
+            }
             Ok(got) => failures.push(format!(
                 "{name}: OUTPUT DIFFERS\n       temen: {:?}\n      native: {:?}",
                 elide(&got),
