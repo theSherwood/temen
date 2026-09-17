@@ -1242,7 +1242,45 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   foreignStats.reset();
   const mods = new Map(); // stem -> { file, deps: [stem], role }
   const work = [{ file: '/lib/std/system.nim', role: 'System' }, { file: mainPath, role: 'Main' }];
-  let crawled = 0;
+  const includes = []; // files reached by `include`, drained after the module walk (see below)
+  let crawled = 0, included = 0;
+  const dirOf = (f) => f.slice(0, f.lastIndexOf('/'));
+  // The `include` edges in a `.p.deps.nif`, through the same parser the Rust driver uses.
+  const parseIncludes = (deps, dir) => {
+    if (!deps.length) return [];
+    const dirB = enc.encode(dir), dp = pushBytes(deps), drp = pushBytes(dirB);
+    ex.temen_nim_parse_includes(dp, deps.length, drp, dirB.length);
+    const out = dec.decode(readOut());
+    ex.temen_dealloc(dp, deps.length); ex.temen_dealloc(drp, dirB.length);
+    return out.split('\n').filter(Boolean);
+  };
+  // Parse one nim source with nifler on the EMITTED tier, falling back to the interpreter, and seed its
+  // `.p.nif` + `.p.deps.nif` into the memfs the phases are handed. `null` when nifler produced nothing —
+  // the caller decides whether that is fatal.
+  //
+  // #1364 pinned this to the interpreter: emitting the ~13 MB nifler guest peaked the engine near its
+  // 1 GiB ceiling, and a constrained tab that trapped the grow dropped the whole card to the
+  // multi-minute tree-walker. The ceiling is the host's now (#1561, `web/engine-mem.js`), so the emit
+  // has room — and `runJitNiflerCrawl` is emit-cached, so the whole crawl pays for one nifler compile.
+  // The fallback is its documented contract, and still the right answer on a host that gave itself a
+  // small ceiling: a throw means the emit declined or trapped, never a wrong parse.
+  const parseOne = async (file, stem, src) => {
+    const out = `/nimcache/${stem}.p.nif`;
+    let pnif, deps;
+    try {
+      ({ pnif, deps } = await runJitNiflerCrawl(ex, memory, nifler, file, out, src, `${cacheKey}-crawl`));
+    } catch {
+      const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
+      const fp = pushBytes(fb), op = pushBytes(ob);
+      ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
+      pnif = readOut(); deps = readErr();
+      ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
+    }
+    if (!pnif.length) return null;
+    fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
+    putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
+    return { pnif, deps };
+  };
   while (work.length) {
     const { file, role } = work.pop();
     const stem = dec.decode(call1('temen_nim_module_suffix', file));
@@ -1259,6 +1297,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
         const imports = dec.decode(readOut());
         ex.temen_dealloc(dp, deps.length); ex.temen_dealloc(drp, dirB.length);
         for (const imp of imports.split('\n')) if (imp) { depStems.push(dec.decode(call1('temen_nim_module_suffix', imp))); work.push({ file: imp, role: 'Import' }); }
+        includes.push(...parseIncludes(deps, dir));
       }
       mods.set(stem, { file, deps: depStems, role });
       continue;
@@ -1266,22 +1305,12 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
     const src = file === mainPath ? mainSrc : call1('temen_nim_stdlib_read', file);
     if (!src.length) { continue; } // unresolved import — the interpreter card redoes phase-1 for it
 
-    // nifler --deps parse <file> <out> on the INTERPRETER (#1364): emitting the ~13 MB nifler guest peaks
-    // the engine near the 1 GiB ceiling, so a constrained tab traps the grow and the whole card silently
-    // falls back to the multi-minute tree-walker. The crawl is cheap interpreted (its footprint is the
-    // nifler decode, a fraction of the emit's) — so we keep the tier-up budget for nimsem/hexer, where the
-    // time and the smaller emit actually are. `.p.nif` rides OUT, `.p.deps.nif` rides ERR.
-    const out = `/nimcache/${stem}.p.nif`;
-    const cp = pushBytes(nifler), fb = enc.encode(file), ob = enc.encode(out), sp = pushBytes(src);
-    const fp = pushBytes(fb), op = pushBytes(ob);
-    ex.temen_run_nifler_crawl_fs(cp, nifler.length, fp, fb.length, op, ob.length, sp, src.length);
-    const pnif = readOut(), deps = readErr();
-    ex.temen_dealloc(cp, nifler.length); ex.temen_dealloc(fp, fb.length); ex.temen_dealloc(op, ob.length); ex.temen_dealloc(sp, src.length);
+    const r = await parseOne(file, stem, src);
     // nifler parsed nothing. This used to `continue` silently, which is the worst possible outcome:
     // the module never gets a `.p.nif`, so it is never semmed, and a *dependent* module's nimsem dies
     // much later with `cannot open <stem>.s.nif` — a message that names the wrong module and says
     // nothing about the cause. Report it here, where the cause is (#1364).
-    if (!pnif.length) {
+    if (!r) {
       let why = '';
       if (ex.temen_run_nifler_crawl_diag) {
         const dl = ex.temen_run_nifler_crawl_diag();
@@ -1289,19 +1318,39 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
       }
       return { crawled, error: `nifler could not parse ${file}${why}` };
     }
-    fs.set(`nimcache/${stem}.p.nif`, pnif); fs.set(`nimcache/${stem}.p.deps.nif`, deps);
-    putFile(`nimcache/${stem}.p.nif`, pnif); putFile(`nimcache/${stem}.p.deps.nif`, deps);
+    const { pnif, deps } = r;
     if (role !== 'Main') { const e = produced.get(stem) || {}; e.pNif = pnif; e.depsNif = deps; produced.set(stem, e); }
     crawled++;
 
-    const dir = file.slice(0, file.lastIndexOf('/'));
+    const dir = dirOf(file);
     const dirB = enc.encode(dir), dp = pushBytes(deps), drp = pushBytes(dirB);
     ex.temen_nim_parse_imports(dp, deps.length, drp, dirB.length);
     const imports = dec.decode(readOut());
     ex.temen_dealloc(dp, deps.length); ex.temen_dealloc(drp, dirB.length);
     const depStems = [];
     for (const imp of imports.split('\n')) if (imp) { depStems.push(dec.decode(call1('temen_nim_module_suffix', imp))); work.push({ file: imp, role: 'Import' }); }
+    includes.push(...parseIncludes(deps, dir));
     mods.set(stem, { file, deps: depStems, role });
+  }
+
+  // `include`d files are not modules — nim splices them into the includer, so they are never semmed,
+  // hexed or linked — but nimsem parses every one, by shelling out to nifler for it *unconditionally*
+  // (it does not look for an existing `.p.nif`, and it is not an mtime check either — both measured).
+  // On the bench card that is 21 execs and 5.9 s of an 18 s compile, all of it nifler on the
+  // interpreter. Parsing them here instead means the same parse, once, on this tier; `nimc::make_exec`
+  // then serves each exec from what we wrote, byte-identical to what it would have produced (#1359).
+  const incSeen = new Set();
+  while (includes.length) {
+    const file = includes.pop();
+    const stem = dec.decode(call1('temen_nim_module_suffix', file));
+    if (mods.has(stem) || pre.has(stem) || incSeen.has(stem)) continue;
+    incSeen.add(stem);
+    const src = call1('temen_nim_stdlib_read', file);
+    if (!src.length) continue;                    // not in the image — nimsem parses it, as before
+    const r = await parseOne(file, stem, src);
+    if (!r) continue;                             // best-effort: nimsem redoes it, as before
+    included++;
+    includes.push(...parseIncludes(r.deps, dirOf(file)));
   }
 
   const tCrawl = now();
@@ -1384,7 +1433,7 @@ export async function jitNimWholeCardOp13(ex, memory, assets, stdlibImage, mainP
   const tHexer = now();
   const bHexer = bounceStats.take(), fHexer = foreignStats.take();
   return {
-    crawled, semmed, hexed, produced,
+    crawled, semmed, hexed, included, produced,
     timings: {
       crawlMs: tCrawl - t0, nimsemMs: tNimsem - tCrawl, hexerMs: tHexer - tNimsem,
       // #1417: declined-body accounting per phase — bounce count and wall-clock inside bounces.
