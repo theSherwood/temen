@@ -223,9 +223,9 @@ fn audited_coverage_does_not_regress() {
         .filter(|cell| cell.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 44,
-        "audited cell count fell to {audited}; it was 32 when the matrix landed and 44 once the \
-         `debugger` column was driven. Filling axes in is the work (#1413) — emptying them is a \
-         regression."
+        audited >= 56,
+        "audited cell count fell to {audited}; it was 32 when the matrix landed, 44 once the \
+         `debugger` column was driven, and 56 once `concurrency` was. Filling axes in is the work \
+         (#1413) — emptying them is a regression."
     );
 }

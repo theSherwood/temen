@@ -43,7 +43,18 @@
 //! when *every* one of its ops was actually driven; scoring one on a partial sweep would be the
 //! wish the matrix exists to avoid.
 //!
-//! The remaining four axes are populated as their predicates become locatable; until then their
+//! **Concurrency** is the third shape again. There is no predicate to read at all: whether a
+//! capability is "carried by both drivers" is only answerable by running it on both, so the column
+//! is derived by driving each capability's ops on `bytecode::drive` and `bytecode::run_vcpu_parallel`
+//! and comparing the answers shape by shape (`tests/concurrency_conformance.rs`). The comparison is
+//! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
+//! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
+//!
+//! Its first rendering found one: `child_offer` answers `-EINVAL` on the coop driver and traps on
+//! the parallel one (#1566). The same four rows that need a live unit or peer stay `Unaudited` here
+//! as on the debugger column.
+//!
+//! The remaining three axes are populated as their predicates become locatable; until then their
 //! cells read `Unaudited`, which is the point — an unaudited cell is visible, countable, and cannot
 //! be mistaken for a passing one.
 //!
@@ -225,7 +236,10 @@ impl Axis {
     /// A conformed column may still hold `Unaudited` cells (`debugger` holds four): the claim is
     /// that the column is *checked*, not that every row in it could be reached.
     pub fn is_conformed(self) -> bool {
-        matches!(self, Axis::Nesting | Axis::Durability | Axis::Debugger)
+        matches!(
+            self,
+            Axis::Nesting | Axis::Durability | Axis::Debugger | Axis::ConcurrencyModel
+        )
     }
 }
 
@@ -238,6 +252,22 @@ const F: Cell = Cell {
 const U: Cell = Cell {
     status: Status::Unaudited,
     note: "",
+};
+/// `Full` on the **concurrency** axis: both drivers, given the same call, give the same answer.
+/// `tests/concurrency_conformance.rs` drives each of the row's ops on `bytecode::drive` and on
+/// `bytecode::run_vcpu_parallel` and compares them shape by shape.
+const K: Cell = Cell {
+    status: Status::Full,
+    note: "",
+};
+/// The one concurrency-axis gap the column's first rendering found (#1566): `child_offer` (op 14)
+/// answers `-EINVAL` on the cooperative driver and **traps** `ThreadFault` on the parallel one, so a
+/// guest probing a stale child handle survives on one driver and dies on the other — INVARIANTS #5
+/// (errors are values) and #9 (refuse probeably, never diverge). A `NotYet`, not a `Declines`: the
+/// op works, the two drivers disagree about how it fails.
+const CHILD_OFFER_DIVERGES: Cell = Cell {
+    status: Status::NotYet,
+    note: "child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)",
 };
 
 const fn declines(note: &'static str) -> Cell {
@@ -263,7 +293,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
     match c {
         // Coordinate-free value caps: copyable into a child (`resolve_copyable`) and value-typed, so
         // they ride a freeze. The only rows that are unconditionally `Full` on both audited axes.
-        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, U, U, F],
+        Capability::Stream | Capability::Exit | Capability::Clock => [F, F, U, U, K, U, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
         // FIFO into the child (the cross-domain `cmd1 | cmd2` grant), while a freeze cannot carry the
@@ -273,7 +303,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("the live FIFO backing cannot be serialized (NonDurableKind::Pipe)"),
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -286,7 +316,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("a snapshot cannot reproduce a live alias into shared backing (#14 exception)"),
             U,
             U,
-            U,
+            K,
             U,
             conditional(
                 "map/unmap/len/page_size run; op 4 (the guest-minted-region grant) is vetoed by \
@@ -303,7 +333,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -315,7 +345,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             U,
             U,
-            U,
+            CHILD_OFFER_DIVERGES,
             U,
             conditional(
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
@@ -334,7 +364,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -346,7 +376,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("NonDurableKind::Module — re-granted by the embedder after restore"),
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -355,7 +385,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("NonDurableKind::ModuleLoader — a live loader makes the domain non-snapshottable"),
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -381,7 +411,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("NonDurableKind::Blocking"),
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
@@ -395,7 +425,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             declines("NonDurableKind::HostProc — the host closure cannot be serialized"),
             U,
             U,
-            U,
+            K,
             U,
             F,
         ],
