@@ -1136,11 +1136,12 @@ mod tests {
 // they are not a gate. These drive the walk directly with a chain built to fault, which is.
 //
 // Unit tests rather than an integration test: the `trap_capture.c` symbols are linked into this
-// crate, not re-exported from its rlib.
-#[cfg(all(test, unix, target_arch = "x86_64"))]
+// crate, not re-exported from its rlib. Arch-independent — the chain is synthetic, so no register or
+// frame layout is assumed — and gated on `fiber_rt` because that is exactly where `install_guard`
+// exists, which puts the walk under macOS/aarch64 in the `cross-os` lane too.
+#[cfg(all(test, unix, fiber_rt))]
 mod trap_walk_tests {
     extern "C" {
-        fn temen_install_trap_handler();
         fn temen_capture_explicit_trap(guest_fp: usize);
         fn temen_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
     }
@@ -1215,7 +1216,7 @@ mod trap_walk_tests {
     /// with SIGSEGV inside the handler rather than failing.
     #[test]
     fn a_walk_that_faults_truncates_the_backtrace_instead_of_killing_the_host() {
-        unsafe { temen_install_trap_handler() };
+        super::install_guard();
         let chain = FaultingChain::new();
 
         unsafe { temen_capture_explicit_trap(chain.fp()) };
@@ -1241,7 +1242,7 @@ mod trap_walk_tests {
     /// second call only behaves identically if the first cleared the in-progress flag on its way out.
     #[test]
     fn a_truncated_walk_disarms_itself() {
-        unsafe { temen_install_trap_handler() };
+        super::install_guard();
         let chain = FaultingChain::new();
 
         unsafe { temen_capture_explicit_trap(chain.fp()) };
@@ -1256,7 +1257,7 @@ mod trap_walk_tests {
     /// A chain that ends cleanly is unaffected — the bracket costs the normal path nothing.
     #[test]
     fn a_well_formed_chain_still_walks_to_its_end() {
-        unsafe { temen_install_trap_handler() };
+        super::install_guard();
         let mut buf = vec![0usize; 512];
         let base = buf.as_mut_ptr();
         unsafe {

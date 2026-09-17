@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -121,16 +122,20 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
 }
 
 /* Install the handler. **Idempotent, and it has to be**: `sigaction` hands back the *previous*
- * disposition, so a second install would save our own handler as `g_old_*` and `temen_chain` would
- * then call `temen_handler` from `temen_handler` — an unkillable spin on the first fault we decline,
- * which is worse than the crash it replaces. The Rust side wraps this in a `std::sync::Once`; this
- * flag makes the property belong to the function rather than to every caller remembering. */
-static int g_installed = 0;
+ * disposition, so a second install saves our own handler as `g_old_*`, and `temen_chain` then calls
+ * `temen_handler` from `temen_handler` — an unkillable spin on the first fault we decline, which is
+ * far worse than the crash it replaces.
+ *
+ * `mem.rs`'s `install_guard` orders the real call behind a `std::sync::Once`, which is what makes the
+ * install itself well-defined; the test-and-set here is so that a *direct* caller (a second one, or
+ * two at once) cannot reach the self-chaining state. A loser returns without waiting: under the
+ * `Once` there are no losers, and for a caller outside that contract "possibly not installed yet" is
+ * a far better failure than an unkillable spin. */
+static atomic_flag g_installed = ATOMIC_FLAG_INIT;
 
 void temen_install_trap_handler(void) {
-    if (g_installed)
+    if (atomic_flag_test_and_set(&g_installed))
         return;
-    g_installed = 1;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = temen_handler;
