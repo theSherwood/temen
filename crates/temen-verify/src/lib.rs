@@ -172,9 +172,10 @@ pub enum VerifyError {
     ExportHandleOutOfRange { func: u32, block: u32, export: u32 },
 }
 
-/// The most shadow contexts a declared arena may hold (`(end - base) / SHADOW_STRIDE`): one
-/// machine word of allocator occupancy bits, and far above any fiber quota in the tree.
-pub const MAX_SHADOW_CONTEXTS: usize = 64;
+/// The most shadow contexts a declared arena may hold — re-exported from `temen-ir`, where the rest
+/// of the arena geometry lives, so a producer that places an arena and the verifier that checks it
+/// read the same number (#1534).
+pub use temen_ir::durable_abi::MAX_SHADOW_CONTEXTS;
 
 /// Verify an entire module. `Ok(())` is the only "accept".
 pub fn verify_module(m: &Module) -> Result<(), VerifyError> {

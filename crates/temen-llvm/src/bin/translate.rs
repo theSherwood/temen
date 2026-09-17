@@ -44,7 +44,11 @@ fn try_main() -> Result<(), String> {
              \n  failing translation (large-program bring-up, e.g. Postgres).\n\
              \n  --null-guard (#964) is a redundant no-op: the powerbox low scratch is always laid out\n\
              \n  one 16 KiB guard above zero so a host seeds [0, 16384) unmapped and NULL dereferences\n\
-             \n  trap (#1094 — the one canonical layout). The flag is kept only for compatibility."
+             \n  trap (#1094 — the one canonical layout). The flag is kept only for compatibility.\n\
+             \n  --shadow-arena <contexts> reserves a durable shadow arena of that many per-context\n\
+             \n  regions and declares it in the memory descriptor, making the guest freezable\n\
+             \n  (one region for the root plus one per concurrent fiber/vCPU; 1..=64). Omit it for\n\
+             \n  a non-durable guest, which reserves nothing."
         );
         return Err("no input file".into());
     }
@@ -55,6 +59,7 @@ fn try_main() -> Result<(), String> {
     let mut host_page: u64 = temen_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
     let mut child_entry = false;
+    let mut shadow_contexts: Option<u32> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -77,6 +82,16 @@ fn try_main() -> Result<(), String> {
             // §14 child-entry mode (#1011 slice 3c): synthesize the powerbox entry with the
             // `instantiate_module` child ABI, so a guest driver can spawn this module as a phase child.
             "--child-entry" => child_entry = true,
+            // #1534: reserve + declare the durable shadow arena, so the durable transform accepts
+            // this guest (it fails closed on a module that declares none — INVARIANTS.md #16).
+            "--shadow-arena" => {
+                shadow_contexts = Some(
+                    it.next()
+                        .ok_or("--shadow-arena needs a context-count argument")?
+                        .parse()
+                        .map_err(|e| format!("--shadow-arena: {e}"))?,
+                )
+            }
             _ if a.starts_with('-') => return Err(format!("unknown flag `{a}`")),
             _ => {
                 if input.replace(a.clone()).is_some() {
@@ -100,6 +115,7 @@ fn try_main() -> Result<(), String> {
         stub_unresolved_externs: stub_externs,
         stack_page: host_page,
         child_entry,
+        shadow_contexts,
     };
     let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
     let translated = if is_ll {

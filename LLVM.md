@@ -3485,12 +3485,42 @@ the peval probe running (not skipping); embench + cross-engine verified green on
 
 ---
 
+## 8a. Durability: `--shadow-arena` (#1534)
+
+A C guest is a **durable domain** only if its module declares where the durable runtime may keep its
+per-context shadow regions. #1503 made that placement a module-declared, verified parameter
+(`memory N shadow BASE END`, INVARIANTS.md #16: there is **no default placement**), so
+`transform_module*` fails closed with `NoShadowArena` on a module that declares none — which every
+translated module was.
+
+`temen-llvm-translate --shadow-arena <contexts>` (`TranslateOptions::shadow_contexts`) reserves
+`contexts × SHADOW_STRIDE` bytes and declares them. Placement follows R9's "a toolchain points the
+arena at a BSS array": it goes on top of whatever the window already holds — the data-stack reserve
+when some function uses it, the float scratch, the C++ EH region — and below the heap, so the
+allocator never manages it and no data segment can alias it (the R9 contract as a static verifier
+check rather than a convention). Sitting on the window top rather than at a fixed offset is what
+keeps it free for a guest that already reserves a stack, and keeps a frameless guest from being sized
+as if it reserved one. The base is **host-page**-aligned for the same reason `entry_sp` is: the arena
+is written during freeze/thaw and D40 protects read-only segments page-granularly, so sharing a page
+with the last read-only global faults on the first shadow push. Size it one region for the root plus
+one per concurrent fiber/vCPU (`1..=MAX_SHADOW_CONTEXTS`, range-checked at translate time).
+
+Omit the flag for a non-durable guest: it reserves nothing and the window is unchanged.
+`tests/durable_shadow_arena.rs` takes a translated C guest through the durable transform (strict —
+the probe has no guest loads/stores — and confined) and freezes it mid-loop, thawing the artifact
+into a fresh host on the tree-walker and on the JIT.
+
+---
+
 ## 9. Code map
 - Translator + frozen-subset chokepoint: `crates/temen-llvm/src/lib.rs` — `translate`/
   `translate_bc_path`, `val_type`/`operand_int_ty` (the §3b narrow-int collapse), `BlockCtx`
   (block-local SSA numbering, §3a), and the `unsup(...)` fail-closed chokepoint.
 - First-light differential: `crates/temen-llvm/tests/translate.rs` — `compile_to_bc` runs the
   pinned `clang -O2 -emit-llvm` pipeline; `run` does translate→verify→interp.
+- Durable guests (§8a): `crates/temen-llvm/tests/durable_shadow_arena.rs` +
+  `tests/fixtures/durable_probe.c`; the reserve cursor that places the arena is in `translate`
+  (`float_scratch_base` / `eh_base` / `shadow_arena`).
 - Crate config + build prereqs: `crates/temen-llvm/Cargo.toml` (no libLLVM deps since the
   textual-reader flip — the in-house `.ll` reader lives in `crates/temen-llvm/src/ll/`; see §8
   Q1b/Q4); workspace exclusion in the root `Cargo.toml`.
