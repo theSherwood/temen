@@ -175,32 +175,50 @@ fn the_concurrency_column_matches_what_the_two_drivers_actually_do() {
     }
 }
 
-/// The divergence the column's first rendering found, pinned as a *specific* fact rather than left
-/// as a bare `NotYet`: `child_offer` (op 14) answers `-EINVAL` on the cooperative driver and
-/// **traps** on the parallel one. INVARIANTS #5 keeps traps for forgery and #9 requires a backend
-/// that cannot do something to refuse probeably, so a guest that probes this handle survives on one
-/// driver and has its domain killed on the other. Tracked as its own bug; this test keeps the shape
-/// of it honest so a fix (or a regression) is visible here.
+/// The column's first rendering found two divergences on the `Instantiator` row, and this pins both
+/// halves as *specific* facts rather than leaving the cell a bare `NotYet`.
+///
+/// `child_offer` (op 14) answered `-EINVAL` on the cooperative driver and **trapped** on the
+/// parallel one, so a guest probing a stale child handle survived on one driver and had its domain
+/// killed on the other — INVARIANTS #5 (errors are values, traps are for forgery) and #9 (refuse
+/// probeably, never diverge). Fixed in #1566: both now answer `-EINVAL`.
+///
+/// `instantiate_module_named` (op 13) remains (#1570): the parallel driver's named-grant decline is
+/// a `Trap::Malformed`, and it fires before the module handle is resolved, so a forged handle gets
+/// that instead of the `CapFault` the cooperative driver correctly gives. Both drivers kill the
+/// domain here, which is why it is milder — but it is still one op with two answers.
 #[test]
-fn child_offer_answers_on_the_coop_driver_and_traps_on_the_parallel_one() {
+fn the_instantiator_rows_two_divergences_are_where_they_are_claimed_to_be() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
         .expect("the Instantiator row");
-    let found = divergences(&row, 14);
+
     assert!(
-        !found.is_empty(),
-        "child_offer no longer diverges — if it was fixed, this pin and the Instantiator cell \
-         should move together"
+        divergences(&row, 14).is_empty(),
+        "child_offer diverges again — #1566 regressed. Both drivers must answer -EINVAL: {:?}",
+        divergences(&row, 14),
     );
-    for (shape, c, p) in &found {
+
+    let op13 = divergences(&row, 13);
+    assert!(
+        !op13.is_empty(),
+        "op 13 no longer diverges — if #1570 was fixed, this pin and the Instantiator cell should \
+         move together (and the cell can go Full only once the probe supplies a real Module \
+         handle, so the valid-handle case is covered rather than assumed)"
+    );
+    // On this shape the coop side's `CapFault` is the **genuine answer** — the arm lowered, the
+    // driver resolved `mh = 0`, and a forged handle traps (INVARIANTS #5) — not the harness
+    // miscalling, which is the other thing that verdict can mean. `divergences` keeps a cap fault on
+    // exactly one side for precisely this reason: it skips a shape only when *both* drivers give it.
+    for (shape, c, p) in &op13 {
         assert!(
-            matches!(c, Verdict::Answered(-22)),
-            "{shape}: the coop driver should answer -EINVAL probeably, got {c:?}"
+            matches!(c, Verdict::CapFault),
+            "{shape}: the coop driver traps CapFault on the forged handle, got {c:?}"
         );
         assert!(
-            matches!(p, Verdict::Trapped(_)),
-            "{shape}: the parallel driver should be the one trapping, got {p:?}"
+            matches!(p, Verdict::Trapped(t) if t.contains("Malformed")),
+            "{shape}: the parallel driver's feature check fires first and names Malformed, got {p:?}"
         );
     }
 }
