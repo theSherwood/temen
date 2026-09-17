@@ -2771,6 +2771,7 @@ impl Translator {
             )),
             other => other,
         })?;
+        f.close_block_gaps()?;
         let used_memory = f.used_memory;
         for blk in f.blocks {
             out.push_str(&blk);
@@ -2976,6 +2977,49 @@ impl<'a> FuncGen<'a> {
         self.cur = (0..n).collect();
         self.cur_buf.clear();
         self.terminated = false;
+    }
+
+    /// Emit a stub for any block a lowering **allocated but never finished**, so the label sequence
+    /// stays contiguous.
+    ///
+    /// Blocks are stored by id and concatenated in index order, and the text IR requires ascending
+    /// consecutive labels — so an unfilled slot renders as a gap and the emitted IR fails to reparse
+    /// with "block label N out of order". The `case` lowering allocates its `cont` join up front;
+    /// when every arm ends in `ret` — which v0.6.2's `system` module does and v0.4.0's did not —
+    /// nothing ever branches there and the slot stays empty. Other lowerings that pre-allocate a
+    /// join have the same latent shape, so this closes the class rather than that one site.
+    ///
+    /// **Only genuinely unreferenced blocks get stubbed.** If some terminator does target the
+    /// missing block then the lowering dropped a block it still branches to, and quietly emitting
+    /// `unreachable` would convert that into a trap at run instead of an error at compile time. That
+    /// one fails the translation and names the block.
+    fn close_block_gaps(&mut self) -> Result<(), LengError> {
+        for id in 0..self.blocks.len() {
+            if !self.blocks[id].is_empty() {
+                continue;
+            }
+            // A block reference in a terminator is the bare id followed by its argument list
+            // (`br 3(v0)`, `br_if v4 3(v0) 2(v0)`, `br_table v4 [3(v0)] 2(v0)`); nothing else in the
+            // text puts a bare integer immediately before `(`.
+            let needle = format!("{id}(");
+            let referenced = self.blocks.iter().any(|b| {
+                b.match_indices(&needle).any(|(at, _)| {
+                    // Not a longer number (`13(` is not block 3) and not a value (`v3(`).
+                    at == 0 || {
+                        let prev = b.as_bytes()[at - 1];
+                        !prev.is_ascii_digit() && prev != b'v'
+                    }
+                })
+            });
+            if referenced {
+                return Err(LengError::Malformed(format!(
+                    "block {id} is branched to but was never emitted"
+                )));
+            }
+            let params = self.block_params(id as u32);
+            self.blocks[id] = format!("block {id} {params} {{\n  unreachable\n  }}\n");
+        }
+        Ok(())
     }
 
     fn new_block_id(&mut self) -> u32 {
