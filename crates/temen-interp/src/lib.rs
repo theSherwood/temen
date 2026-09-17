@@ -11,6 +11,7 @@
 /// Phase-1b bytecode-dispatch engine (see `INTERP_PERF.md`) — a flat, operand-resolved execution
 /// path, not yet the default; gated by the equality harness against this interpreter.
 pub mod bytecode;
+pub mod journal;
 pub mod moment;
 
 use std::cmp::Reverse;
@@ -27332,6 +27333,27 @@ impl Mem {
 
     /// Read one byte; unwritten anonymous pages read as zero. A [`PageProt::Backed`] page redirects
     /// to its §13 region buffer (so an aliased page reads whatever the shared backing holds).
+    /// Read `len` raw bytes at an **already-confined absolute** address — the form
+    /// [`watch_accesses`] reports, so the undo journal ([`crate::journal`]) pairs with it directly
+    /// rather than re-confining a window-relative one through [`read_window`](Self::read_window).
+    ///
+    /// The pure byte view: bounds are the caller's (the address came from `confine_checked`) and no
+    /// protection check runs, so a pre-image is readable even on a page the guest is about to fault
+    /// on. Routes through [`byte`](Self::byte), so a §13 `Backed` page reads its region's bytes.
+    pub(crate) fn read_abs(&self, abs: u64, len: usize) -> Vec<u8> {
+        (0..len as u64).map(|k| self.byte(abs + k)).collect()
+    }
+
+    /// Write raw bytes back at an absolute address — the symmetric restore for
+    /// [`read_abs`](Self::read_abs), used to re-apply a journal pre-image. Protection-free for the
+    /// same reason: undo must be able to put back a byte on a page whose protection changed after
+    /// the write it is undoing.
+    pub(crate) fn write_abs(&mut self, abs: u64, data: &[u8]) {
+        for (k, b) in data.iter().enumerate() {
+            self.set_byte(abs + k as u64, *b);
+        }
+    }
+
     fn byte(&self, off: u64) -> u8 {
         // Fast path: no §13 region is mapped, so no page can be `Backed` — go straight to `back`
         // without touching the address-space lock (the hot, overwhelmingly common case).
