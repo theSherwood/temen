@@ -50,9 +50,11 @@
 //! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
 //! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
 //!
-//! Its first rendering found one: `child_offer` answers `-EINVAL` on the coop driver and traps on
-//! the parallel one (#1566). The same four rows that need a live unit or peer stay `Unaudited` here
-//! as on the debugger column.
+//! Its first rendering found two, both on the `Instantiator` row: `child_offer` answered `-EINVAL`
+//! on the coop driver and trapped on the parallel one (fixed, #1566), and op 13's named-grant
+//! decline traps where it should answer and precedes its handle resolve (#1570, open — so the cell
+//! is still `NotYet`). The same four rows that need a live unit or peer stay `Unaudited` here as on
+//! the debugger column.
 //!
 //! The remaining three axes are populated as their predicates become locatable; until then their
 //! cells read `Unaudited`, which is the point — an unaudited cell is visible, countable, and cannot
@@ -260,14 +262,20 @@ const K: Cell = Cell {
     status: Status::Full,
     note: "",
 };
-/// The one concurrency-axis gap the column's first rendering found (#1566): `child_offer` (op 14)
-/// answers `-EINVAL` on the cooperative driver and **traps** `ThreadFault` on the parallel one, so a
-/// guest probing a stale child handle survives on one driver and dies on the other — INVARIANTS #5
-/// (errors are values) and #9 (refuse probeably, never diverge). A `NotYet`, not a `Declines`: the
-/// op works, the two drivers disagree about how it fails.
-const CHILD_OFFER_DIVERGES: Cell = Cell {
+/// The concurrency-axis gap left on this row. The column's first rendering found two: `child_offer`
+/// (op 14) answered `-EINVAL` on the cooperative driver and **trapped** on the parallel one — fixed
+/// in #1566, the parallel driver now answers the same value — and `instantiate_module_named` (op 13),
+/// which remains (#1570): its named-grant decline is a `Trap::Malformed` rather than a probeable
+/// value, and it fires *before* the module handle is resolved, so a forged handle gets `Malformed`
+/// where the cooperative driver correctly says `CapFault`. Behind that sits the feature itself — a
+/// grant list cannot be re-granted into a child whose `Host` this driver has already moved to
+/// another thread — which is a port, not a rewording.
+///
+/// A `NotYet`, not a `Declines`: the op works on one driver, and the two disagree about the other.
+const INSTANTIATOR_CONCURRENCY_GAP: Cell = Cell {
     status: Status::NotYet,
-    note: "child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)",
+    note: "instantiate_module_named (op 13): the parallel driver's named-grant decline traps, and \
+           precedes the handle resolve (#1570); child_offer was fixed in #1566",
 };
 
 const fn declines(note: &'static str) -> Cell {
@@ -345,7 +353,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             U,
             U,
-            CHILD_OFFER_DIVERGES,
+            INSTANTIATOR_CONCURRENCY_GAP,
             U,
             conditional(
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \

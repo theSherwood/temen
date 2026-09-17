@@ -14563,14 +14563,31 @@ fn run_vcpu_parallel<'scope, 'env>(
             false, // #1157: the OS preempts real threads — no in-engine quantum needed here
         );
         match stop {
-            // §3.6 (I36 slice 2): the serve/call/offer trio runs only on the cooperative
-            // driver (`drive`); a serving module never reaches the parallel driver (the
-            // qualification veto refuses svc + threads together) — fail closed if it somehow
-            // does, rather than park unwakeably. I48 `BlockOnFiber` is likewise cooperative-only
+            // §3.6 (I36 slice 2): the serve/call pair runs only on the cooperative driver
+            // (`drive`); a serving module never reaches the parallel driver (the qualification veto
+            // refuses svc + threads together) — fail closed if it somehow does, rather than park
+            // unwakeably. (`child_offer` was grouped here until #1566; see the arm above.) I48 `BlockOnFiber` is likewise cooperative-only
             // (this path passes `cooperative: false`), so it never arises here — grouped in.
+            // §3.6 `child_offer` (op 14) — #1566. Unlike its neighbours below, this one **is**
+            // reachable here: the qualification veto that keeps a serving module off this driver
+            // covers the svc ops, and `child_offer` is an `Instantiator` op, so a single-vCPU guest
+            // that never spawns a thread reaches it with nothing refusing first. The capability
+            // itself is genuinely unavailable — minting a live offer needs the CALLEE's powerbox,
+            // and this driver moves each child's `Host` into that child's own OS thread, publishing
+            // only its result through `reg`, so the parent has no path to it (the same reason the
+            // browser's per-Worker driver fails closed on a stashed powerbox).
+            //
+            // But "unavailable" is a value, not a trap. The cooperative driver answers `-EINVAL`
+            // for a child it cannot resolve, so this answers the same: one op, one answer, whichever
+            // loop is driving (INVARIANTS #9), and a guest probing a stale child handle is not
+            // killed for the driver it happened to land on (#5 — errors are values, traps are for
+            // forgery). It used to be grouped into the fail-closed trap below on the premise that it
+            // could not arrive.
+            Ok(VcpuStop::ChildOffer { dst, .. }) => {
+                vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            }
             Ok(VcpuStop::LiveCall { .. })
             | Ok(VcpuStop::SvcWait)
-            | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
             | Ok(VcpuStop::BlockOnFiber { .. })
