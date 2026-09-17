@@ -163,7 +163,7 @@ pub use mem::win_commit_rw;
 
 // The §5 W3 frame-pointer walk, under its own fault recovery — the `trap_walk` fuzz target's entry
 // (#1487). See `mem::walk_trap_frame_chain`.
-#[cfg(fiber_rt)]
+#[cfg(all(unix, fiber_rt))]
 pub use mem::walk_trap_frame_chain;
 
 /// Whether this build's JIT lowers the §12 fiber/thread/futex ops (`cont.*`, `thread.*`,

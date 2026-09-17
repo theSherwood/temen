@@ -211,6 +211,12 @@ int temen_take_trap_frame(uintptr_t *pc, uintptr_t *rets, int max) {
     return n;
 }
 
+/* Peek the fiber running on this thread *now* (not the captured one) — for the Windows VEH path, whose
+ * memory-fault capture lives Rust-side and snapshots this at fault time. `TEMEN_NO_FIBER` = root. */
+int64_t temen_current_fiber(void) {
+    return g_current_fiber;
+}
+
 /* The guest fiber handle captured with the most recent trap (paired with `temen_take_trap_frame`), or
  * `TEMEN_NO_FIBER` when the root computation (no fiber) trapped. Not cleared — read it right after a
  * successful `temen_take_trap_frame`. */

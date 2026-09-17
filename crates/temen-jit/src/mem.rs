@@ -269,6 +269,7 @@ pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
 /// Reads memory reachable from `fp` by the walk's own rules. A fault on any link is recovered, so an
 /// arbitrary `fp` is sound; this is the whole point of the entry.
 #[doc(hidden)]
+#[cfg(unix)]
 pub unsafe fn walk_trap_frame_chain(fp: usize) -> Vec<usize> {
     extern "C" {
         fn temen_capture_explicit_trap(guest_fp: usize);
@@ -748,44 +749,76 @@ mod pal {
         static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
         // Set by the VEH before it restores the context, read after RtlCaptureContext returns.
         static TRIPPED: Cell<bool> = const { Cell::new(false) };
+        // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
+        // captures from the access-violation `CONTEXT` *before* it overwrites that context with the
+        // recovery one. Read + cleared by `take_trap_frame`. A fixed buffer (no allocation in the VEH).
+        static TRAP_VALID: Cell<bool> = const { Cell::new(false) };
+        static TRAP_PC: Cell<usize> = const { Cell::new(0) };
+        static TRAP_RETS: Cell<[usize; TRAP_MAXFRAMES]> = const { Cell::new([0; TRAP_MAXFRAMES]) };
+        static TRAP_N: Cell<usize> = const { Cell::new(0) };
+        // Per-fiber attribution (§5 W3 / §23-D57): the fiber running when the fault fired, snapshotted
+        // in the VEH (the C current-fiber TLS the fiber runtime maintains). `-1` = root (no fiber).
+        static TRAP_FIBER: Cell<i64> = const { Cell::new(-1) };
+    }
+
+    /// Max trap-backtrace frames captured (matches the unix shim's `TEMEN_TRAP_MAXFRAMES`).
+    const TRAP_MAXFRAMES: usize = 64;
+
+    /// Walk the frame-pointer chain from `fp` into `out`, returning the count — the Rust analog of the
+    /// unix shim's `temen_walk_fp_chain` (DEBUGGING.md §5/W3). The JIT's `preserve_frame_pointers` gives
+    /// every guest frame a `{ saved_fp, ret_addr }` record (`*fp` = caller's saved fp, `*(fp+1)` = its
+    /// return address). Bounded — aligned, non-null, strictly-increasing links, a span backstop, the
+    /// frame cap — so a corrupt chain terminates instead of looping or reading wild memory.
+    ///
+    /// # Safety
+    /// `fp` must be a live frame pointer of guest JIT code (the faulting `CONTEXT`'s `Rbp`); reads the
+    /// intact-at-fault guest stack. Called only from the VEH, before anything unwinds.
+    unsafe fn walk_fp_chain(fp: usize, out: &mut [usize; TRAP_MAXFRAMES]) -> usize {
+        const SPAN: usize = 8 * 1024 * 1024; // don't chase a corrupt chain off the stack
+        let align = core::mem::size_of::<usize>() - 1;
+        let (mut cur, start) = (fp, fp);
+        let mut n = 0;
+        while n < TRAP_MAXFRAMES
+            && cur != 0
+            && cur & align == 0
+            && cur >= start
+            && cur - start < SPAN
+        {
+            let next = *(cur as *const usize);
+            let ret = *((cur + core::mem::size_of::<usize>()) as *const usize);
+            out[n] = ret;
+            n += 1;
+            if next <= cur {
+                break; // frame pointers grow toward the base; a non-increasing link is the end
+            }
+            cur = next;
+        }
+        n
     }
 
     /// Capture the trap-time backtrace from the faulting `CONTEXT` (§5/W3): the faulting `Rip` is the
-    /// innermost frame (symbolized directly by the host), and the `Rbp` chain gives the callers.
-    ///
-    /// This hands off to the shared `trap_capture.c` helper — the *same* entry point the unix signal
-    /// handler calls. Windows used to carry its own Rust copy of the frame-pointer walk and its own
-    /// capture thread-locals, so an explicit-check trap (which always went through the C helper) and a
-    /// memory fault produced the same data by two different paths (INVARIANTS #15). One walk means one
-    /// place where the walk's own fault recovery has to be right (#1487), which is the whole reason
-    /// the duplicate had to go rather than grow a second guard.
+    /// innermost frame (symbolized directly by the host), and the `Rbp` chain gives the callers. Called
+    /// from the VEH while the guest stack is still intact, before the recovery context is restored.
     ///
     /// # Safety
-    /// `ctx` is the live faulting context for an in-window access violation in guest JIT code. Called
-    /// from the VEH while the guest stack is still intact, before the recovery context is restored.
+    /// `ctx` is the live faulting context for an in-window access violation in guest JIT code.
     unsafe fn capture_trap_frame(ctx: &CONTEXT) {
+        let mut rets = [0usize; TRAP_MAXFRAMES];
+        let n = walk_fp_chain(ctx.Rbp as usize, &mut rets);
+        TRAP_PC.with(|c| c.set(ctx.Rip as usize));
+        TRAP_RETS.with(|c| c.set(rets));
+        TRAP_N.with(|c| c.set(n));
+        // Snapshot the running fiber at fault time (the C trap-capture TLS the fiber runtime maintains).
         extern "C" {
-            fn temen_store_trap_frame(pc: usize, fp: usize);
+            fn temen_current_fiber() -> i64;
         }
-        temen_store_trap_frame(ctx.Rip as usize, ctx.Rbp as usize);
+        TRAP_FIBER.with(|c| c.set(unsafe { temen_current_fiber() }));
+        TRAP_VALID.with(|c| c.set(true));
     }
 
     unsafe extern "system" fn veh(ep: *mut EXCEPTION_POINTERS) -> i32 {
-        extern "C" {
-            fn temen_walk_in_progress() -> i32;
-        }
         let ep = &*ep;
         let rec = &*ep.ExceptionRecord;
-        // Our own backtrace walk faulted (#1487). It reads the guest's stack, and the guest chooses
-        // what is in it, so a planted frame link can steer it onto an unmapped page — and the page it
-        // lands on may well be *inside* `[lo, hi)` (the observed unix case is the window's null
-        // guard), which would otherwise look to the test below exactly like a fresh guest fault and
-        // re-enter the capture. Stand down and let the walk's own `__except` in `trap_capture.c`
-        // unwind it; the backtrace is truncated to what it published and the original trap is still
-        // reported. A VEH runs before SEH frame handlers, so returning here is what lets it.
-        if temen_walk_in_progress() != 0 {
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
         if rec.ExceptionCode == STATUS_ACCESS_VIOLATION {
             // ExceptionInformation[1] is the faulting address for an access violation.
             let addr = rec.ExceptionInformation[1];
@@ -830,21 +863,29 @@ mod pal {
         });
     }
 
-    /// Read and clear the most recent caught trap's stack (§5/W3): the faulting `pc`, the
-    /// frame-pointer chain's return addresses, and the fiber running at the trap (§23-D57; `-1` =
-    /// root). Both Windows capture paths — a memory fault via the VEH and an explicit-check trap
-    /// (div-by-zero etc.) from JIT code — now publish into the shared `trap_capture.c` thread-local,
-    /// so this is one read rather than a Rust capture with a C fallback. `None` if nothing was
-    /// captured.
+    /// Read and clear the most recent caught trap's stack (§5/W3): the faulting `pc` + the
+    /// frame-pointer chain's return addresses. Two capture paths feed it on Windows — a **memory
+    /// fault** lands in the VEH (Rust thread-local, above), and an **explicit-check trap** (div-by-zero
+    /// etc.) lands in the shared `trap_capture.c` helper (its C thread-local, `temen_take_trap_frame`).
+    /// A run trips at most one, so check the Rust capture first and fall back to the C one. `None` if
+    /// neither captured.
     pub(super) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
+        if TRAP_VALID.with(|c| c.get()) {
+            TRAP_VALID.with(|c| c.set(false));
+            let pc = TRAP_PC.with(|c| c.get());
+            let n = TRAP_N.with(|c| c.get());
+            let rets = TRAP_RETS.with(|c| c.get());
+            let fiber = TRAP_FIBER.with(|c| c.get());
+            return Some((pc, rets[..n].to_vec(), fiber));
+        }
+        // Explicit-check trap: the C helper (`trap_capture.c`) stashed it in its own thread-local.
         extern "C" {
             fn temen_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
             fn temen_take_trap_fiber() -> i64;
         }
         const MAX: usize = 64;
         let (mut pc, mut rets) = (0usize, [0usize; MAX]);
-        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot buffer; the fiber
-        // pairs with the same capture (read right after, before any other trap can overwrite it).
+        // SAFETY: reads+clears the shim's thread-locals into `pc` + the `MAX`-slot buffer.
         let n = unsafe { temen_take_trap_frame(&mut pc, rets.as_mut_ptr(), MAX as i32) };
         let fiber = unsafe { temen_take_trap_fiber() };
         (n >= 0).then(|| (pc, rets[..n as usize].to_vec(), fiber))
@@ -1160,11 +1201,11 @@ mod tests {
 // they are not a gate. These drive the walk directly with a chain built to fault, which is.
 //
 // Unit tests rather than an integration test: the `trap_capture.c` symbols are linked into this
-// crate, not re-exported from its rlib. Arch- and platform-independent (the chain is synthetic, so no
-// register or frame layout is assumed), gated on `fiber_rt` because that is exactly where
-// `install_guard`/`run_guarded` exist — so the `cross-os` lane runs this on macOS/aarch64 and on
-// windows, where it is the only thing that exercises the `__try` arm of the guard at runtime.
-#[cfg(all(test, fiber_rt))]
+// crate, not re-exported from its rlib. Arch-independent — the chain is synthetic, so no register or
+// frame layout is assumed — so `fiber_rt` (where `install_guard`/`run_guarded` exist) also puts this
+// under macOS/aarch64 in the `cross-os` lane. **Unix only**: the windows capture keeps its own walk,
+// which this recovery does not cover — see #1575.
+#[cfg(all(test, unix, fiber_rt))]
 mod trap_walk_tests {
     use core::ptr;
 
@@ -1223,11 +1264,9 @@ mod trap_walk_tests {
         }
     }
 
-    #[cfg(unix)]
     fn page_size() -> usize {
         unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
     }
-    #[cfg(unix)]
     fn reserve_rw(len: usize) -> *mut u8 {
         let p = unsafe {
             libc::mmap(
@@ -1242,7 +1281,6 @@ mod trap_walk_tests {
         assert_ne!(p, libc::MAP_FAILED, "mmap");
         p.cast()
     }
-    #[cfg(unix)]
     fn make_inaccessible(at: *mut u8, len: usize) {
         assert_eq!(
             unsafe { libc::mprotect(at.cast(), len, libc::PROT_NONE) },
@@ -1250,38 +1288,8 @@ mod trap_walk_tests {
             "mprotect"
         );
     }
-    #[cfg(unix)]
     fn release(base: *mut u8, len: usize) {
         unsafe { libc::munmap(base.cast(), len) };
-    }
-
-    #[cfg(windows)]
-    fn page_size() -> usize {
-        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
-        unsafe { GetSystemInfo(&mut si) };
-        si.dwPageSize as usize
-    }
-    #[cfg(windows)]
-    fn reserve_rw(len: usize) -> *mut u8 {
-        use windows_sys::Win32::System::Memory::{
-            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
-        };
-        let p = unsafe { VirtualAlloc(ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
-        assert!(!p.is_null(), "VirtualAlloc");
-        p.cast()
-    }
-    #[cfg(windows)]
-    fn make_inaccessible(at: *mut u8, len: usize) {
-        use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_NOACCESS};
-        let mut old = 0u32;
-        let ok = unsafe { VirtualProtect(at.cast(), len, PAGE_NOACCESS, &mut old) };
-        assert!(ok != 0, "VirtualProtect");
-    }
-    #[cfg(windows)]
-    fn release(base: *mut u8, _len: usize) {
-        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
-        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
     fn take() -> Option<(usize, Vec<usize>)> {

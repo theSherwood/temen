@@ -1144,11 +1144,13 @@ and the capture stays within the frame cap. Arbitrary is the right input because
 own stack. Measured at ~3% of executions taking a recovered fault, so the target reaches the path it
 gates rather than passing trivially.
 
-Windows no longer keeps a second copy of the walk. The VEH's memory-fault capture used to have its own
-Rust `walk_fp_chain` plus its own capture thread-locals, while explicit traps went through the C
-helper — one behaviour, two paths (INVARIANTS #15), and the fix above would have needed two guards.
-Both Windows paths now publish into the shared `trap_capture.c` capture, so `take_trap_frame` is one
-read.
+**The recovery is unix-only for now, and windows still keeps two walks.** The VEH's memory-fault
+capture has its own Rust `walk_fp_chain` and its own capture thread-locals, while explicit traps go
+through the C helper — one behaviour, two paths (INVARIANTS #15), so the guard above reaches only the
+second of them there. Collapsing the two (routing the VEH's capture through `temen_store_trap_frame`,
+as unix does) was tried and reverted: it aborts `pal_guard_catches_tail_fault_not_in_window` with
+`0xc0000005` under `cargo nextest` — one process per test — while the *same commit* passes all 25 lib
+tests under `cargo test`, where they share a process. That difference is the lead; #1575 carries it.
 
 ---
 
