@@ -256,6 +256,30 @@ pub(crate) fn take_trap_frame() -> Option<(usize, Vec<usize>, i64)> {
     pal::take_trap_frame()
 }
 
+/// Walk a frame-pointer chain under the trap-time capture's own fault recovery (§5 W3, #1487),
+/// returning the return addresses it collected: `[0]` is this call's own return site, then one per
+/// frame the chain yielded before it ended or ran off a mapped page.
+///
+/// Exposed for the `trap_walk` fuzz target, which gates the property the recovery exists for: the
+/// walk reads the **guest's** stack, so its input is whatever the guest chose to put there, and for
+/// *any* contents it must terminate, stay within the frame cap, and not take the host with it. Not a
+/// runtime entry point — in production the trap detectors call the capture directly.
+///
+/// # Safety
+/// Reads memory reachable from `fp` by the walk's own rules. A fault on any link is recovered, so an
+/// arbitrary `fp` is sound; this is the whole point of the entry.
+#[doc(hidden)]
+pub unsafe fn walk_trap_frame_chain(fp: usize) -> Vec<usize> {
+    extern "C" {
+        fn temen_capture_explicit_trap(guest_fp: usize);
+    }
+    pal::install_guard();
+    temen_capture_explicit_trap(fp);
+    take_trap_frame()
+        .map(|(_, rets, _)| rets)
+        .unwrap_or_default()
+}
+
 /// Run an `Entry`-shaped `code` with faults in `[lo, hi)` caught (detect-and-kill), for a window
 /// fault range obtained from [`GuestWindow::fault_range`]. Used to run a fiber resume on a worker (a
 /// guest memory fault inside the fiber unwinds back here — the fiber stack is abandoned, the domain is
@@ -1136,69 +1160,128 @@ mod tests {
 // they are not a gate. These drive the walk directly with a chain built to fault, which is.
 //
 // Unit tests rather than an integration test: the `trap_capture.c` symbols are linked into this
-// crate, not re-exported from its rlib. Arch-independent — the chain is synthetic, so no register or
-// frame layout is assumed — and gated on `fiber_rt` because that is exactly where `install_guard`
-// exists, which puts the walk under macOS/aarch64 in the `cross-os` lane too.
-#[cfg(all(test, unix, fiber_rt))]
+// crate, not re-exported from its rlib. Arch- and platform-independent (the chain is synthetic, so no
+// register or frame layout is assumed), gated on `fiber_rt` because that is exactly where
+// `install_guard`/`run_guarded` exist — so the `cross-os` lane runs this on macOS/aarch64 and on
+// windows, where it is the only thing that exercises the `__try` arm of the guard at runtime.
+#[cfg(all(test, fiber_rt))]
 mod trap_walk_tests {
+    use core::ptr;
+
     extern "C" {
         fn temen_capture_explicit_trap(guest_fp: usize);
         fn temen_take_trap_frame(pc: *mut usize, rets: *mut usize, max: i32) -> i32;
     }
 
-    /// Two readable frames followed by a link into a `PROT_NONE` page, all inside the walk's span.
+    /// Two readable frames followed by a link into an inaccessible page, all inside the walk's span.
     ///
-    /// Three consecutive pages, the third `PROT_NONE`. Frame 0 sits at the base and frame 1 at `+16`,
-    /// each a `{ saved_fp, ret_addr }` record; frame 1's `saved_fp` points at page 2. Every one of the
-    /// loop's tests passes on that link — non-null, 8-aligned, greater than the current frame, ~8 KiB
-    /// into the span — so the walk dereferences it and faults. Same shape as the real failure, where
-    /// the link is the `mem_base` the JIT entry trampoline spilled and the page is the null guard.
+    /// Three consecutive pages, the third `PROT_NONE`/`PAGE_NOACCESS`. Frame 0 sits at the base and
+    /// frame 1 at `+16`, each a `{ saved_fp, ret_addr }` record; frame 1's `saved_fp` points at page
+    /// 2. Every one of the loop's tests passes on that link — non-null, pointer-aligned, greater than
+    /// the current frame, ~8 KiB into the span — so the walk dereferences it and faults. Same shape as
+    /// the real failure, where the link is the `mem_base` the JIT entry trampoline spilled and the
+    /// page it lands on is the window's null guard.
     struct FaultingChain {
         base: *mut u8,
         len: usize,
+        page: usize,
     }
 
     impl FaultingChain {
         fn new() -> Self {
-            let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+            let page = page_size();
             let len = page * 3;
-            let base = unsafe {
-                libc::mmap(
-                    core::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(base, libc::MAP_FAILED, "mmap");
-            let base = base.cast::<u8>();
+            let base = reserve_rw(len);
             let wall = unsafe { base.add(page * 2) }; // the wall the walk runs into
-            assert_eq!(
-                unsafe { libc::mprotect(wall.cast(), page, libc::PROT_NONE) },
-                0,
-                "mprotect"
-            );
+            make_inaccessible(wall, page);
+
             let w = base.cast::<usize>();
             unsafe {
                 w.write(base as usize + 16); // frame 0: saved_fp -> frame 1
                 w.add(1).write(0xf00d_0001); //          ret
-                w.add(2).write(wall as usize); // frame 1: saved_fp -> the PROT_NONE page
+                w.add(2).write(wall as usize); // frame 1: saved_fp -> the inaccessible page
                 w.add(3).write(0xf00d_0002); //          ret
             }
-            FaultingChain { base, len }
+            FaultingChain { base, len, page }
         }
 
         fn fp(&self) -> usize {
             self.base as usize
         }
+
+        /// The guarded range that *contains the wall* — i.e. the walk's fault will look to the trap
+        /// detector exactly like a guest window fault. This is #1487's observed shape.
+        fn wall_range(&self) -> (usize, usize) {
+            let wall = self.base as usize + self.page * 2;
+            (wall, wall + self.page)
+        }
     }
 
     impl Drop for FaultingChain {
         fn drop(&mut self) {
-            unsafe { libc::munmap(self.base.cast(), self.len) };
+            release(self.base, self.len);
         }
+    }
+
+    #[cfg(unix)]
+    fn page_size() -> usize {
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+    #[cfg(unix)]
+    fn reserve_rw(len: usize) -> *mut u8 {
+        let p = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED, "mmap");
+        p.cast()
+    }
+    #[cfg(unix)]
+    fn make_inaccessible(at: *mut u8, len: usize) {
+        assert_eq!(
+            unsafe { libc::mprotect(at.cast(), len, libc::PROT_NONE) },
+            0,
+            "mprotect"
+        );
+    }
+    #[cfg(unix)]
+    fn release(base: *mut u8, len: usize) {
+        unsafe { libc::munmap(base.cast(), len) };
+    }
+
+    #[cfg(windows)]
+    fn page_size() -> usize {
+        use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        let mut si: SYSTEM_INFO = unsafe { core::mem::zeroed() };
+        unsafe { GetSystemInfo(&mut si) };
+        si.dwPageSize as usize
+    }
+    #[cfg(windows)]
+    fn reserve_rw(len: usize) -> *mut u8 {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE,
+        };
+        let p = unsafe { VirtualAlloc(ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!p.is_null(), "VirtualAlloc");
+        p.cast()
+    }
+    #[cfg(windows)]
+    fn make_inaccessible(at: *mut u8, len: usize) {
+        use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_NOACCESS};
+        let mut old = 0u32;
+        let ok = unsafe { VirtualProtect(at.cast(), len, PAGE_NOACCESS, &mut old) };
+        assert!(ok != 0, "VirtualProtect");
+    }
+    #[cfg(windows)]
+    fn release(base: *mut u8, _len: usize) {
+        use windows_sys::Win32::System::Memory::{VirtualFree, MEM_RELEASE};
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
     fn take() -> Option<(usize, Vec<usize>)> {
@@ -1233,6 +1316,58 @@ mod trap_walk_tests {
             3,
             "trap site + the two readable frames: {rets:x?}"
         );
+        assert_eq!(rets[1], 0xf00d_0001);
+        assert_eq!(rets[2], 0xf00d_0002);
+    }
+
+    /// Entry-shaped probe: walk the chain whose base arrives as the window pointer.
+    extern "C" fn walk_from_mem(
+        _a: *const i64,
+        _r: *mut i64,
+        mem: *mut u8,
+        _t: *const core::ffi::c_void,
+        _tc: *mut i64,
+    ) {
+        // SAFETY: `mem` is the `FaultingChain` base the caller passed; the walk only reads.
+        unsafe { temen_capture_explicit_trap(mem as usize) };
+    }
+
+    /// **The ordering.** `temen_walk_in_progress()` is checked *before* the armed-range test, and
+    /// this is what says so: the wall the walk faults on is inside the guarded `[lo, hi)`, which is
+    /// #1487's observed shape (its gdb trace has both faults at exactly `g_lo`, the window's null
+    /// guard). A detector that tested the range first would treat the walk's own fault as a fresh
+    /// guest window fault — reporting a `MemoryFault` the guest never took, and on unix re-entering
+    /// the capture from a half-written one.
+    ///
+    /// So the assertion is that the guarded call reports **no** fault: the walk stood down, its
+    /// backtrace truncated, and the guest's run was left alone.
+    #[test]
+    fn the_walk_stands_down_before_the_armed_range_test() {
+        super::install_guard();
+        let chain = FaultingChain::new();
+        let (lo, hi) = chain.wall_range();
+
+        // SAFETY: `walk_from_mem` honours the `Entry` ABI and ignores every argument but `mem`, which
+        // carries the chain base; `[lo, hi)` is the chain's own inaccessible page.
+        let tripped = unsafe {
+            super::pal::run_guarded(
+                walk_from_mem,
+                ptr::null(),
+                ptr::null_mut(),
+                chain.base,
+                ptr::null(),
+                ptr::null_mut(),
+                lo,
+                hi,
+            )
+        };
+
+        assert!(
+            !tripped,
+            "the walk's own fault was reported to the host as a guest memory fault"
+        );
+        let (_, rets) = take().expect("the capture stands");
+        assert_eq!(rets.len(), 3, "{rets:x?}");
         assert_eq!(rets[1], 0xf00d_0001);
         assert_eq!(rets[2], 0xf00d_0002);
     }

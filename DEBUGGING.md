@@ -1138,6 +1138,12 @@ none. Bounding the walk to the thread's stack instead would be wrong here: fiber
 `g_current_fiber` exists precisely so a trap is attributed across that seam — the clamp would silently
 truncate every backtrace taken on a fiber.
 
+The walk is fuzzed (`fuzz/fuzz_targets/trap_walk.rs`, `cargo +nightly fuzz run trap_walk`) against the
+property the bracket exists for: for *arbitrary* chain contents the host survives, the walk terminates,
+and the capture stays within the frame cap. Arbitrary is the right input because the guest writes its
+own stack. Measured at ~3% of executions taking a recovered fault, so the target reaches the path it
+gates rather than passing trivially.
+
 Windows no longer keeps a second copy of the walk. The VEH's memory-fault capture used to have its own
 Rust `walk_fp_chain` plus its own capture thread-locals, while explicit traps went through the C
 helper — one behaviour, two paths (INVARIANTS #15), and the fix above would have needed two guards.
