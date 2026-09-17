@@ -96,6 +96,32 @@ const RTTI_VT_FIELD: &str = "vt.00";
 
 /// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
 /// translatable body (calls to it become Temen imports the host binds at link).
+/// True if a proc is an **intrinsic/instruction declaration** — `(pragmas (intrinsic "Bswap") …)`
+/// or `(instruction …)` — which v0.6.2's hexer emits with a non-void return and an **empty** body
+/// (`(stmts .)`). It is metadata for the `instr` application form, not code: `leng_tags.InstrC`
+/// requires an `instr`'s `SYM` to carry exactly one of these pragmas.
+///
+/// Treated like an `importc` extern, because that is what it is from here: no body to translate, and
+/// its applications become imports the link binds — for nimony's intrinsics, to the compute-shim
+/// funcs `COMPUTE_LEAVES` already lists (`bswap64` is row 13). v0.4.0 declared the same operations
+/// as `importc` C externs, so the binding path is unchanged; only the declaration's spelling moved.
+///
+/// Without this they translated as ordinary procs and tripped "non-void proc falls off the end
+/// without `ret`" — a bodyless proc cannot return its non-void result.
+fn is_intrinsic_proc(proc_node: &Node) -> bool {
+    matches!(proc_node.args().get(3), Some(p)
+        if p.tag() == Some("pragmas")
+            && p.args()
+                .iter()
+                .any(|x| matches!(x.tag(), Some("intrinsic" | "instruction"))))
+}
+
+/// Either kind of bodyless declaration: a C extern or an intrinsic. Every site that skipped
+/// `importc` procs has to skip these too, and for the same reason.
+fn is_bodyless_proc(proc_node: &Node) -> bool {
+    is_importc_proc(proc_node) || is_intrinsic_proc(proc_node)
+}
+
 fn is_importc_proc(proc_node: &Node) -> bool {
     matches!(proc_node.args().get(3), Some(p)
         if p.tag() == Some("pragmas") && p.args().iter().any(|x| x.tag() == Some("importc")))
@@ -1300,7 +1326,7 @@ impl Translator {
     /// are skipped.
     fn collect_varargs_imports(&mut self, root: &Node) -> Result<(), LengError> {
         for item in root.args() {
-            if item.tag() == Some("proc") && is_importc_proc(item) {
+            if item.tag() == Some("proc") && is_bodyless_proc(item) {
                 if let Some(fixed) = varargs_fixed_count(item) {
                     let name = sym_def(&item.args()[0])?;
                     self.varargs_imports.insert(name, fixed);
@@ -1883,7 +1909,7 @@ impl Translator {
         };
         let mut out: Vec<(String, TyDesc)> = Vec::new();
         for item in root.args() {
-            if item.tag() != Some("proc") || is_importc_proc(item) {
+            if item.tag() != Some("proc") || is_bodyless_proc(item) {
                 continue;
             }
             let a = item.args();
@@ -1918,7 +1944,7 @@ impl Translator {
     pub fn importc_procs(root: &Node) -> Result<Vec<(String, String)>, LengError> {
         let mut out = Vec::new();
         for item in root.args() {
-            if item.tag() == Some("proc") && is_importc_proc(item) {
+            if item.tag() == Some("proc") && is_bodyless_proc(item) {
                 let a = item.args();
                 if let Some(first) = a.first() {
                     let sym = sym_def(first)?;
@@ -1957,7 +1983,7 @@ impl Translator {
         t.collect_types(root)?;
         let mut out: Vec<(String, Vec<ValType>, Option<ValType>)> = Vec::new();
         for item in root.args() {
-            if item.tag() != Some("proc") || is_importc_proc(item) {
+            if item.tag() != Some("proc") || is_bodyless_proc(item) {
                 continue;
             }
             let a = item.args();
@@ -2033,7 +2059,7 @@ impl Translator {
         // local `(call mk.0. …)` is counted alongside a cross-module `(call mk.0.<other> …)`).
         t.import_sret_procs(ext_sret);
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 if let Some(sret) = t.ret_sret(&item.args()[2])? {
                     let name = sym_def(&item.args()[0])?;
                     t.procs.insert(
@@ -2060,7 +2086,7 @@ impl Translator {
         };
         let mut out = Vec::new();
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 let name = sym_def(&item.args()[0])?;
                 let base = t.proc_needs_frame(item);
                 let mut callees = HashSet::default();
@@ -2168,7 +2194,7 @@ impl Translator {
                 // An `importc` proc is an **extern** (a C bottom-edge function — `memcpy`, `mmap`):
                 // it has no body to translate. Skip it, so a call to it lowers to an Temen import the
                 // host/runtime binds at link (the same seam the ~15 C funcs already use).
-                Some("proc") if is_importc_proc(item) => {}
+                Some("proc") if is_bodyless_proc(item) => {}
                 Some("proc") => {
                     let (name, params, ret0) = self.proc_sig(item)?;
                     let sret = self.ret_sret(&item.args()[2])?;
@@ -2279,7 +2305,7 @@ impl Translator {
     fn compute_funcref_targets(&mut self, root: &Node) -> Result<(), LengError> {
         let mut proc_names: HashSet<String> = HashSet::default();
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 proc_names.insert(sym_def(&item.args()[0])?);
             }
         }
@@ -2736,7 +2762,15 @@ impl Translator {
             }
             _ => {}
         }
-        f.close_fallthrough()?;
+        // Name the proc in the error. "non-void proc falls off the end without `ret`" on its own is
+        // unactionable in a module with a hundred procs — the system module is exactly that.
+        f.close_fallthrough().map_err(|e| match e {
+            LengError::Malformed(m) => LengError::Malformed(format!(
+                "{m} (proc `{}`)",
+                a.first().and_then(|n| n.as_atom()).unwrap_or("?")
+            )),
+            other => other,
+        })?;
         let used_memory = f.used_memory;
         for blk in f.blocks {
             out.push_str(&blk);
