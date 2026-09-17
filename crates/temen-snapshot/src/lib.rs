@@ -184,6 +184,9 @@ use temen_ir::Module;
 /// returns the handler to install or refuses. Before this, *any* live host capability made the freeze
 /// refuse outright (`NonDurableKind::HostProc`), which is to say every capability-using guest. Emitted
 /// only when the domain holds a named host capability, so an artifact without one keeps the v20 layout.
+/// v24 (#1538): each frozen fiber's record carries a `consumed` flag — its last `suspend` value was
+/// already taken by a resumer that ran on, so a thaw claim delivers its argument at the fiber's rewound
+/// `suspend` instead of re-parking it. A v23 artifact's fiber record lacks the flag and is rejected.
 /// v23 (#1361 step 2): a completed-but-unjoined **detached** §14 child rides the control section —
 /// its `(parent_task, slot, join-result)` trails the nested-child block (which is emitted with count
 /// 0 when only detached residue is present, so the decoder always reads a nested count first). An
@@ -191,7 +194,7 @@ use temen_ir::Module;
 /// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
 /// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
 /// whose domain holds no `Budget` is byte-identical to v21.
-const FORMAT_VERSION: u16 = 23;
+const FORMAT_VERSION: u16 = 24;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -540,6 +543,7 @@ pub fn freeze_with_prots(
                 write_uleb(b, f.sp as u64);
                 write_uleb(b, f.shadow_sp);
                 write_uleb(b, f.generation); // 48-bit fiber generation (recycling step 2)
+                write_uleb(b, u64::from(f.consumed)); // v24 (#1538): the park was consumed
             }
             if !vcpus.is_empty() {
                 write_uleb(b, vcpus.len() as u64);
@@ -1137,12 +1141,18 @@ fn decode_control(
         let shadow_sp = cr.uleb()?;
         let generation = cr.uleb()?; // 48-bit fiber generation (u64); a pre-widening artifact's
                                      // small value decodes identically (wire-compatible).
+        let consumed = match cr.uleb()? {
+            0 => false,
+            1 => true,
+            _ => return Err(RestoreError::Malformed), // v24 (#1538): a flag, nothing else
+        };
         fibers.push(FrozenFiber {
             slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
             func,
             sp,
             shadow_sp,
             generation,
+            consumed,
         });
     }
     // Spawned-vCPU residue (slice 3.2.1): present iff the header declares spawned vCPUs.

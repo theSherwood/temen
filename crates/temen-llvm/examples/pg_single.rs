@@ -30,7 +30,7 @@ fn main() {
     let opts = temen_llvm::TranslateOptions {
         stub_unresolved_externs: true,
         stack_page: 65536,
-        child_entry: false,
+        ..Default::default()
     };
     let input = &args[1];
     let t0 = std::time::Instant::now();

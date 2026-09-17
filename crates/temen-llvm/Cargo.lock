@@ -659,6 +659,7 @@ name = "temen-llvm"
 version = "0.0.0"
 dependencies = [
  "temen-dap",
+ "temen-durable",
  "temen-encode",
  "temen-interp",
  "temen-ir",
@@ -667,6 +668,7 @@ dependencies = [
  "temen-peval",
  "temen-posix",
  "temen-run",
+ "temen-snapshot",
  "temen-text",
  "temen-verify",
 ]
@@ -726,6 +728,15 @@ dependencies = [
  "temen-text",
  "temen-verify",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "temen-snapshot"
+version = "0.0.0"
+dependencies = [
+ "temen-encode",
+ "temen-interp",
+ "temen-ir",
 ]
 
 [[package]]

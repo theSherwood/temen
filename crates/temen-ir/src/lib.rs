@@ -298,6 +298,11 @@ pub mod durable_abi {
     pub const REGION_HEADER_LEN: u64 = 16;
     /// Per-context shadow-region stride: context `i` owns `[ShadowArena::region_base(i), +stride)`.
     pub const SHADOW_STRIDE: u64 = 1 << 12;
+    /// The most shadow contexts a declared arena may hold (`(end - base) / SHADOW_STRIDE`): one
+    /// machine word of allocator occupancy bits, and far above any fiber quota in the tree. The
+    /// verifier holds a declared arena to it; a producer that *places* an arena (the LLVM on-ramp's
+    /// `--shadow-arena`, #1534) sizes against the same number rather than a copy of it.
+    pub const MAX_SHADOW_CONTEXTS: usize = 64;
     /// Freeze/thaw **state-word values** ([`STATE_OFF`] / [`STATE_IN_REGION_OFF`]).
     pub const STATE_NORMAL: i32 = 0;
     /// A stop-the-world freeze is in progress (unwinding shadow frames).
@@ -3648,8 +3653,14 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
 /// entry has no capability prologue and the module's import manifest travels through untouched —
 /// nothing here is the retired resolve-and-rewrite bootstrap.
 ///
-/// The entry must take a single `i64` (the data-stack pointer) and return 0 or 1 values; its
-/// result becomes `_start`'s result. `_start` optionally seeds the guest heap words
+/// The entry must take **either a single `i64`** (the data-stack pointer, which `_start` passes as
+/// [`powerbox_entry_sp`]) **or nothing at all**, and return 0 or 1 values; its result becomes
+/// `_start`'s result. The paramless form is what lets a separately-compiled program keep its *own*
+/// frontend-emitted `_start` as the entry (#1536): that bootstrap already establishes `sp` itself and
+/// knows how to call the program's `main` — including a `main(argc, argv)`, whose arguments it reads
+/// from the §3e args buffer. Re-deriving the entry call here instead would mean duplicating the
+/// frontend's calling convention in the linker, and getting it wrong silently for any `main` shape
+/// beyond `main(void)`. `_start` optionally seeds the guest heap words
 /// ([`POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`], to the window's mapped boundary) when
 /// `seed_heap`, then calls the entry with `sp` = [`powerbox_entry_sp`]. The declared memory grows
 /// (never shrinks) to cover the data stack reserve. Every existing funcidx — in code, exports,
@@ -3667,12 +3678,15 @@ pub fn synth_manifest_start(
             module.funcs.len()
         )
     })?;
-    if ef.params.as_slice() != [ValType::I64] {
-        return Err(format!(
-            "powerbox entry must take a single i64 (the data-stack pointer), got params {:?}",
-            ef.params
-        ));
-    }
+    let entry_takes_sp = match ef.params.as_slice() {
+        [ValType::I64] => true,
+        [] => false,
+        other => {
+            return Err(format!(
+                "powerbox entry must take a single i64 (the data-stack pointer) or nothing, got params {other:?}"
+            ));
+        }
+    };
     if ef.results.len() > 1 {
         return Err(format!(
             "powerbox entry must return 0 or 1 value, got {:?}",
@@ -3725,12 +3739,20 @@ pub fn synth_manifest_start(
             });
         }
     }
-    insts.push(Inst::ConstI64(entry_sp as i64));
-    let sp = next;
-    next += 1;
+    // A paramless entry establishes its own `sp` (it is a frontend `_start`), so don't materialize
+    // one — an unused const would be dead weight in the bootstrap and `next` must stay in step with
+    // the values actually pushed, since the call's result is read back as `next`.
+    let args = if entry_takes_sp {
+        insts.push(Inst::ConstI64(entry_sp as i64));
+        let sp = next;
+        next += 1;
+        vec![sp]
+    } else {
+        Vec::new()
+    };
     insts.push(Inst::Call {
         func: entry + 1,
-        args: vec![sp],
+        args,
     });
     let term = if results.is_empty() {
         Terminator::Return(vec![])

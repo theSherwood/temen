@@ -1080,7 +1080,8 @@ pub struct Analysis {
     /// `interp_leaf[i]` — function `i` is **not** in-subset but is safe to run on the bytecode
     /// engine as a cross-tier leaf: a [`marshallable_sig`] signature (each arg/result fits the
     /// scratch — `i32`/`i64`/`f32`/`f64` one slot, `v128` two, #749), **memory-free**, makes no calls (a true
-    /// leaf, so no transitive window/state to share), and no concurrency / capability ops. A JITted
+    /// leaf, so no transitive window/state to share), and no concurrency / capability / `gc.roots`
+    /// ops (#1546 — a root-scan from inside a bounce cannot see the emitted caller's frame). A JITted
     /// caller reaches it via `env.call_interp`.
     pub interp_leaf: Vec<bool>,
     /// `reachable[i]` — function `i` is reachable from func 0 through call edges.
@@ -1462,6 +1463,16 @@ fn func_uses_indirect(f: &Func) -> bool {
 ///   is empty at a bounce entry, so it `CapFault`s. `cont.new`/`cont.resume` are *not* seeds: they
 ///   are self-contained (the drive owns both sides) and gating them would drop working coverage.
 ///
+/// A fourth seed, **`gc.roots`** (#1546), is here for a different and sharper reason than the three
+/// above. The bounce *can* run it — and that is the problem: it completes and returns an **incomplete
+/// answer**. GC.md §3.1 requires coverage of "every fiber not actively executing guest mutator code
+/// **+ the caller of `gc.roots`**", and at a bounce the caller chain runs down into the **emitted
+/// frame** that called `env.call_interp`. That frame's live values are wasm locals and operand-stack
+/// entries, which nothing can enumerate — not the guest, not the host (BROWSER.md: "on wasm even a
+/// thunk can't see JITted locals"). A root held only there is silently omitted, and a non-moving
+/// collector then frees a live object. Every other seed fails *closed* (a trap, or a decline); this
+/// one would fail **open**, which is why it is a seed rather than a documented limitation.
+///
 /// The property is **transitive**: inside a bounce every callee runs on the same nested drive, so a
 /// leaf is admissible only if its whole callee closure is. The fixpoint below propagates the seeds
 /// backwards over direct call edges. A `call.dyn` can dispatch to any table slot, so once anything in
@@ -1485,7 +1496,7 @@ fn bounce_serviceable(m: &Module) -> Vec<bool> {
     let mut bad: Vec<bool> = m
         .funcs
         .iter()
-        .map(|f| f.uses_threads() || f.uses_futex() || f.uses_suspend())
+        .map(|f| f.uses_threads() || f.uses_futex() || f.uses_suspend() || f.uses_gc_roots())
         .collect();
     // Monotone (only sets), so it converges in ≤ n passes.
     loop {
@@ -1523,14 +1534,8 @@ fn interp_leaf(f: &Func) -> bool {
         ) && b.insts.iter().all(|i| {
             !matches!(
                 i,
-                // #1546: `gc.roots` scans the interpreter's frames, so running it as a leaf while
-                // an emitted frame is live silently misses that frame's roots. It is not otherwise
-                // caught here — it writes its buffer through the op, not a `Store` — so a *bare*
-                // wrapper around it (no load, no store, no call) passed this predicate and became a
-                // cross-tier leaf even under a local table.
-                Inst::GcRoots { .. }
                 // memory ops (a leaf's fresh window would diverge from the shared one),
-                | Inst::Load { .. }
+                Inst::Load { .. }
                         | Inst::Store { .. }
                         | Inst::MemCopy { .. }
                         | Inst::MemMove { .. }
@@ -1544,10 +1549,19 @@ fn interp_leaf(f: &Func) -> bool {
                         // calls (a true leaf only — transitive tiers are a later refinement),
                         | Inst::Call { .. }
                         | Inst::CallIndirect { .. }
-                        // and host/capability ops (no powerbox in the cross-tier callback).
+                        // host/capability ops (no powerbox in the cross-tier callback),
                         | Inst::CapCall { .. }
                         | Inst::CallImport { .. }
                         | Inst::ImportAttach { .. }
+                        // and `gc.roots` (#1546): it would run, and answer with the emitted
+                        // caller's frame unscanned — see [`bounce_serviceable`]'s fourth seed.
+                        // `uses_concurrency` above does not cover it (that predicate is the
+                        // single-thread guarantee for the atomics lowering, a different question),
+                        // and neither does the memory rule above — the op writes its buffer through
+                        // itself, not a `Store`, so a *bare* wrapper (no load, no store, no call)
+                        // satisfied this predicate on its own terms. Excluded explicitly rather than
+                        // by accident of the call-free rule.
+                        | Inst::GcRoots { .. }
             )
         })
     })
@@ -3145,7 +3159,9 @@ fn compile_module_tierup_inner(
     //     function that calls a memory/cap helper stays emitted instead of being dropped
     //     (#887 measured this as ~30% → ~90% static coverage on the C-family cards).
     // #1370: the widened set admits any marshallable non-subset function, but a bounce into one that
-    // (transitively) uses threads/futex/`suspend` cannot complete — see [`bounce_serviceable`].
+    // (transitively) uses threads/futex/`suspend` cannot complete — and #1546: one that reaches
+    // `gc.roots` *would* complete, with this emitted frame's roots unscanned. Both are seeds of
+    // [`bounce_serviceable`], which cascades their callers off the emit set.
     let serviceable = bounce_serviceable(m);
     let leaf: Vec<bool> = (0..n)
         .map(|i| {
