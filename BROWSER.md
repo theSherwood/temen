@@ -817,7 +817,7 @@ Three classes, all with existing precedent in this repo:
 | §13 aliasing, page protection | fast path + deopt on the `call.cap` that creates it | zero until used |
 | atomics orderings | wasm seq-cst (safe over-approx) | negligible |
 | fibers / suspend / durable unwind | interp fallback (`Unsupported`, temen-jit precedent) | n/a |
-| `gc.roots` | interp fallback (locals unscannable) | n/a |
+| `gc.roots` | interp fallback, **module-granular** — a module that can reach it emits nothing (#1546) | n/a |
 | debug / single-step | interp tier | n/a |
 | `thread.spawn`/`join`/`wait` | end region, return to the vCPU event loop | boundary only |
 
@@ -1431,8 +1431,13 @@ Readings:
 
 Open questions to settle in slice 1: relooper now vs later (dispatcher first is the recommendation);
 deopt granularity (whole-domain vs per-function — whole-domain is simpler and page ops are rare);
-whether `gc.roots`-bearing functions bail at function or module granularity (function, if the
-partitioning is per-function anyway). Revisit fibers when JSPI / core stack-switching ships.
+whether `gc.roots`-bearing functions bail at function or module granularity — **settled: module**
+(#1546). Function granularity is sound only if an emitted frame can never be live while the op runs,
+and it can be: the #888 widened cross set bounces an emitted caller straight into a collecting
+helper, and on that path the host writes a bounce shim into *every* slot of the shared table, so an
+emitted `call.dyn` reaches any non-emitted function whatever the cross set says. A root held only in
+an emitted local is then missed and a live object freed. `module_uses_gc_roots` vetoes the emit at
+every entry in `temen-wasm-jit`. Revisit fibers when JSPI / core stack-switching ships.
 
 ## Verification
 

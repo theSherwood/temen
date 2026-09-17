@@ -1214,6 +1214,33 @@ fn module_uses_page_ops(m: &Module) -> bool {
     m.funcs.iter().any(func_uses_page_ops)
 }
 
+/// #1546 — whether any function in `m` can run `gc.roots`, in which case **this tier emits nothing**.
+///
+/// `gc.roots` enumerates the live candidate words of the *interpreter's* frames and parked fibers
+/// (GC.md §3.2: defined semantically, realized per backend). An emitted frame's locals and operand
+/// stack are addressable by neither the guest nor the host, so a root held only there is invisible to
+/// it — and a non-moving collector then frees a live object. That is silent heap corruption, not a
+/// decline, so the op cannot be serviced *while any emitted frame of this module may be live*.
+///
+/// Hence **module**, not function, granularity — the posture BROWSER.md documents ("`gc.roots` bails
+/// unconditionally on this tier"). Function granularity is sound only if an emitted frame can never
+/// be live across a bounce that reaches the op, and two routes broke that:
+///
+/// * the #888 **widened** cross set (B2) admits any [`marshallable_sig`] non-in-subset function, so
+///   an emitted caller could bounce directly into a collecting helper; and
+/// * on that same path the host writes a bounce shim into **every** program slot of the shared table,
+///   so an emitted `call.dyn` reaches any non-emitted function whatever a cross set says — which is
+///   why narrowing the cross set alone cannot fix this, and why the veto is module-wide.
+///
+/// The cost is bounded: a collecting guest runs wholly on the interpreter, which is the only tier
+/// that can see its roots at all. A precise wasm-tier realization is possible in principle (the
+/// durable transform's shadow stack already computes the live set in verified IR, DURABILITY.md §2);
+/// #1546 §3 tracks it, and until it exists this is a limitation of the *conservative-scan
+/// realization*, not of the capability.
+fn module_uses_gc_roots(m: &Module) -> bool {
+    m.funcs.iter().any(Func::uses_gc_roots)
+}
+
 /// Whether `f` invokes a §13 `SharedRegion` `map`/`unmap` (iface 4 ops 0/1) — the aliasing subset of
 /// [`func_uses_page_ops`] that even the #750 paged mode cannot carry: a `Backed` page's bytes live
 /// in the region backing, not the window, so an emitted access reads the wrong bytes no matter what
@@ -1496,8 +1523,14 @@ fn interp_leaf(f: &Func) -> bool {
         ) && b.insts.iter().all(|i| {
             !matches!(
                 i,
+                // #1546: `gc.roots` scans the interpreter's frames, so running it as a leaf while
+                // an emitted frame is live silently misses that frame's roots. It is not otherwise
+                // caught here — it writes its buffer through the op, not a `Store` — so a *bare*
+                // wrapper around it (no load, no store, no call) passed this predicate and became a
+                // cross-tier leaf even under a local table.
+                Inst::GcRoots { .. }
                 // memory ops (a leaf's fresh window would diverge from the shared one),
-                Inst::Load { .. }
+                | Inst::Load { .. }
                         | Inst::Store { .. }
                         | Inst::MemCopy { .. }
                         | Inst::MemMove { .. }
@@ -2032,7 +2065,7 @@ pub fn child_carve_fits(
 /// leaves may touch memory and caps (a `map`-calling allocator helper, an op-13 grant seeder) — the
 /// servicer contract is the powerbox over the live window, never a throwaway one (#1151).
 pub fn compile_nested(m: &Module, shared_memory: bool) -> Result<Artifact, Error> {
-    if module_uses_page_ops(m) {
+    if module_uses_page_ops(m) || module_uses_gc_roots(m) {
         return compile_interp_only(m, shared_memory, true);
     }
     if !reachable_fibers(m, 0) {
@@ -2624,6 +2657,7 @@ pub fn compile_module_reactor_paged(
     shared_memory: bool,
     page_log2: u8,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    // (`compile_module_reactor_inner` carries the #1546 `gc.roots` veto.)
     compile_module_reactor_inner(
         m,
         entry,
@@ -2645,6 +2679,14 @@ fn compile_module_reactor_inner(
     split_target: Option<(usize, usize)>,
     paged: Option<u8>,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    // #1546: no wasm emit of a module that can reach `gc.roots`, from any entry — a rooted emit is
+    // all emitted frames, the worst case for the op's scan (see [`module_uses_gc_roots`]). The
+    // shape-deriving front doors ([`compile_jit`], [`compile_jit_paged`]) decline to the interpreter
+    // before reaching here; this refuses the direct `compile_module_reactor*` callers too, so the
+    // property is the crate's rather than each front door's.
+    if module_uses_gc_roots(m) {
+        return Err(Error::Unsupported("gc.roots: no emitted tier (#1546)"));
+    }
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // `oversized[i]` — an in-subset function pulled from the emitted set because its body exceeds the
@@ -2756,6 +2798,11 @@ pub fn compile_module_reactor_keep(
     keep: &[bool],
     shared_memory: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
+    // #1546 — the one reactor entry with its own emit/cross computation rather than the shared inner,
+    // so it carries the `gc.roots` veto itself (see [`module_uses_gc_roots`]).
+    if module_uses_gc_roots(m) {
+        return Err(Error::Unsupported("gc.roots: no emitted tier (#1546)"));
+    }
     let n = m.funcs.len();
     let a = analyze_from(m, entry);
     // Emit a reachable in-subset function iff it is the entry, kept, or has a signature that can't be
@@ -3079,6 +3126,11 @@ fn compile_module_tierup_inner(
         in_subset[worst] = false;
         est_total -= est[worst];
     }
+    // #1546: a module that can reach `gc.roots` emits nothing — see [`module_uses_gc_roots`]. Done
+    // here, at the funnel every tier-up entry shares, so no mode can acquire an emitted frame that
+    // the op would fail to scan. The compile still succeeds: an all-`false` bitmap is the ordinary
+    // "runs on the interpreter" shape, not an error.
+    let gc_veto = module_uses_gc_roots(m);
     // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
@@ -3121,7 +3173,8 @@ fn compile_module_tierup_inner(
     // routable and dispatch-loop functions tier up.
     let mut emit: Vec<bool> = (0..n)
         .map(|i| {
-            in_subset[i]
+            !gc_veto
+                && in_subset[i]
                 && (reserved_table_log2.is_some()
                     || all_in_subset
                     || !func_uses_indirect(&m.funcs[i]))
@@ -3302,7 +3355,9 @@ pub fn compile_jit(m: &Module, shape: Shape, shared_memory: bool) -> Result<Arti
     // mask-only tier — an emitted access ignores page state the interpreter would trap on — so emit
     // nothing and run it wholly on the interpreter (DESIGN.md §14 "wasm-JIT tier coverage"). Checked
     // before the shape split so it holds for `Threaded`/tier-up too, not just the rooted paths.
-    if module_uses_page_ops(m) {
+    // #1546: a module that can reach `gc.roots` declines the same way and for the same reason — an
+    // emitted frame is invisible to the op's scan (see [`module_uses_gc_roots`]).
+    if module_uses_page_ops(m) || module_uses_gc_roots(m) {
         return compile_interp_only(m, shared_memory, false);
     }
     match shape {
@@ -3347,7 +3402,7 @@ pub fn compile_jit_paged(
     if !module_uses_unmap_protect(m) {
         return compile_jit(m, shape, shared_memory);
     }
-    if m.funcs.iter().any(func_uses_region_ops) {
+    if m.funcs.iter().any(func_uses_region_ops) || module_uses_gc_roots(m) {
         return compile_interp_only(m, shared_memory, false);
     }
     let interp_driven = |m: &Module| -> Result<Artifact, Error> {

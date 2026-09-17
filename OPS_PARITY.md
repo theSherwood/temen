@@ -511,7 +511,7 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `gc.roots` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `gc.roots` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3). wasm: **module-granular** — a module that can reach it emits nothing (#1546), since an emitted frame's roots are invisible to the scan |
 | `setjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 | `longjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
