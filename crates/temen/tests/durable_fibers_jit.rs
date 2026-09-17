@@ -70,6 +70,7 @@ fn jit_seed(interp: &[InterpFrozen]) -> Vec<JitFrozen> {
             sp: f.sp,
             shadow_sp: f.shadow_sp,
             generation: f.generation,
+            consumed: f.consumed,
         })
         .collect()
 }
@@ -302,6 +303,7 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
                 sp: f.sp,
                 shadow_sp: f.shadow_sp,
                 generation: f.generation,
+                consumed: f.consumed,
             })
             .collect(),
     );
@@ -620,4 +622,117 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
         }
         other => panic!("JIT thaw: expected Returned([107]), got {other:?}"),
     }
+}
+
+/// #1538 — a fiber whose park was already **consumed** re-delivers on thaw, on the JIT. Root resumes
+/// the fiber (it yields 1), then resumes it again with 10 (it yields 11); armed at safepoint 3 the
+/// freeze promotes *before* resume #2 is performed, so the fiber unwinds at its first `Yield` point
+/// right after the delivery — the park it unwound at was consumed (resume #1 took the `1` and ran on),
+/// so the residue says so and the thaw's re-issued resume #2 makes the rewound `suspend` return `10`
+/// instead of re-parking with the stale `1`. Both directions: an interp-frozen artifact thawed on the
+/// JIT, and a JIT-frozen residue thawed on the JIT — `(1, 11)` each time (it used to be `(1, 1)`).
+#[test]
+fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
+    const SRC: &str = "memory 17 shadow 16448 65536\n\
+        func () -> (i64, i64) {\n\
+        block 0 () {\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = i64.const 4096\n\
+        \x20 v3 = cont.new v1 v2\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v3 v5\n\
+        \x20 v8 = i64.const 10\n\
+        \x20 v9, v10 = cont.resume v3 v8\n\
+        \x20 return v7 v10\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3 = suspend v2\n\
+        \x20 v4 = i64.add v3 v2\n\
+        \x20 v5 = suspend v4\n\
+        \x20 v6 = i64.const 0\n\
+        \x20 return v6\n\
+          }\n\
+        }\n";
+    let m = parse_module(SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    let jit_thaw = |thaw_win: &[u8], seed: &[JitFrozen], what: &str| {
+        let mut jhost = Host::new();
+        let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+            &inst,
+            0,
+            &[],
+            thaw_win,
+            &[],
+            seed,
+            WINDOW_LOG2,
+            temen_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+        )
+        .expect("JIT thaw");
+        match jout {
+            JitOutcome::Returned(slots) => assert_eq!(slots, vec![1, 11], "{what}"),
+            other => panic!("{what}: expected Returned([1, 11]), got {other:?}"),
+        }
+    };
+
+    // Interp freeze at safepoint 3 → artifact → JIT thaw.
+    let mut ihost = Host::new();
+    ihost.set_durable(true);
+    let mut iwin = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut iwin, 3);
+    let mut ifuel = 1_000_000u64;
+    let (ires, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut ifuel, &iwin, WINDOW_LOG2, &mut ihost);
+    assert!(ires.is_ok(), "interp armed freeze: {ires:?}");
+    assert_eq!(
+        ihost.frozen_fibers().len(),
+        1,
+        "the in-flight fiber was captured"
+    );
+    assert!(
+        ihost.frozen_fibers()[0].consumed,
+        "the park it unwound at is recorded as consumed"
+    );
+    let artifact = freeze(&inst, &isnap, &ihost).expect("freeze");
+    let mut thost = Host::new();
+    let mut thaw_win = restore(&artifact, &inst, &mut thost).expect("restore");
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    jit_thaw(
+        &thaw_win,
+        &jit_seed(thost.frozen_fibers()),
+        "interp-frozen consumed park thawed on the JIT",
+    );
+
+    // JIT freeze at the same safepoint → JIT thaw; the residue agrees with the interp's.
+    let mut jhost = Host::new();
+    let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut jwin, 3);
+    let (jout, mut jsnap, jr) = compile_and_run_capture_reserved_with_host_durable(
+        &inst,
+        0,
+        &[],
+        &jwin,
+        &[],
+        &[],
+        WINDOW_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+    )
+    .expect("JIT armed freeze");
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT freeze placeholder, got {jout:?}"
+    );
+    assert_eq!(
+        jit_seed(ihost.frozen_fibers()),
+        jr,
+        "interp and JIT record the same consumed-park residue"
+    );
+    begin_thaw(&mut jsnap, TEST_ARENA, 0);
+    jit_thaw(&jsnap, &jr, "JIT-frozen consumed park thawed on the JIT");
 }

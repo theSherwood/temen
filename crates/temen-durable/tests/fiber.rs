@@ -1001,3 +1001,106 @@ fn a_woken_event_park_thaws_through_a_post_rewind_claim() {
         "the post-rewind claim rewinds the woken park (spilled witness 5 reloaded, not re-read as 9)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1538, the general form: a fiber whose park was **consumed** (its resumer took the value under
+// `NORMAL` and ran on) is flattened idle by the freeze driver when the freeze lands somewhere else
+// entirely — here at the root's `call.cap` (the host proc flips the state word to `UNWINDING`, so the
+// call's trailing poll unwinds the root). On thaw the root reloads the call's result and runs *forward*
+// into resume #2: a plain, non-rewinding claim of the seeded fiber. That claim must deliver `10` at the
+// fiber's rewound `suspend` — the value it parked with was already observed — so the fiber yields
+// `11`. Before the fix the re-park handed the resumer the stale `1` again: `(1, 1)`.
+// ---------------------------------------------------------------------------
+
+const SRC_CONSUMED_PARK: &str = "memory 18 shadow 16448 65536\n\
+    func (i32) -> (i64, i64) {\n\
+    block 0 (v0: i32) {\n\
+    \x20 v1 = ref.func 1\n\
+    \x20 v2 = i64.const 4096\n\
+    \x20 v3 = cont.new v1 v2\n\
+    \x20 v5 = i64.const 0\n\
+    \x20 v6, v7 = cont.resume v3 v5\n\
+    \x20 v8 = call.cap 13 0 () -> (i64) v0 ()\n\
+    \x20 v9 = i64.const 10\n\
+    \x20 v10, v11 = cont.resume v3 v9\n\
+    \x20 return v7 v11\n\
+      }\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block 0 (v0: i64, v1: i64) {\n\
+    \x20 v2 = i64.const 1\n\
+    \x20 v3 = suspend v2\n\
+    \x20 v4 = i64.add v3 v2\n\
+    \x20 v5 = suspend v4\n\
+    \x20 v6 = i64.const 0\n\
+    \x20 return v6\n\
+      }\n\
+    }\n";
+
+/// A durable host whose host proc, when `freeze`, writes `UNWINDING` into the window's state word —
+/// so the freeze lands at that `call.cap`'s trailing poll, away from any fiber safepoint.
+fn consumed_park_host(freeze: bool) -> (Host, i32) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
+        if freeze {
+            if let Some(m) = mem {
+                m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                    .expect("the state word is in the window");
+            }
+        }
+        Ok(vec![0])
+    }));
+    (h, hf)
+}
+
+#[test]
+fn a_consumed_park_delivers_the_next_resume_after_thaw() {
+    let mut m = temen_text::parse_module(SRC_CONSUMED_PARK).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = transform_module(&m).expect("transform");
+    temen_verify::verify_module(&inst).expect("verify");
+
+    let (mut fh, hf) = consumed_park_host(true);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let mut fuel = 100_000u64;
+    let (res, snap) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hf)],
+        &mut fuel,
+        &win,
+        SIZE_LOG2,
+        &mut fh,
+    );
+    assert!(res.is_ok(), "freeze returns a placeholder: {res:?}");
+    let frozen = fh.frozen_fibers().to_vec();
+    assert_eq!(frozen.len(), 1, "the idle fiber was flattened");
+    assert!(
+        frozen[0].consumed,
+        "its park (under NORMAL, taken by resume #1) is recorded as consumed"
+    );
+
+    let mut thaw_win = snap;
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let (mut th, hf2) = consumed_park_host(false);
+    th.set_frozen_fibers(frozen);
+    let mut fuel = 100_000u64;
+    let (r, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hf2)],
+        &mut fuel,
+        &thaw_win,
+        SIZE_LOG2,
+        &mut th,
+    );
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(1), Value::I64(11)]),
+        "the forward resume #2 delivers 10 into the thawed fiber (#1538: it used to re-yield 1)"
+    );
+}

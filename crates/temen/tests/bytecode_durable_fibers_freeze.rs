@@ -239,3 +239,131 @@ const TWO_FIBERS_SRC: &str = "memory 17 shadow 16448 65536\n\
 fn two_fibers_freeze_thaw_round_trip() {
     check(TWO_FIBERS_SRC);
 }
+
+/// #1538 on the bytecode engine — a fiber whose park was already **consumed** (resume #1 took its `1`
+/// under `NORMAL` and ran on) is flattened idle when the freeze lands at the root's `call.cap` (the
+/// host proc flips the state word to `UNWINDING`). Thawed on either engine, the root reloads the
+/// call's result and runs *forward* into resume #2, whose plain claim must deliver `10` at the fiber's
+/// rewound `suspend` — `(1, 11)`, not the stale re-park `(1, 1)`. The bytecode residue records the
+/// park as consumed and matches the tree-walker's.
+#[test]
+fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
+    const SRC: &str = "memory 17 shadow 16448 65536\n\
+        func (i32) -> (i64, i64) {\n\
+        block 0 (v0: i32) {\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = i64.const 4096\n\
+        \x20 v3 = cont.new v1 v2\n\
+        \x20 v5 = i64.const 0\n\
+        \x20 v6, v7 = cont.resume v3 v5\n\
+        \x20 v8 = call.cap 13 0 () -> (i64) v0 ()\n\
+        \x20 v9 = i64.const 10\n\
+        \x20 v10, v11 = cont.resume v3 v9\n\
+        \x20 return v7 v11\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 1\n\
+        \x20 v3 = suspend v2\n\
+        \x20 v4 = i64.add v3 v2\n\
+        \x20 v5 = suspend v4\n\
+        \x20 v6 = i64.const 0\n\
+        \x20 return v6\n\
+          }\n\
+        }\n";
+    let m = parse_module(SRC).expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+
+    // A durable host whose host proc writes `UNWINDING` when `freeze`, seeded with `frozen`.
+    let host = |freeze: bool, frozen: Vec<FrozenFiber>| -> (Host, i32) {
+        let mut h = durable_host(frozen);
+        let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
+            if freeze {
+                if let Some(m) = mem {
+                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                        .expect("the state word is in the window");
+                }
+            }
+            Ok(vec![0])
+        }));
+        (h, hf)
+    };
+    let want = Ok(vec![Value::I64(1), Value::I64(11)]);
+
+    // Freeze on both engines: identical residue, the park recorded as consumed.
+    let (mut hb, hfb) = host(true, vec![]);
+    let mut fuel = 1_000_000u64;
+    let (rb, snap_bc) = bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hfb)],
+        &mut fuel,
+        &window_with(STATE_NORMAL),
+        SIZE_LOG2,
+        &mut hb,
+    )
+    .expect("bytecode drives the fiber module");
+    assert!(rb.is_ok(), "bytecode freeze returns a placeholder: {rb:?}");
+    let (mut ht, hft) = host(true, vec![]);
+    let mut fuel = 1_000_000u64;
+    let (rt, _snap_tw) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hft)],
+        &mut fuel,
+        &window_with(STATE_NORMAL),
+        SIZE_LOG2,
+        &mut ht,
+    );
+    assert!(
+        rt.is_ok(),
+        "tree-walker freeze returns a placeholder: {rt:?}"
+    );
+    assert_eq!(
+        hb.frozen_fibers(),
+        ht.frozen_fibers(),
+        "residue: bytecode != tree-walker"
+    );
+    assert!(
+        hb.frozen_fibers()[0].consumed,
+        "the idle fiber's park (taken by resume #1) is recorded as consumed"
+    );
+    let frozen = hb.frozen_fibers().to_vec();
+
+    // Thaw the bytecode snapshot on both engines: the forward resume #2 delivers.
+    let mut thaw_win = snap_bc;
+    begin_thaw(&mut thaw_win, TEST_ARENA, 0);
+    let (mut h1, hf1) = host(false, frozen.clone());
+    let mut fuel = 1_000_000u64;
+    let (r_bc, _) = bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hf1)],
+        &mut fuel,
+        &thaw_win,
+        SIZE_LOG2,
+        &mut h1,
+    )
+    .expect("bytecode drives the thaw");
+    assert_eq!(
+        r_bc, want,
+        "bytecode thaw delivers 10 into the consumed park"
+    );
+    let (mut h2, hf2) = host(false, frozen);
+    let mut fuel = 1_000_000u64;
+    let (r_tw, _) = run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[Value::I32(hf2)],
+        &mut fuel,
+        &thaw_win,
+        SIZE_LOG2,
+        &mut h2,
+    );
+    assert_eq!(
+        r_tw, want,
+        "tree-walker thaw of the bytecode snapshot delivers too"
+    );
+}

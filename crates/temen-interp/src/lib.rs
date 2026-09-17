@@ -2550,9 +2550,13 @@ fn drive_over_cell(
             let mut seed: Vec<FrozenFiber> = thaw_fibers;
             seed.sort_by_key(|f| f.slot);
             for (expected, ff) in seed.into_iter().enumerate() {
-                let got = root
-                    .registry
-                    .seed_frozen(ff.func, ff.sp, ff.shadow_sp, ff.generation);
+                let got = root.registry.seed_frozen(
+                    ff.func,
+                    ff.sp,
+                    ff.shadow_sp,
+                    ff.generation,
+                    ff.consumed,
+                );
                 debug_assert_eq!(got, expected, "frozen fibers re-seed densely from slot 0");
                 debug_assert_eq!(got, ff.slot, "re-seeded slot matches the recorded handle");
             }
@@ -8743,6 +8747,14 @@ pub struct FrozenFiber {
     /// generation bits, with the top byte reserved for a guest tag — DESIGN.md §3c); serialized as
     /// `uleb(u64)` (snapshot format v3 — see `FORMAT_VERSION`).
     pub generation: u64,
+    /// #1538 — the fiber's last `suspend` value was already **consumed**: its resumer took the value
+    /// and ran on (the park happened under `NORMAL`, or the fiber was re-claimed under `UNWINDING`,
+    /// which unwinds it at that park with the delivered argument dropped). A thaw claim of such a
+    /// fiber must *deliver* the claim's argument at the re-executed `suspend` (the fiber runs on),
+    /// not re-park it (which would hand the resumer the stale value a second time). `false` — the
+    /// park is **fresh**: the resumer's in-flight `cont.resume` has yet to observe it, so the thaw
+    /// re-issue re-parks and re-delivers `(SUSPENDED, value)`. Snapshot format v24.
+    pub consumed: bool,
 }
 
 /// §13.4 slice 4c — a nested child's **host state** at a subtree freeze: its serve trio and its
@@ -8976,6 +8988,15 @@ struct RegState {
     /// in the guest handle's high bits ([`FIBER_GEN_SHIFT`]) so a stale handle to a slot's former
     /// occupant is rejected on `claim`. Grows with `fibers`/`shadow` (same index).
     gens: Vec<u64>,
+    /// #1538 — per slot: the fiber's last `suspend` value was **consumed** (see
+    /// [`FrozenFiber::consumed`]). Set at each park (`!UNWINDING`) and at each claim of a parked fiber
+    /// (`UNWINDING`: the delivery is about to be dropped by the freeze unwind); recorded into the
+    /// freeze residue; restored by `seed_frozen`. Grows with `fibers` (same index).
+    consumed: Vec<bool>,
+    /// #1538 — per slot: the argument a **thaw** claim of a seeded, consumed fiber must deliver at the
+    /// fiber's re-executed `suspend` (its `Yield` rewind arm) instead of re-parking. `Some` only between
+    /// that claim and that suspend. Grows with `fibers` (same index).
+    pending: Vec<Option<i64>>,
     /// Freed slots reclaimable for a new fiber (recycling step 3), a **min-heap** so `create` reuses the
     /// *lowest* free slot — keeping contexts dense and low (within `MAX_SHADOW_CTX`, and clear of the
     /// top-down vCPU pool) and bounding the table to the *peak concurrent* fiber count rather than the
@@ -8996,6 +9017,8 @@ impl FiberRegistry {
                 fibers: Vec::new(),
                 shadow: Vec::new(),
                 gens: Vec::new(),
+                consumed: Vec::new(),
+                pending: Vec::new(),
                 free: BinaryHeap::new(),
                 vcpu_mask: 0,
             }),
@@ -9111,11 +9134,15 @@ impl FiberRegistry {
             t.free.pop();
             t.fibers[slot] = RegFiber::Pending { func, sp };
             t.shadow[slot] = arena.frame_base(slot + 1); // reused region: empty stack at its frame base
+            t.consumed[slot] = false;
+            t.pending[slot] = None;
             t.gens[slot] // kept from the freed occupant's bump (the ABA guard)
         } else {
             t.fibers.push(RegFiber::Pending { func, sp });
             t.shadow.push(arena.frame_base(slot + 1));
             t.gens.push(0); // a fresh slot is generation 0 ⇒ handle == slot
+            t.consumed.push(false);
+            t.pending.push(None);
             0
         };
         Ok(fiber_handle(slot, generation))
@@ -9236,10 +9263,13 @@ impl FiberRegistry {
 
     /// `suspend`: publish the claimant's current fiber back to the pool — claimable by **any**
     /// vCPU again (the migration point).
-    fn park_suspended(&self, slot: usize, frames: Vec<Frame>) {
+    fn park_suspended(&self, slot: usize, frames: Vec<Frame>, unwinding: bool) {
         let mut t = self.lock();
         debug_assert!(matches!(t.fibers[slot], RegFiber::Running(None)));
         t.fibers[slot] = RegFiber::Parked(frames);
+        // #1538: a park under `NORMAL` is consumed by the resumer that runs on with its value; one under
+        // `UNWINDING` is fresh — the resumer's trailing poll unwinds it before it observes the value.
+        t.consumed[slot] = !unwinding;
     }
 
     /// The claimant's current fiber returned: the slot is `Done`. **Recycling (step 3):** bump the
@@ -9325,13 +9355,46 @@ impl FiberRegistry {
     /// thaw `cont.resume` re-enters its entry under `REWINDING`) with its flattened shadow-SP in the
     /// `shadow` table (so the swap re-points there). Seed in ascending slot order to rebuild the
     /// dense handle namespace; returns the slot, which must equal the recorded one.
-    fn seed_frozen(&self, func: i32, sp: i64, shadow_sp: u64, generation: u64) -> usize {
+    fn seed_frozen(
+        &self,
+        func: i32,
+        sp: i64,
+        shadow_sp: u64,
+        generation: u64,
+        consumed: bool,
+    ) -> usize {
         let mut t = self.lock();
         let slot = t.fibers.len();
         t.fibers.push(RegFiber::Pending { func, sp });
         t.shadow.push(shadow_sp);
         t.gens.push(generation); // restore the freeze-time generation so a recycled handle resolves
+        t.consumed.push(consumed); // #1538: a consumed park delivers at its rewound suspend
+        t.pending.push(None);
         slot
+    }
+
+    /// #1538 — a `cont.resume` claimed slot `slot`, delivering `arg`. `live`: it was suspend-parked
+    /// (the argument becomes its `suspend`'s result), else it starts fresh. Under `UNWINDING` a live
+    /// delivery is dropped by the fiber's immediate unwind at that park, so the park counts as
+    /// **consumed**; a fresh start of a seeded *consumed* fiber (a thaw claim) queues `arg` for the
+    /// fiber's rewound `suspend` to return instead of re-parking.
+    fn resumed(&self, slot: usize, live: bool, arg: i64, unwinding: bool) {
+        let mut t = self.lock();
+        if live {
+            t.consumed[slot] = unwinding;
+        } else if t.consumed[slot] {
+            t.pending[slot] = Some(arg);
+        }
+    }
+
+    /// #1538 — the argument a thawed, consumed fiber's re-executed `suspend` must return (taken).
+    fn take_pending(&self, slot: usize) -> Option<i64> {
+        self.lock().pending[slot].take()
+    }
+
+    /// #1538 — whether slot `slot`'s last park was consumed (the freeze residue's record).
+    fn consumed(&self, slot: usize) -> bool {
+        self.lock().consumed.get(slot).copied().unwrap_or(false)
     }
 }
 
@@ -10154,6 +10217,7 @@ impl VCpu {
             sp,
             shadow_sp,
             generation: self.registry.generation(slot),
+            consumed: self.registry.consumed(slot),
         });
         Ok(())
     }
@@ -14175,6 +14239,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     } else {
                         cont_block.retain(|&s| s != target);
                     }
+                    // #1538: record what this delivery means for the target's park (consumed vs.
+                    // fresh), and queue `av` for a thawed consumed fiber's rewound `suspend`.
+                    if durable && matches!(claimed, Claimed::Start { .. } | Claimed::Live(_)) {
+                        let unwinding =
+                            mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                        registry.resumed(
+                            target,
+                            matches!(claimed, Claimed::Live(_)),
+                            av,
+                            unwinding,
+                        );
+                    }
                     let new_frames = match claimed {
                         Claimed::Start { func: funcref, sp } => {
                             // A forged / wrong-type fiber funcref is a **fiber** fault, not a
@@ -14281,33 +14357,43 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if *cur == ROOT_FIBER {
                         return Err(Trap::FiberFault); // no resumer (the root cannot suspend)
                     }
-                    let v = get_i64(&frames[top].vals, *value)?;
-                    let leaving = *cur;
-                    registry.park_suspended(*cur, std::mem::take(frames));
-                    chain.pop();
-                    *cur = *chain.last().expect("chain keeps the root");
-                    // Hand the active shadow-SP back to the resumer's region (durable runs only):
-                    // the suspended fiber's SP is saved to its slot so a later resume restores it.
-                    shadow_switch(
-                        mem,
-                        registry,
-                        root_shadow_sp,
-                        *vcpu_ctx,
-                        durable_sp_ctx,
-                        durable,
-                        leaving,
-                        *cur,
-                    );
-                    *frames = if *cur == ROOT_FIBER {
-                        root_parked.take().ok_or(Trap::Malformed)?
+                    // #1538: a thawed fiber whose park was already consumed re-executes its `suspend`
+                    // in the `Yield` rewind arm — the claim that re-entered it queued its argument, so
+                    // the suspend returns that and the fiber runs on (no re-park: the resumer already
+                    // took the old value before the freeze).
+                    if let Some(arg) = registry.take_pending(*cur) {
+                        frames[top].vals.push(Reg::from_i64(arg));
                     } else {
-                        registry.unpark_resumer(*cur)?
-                    };
-                    *parked_frames -= frames.len();
-                    let rtop = frames.len() - 1;
-                    frames[rtop].vals.push(Reg::from_i32(FIBER_SUSPENDED));
-                    frames[rtop].vals.push(Reg::from_i64(v));
-                    continue 'frames;
+                        let v = get_i64(&frames[top].vals, *value)?;
+                        let leaving = *cur;
+                        let unwinding = durable
+                            && mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                        registry.park_suspended(*cur, std::mem::take(frames), unwinding);
+                        chain.pop();
+                        *cur = *chain.last().expect("chain keeps the root");
+                        // Hand the active shadow-SP back to the resumer's region (durable runs only):
+                        // the suspended fiber's SP is saved to its slot so a later resume restores it.
+                        shadow_switch(
+                            mem,
+                            registry,
+                            root_shadow_sp,
+                            *vcpu_ctx,
+                            durable_sp_ctx,
+                            durable,
+                            leaving,
+                            *cur,
+                        );
+                        *frames = if *cur == ROOT_FIBER {
+                            root_parked.take().ok_or(Trap::Malformed)?
+                        } else {
+                            registry.unpark_resumer(*cur)?
+                        };
+                        *parked_frames -= frames.len();
+                        let rtop = frames.len() - 1;
+                        frames[rtop].vals.push(Reg::from_i32(FIBER_SUSPENDED));
+                        frames[rtop].vals.push(Reg::from_i64(v));
+                        continue 'frames;
+                    }
                 }
                 // `setjmp`: snapshot this frame's resume point (the value state is captured because
                 // `vals` is replaced per block) keyed by the guest `jmp_buf` address, and fall through
@@ -14960,6 +15046,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             sp,
                             shadow_sp,
                             generation: registry.generation(leaving),
+                            consumed: registry.consumed(leaving),
                         });
                     } else {
                         registry.finish(*cur);
