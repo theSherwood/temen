@@ -118,12 +118,27 @@ fn varargs_fixed_count(proc_node: &Node) -> Option<usize> {
         .position(|p| p.args().get(2).is_some_and(|t| t.tag() == Some("varargs")))
 }
 
+/// `call` and `instr` are the same application shape. Per `leng_tags.InstrC`, an `instr` is "typed
+/// exactly like `(call SYM X*)` — `SYM`'s params and return type drive everything — but a distinct
+/// tag, so a consumer sees 'not an ABI call' from the tag alone", and its `SYM` carries
+/// `(instruction …)`/`(intrinsic …)`. We do not select opcodes, so the distinction buys us nothing
+/// and both lower through the call path; the intrinsics it carries (nimony's `atomic*` family) are
+/// already bound as compute leaves.
+///
+/// Every site that asks "is this a call?" has to ask it this way, including the pre-scans. The
+/// frame-need fixpoint and the arg/return-type scans drive frame threading and import binding, so a
+/// site that still matched only `call` would leave an `instr`'s callee unframed or unbound — the
+/// same trap `haddr` had with `collect_addr_taken`.
+fn is_call_tag(t: Option<&str>) -> bool {
+    matches!(t, Some("call" | "instr"))
+}
+
 /// True if `node` can be **re-evaluated** without changing observable behavior — no `(call …)`
 /// anywhere in the tree (a call may have side effects or a non-idempotent result). Used to gate a
 /// sparse-`case` discriminant, which is recomputed in each comparison block (#858); nimony pre-binds
 /// anything heavier than a pure read (symbol / `deref` / field access), so this holds in practice.
 fn expr_side_effect_free(node: &Node) -> bool {
-    node.tag() != Some("call") && node.args().iter().all(expr_side_effect_free)
+    !is_call_tag(node.tag()) && node.args().iter().all(expr_side_effect_free)
 }
 
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
@@ -1312,7 +1327,7 @@ impl Translator {
     fn agg_temp_bytes_at(&self, node: &Node, materializes: bool) -> u64 {
         let mut total = 0;
         match node.tag() {
-            Some("call") => {
+            Some("call" | "instr") => {
                 // A **variadic import** call marshals its trailing variadic args into a data-stack
                 // buffer (one 8-byte slot each), so reserve that here — the frame predicate
                 // (`proc_needs_frame`) and this sizing both route through `agg_temp_bytes`, so they
@@ -1324,7 +1339,7 @@ impl Translator {
                     }
                 }
                 for arg in node.args().iter().skip(1) {
-                    if arg.tag() == Some("call") {
+                    if is_call_tag(arg.tag()) {
                         // An **aggregate-returning call in argument position** (`f($ x)`) materializes
                         // a result temp (`agg_rvalue_temp`); reserve its return aggregate's bytes. (An
                         // `oconstr`/`aconstr` *argument*'s temp is reserved by the constructor clause
@@ -1342,7 +1357,7 @@ impl Translator {
                 // position — which builds in place into the destination's own `$sret`, no temp — is
                 // *not* counted (it is a child of `ret`/`asgn`/`var`, not a direct statement/arg).
                 for stmt in node.args() {
-                    if stmt.tag() == Some("call") {
+                    if is_call_tag(stmt.tag()) {
                         if let Some(d) = stmt.args().first().and_then(|c| self.sret_return(c)) {
                             total += self.sizeof(&d);
                         }
@@ -2237,7 +2252,7 @@ impl Translator {
     /// callee (the funcref ABI). A bare-atom head naming a proc/import is a direct call — it does not
     /// count (a call *to* the proc, resolved by name).
     fn body_has_indirect_call(&self, node: &Node, funcref_locals: &HashSet<String>) -> bool {
-        if node.tag() == Some("call") {
+        if is_call_tag(node.tag()) {
             if let Some(head) = node.args().first() {
                 match head.as_atom() {
                     None => return true, // a computed funcref head (cast / field / slot)
@@ -3549,7 +3564,7 @@ impl<'a> FuncGen<'a> {
                 }
                 Ok(())
             }
-            Some("call") => {
+            Some("call" | "instr") => {
                 // An aggregate-returning call: hand `daddr` to the callee as its `$sret` pointer, so
                 // it writes the result straight into the destination (no temporary).
                 self.call_sret(rhs, daddr)
@@ -3778,7 +3793,7 @@ impl<'a> FuncGen<'a> {
                 }
                 Ok(())
             }
-            Some("call") => {
+            Some("call" | "instr") => {
                 self.call(s, None)?; // statement position: result (if any) discarded
                 Ok(())
             }
@@ -4438,7 +4453,7 @@ impl<'a> FuncGen<'a> {
                 }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
-                Some("call") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
+                Some("call" | "instr") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
                 // An **aggregate literal in value position** — `(oconstr T …)` / `(aconstr T …)` with
                 // an aggregate `T`. An aggregate value *is* its address in this by-address model, so
                 // materialize the constructor into a scratch temp (the same lowering a call-argument
@@ -4529,7 +4544,7 @@ impl<'a> FuncGen<'a> {
         }
         // A call in typed position hands `want` down as the return hint, so a cross-module callee's
         // import is declared returning exactly this type (not a guessed `i64`).
-        let v = if e.tag() == Some("call") {
+        let v = if is_call_tag(e.tag()) {
             self.call(e, Some(want))?
         } else {
             self.expr(e)?
@@ -5109,7 +5124,7 @@ impl<'a> FuncGen<'a> {
         // the temp's address (aggregates go by-address). `call_sret` handles the local and the
         // cross-module (`call_import_sret`) callee alike; `callee_sret` knows the return type from the
         // local proc table or the pooled `ext_sret_procs`.
-        if node.tag() == Some("call") {
+        if is_call_tag(node.tag()) {
             if let Some(desc) = node.args().first().and_then(|c| self.callee_sret(c)) {
                 let addr = self.alloc_temp(self.t.sizeof(&desc));
                 self.call_sret(node, addr)?;
@@ -5557,7 +5572,7 @@ fn is_float(t: ValType) -> bool {
 /// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
 /// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
 fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>, ext: &HashSet<String>) -> bool {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             // A **local** frame-needing callee (bare `foo.0.`) or a **cross-module** one (`foo.0.<stem>`
             // the linker pooled as frame-needing) both force this proc to own an `$sp` to hand down.
@@ -5572,7 +5587,7 @@ fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>, ext: &HashSet<St
 /// Collect every direct **call callee** name in a proc body (bare `foo.0.` for a local proc,
 /// `foo.0.<stem>` for a cross-module one). Feeds the linker's whole-program frame fixpoint.
 fn collect_calls(node: &Node, out: &mut HashSet<String>) {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             out.insert(callee.to_string());
         }
@@ -5605,7 +5620,7 @@ fn peel_cast(n: &Node) -> &Node {
 }
 
 fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashSet<String>) {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         let args = node.args();
         // The head: recurse *unless* it is a bare proc-name atom (a direct call, not a funcref use).
         // `map_or` not `is_none_or` — temen-leng compiles under the rustc 1.81 W5 guest toolchain floor.
