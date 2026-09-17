@@ -109,10 +109,18 @@ static void temen_walk_fp_chain(uintptr_t fp) {
  * precisely so a trap is attributed to the fiber running at the trap instant. Clamping to the thread
  * stack would silently truncate every backtrace taken on a fiber. A recovery point costs nothing and
  * is correct for *any* faulting address, which a bound never is. */
+/* Three arms, split on the *platform* and then the compiler — not on `_MSC_VER` alone, which was
+ * wrong: the `windows-gnu` cross-check lane installs mingw-w64 on purpose and does compile this file,
+ * so a non-`_MSC_VER` windows build must be a case here rather than falling into the unix one. */
 #if defined(_MSC_VER)
-/* MSVC compiles this file natively on windows (the mingw cross-check doesn't build it at all — see
- * `build.rs`), so SEH is the idiom. `EXCEPTION_EXECUTE_HANDLER` spelled out to avoid <windows.h>. */
+/* The shipping windows build. `EXCEPTION_EXECUTE_HANDLER` spelled out to avoid <windows.h>. */
 #define TEMEN_EXECUTE_HANDLER 1
+#elif defined(_WIN32)
+/* mingw-w64 GCC has no SEH keywords, so there is nothing to bracket the walk with. This arm exists
+ * for the `windows-gnu` lane, which is `cargo clippy --target x86_64-pc-windows-gnu`: it type-checks
+ * and compiles, and never links or runs. Shipping windows is MSVC and takes the arm above, so no
+ * configuration that can execute this walk is left unguarded. Tracked in #1572 against the day
+ * windows-gnu becomes a real target. */
 #else
 #include <setjmp.h>
 static TEMEN_TLS sigjmp_buf g_walk_buf;
@@ -125,7 +133,7 @@ int temen_walk_in_progress(void) {
     return g_walking;
 }
 
-#ifndef _MSC_VER
+#if !defined(_WIN32)
 /* Abandon a faulting walk: back to `temen_guarded_walk`, which returns to the detector as if the walk
  * had simply ended. Called from the signal handler; does not return. */
 void temen_walk_abort(void) {
@@ -143,6 +151,9 @@ static void temen_guarded_walk(uintptr_t fp) {
     } __except (TEMEN_EXECUTE_HANDLER) {
         /* a link pointed off a mapped page — keep what the walk published */
     }
+#elif defined(_WIN32)
+    g_walking = 1; /* unguarded; see the arm comment above — this build never links or runs */
+    temen_walk_fp_chain(fp);
 #else
     if (sigsetjmp(g_walk_buf, 1) == 0) {
         g_walking = 1;
