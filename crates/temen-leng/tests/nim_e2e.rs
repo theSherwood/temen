@@ -863,8 +863,18 @@ fn run_io_capture(
     }
     let inst = temen_run::instantiate_with_imports(m.clone(), imports)
         .unwrap_or_else(|e| panic!("instantiate manifest module: {e}"));
-    inst.run(backend, config)
-        .unwrap_or_else(|e| panic!("run `_start` on {backend:?}: {e}"));
+    if let Err(e) = inst.run(backend, config) {
+        // A guest that wrote before it died names its own problem — the plain `?` dropped that with
+        // the personality. Print what it managed to say, then fail.
+        let out = posix.stdout();
+        if !out.is_empty() {
+            eprintln!(
+                "  guest stdout before the trap: {:?}",
+                elide(&String::from_utf8_lossy(&out))
+            );
+        }
+        panic!("run `_start` on {backend:?}: {e}");
+    }
     posix
 }
 
@@ -2101,6 +2111,28 @@ fn elide(s: &str) -> String {
     format!("{}…{}", &s[..100], &s[s.len() - 40..])
 }
 
+/// The modification time of `<stem>.x.nif` under `dir` (searched recursively), or the epoch when it
+/// cannot be read — how the spike tells this build's program module from a previous one's left in the
+/// shared `nimcache`.
+#[cfg(test)]
+fn x_nif_mtime(dir: &std::path::Path, stem: &str) -> std::time::SystemTime {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return std::time::UNIX_EPOCH;
+    };
+    let mut best = std::time::UNIX_EPOCH;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            best = best.max(x_nif_mtime(&p, stem));
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{stem}.x.nif")) {
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                best = best.max(t);
+            }
+        }
+    }
+    best
+}
+
 /// **A nim program reads and writes real files** through the POSIX personality — the route
 /// [`temen_leng::nim_posix_runtime`] links: the compute shim plus `POSIX_OPEN_ADAPTER`, with the
 /// syscalls left as retained manifest imports the host binds to `temen_posix`'s fd ops over an
@@ -2227,6 +2259,34 @@ fn nifler2_links_through_leng() {
 
     let mut mods = Vec::new();
     collect_x_nif(&root.join("nimcache"), &mut mods);
+    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so a previous
+    // `--isMain` build's program module is still sitting there — two `main`s, and the link fails
+    // `DuplicateSymbol("main")`. Keep the one this build just wrote (its `.x.nif` is the newest of
+    // them); every other module in the closure is a library module with no `main`.
+    let mains: Vec<usize> = mods
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
+        .map(|(i, _)| i)
+        .collect();
+    if mains.len() > 1 {
+        let keep = *mains
+            .iter()
+            .max_by_key(|&&i| {
+                let stem = &mods[i].0;
+                x_nif_mtime(&root.join("nimcache"), stem)
+            })
+            .expect("a newest program module");
+        eprintln!(
+            "  nifler2: {} program modules in the cache, keeping `{}`",
+            mains.len(),
+            mods[keep].0
+        );
+        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+        for i in drop.into_iter().rev() {
+            mods.remove(i);
+        }
+    }
     eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
