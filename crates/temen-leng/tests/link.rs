@@ -436,7 +436,7 @@ fn cross_module_aggregate_global_materializes() {
     // A **module-level aggregate global** whose constructor type is defined in a *sibling* module
     // (`var g = Pair(x: 9, y: 7)` where `Pair` lives in module `p`) — exactly nimony's `var s =
     // "…"`, where `string` is defined in `system`. The linker's funcref/frame **pre-scans**
-    // (`export_funcrefs`/`export_tls_vars`/`proc_frame_nodes`) run `collect_globals` on a fresh,
+    // (`export_globals`/`export_tls_vars`/`proc_frame_nodes`) run `collect_globals` on a fresh,
     // import-less translator just to enumerate funcref/thread-var globals; with no pooled sibling
     // types they can't fold this `oconstr` and previously **fail-closed there**, aborting the whole
     // link for *every* program with a module-level cross-module aggregate `var`. The pre-scans now

@@ -457,13 +457,23 @@ pub(crate) struct Translator {
     link_mode: bool,
     /// Cross-module callees lowered to Temen imports (discovered during emission).
     imports: RefCell<ImportTable>,
-    /// **External funcref globals** — another unit's `gvar` whose type is a `proctype`, under the
-    /// stem-suffixed name this module references it by ([`export_funcrefs`]). A cross-module
-    /// `(call oomHandler.0.<sys> …)` targets a function-*pointer* data symbol, not a proc: with the
-    /// pooled signature here, `lvalue_type`/`lvalue_addr` treat it as an `FnPtr` global (address via
-    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call.dyn`. Empty
-    /// unless the linker pooled sibling units' funcref gvars.
-    ext_funcrefs: HashMap<String, FnPtrSig>,
+    /// **External non-scalar globals** — another unit's `gvar`/`const` whose type is a `proctype` or
+    /// an aggregate, under the stem-suffixed name this module references it by ([`export_globals`]).
+    /// A cross-module symbol with no entry here falls back to a bare `data.sym` + `Scalar(I64)`,
+    /// which is right for a scalar and wrong for everything else:
+    ///
+    /// - a `proctype` global — `(call oomHandler.0.<sys> …)` targets a function-*pointer* data
+    ///   symbol, not a proc, so `lvalue_type`/`lvalue_addr` must see `FnPtr` for `indirect_callee`
+    ///   to lower it to a `data.sym` load + `call.dyn`;
+    /// - an **aggregate** global — `x in Digits` compiles to `(at Digits.0.<strutils> (shr … 3))`,
+    ///   a byte index into a sibling's `set[char]` (an `array[uint8, 32]`). Without the layout here
+    ///   that is "`at` on a non-array": the data symbol resolves at link, but the *descriptor* the
+    ///   indexing needs does not cross the unit boundary on its own.
+    ///
+    /// One table rather than two, because both cases are the same question — what is this foreign
+    /// symbol's type? — and a second parallel list would be one more thing to keep in step.
+    /// Empty unless the linker pooled sibling units' globals.
+    ext_globals: HashMap<String, TyDesc>,
     /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
     /// `$sp` param (they take a local's address; see [`proc_needs_frame`](Self::proc_needs_frame)),
     /// under the stem-suffixed names this module calls them by ([`export_proc_frames`]). A
@@ -533,7 +543,7 @@ pub(crate) struct Translator {
     /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
     /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
     own_stem: String,
-    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_funcrefs`],
+    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_globals`],
     /// [`export_tls_vars`]), which run [`collect_globals`](Self::collect_globals) on a *fresh,
     /// import-less* translator purely to enumerate funcref/thread-var globals. Such a translator
     /// has no pooled sibling types, so an aggregate global whose constructor type is defined in
@@ -572,7 +582,7 @@ impl Translator {
             consts: HashMap::default(),
             ext_consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
-            ext_funcrefs: HashMap::default(),
+            ext_globals: HashMap::default(),
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
             ext_proc_params: HashMap::default(),
@@ -863,7 +873,7 @@ impl Translator {
                                 // pre-scan (its type lives in a sibling module, not pooled here; in a
                                 // fresh translator the type name isn't even known to be an aggregate,
                                 // so `desc` is a scalar fallback — key off the init node). Only the
-                                // funcref/frame pre-passes (`export_funcrefs`, `export_tls_vars`) set
+                                // funcref/frame pre-passes (`export_globals`, `export_tls_vars`) set
                                 // `scan_lenient`; they run `collect_globals` on a fresh, import-less
                                 // translator purely to enumerate funcref/tls globals, and erroring
                                 // here aborted the whole link for any program with a module-level
@@ -1793,14 +1803,13 @@ impl Translator {
         }
     }
 
-    /// Pre-register **external funcref globals** — another module's `gvar`s whose type is a
-    /// `proctype`, under the stem-suffixed names this module references them by
-    /// ([`export_funcrefs`]). See the [`ext_funcrefs`](Self::ext_funcrefs) field: this is what turns
-    /// a cross-module `(call <funcref-gvar> …)` from a (wrong) proc import into a `data.sym` load +
-    /// `call.dyn`.
-    pub fn import_funcrefs(&mut self, ext: &[(String, FnPtrSig)]) {
-        for (name, sig) in ext {
-            self.ext_funcrefs.insert(name.clone(), sig.clone());
+    /// Pre-register **external non-scalar globals** — another module's `gvar`s/`const`s whose type
+    /// is a `proctype` or an aggregate, under the stem-suffixed names this module references them by
+    /// ([`export_globals`]). See the [`ext_globals`](Self::ext_globals) field for why a bare
+    /// `data.sym` is not enough for either kind.
+    pub fn import_globals(&mut self, ext: &[(String, TyDesc)]) {
+        for (name, desc) in ext {
+            self.ext_globals.insert(name.clone(), desc.clone());
         }
     }
 
@@ -1831,7 +1840,7 @@ impl Translator {
     }
 
     /// Collect a module's **thread-vars** under their stem-suffixed global names, with each one's
-    /// size — the input to the linker's shared TLS layout. Mirrors [`export_funcrefs`]: a throwaway
+    /// size — the input to the linker's shared TLS layout. Mirrors [`export_globals`]: a throwaway
     /// `tls_mode` translator resolves each `tvar`'s type (so the size is exact), then [`link_selected`]
     /// pools these across units and assigns disjoint block offsets before translating any. (Aggregate
     /// `tvar`s whose type lives in a *sibling* unit resolve only if that type is local here — a
@@ -1860,18 +1869,24 @@ impl Translator {
     /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
     /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
-    pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
+    pub fn export_globals(root: &Node, stem: &str) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
-        t.scan_lenient = true; // enumerating funcref globals; tolerate unresolvable cross-module aggregates
+        t.scan_lenient = true; // enumerating globals; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
         t.collect_globals(root)?;
-        let mut out: Vec<(String, FnPtrSig)> = t
+        let mut out: Vec<(String, TyDesc)> = t
             .globals
             .iter()
-            .filter_map(|(name, (_, desc))| match desc {
-                TyDesc::FnPtr(sig) => Some((format!("{name}{stem}"), (**sig).clone())),
-                _ => None,
+            // Scalars are deliberately absent: the `data.sym` + `Scalar(I64)` fallback already reads
+            // one correctly, and a scalar `const` never reaches here at all (`export_consts` inlines
+            // it). What needs the real descriptor is a symbol you *index into* or *call through*.
+            .filter(|(_, (_, desc))| {
+                matches!(
+                    desc,
+                    TyDesc::FnPtr(_) | TyDesc::Agg(_) | TyDesc::FlexArray(_) | TyDesc::Ptr(_)
+                )
             })
+            .map(|(name, (_, desc))| (format!("{name}{stem}"), desc.clone()))
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
         Ok(out)
@@ -1879,7 +1894,7 @@ impl Translator {
 
     /// A module's **top-level scalar-int `const`s** — each folded to its integer value, under the
     /// stem-suffixed global name a sibling references it by (`replRune.0.` + `<stem>`). The `const`
-    /// counterpart of [`export_funcrefs`]; [`link_selected`] pools these across its units so a
+    /// counterpart of [`export_globals`]; [`link_selected`] pools these across its units so a
     /// cross-module reference inlines the value ([`import_consts`]) rather than emitting an unresolved
     /// `data.sym`. Only the scalar-int consts (the ones [`collect_globals`] inlines and never exports);
     /// an aggregate `const` is materialized as an addressable global and already exports as data.
@@ -2291,7 +2306,7 @@ impl Translator {
     /// value, not a named proc: a non-atom (a `(cast <proctype> …)`, or a funcref field/slot lvalue
     /// `(dot …)`/`(deref …)`/`(pat …)`), a funcref-typed param/local (`funcref_locals`), or a
     /// **funcref global** — a local `proctype` gvar, or a pooled cross-module funcref gvar
-    /// ([`ext_funcrefs`](Self::ext_funcrefs)). Such a proc must own a frame to hand `$sp` to the
+    /// ([`ext_globals`](Self::ext_globals)). Such a proc must own a frame to hand `$sp` to the
     /// callee (the funcref ABI). A bare-atom head naming a proc/import is a direct call — it does not
     /// count (a call *to* the proc, resolved by name).
     fn body_has_indirect_call(&self, node: &Node, funcref_locals: &HashSet<String>) -> bool {
@@ -2300,7 +2315,9 @@ impl Translator {
                 match head.as_atom() {
                     None => return true, // a computed funcref head (cast / field / slot)
                     Some(a) if funcref_locals.contains(a) => return true,
-                    Some(a) if self.ext_funcrefs.contains_key(a) => return true,
+                    Some(a) if matches!(self.ext_globals.get(a), Some(TyDesc::FnPtr(_))) => {
+                        return true
+                    }
                     Some(a) if matches!(self.globals.get(a), Some((_, TyDesc::FnPtr(_)))) => {
                         return true
                     }
@@ -3228,9 +3245,9 @@ impl<'a> FuncGen<'a> {
                 // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
                 // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
                 // and `indirect_callee` recover the `call.dyn` signature.
-                if let Some(sig) = self.t.ext_funcrefs.get(name).cloned() {
+                if let Some(d) = self.t.ext_globals.get(name).cloned() {
                     let addr = self.emit_data_sym(name, 0);
-                    return Ok((addr, TyDesc::FnPtr(Box::new(sig))));
+                    return Ok((addr, d));
                 }
                 // In a link unit, an atom resolved by none of the above is a **cross-module data
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
@@ -3571,9 +3588,9 @@ impl<'a> FuncGen<'a> {
                 if let Some((_, d)) = self.t.tls_vars.get(name) {
                     return Some(d.clone());
                 }
-                if let Some(sig) = self.t.ext_funcrefs.get(name) {
-                    // A cross-module funcref global — an `FnPtr` data symbol (see `ext_funcrefs`).
-                    return Some(TyDesc::FnPtr(Box::new(sig.clone())));
+                if let Some(d) = self.t.ext_globals.get(name) {
+                    // A cross-module funcref or aggregate global (see `ext_globals`).
+                    return Some(d.clone());
                 }
                 self.local_desc.get(name).cloned()
             }

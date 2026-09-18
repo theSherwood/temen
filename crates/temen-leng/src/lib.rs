@@ -215,7 +215,7 @@ fn translate_object_module(
     src: &str,
     sel: Select,
     ext_types: &[(String, translate::Layout)],
-    ext_funcrefs: &[(String, translate::FnPtrSig)],
+    ext_globals: &[(String, translate::TyDesc)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
     ext_proc_params: &[translate::ProcParamSig],
@@ -225,7 +225,7 @@ fn translate_object_module(
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
-    t.import_funcrefs(ext_funcrefs);
+    t.import_globals(ext_globals);
     t.import_proc_frames(ext_frame_procs);
     t.import_sret_procs(ext_sret);
     t.import_proc_params(ext_proc_params);
@@ -427,7 +427,9 @@ fn link_selected_with_extra(
         }
         prev_fields = fields;
     }
-    let mut pooled_funcrefs = Vec::new();
+    // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
+    // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
+    let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
     // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
@@ -452,7 +454,7 @@ fn link_selected_with_extra(
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
+        pooled_globals.extend(translate::Translator::export_globals(&root, stem)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_proc_params.extend(translate::Translator::export_proc_params(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
@@ -529,7 +531,7 @@ fn link_selected_with_extra(
                 src,
                 *sel,
                 &pooled,
-                &pooled_funcrefs,
+                &pooled_globals,
                 &pooled_frame_procs,
                 &pooled_sret,
                 &pooled_proc_params,
