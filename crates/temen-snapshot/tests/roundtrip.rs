@@ -1757,3 +1757,166 @@ fn a_completed_detached_child_rides_the_control_section() {
         "canonical re-freeze is byte-identical",
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1361 — a **freezable** module handle rides the artifact. Before this, a durable domain holding
+// any `Module` grant could not be frozen at all: `capture_durable_handles` refused every one, so a
+// parent that had spawned a §14 child (op 15 takes a module handle) hit `NonDurableHandle` before
+// any capture logic ran. Now an attested-freezable grant is carried by its §4 **content digest** —
+// a name, never the bytes — and the restoring host re-grants the module it chooses to.
+// ---------------------------------------------------------------------------------------------
+
+/// A granted module with one named export, so a thawed handle can be asked *which* module it names
+/// rather than merely whether it resolved.
+const SRC_GRANT_A: &str = r#"
+export 0 func "alpha" 0
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 1
+  return v0
+  }
+}
+"#;
+
+/// A second, content-distinct grant — its export name is different, so a handle that resolved to the
+/// wrong grant answers `-EINVAL` for `"alpha"` instead of a funcidx.
+const SRC_GRANT_B: &str = r#"
+export 0 func "beta" 0
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 2
+  return v0
+  }
+}
+"#;
+
+fn verified(src: &str) -> Module {
+    let m = temen_text::parse_module(src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    m
+}
+
+/// The minimum a `Module.resolve_export` probe needs: the name lives in the caller's window.
+struct VecMem(Vec<u8>);
+
+impl temen_interp::GuestMem for VecMem {
+    fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+        let (a, b) = (ptr as usize, (ptr + len) as usize);
+        self.0.get(a..b).map(<[u8]>::to_vec)
+    }
+    fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+        let a = ptr as usize;
+        self.0.get_mut(a..a + data.len())?.copy_from_slice(data);
+        Some(())
+    }
+}
+
+/// Ask the module behind `h` for the funcidx it exports as `name` (`-EINVAL` if it exports no such
+/// name — i.e. if the handle resolved to a different module).
+fn resolve_export(host: &mut Host, h: i32, name: &str) -> i64 {
+    let mut mem = VecMem(vec![0u8; 64]);
+    <VecMem as temen_interp::GuestMem>::write_bytes(&mut mem, 0, name.as_bytes())
+        .expect("the name fits");
+    host.cap_dispatch_slots(
+        temen_interp::cap_id::MODULE,
+        0,
+        h,
+        &[0, name.len() as i64],
+        Some(&mut mem),
+    )
+    .expect("a live module handle dispatches")[0]
+}
+
+/// **The headline**, and the discriminating half: the thaw host re-grants the module at a *different*
+/// index than the freeze host held it at. A binding that carried the index would come back pointing
+/// at the wrong grant; carrying the digest makes it land on the right one.
+#[test]
+fn a_freezable_module_handle_survives_freeze_and_thaw_at_a_different_index() {
+    let inst = instrument(SRC);
+    let (a, b) = (verified(SRC_GRANT_A), verified(SRC_GRANT_B));
+
+    let mut host = Host::new();
+    host.grant_clock();
+    let h = host.grant_durable_module(&a); // the freeze host's only grant: index 0
+    assert_eq!(resolve_export(&mut host, h, "alpha"), 0);
+
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let artifact =
+        freeze(&inst, &win, &host).expect("an attested module no longer refuses a freeze");
+
+    let mut thost = Host::new();
+    thost.grant_clock();
+    thost.grant_durable_module(&b); // index 0 on the thaw host
+    thost.grant_durable_module(&a); // index 1 — where the artifact's digest must land
+    restore(&artifact, &inst, &mut thost).expect("restore");
+
+    assert_eq!(
+        resolve_export(&mut thost, h, "alpha"),
+        0,
+        "the guest's handle value resolves to the module the artifact named, not to whatever grant \
+         sits at the captured index"
+    );
+    assert_eq!(
+        resolve_export(&mut thost, h, "beta"),
+        -22, // -EINVAL
+        "and it is not the other grant"
+    );
+}
+
+/// The authority seam, fail-closed: an artifact *names* a module, it never carries one. A host that
+/// re-granted a different build has nothing to resolve against, and the restore refuses rather than
+/// thawing a domain whose handle points at nothing.
+#[test]
+fn a_thaw_that_was_not_re_granted_the_module_fails_closed() {
+    let inst = instrument(SRC);
+    let a = verified(SRC_GRANT_A);
+
+    let mut host = Host::new();
+    host.grant_clock();
+    host.grant_durable_module(&a);
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let artifact = freeze(&inst, &win, &host).expect("freeze");
+
+    let mut thost = Host::new();
+    thost.grant_clock();
+    thost.grant_durable_module(&verified(SRC_GRANT_B)); // a different module entirely
+    match restore(&artifact, &inst, &mut thost) {
+        Err(RestoreError::ModuleUnresolved(_)) => {}
+        other => panic!("expected ModuleUnresolved, got {other:?}"),
+    }
+
+    // And a host that re-granted it *non*-durably is the same refusal: the §4 attestation is a
+    // compile-mode fact only the granting host knows, so an un-attested re-grant is not the module
+    // the artifact asked for.
+    let mut plain = Host::new();
+    plain.grant_clock();
+    plain.grant_module(&a);
+    assert!(
+        matches!(
+            restore(&artifact, &inst, &mut plain),
+            Err(RestoreError::ModuleUnresolved(_))
+        ),
+        "an un-attested re-grant does not satisfy a durable module handle"
+    );
+}
+
+/// The other half of the conditional row: a grant the host never attested freezable is still
+/// non-durable, so it still refuses the freeze and still drains.
+#[test]
+fn an_unattested_module_grant_still_refuses_the_freeze() {
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    host.grant_module(&verified(SRC_GRANT_A)); // slot 1, no §4 attestation
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    match freeze(&inst, &win, &host) {
+        Err(FreezeError::NonDurableHandle(h)) => assert_eq!(h.slot, 1),
+        other => panic!("expected NonDurableHandle refusal, got {other:?}"),
+    }
+
+    assert_eq!(host.drain_non_durable().len(), 1, "the drain takes it");
+    assert!(
+        freeze(&inst, &win, &host).is_ok(),
+        "and the drained domain is snapshottable again"
+    );
+}

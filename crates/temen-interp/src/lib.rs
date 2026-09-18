@@ -11861,9 +11861,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // from spending a handle-table slot per spawn. `holds_` makes it
                                     // idempotent, and the fallible grant means a full table costs the
                                     // exposure bit's precision, never the run.
-                                    if durable && !hg.holds_freeze_authority_over(carve.0, carve.1)
+                                    if durable
+                                        && !hg.holds_freeze_authority(FreezeScope::Carve {
+                                            base: carve.0,
+                                            size: carve.1,
+                                        })
                                     {
-                                        let _ = hg.try_grant_freeze_authority(ibase, isize);
+                                        let _ = hg.try_grant_freeze_authority(FreezeScope::Carve {
+                                            base: ibase,
+                                            size: isize,
+                                        });
                                     }
                                     hg.child_attestation(durable, Some(carve))
                                 };
@@ -16911,6 +16918,41 @@ pub enum StreamRole {
 /// The host-side object a handle-table entry dispatches to — the mock equivalent of
 /// §3c's `(methods, object)`. The guest never names or writes this (it lives in host
 /// memory); it is selected only by a *granted* handle index.
+/// What a [`Binding::FreezeAuthority`] covers.
+///
+/// Two scopes because the two kinds of child are named differently, and that difference is the whole
+/// of #1440's hard half. A §14 **nested carve** child *is* a sub-range of its parent's window, so an
+/// address range names it. A **detached** child owns a separate window and has no address in its
+/// parent's frame at all — there is nothing to point at.
+///
+/// One binding parameterized by scope rather than two bindings: "may this holder snapshot that
+/// domain?" is one question, and two variants would be two places to keep the answer (INVARIANTS #15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeScope {
+    /// The window sub-range `[base, base+size)` — a §14 nested carve, where the range *is* the child.
+    /// Covers by **containment**: authority over a range covers anything inside it, the same rule
+    /// [`Binding::AddressSpace`]/[`Binding::Instantiator`] sub-ranges use. One grant over an
+    /// instantiator's range therefore covers every carve from it, instead of costing a handle-table
+    /// slot per spawn.
+    Carve { base: u64, size: u64 },
+    /// Every **detached** child the holder spawns — all of them or none.
+    ///
+    /// Deliberately not per-child (owner decision): a detached child has no sub-range to be named by,
+    /// and the per-child alternatives both have costs worth deferring — a domain id would have to be
+    /// recorded in the artifact and re-linked on thaw first, and naming a child by its spawn edge
+    /// rebinds silently when a join slot is recycled. All-or-nothing needs none of that and is the
+    /// granularity the blocking question actually wants.
+    ///
+    /// **This one must never be self-minted.** A nested parent already reads its child's carve, so
+    /// granting itself authority there documents a fact. A detached child's window is *not* readable
+    /// by its parent — that is what detached means — so authority over one is a real new power, and a
+    /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
+    /// from above (the embedder, or an ancestor re-granting downward) or not at all, which holds by
+    /// construction: no guest-reachable op mints a capability, and the §14 spawn path mints only the
+    /// [`Carve`](FreezeScope::Carve) form.
+    DetachedProgeny,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream {
@@ -16971,22 +17013,9 @@ enum Binding {
         base: u64,
         size: u64,
     },
-    /// **Freeze authority** over the window sub-range `[base, base+size)` — the authority to snapshot
-    /// the domain living there (#1440, INVARIANTS #14 R1, PROCESS.md O14).
-    ///
-    /// Same `(base, size)` shape as [`Binding::Instantiator`] and [`Binding::AddressSpace`], and for
-    /// the same reason: a §14 **nested carve** child *is* a sub-range of its parent's window, so the
-    /// range names the child, attenuates through the existing discipline, and is value-typed enough to
-    /// ride the durable re-grant path — a thawed parent must still hold authority over its thawed
-    /// child, or a freeze/thaw round trip would quietly launder exposure away.
-    ///
-    /// A **detached** child owns its own window and so has no sub-range here to be named by; granting
-    /// authority over one needs a value-typed name for a domain that this shape cannot express. That
-    /// is the open half of #1440 and the reason the op-15 gate still refuses outright.
-    FreezeAuthority {
-        base: u64,
-        size: u64,
-    },
+    /// **Freeze authority** — the authority to snapshot a domain (#1440, INVARIANTS #14 R1,
+    /// PROCESS.md O14). What it covers is the [`FreezeScope`].
+    FreezeAuthority(FreezeScope),
     /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
     /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
     /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
@@ -17101,8 +17130,9 @@ impl Attestation {
 /// into a fresh `Host` reconstructs the exact authority. The `JitTable`/`JitCode` variants
 /// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
 /// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
-/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`,
-/// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Blocking`, an unnamed
+/// `HostProc`, a non-freezable `Module`) are **not** durable: a live one makes the domain
+/// non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
     Stream(StreamRole),
@@ -17117,13 +17147,10 @@ pub enum DurableBinding {
         base: u64,
         size: u64,
     },
-    /// Freeze authority over `[base, base+size)` (#1440). Value-typed, so a thawed parent holds the
-    /// same authority over its thawed child that it held before the freeze — without this, a round
-    /// trip would launder a domain's exposure away and `attest` would start lying.
-    FreezeAuthority {
-        base: u64,
-        size: u64,
-    },
+    /// Freeze authority, and what it covers (#1440). Value-typed, so a thawed parent holds the same
+    /// authority over its thawed child that it held before the freeze — without this, a round trip
+    /// would launder a domain's exposure away and `attest` would start lying.
+    FreezeAuthority(FreezeScope),
     /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
     /// **structurally** by the callee's join `slot` in the holder's own table + the offer
     /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
@@ -17148,6 +17175,24 @@ pub enum DurableBinding {
     JitCode {
         domain: u32,
         unit: u32,
+    },
+    /// #1361 — a §14 [`Binding::Module`] grant the granting host attested **freezable**
+    /// (`grant_durable_module` ran `temen_durable::transform_module` on it), named by its §4
+    /// content digest. The module *bytes* never ride an artifact (D-scope): the restoring host
+    /// re-grants the same module and this digest re-resolves the handle against it — exactly the
+    /// rule a separate-module [`FrozenNested`] child already re-attaches by
+    /// ([`Host::module_by_digest`]), reused rather than duplicated.
+    ///
+    /// A grant *without* the attestation stays non-durable ([`NonDurableKind::Module`]): a durable
+    /// domain may not instantiate one anyway (DURABILITY.md §4), so there is nothing a thaw could
+    /// usefully hand back. This is the same conditional shape [`Named`](Self::Named) has — durable
+    /// iff the grant carries a reconstruction rule the restoring host can act on.
+    ///
+    /// Authority is unchanged: a digest is not authority. The thaw resolves it only against modules
+    /// the **restoring** host chose to grant, so a moment cannot carry in code a host would not have
+    /// granted fresh (INVARIANTS #3).
+    Module {
+        digest: [u8; 32],
     },
     /// #1455 — an embedder host capability ([`Binding::HostProc`]) that carries a registered
     /// **name**, so a thaw can re-grant it. A host-proc is a closure: its code address is
@@ -17910,6 +17955,16 @@ pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Se
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NamedCapRestoreError {
     pub name: String,
+}
+
+/// Why a thaw could not re-resolve a durable [`DurableBinding::Module`] handle (#1361): the
+/// restoring host holds no **durable** module grant whose §4 content digest matches. Fail-closed,
+/// and carrying the digest, so an embedder can tell "I forgot to re-grant it" from "I re-granted a
+/// different build". The bytes never ride the artifact (D-scope), so re-granting the same module is
+/// the embedder's half of the contract, exactly as for a separate-module nested child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ModuleRestoreError {
+    pub digest: [u8; 32],
 }
 
 /// #1502 — the thaw-side **budget hook**: given a carried `Budget`'s remaining quotas, what the
@@ -21110,13 +21165,19 @@ impl Host {
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
-                Binding::FreezeAuthority { base, size } => {
-                    DurableBinding::FreezeAuthority { base, size }
-                }
+                Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
                 Binding::SharedRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
-                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                // #1361: a module grant the granting host attested **freezable** (§4) is durable —
+                // named by its content digest, which the thaw resolves against the restoring host's
+                // re-granted modules (the same rule a separate-module nested child re-attaches by).
+                // An un-attested grant is still refused: a durable domain cannot instantiate one,
+                // so there is no authority for a thaw to reconstruct.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => DurableBinding::Module { digest: g.digest },
+                    _ => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                },
                 Binding::ModuleLoader => {
                     return Err(self.non_durable(slot, NonDurableKind::ModuleLoader))
                 }
@@ -21199,7 +21260,7 @@ impl Host {
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
                 | Binding::Instantiator { .. }
-                | Binding::FreezeAuthority { .. }
+                | Binding::FreezeAuthority(_)
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
@@ -21208,7 +21269,12 @@ impl Host {
                 // complement of `capture` above.
                 | Binding::Budget(_) => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
-                Binding::Module(_) => NonDurableKind::Module,
+                // #1361: the complement of `capture` above — an attested-freezable grant is
+                // durable and a drain keeps it; an un-attested one is still relinquished.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => continue,
+                    _ => NonDurableKind::Module,
+                },
                 Binding::ModuleLoader => NonDurableKind::ModuleLoader,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
@@ -21254,9 +21320,7 @@ impl Host {
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
-                DurableBinding::FreezeAuthority { base, size } => {
-                    Binding::FreezeAuthority { base, size }
-                }
+                DurableBinding::FreezeAuthority(scope) => Binding::FreezeAuthority(scope),
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
                     // patched once the §14 child at `slot` is re-created — see
@@ -21278,6 +21342,15 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1361: re-resolve the module the artifact *names* against what this host has been
+                // granted. `check_modules_for_thaw` validated every carried digest before any slot
+                // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
+                // anyway, leaving the slot closed drops the authority rather than forging one, and
+                // the guest's handle value becomes a dead generation (D37).
+                DurableBinding::Module { digest } => match self.module_id_by_digest(&digest) {
+                    Some(id) => Binding::Module(id),
+                    None => continue,
+                },
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
                 // re-granted by `restore_durable_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
@@ -21295,6 +21368,27 @@ impl Host {
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
+    /// modules, **before** [`Self::restore_durable_handles`] pins anything. The module twin of
+    /// [`Self::restore_durable_named`]'s registrar step, and fail-closed for the same reason: an
+    /// artifact *names* a module, it never carries one, so a restore that cannot find it must fail
+    /// rather than thaw a domain holding a handle to nothing.
+    ///
+    /// Reports the **first** unresolved digest, so the restore is all-or-nothing like the capture.
+    pub fn check_modules_for_thaw(
+        &self,
+        handles: &[DurableHandle],
+    ) -> Result<(), ModuleRestoreError> {
+        for h in handles {
+            if let DurableBinding::Module { digest } = h.binding {
+                if self.module_id_by_digest(&digest).is_none() {
+                    return Err(ModuleRestoreError { digest });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The name registered for the grant living at `slot`, if any — the reverse of
@@ -22783,12 +22877,9 @@ impl Host {
     /// For a §14 nested carve the range is the child's carve, which is what makes the R1 rule
     /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
     /// rather than an inference from placement: the spawn path mints this, and
-    /// [`holds_freeze_authority_over`](Host::holds_freeze_authority_over) is how a later freeze asks.
-    pub fn grant_freeze_authority(&mut self, base: u64, size: u64) -> i32 {
-        self.grant(
-            cap_id::FREEZE_AUTHORITY,
-            Binding::FreezeAuthority { base, size },
-        )
+    /// [`holds_freeze_authority`](Host::holds_freeze_authority) is how a later freeze asks.
+    pub fn grant_freeze_authority(&mut self, scope: FreezeScope) -> i32 {
+        self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
     }
 
     /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
@@ -22796,28 +22887,30 @@ impl Host {
     /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
     /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
     /// a lot of legitimate work).
-    pub fn try_grant_freeze_authority(&mut self, base: u64, size: u64) -> Option<i32> {
-        self.try_grant(
-            cap_id::FREEZE_AUTHORITY,
-            Binding::FreezeAuthority { base, size },
-        )
+    pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
+        self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
     }
 
-    /// Whether this host holds freeze authority covering `[base, base+size)` — i.e. may snapshot the
-    /// domain living there.
+    /// Whether this host holds freeze authority covering `scope` — i.e. may snapshot what it names.
     ///
-    /// Covering, not equal: authority over a range includes authority over anything inside it, the
-    /// same containment `AddressSpace`/`Instantiator` sub-ranges use. A domain nobody holds authority
-    /// over is **confidential** — that is the whole of the confidential/ancestor-freezable distinction
-    /// (INVARIANTS #14 R1 §6), derived rather than tracked as a state of its own.
-    pub fn holds_freeze_authority_over(&self, base: u64, size: u64) -> bool {
-        let end = base.saturating_add(size);
-        self.table.iter().any(|slot| {
-            matches!(
-                slot.entry,
-                Some(Binding::FreezeAuthority { base: b, size: n })
-                    if b <= base && end <= b.saturating_add(n)
-            )
+    /// A [`Carve`](FreezeScope::Carve) matches by **containment**: authority over a range covers
+    /// anything inside it. [`DetachedProgeny`](FreezeScope::DetachedProgeny) matches exactly — it is
+    /// all-or-nothing by construction, so there is nothing to contain.
+    ///
+    /// A domain nobody holds authority over is **confidential**; that is the whole of the
+    /// confidential/ancestor-freezable distinction (INVARIANTS #14 R1 §6), derived from the absence of
+    /// a grant rather than tracked as a state of its own.
+    pub fn holds_freeze_authority(&self, scope: FreezeScope) -> bool {
+        self.table.iter().any(|slot| match (slot.entry, scope) {
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::Carve { base: b, size: n })),
+                FreezeScope::Carve { base, size },
+            ) => b <= base && base.saturating_add(size) <= b.saturating_add(n),
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::DetachedProgeny)),
+                FreezeScope::DetachedProgeny,
+            ) => true,
+            _ => false,
         })
     }
 
@@ -22940,33 +23033,46 @@ impl Host {
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
     /// host re-grants the child's module, and its re-attach residue names it by [`module_digest`].
-    /// Returns the grant's function table, or `None` (a missing / mismatched re-grant ⇒
-    /// the thaw fails closed, the per-child R5 identity gate).
-    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+    /// `None` on a missing / mismatched re-grant, so the thaw fails closed — the per-child R5
+    /// identity gate. The single lookup behind every `*_by_digest` accessor and behind a durable
+    /// [`DurableBinding::Module`] handle's re-resolution: one rule for "which grant is this digest",
+    /// not one per consumer (INVARIANTS #15).
+    ///
+    /// Matching is by *content*, so two grants of the same module are interchangeable by
+    /// construction — which is the point of naming a module by what it is rather than by an index.
+    fn grant_by_digest(&self, digest: &[u8; 32]) -> Option<(u32, &ModuleGrant)> {
         self.modules
             .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.funcs))
+            .position(|g| g.durable && &g.digest == digest)
+            .map(|i| (i as u32, &self.modules[i]))
+    }
+
+    /// The `modules` index a durable digest names — what a captured [`DurableBinding::Module`]
+    /// re-binds to on thaw.
+    fn module_id_by_digest(&self, digest: &[u8; 32]) -> Option<u32> {
+        self.grant_by_digest(digest).map(|(i, _)| i)
+    }
+
+    /// The function table of the grant [`Self::grant_by_digest`] names.
+    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.funcs))
     }
 
     /// The type section of the granted module matching `digest` (FuncType interning, #922) — the
     /// sibling of [`Self::module_by_digest`] so a re-granted separate-module thread child resolves
     /// its call variants' interned signatures.
     fn module_types_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.types))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.types))
     }
 
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
     /// thaw to register as the re-created serving child's **self module** (serve admission +
     /// handler resolution need the module, not just its functions).
     fn module_arc_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.module))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.module))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
@@ -23257,7 +23363,17 @@ impl Host {
         Attestation {
             tier: self.attestation.tier,
             window_exposed: false,
-            freeze_exposed: false,
+            // Derived, like the nested case (#1440): an ancestor may snapshot this child iff the
+            // spawner holds `DetachedProgeny` *and* the subtree is durable. Both conjuncts matter —
+            // authority is *who may*, durability is *whether a snapshot is possible at all*.
+            //
+            // In practice this is still `false` today, because op 15's `!durable` gate refuses a
+            // durable parent a detached child at all (#1412, restored on all three engines until
+            // #1361's capture lands). Written as the derivation anyway so the gate lift is a change to
+            // the gate and nothing else — and so this stops being a hardcoded `false` that would have
+            // to be remembered.
+            freeze_exposed: self.durable
+                && self.holds_freeze_authority(FreezeScope::DetachedProgeny),
         }
     }
 
@@ -23277,7 +23393,9 @@ impl Host {
             tier: self.attestation.tier,
             window_exposed: true,
             freeze_exposed: durable
-                && carve.is_none_or(|(base, size)| self.holds_freeze_authority_over(base, size)),
+                && carve.is_none_or(|(base, size)| {
+                    self.holds_freeze_authority(FreezeScope::Carve { base, size })
+                }),
         }
     }
 
@@ -24933,7 +25051,7 @@ impl Host {
             // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
             // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
             // traps are for forgery, and the handle here is genuine).
-            Binding::FreezeAuthority { .. } => Ok(vec![EINVAL]),
+            Binding::FreezeAuthority(_) => Ok(vec![EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
             // argument), not a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37

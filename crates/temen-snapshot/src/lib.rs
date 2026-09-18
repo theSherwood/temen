@@ -58,9 +58,9 @@
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedProt, DurableBinding, DurableHandle,
-    DurableJitTable, DurableJitUnit, DurableNamedCap, FrozenChildState, FrozenDetached,
-    FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle, ShadowArena,
-    StreamRole, SvcDispatch,
+    DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope, FrozenChildState,
+    FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle,
+    ShadowArena, StreamRole, SvcDispatch,
 };
 use temen_ir::Module;
 
@@ -194,10 +194,20 @@ use temen_ir::Module;
 /// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
 /// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
 /// whose domain holds no `Budget` is byte-identical to v21.
+/// v27 (#1361): `B_MODULE` — a §14 module grant the granting host attested **freezable** is durable,
+/// carried as its 32-byte §4 content digest. The module bytes never ride the artifact (D-scope); the
+/// restoring host re-grants the same module and the digest re-resolves the handle against it, the
+/// same rule a separate-module nested child already re-attaches by. An un-attested grant is still
+/// `NonDurableKind::Module`, so a drain is still the route for one.
+///
+/// v26 (#1440): `B_FREEZE_DETACHED` — the all-or-nothing authority over a holder's **detached**
+/// children, which a carve range cannot name. A separate tag rather than a scope byte on
+/// `B_FREEZE_AUTHORITY`, so a v25 artifact decodes unchanged; one holding no detached-progeny
+/// authority is byte-identical to v25 but for the version field.
 /// v25 (#1440): `B_FREEZE_AUTHORITY` — freeze authority is a durable binding, so a thawed parent
 /// still holds it over its thawed child. An artifact whose domain holds none is byte-identical to
 /// v24 but for the version field.
-const FORMAT_VERSION: u16 = 25;
+const FORMAT_VERSION: u16 = 27;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -250,6 +260,14 @@ const B_BUDGET: u8 = 11;
 /// thawed child what it held before, or a freeze/thaw would quietly launder a domain's exposure away
 /// and `attest.freeze_exposed` would start lying.
 const B_FREEZE_AUTHORITY: u8 = 12;
+/// `FreezeAuthority(DetachedProgeny)` (#1440): all-or-nothing authority over the holder's detached
+/// children. Its own tag rather than a scope byte on `B_FREEZE_AUTHORITY`, so a v25 artifact — whose
+/// only scope was the carve — still decodes unchanged.
+const B_FREEZE_DETACHED: u8 = 13;
+/// #1361 — a durable §14 module handle, carried as the 32-byte §4 content digest of the grant. A
+/// *name*, not a payload: the restore resolves it against the modules the restoring host itself
+/// granted, so the artifact conveys identity and never code.
+const B_MODULE: u8 = 14;
 
 const PROT_RW: u8 = 0;
 const PROT_RO: u8 = 1;
@@ -325,6 +343,10 @@ pub enum RestoreError {
     /// capability, it never carries one. What gets granted is whatever the restoring host chooses to
     /// grant, exactly as on a fresh run (INVARIANTS #3).
     NamedCapRefused(String),
+    /// #1361 — the restoring host holds no durable module grant matching a carried module handle's
+    /// §4 content digest. The third face of the same authority seam as `NamedCapRefused` /
+    /// `BudgetRefused`: an artifact names what it needs, the restoring host decides what to grant.
+    ModuleUnresolved([u8; 32]),
     /// #1502 — the restoring host's budget hook refused a carried `Budget`, or offered more than was
     /// carried. The other half of the same seam: an artifact carries what the domain had *left*, and
     /// the thaw may narrow that, never widen it (INVARIANTS #3).
@@ -352,10 +374,11 @@ fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
         } => return true,
         DurableBinding::AddressSpace { base, size }
         | DurableBinding::Instantiator { base, size }
-        // #1440: a freeze authority names a window sub-range too, so it takes the same bounds check.
-        // Falling through to the permissive arm would let an artifact carry authority over a range
-        // outside the window it restores into — laundering exposure past the very check this is.
-        | DurableBinding::FreezeAuthority { base, size } => (base, size),
+        // #1440: a carve-scoped freeze authority names a window sub-range too, so it takes the same
+        // bounds check. Falling through to the permissive arm would let an artifact carry authority
+        // over a range outside the window it restores into — laundering exposure past the very check
+        // this is. `DetachedProgeny` names no range, so it has nothing to bound and falls through.
+        | DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => (base, size),
         _ => return true,
     };
     size != 0
@@ -1011,6 +1034,12 @@ pub fn restore_with_prots(
     }
     host.restore_durable_named(&named)
         .map_err(|e| RestoreError::NamedCapRefused(e.name))?;
+    // #1361: the module twin of the registrar step above — every carried module digest must name a
+    // durable grant *this* host holds, checked before any slot is pinned. The bytes are D-scope, so
+    // a restore the embedder did not re-grant the module for fails here rather than thawing a
+    // domain whose handle resolves to nothing.
+    host.check_modules_for_thaw(&handles)
+        .map_err(|e| RestoreError::ModuleUnresolved(e.digest))?;
     host.restore_durable_jit(&jit)
         .map_err(|_| RestoreError::JitReconstruct)?;
     // v17: restore the call.dyn table reservation so the thaw run's dispatch table has the
@@ -1508,10 +1537,13 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
             write_uleb(b, base);
             write_uleb(b, size);
         }
-        DurableBinding::FreezeAuthority { base, size } => {
+        DurableBinding::FreezeAuthority(FreezeScope::Carve { base, size }) => {
             b.push(B_FREEZE_AUTHORITY);
             write_uleb(b, base);
             write_uleb(b, size);
+        }
+        DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny) => {
+            b.push(B_FREEZE_DETACHED);
         }
         DurableBinding::LiveImpl { slot, export } => {
             b.push(B_LIVE_IMPL);
@@ -1521,6 +1553,10 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         DurableBinding::JitTable { idx } => {
             b.push(B_JIT_TABLE);
             write_uleb(b, idx as u64);
+        }
+        DurableBinding::Module { digest } => {
+            b.push(B_MODULE);
+            b.extend_from_slice(&digest);
         }
         DurableBinding::Named { idx } => {
             b.push(B_NAMED);
@@ -1557,10 +1593,11 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
             base: r.uleb()?,
             size: r.uleb()?,
         },
-        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority {
+        B_FREEZE_AUTHORITY => DurableBinding::FreezeAuthority(FreezeScope::Carve {
             base: r.uleb()?,
             size: r.uleb()?,
-        },
+        }),
+        B_FREEZE_DETACHED => DurableBinding::FreezeAuthority(FreezeScope::DetachedProgeny),
         B_INSTANTIATOR => DurableBinding::Instantiator {
             base: r.uleb()?,
             size: r.uleb()?,
@@ -1568,6 +1605,12 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
         B_LIVE_IMPL => DurableBinding::LiveImpl {
             slot: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
             export: u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?,
+        },
+        B_MODULE => DurableBinding::Module {
+            digest: r
+                .take(32)?
+                .try_into()
+                .expect("take(32) yields exactly 32 bytes"),
         },
         B_NAMED => DurableBinding::Named {
             idx: r.uleb()? as u32,

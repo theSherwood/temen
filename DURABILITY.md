@@ -463,11 +463,12 @@ spawn). The residue type, the freeze-capture (completed → capture, else the ex
 refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
 completed-result path above; the codec round-trip is pinned by
 `roundtrip.rs::a_completed_detached_child_rides_the_control_section`. The capture and thaw-delivery are
-**inert behind two prerequisites**, so they ship correct-but-unexercised (the #1501/#1502 pattern):
-(1) op 15's `!durable` **admission gate** (a durable parent cannot yet spawn a detached child — step
-4), and (2) **`Binding::Module` non-durability** — op 15 takes a *module handle*, which
-`capture_durable_handles` refuses, so a durable parent that spawned a detached child cannot be frozen
-at all until module handles become durable (or a post-spawn cap-close lands). Under a scratch
+**inert behind one remaining prerequisite**, so they ship correct-but-unexercised (the #1501/#1502
+pattern): op 15's `!durable` **admission gate** — a durable parent cannot yet spawn a detached child
+(step 4). The second prerequisite is **cleared**: op 15 takes a *module handle*, which
+`capture_durable_handles` used to refuse outright, so a durable parent that spawned a detached child
+could not be frozen at all; an attested-freezable grant is durable as of #1361 (§12.5 above), and no
+post-spawn cap-close op is needed. Under a scratch
 gate-lift the admission path and the still-running fail-closed refusal both check out; a completed
 capture at freeze is the scheduling-fragile "child must finish during a parent park" case Finding 1
 flagged, deferred with step 4.
@@ -478,9 +479,11 @@ too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` 
 The thaw resolves that digest against the restore host's re-granted modules (`Host::module_by_digest`)
 and runs the *child*'s funcs; a **missing or mismatched** re-grant fails closed — the parent's
 re-executed `join` traps rather than mis-run a wrong module in the carve (the per-child R5 identity
-gate). Since a live `Module` handle is non-durable (§12.5), the embedder `drain_non_durable`s it before
-serializing (the digest was already captured at instantiate); the §12.6 canonical re-freeze then sees
-only durable handles, and the module is re-granted after it. Pinned by
+gate). The grant handle itself rides too since #1361 — by the same digest (§12.5 above), so the child
+record and the parent's handle now name the module by one rule rather than the handle being drained
+away and re-granted around the freeze. An **un-attested** grant is still drained
+(`drain_non_durable`) before serializing; either way the §12.6 canonical re-freeze sees only durable
+handles. Pinned by
 `durable_nesting.rs::{freeze_with_live_separate_module_child_thaws_through_the_codec,
 thaw_separate_module_child_fails_closed_on_missing_or_mismatched_module}`. This completes depth-1
 nesting for **both** module kinds (same- and separate-module) in every child state.
@@ -1052,6 +1055,8 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `JitTable { idx }` (Slice 2) | idx | domain units ride Section 5 (`capture_durable_jit`), rebuilt positionally |
 | `JitCode { domain, unit }` (Slice 2) | domain, unit | resolves against the rebuilt domain's re-verified units |
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
+| `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
+| `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
 | `Budget(BudgetState)` (#1502, v22) | fuel, mem, spawn, channel — the **remaining** quotas (`-1` = unbounded) | re-minted into `Host::budgets` at its captured slot; the thaw's **budget hook** (`set_budget_thaw_hook`) may attenuate, never raise; no hook ⇒ verbatim |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
@@ -1059,11 +1064,35 @@ presence in a live, non-drainable state makes the subtree non-snapshottable, so
 **freeze refuses** unless they're closed/drained first (the drain is
 `Host::drain_non_durable`, below):
 
-`SharedRegion(u32)` (R4), `Module(u32)`, `Blocking(u32)` (§5 + cancellation R2). *(The §22 `JitTable`/`JitCode` handles were here until
+`SharedRegion(u32)` (R4), `Blocking(u32)` (§5 + cancellation R2), and a `Module(u32)` grant the
+granting host did **not** attest freezable (#1361, below). *(The §22 `JitTable`/`JitCode` handles were here until
 **Slice 2**: their out-of-line unit state — instrumented+verified IR + quotas — now rides snapshot
 Section 5, so they are re-grantable; `drain_non_durable` keeps them. The native/wasm code pointers
 still don't ride — an interpreter thaw invokes the restored funcs directly, a native re-compile is
 the Slice-3 follow-on.)*
+
+**Freezable module grants — `Module` left the non-durable set (#1361, v27).** A `Module` grant is a
+host-side registration, so the grant itself cannot be serialized; what *can* is the §4 **content
+digest** of the module it names (`module_digest`), and the restoring host re-grants the module. That
+is not a new mechanism: a separate-module `FrozenNested` child has re-attached by exactly this digest
+since v11 (below), so the handle now rides the same rule instead of a second one (INVARIANTS #15).
+Carried as `DurableBinding::Module { digest }` / `B_MODULE`; the restore resolves every carried digest
+against this host's durable grants **before** any slot is pinned (`Host::check_modules_for_thaw`) and
+fails closed with `RestoreError::ModuleUnresolved` otherwise. **Ordering contract:** the restoring
+embedder grants the module *before* `restore`, the same point at which it installs a named-cap
+registrar or a budget hook — a handle cannot be pinned to a module the host does not hold. (The old
+pattern — drain the handle, restore, re-grant the module afterwards for the child record's sake —
+was only ever needed because the handle could not ride; no shipping embedder used it, only
+`durable_nesting.rs`.) It is the same seam as `NamedCapRefused` and `BudgetRefused`:
+the artifact names what it needs, the restoring host decides what to grant (INVARIANTS #3).
+
+It is **conditional**, like `Named`: durable iff the grant carries the §4 freezability attestation
+(`grant_durable_module`). An un-attested grant stays `NonDurableKind::Module` and still drains — a
+durable domain may not instantiate one anyway (§4), so there is no authority a thaw could reconstruct.
+Pinned by `roundtrip.rs::{a_freezable_module_handle_survives_freeze_and_thaw_at_a_different_index,
+a_thaw_that_was_not_re_granted_the_module_fails_closed, an_unattested_module_grant_still_refuses_the_freeze}`
+— the first re-grants the module at a *different* index on the thaw host, so a binding that carried the
+index rather than the digest fails it.
 
 **Named host capabilities — `HostProc` left the non-durable set (#1455, v21).** A `HostProc` is an
 embedder closure: its code address is process-local and its captured state is the provider's, so

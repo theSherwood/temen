@@ -363,11 +363,17 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
         ],
 
-        // An immutable instantiable artifact: shared into the child (FORK.md §8.6), but its host-side
-        // registration cannot be serialized, so the embedder re-grants after restore.
+        // An immutable instantiable artifact: shared into the child (FORK.md §8.6). Durable only when
+        // the granting host attested it **freezable** (§4) — then the artifact names it by content
+        // digest and the restoring host re-grants the bytes (#1361).
         Capability::Module => [
             F,
-            declines("NonDurableKind::Module — re-granted by the embedder after restore"),
+            Cell {
+                status: Status::Conditional,
+                note: "durable iff the grant is attested freezable (#1361): the artifact carries the \
+                       §4 content digest and the restoring host re-grants the module. An un-attested \
+                       grant is still NonDurableKind::Module",
+            },
             U,
             U,
             K,
@@ -416,7 +422,12 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                 status: Status::Conditional,
                 note: "only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot",
             },
-            declines("NonDurableKind::HostProc — the host closure cannot be serialized"),
+            Cell {
+                status: Status::Conditional,
+                note: "durable iff the grant carries a registered **name** (#1455): the closure \
+                       cannot be serialized, but the name is a reconstruction rule the thaw's \
+                       registrar acts on. An unnamed one is still NonDurableKind::HostProc",
+            },
             U,
             U,
             K,

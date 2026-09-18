@@ -307,9 +307,12 @@ three engines is therefore the resting state until (a) freeze authority is **rep
 `Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
 carve names it: granted at spawn, containment-covering so one grant serves every child of an
 instantiator range, durable so a thawed parent holds what it held, and askable through
-`Host::holds_freeze_authority_over` (#1440). What it cannot yet name is a **detached** child, which
-owns its own window and so has no sub-range to be named by; that is the open half, and it is precisely
-the half this gate needs — and (b) the per-child-artifact capture lands (#1361). Then the gate comes out everywhere at once and the rule is
+`Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
+sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never
+self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
+whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very
+isolation the spawn asked for. Authority over detached children therefore arrives from above or not at
+all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
 
