@@ -450,8 +450,27 @@ impl Domain {
     /// parked child would push `parked` past `live` and fail a *parent* vCPU's infinite wait closed.
     /// Called on the spawning thread before `instantiate` returns (so a subsequent wait already counts
     /// the child); paired with [`Self::child_finished`] on the child's own thread.
-    pub(crate) fn child_started(&self) {
-        lock(&self.threads).live += 1;
+    /// Reserve a §15 live-vCPU slot for a §14 child, or refuse. `false` ⇒ the domain is at
+    /// [`Domain::max_vcpus`] and the caller must not spawn.
+    ///
+    /// #1586 — this used to be an unconditional `live += 1`, so every §14 child (nested, named, or
+    /// detached) *incremented the very counter the ceiling is built on and skipped the check*. Only
+    /// `thread.spawn` consulted it. That let a parent hold more concurrency than its ancestors
+    /// granted (INVARIANTS #3) — and on this backend a §14 child is one real OS thread, so the
+    /// overshoot was host threads, not green tasks. The check and the increment are one locked step
+    /// here for the same reason they are at the `thread.spawn` site: two vCPUs spawning concurrently
+    /// must not both observe room.
+    ///
+    /// The interpreter has always enforced this for every child kind — `Scheduler::spawn` returns
+    /// `None` past its live cap and op 0/5/15 turn that into a `ThreadFault` — so this is the
+    /// oracle's behaviour, arriving on this backend.
+    pub(crate) fn try_child_start(&self) -> bool {
+        let mut t = lock(&self.threads);
+        if t.live >= self.max_vcpus {
+            return false;
+        }
+        t.live += 1;
+        true
     }
 
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
