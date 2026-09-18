@@ -903,6 +903,19 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // 0) would be exactly the silent-wrong-answer this table is careful about everywhere else: the
     // call would succeed and quietly produce a wrong port number. Row 84 does the swap.
     ("htons", ANY, 84),
+    // **`errnoLocation` returns a real, writable word** (row 85, the shim's own 8-byte data
+    // segment), not 0. `std/posix` reaches libc's `errno` through the address-returning accessor
+    // (`__errno_location`, `__error` on Darwin) and both *reads and writes* through it —
+    // `readdir` must zero errno at end-of-directory or a consumer misreads a stale value as a
+    // failure. A 0 here would not be a stub, it would be a store to the #1094 NULL guard: a trap,
+    // from a program that merely cleared errno. One word for the whole guest is the right shape —
+    // §3d is a single vCPU, which is exactly the condition under which a process-wide errno is
+    // well-defined.
+    ("errnoLocation", ANY, 85),
+    // `posix_fallocate`'s bottom half (row 86), stubbed to `-1` like the adapter's other file-op
+    // syscalls: this powerbox has no filesystem to preallocate on. Reached by *linking* `std/posix`
+    // (`std/times`, `std/strtabs` and `std/paths` all pull it in transitively), not by calling it.
+    ("fallocateImpl", ANY, 86),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
