@@ -2164,11 +2164,22 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
 /// Gated on `NIM_NIFLER2=1`: the compile is minutes and the closure is 10× the corpus, far past what
 /// the per-PR suite should carry. Reports how far it gets rather than asserting, until it lands.
 ///
-/// **Where it stands:** links and verifies (3293 funcs), then traps `MemoryFault` at run — because
-/// this is the wrong bottom edge, not because of memory. `link_nim_powerbox` stubs the file syscalls
-/// for stdout-only programs; nifler2 reads a file. Two memory hypotheses were tested and disproved
-/// first (run window 64 MiB/256 MiB/1 GiB, and heap 11 MiB → 251 MiB, all faulting identically),
+/// **Where it stands:** it runs the real parse. `nifler2 parse /in.nim /out.nif` reads the seeded
+/// memfs file and writes a `/out.nif` whose header is byte-identical to the native nifler2's. The
+/// body is not: the guest trips `[Assertion Failure] beginRead with unclosed tags` and emits the
+/// header alone, where native emits the parsed `(stmts …)` — so `parseModule` leaves a tag open on
+/// Temen. That is a translator correctness bug, and this is its reproducer.
+///
+/// Getting here took three edges, each of which looked like the last one's cause: a `MemoryFault`
+/// that was really `argc = 0` (`_start` passed no argv, so `getopt()` saw nothing); then
+/// `cannot read the input file`, which was `link_nim_powerbox`'s stdout-only `sysOpen` stub; then
+/// the same message again from `getcwd` returning NULL. Two memory hypotheses were tested and
+/// disproved along the way (run window 64 MiB/256 MiB/1 GiB, heap 11 MiB → 251 MiB, all identical),
 /// which is what pointed at the bottom edge rather than the sizing.
+///
+/// **Knobs**, for bisecting from the outside: `NIM_NIFLER2_SRC` picks a different in-tree program
+/// (a smaller probe against the same parser), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SL`
+/// its window.
 #[test]
 fn nifler2_links_through_leng() {
     if std::env::var("NIM_NIFLER2").is_err() {
@@ -2182,7 +2193,10 @@ fn nifler2_links_through_leng() {
     // The nimony source root is the parent of the `bin/` the toolchain lives in.
     let bin = std::env::var("NIMONY_BIN").expect("NIMONY_BIN");
     let root = std::path::Path::new(&bin).parent().expect("nimony root");
-    let src = root.join("src/nifler2/nifler2.nim");
+    // `NIM_NIFLER2_SRC` points at a different program in the same tree — a smaller probe against the
+    // same parser, compiled and linked by this one route rather than a copy of it.
+    let rel = std::env::var("NIM_NIFLER2_SRC").unwrap_or_else(|_| "src/nifler2/nifler2.nim".into());
+    let src = root.join(&rel);
     if !src.exists() {
         eprintln!("SKIP nifler2_links_through_leng ({src:?} absent — v0.6.2+ only)");
         return;
@@ -2195,7 +2209,7 @@ fn nifler2_links_through_leng() {
             "-d:release",
             "--silentMake",
             &format!("--out:{}", out.display()),
-            "src/nifler2/nifler2.nim",
+            &rel,
         ])
         .current_dir(root)
         .env("PATH", &path)
@@ -2296,8 +2310,19 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mk oracle dir");
     std::fs::write(dir.join("in.nim"), SRC).expect("write in.nim");
+    // The oracle runs the **same argv** the guest gets (minus `argv[0]`), so a probe program with no
+    // arguments is its own oracle on stdout and `nifler2 parse` is one on the written file.
+    let argv: Vec<String> = std::env::var("NIM_NIFLER2_ARGS")
+        .unwrap_or_else(|_| "nifler2 parse in.nim out.nif".into())
+        .split_whitespace()
+        .skip(1)
+        .map(|a| {
+            a.replace("/in.nim", "in.nim")
+                .replace("/out.nif", "out.nif")
+        })
+        .collect();
     let st = Command::new(native_bin)
-        .args(["parse", "in.nim", "out.nif"])
+        .args(&argv)
         .current_dir(&dir)
         .output()
         .expect("run native nifler2");
@@ -2306,9 +2331,14 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             "  nifler2: native oracle failed: {}",
             String::from_utf8_lossy(&st.stderr)
         );
-        return;
     }
-    let want = std::fs::read(dir.join("out.nif")).expect("oracle out.nif");
+    let want = std::fs::read(dir.join("out.nif")).unwrap_or_default();
+    if !st.stdout.is_empty() {
+        eprintln!(
+            "  nifler2: native stdout {:?}",
+            elide(&String::from_utf8_lossy(&st.stdout))
+        );
+    }
 
     let cfg = RunConfig {
         limits: Limits {
@@ -2334,6 +2364,9 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             "  nifler2: stdout {:?}",
             elide(&String::from_utf8_lossy(&out))
         );
+    }
+    if want.is_empty() {
+        return; // a probe run: stdout above is the whole comparison
     }
     match posix.read_file("/out.nif") {
         None => eprintln!("  nifler2: wrote no /out.nif"),
