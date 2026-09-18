@@ -1,5 +1,6 @@
 # Variant (`case`) objects with scalar branch fields: construction per branch, discriminant test,
-# branch field read. The string-branch shape is a known gap — see known_gaps/objects_variant_string.
+# branch field read. `objects_variant_string` is the same shape with a string branch; it was a known
+# gap once, and has been in the corpus proper since it was fixed.
 import std/syncio
 
 type

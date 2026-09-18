@@ -1717,9 +1717,26 @@ impl Translator {
                             let union_base = off;
                             let mut union_max = 0u64;
                             for branch in fld.args() {
-                                if branch.tag() != Some("object") {
-                                    continue;
-                                }
+                                // v0.6.2 wraps each branch in its `of` clause —
+                                // `(union (of (ranges N…) (object (fld…)))+)` — where v0.4.0 listed
+                                // the branch objects bare. The `ranges` are the discriminant values
+                                // that select the branch, which the layout does not depend on: every
+                                // branch still overlaps at `union_base`. So unwrap the clause and lay
+                                // the object out exactly as before. Unwrapping (rather than matching
+                                // `object` at one fixed depth) keeps both spellings working, which is
+                                // what the pooled type table needs — a module compiled by either
+                                // frontend has to resolve the same way.
+                                let branch = match branch.tag() {
+                                    Some("object") => branch,
+                                    Some("of") => {
+                                        match branch.args().iter().find(|n| n.tag() == Some("object"))
+                                        {
+                                            Some(o) => o,
+                                            None => continue,
+                                        }
+                                    }
+                                    _ => continue,
+                                };
                                 let mut boff = union_base;
                                 for bf in branch.args() {
                                     if bf.tag() != Some("fld") {
