@@ -2154,8 +2154,118 @@ fn nifler2_links_through_leng() {
                 .collect();
             if !unbound.is_empty() {
                 eprintln!("  nifler2: unbound leaves: {}", unbound.join(", "));
+                return;
             }
+            if let Some(mem) = m.memory.as_ref() {
+                let win = 1u64 << mem.size_log2;
+                let brk = temen_ir::powerbox_entry_sp(&m) + temen_ir::POWERBOX_STACK_RESERVE;
+                eprintln!(
+                    "  nifler2: window 2^{} = {} MiB · heap [{}, {}) = {} MiB",
+                    mem.size_log2,
+                    win >> 20,
+                    brk,
+                    win,
+                    (win - brk) >> 20
+                );
+            }
+            nifler2_run_vs_native(&m, &out);
         }
         Err(e) => eprintln!("  nifler2: LINK FAILED — {e}"),
+    }
+}
+
+/// Drive the Temen-linked nifler2 over an in-memory fs and diff its `.nif` against the **native**
+/// nifler2 binary the same `nimony c` just produced — the same oracle shape as
+/// `temen-run/tests/nifler_asset.rs`, which does this for the LLVM-built `nifler.temen`.
+#[cfg(test)]
+fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
+    use temen_run::{Backend, HostCap, Limits, Outcome, RunConfig};
+    const SRC: &str = "let x = 5\n";
+
+    // Native oracle: run in a scratch cwd with the input named `in.nim`, so the path nifler2 embeds
+    // in the NIF header matches what the guest sees at `/in.nim` (`fs::norm` strips the leading `/`).
+    let dir = std::env::temp_dir().join("nifler2_oracle");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mk oracle dir");
+    std::fs::write(dir.join("in.nim"), SRC).expect("write in.nim");
+    let st = Command::new(native_bin)
+        .args(["parse", "in.nim", "out.nif"])
+        .current_dir(&dir)
+        .output()
+        .expect("run native nifler2");
+    if !st.status.success() {
+        eprintln!(
+            "  nifler2: native oracle failed: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+        return;
+    }
+    let want = std::fs::read(dir.join("out.nif")).expect("oracle out.nif");
+
+    let (factory, handle) = temen_run::fs::mem_fs_shared_factory(
+        vec![("in.nim".into(), SRC.as_bytes().to_vec())],
+        vec![],
+    );
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: None,
+            deadline: None,
+            max_fibers: 0,
+            max_vcpus: 0,
+        },
+        stdin: vec![],
+        // `NIM_NIFLER2_SL` overrides the window so the need can be *measured* rather than argued —
+        // the same knob #1591 wanted and did not have.
+        memory_size_log2: std::env::var("NIM_NIFLER2_SL")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        args: vec![
+            b"nifler2".to_vec(),
+            b"parse".to_vec(),
+            b"/in.nim".to_vec(),
+            b"/out.nif".to_vec(),
+        ],
+        env: vec![],
+        ..RunConfig::default()
+    };
+    let run = match temen_run::instantiate(m.clone())
+        .expect("instantiate nifler2")
+        .run_with_caps(
+            Backend::TreeWalk,
+            &cfg,
+            &[("fs", HostCap::host_proc(0, factory))],
+        ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  nifler2: RUN FAILED — {e}");
+            return;
+        }
+    };
+    eprintln!("  nifler2: ran — outcome {:?}", run.outcome);
+    if !matches!(run.outcome, Outcome::Exited(0) | Outcome::Returned(_)) {
+        eprintln!(
+            "  nifler2: unclean exit; stderr {:?}",
+            elide(&String::from_utf8_lossy(&run.stderr))
+        );
+        return;
+    }
+    let (files, _dirs) = handle.seed();
+    match files.iter().find(|(k, _)| k == "out.nif") {
+        None => eprintln!(
+            "  nifler2: wrote no out.nif (memfs keys: {:?})",
+            files.iter().map(|(k, _)| k).collect::<Vec<_>>()
+        ),
+        Some((_, got)) if got == &want => eprintln!(
+            "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
+             no C compiler, runs on Temen",
+            got.len()
+        ),
+        Some((_, got)) => eprintln!(
+            "  nifler2: DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
+            got.len(),
+            want.len(),
+            elide(&String::from_utf8_lossy(got)),
+            elide(&String::from_utf8_lossy(&want))
+        ),
     }
 }
