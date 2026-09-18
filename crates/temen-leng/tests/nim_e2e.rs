@@ -2075,3 +2075,87 @@ fn elide(s: &str) -> String {
     }
     format!("{}…{}", &s[..100], &s[s.len() - 40..])
 }
+
+/// **#763 spike — `nifler2` through the no-C path.** Today's `nifler.temen` is built
+/// `nifler.nim → (stock nim c) → C → clang → bitcode → temen-llvm-translate`, and that clang hop is
+/// exactly the "no C compiler" dependency the capstone exists to remove. v0.6.2 ships **nifler2**,
+/// which hexer's own builder calls "a NIMONY program" — it has no stock-compiler dependency, so it
+/// can go `nimony c → Leng → link_nim_powerbox` with no C anywhere.
+///
+/// This compiles the real `src/nifler2/nifler2.nim` **in the nimony tree** (its imports are relative,
+/// so it cannot be copied into a scratch dir the way [`compile_to_leng`] does for a source string)
+/// and links its whole `.x.nif` closure. It is the same route as the corpus — `collect_x_nif` then
+/// `link_nim_powerbox` — parameterized by *where the source lives*, not a second copy of it.
+///
+/// Gated on `NIM_NIFLER2=1`: the closure is ~145 modules and the compile is minutes, far past what
+/// the per-PR suite should carry. Reports how far it gets rather than asserting, until it lands.
+#[test]
+fn nifler2_links_through_leng() {
+    if std::env::var("NIM_NIFLER2").is_err() {
+        eprintln!("SKIP nifler2_links_through_leng (set NIM_NIFLER2=1)");
+        return;
+    }
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nifler2_links_through_leng (no nimony toolchain)");
+        return;
+    };
+    // The nimony source root is the parent of the `bin/` the toolchain lives in.
+    let bin = std::env::var("NIMONY_BIN").expect("NIMONY_BIN");
+    let root = std::path::Path::new(&bin).parent().expect("nimony root");
+    let src = root.join("src/nifler2/nifler2.nim");
+    if !src.exists() {
+        eprintln!("SKIP nifler2_links_through_leng ({src:?} absent — v0.6.2+ only)");
+        return;
+    }
+    let out = std::env::temp_dir().join("nifler2_spike_bin");
+    let started = std::time::Instant::now();
+    let st = Command::new("nimony")
+        .args([
+            "c",
+            "-d:release",
+            "--silentMake",
+            &format!("--out:{}", out.display()),
+            "src/nifler2/nifler2.nim",
+        ])
+        .current_dir(root)
+        .env("PATH", &path)
+        .output()
+        .expect("run nimony on nifler2");
+    assert!(
+        st.status.success(),
+        "nimony c nifler2 failed:\n{}\n{}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+    eprintln!("  nifler2: nimony c ok in {}s", started.elapsed().as_secs());
+
+    let mut mods = Vec::new();
+    collect_x_nif(&root.join("nimcache"), &mut mods);
+    eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    match temen_leng::link_nim_powerbox(&units, guest_libc().as_deref()) {
+        Ok(m) => {
+            dump_module("nifler2", &m);
+            let v = temen_verify::verify_module(&m);
+            eprintln!(
+                "  nifler2: LINKED — {} funcs, {} imports, verify {:?}",
+                m.funcs.len(),
+                m.imports.len(),
+                v.map(|_| "ok")
+            );
+            let unbound: Vec<&str> = m
+                .imports
+                .iter()
+                .map(|i| i.name.as_str())
+                .filter(|n| *n != "write")
+                .collect();
+            if !unbound.is_empty() {
+                eprintln!("  nifler2: unbound leaves: {}", unbound.join(", "));
+            }
+        }
+        Err(e) => eprintln!("  nifler2: LINK FAILED — {e}"),
+    }
+}

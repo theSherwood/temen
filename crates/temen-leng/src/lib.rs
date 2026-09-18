@@ -928,6 +928,13 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // declaration with a name to bind. Same single-vCPU posture as its `builtinThreadFence`
     // neighbours (§3d): a spin-wait hint has nothing to yield to when there is one vCPU.
     ("builtinCpuRelax", ANY, 87),
+    // `nimony/src/lib/vfs.nim`'s `proc osProcessId(): int32 {.importc: "getpid".}` — the pid that
+    // names a temp file (`target & ".tmp." & $osProcessId() & …`). Same shim as `cGetpid` (row 1) and
+    // the same posture: one process in the sandbox, so a constant pid is the honest answer, and the
+    // only thing that reads it is a filename's uniqueness against *other processes*. **Pinned**, not
+    // `ANY` (#1499) — the row and the shim are both `() -> i32`, and `sysconf` is the standing
+    // reminder of what an `ANY` row does when those drift apart.
+    ("osProcessId", sig(&[], &[I32]), 1),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
