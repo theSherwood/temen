@@ -1251,47 +1251,7 @@ pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<M
 /// depends only on which bottom-edge leaves and raw syscalls the program references), so one build
 /// serves every permutation.
 pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    // The compute shim must know which leaf names to export; discover them from the `system` unit's
-    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
-    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
-    let sys = units
-        .iter()
-        .find(|u| u.stem.starts_with("sysv"))
-        .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
-    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
-        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
-    let mut compute_exports: Vec<(String, u32)> = Vec::new();
-    for imp in &sys_obj.imports {
-        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&sys_obj, imp)) {
-            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
-                compute_exports.push((imp.name.clone(), i));
-            }
-        }
-    }
-    let compute_unit = |exports: Vec<(String, u32)>| -> Result<temen_ir::LinkUnit, LengError> {
-        let module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
-            .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
-        Ok(temen_ir::LinkUnit {
-            module,
-            exports,
-            ..Default::default()
-        })
-    };
-
-    // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
-    let m1 = link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports.clone())?])?;
-
-    // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
-    // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
-    // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
-    // program is linked. Both passes feed one export list, so the final compute unit serves both.
-    for imp in &m1.imports {
-        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&m1, imp)) {
-            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
-                compute_exports.push((imp.name.clone(), i));
-            }
-        }
-    }
+    let (compute_exports, m1) = nim_compute_exports(units)?;
 
     // Map each retained syscall onto the adapter's fixed func order.
     let mut adapter_exports: Vec<(String, u32)> = Vec::new();
@@ -1319,7 +1279,66 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
         ..Default::default()
     };
 
-    Ok(vec![compute_unit(compute_exports)?, adapter])
+    Ok(vec![compute_shim_unit(compute_exports)?, adapter])
+}
+
+/// The **compute-shim link unit alone** — the half of [`nim_powerbox_runtime`] that carries no
+/// syscalls, exporting exactly the pure-compute leaves `units` reference.
+///
+/// Link against this (rather than the full runtime) when the true syscalls must stay **retained
+/// imports**, so a host personality can bind them by name — the POSIX route, where `sysWrite`/
+/// `sysOpen`/… go to `temen_posix`'s memfs ops instead of [`SYSCALL_ADAPTER`]'s stdout-only stubs.
+/// Same discovery, same table: one route through the compute bottom edge, two bindings above it.
+pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
+    compute_shim_unit(nim_compute_exports(units)?.0)
+}
+
+/// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).
+fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, LengError> {
+    let module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
+        .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+    Ok(temen_ir::LinkUnit {
+        module,
+        exports,
+        ..Default::default()
+    })
+}
+
+/// Which [`COMPUTE_LEAVES`] rows `units` actually reference, plus the **pass-1 link** they were
+/// discovered against (whose surviving imports are the true syscalls — what the caller binds next).
+fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Module), LengError> {
+    // The compute shim must know which leaf names to export; discover them from the `system` unit's
+    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
+    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
+    let sys = units
+        .iter()
+        .find(|u| u.stem.starts_with("sysv"))
+        .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
+    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
+        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
+    let mut compute_exports: Vec<(String, u32)> = Vec::new();
+    let widen = |m: &Module, exports: &mut Vec<(String, u32)>| {
+        for imp in &m.imports {
+            if let Some(i) = compute_leaf_index(&imp.name, import_sig(m, imp)) {
+                if exports.iter().all(|(n, _)| n != &imp.name) {
+                    exports.push((imp.name.clone(), i));
+                }
+            }
+        }
+    };
+    widen(&sys_obj, &mut compute_exports);
+
+    // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
+    let m1 =
+        link_whole_powerbox_manifest(units, vec![compute_shim_unit(compute_exports.clone())?])?;
+
+    // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
+    // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
+    // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
+    // program is linked. Both passes feed one export list, so the final compute unit serves both.
+    widen(&m1, &mut compute_exports);
+
+    Ok((compute_exports, m1))
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that

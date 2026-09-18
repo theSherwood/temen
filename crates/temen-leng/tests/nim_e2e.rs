@@ -14,43 +14,7 @@
 
 use std::process::Command;
 use temen_interp::Value;
-use temen_ir::{LinkUnit, Module};
-
-/// The runtime shim's function indices, keyed by the C symbol each bottom-edge import lowers to.
-/// Longest-prefix wins so `atomicCompareExchangeN` is not shadowed by a shorter atomic name.
-const SHIM_BINDINGS: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
-];
-
-/// The shim function bound to a **bottom-edge C** import, or `None` for a cross-module nimony symbol
-/// (`ini`, a proc defined in a sibling module) — those resolve against the other link units, not the
-/// runtime shim. Longest-prefix wins so `atomicCompareExchangeN` isn't shadowed by a shorter atomic.
-fn shim_index(name: &str) -> Option<u32> {
-    SHIM_BINDINGS
-        .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
-}
+use temen_ir::Module;
 
 /// Locate the nimony toolchain. Honours `NIMONY_BIN`/`NIM_BIN` (directories holding `nimony`/`nim`),
 /// else looks for `nimony` on `PATH`. Returns the `PATH` value to run the compiler under (nimony
@@ -163,38 +127,6 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
 /// modules actually reference — discovered from each module's compiled object, so the mangled atomic
 /// symbol names never have to be hard-coded.
 fn link_with_runtime(mods: &[(String, String)]) -> Module {
-    // Discover the real import names from the **system module** only (stem `sysv…`). Every
-    // bottom-edge C import (`mmap`, `memcpy`, the atomics, …) originates there, and — unlike a
-    // program module that references a cross-module aggregate type such as `string.0.sysv…` — the
-    // system module is self-contained, so it compiles standalone (no pooled types) for discovery.
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_encode::decode_unit(
-            &temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-                .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
-        )
-        .expect("decode object");
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    // Bind only the bottom-edge C imports to the shim; cross-module nimony imports (`ini`, sibling
-    // procs) are left for the other link units to resolve.
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
-
     // Order the **program module first** (the `system` module — stem `sysv…` — last), the convention
     // `link` builds on: the first unit's first proc is func 0, the natural entry, and the C `main`/init
     // chain lives in the program module. `collect_x_nif`'s directory order is filesystem-dependent, so
@@ -206,6 +138,9 @@ fn link_with_runtime(mods: &[(String, String)]) -> Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
+    // The compute-shim link unit comes from the library's own leaf table — one route through the
+    // bottom edge. A test-local copy of that table went stale the moment a leaf was added.
+    let runtime = temen_leng::nim_compute_shim_unit(&units).expect("compute shim unit");
     let m = temen_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link with runtime: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -732,36 +667,15 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
 fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // Bind the pure-compute bottom edge to the shim (as `link_with_runtime`), but via the *manifest*
     // link so the raw-syscall leaves survive as host-bound imports rather than fail-closing.
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_encode::decode_unit(
-            &temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-                .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
-        )
-        .expect("decode object");
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
     let mut ordered: Vec<&(String, String)> = mods.iter().collect();
     ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
     let units: Vec<temen_leng::WholeModule> = ordered
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
+    // Compute leaves only: the true syscalls stay **retained imports** for the POSIX personality to
+    // bind by name below, so this deliberately does not take `nim_powerbox_runtime`'s adapter.
+    let runtime = temen_leng::nim_compute_shim_unit(&units).expect("compute shim unit");
     // Link with a synthesized **powerbox `_start`** at function 0: it reads the post-link data-stack
     // base (`data.top` → `powerbox_entry_sp`, page-aligned above the globals) and calls the C-shaped
     // `main($sp, argc, argv, envp)` with `argc/argv/envp = 0` — a real powerbox entry, not a
