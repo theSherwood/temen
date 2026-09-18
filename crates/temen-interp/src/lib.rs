@@ -3019,6 +3019,42 @@ fn drive_over_cell(
         // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
         // source kept alive past the run pins nothing and a post-run raise is a no-op.
     }
+    // #1361 step 3 — harvest each live detached child the freeze rang the doorbell for. By here
+    // `worker_loop` has run until every vCPU finished, so a child that took the bell has unwound and
+    // delivered its window through the ordinary result channel; claim it and pair it with the
+    // powerbox the parent kept. A record left undrained is a child that never reached its poll — it
+    // stays in `pending_detached` for the caller to refuse on (#1584), rather than being silently
+    // dropped into a partial artifact.
+    {
+        let pending = std::mem::take(&mut host_shared.lock_unpoisoned().pending_detached);
+        let mut s = sched.lock();
+        let mut captured = Vec::new();
+        let mut unreached = Vec::new();
+        for p in pending {
+            // `layout_snapshot` is root-window-only and excludes a §13-region-mapped window; a
+            // detached child's window *is* a root window, and an unsafe one stays unreached rather
+            // than producing a partial image (R4 cross-tree sharing is its own open question).
+            match s
+                .results
+                .remove(&p.child_task)
+                .and_then(|o| o.mem)
+                .filter(|m| m.layout_snapshot_safe())
+            {
+                Some(m) => captured.push(CapturedDetached {
+                    parent_task: p.parent_task,
+                    slot: p.slot,
+                    reserved_log2: m.reserved_size().trailing_zeros() as u8,
+                    window: m.layout_snapshot(),
+                    host: p.host,
+                }),
+                None => unreached.push(p),
+            }
+        }
+        drop(s);
+        let mut hg = host_shared.lock_unpoisoned();
+        hg.captured_detached = captured;
+        hg.pending_detached = unreached;
+    }
     let (out, trap_origin) = {
         let mut s = sched.lock();
         // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
@@ -7013,8 +7049,37 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 }
                             }
                         } else {
-                            refuse = true; // still running: the O6 mid-flight case (step 3)
-                            break;
+                            // #1361 step 3 — **still running**: ring the freeze doorbell and record
+                            // the child for harvest. We do not wait for it: this vCPU is itself
+                            // mid-freeze, and the child needs to *run* (to unwind) and *finish* (to
+                            // deliver its window through the scheduler's ordinary result channel).
+                            // The run driver already runs until every vCPU has finished, so it is the
+                            // natural collector — the parent rings, records, and unwinds.
+                            //
+                            // A child that never reaches its poll (parked on a futex or a join) never
+                            // unwinds, and the run reaches quiescence with this record undrained. That
+                            // is the fail-closed case tracked as #1584: a child must not be able to
+                            // veto its parent's freeze, but until the parked kinds are reachable the
+                            // honest answer is to refuse loudly rather than emit a partial artifact.
+                            if let Some(bell) = v.child_freeze.get(&slot) {
+                                bell.store(true, Ordering::Relaxed);
+                                let host = Arc::clone(&v.child_hosts[&slot]);
+                                let sink =
+                                    v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                                sink.lock_unpoisoned()
+                                    .pending_detached
+                                    .push(PendingDetached {
+                                        parent_task: v.id as usize,
+                                        slot,
+                                        child_task: cid,
+                                        host,
+                                    });
+                            } else {
+                                // No doorbell: a child minted before this mechanism existed, or one
+                                // reached by a path that does not wire one. Nothing can reach it.
+                                refuse = true;
+                                break;
+                            }
                         }
                     }
                     refuse
@@ -8923,6 +8988,48 @@ pub struct FrozenDetached {
     pub completed_result: i64,
 }
 
+/// #1361 step 3 — a **live** detached §14 child the freeze rang the doorbell for, recorded while the
+/// parent unwinds and harvested by the run driver once the child has unwound and finished. The
+/// in-flight half of [`FrozenDetached`]: that one is the completed case, where only a join result
+/// crosses; this one names a child whose whole *separate window* has to come back.
+///
+/// It exists because the parent cannot wait for the child. The parent is itself a running vCPU
+/// mid-freeze, and the child must run (to unwind) and finish (to deliver its window through the
+/// scheduler's ordinary result channel, [`Outcome::mem`]). So the parent rings, records, and unwinds;
+/// the driver — which already runs until every vCPU has finished — collects. Never serialized: the
+/// codec sees the harvested [`CapturedDetached`], not this.
+#[derive(Clone)]
+pub struct PendingDetached {
+    /// The task that spawned this child (op 15) — `0` for a direct child of the root.
+    pub parent_task: usize,
+    /// The spawner's `threads`/join slot the child was minted at.
+    pub slot: usize,
+    /// The child's scheduler task, so the driver can claim its outcome.
+    pub child_task: u64,
+    /// The child's own powerbox. An `Arc`, so it outlives the child's vCPU and is still readable when
+    /// the driver captures its handle table — the linkage that survives detachment is the powerbox,
+    /// never the window (PROCESS.md §5).
+    pub host: Arc<Mutex<Host>>,
+}
+
+/// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
+/// ready for the codec to freeze as its own root-shaped artifact (the form slice 3 established) and
+/// embed in the parent's. The parent's join edge is named the same way a completed child's is, so a
+/// thaw rebuilds it identically.
+pub struct CapturedDetached {
+    /// The task that spawned this child — `0` for a direct child of the root.
+    pub parent_task: usize,
+    /// The spawner's `threads`/join slot the child was minted at.
+    pub slot: usize,
+    /// The child's window at the instant it finished unwinding — its whole separate image, in the one
+    /// image form ([`MemLayout`], #1456), which is what [`temen_snapshot::freeze_layout`] consumes.
+    pub window: MemLayout,
+    /// `log2` of the child's reservation, the other half `freeze_layout` needs.
+    pub reserved_log2: u8,
+    /// The child's powerbox, for its handle table / JIT / named-cap residue.
+    pub host: Arc<Mutex<Host>>,
+}
+
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
 /// continuation is exactly its reified call stack. `cont.new` makes one (`Pending`);
 /// `cont.resume` claims and switches into it; `suspend` parks it back, claimable again
@@ -9658,6 +9765,18 @@ struct VCpu {
     /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
+    /// #1361 step 3 — the **freeze doorbell**: `Some` on a *detached* §14 child, whose window its
+    /// parent cannot reach. A nested child is told to unwind by one word written into the parent's
+    /// own image (`carve_off + STATE_OFF`); a detached child owns its window elsewhere and the
+    /// parent deliberately holds no pointer into it (`window_exposed = false` is structural), so the
+    /// broadcast is rung out-of-band instead — the same shape as [`kill`](Self::kill), which already
+    /// crosses this boundary.
+    ///
+    /// It is a **doorbell, not a second unwinding path** (INVARIANTS #15): all it does is write
+    /// `UNWINDING` into this domain's *own* global freeze word, which is the one thing that makes any
+    /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
+    /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
+    freeze_bell: Option<Arc<AtomicBool>>,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
     /// (a different unmasked signal can interrupt a running handler — the source blocks the
@@ -9670,6 +9789,11 @@ struct VCpu {
     /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
     /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
     child_kill: BTreeMap<usize, Arc<AtomicBool>>,
+    /// #1361 step 3 — a parent's map from a **detached** child's join slot to that child's freeze
+    /// doorbell ([`VCpu::freeze_bell`]), so a subtree freeze can ring it. The detached twin of
+    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only op-15 children have one
+    /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
+    child_freeze: BTreeMap<usize, Arc<AtomicBool>>,
     /// §3.6 slice 5b — the serve loop's **running handler fiber**, set when the
     /// `svc.poll`/`svc.wait` arm switches into one and consumed when the serve frame re-executes
     /// (the handler returned, fiber-parked, or suspended). See [`ServeRun`].
@@ -9808,8 +9932,10 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -9878,8 +10004,10 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -9972,8 +10100,10 @@ impl VCpu {
             invoked_ref_slots,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -10426,8 +10556,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         invoked_ref_slots,
         debug,
         kill,
+        freeze_bell,
         sig_handler_stack,
         child_kill,
+        child_freeze,
         serve_run,
         handler_parks,
         serve_count,
@@ -11071,6 +11203,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
+            // #1361 step 3 — the freeze doorbell. A **detached** child owns a window its parent
+            // cannot write, so a subtree freeze rings this instead of broadcasting into a carve. All
+            // it does is set our OWN global freeze word: from here the instrumented code unwinds
+            // exactly as it would for a root freeze, so there is still one unwinding path and this is
+            // a doorbell for it (#15). Idempotent, and placed here rather than at a safepoint for the
+            // same reason `kill` is — a child must be reachable even in a loop with no back-edge.
+            // Free when unarmed (`None`); when armed, one relaxed load per op.
+            if freeze_bell
+                .as_deref()
+                .is_some_and(|b| b.load(Ordering::Relaxed))
+            {
+                if let Some(m) = mem.as_mut() {
+                    if m.durable_state() == STATE_NORMAL {
+                        m.durable_set_state(STATE_UNWINDING);
+                    }
+                }
+            }
             // #796 default actions — a `SIG_DFL` terminate delivered to this domain: die at the
             // next op, exactly like the parent-set kill flag (the exit hook reports term-by-signal
             // from the personality's bookkeeping). Checked before stop — death beats stop, so a
@@ -12649,6 +12798,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let csched = sched.clone();
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
+                                    // #1361 step 3 — the freeze doorbell, minted beside the kill flag
+                                    // because it crosses the same boundary for the same reason: the
+                                    // parent keeps lifecycle authority over a child whose window it
+                                    // cannot reach (PROCESS.md §5, "detachment severs *read*, not
+                                    // lifecycle"). A freeze is a lifecycle action.
+                                    let bell = Arc::new(AtomicBool::new(false));
+                                    let bell_child = Arc::clone(&bell);
                                     let made = sched.spawn(move |id| {
                                         // A detached child is its own domain: own dispatch
                                         // table, own window; NOT `nested_child` (no carve to
@@ -12681,12 +12837,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // host's.
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
+                                        child.freeze_bell = Some(bell_child); // and so does the freeze
                                         Box::new(child)
                                     });
                                     match made {
                                         Some(child_id) => {
                                             threads.push(Some(child_id));
                                             child_kill.insert(threads.len() - 1, kflag);
+                                            child_freeze.insert(threads.len() - 1, bell);
                                             // Live offers over a detached child work exactly as
                                             // nested (`child_offer` + caller parking): the
                                             // linkage is the powerbox Arc, not the window.
@@ -19074,6 +19232,14 @@ pub struct Host {
     /// refused) and **in** to a thaw (the seeding posts each result and rebuilds the join edge).
     /// See [`FrozenDetached`]. Empty for every run that froze no completed detached child.
     frozen_detached: Vec<FrozenDetached>,
+    /// #1361 step 3 — **live** detached children a freeze rang the doorbell for, awaiting harvest by
+    /// the run driver (see [`PendingDetached`]). Transient: the driver drains this into
+    /// [`captured_detached`](Self::captured_detached) once each child has unwound and finished, so a
+    /// non-empty one at the end of a run is a child that never got there (#1584).
+    pending_detached: Vec<PendingDetached>,
+    /// #1361 step 3 — the harvested form (see [`CapturedDetached`]): each live detached child's
+    /// unwound window + powerbox, for the codec to embed as a sub-artifact.
+    captured_detached: Vec<CapturedDetached>,
     /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
     /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
     /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
@@ -19485,6 +19651,8 @@ impl Host {
             frozen_vcpus: Vec::new(),
             frozen_nested: Vec::new(),
             frozen_detached: Vec::new(),
+            pending_detached: Vec::new(),
+            captured_detached: Vec::new(),
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
@@ -20493,6 +20661,22 @@ impl Host {
 
     /// Seed the completed detached children a **thaw** must deliver, alongside the restored window
     /// (the in-memory counterpart of [`Host::set_frozen_nested`]).
+    /// #1361 step 3 — the **live** detached children this run's freeze captured, each with its own
+    /// unwound window and powerbox (see [`CapturedDetached`]). The codec freezes each as its own
+    /// root-shaped artifact and embeds it in the parent's.
+    pub fn captured_detached(&self) -> &[CapturedDetached] {
+        &self.captured_detached
+    }
+
+    /// #1361 step 3 — detached children the freeze rang the doorbell for that **never reached their
+    /// poll** (parked on a futex or a join, so they never unwound). Non-empty means the artifact
+    /// would be incomplete: a caller must refuse rather than emit it. Tracked as #1584 — a child
+    /// should not be able to veto its parent's freeze, so this is the fail-closed resting state, not
+    /// the end state.
+    pub fn unreached_detached(&self) -> &[PendingDetached] {
+        &self.pending_detached
+    }
+
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
     }
