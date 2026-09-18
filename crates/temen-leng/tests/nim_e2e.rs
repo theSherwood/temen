@@ -804,6 +804,10 @@ fn nim_posix_op(name: &str) -> u32 {
         temen_posix::OP_CLOSE
     } else if name.starts_with("sysLseek") {
         temen_posix::OP_LSEEK
+    } else if name.starts_with("getcwd") {
+        // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
+        // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
+        temen_posix::OP_GETCWD
     } else {
         panic!("unmapped nimony syscall import `{name}` — extend nim_posix_op");
     }
@@ -2095,6 +2099,57 @@ fn elide(s: &str) -> String {
     format!("{}…{}", &s[..100], &s[s.len() - 40..])
 }
 
+/// **A nim program reads and writes real files** through the POSIX personality — the route
+/// [`temen_leng::nim_posix_runtime`] links: the compute shim plus `POSIX_OPEN_ADAPTER`, with the
+/// syscalls left as retained manifest imports the host binds to `temen_posix`'s fd ops over an
+/// in-memory filesystem.
+///
+/// `link_nim_powerbox`'s bottom edge cannot do this at all (its `sysOpen` is a `{ return -1 }` stub
+/// for stdout-only programs), so until now nothing on the leng route had ever opened a file. This is
+/// the smallest program that does, and the gate for the ABI reconciliation the route needs: C's
+/// `open` takes a NUL-terminated `char*` where every `temen_posix` path op takes `(ptr, len)`.
+#[test]
+fn nim_reads_and_writes_files_through_the_posix_personality() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         try:\n\
+         \x20 let s = readFile(\"/in.txt\")\n\
+         \x20 write(stdout, s)\n\
+         \x20 writeFile(\"/out.txt\", s & \"!\")\n\
+         except:\n\
+         \x20 write(stdout, \"IO FAILED\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let posix = run_io_capture(
+        &m,
+        temen_run::Backend::TreeWalk,
+        &temen_run::RunConfig::default(),
+        &[("/in.txt", b"hello from the memfs")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&posix.stdout()),
+        "hello from the memfs",
+        "the guest read a seeded memfs file and printed it"
+    );
+    assert_eq!(
+        posix.read_file("/out.txt").as_deref(),
+        Some(b"hello from the memfs!".as_slice()),
+        "the guest wrote a new memfs file"
+    );
+}
+
 /// **#763 spike — `nifler2` through the no-C path.** Today's `nifler.temen` is built
 /// `nifler.nim → (stock nim c) → C → clang → bitcode → temen-llvm-translate`, and that clang hop is
 /// exactly the "no C compiler" dependency the capstone exists to remove. v0.6.2 ships **nifler2**,
@@ -2190,11 +2245,15 @@ fn nifler2_links_through_leng() {
                     // `write` is the guest libc's §3e STREAM cap; `open` is the POSIX open adapter's
                     // forward. The rest are nimony syscall leaves. All bound at instantiation.
                     !["write", "open"].contains(n)
-                        && !["sysWrite", "sysRead", "sysClose", "sysLseek"]
+                        && !["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]
                             .iter()
                             .any(|p| n.starts_with(p))
                 })
                 .collect();
+            eprintln!(
+                "  nifler2: imports: {:?}",
+                m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+            );
             if !unbound.is_empty() {
                 eprintln!("  nifler2: unbound leaves: {}", unbound.join(", "));
                 return;
@@ -2261,12 +2320,11 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         memory_size_log2: std::env::var("NIM_NIFLER2_SL")
             .ok()
             .and_then(|v| v.parse().ok()),
-        args: vec![
-            b"nifler2".to_vec(),
-            b"parse".to_vec(),
-            b"/in.nim".to_vec(),
-            b"/out.nif".to_vec(),
-        ],
+        args: std::env::var("NIM_NIFLER2_ARGS")
+            .unwrap_or_else(|_| "nifler2 parse /in.nim /out.nif".into())
+            .split_whitespace()
+            .map(|a| a.as_bytes().to_vec())
+            .collect(),
         ..RunConfig::default()
     };
     let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &[("/in.nim", SRC.as_bytes())]);

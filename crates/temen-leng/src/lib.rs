@@ -1455,6 +1455,13 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
     compute_shim_unit(nim_compute_exports(units)?.0)
 }
 
+/// Bottom-edge leaves the **POSIX personality** serves for real, so [`nim_posix_runtime`] leaves them
+/// to the host instead of binding [`POWERBOX_COMPUTE_SHIM`]'s fail-closed stub. Each one's C ABI is
+/// what the matching `temen_posix` op already takes, so no adapter stands between them — a leaf that
+/// *does* need reconciling (a NUL-terminated path where the op wants `(ptr, len)`) belongs in
+/// [`POSIX_OPEN_ADAPTER`] instead, not here.
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd"];
+
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.
 ///
@@ -1465,7 +1472,14 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 /// that opens and reads files (`nifler2 parse in.nim out.nif`) works — and adds only
 /// [`POSIX_OPEN_ADAPTER`], the one ABI reconciliation that edge needs.
 pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    let (compute_exports, m1) = nim_compute_exports(units)?;
+    let (mut compute_exports, m1) = nim_compute_exports(units)?;
+    // Withhold the leaves the **personality serves for real** from the compute shim, whose versions
+    // of them are deliberate fail-closed stubs ("a playground guest is granted no ambient
+    // filesystem"). Bound to the stub, `getcwd` returns NULL and nim's `getCurrentDir()` raises —
+    // which is right for the stdout-only powerbox and wrong here, where a real cwd exists. Dropped
+    // from the shim's export set they survive as retained imports the host binds to the matching
+    // `temen_posix` op, whose `getcwd(buf, size) -> buf` is the C ABI unchanged.
+    compute_exports.retain(|(n, _)| !POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)));
     // `sysOpen`'s nim name is only known once the program is linked (pass 1's retained imports).
     let opens: Vec<(String, u32)> = m1
         .imports
