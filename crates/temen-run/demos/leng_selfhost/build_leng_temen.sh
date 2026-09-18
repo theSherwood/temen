@@ -25,9 +25,12 @@ OPT="${LLVM_OPT:-opt}"
 # [1/4] build-std: emit per-crate textual LLVM IR for the whole closure (guest + temen-leng + std from
 # source). `--emit=llvm-ir`, release, panic=abort with panic_immediate_abort.
 echo "[1/4] build-std (default rustc) ..."
-( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
+# `-Cpanic=immediate-abort`, not `-Zbuild-std-features=panic_immediate_abort`: rustc promoted it to a
+# real panic strategy, and the old spelling is now a hard `compile_error!` in `core`. Same form as the
+# sibling `build_nim_link.sh`, which already carried the new one.
+( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir -Zunstable-options -Cpanic=immediate-abort' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
     cargo build --release \
-      -Zbuild-std=std,panic_abort -Zbuild-std-features=panic_immediate_abort \
+      -Zbuild-std=std,panic_abort \
       --target "$TRIPLE" --ignore-rust-version )
 
 DEPS="$CACHE/target/$TRIPLE/release/deps"
