@@ -2015,7 +2015,15 @@ impl Translator {
         t.collect_types(root)?;
         let mut out: Vec<(String, Vec<ValType>, Option<ValType>)> = Vec::new();
         for item in root.args() {
-            if item.tag() != Some("proc") || is_bodyless_proc(item) {
+            // `is_importc_proc`, NOT `is_bodyless_proc`: an **intrinsic** declaration is bodyless but
+            // its signature is authoritative — `leng_tags.InstrC` says `SYM`'s params and return type
+            // drive everything about an `(instr SYM …)`. `builtinCompareExchangeN[T]` returns `bool`,
+            // and without its declared return here the call site's default `i64` value-hint wins: the
+            // import is declared `[I64]`, which both fails to verify against the `i32`-returning
+            // wrapper AND misses its signature-pinned `COMPUTE_LEAVES` row (#1499), leaving the leaf
+            // unbound. A C extern stays excluded: those bind to the guest libc and the compute shim,
+            // whose signatures are settled against call-site derivation.
+            if item.tag() != Some("proc") || is_importc_proc(item) {
                 continue;
             }
             let a = item.args();
@@ -2226,7 +2234,28 @@ impl Translator {
                 // An `importc` proc is an **extern** (a C bottom-edge function — `memcpy`, `mmap`):
                 // it has no body to translate. Skip it, so a call to it lowers to an Temen import the
                 // host/runtime binds at link (the same seam the ~15 C funcs already use).
-                Some("proc") if is_bodyless_proc(item) => {}
+                //
+                // An **intrinsic** declaration is skipped the same way, but its *return type* is
+                // recorded first. `leng_tags.InstrC` makes `SYM`'s signature authoritative, and
+                // unlike a C extern the intrinsic is declared in the very module that applies it —
+                // so nothing else carries the type. Without it `call_import` falls back to the call
+                // site's default `i64` value-hint: `builtinCompareExchangeN[T]` returns `bool`, and
+                // an import declared `[I64]` both fails to verify against its `i32`-returning wrapper
+                // and misses its signature-pinned `COMPUTE_LEAVES` row (#1499), leaving the leaf
+                // unbound. `ext_proc_rets` is exactly the "this import's real return" table (#1404),
+                // so this reuses it under the bare local name rather than adding a second one.
+                Some("proc") if is_bodyless_proc(item) => {
+                    if is_intrinsic_proc(item) {
+                        if let Ok((name, _, ret0)) = self.proc_sig(item) {
+                            let ret = if self.ret_sret(&item.args()[2])?.is_some() {
+                                None
+                            } else {
+                                ret0
+                            };
+                            self.ext_proc_rets.insert(name, ret);
+                        }
+                    }
+                }
                 Some("proc") => {
                     let (name, params, ret0) = self.proc_sig(item)?;
                     let sret = self.ret_sret(&item.args()[2])?;

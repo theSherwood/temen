@@ -918,6 +918,11 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // syscalls: this powerbox has no filesystem to preallocate on. Reached by *linking* `std/posix`
     // (`std/times`, `std/strtabs` and `std/paths` all pull it in transitively), not by calling it.
     ("fallocateImpl", ANY, 86),
+    // **`cpuRelax`'s intrinsic form** (row 87, a bare `() -> ()` no-op). v0.4.0 spelled this as an
+    // `{.emit.}` of raw C, which `EMIT_NOPS` already swallowed; v0.6.2 makes it a real intrinsic
+    // declaration with a name to bind. Same single-vCPU posture as its `builtinThreadFence`
+    // neighbours (§3d): a spin-wait hint has nothing to yield to when there is one vCPU.
+    ("builtinCpuRelax", ANY, 87),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the

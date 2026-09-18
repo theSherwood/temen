@@ -1815,23 +1815,12 @@ fn temen_output(
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let m = temen_leng::link_nim_powerbox(&units, Some(libc)).map_err(|e| format!("link: {e}"))?;
-    temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
-    let extra: Vec<&str> = m
-        .imports
-        .iter()
-        .map(|i| i.name.as_str())
-        .filter(|n| *n != "write")
-        .collect();
-    if !extra.is_empty() {
-        // An unbound bottom-edge leaf. The program would trap at run with nothing to say, so name it
-        // here — this is how the missing half of libm surfaced (#1375).
-        return Err(format!("unbound leaves: {}", extra.join(", ")));
-    }
     // `NIM_DIFF_DUMP=<dir>` writes the linked module as text next to its bound import list. A
     // program that runs cleanly and prints nothing gives the Nim side no way to say why; reading the
     // generated IR for the write path is what found the dropped-`scope` miscompile, after a day of
     // bisecting from the guest side. `print_module` output is large (a hello-world links ~660
-    // functions), so this is opt-in.
+    // functions), so this is opt-in. Written BEFORE `verify_module`: a module that fails to verify
+    // is exactly the one whose IR you need, and dumping after the `?` would never produce it.
     if let Ok(dir) = std::env::var("NIM_DIFF_DUMP") {
         let mut txt = String::new();
         for i in &m.imports {
@@ -1844,6 +1833,18 @@ fn temen_output(
         }
         txt.push_str(&temen_text::print_module(&m));
         let _ = std::fs::write(format!("{dir}/{name}.temt"), txt);
+    }
+    temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
+    let extra: Vec<&str> = m
+        .imports
+        .iter()
+        .map(|i| i.name.as_str())
+        .filter(|n| *n != "write")
+        .collect();
+    if !extra.is_empty() {
+        // An unbound bottom-edge leaf. The program would trap at run with nothing to say, so name it
+        // here — this is how the missing half of libm surfaced (#1375).
+        return Err(format!("unbound leaves: {}", extra.join(", ")));
     }
     let run = temen_run::run_powerbox(&m, &[]).map_err(|e| format!("run: {e}"))?;
     Ok((
