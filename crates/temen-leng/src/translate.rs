@@ -474,6 +474,36 @@ pub(crate) struct Translator {
     /// symbol's type? — and a second parallel list would be one more thing to keep in step.
     /// Empty unless the linker pooled sibling units' globals.
     ext_globals: HashMap<String, TyDesc>,
+    /// **`importc` globals another unit `exportc`s** — local gvar name → (C name, type). An
+    /// `importc` gvar is a declaration, not a definition: nimony's C backend resolves it to whatever
+    /// object the C linker finds under that name. Two of them are written by the program's own
+    /// generated `main` (`cmdCount`/`cmdLine`, from its `argc`/`argv`; `nimEnviron`, from `envp`) and
+    /// read by `std/cmdline` / `std/envvars` — *different modules*, so the declaration and the
+    /// definition are in different link units, spelled by different nim symbols (`` `cmdCount.0. ``
+    /// vs `cmdCount.0.~9`) and related only by their shared C name.
+    ///
+    /// Lowering each declaration to its own zero-initialized local global therefore silently split
+    /// the object in two: `main` wrote `argc` into the program unit's copy and `paramCount()` read
+    /// `std/cmdline`'s, which was zero forever — so `paramCount()` was `-1` and `paramStr(i)` was
+    /// `""` however the host was invoked (#763). A declaration listed here instead resolves to a
+    /// `data.sym "<C name>"` that the linker binds to the defining unit's `exportc` data export
+    /// ([`exportc_exports`]) — the same object, as C meant.
+    ///
+    /// Only names some unit actually exports land here; one nothing defines keeps the local-global
+    /// lowering (plus any [`importc_global_seed`]), so this can never turn a program that links
+    /// today into an unresolved-symbol link error.
+    ext_c_globals: HashMap<String, (String, TyDesc)>,
+    /// **Sibling units' `importc` global aliases** — a diverted declaration's *stem-suffixed nim*
+    /// name → the C name it binds by, pooled by the linker ([`export_c_global_aliases`]). A unit that
+    /// diverts `posix_environ.0.` to `data.sym "nimEnviron"` no longer allocates a slot for it, so it
+    /// no longer exports `posix_environ.0.<stem>` either — and a sibling that references that name
+    /// (`std/posix` is read from `std/os`) would fail the link as unresolved. Listed here, the sibling
+    /// emits the same `data.sym "<C name>"` and lands on the one object. The descriptor still comes
+    /// from [`ext_globals`](Self::ext_globals) (unchanged: the alias moves the *address*, not the type).
+    ext_c_aliases: HashMap<String, String>,
+    /// The C names sibling units **define** (`exportc` gvars), pooled by the linker — the filter for
+    /// [`ext_c_globals`](Self::ext_c_globals).
+    c_global_defs: HashSet<String>,
     /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
     /// `$sp` param (they take a local's address; see [`proc_needs_frame`](Self::proc_needs_frame)),
     /// under the stem-suffixed names this module calls them by ([`export_proc_frames`]). A
@@ -583,6 +613,9 @@ impl Translator {
             ext_consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
             ext_globals: HashMap::default(),
+            ext_c_globals: HashMap::default(),
+            ext_c_aliases: HashMap::default(),
+            c_global_defs: HashSet::default(),
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
             ext_proc_params: HashMap::default(),
@@ -795,6 +828,16 @@ impl Translator {
                         };
                         self.tls_vars.insert(name, (off, desc));
                         continue;
+                    }
+                    // An `importc` gvar whose C name another unit **defines** (`exportc`) is not
+                    // this unit's object at all — it is that one. Bind it by C name instead of
+                    // giving it private storage the definition would never write (see
+                    // [`ext_c_globals`](Self::ext_c_globals)); it reserves no window slot.
+                    if let Some(cname) = importc_name(a.get(1)) {
+                        if self.c_global_defs.contains(&cname) {
+                            self.ext_c_globals.insert(name, (cname, desc));
+                            continue;
+                        }
                     }
                     // An `importc` gvar (`nimEnviron`) has no definition to link against — seed it
                     // with the value the powerbox runtime stands behind it (see
@@ -1840,6 +1883,58 @@ impl Translator {
         for (name, desc) in ext {
             self.ext_globals.insert(name.clone(), desc.clone());
         }
+    }
+
+    /// Pre-register the **C names sibling units define** (`exportc` gvars, from
+    /// [`export_c_global_names`](Self::export_c_global_names)), so this unit's matching `importc`
+    /// gvar declarations resolve to them rather than each becoming a private zero global. See
+    /// [`ext_c_globals`](Self::ext_c_globals).
+    pub fn import_c_global_defs(&mut self, names: &[String]) {
+        for n in names {
+            self.c_global_defs.insert(n.clone());
+        }
+    }
+
+    /// The **C names this unit defines**: every `gvar` carrying an `exportc` pragma. The pool the
+    /// linker feeds back to every unit via [`import_c_global_defs`](Self::import_c_global_defs).
+    pub fn export_c_global_names(root: &Node) -> Vec<String> {
+        root.args()
+            .iter()
+            .filter(|item| item.tag() == Some("gvar"))
+            .filter_map(|item| exportc_name(item.args().get(1)))
+            .collect()
+    }
+
+    /// Pre-register sibling units' **`importc` global aliases** (from
+    /// [`export_c_global_aliases`](Self::export_c_global_aliases)). See
+    /// [`ext_c_aliases`](Self::ext_c_aliases).
+    pub fn import_c_global_aliases(&mut self, aliases: &[(String, String)]) {
+        for (name, cname) in aliases {
+            self.ext_c_aliases.insert(name.clone(), cname.clone());
+        }
+    }
+
+    /// This unit's **diverted `importc` globals** as `(stem-suffixed nim name, C name)` — every `gvar`
+    /// declaring a C name in `defs` (i.e. one some unit actually defines). These are the symbols this
+    /// unit stops exporting because it stops owning storage for them, so every *other* unit must be
+    /// told to reach them by C name instead. Runs over the same `defs` pool
+    /// [`import_c_global_defs`](Self::import_c_global_defs) takes, so the two sides cannot disagree
+    /// about which declarations were diverted.
+    pub fn export_c_global_aliases(
+        root: &Node,
+        stem: &str,
+        defs: &[String],
+    ) -> Vec<(String, String)> {
+        root.args()
+            .iter()
+            .filter(|item| item.tag() == Some("gvar"))
+            .filter_map(|item| {
+                let name = sym_def(item.args().first()?).ok()?;
+                let cname = importc_name(item.args().get(1))?;
+                defs.contains(&cname)
+                    .then(|| (format!("{name}{stem}"), cname))
+            })
+            .collect()
     }
 
     /// Pre-register **external scalar-int `const`s** — another module's top-level `const`s that fold
@@ -3297,6 +3392,25 @@ impl<'a> FuncGen<'a> {
                     let base = self.emit_tls_base();
                     return Ok((self.add_const_off(base, off), desc));
                 }
+                // An `importc` declaration of a global another unit defines: its address is the
+                // defining unit's, resolved by C name at link (see `ext_c_globals`).
+                if let Some((cname, desc)) = self.t.ext_c_globals.get(name).cloned() {
+                    let addr = self.emit_data_sym(&cname, 0);
+                    return Ok((addr, desc));
+                }
+                // A **sibling unit's** diverted `importc` declaration, referenced by its nim name:
+                // same object, reached by the same C name (see `ext_c_aliases`). The descriptor is
+                // the pooled one, or the scalar-i64 a bare cross-module `data.sym` assumes.
+                if let Some(cname) = self.t.ext_c_aliases.get(name).cloned() {
+                    let desc = self
+                        .t
+                        .ext_globals
+                        .get(name)
+                        .cloned()
+                        .unwrap_or(TyDesc::Scalar(ValType::I64));
+                    let addr = self.emit_data_sym(&cname, 0);
+                    return Ok((addr, desc));
+                }
                 // A module global's address: a fixed absolute offset in a runnable module, or a
                 // relocatable `data.self <off>` in a link unit (the linker rewrites it on placement).
                 if let Some((off, desc)) = self.t.globals.get(name).cloned() {
@@ -3686,6 +3800,9 @@ impl<'a> FuncGen<'a> {
                     return Some(d.clone());
                 }
                 if let Some((_, d)) = self.t.globals.get(name) {
+                    return Some(d.clone());
+                }
+                if let Some((_, d)) = self.t.ext_c_globals.get(name) {
                     return Some(d.clone());
                 }
                 if let Some((_, d)) = self.t.tls_vars.get(name) {
@@ -4534,7 +4651,10 @@ impl<'a> FuncGen<'a> {
                 if let Some(&c) = self.t.ext_consts.get(a) {
                     return Ok(self.emit_const(ValType::I64, c));
                 }
-                if self.t.globals.contains_key(a) || self.t.tls_vars.contains_key(a) {
+                if self.t.globals.contains_key(a)
+                    || self.t.tls_vars.contains_key(a)
+                    || self.t.ext_c_globals.contains_key(a)
+                {
                     return self.load_lvalue(e); // load the scalar global / thread-var
                 }
                 if let Ok(n) = parse_int(a) {

@@ -220,6 +220,8 @@ fn translate_object_module(
     ext_sret: &[(String, translate::TyDesc)],
     ext_proc_params: &[translate::ProcParamSig],
     ext_consts: &[(String, i64)],
+    c_global_defs: &[String],
+    c_global_aliases: &[(String, String)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
@@ -230,6 +232,8 @@ fn translate_object_module(
     t.import_sret_procs(ext_sret);
     t.import_proc_params(ext_proc_params);
     t.import_consts(ext_consts);
+    t.import_c_global_defs(c_global_defs);
+    t.import_c_global_aliases(c_global_aliases);
     // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
     // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
     if let Some(layout) = tls_layout {
@@ -292,6 +296,8 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
+        &[],
         None,
     )?))
 }
@@ -305,6 +311,8 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         unit.stem,
         unit.src,
         Select::Whole,
+        &[],
+        &[],
         &[],
         &[],
         &[],
@@ -334,43 +342,141 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 
 /// Build the **powerbox `_start` link unit** (function 0): a paramless entry that reads the
 /// post-link data-stack base (`data.top`, which the linker resolves to `powerbox_entry_sp` and
-/// reserves stack above) and tail-calls the C-shaped `main($sp, argc, argv, envp)` with
-/// `argc/argv/envp = 0`, returning its `cint`. `main` is a cross-unit symbol resolved at link
-/// (`call.import "main"` → a direct `call` once merged). Injecting the entry **as a unit** (linked
-/// first, so it is function 0) — rather than [`temen_ir::synth_manifest_start`]-prepending it after
-/// the link — is what keeps the program's `data.funcref` initializers valid: the linker numbers
-/// `_start` first and bakes every funcref at its final merged index in one pass, so nothing needs a
-/// post-hoc +1 shift (which the discarded relocation metadata could no longer drive).
+/// reserves stack above), marshals the §3e args buffer into C `argv[]`/`envp[]` arrays, and
+/// tail-calls the C-shaped `main($sp, argc, argv, envp)`, returning its `cint`. `main` is a
+/// cross-unit symbol resolved at link (`call.import "main"` → a direct `call` once merged).
+/// Injecting the entry **as a unit** (linked first, so it is function 0) — rather than
+/// [`temen_ir::synth_manifest_start`]-prepending it after the link — is what keeps the program's
+/// `data.funcref` initializers valid: the linker numbers `_start` first and bakes every funcref at
+/// its final merged index in one pass, so nothing needs a post-hoc +1 shift (which the discarded
+/// relocation metadata could no longer drive).
+///
+/// **argv (#763).** The entry used to pass `argc = 0` and point `argv`/`envp` at the fixed empty
+/// vectors, so *no* nim program on this route could read its own command line: nimony's
+/// `std/cmdline` reads the `cmdCount`/`cmdLine` globals that the generated `main` parks its
+/// parameters in, so `paramCount()` came back `-1` and `paramStr(i)` came back `""` however the host
+/// was invoked. Real tools are argv-driven — `nifler2 parse in.nim out.nif` does nothing without
+/// one — so the entry now parses the buffer the host seeds at [`temen_ir::module_args_base`]
+/// (`{argc:u32, envc:u32}` then the packed NUL-terminated strings, [`temen_ir::write_args_blob`]):
+/// it walks the strings, writes a `char*` per entry (pointing *into* the buffer — no copy) plus the
+/// required NULL terminator at the data-stack base, parks `envp[]` just above `argv[]`, and gives
+/// `main` a frame 16-byte-aligned above both. This mirrors `temen-llvm`'s `synth_start_argv` and
+/// chibicc's `needs_argv` entry — the C `char**` convention lives only in a frontend's `_start`; the
+/// powerbox ABI itself delivers the neutral byte blob.
+///
+/// There is no second, no-args entry: a run that seeds nothing leaves the buffer zeroed, which reads
+/// back as `argc = envc = 0` and produces one-entry NULL-terminated vectors — exactly the old
+/// [`temen_ir::POWERBOX_EMPTY_ARGV`] behaviour, and the reason a null `argv`/`envp` must never be
+/// passed (#1422: nim's `getEnvVarsC` dereferences `envp` before it can discover it is empty).
 ///
 /// The guest heap bump-pointer words ([`temen_ir::POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]) are
 /// **not** seeded here — this unit is built before the merged window size is known, and the heap
 /// ceiling *is* that window top. [`seed_powerbox_heap`] bakes both words into the linked module's
 /// data image (post-link, where the window is known); see it for the #1051/#1054/#1060 rationale.
 fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
-    // `argc = 0`, and `argv`/`envp` point at **one-entry NULL-terminated vectors** rather than being
-    // NULL themselves (#1422): `_start` writes the terminator into the reserved page-0 scratch at
-    // [`temen_ir::POWERBOX_EMPTY_ARGV`]/[`POWERBOX_EMPTY_ENVP`] and hands `main` their addresses.
-    // Passing 0 is what a C `main` is never given, and nim's `getEnvVarsC` walks `nimEnviron` until
-    // it reads NULL — so a null `envp` faulted on the very first load against the #1094 guard,
-    // taking every module that reaches `std/envvars` (`os`, `paths`, `strtabs`, `appdirs`, …) down
-    // with it. One store each, paid once per run.
-    let argv = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ARGV;
-    let envp = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP;
+    let args = temen_ir::module_args_base();
+    let strs = args + 8; // past `{argc:u32, envc:u32}`: the first packed string
+                         // `argv[]` is built at the data-stack base (`data.top`) and `envp[]` directly above it; `main`'s
+                         // frame starts 16-byte-aligned above *both*, so its upward-growing frame never overwrites them.
+                         // The arrays cost `(argc + envc + 2) * 8` bytes out of the [`temen_ir::POWERBOX_STACK_RESERVE`]
+                         // the linker reserves above the entry SP — the same place chibicc's entry puts them.
     let text = format!(
         "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
          func () -> (i32) {{\n\
          block 0 () {{\n\
-         \x20 v0 = data.top\n\
-         \x20 v1 = i32.const 0\n\
-         \x20 vz = i64.const 0\n\
-         \x20 v2 = i64.const {argv}\n\
-         \x20 i64.store v2 vz\n\
-         \x20 v3 = i64.const {envp}\n\
-         \x20 i64.store v3 vz\n\
-         \x20 v4 = call.import 0 (v0, v1, v2, v3)\n\
-         \x20 return v4\n\
+         \x20 v0 = i64.const {args}\n\
+         \x20 v1 = i32.load v0\n\
+         \x20 v2 = i64.extend_i32_u v1\n\
+         \x20 v3 = i64.const {envc_off}\n\
+         \x20 v4 = i32.load v3\n\
+         \x20 v5 = i64.extend_i32_u v4\n\
+         \x20 v6 = i64.const 0\n\
+         \x20 v7 = i64.const {strs}\n\
+         \x20 br 1(v2, v5, v6, v7)\n\
          \x20 }}\n\
-         }}\n"
+         block 1 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.lt_u v2 v0\n\
+         \x20 br_if v4 2(v0, v1, v2, v3) 5(v0, v1, v3)\n\
+         \x20 }}\n\
+         block 2 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = data.top\n\
+         \x20 v5 = i64.const 8\n\
+         \x20 v6 = i64.mul v2 v5\n\
+         \x20 v7 = i64.add v4 v6\n\
+         \x20 i64.store v7 v3\n\
+         \x20 br 3(v0, v1, v2, v3)\n\
+         \x20 }}\n\
+         block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i32.load8_u v3\n\
+         \x20 v5 = i64.const 1\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 v7 = i32.eqz v4\n\
+         \x20 br_if v7 4(v0, v1, v2, v6) 3(v0, v1, v2, v6)\n\
+         \x20 }}\n\
+         block 4 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 1\n\
+         \x20 v5 = i64.add v2 v4\n\
+         \x20 br 1(v0, v1, v5, v3)\n\
+         \x20 }}\n\
+         block 5 (v0: i64, v1: i64, v2: i64) {{\n\
+         \x20 v3 = data.top\n\
+         \x20 v4 = i64.const 8\n\
+         \x20 v5 = i64.mul v0 v4\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 v7 = i64.const 0\n\
+         \x20 i64.store v6 v7\n\
+         \x20 v8 = i64.const 1\n\
+         \x20 v9 = i64.add v0 v8\n\
+         \x20 v10 = i64.mul v9 v4\n\
+         \x20 v11 = i64.add v3 v10\n\
+         \x20 v12 = i64.const 0\n\
+         \x20 br 6(v1, v12, v2, v11)\n\
+         \x20 }}\n\
+         block 6 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.lt_u v1 v0\n\
+         \x20 br_if v4 7(v0, v1, v2, v3) 10(v0, v3)\n\
+         \x20 }}\n\
+         block 7 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 8\n\
+         \x20 v5 = i64.mul v1 v4\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 i64.store v6 v2\n\
+         \x20 br 8(v0, v1, v2, v3)\n\
+         \x20 }}\n\
+         block 8 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i32.load8_u v2\n\
+         \x20 v5 = i64.const 1\n\
+         \x20 v6 = i64.add v2 v5\n\
+         \x20 v7 = i32.eqz v4\n\
+         \x20 br_if v7 9(v0, v1, v6, v3) 8(v0, v1, v6, v3)\n\
+         \x20 }}\n\
+         block 9 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 1\n\
+         \x20 v5 = i64.add v1 v4\n\
+         \x20 br 6(v0, v5, v2, v3)\n\
+         \x20 }}\n\
+         block 10 (v0: i64, v1: i64) {{\n\
+         \x20 v2 = i64.const 8\n\
+         \x20 v3 = i64.mul v0 v2\n\
+         \x20 v4 = i64.add v1 v3\n\
+         \x20 v5 = i64.const 0\n\
+         \x20 i64.store v4 v5\n\
+         \x20 v6 = i64.const 1\n\
+         \x20 v7 = i64.add v0 v6\n\
+         \x20 v8 = i64.mul v7 v2\n\
+         \x20 v9 = i64.add v1 v8\n\
+         \x20 v10 = i64.const 15\n\
+         \x20 v11 = i64.add v9 v10\n\
+         \x20 v12 = i64.const -16\n\
+         \x20 v13 = i64.and v11 v12\n\
+         \x20 v14 = i64.const {args}\n\
+         \x20 v15 = i32.load v14\n\
+         \x20 v16 = data.top\n\
+         \x20 v17 = call.import 0 (v13, v15, v16, v1)\n\
+         \x20 return v17\n\
+         \x20 }}\n\
+         }}\n",
+        envc_off = args + 4,
     );
     let module = temen_text::parse_module(&text)
         .map_err(|e| LengError::Malformed(format!("synth `_start` unit: {e:?}")))?;
@@ -452,15 +558,35 @@ fn link_selected_with_extra(
     // which `fastRuneAt`'s template expansion plants in every consumer) has no data symbol to bind.
     // Pooling lets the referencing unit inline the same value the defining unit does.
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
+    // Pooled **C names of `exportc` globals** across all units: an `importc` gvar declaring one of
+    // these is the *same object* the exporting unit defines (`cmdCount`/`cmdLine`/`nimEnviron`, which
+    // the program's generated `main` writes and `std/cmdline`/`std/envvars` read), so the declaring
+    // unit binds it by C name instead of giving it private, never-written storage (#763). A C name no
+    // unit defines is absent here and keeps the local-global lowering — this can only link objects
+    // that were already meant to be one, never fail a link that worked.
+    let mut pooled_c_global_defs: Vec<String> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
         pooled_globals.extend(translate::Translator::export_globals(&root, stem, &pooled)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_proc_params.extend(translate::Translator::export_proc_params(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
+        pooled_c_global_defs.extend(translate::Translator::export_c_global_names(&root));
         if tls {
             pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
         }
+    }
+    // The C-name alias pool, built **after** `pooled_c_global_defs` is complete: a unit that diverts
+    // an `importc` declaration to its C name stops exporting that declaration's nim name, so every
+    // other unit needs the same redirection for its own references. Second pass for the same reason
+    // the frame fixpoint has one — the input must be whole before it is consumed.
+    let mut pooled_c_global_aliases: Vec<(String, String)> = Vec::new();
+    for ((stem, _, _), root) in units.iter().zip(&roots) {
+        pooled_c_global_aliases.extend(translate::Translator::export_c_global_aliases(
+            root,
+            stem,
+            &pooled_c_global_defs,
+        ));
     }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
@@ -536,6 +662,8 @@ fn link_selected_with_extra(
                 &pooled_sret,
                 &pooled_proc_params,
                 &pooled_consts,
+                &pooled_c_global_defs,
+                &pooled_c_global_aliases,
                 tls_layout.as_ref(),
             )?))
         })
@@ -1157,6 +1285,40 @@ func (i32) -> (i32) { block 0 (v0: i32) { v1 = i32.const 0 return v1 } }
 func (i64, i32, i64) -> (i32) { block 0 (v0: i64, v1: i32, v2: i64) { v3 = i32.const -1 return v3 } }
 func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.const -1 return v3 } }";
 
+/// The **POSIX-personality open adapter**: the one place nimony's C bottom edge and `temen_posix`'s
+/// op ABI disagree.
+///
+/// Over a full POSIX personality the nim syscall leaves bind **directly** to the personality's ops —
+/// `sysWrite(fd, buf, len)`, `sysRead(fd, buf, len)`, `sysClose(fd)` and `sysLseek(fd, off, whence)`
+/// are argument-for-argument what `temen_posix`'s `write`/`read`/`close`/`lseek` take, so no shim
+/// stands between them. `open` is the exception: C passes a **NUL-terminated `char*`**, while every
+/// `temen_posix` path op takes an explicit `(ptr, len)` pair (the sandbox never scans guest memory for
+/// a terminator on the host side). Binding `sysOpen` straight to `OP_OPEN` therefore read the *flags*
+/// word as the path length — `O_RDONLY` is 0, so every open saw the empty path and returned `ENOENT`.
+///
+/// This unit exports `sysOpen`'s nim signature, walks the string to its NUL in the guest, and forwards
+/// `(ptr, len, flags)`. `open` itself stays a manifest import the host binds to the personality.
+const POSIX_OPEN_ADAPTER: &str = "\
+import 0 \"open\" (i64, i64, i64) -> (i64)
+
+func (i64, i32, i64) -> (i32) {
+block 0 (v0: i64, v1: i32, v2: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i32, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i32, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = i64.extend_i32_s v1
+  v5 = call.import 0 (v0, v3, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}";
+
 /// The compute-shim func index for a bottom-edge leaf import `name`, or `None` for a name the shim
 /// doesn't serve (the true syscalls — those go to the adapter / powerbox).
 /// The shim func serving a leaf, or `None` to leave it unbound.
@@ -1291,6 +1453,33 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
 /// Same discovery, same table: one route through the compute bottom edge, two bindings above it.
 pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
     compute_shim_unit(nim_compute_exports(units)?.0)
+}
+
+/// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
+/// [`nim_powerbox_runtime`] makes, over the same compute half.
+///
+/// Both are `[compute shim, syscall edge]`. They differ only in what stands behind the syscalls:
+/// `nim_powerbox_runtime` uses [`SYSCALL_ADAPTER`], which folds them onto the single §3e STREAM
+/// `write` cap and fails every file operation closed (a stdout-only program). This leaves them as
+/// **retained manifest imports** the host binds to a real `temen_posix` personality — so a program
+/// that opens and reads files (`nifler2 parse in.nim out.nif`) works — and adds only
+/// [`POSIX_OPEN_ADAPTER`], the one ABI reconciliation that edge needs.
+pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let (compute_exports, m1) = nim_compute_exports(units)?;
+    // `sysOpen`'s nim name is only known once the program is linked (pass 1's retained imports).
+    let opens: Vec<(String, u32)> = m1
+        .imports
+        .iter()
+        .filter(|i| i.name.starts_with("sysOpen"))
+        .map(|i| (i.name.clone(), 0))
+        .collect();
+    let open_adapter = temen_ir::LinkUnit {
+        module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
+            .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,
+        exports: opens,
+        ..Default::default()
+    };
+    Ok(vec![compute_shim_unit(compute_exports)?, open_adapter])
 }
 
 /// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).
