@@ -94,6 +94,32 @@ fn nif_unquote(raw: &str) -> String {
 /// when the real `RootObj` layout isn't in scope, so those accesses resolve (#859).
 const RTTI_VT_FIELD: &str = "vt.00";
 
+/// True if a proc is an **intrinsic/instruction declaration** — `(pragmas (intrinsic "Bswap") …)`
+/// or `(instruction …)` — which v0.6.2's hexer emits with a non-void return and an **empty** body
+/// (`(stmts .)`). It is metadata for the `instr` application form, not code: `leng_tags.InstrC`
+/// requires an `instr`'s `SYM` to carry exactly one of these pragmas.
+///
+/// Treated like an `importc` extern, because that is what it is from here: no body to translate, and
+/// its applications become imports the link binds — for nimony's intrinsics, to the compute-shim
+/// funcs `COMPUTE_LEAVES` already lists (`bswap64` is row 13). v0.4.0 declared the same operations
+/// as `importc` C externs, so the binding path is unchanged; only the declaration's spelling moved.
+///
+/// Without this they translated as ordinary procs and tripped "non-void proc falls off the end
+/// without `ret`" — a bodyless proc cannot return its non-void result.
+fn is_intrinsic_proc(proc_node: &Node) -> bool {
+    matches!(proc_node.args().get(3), Some(p)
+        if p.tag() == Some("pragmas")
+            && p.args()
+                .iter()
+                .any(|x| matches!(x.tag(), Some("intrinsic" | "instruction"))))
+}
+
+/// Either kind of bodyless declaration: a C extern or an intrinsic. Every site that skipped
+/// `importc` procs has to skip these too, and for the same reason.
+fn is_bodyless_proc(proc_node: &Node) -> bool {
+    is_importc_proc(proc_node) || is_intrinsic_proc(proc_node)
+}
+
 /// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
 /// translatable body (calls to it become Temen imports the host binds at link).
 fn is_importc_proc(proc_node: &Node) -> bool {
@@ -118,12 +144,27 @@ fn varargs_fixed_count(proc_node: &Node) -> Option<usize> {
         .position(|p| p.args().get(2).is_some_and(|t| t.tag() == Some("varargs")))
 }
 
+/// `call` and `instr` are the same application shape. Per `leng_tags.InstrC`, an `instr` is "typed
+/// exactly like `(call SYM X*)` — `SYM`'s params and return type drive everything — but a distinct
+/// tag, so a consumer sees 'not an ABI call' from the tag alone", and its `SYM` carries
+/// `(instruction …)`/`(intrinsic …)`. We do not select opcodes, so the distinction buys us nothing
+/// and both lower through the call path; the intrinsics it carries (nimony's `atomic*` family) are
+/// already bound as compute leaves.
+///
+/// Every site that asks "is this a call?" has to ask it this way, including the pre-scans. The
+/// frame-need fixpoint and the arg/return-type scans drive frame threading and import binding, so a
+/// site that still matched only `call` would leave an `instr`'s callee unframed or unbound — the
+/// same trap `haddr` had with `collect_addr_taken`.
+fn is_call_tag(t: Option<&str>) -> bool {
+    matches!(t, Some("call" | "instr"))
+}
+
 /// True if `node` can be **re-evaluated** without changing observable behavior — no `(call …)`
 /// anywhere in the tree (a call may have side effects or a non-idempotent result). Used to gate a
 /// sparse-`case` discriminant, which is recomputed in each comparison block (#858); nimony pre-binds
 /// anything heavier than a pure read (symbol / `deref` / field access), so this holds in practice.
 fn expr_side_effect_free(node: &Node) -> bool {
-    node.tag() != Some("call") && node.args().iter().all(expr_side_effect_free)
+    !is_call_tag(node.tag()) && node.args().iter().all(expr_side_effect_free)
 }
 
 /// The C name in a `(pragmas … (exportc "name") …)` node, if present. `pragmas` is the optional
@@ -416,13 +457,23 @@ pub(crate) struct Translator {
     link_mode: bool,
     /// Cross-module callees lowered to Temen imports (discovered during emission).
     imports: RefCell<ImportTable>,
-    /// **External funcref globals** — another unit's `gvar` whose type is a `proctype`, under the
-    /// stem-suffixed name this module references it by ([`export_funcrefs`]). A cross-module
-    /// `(call oomHandler.0.<sys> …)` targets a function-*pointer* data symbol, not a proc: with the
-    /// pooled signature here, `lvalue_type`/`lvalue_addr` treat it as an `FnPtr` global (address via
-    /// `data.sym`), so `indirect_callee` lowers it to a `data.sym` load + `call.dyn`. Empty
-    /// unless the linker pooled sibling units' funcref gvars.
-    ext_funcrefs: HashMap<String, FnPtrSig>,
+    /// **External non-scalar globals** — another unit's `gvar`/`const` whose type is a `proctype` or
+    /// an aggregate, under the stem-suffixed name this module references it by ([`export_globals`]).
+    /// A cross-module symbol with no entry here falls back to a bare `data.sym` + `Scalar(I64)`,
+    /// which is right for a scalar and wrong for everything else:
+    ///
+    /// - a `proctype` global — `(call oomHandler.0.<sys> …)` targets a function-*pointer* data
+    ///   symbol, not a proc, so `lvalue_type`/`lvalue_addr` must see `FnPtr` for `indirect_callee`
+    ///   to lower it to a `data.sym` load + `call.dyn`;
+    /// - an **aggregate** global — `x in Digits` compiles to `(at Digits.0.<strutils> (shr … 3))`,
+    ///   a byte index into a sibling's `set[char]` (an `array[uint8, 32]`). Without the layout here
+    ///   that is "`at` on a non-array": the data symbol resolves at link, but the *descriptor* the
+    ///   indexing needs does not cross the unit boundary on its own.
+    ///
+    /// One table rather than two, because both cases are the same question — what is this foreign
+    /// symbol's type? — and a second parallel list would be one more thing to keep in step.
+    /// Empty unless the linker pooled sibling units' globals.
+    ext_globals: HashMap<String, TyDesc>,
     /// **External frame-needing procs** — sibling units' procs whose emitted signature has a leading
     /// `$sp` param (they take a local's address; see [`proc_needs_frame`](Self::proc_needs_frame)),
     /// under the stem-suffixed names this module calls them by ([`export_proc_frames`]). A
@@ -492,7 +543,7 @@ pub(crate) struct Translator {
     /// This unit's stem — used to map a local `tvar` name to its stem-suffixed key in
     /// [`ext_tls_layout`]. Empty unless linking in `tls_mode`.
     own_stem: String,
-    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_funcrefs`],
+    /// **Global-scan leniency** for the linker's funcref/frame pre-passes ([`export_globals`],
     /// [`export_tls_vars`]), which run [`collect_globals`](Self::collect_globals) on a *fresh,
     /// import-less* translator purely to enumerate funcref/thread-var globals. Such a translator
     /// has no pooled sibling types, so an aggregate global whose constructor type is defined in
@@ -531,7 +582,7 @@ impl Translator {
             consts: HashMap::default(),
             ext_consts: HashMap::default(),
             imports: RefCell::new(ImportTable::default()),
-            ext_funcrefs: HashMap::default(),
+            ext_globals: HashMap::default(),
             ext_frame_procs: HashSet::default(),
             ext_sret_procs: HashMap::default(),
             ext_proc_params: HashMap::default(),
@@ -822,7 +873,7 @@ impl Translator {
                                 // pre-scan (its type lives in a sibling module, not pooled here; in a
                                 // fresh translator the type name isn't even known to be an aggregate,
                                 // so `desc` is a scalar fallback — key off the init node). Only the
-                                // funcref/frame pre-passes (`export_funcrefs`, `export_tls_vars`) set
+                                // funcref/frame pre-passes (`export_globals`, `export_tls_vars`) set
                                 // `scan_lenient`; they run `collect_globals` on a fresh, import-less
                                 // translator purely to enumerate funcref/tls globals, and erroring
                                 // here aborted the whole link for any program with a module-level
@@ -1285,7 +1336,7 @@ impl Translator {
     /// are skipped.
     fn collect_varargs_imports(&mut self, root: &Node) -> Result<(), LengError> {
         for item in root.args() {
-            if item.tag() == Some("proc") && is_importc_proc(item) {
+            if item.tag() == Some("proc") && is_bodyless_proc(item) {
                 if let Some(fixed) = varargs_fixed_count(item) {
                     let name = sym_def(&item.args()[0])?;
                     self.varargs_imports.insert(name, fixed);
@@ -1312,7 +1363,7 @@ impl Translator {
     fn agg_temp_bytes_at(&self, node: &Node, materializes: bool) -> u64 {
         let mut total = 0;
         match node.tag() {
-            Some("call") => {
+            Some("call" | "instr") => {
                 // A **variadic import** call marshals its trailing variadic args into a data-stack
                 // buffer (one 8-byte slot each), so reserve that here — the frame predicate
                 // (`proc_needs_frame`) and this sizing both route through `agg_temp_bytes`, so they
@@ -1324,7 +1375,7 @@ impl Translator {
                     }
                 }
                 for arg in node.args().iter().skip(1) {
-                    if arg.tag() == Some("call") {
+                    if is_call_tag(arg.tag()) {
                         // An **aggregate-returning call in argument position** (`f($ x)`) materializes
                         // a result temp (`agg_rvalue_temp`); reserve its return aggregate's bytes. (An
                         // `oconstr`/`aconstr` *argument*'s temp is reserved by the constructor clause
@@ -1342,7 +1393,7 @@ impl Translator {
                 // position — which builds in place into the destination's own `$sret`, no temp — is
                 // *not* counted (it is a child of `ret`/`asgn`/`var`, not a direct statement/arg).
                 for stmt in node.args() {
-                    if stmt.tag() == Some("call") {
+                    if is_call_tag(stmt.tag()) {
                         if let Some(d) = stmt.args().first().and_then(|c| self.sret_return(c)) {
                             total += self.sizeof(&d);
                         }
@@ -1513,12 +1564,19 @@ impl Translator {
                 }
             }
         }
-        // Record which declared types are aggregates (object/array) *before* resolving, so
+        // Record which declared types are aggregates (object/array/union) *before* resolving, so
         // `tydesc` classifies every other named type (enum/distinct/…) as a scalar as it resolves
         // fields. Extend (don't overwrite): external types registered by `import_types` stay.
+        //
+        // `union` is a whole type body, not just the variant-object child: a C-style `{.union.}`
+        // object (`std/posix`'s `EpollData`) is spelled `(type :X . (union (fld …)+))`. Leaving it
+        // out classified the *field* as a scalar before any layout ran, so `ev.data.ptr` failed as
+        // "`dot` field `ptr.0` on a non-object base" no matter what `resolve_type` did with it.
         self.agg_names.extend(
             raw.iter()
-                .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
+                .filter(|(_, body)| {
+                    matches!(body.tag(), Some("object") | Some("array") | Some("union"))
+                })
                 .map(|(n, _)| n.clone()),
         );
         // Record `proctype` signatures next — after `agg_names` (so an aggregate return classifies as
@@ -1617,6 +1675,25 @@ impl Translator {
             None => return Ok(()), // an external/opaque type; leave unresolved (sizeof falls back)
         };
         let layout = match body.tag() {
+            // A **C-style `{.union.}` object** — `(union (fld …)+)` as the whole type body, not the
+            // `(object … (union …))` of a Nim variant. Every field starts at offset 0 and the type is
+            // as large as its largest member, which is the same flat field list the variant case
+            // builds, with `union_base` fixed at 0. `std/posix`'s `EpollData` is one; without this the
+            // body tag matched nothing, the type resolved to a scalar, and `ev.data.ptr` failed as
+            // "`dot` field `ptr.0` on a non-object base".
+            Some("union") => {
+                let mut fields = Vec::new();
+                let mut size = 0u64;
+                for fld in body.args() {
+                    if fld.tag() != Some("fld") {
+                        continue;
+                    }
+                    let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                    fields.push((fname, 0, fdesc));
+                    size = size.max(fsize);
+                }
+                Layout::Object { fields, size }
+            }
             Some("object") => {
                 // `(object [Empty|Base] (fld :f pragmas Type)*)` — packed at natural size.
                 let mut fields = Vec::new();
@@ -1676,9 +1753,29 @@ impl Translator {
                             let union_base = off;
                             let mut union_max = 0u64;
                             for branch in fld.args() {
-                                if branch.tag() != Some("object") {
-                                    continue;
-                                }
+                                // v0.6.2 wraps each branch in its `of` clause —
+                                // `(union (of (ranges N…) (object (fld…)))+)` — where v0.4.0 listed
+                                // the branch objects bare. The `ranges` are the discriminant values
+                                // that select the branch, which the layout does not depend on: every
+                                // branch still overlaps at `union_base`. So unwrap the clause and lay
+                                // the object out exactly as before. Unwrapping (rather than matching
+                                // `object` at one fixed depth) keeps both spellings working, which is
+                                // what the pooled type table needs — a module compiled by either
+                                // frontend has to resolve the same way.
+                                let branch = match branch.tag() {
+                                    Some("object") => branch,
+                                    Some("of") => {
+                                        match branch
+                                            .args()
+                                            .iter()
+                                            .find(|n| n.tag() == Some("object"))
+                                        {
+                                            Some(o) => o,
+                                            None => continue,
+                                        }
+                                    }
+                                    _ => continue,
+                                };
                                 let mut boff = union_base;
                                 for bf in branch.args() {
                                     if bf.tag() != Some("fld") {
@@ -1735,14 +1832,13 @@ impl Translator {
         }
     }
 
-    /// Pre-register **external funcref globals** — another module's `gvar`s whose type is a
-    /// `proctype`, under the stem-suffixed names this module references them by
-    /// ([`export_funcrefs`]). See the [`ext_funcrefs`](Self::ext_funcrefs) field: this is what turns
-    /// a cross-module `(call <funcref-gvar> …)` from a (wrong) proc import into a `data.sym` load +
-    /// `call.dyn`.
-    pub fn import_funcrefs(&mut self, ext: &[(String, FnPtrSig)]) {
-        for (name, sig) in ext {
-            self.ext_funcrefs.insert(name.clone(), sig.clone());
+    /// Pre-register **external non-scalar globals** — another module's `gvar`s/`const`s whose type
+    /// is a `proctype` or an aggregate, under the stem-suffixed names this module references them by
+    /// ([`export_globals`]). See the [`ext_globals`](Self::ext_globals) field for why a bare
+    /// `data.sym` is not enough for either kind.
+    pub fn import_globals(&mut self, ext: &[(String, TyDesc)]) {
+        for (name, desc) in ext {
+            self.ext_globals.insert(name.clone(), desc.clone());
         }
     }
 
@@ -1773,7 +1869,7 @@ impl Translator {
     }
 
     /// Collect a module's **thread-vars** under their stem-suffixed global names, with each one's
-    /// size — the input to the linker's shared TLS layout. Mirrors [`export_funcrefs`]: a throwaway
+    /// size — the input to the linker's shared TLS layout. Mirrors [`export_globals`]: a throwaway
     /// `tls_mode` translator resolves each `tvar`'s type (so the size is exact), then [`link_selected`]
     /// pools these across units and assigns disjoint block offsets before translating any. (Aggregate
     /// `tvar`s whose type lives in a *sibling* unit resolve only if that type is local here — a
@@ -1802,17 +1898,45 @@ impl Translator {
     /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
     /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
-    pub fn export_funcrefs(root: &Node, stem: &str) -> Result<Vec<(String, FnPtrSig)>, LengError> {
+    pub fn export_globals(
+        root: &Node,
+        stem: &str,
+        pooled: &[(String, Layout)],
+    ) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
-        t.scan_lenient = true; // enumerating funcref globals; tolerate unresolvable cross-module aggregates
+        t.scan_lenient = true; // enumerating globals; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
+        // The **pooled** cross-module layouts, as the real translation pass gets them. Without these
+        // a global whose type is declared in a sibling module resolves to the `scan_lenient` scalar
+        // placeholder, and exporting that is worse than exporting nothing: the consumer then indexes
+        // `TagData.0.<tags>` as a `Scalar(I64)` and fails with "`at` on a non-array". The pool is
+        // complete before this runs (`link_selected_with_extra` drives it to a fixpoint first), so
+        // there is no ordering cost to using it.
+        let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
+        t.import_types(pooled);
         t.collect_globals(root)?;
-        let mut out: Vec<(String, FnPtrSig)> = t
+        // This unit's own type names, which the descriptors below must be rewritten into their
+        // stem-suffixed global form — the same rewrite `export_types_pooled` applies to a field or
+        // element descriptor, and for the same reason: the consumer's table is keyed by the global
+        // name, so an unsuffixed `Agg("`t.0.IAarray…`")` resolves to nothing there.
+        let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
+        let mut out: Vec<(String, TyDesc)> = t
             .globals
             .iter()
-            .filter_map(|(name, (_, desc))| match desc {
-                TyDesc::FnPtr(sig) => Some((format!("{name}{stem}"), (**sig).clone())),
-                _ => None,
+            // Scalars are deliberately absent: the `data.sym` + `Scalar(I64)` fallback already reads
+            // one correctly, and a scalar `const` never reaches here at all (`export_consts` inlines
+            // it). What needs the real descriptor is a symbol you *index into* or *call through*.
+            .filter(|(_, (_, desc))| {
+                matches!(
+                    desc,
+                    TyDesc::FnPtr(_) | TyDesc::Agg(_) | TyDesc::FlexArray(_) | TyDesc::Ptr(_)
+                )
+            })
+            .map(|(name, (_, desc))| {
+                (
+                    format!("{name}{stem}"),
+                    rewrite_agg_names(desc, &local, stem),
+                )
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
@@ -1821,7 +1945,7 @@ impl Translator {
 
     /// A module's **top-level scalar-int `const`s** — each folded to its integer value, under the
     /// stem-suffixed global name a sibling references it by (`replRune.0.` + `<stem>`). The `const`
-    /// counterpart of [`export_funcrefs`]; [`link_selected`] pools these across its units so a
+    /// counterpart of [`export_globals`]; [`link_selected`] pools these across its units so a
     /// cross-module reference inlines the value ([`import_consts`]) rather than emitting an unresolved
     /// `data.sym`. Only the scalar-int consts (the ones [`collect_globals`] inlines and never exports);
     /// an aggregate `const` is materialized as an addressable global and already exports as data.
@@ -1868,7 +1992,7 @@ impl Translator {
         };
         let mut out: Vec<(String, TyDesc)> = Vec::new();
         for item in root.args() {
-            if item.tag() != Some("proc") || is_importc_proc(item) {
+            if item.tag() != Some("proc") || is_bodyless_proc(item) {
                 continue;
             }
             let a = item.args();
@@ -1903,7 +2027,7 @@ impl Translator {
     pub fn importc_procs(root: &Node) -> Result<Vec<(String, String)>, LengError> {
         let mut out = Vec::new();
         for item in root.args() {
-            if item.tag() == Some("proc") && is_importc_proc(item) {
+            if item.tag() == Some("proc") && is_bodyless_proc(item) {
                 let a = item.args();
                 if let Some(first) = a.first() {
                     let sym = sym_def(first)?;
@@ -1942,6 +2066,14 @@ impl Translator {
         t.collect_types(root)?;
         let mut out: Vec<(String, Vec<ValType>, Option<ValType>)> = Vec::new();
         for item in root.args() {
+            // `is_importc_proc`, NOT `is_bodyless_proc`: an **intrinsic** declaration is bodyless but
+            // its signature is authoritative — `leng_tags.InstrC` says `SYM`'s params and return type
+            // drive everything about an `(instr SYM …)`. `builtinCompareExchangeN[T]` returns `bool`,
+            // and without its declared return here the call site's default `i64` value-hint wins: the
+            // import is declared `[I64]`, which both fails to verify against the `i32`-returning
+            // wrapper AND misses its signature-pinned `COMPUTE_LEAVES` row (#1499), leaving the leaf
+            // unbound. A C extern stays excluded: those bind to the guest libc and the compute shim,
+            // whose signatures are settled against call-site derivation.
             if item.tag() != Some("proc") || is_importc_proc(item) {
                 continue;
             }
@@ -2018,7 +2150,7 @@ impl Translator {
         // local `(call mk.0. …)` is counted alongside a cross-module `(call mk.0.<other> …)`).
         t.import_sret_procs(ext_sret);
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 if let Some(sret) = t.ret_sret(&item.args()[2])? {
                     let name = sym_def(&item.args()[0])?;
                     t.procs.insert(
@@ -2045,7 +2177,7 @@ impl Translator {
         };
         let mut out = Vec::new();
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 let name = sym_def(&item.args()[0])?;
                 let base = t.proc_needs_frame(item);
                 let mut callees = HashSet::default();
@@ -2153,7 +2285,28 @@ impl Translator {
                 // An `importc` proc is an **extern** (a C bottom-edge function — `memcpy`, `mmap`):
                 // it has no body to translate. Skip it, so a call to it lowers to an Temen import the
                 // host/runtime binds at link (the same seam the ~15 C funcs already use).
-                Some("proc") if is_importc_proc(item) => {}
+                //
+                // An **intrinsic** declaration is skipped the same way, but its *return type* is
+                // recorded first. `leng_tags.InstrC` makes `SYM`'s signature authoritative, and
+                // unlike a C extern the intrinsic is declared in the very module that applies it —
+                // so nothing else carries the type. Without it `call_import` falls back to the call
+                // site's default `i64` value-hint: `builtinCompareExchangeN[T]` returns `bool`, and
+                // an import declared `[I64]` both fails to verify against its `i32`-returning wrapper
+                // and misses its signature-pinned `COMPUTE_LEAVES` row (#1499), leaving the leaf
+                // unbound. `ext_proc_rets` is exactly the "this import's real return" table (#1404),
+                // so this reuses it under the bare local name rather than adding a second one.
+                Some("proc") if is_bodyless_proc(item) => {
+                    if is_intrinsic_proc(item) {
+                        if let Ok((name, _, ret0)) = self.proc_sig(item) {
+                            let ret = if self.ret_sret(&item.args()[2])?.is_some() {
+                                None
+                            } else {
+                                ret0
+                            };
+                            self.ext_proc_rets.insert(name, ret);
+                        }
+                    }
+                }
                 Some("proc") => {
                     let (name, params, ret0) = self.proc_sig(item)?;
                     let sret = self.ret_sret(&item.args()[2])?;
@@ -2233,16 +2386,18 @@ impl Translator {
     /// value, not a named proc: a non-atom (a `(cast <proctype> …)`, or a funcref field/slot lvalue
     /// `(dot …)`/`(deref …)`/`(pat …)`), a funcref-typed param/local (`funcref_locals`), or a
     /// **funcref global** — a local `proctype` gvar, or a pooled cross-module funcref gvar
-    /// ([`ext_funcrefs`](Self::ext_funcrefs)). Such a proc must own a frame to hand `$sp` to the
+    /// ([`ext_globals`](Self::ext_globals)). Such a proc must own a frame to hand `$sp` to the
     /// callee (the funcref ABI). A bare-atom head naming a proc/import is a direct call — it does not
     /// count (a call *to* the proc, resolved by name).
     fn body_has_indirect_call(&self, node: &Node, funcref_locals: &HashSet<String>) -> bool {
-        if node.tag() == Some("call") {
+        if is_call_tag(node.tag()) {
             if let Some(head) = node.args().first() {
                 match head.as_atom() {
                     None => return true, // a computed funcref head (cast / field / slot)
                     Some(a) if funcref_locals.contains(a) => return true,
-                    Some(a) if self.ext_funcrefs.contains_key(a) => return true,
+                    Some(a) if matches!(self.ext_globals.get(a), Some(TyDesc::FnPtr(_))) => {
+                        return true
+                    }
                     Some(a) if matches!(self.globals.get(a), Some((_, TyDesc::FnPtr(_)))) => {
                         return true
                     }
@@ -2264,7 +2419,7 @@ impl Translator {
     fn compute_funcref_targets(&mut self, root: &Node) -> Result<(), LengError> {
         let mut proc_names: HashSet<String> = HashSet::default();
         for item in root.args() {
-            if item.tag() == Some("proc") && !is_importc_proc(item) {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
                 proc_names.insert(sym_def(&item.args()[0])?);
             }
         }
@@ -2672,6 +2827,11 @@ impl Translator {
         }
         slots.extend(params.clone());
         slots.extend(ssa_vars);
+        // One i32 temp per short-circuit nesting level (#763). Reserved here, before any block is
+        // rendered, because the slot set is every block's parameter list.
+        for i in 0..body.map(max_and_or_depth).unwrap_or(0) {
+            slots.push((format!("$sc{i}"), ValType::I32));
+        }
         let nparams = usize::from(needs_frame) + usize::from(has_sret) + params.len();
         let sret = sret_desc.map(|d| (usize::from(needs_frame), d));
 
@@ -2710,13 +2870,26 @@ impl Translator {
         if let Some(b) = body {
             f.declare_labels(b);
         }
+        // Name the proc in EVERY error out of the body. "unsupported construct: lvalue `haddr`" or
+        // "non-void proc falls off the end without `ret`" on its own is unactionable in a module with
+        // a hundred procs — the system module is exactly that, and finding which proc a bare message
+        // came from meant bisecting the whole stdlib by hand.
+        let named = |e: LengError| -> LengError {
+            let who = a.first().and_then(|n| n.as_atom()).unwrap_or("?");
+            match e {
+                LengError::Malformed(m) => LengError::Malformed(format!("{m} (proc `{who}`)")),
+                LengError::Unsupported(m) => LengError::Unsupported(format!("{m} (proc `{who}`)")),
+                other => other,
+            }
+        };
         match body {
             Some(b) if !matches!(b, Node::Atom(_)) => {
-                f.stmt_list(b)?;
+                f.stmt_list(b).map_err(named)?;
             }
             _ => {}
         }
-        f.close_fallthrough()?;
+        f.close_fallthrough().map_err(named)?;
+        f.close_block_gaps().map_err(named)?;
         let used_memory = f.used_memory;
         for blk in f.blocks {
             out.push_str(&blk);
@@ -2781,6 +2954,10 @@ struct FuncGen<'a> {
     cur_buf: String,
     cur_next: u32, // value counter within the block
     cur: Vec<u32>, // slot → current value id
+    // Nesting depth of the `and`/`or` short-circuit currently being lowered — the index into the
+    // `$sc*` temp slots [`max_and_or_depth`] reserved. Bumped for the operands, so a nested
+    // `(or A (and B C))` gets its own live temp per level.
+    sc_depth: usize,
     terminated: bool,
 }
 
@@ -2832,6 +3009,7 @@ impl<'a> FuncGen<'a> {
             cur_next: 0,
             cur: Vec::new(),
             terminated: false,
+            sc_depth: 0,
         }
     }
 
@@ -2917,6 +3095,49 @@ impl<'a> FuncGen<'a> {
         self.cur = (0..n).collect();
         self.cur_buf.clear();
         self.terminated = false;
+    }
+
+    /// Emit a stub for any block a lowering **allocated but never finished**, so the label sequence
+    /// stays contiguous.
+    ///
+    /// Blocks are stored by id and concatenated in index order, and the text IR requires ascending
+    /// consecutive labels — so an unfilled slot renders as a gap and the emitted IR fails to reparse
+    /// with "block label N out of order". The `case` lowering allocates its `cont` join up front;
+    /// when every arm ends in `ret` — which v0.6.2's `system` module does and v0.4.0's did not —
+    /// nothing ever branches there and the slot stays empty. Other lowerings that pre-allocate a
+    /// join have the same latent shape, so this closes the class rather than that one site.
+    ///
+    /// **Only genuinely unreferenced blocks get stubbed.** If some terminator does target the
+    /// missing block then the lowering dropped a block it still branches to, and quietly emitting
+    /// `unreachable` would convert that into a trap at run instead of an error at compile time. That
+    /// one fails the translation and names the block.
+    fn close_block_gaps(&mut self) -> Result<(), LengError> {
+        for id in 0..self.blocks.len() {
+            if !self.blocks[id].is_empty() {
+                continue;
+            }
+            // A block reference in a terminator is the bare id followed by its argument list
+            // (`br 3(v0)`, `br_if v4 3(v0) 2(v0)`, `br_table v4 [3(v0)] 2(v0)`); nothing else in the
+            // text puts a bare integer immediately before `(`.
+            let needle = format!("{id}(");
+            let referenced = self.blocks.iter().any(|b| {
+                b.match_indices(&needle).any(|(at, _)| {
+                    // Not a longer number (`13(` is not block 3) and not a value (`v3(`).
+                    at == 0 || {
+                        let prev = b.as_bytes()[at - 1];
+                        !prev.is_ascii_digit() && prev != b'v'
+                    }
+                })
+            });
+            if referenced {
+                return Err(LengError::Malformed(format!(
+                    "block {id} is branched to but was never emitted"
+                )));
+            }
+            let params = self.block_params(id as u32);
+            self.blocks[id] = format!("block {id} {params} {{\n  unreachable\n  }}\n");
+        }
+        Ok(())
     }
 
     fn new_block_id(&mut self) -> u32 {
@@ -3104,9 +3325,9 @@ impl<'a> FuncGen<'a> {
                 // A cross-module **funcref global** (a sibling unit's proctype `gvar`): its address
                 // is a `data.sym`, and its `FnPtr` desc lets `load_lvalue` read the `i32` funcref
                 // and `indirect_callee` recover the `call.dyn` signature.
-                if let Some(sig) = self.t.ext_funcrefs.get(name).cloned() {
+                if let Some(d) = self.t.ext_globals.get(name).cloned() {
                     let addr = self.emit_data_sym(name, 0);
-                    return Ok((addr, TyDesc::FnPtr(Box::new(sig))));
+                    return Ok((addr, d));
                 }
                 // In a link unit, an atom resolved by none of the above is a **cross-module data
                 // symbol** (a `gvar` another unit defines) → a relocatable `data.sym`. Assumed i64
@@ -3146,18 +3367,46 @@ impl<'a> FuncGen<'a> {
                 }
                 Some("dot") => {
                     let a = node.args();
-                    let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
+                    let (mut baddr, mut bdesc) = self.lvalue_addr(&a[0])?;
+                    // C's `p->f`: hexer writes a field access on a POINTER-valued base with no
+                    // `deref` of its own — `(dot (deref dest) r.00)` where `dest: ptr RootRef` is
+                    // `dest[][].r`. The atom case is already handled one level up (a pointer local's
+                    // slot value *is* the object address); here the base is an expression whose
+                    // lvalue is the cell holding the pointer, so follow it with a load.
+                    if let TyDesc::Ptr(pointee) = bdesc {
+                        let pv = self.fresh();
+                        self.used_memory = true;
+                        self.cur_buf
+                            .push_str(&format!("  v{pv} = i64.load v{baddr}\n"));
+                        baddr = pv;
+                        bdesc = *pointee;
+                    }
                     let fname = a
                         .get(1)
                         .and_then(|n| n.as_atom())
                         .ok_or_else(|| LengError::Malformed("dot needs a field name".into()))?;
-                    let (foff, fdesc) = self.field_of(&bdesc, fname)?;
+                    let (foff, fdesc) = self.field_of(&bdesc, fname).map_err(|e| match e {
+                        LengError::Unsupported(m) => LengError::Unsupported(match a[0].as_atom() {
+                            Some(n) => format!("{m}, base `{n}`"),
+                            None => format!("{m}, base a `{}`", a[0].tag().unwrap_or("?")),
+                        }),
+                        other => other,
+                    })?;
                     Ok((self.add_const_off(baddr, foff), fdesc))
                 }
                 Some("at") => {
                     let a = node.args();
                     let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
-                    let (esize, edesc) = self.array_of(&bdesc)?;
+                    // Name the base in the error. "`at` on a non-array" is the same message whether
+                    // the base is an unresolved cross-module symbol, a pointer that wanted `pat`, or
+                    // a tuple — and the symbol is what tells you which.
+                    let (esize, edesc) = self.array_of(&bdesc).map_err(|e| match e {
+                        LengError::Unsupported(m) => LengError::Unsupported(match a[0].as_atom() {
+                            Some(n) => format!("{m} indexing `{n}`"),
+                            None => format!("{m} indexing a `{}`", a[0].tag().unwrap_or("?")),
+                        }),
+                        other => other,
+                    })?;
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
                     Ok((self.add_scaled(baddr, idx.id, esize), edesc))
                 }
@@ -3209,7 +3458,24 @@ impl<'a> FuncGen<'a> {
                 }
             }
         }
+        // `(addr X)` / `(haddr X)` — an address-of IS a pointer expression, and its value is `X`'s
+        // address. `(deref (haddr X))` is then the identity, which is how hexer spells an inlined
+        // `var` parameter's use site: `off += k` comes out as
+        // `(asgn (deref (haddr off)) (add (deref (haddr off)) k))`.
+        if matches!(operand.tag(), Some("addr" | "haddr")) {
+            let inner = operand
+                .args()
+                .first()
+                .ok_or_else(|| LengError::Malformed("`addr` without an operand".into()))?;
+            return self.lvalue_addr(inner);
+        }
         let (laddr, ldesc) = self.lvalue_addr(operand)?;
+        // An **inline flexible array** (`LongString.data`) is not a pointer field: the data begins
+        // at the field's own address, so `(deref (dot L data))` — `L.data[0]` — is that address with
+        // NO load. Same rule the `pat` lvalue arm applies one level up.
+        if let TyDesc::FlexArray(elem) = &ldesc {
+            return Ok((laddr, (**elem).clone()));
+        }
         if let TyDesc::Ptr(pointee) = ldesc {
             let pv = self.fresh();
             self.used_memory = true;
@@ -3218,8 +3484,9 @@ impl<'a> FuncGen<'a> {
             return Ok((pv, *pointee));
         }
         Err(LengError::Unsupported(format!(
-            "not a pointer expression (`{}`)",
-            operand.tag().unwrap_or("<atom>")
+            "not a pointer expression (`{}` resolved to {:?})",
+            operand.tag().unwrap_or("<atom>"),
+            ldesc
         )))
     }
 
@@ -3394,11 +3661,19 @@ impl<'a> FuncGen<'a> {
                 {
                     return Ok((*elem_size, elem.clone()));
                 }
-                Err(LengError::Unsupported("`at` on a non-array".into()))
+                Err(LengError::Unsupported(format!(
+                    "`at` on a non-array (`{n}` is {:?})",
+                    self.t.types.get(n)
+                )))
             }
             // An inline flexible array (`LongString.data`): element size from the element type.
             TyDesc::FlexArray(elem) => Ok((self.t.sizeof(elem).max(1), (**elem).clone())),
-            _ => Err(LengError::Unsupported("`at` on a non-array".into())),
+            // Name what the base actually resolved to. "`at` on a non-array" alone says nothing
+            // about *which* wrong thing it is, and the answers differ: an unresolved cross-module
+            // symbol (`Scalar(I64)`), a pointer that wanted `pat`, a tuple.
+            other => Err(LengError::Unsupported(format!(
+                "`at` on a non-array ({other:?})"
+            ))),
         }
     }
 
@@ -3416,9 +3691,9 @@ impl<'a> FuncGen<'a> {
                 if let Some((_, d)) = self.t.tls_vars.get(name) {
                     return Some(d.clone());
                 }
-                if let Some(sig) = self.t.ext_funcrefs.get(name) {
-                    // A cross-module funcref global — an `FnPtr` data symbol (see `ext_funcrefs`).
-                    return Some(TyDesc::FnPtr(Box::new(sig.clone())));
+                if let Some(d) = self.t.ext_globals.get(name) {
+                    // A cross-module funcref or aggregate global (see `ext_globals`).
+                    return Some(d.clone());
                 }
                 self.local_desc.get(name).cloned()
             }
@@ -3539,7 +3814,7 @@ impl<'a> FuncGen<'a> {
                 }
                 Ok(())
             }
-            Some("call") => {
+            Some("call" | "instr") => {
                 // An aggregate-returning call: hand `daddr` to the callee as its `$sret` pointer, so
                 // it writes the result straight into the destination (no temporary).
                 self.call_sret(rhs, daddr)
@@ -3649,11 +3924,18 @@ impl<'a> FuncGen<'a> {
         match s.tag() {
             // Nested block / scope: recurse (hexer emits `(stmts (stmts …))` and `(scope (stmts …))`).
             Some("stmts") => self.stmt_list(s),
+            // A `scope`'s children ARE its statements. They are *usually* wrapped in one `stmts`,
+            // but hexer emits them bare whenever it inlines a proc whose body is a single statement
+            // plus its return label — `off += k` comes out as
+            // `(scope (scope (asgn (deref (haddr off)) …) (lab returnLabel)))`. Recursing only into
+            // `stmts`-tagged children silently DROPPED every such statement: the write path's
+            // `wbuf.setLen`, `copyMem` and every `+=` loop increment vanished, leaving programs that
+            // ran to completion and did nothing (and loops that never advanced). Run every child —
+            // `stmt` already skips the `.` markers and rejects a tag that is not a statement, so
+            // nothing needs filtering here, and an unexpected child fails loudly instead of quietly.
             Some("scope") => {
                 for child in s.args() {
-                    if child.tag() == Some("stmts") {
-                        self.stmt_list(child)?;
-                    }
+                    self.stmt(child)?;
                 }
                 Ok(())
             }
@@ -3768,7 +4050,7 @@ impl<'a> FuncGen<'a> {
                 }
                 Ok(())
             }
-            Some("call") => {
+            Some("call" | "instr") => {
                 self.call(s, None)?; // statement position: result (if any) discarded
                 Ok(())
             }
@@ -4370,7 +4652,13 @@ impl<'a> FuncGen<'a> {
                 Some("neginf") => Ok(self.emit_fconst(ValType::F64, f64::NEG_INFINITY)),
                 #[cfg(feature = "float")]
                 Some("nan") => Ok(self.emit_fconst(ValType::F64, f64::NAN)),
-                Some("addr") => {
+                // `haddr` rides with `addr`: per `leng_tags.HaddrC`, "everywhere else it lowers
+                // exactly like `(addr X)`". The distinction it preserves is for a consumer that can
+                // bind an `(instr …)` `inout` operand slot to a local's home instead of forcing it
+                // to memory — an optimization we do not take, so both spellings mean the same
+                // address here. The one thing not to get wrong is the addr-taken scan above, which
+                // has to see `haddr` or there is no address to take.
+                Some("addr" | "haddr") => {
                     // The address of an lvalue (a frame/aggregate local, or a `dot`/`at`/`pat`).
                     let (id, _desc) = self.lvalue_addr(&e.args()[0])?;
                     Ok(Val {
@@ -4422,7 +4710,7 @@ impl<'a> FuncGen<'a> {
                 }
                 // Reading through an lvalue: load the scalar it addresses.
                 Some("deref" | "dot" | "at" | "pat") => self.load_lvalue(e),
-                Some("call") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
+                Some("call" | "instr") => self.call(e, Some(ValType::I64)), // value wanted (default i64 hint)
                 // An **aggregate literal in value position** — `(oconstr T …)` / `(aconstr T …)` with
                 // an aggregate `T`. An aggregate value *is* its address in this by-address model, so
                 // materialize the constructor into a scratch temp (the same lowering a call-argument
@@ -4438,6 +4726,63 @@ impl<'a> FuncGen<'a> {
                         "non-aggregate constructor in expression position".into(),
                     )),
                 },
+                // **Boolean `and`/`or` (#763).** `leng_tags` spells these `AndC`/`OrC`, and nim's
+                // semantics are **short-circuiting**: the right operand must not be evaluated once
+                // the left decides the answer. v0.4.0's hexer never emitted them in expression
+                // position, so this fell through to the error below; v0.6.2's does, everywhere.
+                //
+                // Evaluating both eagerly and folding with `i32.and`/`i32.or` would give the right
+                // *value* — `0 and x` is 0 and `1 or x` is 1 whatever `x` is — and it is tempting,
+                // because every operand in the stdlib sample is a pure comparison. It is still
+                // wrong: `(and (ne p nil) (pat p 0))` is the ordinary nil guard, and evaluating the
+                // right operand eagerly dereferences a null pointer, which the #964 NULL guard
+                // turns into a MemoryFault. Bounds guards (`i < len and s[i] == c`) have the same
+                // shape. So this branches.
+                //
+                // The result travels in a reserved `$sc{depth}` slot rather than a block result:
+                // every block's parameters *are* the slot set, so writing the slot in each arm
+                // makes the join block's `v{k}` the phi. `Y+` operands fold left, each fold its own
+                // pair of blocks.
+                Some(t @ ("and" | "or")) => {
+                    let a = e.args();
+                    if a.len() < 2 {
+                        return Err(LengError::Malformed(format!("`{t}` needs two operands")));
+                    }
+                    let Some(k) = self.sc_slot(self.sc_depth) else {
+                        return Err(LengError::Unsupported(format!(
+                            "`{t}` nested deeper than the reserved short-circuit slots"
+                        )));
+                    };
+                    let is_or = t == "or";
+                    self.sc_depth += 1;
+                    let first = self.expr(&a[0])?;
+                    let mut acc = self.as_bool(first);
+                    for operand in &a[1..] {
+                        // The decided answer is this arm's contribution; the join reads it back.
+                        self.cur[k] = acc.id;
+                        let rhs = self.new_block_id();
+                        let join = self.new_block_id();
+                        let args = self.branch_args();
+                        // `or` short-circuits when true, `and` when false — only the target order
+                        // differs.
+                        let (t_lbl, f_lbl) = if is_or { (join, rhs) } else { (rhs, join) };
+                        self.finish_block(
+                            format!("br_if v{} {t_lbl}{args} {f_lbl}{args}", acc.id),
+                            rhs,
+                        );
+                        let rv = self.expr(operand)?;
+                        let rv = self.as_bool(rv);
+                        self.cur[k] = rv.id;
+                        let jargs = self.branch_args();
+                        self.finish_block(format!("br {join}{jargs}"), join);
+                        acc = Val {
+                            id: k as u32,
+                            ty: ValType::I32,
+                        };
+                    }
+                    self.sc_depth -= 1;
+                    Ok(acc)
+                }
                 other => Err(LengError::Unsupported(format!(
                     "expression `{}`",
                     other.unwrap_or("<headless>")
@@ -4456,7 +4801,7 @@ impl<'a> FuncGen<'a> {
         }
         // A call in typed position hands `want` down as the return hint, so a cross-module callee's
         // import is declared returning exactly this type (not a guessed `i64`).
-        let v = if e.tag() == Some("call") {
+        let v = if is_call_tag(e.tag()) {
             self.call(e, Some(want))?
         } else {
             self.expr(e)?
@@ -5036,7 +5381,7 @@ impl<'a> FuncGen<'a> {
         // the temp's address (aggregates go by-address). `call_sret` handles the local and the
         // cross-module (`call_import_sret`) callee alike; `callee_sret` knows the return type from the
         // local proc table or the pooled `ext_sret_procs`.
-        if node.tag() == Some("call") {
+        if is_call_tag(node.tag()) {
             if let Some(desc) = node.args().first().and_then(|c| self.callee_sret(c)) {
                 let addr = self.alloc_temp(self.t.sizeof(&desc));
                 self.call_sret(node, addr)?;
@@ -5315,6 +5660,26 @@ impl<'a> FuncGen<'a> {
 
     /// Emit a relational compare `v = <ty>.<op> l r` (result an `i32` bool). Used by the case
     /// comparison-chain fallback; `op` ∈ {`eq`, `le_s`, …}.
+    /// The slot reserved for short-circuit nesting level `depth` (see [`max_and_or_depth`]).
+    fn sc_slot(&self, depth: usize) -> Option<usize> {
+        let want = format!("$sc{depth}");
+        self.slots.iter().position(|(n, _)| *n == want)
+    }
+
+    /// Normalize a condition to a canonical i32 0/1. Leng bools already are one; an `i64`-slotted
+    /// operand (a pointer-typed truth test) becomes `!= 0` so `br_if` and the fold see 0/1.
+    fn as_bool(&mut self, v: Val) -> Val {
+        if v.ty == ValType::I32 {
+            return v;
+        }
+        let z = self.emit_const(v.ty, 0);
+        let id = self.emit_rel("ne", v.ty, v.id, z.id);
+        Val {
+            id,
+            ty: ValType::I32,
+        }
+    }
+
     fn emit_rel(&mut self, op: &str, ty: ValType, l: u32, r: u32) -> u32 {
         let id = self.fresh();
         self.cur_buf
@@ -5464,7 +5829,7 @@ fn is_float(t: ValType) -> bool {
 /// True if `body` contains a `(call callee …)` to a proc that itself needs a frame — so this proc
 /// must own an `$sp` to hand down. Used to propagate framing transitively across the call graph.
 fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>, ext: &HashSet<String>) -> bool {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             // A **local** frame-needing callee (bare `foo.0.`) or a **cross-module** one (`foo.0.<stem>`
             // the linker pooled as frame-needing) both force this proc to own an `$sp` to hand down.
@@ -5479,7 +5844,7 @@ fn body_calls_framed(node: &Node, procs: &HashMap<String, Sig>, ext: &HashSet<St
 /// Collect every direct **call callee** name in a proc body (bare `foo.0.` for a local proc,
 /// `foo.0.<stem>` for a cross-module one). Feeds the linker's whole-program frame fixpoint.
 fn collect_calls(node: &Node, out: &mut HashSet<String>) {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         if let Some(callee) = node.args().first().and_then(|n| n.as_atom()) {
             out.insert(callee.to_string());
         }
@@ -5512,7 +5877,7 @@ fn peel_cast(n: &Node) -> &Node {
 }
 
 fn collect_funcref_targets(node: &Node, procs: &HashSet<String>, out: &mut HashSet<String>) {
-    if node.tag() == Some("call") {
+    if is_call_tag(node.tag()) {
         let args = node.args();
         // The head: recurse *unless* it is a bare proc-name atom (a direct call, not a funcref use).
         // `map_or` not `is_none_or` — temen-leng compiles under the rustc 1.81 W5 guest toolchain floor.
@@ -5576,9 +5941,27 @@ fn collect_labels(node: &Node, out: &mut Vec<String>) {
 }
 
 /// Collect the names of locals whose address is taken (`(addr name)`).
+/// Deepest nesting of a boolean `and`/`or` in this subtree, i.e. how many short-circuit results can
+/// be live at once. Each level needs its own `$sc*` slot: lowering `(or A (and B C))` still holds the
+/// outer `or`'s partial result while the inner `and` computes its own.
+///
+/// Counted up front because the slot set **is** every block's parameter list ([`block_params`]), and
+/// blocks render as they are finished — appending a slot mid-translation would leave already-rendered
+/// blocks with a shorter signature than their predecessors pass arguments for.
+fn max_and_or_depth(n: &Node) -> usize {
+    let here = usize::from(matches!(n.tag(), Some("and" | "or")));
+    let deepest = n.args().iter().map(max_and_or_depth).max().unwrap_or(0);
+    here + deepest
+}
+
 fn collect_addr_taken(node: &Node, out: &mut HashSet<String>) {
     if let Node::List(_) = node {
-        if node.tag() == Some("addr") {
+        // `haddr` counts as address-taken exactly like `addr` (#763). It is hexer's *hidden*
+        // address — inserted by `derefs.nim` where a `var`/`out` parameter needs the argument's
+        // location — and we lower it as a plain address-of, so the local has to live in the frame
+        // for `lvalue_addr` to have an address to give. Scanning only `addr` left it in an SSA slot
+        // and the lowering then failed with "is not an addressable lvalue".
+        if matches!(node.tag(), Some("addr" | "haddr")) {
             if let Some(name) = node.args().first().and_then(|n| n.as_atom()) {
                 out.insert(name.to_string());
             }

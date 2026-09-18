@@ -92,3 +92,33 @@ fn real_nimony_if_else() {
     assert_eq!(run(&m, 0, &[9, 3]), 9);
     assert_eq!(run(&m, 0, &[-4, -10]), -4);
 }
+
+/// **A `scope`'s children are its statements, wrapped in `stmts` or not** (the v0.6.2 bump's
+/// no-output blocker).
+///
+/// hexer wraps an inlined proc body in `(scope (stmts …))` most of the time, but when the body is a
+/// single statement plus its return label it emits them **bare**: `+=` on a `var` parameter comes out
+/// as `(scope (scope (asgn …) (lab returnLabel)))`. Recursing only into `stmts`-tagged children
+/// dropped every such statement *silently* — `wbuf.setLen`, `copyMem` and every loop increment
+/// vanished, so the whole nim corpus compiled, verified, ran to completion and printed nothing, and
+/// `rawWriteAll`'s `off += k` left a loop that never advanced. A dropped statement must never be a
+/// quiet success, so this pins both shapes against the same expected value.
+#[test]
+fn bare_statements_inside_a_scope_are_not_dropped() {
+    // sumto(n) with the loop's two updates buried in bare `scope`s, the way hexer inlines them.
+    let leng = "\
+(stmts
+ (proc :sumto.0 (params (param :n.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :r.0 . (i +64) 0)
+   (var :i.0 . (i +64) 1)
+   (while (le i.0 n.0)
+    (stmts .
+     (scope (scope (asgn r.0 (add (i +64) r.0 i.0)) (lab :rl.0)))
+     (scope (asgn i.0 (add (i +64) i.0 1)))))
+   (ret r.0))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    assert_eq!(run(&m, 0, &[10]), 55, "bare `scope` statements must run");
+    assert_eq!(run(&m, 0, &[1]), 1);
+    assert_eq!(run(&m, 0, &[0]), 0);
+}

@@ -4,8 +4,14 @@
 import std/syncio
 
 proc mayFail(x: int): int {.raises.} =
-  if x < 0: raise ValueError
-  else: x * 2
+  # Statement-form `if`, not `if x < 0: raise ValueError else: x * 2`. That expression form regressed
+  # in nimony v0.6.2 — nimsem's `xelim` cannot type an `if` whose branch `raise`s
+  # (`result.typeKind != AutoT`, xelim.nim:113) and the compile aborts. Upstream, not our lowering:
+  # it never reaches Leng. The exception model below is what this case is here to cover, and it is
+  # unaffected, so the fixture takes the shape that compiles rather than dropping the coverage.
+  if x < 0:
+    raise ValueError
+  result = x * 2
 
 proc safe(x: int): int =
   try: mayFail(x)

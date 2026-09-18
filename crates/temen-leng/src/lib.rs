@@ -215,7 +215,7 @@ fn translate_object_module(
     src: &str,
     sel: Select,
     ext_types: &[(String, translate::Layout)],
-    ext_funcrefs: &[(String, translate::FnPtrSig)],
+    ext_globals: &[(String, translate::TyDesc)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
     ext_proc_params: &[translate::ProcParamSig],
@@ -225,7 +225,7 @@ fn translate_object_module(
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
-    t.import_funcrefs(ext_funcrefs);
+    t.import_globals(ext_globals);
     t.import_proc_frames(ext_frame_procs);
     t.import_sret_procs(ext_sret);
     t.import_proc_params(ext_proc_params);
@@ -427,7 +427,9 @@ fn link_selected_with_extra(
         }
         prev_fields = fields;
     }
-    let mut pooled_funcrefs = Vec::new();
+    // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
+    // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
+    let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
     // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
@@ -452,7 +454,7 @@ fn link_selected_with_extra(
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
+        pooled_globals.extend(translate::Translator::export_globals(&root, stem, &pooled)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_proc_params.extend(translate::Translator::export_proc_params(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
@@ -529,7 +531,7 @@ fn link_selected_with_extra(
                 src,
                 *sel,
                 &pooled,
-                &pooled_funcrefs,
+                &pooled_globals,
                 &pooled_frame_procs,
                 &pooled_sret,
                 &pooled_proc_params,
@@ -800,7 +802,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("setpgid", ANY, 45),
     ("kill", ANY, 46),
     ("nanosleep", ANY, 47),
-    ("sysconf", ANY, 48),
+    // **Pinned, not `ANY`** (#1499): nim declares `sysconf(a1: cint): int`, so the shim must take
+    // `i32` — row 48 took `i64`, and an `ANY` row binds by name whatever the shape, so the call
+    // linked and the module then failed to verify with `TypeMismatch { expected: I64, found: I32 }`
+    // deep inside `std/cpuinfo` (`sysconf(_SC_NPROCESSORS_ONLN)`, which is what `std/threadpool`
+    // sizes itself from). Pinning makes the next such drift an unbound leaf named at link instead.
+    ("sysconf", sig(&[I32], &[I64]), 48),
     ("nativeIoctl", ANY, 49),
     ("pthread_attr_init", ANY, 50),
     ("pthread_attr_setstacksize", ANY, 51),
@@ -903,6 +910,24 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // 0) would be exactly the silent-wrong-answer this table is careful about everywhere else: the
     // call would succeed and quietly produce a wrong port number. Row 84 does the swap.
     ("htons", ANY, 84),
+    // **`errnoLocation` returns a real, writable word** (row 85, the shim's own 8-byte data
+    // segment), not 0. `std/posix` reaches libc's `errno` through the address-returning accessor
+    // (`__errno_location`, `__error` on Darwin) and both *reads and writes* through it —
+    // `readdir` must zero errno at end-of-directory or a consumer misreads a stale value as a
+    // failure. A 0 here would not be a stub, it would be a store to the #1094 NULL guard: a trap,
+    // from a program that merely cleared errno. One word for the whole guest is the right shape —
+    // §3d is a single vCPU, which is exactly the condition under which a process-wide errno is
+    // well-defined.
+    ("errnoLocation", ANY, 85),
+    // `posix_fallocate`'s bottom half (row 86), stubbed to `-1` like the adapter's other file-op
+    // syscalls: this powerbox has no filesystem to preallocate on. Reached by *linking* `std/posix`
+    // (`std/times`, `std/strtabs` and `std/paths` all pull it in transitively), not by calling it.
+    ("fallocateImpl", ANY, 86),
+    // **`cpuRelax`'s intrinsic form** (row 87, a bare `() -> ()` no-op). v0.4.0 spelled this as an
+    // `{.emit.}` of raw C, which `EMIT_NOPS` already swallowed; v0.6.2 makes it a real intrinsic
+    // declaration with a name to bind. Same single-vCPU posture as its `builtinThreadFence`
+    // neighbours (§3d): a spin-wait hint has nothing to yield to when there is one vCPU.
+    ("builtinCpuRelax", ANY, 87),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
