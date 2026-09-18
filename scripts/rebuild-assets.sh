@@ -335,6 +335,27 @@ echo
 echo "=== rebuild-assets summary ==="
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo
+# A SKIP here is easy to read as "not applicable" when it actually means "this asset is now STALE and
+# nothing regenerated it" — which is silent until CI fails on a byte-comparison gate. That happened
+# twice on the v0.6.2 bump: `nim_link`/`nim_link_fs` (the in-guest linker IS temen-leng, so it goes
+# stale whenever the linker changes, wire format or not) and `nim_prestdlib` (wire-coupled to the
+# `_ce` guests). Call the skipped steps out again, separately, with what unblocks each.
+SKIPPED=()
+for r in "${RESULTS[@]}"; do case "$r" in *SKIP*|*✗*) SKIPPED+=("$r");; esac; done
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "!!! ${#SKIPPED[@]} step(s) did NOT regenerate — each may now be STALE:"
+  for r in "${SKIPPED[@]}"; do echo "    $r"; done
+  echo
+  echo "    These are not advisory. An asset that embeds compiled code (the nim-link guests embed"
+  echo "    temen-leng; the prestdlib pack embeds the _ce guests' output) goes stale on any change to"
+  echo "    what it embeds, and the gate that catches it is a byte-comparison in CI, not here."
+  echo "    The browser-engine steps need:  cd browser && cargo run --bin gencorpus && \\"
+  echo "      RUSTFLAGS=\"-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals -Clink-arg=--shared-memory\" \\"
+  echo "      cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown"
+  echo "    (see .github/workflows/ci.yml for the full flag set); the LLVM steps need the LLVM whose"
+  echo "    major matches rustc's on PATH (scripts/ci/install-llvm.sh)."
+  echo
+fi
 echo "Also (non-CI, but tracked) browser/tests/fixtures/*.temen — the display/reactor/onramp Rust-test"
 echo "fixtures — are clang -O2 + temen-llvm-translate --host-page 65536 (+--null-guard for the #964"
 echo "guarded ones: hello_onramp/bounce/life/mandelzoom; plain for gradient/fsread). shell/stage_runner/"
