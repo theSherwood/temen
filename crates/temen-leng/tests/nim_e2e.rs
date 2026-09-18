@@ -2087,8 +2087,14 @@ fn elide(s: &str) -> String {
 /// and links its whole `.x.nif` closure. It is the same route as the corpus — `collect_x_nif` then
 /// `link_nim_powerbox` — parameterized by *where the source lives*, not a second copy of it.
 ///
-/// Gated on `NIM_NIFLER2=1`: the closure is ~145 modules and the compile is minutes, far past what
+/// Gated on `NIM_NIFLER2=1`: the compile is minutes and the closure is 10× the corpus, far past what
 /// the per-PR suite should carry. Reports how far it gets rather than asserting, until it lands.
+///
+/// **Where it stands:** links and verifies (3293 funcs), then traps `MemoryFault` at run — because
+/// this is the wrong bottom edge, not because of memory. `link_nim_powerbox` stubs the file syscalls
+/// for stdout-only programs; nifler2 reads a file. Two memory hypotheses were tested and disproved
+/// first (run window 64 MiB/256 MiB/1 GiB, and heap 11 MiB → 251 MiB, all faulting identically),
+/// which is what pointed at the bottom edge rather than the sizing.
 #[test]
 fn nifler2_links_through_leng() {
     if std::env::var("NIM_NIFLER2").is_err() {
@@ -2238,6 +2244,16 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("  nifler2: RUN FAILED — {e}");
+            eprintln!(
+                "  nifler2: NOTE — `link_nim_powerbox` is a **stdout-only** bottom edge: its \
+                 `SYSCALL_ADAPTER` binds `sysOpen*` to a `{{ return -1 }}` stub and `sysRead*` to \
+                 `{{ return 0 }}` (its own doc: \"imported by `syncio` but never reached by a \
+                 stdout-only program\"). nifler2 opens and reads a file, so it cannot work on this \
+                 route at all — the fault is almost certainly downstream of an unchecked \
+                 `open() == -1`, not a memory problem. The route it needs is \
+                 `link_whole_powerbox_manifest` + the POSIX personality (`nim_posix_op`), which \
+                 RETAINS the syscall leaves and binds them to real fd ops."
+            );
             return;
         }
     };
