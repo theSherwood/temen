@@ -1765,7 +1765,10 @@ impl Translator {
                                 let branch = match branch.tag() {
                                     Some("object") => branch,
                                     Some("of") => {
-                                        match branch.args().iter().find(|n| n.tag() == Some("object"))
+                                        match branch
+                                            .args()
+                                            .iter()
+                                            .find(|n| n.tag() == Some("object"))
                                         {
                                             Some(o) => o,
                                             None => continue,
@@ -1930,7 +1933,10 @@ impl Translator {
                 )
             })
             .map(|(name, (_, desc))| {
-                (format!("{name}{stem}"), rewrite_agg_names(desc, &local, stem))
+                (
+                    format!("{name}{stem}"),
+                    rewrite_agg_names(desc, &local, stem),
+                )
             })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output

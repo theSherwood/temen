@@ -1384,7 +1384,10 @@ fn real_ioring_blocked_on_conflicting_syscall_decls() {
         eprintln!("SKIP real_ioring_blocked_on_conflicting_syscall_decls (no toolchain)");
         return;
     };
-    let mods = compile_to_leng(&path, "import std/syncio\nimport std/ioring\n\nwrite(stdout, \"ok\")\n");
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nimport std/ioring\n\nwrite(stdout, \"ok\")\n",
+    );
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
@@ -1864,8 +1867,13 @@ fn dump_module(name: &str, m: &temen_ir::Module) {
 }
 
 /// The `(params, results)` behind an import's type index, for `NIM_DIFF_DUMP`.
-fn import_sig_dbg(m: &temen_ir::Module, imp: &temen_ir::Import) -> Option<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)> {
-    let temen_ir::ImportShape::Func(t) = imp.shape else { return None };
+fn import_sig_dbg(
+    m: &temen_ir::Module,
+    imp: &temen_ir::Import,
+) -> Option<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)> {
+    let temen_ir::ImportShape::Func(t) = imp.shape else {
+        return None;
+    };
     match m.types.get(t as usize)? {
         temen_ir::TypeEntry::Func(f) => Some((f.params.clone(), f.results.clone())),
         _ => None,
@@ -1995,9 +2003,9 @@ fn nim_differential_corpus() {
             // ends any other way has diverged even when it printed the right bytes. `Exited(127)` is
             // what a nim panic looks like once `cAbort` reaches the stubbed `kill`, and a program
             // that panics after printing its output would otherwise pass.
-            Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => failures.push(format!(
-                "{name}: output matches but the run ended {outcome} (native exits 0)"
-            )),
+            Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => failures.push(
+                format!("{name}: output matches but the run ended {outcome} (native exits 0)"),
+            ),
             Ok((got, _)) if got == want => {
                 eprintln!(
                     "  {name}: ok in {}ms ({:?})",
