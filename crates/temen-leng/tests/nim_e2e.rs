@@ -918,6 +918,7 @@ fn run_libc_program(src: &str) -> Option<Vec<u8>> {
         .collect();
     let m = temen_leng::link_nim_powerbox(&units, Some(&libc))
         .unwrap_or_else(|e| panic!("nim→powerbox link (with libc): {e}"));
+    dump_module("libc_program", &m);
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The guest libc's file/heap caps resolve to stubs at link, so the program's manifest is the one
     // `write` STREAM cap — exactly as it is without the libc.
@@ -1355,17 +1356,50 @@ fn real_threadpool_and_parfor_link_and_run() {
     }
 }
 
-/// **`std/ioring` links and runs**, the last module the posix/socket edge was holding back. Same
-/// shape as `threadpool`: every descriptor call sits inside an explicit proc (`initIoRing`,
-/// `listenTcp`, `submitRead`), so importing is safe and a program that opens a socket gets -1.
+/// **`std/ioring` is blocked on an upstream declaration conflict**, and this pins the blocker so it
+/// self-heals.
+///
+/// The module used to link and run (every descriptor call sits inside an explicit proc —
+/// `initIoRing`, `listenTcp`, `submitRead` — so importing is safe and a program that opens a socket
+/// gets -1). Under nimony v0.6.2 it cannot link, because **three stdlib modules declare the same C
+/// `syscall` with different widths**:
+///
+/// - `std/posix/io_uring`: `proc syscall(arg: cint): cint {.importc: "syscall", varargs.}`
+/// - `std/rawthreads`:     `proc syscall(arg: clong): clong {.varargs, importc: "syscall".}`
+/// - `std/private/syslocks`: `proc syscall(number: clong): clong {.importc: "syscall", varargs.}`
+///
+/// `std/ioring` pulls in all three. On the C backend this is invisible — `<unistd.h>`'s prototype is
+/// the one that matters and nim's `importc` just calls it — but in an object-link model the bottom
+/// edge has one `syscall.0.` symbol, and after the varargs marshalling its shape is either
+/// `(i32, i64) -> i32` or `(i64, i64) -> i64`. C's own prototype is `long syscall(long, ...)`, so
+/// io_uring's is the inaccurate one.
+///
+/// Refusing is correct (#1524): picking a width would be the silent-widening this project made
+/// fail-closed on purpose, and it is the kind of mismatch that reads a register the callee never
+/// wrote. So this asserts the **blocker**, not a workaround — the moment upstream aligns the three
+/// declarations the link succeeds, this test fails, and it goes back to asserting `"ok"`.
 #[test]
-fn real_ioring_links_and_runs() {
-    let src = "import std/syncio\nimport std/ioring\n\nwrite(stdout, \"ok\")\n";
-    let Some(out) = run_libc_program(src) else {
-        eprintln!("SKIP real_ioring_links_and_runs (no toolchain / libc asset)");
+fn real_ioring_blocked_on_conflicting_syscall_decls() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP real_ioring_blocked_on_conflicting_syscall_decls (no toolchain)");
         return;
     };
-    assert_eq!(String::from_utf8_lossy(&out), "ok");
+    let mods = compile_to_leng(&path, "import std/syncio\nimport std/ioring\n\nwrite(stdout, \"ok\")\n");
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let err = match temen_leng::link_nim_powerbox(&units, guest_libc().as_deref()) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!(
+            "std/ioring now links — upstream aligned the three `syscall` declarations. Restore this \
+             test to `run_libc_program` + assert_eq!(out, \"ok\")."
+        ),
+    };
+    assert!(
+        err.contains("syscall.0.") && err.contains("ImportShapeMismatch"),
+        "expected the conflicting-`syscall` link refusal, got: {err}"
+    );
 }
 
 /// **`htons` computes, it does not stub.** It rides in with `std/ioring`'s socket leaves but is not
@@ -1804,7 +1838,32 @@ fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String
 /// you nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing),
 /// `Exited(127)` (panicked through `cAbort`) and a trap are three different bugs that a bare `""`
 /// renders identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
-/// The `(params, results)` behind an import's type index, for `NIM_DIFF_DEBUG`.
+/// `NIM_DIFF_DUMP=<dir>` writes the linked module as text next to its bound import list. A program
+/// that runs cleanly and prints nothing gives the Nim side no way to say why; reading the generated
+/// IR for the write path is what found the dropped-`scope` miscompile, after a day of bisecting from
+/// the guest side. `print_module` output is large (a hello-world links ~660 functions), so this is
+/// opt-in. Call it BEFORE `verify_module`: a module that fails to verify is exactly the one whose IR
+/// you need, and dumping after the `?` would never produce it.
+///
+/// One helper rather than one per link path, so every caller reports the same way.
+fn dump_module(name: &str, m: &temen_ir::Module) {
+    let Ok(dir) = std::env::var("NIM_DIFF_DUMP") else {
+        return;
+    };
+    let mut txt = String::new();
+    for i in &m.imports {
+        txt.push_str(&format!(
+            "; import {:?} shape {:?} sig {:?}\n",
+            i.name,
+            i.shape,
+            import_sig_dbg(m, i)
+        ));
+    }
+    txt.push_str(&temen_text::print_module(m));
+    let _ = std::fs::write(format!("{dir}/{name}.temt"), txt);
+}
+
+/// The `(params, results)` behind an import's type index, for `NIM_DIFF_DUMP`.
 fn import_sig_dbg(m: &temen_ir::Module, imp: &temen_ir::Import) -> Option<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)> {
     let temen_ir::ImportShape::Func(t) = imp.shape else { return None };
     match m.types.get(t as usize)? {
@@ -1825,25 +1884,7 @@ fn temen_output(
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
     let m = temen_leng::link_nim_powerbox(&units, Some(libc)).map_err(|e| format!("link: {e}"))?;
-    // `NIM_DIFF_DUMP=<dir>` writes the linked module as text next to its bound import list. A
-    // program that runs cleanly and prints nothing gives the Nim side no way to say why; reading the
-    // generated IR for the write path is what found the dropped-`scope` miscompile, after a day of
-    // bisecting from the guest side. `print_module` output is large (a hello-world links ~660
-    // functions), so this is opt-in. Written BEFORE `verify_module`: a module that fails to verify
-    // is exactly the one whose IR you need, and dumping after the `?` would never produce it.
-    if let Ok(dir) = std::env::var("NIM_DIFF_DUMP") {
-        let mut txt = String::new();
-        for i in &m.imports {
-            txt.push_str(&format!(
-                "; import {:?} shape {:?} sig {:?}\n",
-                i.name,
-                i.shape,
-                import_sig_dbg(&m, i)
-            ));
-        }
-        txt.push_str(&temen_text::print_module(&m));
-        let _ = std::fs::write(format!("{dir}/{name}.temt"), txt);
-    }
+    dump_module(name, &m);
     temen_verify::verify_module(&m).map_err(|e| format!("verify: {e:?}"))?;
     let extra: Vec<&str> = m
         .imports

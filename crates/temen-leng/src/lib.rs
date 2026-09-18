@@ -802,7 +802,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("setpgid", ANY, 45),
     ("kill", ANY, 46),
     ("nanosleep", ANY, 47),
-    ("sysconf", ANY, 48),
+    // **Pinned, not `ANY`** (#1499): nim declares `sysconf(a1: cint): int`, so the shim must take
+    // `i32` — row 48 took `i64`, and an `ANY` row binds by name whatever the shape, so the call
+    // linked and the module then failed to verify with `TypeMismatch { expected: I64, found: I32 }`
+    // deep inside `std/cpuinfo` (`sysconf(_SC_NPROCESSORS_ONLN)`, which is what `std/threadpool`
+    // sizes itself from). Pinning makes the next such drift an unbound leaf named at link instead.
+    ("sysconf", sig(&[I32], &[I64]), 48),
     ("nativeIoctl", ANY, 49),
     ("pthread_attr_init", ANY, 50),
     ("pthread_attr_setstacksize", ANY, 51),
