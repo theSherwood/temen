@@ -95,7 +95,7 @@ fn spawn_child_on_thread(
     n_results: usize,
     done: std::sync::Arc<ChildDone>,
     futex_sched: usize,
-) -> std::thread::JoinHandle<()> {
+) -> Option<std::thread::JoinHandle<()>> {
     struct SendPtr(*mut u8);
     // SAFETY: `parent_mem_base` is the parent window, which outlives every child (`join_children` runs
     // before it frees). The child thread touches only its **own** carve `[sub_base, +size)` for copy-in
@@ -105,39 +105,47 @@ fn spawn_child_on_thread(
     unsafe impl Send for SendPtr {}
     let base = SendPtr(parent_mem_base);
     // Count the child live in the parent domain's futex accounting for the wait/join deadlock
-    // detection — before the spawn returns, so a wait issued right after already sees it. SAFETY:
-    // a nonzero `futex_sched` is the run's live `Domain`, which outlives every child (children are
-    // joined at run teardown, before the domain drops).
-    if futex_sched != 0 {
-        unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_started() };
+    // detection — before the spawn returns, so a wait issued right after already sees it. #1586: the
+    // same step now *reserves* against the §15 ceiling and refuses when the domain is full, so a §14
+    // child can no longer take host concurrency the domain was never granted. SAFETY: a nonzero
+    // `futex_sched` is the run's live `Domain`, which outlives every child (children are joined at
+    // run teardown, before the domain drops).
+    if futex_sched != 0
+        && !unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).try_child_start() }
+    {
+        return None;
     }
-    std::thread::Builder::new()
-        .name("temen-child".into())
-        .spawn(move || {
-            let base = base; // move the wrapper into the thread
-            mem::install_guard();
-            // SAFETY: `code` is a live `Arc<CompiledModule>` held by this closure (passed by raw
-            // pointer — see `run_child_code`); the carve is committed parent memory the Instantiator
-            // bounded; `args` matches the entry arity (caller-checked).
-            let (r, t) = unsafe {
-                crate::run_child_code(
-                    std::sync::Arc::as_ptr(&code),
-                    sub_base,
-                    child_size_log2,
-                    base.0,
-                    &args,
-                    n_results,
-                )
-            };
-            let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = Some((r, t));
-            done.cv.notify_all();
-            // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
-            if futex_sched != 0 {
-                unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
-            }
-        })
-        .expect("spawn a §14 child OS thread")
+    Some(
+        std::thread::Builder::new()
+            .name("temen-child".into())
+            .spawn(move || {
+                let base = base; // move the wrapper into the thread
+                mem::install_guard();
+                // SAFETY: `code` is a live `Arc<CompiledModule>` held by this closure (passed by raw
+                // pointer — see `run_child_code`); the carve is committed parent memory the Instantiator
+                // bounded; `args` matches the entry arity (caller-checked).
+                let (r, t) = unsafe {
+                    crate::run_child_code(
+                        std::sync::Arc::as_ptr(&code),
+                        sub_base,
+                        child_size_log2,
+                        base.0,
+                        &args,
+                        n_results,
+                    )
+                };
+                let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+                *st = Some((r, t));
+                done.cv.notify_all();
+                // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
+                if futex_sched != 0 {
+                    unsafe {
+                        (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished()
+                    };
+                }
+            })
+            .expect("spawn a §14 child OS thread"),
+    )
 }
 
 /// S1c for **granted** children (Instantiator ops 8/11/13) — spawn the per-spawn-compiled child on
@@ -166,6 +174,7 @@ unsafe fn spawn_granted_child(
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
     retained_ctx: *mut core::ffi::c_void,
+    trap_out: *mut i64,
 ) -> i32 {
     struct SendRaw<T>(T);
     // SAFETY: `parent_mem_base` outlives every child (`join_children` runs before it frees) and the
@@ -195,10 +204,14 @@ unsafe fn spawn_granted_child(
     let done2 = std::sync::Arc::clone(&done);
     let futex_sched = rt.futex_sched;
     // Count the child live for the parent domain's wait/join deadlock detection (see
-    // [`spawn_child_on_thread`]). SAFETY: a nonzero `futex_sched` is the run's live `Domain`,
-    // outliving every (teardown-joined) child.
-    if futex_sched != 0 {
-        unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_started() };
+    // [`spawn_child_on_thread`]), which since #1586 also **reserves** against the §15 ceiling.
+    // `ThreadFault` at the ceiling is what the interpreter raises for the same refusal. SAFETY: a
+    // nonzero `futex_sched` is the run's live `Domain`, outliving every (teardown-joined) child.
+    if futex_sched != 0
+        && !unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).try_child_start() }
+    {
+        unsafe { *trap_out = TrapKind::ThreadFault as i64 };
+        return 0;
     }
     let handle = std::thread::Builder::new()
         .name("temen-child".into())
@@ -961,7 +974,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         state: Mutex::new(None),
         cv: Condvar::new(),
     });
-    let handle = spawn_child_on_thread(
+    let Some(handle) = spawn_child_on_thread(
         code,
         base + off,
         size_log2 as u8,
@@ -970,7 +983,12 @@ pub(crate) unsafe extern "C" fn instantiate(
         n_results,
         std::sync::Arc::clone(&done),
         rt.futex_sched,
-    );
+    ) else {
+        // #1586 — at the §15 live-vCPU ceiling. `ThreadFault` is what the interpreter raises when
+        // its scheduler refuses a §14 spawn for the same reason, so the engines agree.
+        *trap_out = TrapKind::ThreadFault as i64;
+        return 0;
+    };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
     children.push(Child::pending(done));
@@ -1152,6 +1170,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         release,
         gc.ctx,
         gc.retained_ctx,
+        trap_out,
     )
 }
 
@@ -1500,6 +1519,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         release,
         gc.ctx,
         gc.retained_ctx,
+        trap_out,
     )
 }
 
@@ -1532,6 +1552,7 @@ unsafe fn spawn_detached_child(
     release: crate::GrantChildReleaser,
     gc_ctx: *mut core::ffi::c_void,
     retained_ctx: *mut core::ffi::c_void,
+    trap_out: *mut i64,
 ) -> i32 {
     struct SendRaw<T>(T);
     // SAFETY: `gc_ctx` is a heap `Host` handed over wholesale to the child thread (`Host: Send`),
@@ -1552,9 +1573,15 @@ unsafe fn spawn_detached_child(
     });
     let done2 = std::sync::Arc::clone(&done);
     let futex_sched = rt.futex_sched;
-    // SAFETY: a nonzero `futex_sched` is the run's live `Domain`, outliving every (joined) child.
-    if futex_sched != 0 {
-        unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_started() };
+    // #1586 — reserve a §15 live-vCPU slot before taking a host thread. A detached child is one real
+    // OS thread on this backend, so without this a parent could hold concurrency its ancestors never
+    // granted it (INVARIANTS #3). SAFETY: a nonzero `futex_sched` is the run's live `Domain`,
+    // outliving every (joined) child.
+    if futex_sched != 0
+        && !unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).try_child_start() }
+    {
+        unsafe { *trap_out = TrapKind::ThreadFault as i64 };
+        return 0;
     }
     let handle = std::thread::Builder::new()
         .name("temen-child".into())
@@ -1839,6 +1866,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         release,
         gc.ctx,
         gc.retained_ctx,
+        trap_out,
     )
 }
 

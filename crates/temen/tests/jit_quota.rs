@@ -260,3 +260,92 @@ fn jit_fiber_quota_spans_vcpus() {
         other => panic!("one more slot must admit the child's cont.new, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// #1586 — §14 children count against the same ceiling as `thread.spawn`.
+//
+// Every §14 async child on this backend is one real OS thread (`os_thread_rt`: "a spawned vCPU is
+// one real OS thread", not a green task). Until this, `Instantiator.instantiate` / `instantiate_
+// named` / `instantiate_detached` *incremented the live count the ceiling is built on and skipped
+// the check* — only `thread.spawn` consulted it. So a parent could hold host concurrency its
+// ancestors never granted it (INVARIANTS #3), and the bound on how much was the OS thread limit.
+//
+// The interpreter has always refused all three through `Scheduler::spawn`, raising `ThreadFault`.
+// These pin that the JIT now agrees.
+// ---------------------------------------------------------------------------------------------
+
+/// Two §14 children spawned **without joining**, so both are live at once. Returns the second
+/// spawn's slot (or traps at the ceiling); the children just return.
+const TWO_LIVE_CHILDREN: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ventry = i64.const 1
+  voff1 = i64.const 65536
+  voff2 = i64.const 69632
+  vsl = i64.const 12
+  vq = i64.const 0
+  va = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff1, vsl, vq)
+  vb = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff2, vsl, vq)
+  vr = i64.extend_i32_s vb
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 7
+  return v1
+  }
+}
+"#;
+
+/// Run `src` on the JIT under `quota` with a **real** powerbox (so §14 ops actually spawn), the
+/// `Instantiator` granted over the whole window as `v0`.
+fn run_with_instantiator(src: &str, quota: Quota, win_log2: u8) -> JitOutcome {
+    let m = parse_module(src).unwrap_or_else(|e| panic!("parse: {e:?}"));
+    verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let mut host = temen_interp::Host::new();
+    let ih = host.grant_instantiator(0, 1u64 << win_log2);
+    temen_jit::compile_and_run_with_host_fast(
+        &m,
+        0,
+        &[ih as i64],
+        temen_run::cap_thunk,
+        &mut host as *mut temen_interp::Host as *mut c_void,
+        no_resolver,
+        quota,
+    )
+    .expect("jit compile")
+}
+
+/// `max_vcpus = 2` is the root plus one live child, so the **second** concurrent §14 child trips the
+/// ceiling — the same answer, and the same trap, the interpreter gives when its scheduler refuses.
+/// `max_vcpus = 3` admits both.
+#[test]
+fn a_second_live_nested_child_trips_the_vcpu_ceiling() {
+    let tight = run_with_instantiator(
+        TWO_LIVE_CHILDREN,
+        Quota {
+            max_fibers: 1 << 16,
+            max_vcpus: 2,
+        },
+        17,
+    );
+    assert!(
+        matches!(tight, JitOutcome::Trapped(TrapKind::ThreadFault)),
+        "a §14 child must be metered like `thread.spawn`, not spawn a host thread for free; \
+         got {tight:?}"
+    );
+
+    let roomy = run_with_instantiator(
+        TWO_LIVE_CHILDREN,
+        Quota {
+            max_fibers: 1 << 16,
+            max_vcpus: 3,
+        },
+        17,
+    );
+    assert!(
+        !matches!(roomy, JitOutcome::Trapped(_)),
+        "root + two children fits in 3: {roomy:?}"
+    );
+}
