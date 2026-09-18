@@ -1786,10 +1786,29 @@ fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String
 }
 
 /// Run `src` on **Temen**: the real toolchain to Leng, `link_nim_powerbox` against the guest libc,
-/// then `_start` under the standard powerbox. Returns what the program printed. Every failure mode
-/// (nimony, link, verify, trap) comes back as `Err` with its reason, so the differential reports
-/// *where* a program diverged rather than panicking on the first one.
-fn temen_output(nim_path: &str, libc: &[u8], name: &str, src: &str) -> Result<String, String> {
+/// then `_start` under the standard powerbox. Returns what the program printed **and how the run
+/// ended**. Every failure mode (nimony, link, verify, trap) comes back as `Err` with its reason, so
+/// the differential reports *where* a program diverged rather than panicking on the first one.
+///
+/// The outcome is returned alongside the bytes because a program that produces no output has told
+/// you nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing),
+/// `Exited(127)` (panicked through `cAbort`) and a trap are three different bugs that a bare `""`
+/// renders identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
+/// The `(params, results)` behind an import's type index, for `NIM_DIFF_DEBUG`.
+fn import_sig_dbg(m: &temen_ir::Module, imp: &temen_ir::Import) -> Option<(Vec<temen_ir::ValType>, Vec<temen_ir::ValType>)> {
+    let temen_ir::ImportShape::Func(t) = imp.shape else { return None };
+    match m.types.get(t as usize)? {
+        temen_ir::TypeEntry::Func(f) => Some((f.params.clone(), f.results.clone())),
+        _ => None,
+    }
+}
+
+fn temen_output(
+    nim_path: &str,
+    libc: &[u8],
+    name: &str,
+    src: &str,
+) -> Result<(String, String), String> {
     let mods = try_compile_to_leng(nim_path, name, src)?;
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
@@ -1808,8 +1827,29 @@ fn temen_output(nim_path: &str, libc: &[u8], name: &str, src: &str) -> Result<St
         // here — this is how the missing half of libm surfaced (#1375).
         return Err(format!("unbound leaves: {}", extra.join(", ")));
     }
+    // `NIM_DIFF_DUMP=<dir>` writes the linked module as text next to its bound import list. A
+    // program that runs cleanly and prints nothing gives the Nim side no way to say why; reading the
+    // generated IR for the write path is what found the dropped-`scope` miscompile, after a day of
+    // bisecting from the guest side. `print_module` output is large (a hello-world links ~660
+    // functions), so this is opt-in.
+    if let Ok(dir) = std::env::var("NIM_DIFF_DUMP") {
+        let mut txt = String::new();
+        for i in &m.imports {
+            txt.push_str(&format!(
+                "; import {:?} shape {:?} sig {:?}\n",
+                i.name,
+                i.shape,
+                import_sig_dbg(&m, i)
+            ));
+        }
+        txt.push_str(&temen_text::print_module(&m));
+        let _ = std::fs::write(format!("{dir}/{name}.temt"), txt);
+    }
     let run = temen_run::run_powerbox(&m, &[]).map_err(|e| format!("run: {e}"))?;
-    Ok(String::from_utf8_lossy(&run.stdout).into_owned())
+    Ok((
+        String::from_utf8_lossy(&run.stdout).into_owned(),
+        format!("{:?}", run.outcome),
+    ))
 }
 
 /// **The nim differential corpus** — every `tests/nim_diff/*.nim` compiled and run twice, on Temen and
@@ -1836,14 +1876,47 @@ fn nim_differential_corpus() {
         return;
     };
     let dir = std::path::Path::new("tests/nim_diff");
-    let cases = nim_cases(dir);
+    let mut cases = nim_cases(dir);
     assert!(!cases.is_empty(), "no corpus programs in {dir:?}");
+    // `NIM_DIFF_ONLY=a,b,c` narrows the run to a few cases. The full corpus drives the whole
+    // toolchain twice per case (native oracle + temen), so chasing one divergence over the whole
+    // corpus costs ~30 min of wall clock to reach the case you care about. Filtering here — rather
+    // than in a hand-rolled probe harness — keeps the one code path: the case runs under exactly the
+    // driver that reports it, oracle comparison included.
+    let only = std::env::var("NIM_DIFF_ONLY").unwrap_or_default();
+    if !only.is_empty() {
+        let want: Vec<&str> = only
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        cases.retain(|c| {
+            c.file_stem()
+                .map(|s| want.contains(&&*s.to_string_lossy()))
+                .unwrap_or(false)
+        });
+        assert_eq!(
+            cases.len(),
+            want.len(),
+            "NIM_DIFF_ONLY named {want:?} but matched {:?}",
+            cases
+                .iter()
+                .map(|c| c.file_stem().unwrap().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        );
+    }
     // `known_gaps/` holds programs that are *expected* to diverge, each naming its issue. They are
     // still run: a gap that quietly starts working should be promoted and its issue closed, so that
     // is reported as a failure too. A directory is the whole expectation mechanism — no per-case
     // enum to keep in sync.
     let gap_dir = dir.join("known_gaps");
-    let gaps = nim_cases(&gap_dir);
+    // `NIM_DIFF_ONLY` names cases, so a filtered run skips the gaps outright — they are a separate
+    // expectation, and re-running them would dominate the wall clock the filter exists to cut.
+    let gaps = if only.is_empty() {
+        nim_cases(&gap_dir)
+    } else {
+        Vec::new()
+    };
 
     let mut failures: Vec<String> = Vec::new();
     for case in &cases {
@@ -1865,15 +1938,23 @@ fn nim_differential_corpus() {
             }
         };
         match temen_output(&path, &libc, &name, &src) {
-            Ok(got) if got == want => {
+            // The bytes are only half the answer. `native_output` rejects a program that exits
+            // non-zero natively, so every corpus case ends cleanly on the oracle — a Temen run that
+            // ends any other way has diverged even when it printed the right bytes. `Exited(127)` is
+            // what a nim panic looks like once `cAbort` reaches the stubbed `kill`, and a program
+            // that panics after printing its output would otherwise pass.
+            Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => failures.push(format!(
+                "{name}: output matches but the run ended {outcome} (native exits 0)"
+            )),
+            Ok((got, _)) if got == want => {
                 eprintln!(
                     "  {name}: ok in {}ms ({:?})",
                     started.elapsed().as_millis(),
                     elide(&got)
                 )
             }
-            Ok(got) => failures.push(format!(
-                "{name}: OUTPUT DIFFERS\n       temen: {:?}\n      native: {:?}",
+            Ok((got, outcome)) => failures.push(format!(
+                "{name}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
                 elide(&got),
                 elide(&want)
             )),
@@ -1890,7 +1971,7 @@ fn nim_differential_corpus() {
             continue;
         };
         match temen_output(&path, &libc, &name, &src) {
-            Ok(got) if got == want => failures.push(format!(
+            Ok((got, _)) if got == want => failures.push(format!(
                 "known_gaps/{name}: NOW MATCHES native — the gap is fixed. Move it into \
                  tests/nim_diff/ and close the issue named in its header."
             )),
@@ -1904,6 +1985,13 @@ fn nim_differential_corpus() {
         cases.len() + gaps.len(),
         failures.join("\n  - ")
     );
+}
+
+/// Did the Temen run end the way a normally-terminating program does — `main` returning 0, or an
+/// explicit `quit(0)`? Anything else (a non-zero status from `cExit`/`cAbort`, a returned non-zero)
+/// is a divergence from the native oracle, which by construction exited 0.
+fn is_clean_exit(outcome: &str) -> bool {
+    outcome == "Returned([I32(0)])" || outcome == "Exited(0)"
 }
 
 /// The `.nim` programs in `dir`, sorted, or empty if the directory is absent.

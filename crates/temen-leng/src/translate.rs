@@ -2756,22 +2756,26 @@ impl Translator {
         if let Some(b) = body {
             f.declare_labels(b);
         }
+        // Name the proc in EVERY error out of the body. "unsupported construct: lvalue `haddr`" or
+        // "non-void proc falls off the end without `ret`" on its own is unactionable in a module with
+        // a hundred procs — the system module is exactly that, and finding which proc a bare message
+        // came from meant bisecting the whole stdlib by hand.
+        let named = |e: LengError| -> LengError {
+            let who = a.first().and_then(|n| n.as_atom()).unwrap_or("?");
+            match e {
+                LengError::Malformed(m) => LengError::Malformed(format!("{m} (proc `{who}`)")),
+                LengError::Unsupported(m) => LengError::Unsupported(format!("{m} (proc `{who}`)")),
+                other => other,
+            }
+        };
         match body {
             Some(b) if !matches!(b, Node::Atom(_)) => {
-                f.stmt_list(b)?;
+                f.stmt_list(b).map_err(named)?;
             }
             _ => {}
         }
-        // Name the proc in the error. "non-void proc falls off the end without `ret`" on its own is
-        // unactionable in a module with a hundred procs — the system module is exactly that.
-        f.close_fallthrough().map_err(|e| match e {
-            LengError::Malformed(m) => LengError::Malformed(format!(
-                "{m} (proc `{}`)",
-                a.first().and_then(|n| n.as_atom()).unwrap_or("?")
-            )),
-            other => other,
-        })?;
-        f.close_block_gaps()?;
+        f.close_fallthrough().map_err(named)?;
+        f.close_block_gaps().map_err(named)?;
         let used_memory = f.used_memory;
         for blk in f.blocks {
             out.push_str(&blk);
@@ -3249,7 +3253,20 @@ impl<'a> FuncGen<'a> {
                 }
                 Some("dot") => {
                     let a = node.args();
-                    let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
+                    let (mut baddr, mut bdesc) = self.lvalue_addr(&a[0])?;
+                    // C's `p->f`: hexer writes a field access on a POINTER-valued base with no
+                    // `deref` of its own — `(dot (deref dest) r.00)` where `dest: ptr RootRef` is
+                    // `dest[][].r`. The atom case is already handled one level up (a pointer local's
+                    // slot value *is* the object address); here the base is an expression whose
+                    // lvalue is the cell holding the pointer, so follow it with a load.
+                    if let TyDesc::Ptr(pointee) = bdesc {
+                        let pv = self.fresh();
+                        self.used_memory = true;
+                        self.cur_buf
+                            .push_str(&format!("  v{pv} = i64.load v{baddr}\n"));
+                        baddr = pv;
+                        bdesc = *pointee;
+                    }
                     let fname = a
                         .get(1)
                         .and_then(|n| n.as_atom())
@@ -3312,7 +3329,24 @@ impl<'a> FuncGen<'a> {
                 }
             }
         }
+        // `(addr X)` / `(haddr X)` — an address-of IS a pointer expression, and its value is `X`'s
+        // address. `(deref (haddr X))` is then the identity, which is how hexer spells an inlined
+        // `var` parameter's use site: `off += k` comes out as
+        // `(asgn (deref (haddr off)) (add (deref (haddr off)) k))`.
+        if matches!(operand.tag(), Some("addr" | "haddr")) {
+            let inner = operand
+                .args()
+                .first()
+                .ok_or_else(|| LengError::Malformed("`addr` without an operand".into()))?;
+            return self.lvalue_addr(inner);
+        }
         let (laddr, ldesc) = self.lvalue_addr(operand)?;
+        // An **inline flexible array** (`LongString.data`) is not a pointer field: the data begins
+        // at the field's own address, so `(deref (dot L data))` — `L.data[0]` — is that address with
+        // NO load. Same rule the `pat` lvalue arm applies one level up.
+        if let TyDesc::FlexArray(elem) = &ldesc {
+            return Ok((laddr, (**elem).clone()));
+        }
         if let TyDesc::Ptr(pointee) = ldesc {
             let pv = self.fresh();
             self.used_memory = true;
@@ -3321,8 +3355,9 @@ impl<'a> FuncGen<'a> {
             return Ok((pv, *pointee));
         }
         Err(LengError::Unsupported(format!(
-            "not a pointer expression (`{}`)",
-            operand.tag().unwrap_or("<atom>")
+            "not a pointer expression (`{}` resolved to {:?})",
+            operand.tag().unwrap_or("<atom>"),
+            ldesc
         )))
     }
 
@@ -3752,11 +3787,18 @@ impl<'a> FuncGen<'a> {
         match s.tag() {
             // Nested block / scope: recurse (hexer emits `(stmts (stmts …))` and `(scope (stmts …))`).
             Some("stmts") => self.stmt_list(s),
+            // A `scope`'s children ARE its statements. They are *usually* wrapped in one `stmts`,
+            // but hexer emits them bare whenever it inlines a proc whose body is a single statement
+            // plus its return label — `off += k` comes out as
+            // `(scope (scope (asgn (deref (haddr off)) …) (lab returnLabel)))`. Recursing only into
+            // `stmts`-tagged children silently DROPPED every such statement: the write path's
+            // `wbuf.setLen`, `copyMem` and every `+=` loop increment vanished, leaving programs that
+            // ran to completion and did nothing (and loops that never advanced). Run every child —
+            // `stmt` already skips the `.` markers and rejects a tag that is not a statement, so
+            // nothing needs filtering here, and an unexpected child fails loudly instead of quietly.
             Some("scope") => {
                 for child in s.args() {
-                    if child.tag() == Some("stmts") {
-                        self.stmt_list(child)?;
-                    }
+                    self.stmt(child)?;
                 }
                 Ok(())
             }
