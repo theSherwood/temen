@@ -159,7 +159,15 @@ fn main() {
     .expect("decode nimsem_ce.temen");
     temen_verify::verify_module(&nimsem).expect("nimsem verifies");
     let decl = nimsem.memory.as_ref().expect("nimsem window").size_log2 as u32;
-    let child_sl = (decl + 3).max(28); // >= declared; nimsem's no-GC system semcheck peaks in (128, 256] MiB
+    // `>=` the declared window; the floor is what nimsem's system semcheck actually peaks at.
+    // `TEMEN_NIMSEM_CHILD_SL` overrides the floor so the peak can be *measured* (sweep it until the
+    // child stops faulting) instead of guessed — the comment here was a guess that went stale the
+    // moment the frontend's allocator changed.
+    let floor: u32 = std::env::var("TEMEN_NIMSEM_CHILD_SL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(28);
+    let child_sl = (decl + 3).max(floor);
     let carve_off = 1u64 << child_sl;
     let parent_win = 1u64 << (child_sl + 1);
 
