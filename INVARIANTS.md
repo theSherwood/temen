@@ -307,7 +307,7 @@ three engines is therefore the resting state until (a) freeze authority is **rep
 `Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
 carve names it: granted at spawn, containment-covering so one grant serves every child of an
 instantiator range, durable so a thawed parent holds what it held, and askable through
-`Host::holds_freeze_authority_over` (#1440). A **detached** child, which owns its own window and has no
+`Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
 sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never
 self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
 whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very

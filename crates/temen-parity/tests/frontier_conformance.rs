@@ -21,7 +21,7 @@
 //! locatable. That is deliberate: an unaudited cell is visible and countable, and this test asserts
 //! the count only moves in one direction.
 
-use temen_interp::{Host, NonDurableKind, StreamRole};
+use temen_interp::{DurableBinding, Host, NonDurableKind, StreamRole};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
 
@@ -130,6 +130,11 @@ fn the_durability_column_matches_the_durable_capture_classifier() {
         let expected_durable = match claimed {
             Status::Full => true,
             Status::Declines => false,
+            // A conditional row's answer depends on *how the grant was minted*, which one handle
+            // cannot express. `mintable` supplies the non-durable form; both directions are pinned
+            // by the dedicated test below (`a_module_handle_is_durable_iff_the_grant_is_attested_
+            // freezable`), so skipping here loses no coverage.
+            Status::Conditional => continue,
             other => panic!(
                 "{}: durability cell is {other:?}, uncheckable here",
                 cap.name()
@@ -228,4 +233,52 @@ fn audited_coverage_does_not_regress() {
          `debugger` column was driven, and 56 once `concurrency` was. Filling axes in is the work \
          (#1413) — emptying them is a regression."
     );
+}
+
+/// **The `Module` durability row's conditional half (#1361).** The cell is `Conditional` because the
+/// answer depends on how the grant was minted, so the loop above cannot check it with one handle.
+/// Both directions, on one host, so the pin fails if either half drifts:
+///
+/// - an **attested-freezable** grant (`grant_durable_module`) survives a drain and is captured,
+///   named by its §4 content digest — the module bytes are D-scope and never ride the artifact;
+/// - a plain grant (`grant_module`) is still drained as `NonDurableKind::Module`.
+#[test]
+fn a_module_handle_is_durable_iff_the_grant_is_attested_freezable() {
+    let m = a_module();
+    let mut host = Host::new();
+    let plain = host.grant_module(&m);
+    let freezable = host.grant_durable_module(&m);
+
+    // Before the drain, the un-attested grant is what makes a capture refuse.
+    assert!(
+        matches!(host.capture_durable_handles(), Err(h) if h.kind == NonDurableKind::Module),
+        "an un-attested module grant must still make the capture refuse"
+    );
+
+    let drained: Vec<NonDurableKind> = host
+        .drain_non_durable()
+        .into_iter()
+        .map(|h| h.kind)
+        .collect();
+    assert_eq!(
+        drained,
+        vec![NonDurableKind::Module],
+        "the drain must take the un-attested grant and keep the attested one"
+    );
+
+    let captured = host
+        .capture_durable_handles()
+        .expect("with the un-attested grant drained, the attested one is capturable");
+    let slots: Vec<u32> = captured.iter().map(|h| h.slot).collect();
+    assert_eq!(
+        slots,
+        vec![(freezable as u32) & 0xff],
+        "exactly the attested grant's slot survives; the drained one's is closed"
+    );
+    assert!(
+        matches!(captured[0].binding, DurableBinding::Module { .. }),
+        "the attested grant is captured as a module binding, got {:?}",
+        captured[0].binding
+    );
+    assert_ne!(plain, freezable, "the two grants are distinct handles");
 }

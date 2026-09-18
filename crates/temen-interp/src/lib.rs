@@ -17130,8 +17130,9 @@ impl Attestation {
 /// into a fresh `Host` reconstructs the exact authority. The `JitTable`/`JitCode` variants
 /// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
 /// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
-/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`,
-/// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Blocking`, an unnamed
+/// `HostProc`, a non-freezable `Module`) are **not** durable: a live one makes the domain
+/// non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
     Stream(StreamRole),
@@ -17174,6 +17175,24 @@ pub enum DurableBinding {
     JitCode {
         domain: u32,
         unit: u32,
+    },
+    /// #1361 — a §14 [`Binding::Module`] grant the granting host attested **freezable**
+    /// (`grant_durable_module` ran `temen_durable::transform_module` on it), named by its §4
+    /// content digest. The module *bytes* never ride an artifact (D-scope): the restoring host
+    /// re-grants the same module and this digest re-resolves the handle against it — exactly the
+    /// rule a separate-module [`FrozenNested`] child already re-attaches by
+    /// ([`Host::module_by_digest`]), reused rather than duplicated.
+    ///
+    /// A grant *without* the attestation stays non-durable ([`NonDurableKind::Module`]): a durable
+    /// domain may not instantiate one anyway (DURABILITY.md §4), so there is nothing a thaw could
+    /// usefully hand back. This is the same conditional shape [`Named`](Self::Named) has — durable
+    /// iff the grant carries a reconstruction rule the restoring host can act on.
+    ///
+    /// Authority is unchanged: a digest is not authority. The thaw resolves it only against modules
+    /// the **restoring** host chose to grant, so a moment cannot carry in code a host would not have
+    /// granted fresh (INVARIANTS #3).
+    Module {
+        digest: [u8; 32],
     },
     /// #1455 — an embedder host capability ([`Binding::HostProc`]) that carries a registered
     /// **name**, so a thaw can re-grant it. A host-proc is a closure: its code address is
@@ -17936,6 +17955,16 @@ pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Se
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NamedCapRestoreError {
     pub name: String,
+}
+
+/// Why a thaw could not re-resolve a durable [`DurableBinding::Module`] handle (#1361): the
+/// restoring host holds no **durable** module grant whose §4 content digest matches. Fail-closed,
+/// and carrying the digest, so an embedder can tell "I forgot to re-grant it" from "I re-granted a
+/// different build". The bytes never ride the artifact (D-scope), so re-granting the same module is
+/// the embedder's half of the contract, exactly as for a separate-module nested child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ModuleRestoreError {
+    pub digest: [u8; 32],
 }
 
 /// #1502 — the thaw-side **budget hook**: given a carried `Budget`'s remaining quotas, what the
@@ -21140,7 +21169,15 @@ impl Host {
                 Binding::SharedRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
-                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                // #1361: a module grant the granting host attested **freezable** (§4) is durable —
+                // named by its content digest, which the thaw resolves against the restoring host's
+                // re-granted modules (the same rule a separate-module nested child re-attaches by).
+                // An un-attested grant is still refused: a durable domain cannot instantiate one,
+                // so there is no authority for a thaw to reconstruct.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => DurableBinding::Module { digest: g.digest },
+                    _ => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                },
                 Binding::ModuleLoader => {
                     return Err(self.non_durable(slot, NonDurableKind::ModuleLoader))
                 }
@@ -21232,7 +21269,12 @@ impl Host {
                 // complement of `capture` above.
                 | Binding::Budget(_) => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
-                Binding::Module(_) => NonDurableKind::Module,
+                // #1361: the complement of `capture` above — an attested-freezable grant is
+                // durable and a drain keeps it; an un-attested one is still relinquished.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => continue,
+                    _ => NonDurableKind::Module,
+                },
                 Binding::ModuleLoader => NonDurableKind::ModuleLoader,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
@@ -21300,6 +21342,15 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1361: re-resolve the module the artifact *names* against what this host has been
+                // granted. `check_modules_for_thaw` validated every carried digest before any slot
+                // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
+                // anyway, leaving the slot closed drops the authority rather than forging one, and
+                // the guest's handle value becomes a dead generation (D37).
+                DurableBinding::Module { digest } => match self.module_id_by_digest(&digest) {
+                    Some(id) => Binding::Module(id),
+                    None => continue,
+                },
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
                 // re-granted by `restore_durable_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
@@ -21317,6 +21368,27 @@ impl Host {
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
+    /// modules, **before** [`Self::restore_durable_handles`] pins anything. The module twin of
+    /// [`Self::restore_durable_named`]'s registrar step, and fail-closed for the same reason: an
+    /// artifact *names* a module, it never carries one, so a restore that cannot find it must fail
+    /// rather than thaw a domain holding a handle to nothing.
+    ///
+    /// Reports the **first** unresolved digest, so the restore is all-or-nothing like the capture.
+    pub fn check_modules_for_thaw(
+        &self,
+        handles: &[DurableHandle],
+    ) -> Result<(), ModuleRestoreError> {
+        for h in handles {
+            if let DurableBinding::Module { digest } = h.binding {
+                if self.module_id_by_digest(&digest).is_none() {
+                    return Err(ModuleRestoreError { digest });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The name registered for the grant living at `slot`, if any — the reverse of
@@ -22805,7 +22877,7 @@ impl Host {
     /// For a §14 nested carve the range is the child's carve, which is what makes the R1 rule
     /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
     /// rather than an inference from placement: the spawn path mints this, and
-    /// [`holds_freeze_authority_over`](Host::holds_freeze_authority_over) is how a later freeze asks.
+    /// [`holds_freeze_authority`](Host::holds_freeze_authority) is how a later freeze asks.
     pub fn grant_freeze_authority(&mut self, scope: FreezeScope) -> i32 {
         self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
     }
@@ -22961,33 +23033,46 @@ impl Host {
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
     /// host re-grants the child's module, and its re-attach residue names it by [`module_digest`].
-    /// Returns the grant's function table, or `None` (a missing / mismatched re-grant ⇒
-    /// the thaw fails closed, the per-child R5 identity gate).
-    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+    /// `None` on a missing / mismatched re-grant, so the thaw fails closed — the per-child R5
+    /// identity gate. The single lookup behind every `*_by_digest` accessor and behind a durable
+    /// [`DurableBinding::Module`] handle's re-resolution: one rule for "which grant is this digest",
+    /// not one per consumer (INVARIANTS #15).
+    ///
+    /// Matching is by *content*, so two grants of the same module are interchangeable by
+    /// construction — which is the point of naming a module by what it is rather than by an index.
+    fn grant_by_digest(&self, digest: &[u8; 32]) -> Option<(u32, &ModuleGrant)> {
         self.modules
             .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.funcs))
+            .position(|g| g.durable && &g.digest == digest)
+            .map(|i| (i as u32, &self.modules[i]))
+    }
+
+    /// The `modules` index a durable digest names — what a captured [`DurableBinding::Module`]
+    /// re-binds to on thaw.
+    fn module_id_by_digest(&self, digest: &[u8; 32]) -> Option<u32> {
+        self.grant_by_digest(digest).map(|(i, _)| i)
+    }
+
+    /// The function table of the grant [`Self::grant_by_digest`] names.
+    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.funcs))
     }
 
     /// The type section of the granted module matching `digest` (FuncType interning, #922) — the
     /// sibling of [`Self::module_by_digest`] so a re-granted separate-module thread child resolves
     /// its call variants' interned signatures.
     fn module_types_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.types))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.types))
     }
 
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
     /// thaw to register as the re-created serving child's **self module** (serve admission +
     /// handler resolution need the module, not just its functions).
     fn module_arc_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.module))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.module))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's

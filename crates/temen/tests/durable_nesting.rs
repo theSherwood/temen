@@ -453,9 +453,13 @@ fn freeze_with_live_nested_child_thaws_and_completes() {
 
 /// Freeze a live **separate-module** child (host-supplied at restore): its module identity rides
 /// the artifact as a content digest only; the thaw re-attaches it against the restore host's
-/// **re-granted** module and reproduces the total. Covers the in-memory arc *and* the codec (the
-/// non-durable `Module` handle is drained before serialize; the module is re-granted after the
-/// §12.6 canonical re-freeze check so the re-freeze still sees only durable handles).
+/// **re-granted** module and reproduces the total. Covers the in-memory arc *and* the codec.
+///
+/// Since #1361 the parent's `Module` **handle** is durable too — carried by the same digest — so
+/// there is nothing to drain, and the restoring host must hold the module *before* `restore`,
+/// exactly as it installs a named-cap registrar before restore. That makes the two digests one
+/// rule rather than a handle drained around the freeze and a child record resolved after it, and
+/// it lets the thaw re-enter with the guest's **original** handle values (§12.6).
 #[test]
 fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
     let parent = instrument(PARENT_JOIN);
@@ -485,13 +489,20 @@ fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
         "separate-module child carries a digest"
     );
 
-    // Drain the non-durable Module handle so the domain is snapshottable, then serialize.
-    fhost.drain_non_durable();
-    let artifact = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes after drain");
+    // Nothing to drain: an attested-freezable module grant is durable (#1361), so the handle rides
+    // the artifact by digest alongside the child record's.
+    assert!(
+        fhost.drain_non_durable().is_empty(),
+        "an attested module grant is durable — a drain has nothing to take"
+    );
+    let artifact = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes");
 
-    // Restore; §12.6 canonical re-freeze BEFORE re-granting the module (only durable handles live).
+    // The restoring host supplies the module *before* restore — the artifact names it, the host
+    // grants it. A host that did not would be refused `ModuleUnresolved` rather than thawing a
+    // domain whose handle resolves to nothing.
     let mut thost = Host::new();
     thost.set_durable(true);
+    thost.grant_durable_module(&child_loop());
     let window = temen_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
     assert_eq!(
         thost.frozen_nested(),
@@ -504,13 +515,18 @@ fn freeze_with_live_separate_module_child_thaws_through_the_codec() {
         "canonical re-freeze byte-identical"
     );
 
-    // Recover the restored Instantiator handle *before* re-granting the (non-durable) Module — the
-    // embedder then supplies the matching module (host-supplied at restore) and thaws.
+    // §12.6: guest-held handle values survive the round trip, so the thaw re-enters with the very
+    // handles the freeze ran with — both of them, now that the module handle rides too.
     let caps = thost
         .capture_durable_handles()
         .expect("only durable handles restored");
-    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
-    let tmh = thost.grant_durable_module(&child_loop());
+    assert!(
+        caps.iter()
+            .any(|c| matches!(c.binding, temen_interp::DurableBinding::Module { .. })),
+        "the module handle came back as a durable binding: {:?}",
+        caps.iter().map(|c| c.binding).collect::<Vec<_>>()
+    );
+    let (tih, tmh) = (ih, mh);
     let mut twin = window;
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut fuel = 50_000_000u64;
