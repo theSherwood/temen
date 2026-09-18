@@ -36,11 +36,14 @@ declare -a RESULTS=()
 note() { RESULTS+=("$1"); echo "  >> $1"; }
 
 # --- toolchain env: the setup each nimony builder assumes (see the header) ---------------------------
-# Prefer a real Nim toolchain dir (adjacent ../lib/nimbase.h) over a bare `nim` shim.
+# Prefer a real Nim toolchain dir (adjacent ../lib/nimbase.h) over a bare `nim` shim. `.nimtool/` is
+# the repo-local toolchain dir the nim demos already key off (`demos/nim_e2e_chain`,
+# `demos/nifler_temen`); a checkout whose Nim lives only there had every nimony asset SKIP silently.
 pick_nim() {
   local c
   for c in \
     "$(command -v nim 2>/dev/null)" \
+    "$REPO"/.nimtool/*/bin/nim \
     /root/.choosenim/toolchains/*/bin/nim \
     "$HOME"/.choosenim/toolchains/*/bin/nim; do
     [ -x "$c" ] || continue
