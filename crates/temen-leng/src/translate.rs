@@ -94,8 +94,6 @@ fn nif_unquote(raw: &str) -> String {
 /// when the real `RootObj` layout isn't in scope, so those accesses resolve (#859).
 const RTTI_VT_FIELD: &str = "vt.00";
 
-/// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
-/// translatable body (calls to it become Temen imports the host binds at link).
 /// True if a proc is an **intrinsic/instruction declaration** — `(pragmas (intrinsic "Bswap") …)`
 /// or `(instruction …)` — which v0.6.2's hexer emits with a non-void return and an **empty** body
 /// (`(stmts .)`). It is metadata for the `instr` application form, not code: `leng_tags.InstrC`
@@ -122,6 +120,8 @@ fn is_bodyless_proc(proc_node: &Node) -> bool {
     is_importc_proc(proc_node) || is_intrinsic_proc(proc_node)
 }
 
+/// True if a `(proc :name params ret pragmas body)` carries an `importc` pragma — a C extern with no
+/// translatable body (calls to it become Temen imports the host binds at link).
 fn is_importc_proc(proc_node: &Node) -> bool {
     matches!(proc_node.args().get(3), Some(p)
         if p.tag() == Some("pragmas") && p.args().iter().any(|x| x.tag() == Some("importc")))
