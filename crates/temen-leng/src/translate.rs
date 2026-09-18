@@ -1564,12 +1564,19 @@ impl Translator {
                 }
             }
         }
-        // Record which declared types are aggregates (object/array) *before* resolving, so
+        // Record which declared types are aggregates (object/array/union) *before* resolving, so
         // `tydesc` classifies every other named type (enum/distinct/…) as a scalar as it resolves
         // fields. Extend (don't overwrite): external types registered by `import_types` stay.
+        //
+        // `union` is a whole type body, not just the variant-object child: a C-style `{.union.}`
+        // object (`std/posix`'s `EpollData`) is spelled `(type :X . (union (fld …)+))`. Leaving it
+        // out classified the *field* as a scalar before any layout ran, so `ev.data.ptr` failed as
+        // "`dot` field `ptr.0` on a non-object base" no matter what `resolve_type` did with it.
         self.agg_names.extend(
             raw.iter()
-                .filter(|(_, body)| matches!(body.tag(), Some("object") | Some("array")))
+                .filter(|(_, body)| {
+                    matches!(body.tag(), Some("object") | Some("array") | Some("union"))
+                })
                 .map(|(n, _)| n.clone()),
         );
         // Record `proctype` signatures next — after `agg_names` (so an aggregate return classifies as
@@ -1668,6 +1675,25 @@ impl Translator {
             None => return Ok(()), // an external/opaque type; leave unresolved (sizeof falls back)
         };
         let layout = match body.tag() {
+            // A **C-style `{.union.}` object** — `(union (fld …)+)` as the whole type body, not the
+            // `(object … (union …))` of a Nim variant. Every field starts at offset 0 and the type is
+            // as large as its largest member, which is the same flat field list the variant case
+            // builds, with `union_base` fixed at 0. `std/posix`'s `EpollData` is one; without this the
+            // body tag matched nothing, the type resolved to a scalar, and `ev.data.ptr` failed as
+            // "`dot` field `ptr.0` on a non-object base".
+            Some("union") => {
+                let mut fields = Vec::new();
+                let mut size = 0u64;
+                for fld in body.args() {
+                    if fld.tag() != Some("fld") {
+                        continue;
+                    }
+                    let (fname, fdesc, fsize) = self.layout_field(fld, raw)?;
+                    fields.push((fname, 0, fdesc));
+                    size = size.max(fsize);
+                }
+                Layout::Object { fields, size }
+            }
             Some("object") => {
                 // `(object [Empty|Base] (fld :f pragmas Type)*)` — packed at natural size.
                 let mut fields = Vec::new();
