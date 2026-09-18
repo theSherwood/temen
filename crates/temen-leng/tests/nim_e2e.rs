@@ -131,6 +131,16 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
     for e in entries.flatten() {
         let p = e.path();
         if p.is_dir() {
+            // `<scratch>_d` is a **macro plugin's own sub-build** (`semos.buildPlugin`: a plugin is
+            // a separate executable Nimony compiles at compile time, in its own cache directory, with
+            // its own C `main`). Those modules belong to a different program, not this one — sweeping
+            // them in is how `import std/macros` started failing with `DuplicateSymbol("main")` under
+            // v0.6.2, which routes `parsegen`/`regex` through plugins. The sibling `_v` is the
+            // validator's sem-only run of the same source; skip it too.
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with("_d") || name.ends_with("_v") {
+                continue;
+            }
             collect_x_nif(&p, out);
         } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
             if let Some(stem) = name.strip_suffix(".x.nif") {

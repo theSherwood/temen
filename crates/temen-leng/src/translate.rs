@@ -1869,11 +1869,28 @@ impl Translator {
     /// it needs the `call.dyn` signature at translate time (the funcref value itself, an `i32`
     /// index, resolves at link time via `data.sym`). This is the funcref counterpart of
     /// [`export_types_pooled`]; [`link_selected`] pools these across its units before translating any.
-    pub fn export_globals(root: &Node, stem: &str) -> Result<Vec<(String, TyDesc)>, LengError> {
+    pub fn export_globals(
+        root: &Node,
+        stem: &str,
+        pooled: &[(String, Layout)],
+    ) -> Result<Vec<(String, TyDesc)>, LengError> {
         let mut t = Translator::new();
         t.scan_lenient = true; // enumerating globals; tolerate unresolvable cross-module aggregates
         t.collect_types(root)?;
+        // The **pooled** cross-module layouts, as the real translation pass gets them. Without these
+        // a global whose type is declared in a sibling module resolves to the `scan_lenient` scalar
+        // placeholder, and exporting that is worse than exporting nothing: the consumer then indexes
+        // `TagData.0.<tags>` as a `Scalar(I64)` and fails with "`at` on a non-array". The pool is
+        // complete before this runs (`link_selected_with_extra` drives it to a fixpoint first), so
+        // there is no ordering cost to using it.
+        let imported: HashSet<String> = pooled.iter().map(|(n, _)| n.clone()).collect();
+        t.import_types(pooled);
         t.collect_globals(root)?;
+        // This unit's own type names, which the descriptors below must be rewritten into their
+        // stem-suffixed global form — the same rewrite `export_types_pooled` applies to a field or
+        // element descriptor, and for the same reason: the consumer's table is keyed by the global
+        // name, so an unsuffixed `Agg("`t.0.IAarray…`")` resolves to nothing there.
+        let local: HashSet<&String> = t.types.keys().filter(|n| !imported.contains(*n)).collect();
         let mut out: Vec<(String, TyDesc)> = t
             .globals
             .iter()
@@ -1886,7 +1903,9 @@ impl Translator {
                     TyDesc::FnPtr(_) | TyDesc::Agg(_) | TyDesc::FlexArray(_) | TyDesc::Ptr(_)
                 )
             })
-            .map(|(name, (_, desc))| (format!("{name}{stem}"), desc.clone()))
+            .map(|(name, (_, desc))| {
+                (format!("{name}{stem}"), rewrite_agg_names(desc, &local, stem))
+            })
             .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0)); // HashMap order → deterministic output
         Ok(out)
@@ -3334,13 +3353,28 @@ impl<'a> FuncGen<'a> {
                         .get(1)
                         .and_then(|n| n.as_atom())
                         .ok_or_else(|| LengError::Malformed("dot needs a field name".into()))?;
-                    let (foff, fdesc) = self.field_of(&bdesc, fname)?;
+                    let (foff, fdesc) = self.field_of(&bdesc, fname).map_err(|e| match e {
+                        LengError::Unsupported(m) => LengError::Unsupported(match a[0].as_atom() {
+                            Some(n) => format!("{m}, base `{n}`"),
+                            None => format!("{m}, base a `{}`", a[0].tag().unwrap_or("?")),
+                        }),
+                        other => other,
+                    })?;
                     Ok((self.add_const_off(baddr, foff), fdesc))
                 }
                 Some("at") => {
                     let a = node.args();
                     let (baddr, bdesc) = self.lvalue_addr(&a[0])?;
-                    let (esize, edesc) = self.array_of(&bdesc)?;
+                    // Name the base in the error. "`at` on a non-array" is the same message whether
+                    // the base is an unresolved cross-module symbol, a pointer that wanted `pat`, or
+                    // a tuple — and the symbol is what tells you which.
+                    let (esize, edesc) = self.array_of(&bdesc).map_err(|e| match e {
+                        LengError::Unsupported(m) => LengError::Unsupported(match a[0].as_atom() {
+                            Some(n) => format!("{m} indexing `{n}`"),
+                            None => format!("{m} indexing a `{}`", a[0].tag().unwrap_or("?")),
+                        }),
+                        other => other,
+                    })?;
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
                     Ok((self.add_scaled(baddr, idx.id, esize), edesc))
                 }
@@ -3595,11 +3629,19 @@ impl<'a> FuncGen<'a> {
                 {
                     return Ok((*elem_size, elem.clone()));
                 }
-                Err(LengError::Unsupported("`at` on a non-array".into()))
+                Err(LengError::Unsupported(format!(
+                    "`at` on a non-array (`{n}` is {:?})",
+                    self.t.types.get(n)
+                )))
             }
             // An inline flexible array (`LongString.data`): element size from the element type.
             TyDesc::FlexArray(elem) => Ok((self.t.sizeof(elem).max(1), (**elem).clone())),
-            _ => Err(LengError::Unsupported("`at` on a non-array".into())),
+            // Name what the base actually resolved to. "`at` on a non-array" alone says nothing
+            // about *which* wrong thing it is, and the answers differ: an unresolved cross-module
+            // symbol (`Scalar(I64)`), a pointer that wanted `pat`, a tuple.
+            other => Err(LengError::Unsupported(format!(
+                "`at` on a non-array ({other:?})"
+            ))),
         }
     }
 
