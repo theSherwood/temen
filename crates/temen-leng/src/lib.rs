@@ -6,6 +6,19 @@
 //! Like them it is an untrusted producer (DESIGN.md §2a): the verifier re-checks every module it
 //! emits, so a bug here is a clean error, never an escape.
 //!
+//! ## This crate ships **inside a sandbox guest**
+//!
+//! `temen-leng` is compiled into the nim-link guest (`demos/nim_frontend/nim_link_guest`, the
+//! committed `nim-link.temen.gz` asset): the linker running *on Temen*, over the LLVM on-ramp. That
+//! on-ramp provides a deliberately tiny C bottom edge — `read`/`write`/`mem*`/`malloc`/`free` and the
+//! `__vm_*` ops — and `build_nim_link.sh`'s stub audit **fails the build** on any other extern in the
+//! link closure. So this crate must not reach for anything that pulls in libc: no `std::env` (a
+//! `getenv`), no `eprintln!`/`println!` (thread-local stdio drags in `pthread_key_*`, `abort`,
+//! `__errno_location`). A `TEMEN_LENG_DUMP_LAYOUT` diagnostic knob added here during #1593 tripped
+//! exactly that audit — the guest is not a place where an environment exists to read.
+//!
+//! Diagnostics belong in the **callers** (`temen-run`, the tests), which are ordinary host binaries.
+//!
 //! ## Scope — a walking skeleton
 //!
 //! The frontend now lowers integers/floats, arithmetic, locals and direct/indirect calls, control
@@ -248,12 +261,6 @@ fn translate_object_module(
             (text, names.iter().map(|s| s.to_string()).collect())
         }
     };
-    // #1593: the same type can be laid out by the unit that declares it *and* by the pooled table
-    // every other unit imports. A disagreement between the two is invisible downstream — both sides
-    // verify, they just read different bytes — so dump both on request and compare.
-    if let Ok(want) = std::env::var("TEMEN_LENG_DUMP_LAYOUT") {
-        t.dump_layouts(&want, stem);
-    }
     let mut module = temen_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
@@ -612,18 +619,6 @@ fn link_selected_with_extra(
             stem,
             &pooled_c_global_defs,
         ));
-    }
-    if let Ok(want) = std::env::var("TEMEN_LENG_DUMP_LAYOUT") {
-        for (name, layout) in &pooled {
-            if name.contains(&want) {
-                if let translate::Layout::Object { fields, size } = layout {
-                    eprintln!("[layout POOLED] {name}: object size={size}");
-                    for (f, off, d) in fields {
-                        eprintln!("[layout POOLED]   +{off:<4} {f} : {d:?}");
-                    }
-                }
-            }
-        }
     }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).

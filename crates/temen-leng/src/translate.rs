@@ -1523,33 +1523,6 @@ impl Translator {
         }
     }
 
-    /// **Layout dump** (`TEMEN_LENG_DUMP_LAYOUT=<substring>`): print every resolved type whose name
-    /// contains `want`, with its size and each field's offset and descriptor, tagged with the unit
-    /// that computed it. A cross-unit layout disagreement (#1593) is invisible in the emitted IR —
-    /// both sides verify, they just read different bytes — so the only way to see one is to put the
-    /// two units' tables side by side.
-    pub fn dump_layouts(&self, want: &str, tag: &str) {
-        let mut names: Vec<&String> = self.types.keys().filter(|n| n.contains(want)).collect();
-        names.sort();
-        for n in names {
-            match &self.types[n] {
-                Layout::Object { fields, size } => {
-                    eprintln!("[layout {tag}] {n}: object size={size}");
-                    for (f, off, d) in fields {
-                        eprintln!("[layout {tag}]   +{off:<4} {f} : {d:?}");
-                    }
-                }
-                Layout::Array {
-                    elem,
-                    elem_size,
-                    size,
-                } => eprintln!(
-                    "[layout {tag}] {n}: array size={size} elem_size={elem_size} elem={elem:?}"
-                ),
-            }
-        }
-    }
-
     /// True if `t` denotes a `proctype` — written inline as `(proctype …)` or as a named proctype.
     fn is_proctype(&self, t: &Node) -> bool {
         t.tag() == Some("proctype") || t.as_atom().is_some_and(|n| self.proctypes.contains_key(n))
