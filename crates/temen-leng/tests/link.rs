@@ -25,6 +25,28 @@ fn run(m: &temen_ir::Module, idx: u32, args: &[i64]) -> i64 {
     n
 }
 
+/// Like [`run`], but pre-seed an i64 at `off` in the window first (both engines, parity).
+fn run_with_seed(m: &temen_ir::Module, idx: u32, args: &[i64], off: usize, val: i64) -> i64 {
+    temen_verify::verify_module(m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // #1094: the NULL guard is unconditional, so seeds must clear `[0, POWERBOX_NULL_GUARD)`.
+    let mut seed = vec![0u8; 20480];
+    seed[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    let ivals: Vec<Value> = args.iter().map(|&n| Value::I64(n)).collect();
+    let mut fuel = u64::MAX;
+    let (ir, _) = temen_interp::run_capture(m, idx, &ivals, &mut fuel, &seed);
+    let n = match ir.expect("interp").as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("expected i64, got {o:?}"),
+    };
+    let (jout, _) = temen_jit::compile_and_run_capture(m, idx, args, &seed).expect("jit");
+    let jit = match jout {
+        temen_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(jit.as_slice(), &[n], "§9 interp/JIT parity");
+    n
+}
+
 /// Real nimony: `moda` imports `pkg/modb` and calls `helper`. `hexer` emits `moda`'s call as
 /// `helper.0.<modb-stem>`; `modb` defines `helper.0.` locally. Linking the two translated modules
 /// resolves the cross-module call to compiled Nim, and `useit(5) = helper(5) + 1 = 16`.
@@ -890,4 +912,56 @@ fn funcref_global_static_initializer() {
         "drive calls the materialized hook = dbl"
     );
     assert_eq!(run(&linked, 0, &[18432, -5]), -10);
+}
+
+#[test]
+fn a_siblings_proc_taken_as_a_funcref() {
+    // #760: unit `b` stores unit `a`'s proc into a dispatch record and calls through it. nimony
+    // builds exactly this — `cps.nim` puts `coro_transform`'s `transformCoroutineDecl` into a
+    // `trCoroutine` field — and it was the second construct standing between hexer and the pure
+    // no-C path, as `Unresolved("transformCoroutineDecl.0.cor8uhndx")`.
+    //
+    // Two things have to be true at once. The *using* unit needs a value for a proc it has no func
+    // index for (`Inst::RefFunc` takes an index immediate), and the *defining* unit has to give
+    // that proc the funcref ABI's leading `$sp` — which it can only know from the whole-program
+    // pool, since the use is in a sibling. Get either half wrong and this fails closed: an
+    // unresolved symbol, or a call-arity mismatch at verify.
+    let a = temen_leng::WholeModule {
+        stem: "moda",
+        src: "\
+(stmts
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))",
+    };
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (type :Box.0. . (object . (fld :fn.0 . IntFn.0.) (fld :v.0 . (i +64))))
+ (proc :useit.0. (params (param :bx.0 . (ptr Box.0.))) (i +64) .
+  (stmts .
+   (asgn (dot (deref bx.0) fn.0 0) dbl.0.moda)
+   (ret (call (dot (deref bx.0) fn.0 0) (dot (deref bx.0) v.0 0))))))",
+    };
+    let m = temen_leng::link_whole_units(&[a, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    // Box at 16512: `fn`@0 is overwritten by the store, `v`@8 seeded to 21. The func index is
+    // whichever slot the merge gave `useit`; find it by name rather than assuming an order.
+    let idx = m
+        .exports
+        .iter()
+        .find(|e| e.name == "useit.0.modb")
+        .unwrap_or_else(|| {
+            panic!(
+                "useit exported: {:?}",
+                m.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        })
+        .func;
+    let bx = 16512usize;
+    assert_eq!(
+        run_with_seed(&m, idx, &[18432, bx as i64], bx + 8, 21),
+        42,
+        "dbl(21) called through a funcref to a sibling unit's proc"
+    );
 }

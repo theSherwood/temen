@@ -2235,7 +2235,14 @@ fn nifler2_links_through_leng() {
         eprintln!("SKIP nifler2_links_through_leng ({src:?} absent — v0.6.2+ only)");
         return;
     }
-    let out = std::env::temp_dir().join("nifler2_spike_bin");
+    // One output path **per source**. A shared path is a stale-oracle trap: `nimony c` is cached, so
+    // a probe whose binary is already up to date rewrites nothing, and the native side of the
+    // comparison is then whichever program the *previous* probe built — a hexer run leaves a hexer
+    // binary that the next nifler2 run happily diffs against. Name the binary after the source.
+    let out = std::env::temp_dir().join(format!(
+        "nifler2_spike_bin_{}",
+        rel.replace(['/', '\\', '.'], "_")
+    ));
     let started = std::time::Instant::now();
     let st = Command::new("nimony")
         .args([
@@ -2259,35 +2266,89 @@ fn nifler2_links_through_leng() {
 
     let mut mods = Vec::new();
     collect_x_nif(&root.join("nimcache"), &mut mods);
-    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so a previous
-    // `--isMain` build's program module is still sitting there — two `main`s, and the link fails
-    // `DuplicateSymbol("main")`. Keep the one this build just wrote (its `.x.nif` is the newest of
-    // them); every other module in the closure is a library module with no `main`.
+    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so it accumulates the
+    // modules of **every** program ever built there — a previous `nifler2` build's as well as this
+    // one's. Sweeping all of them in is wrong twice over: two `main`s fail the link
+    // `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
+    // cross-module references need not resolve in *this* program.
+    //
+    // Take the program's own module set instead of patching the symptom. nimony writes one
+    // `<stem>.c` per module into the program's own build directory (`nimcache/<program stem>/`), so
+    // that directory's `.c` stems are exactly this program's closure. Restricting to it drops the
+    // foreign modules *and* their `main`s together — one rule instead of a duplicate-`main` hack
+    // that left the rest of the foreign program in the link.
+    //
+    // The program module is identified as before (the newest `.x.nif` carrying `main`), because the
+    // build directory is named after it. If that directory is absent — an older toolchain, or a
+    // layout change — fall back to keeping the newest `main` and sweeping the rest, which is what
+    // this did before and is merely imprecise rather than wrong.
     let mains: Vec<usize> = mods
         .iter()
         .enumerate()
         .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
         .map(|(i, _)| i)
         .collect();
-    if mains.len() > 1 {
-        let keep = *mains
-            .iter()
-            .max_by_key(|&&i| {
-                let stem = &mods[i].0;
-                x_nif_mtime(&root.join("nimcache"), stem)
+    if !mains.is_empty() {
+        // Which of them is *this* program? Not the newest: `nimony c` is cached, so a run whose
+        // output is already up to date rewrites nothing and mtime then names whichever program was
+        // built last — the hexer probe and the nifler2 probe would both select hexer, and the
+        // nifler2 run would silently link hexer's closure. A program module's own `.x.nif` carries
+        // its source path in its line info (60 hits for `src/hexer/hexer.nim` in hexer's, 0 in every
+        // other program module's), so match on the source we were actually asked to build. Fall back
+        // to newest-by-mtime when nothing matches, which is the old behaviour.
+        let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(&rel));
+        let keep = by_src.unwrap_or_else(|| {
+            *mains
+                .iter()
+                .max_by_key(|&&i| {
+                    let stem = &mods[i].0;
+                    x_nif_mtime(&root.join("nimcache"), stem)
+                })
+                .expect("a newest program module")
+        });
+        if by_src.is_none() {
+            eprintln!("  nifler2: no program module names `{rel}` — falling back to newest `main`");
+        }
+        let keep_stem = mods[keep].0.clone();
+        let build_dir = root.join("nimcache").join(&keep_stem);
+        let own: std::collections::HashSet<String> = std::fs::read_dir(&build_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_suffix(".c"))
+                    .map(|s| s.to_string())
             })
-            .expect("a newest program module");
-        eprintln!(
-            "  nifler2: {} program modules in the cache, keeping `{}`",
-            mains.len(),
-            mods[keep].0
-        );
-        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
-        for i in drop.into_iter().rev() {
-            mods.remove(i);
+            .collect();
+        if own.is_empty() {
+            eprintln!(
+                "  nifler2: no build dir for `{keep_stem}` — keeping newest `main` only ({} program modules)",
+                mains.len()
+            );
+            let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+            for i in drop.into_iter().rev() {
+                mods.remove(i);
+            }
+        } else {
+            let before = mods.len();
+            mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
+            eprintln!(
+                "  nifler2: program `{keep_stem}` owns {} modules; dropped {} foreign of {before}",
+                own.len(),
+                before - mods.len()
+            );
         }
     }
     eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
+    if let Ok(want) = std::env::var("NIM_CLOSURE_HAS") {
+        eprintln!(
+            "  nifler2: closure contains `{want}`: {}",
+            mods.iter().any(|(s, _)| *s == want)
+        );
+    }
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
@@ -2427,18 +2488,34 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             elide(&String::from_utf8_lossy(&out))
         );
     }
+    // **Assert**, do not narrate. Every arm here used to be an `eprintln!`, `DIFFERS` included, so
+    // the run reported success whatever came out — the headline "byte-identical" line was a print
+    // statement and the probe could not fail on a wrong answer. A comparison that cannot fail is not
+    // a comparison.
     if want.is_empty() {
-        return; // a probe run: stdout above is the whole comparison
+        // A program invoked with no file to write (`hexer` with no args) is its own oracle on
+        // stdout: native and Temen ran the same argv, so the bytes must match.
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&st.stdout),
+            "stdout must match native (no output file to compare)"
+        );
+        eprintln!(
+            "  nifler2: ✅ stdout BYTE-IDENTICAL to native ({} bytes) — compiled with no C \
+             compiler, running on Temen",
+            out.len()
+        );
+        return;
     }
     match posix.read_file("/out.nif") {
-        None => eprintln!("  nifler2: wrote no /out.nif"),
+        None => panic!("wrote no /out.nif, but native wrote {} bytes", want.len()),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
              no C compiler, runs on Temen",
             got.len()
         ),
-        Some(got) => eprintln!(
-            "  nifler2: DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
+        Some(got) => panic!(
+            "DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
             got.len(),
             want.len(),
             elide(&String::from_utf8_lossy(&got)),
