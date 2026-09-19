@@ -797,22 +797,40 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
 /// `sysOpen` is deliberately absent: C's `open` takes a NUL-terminated `char*` where the personality
 /// wants `(ptr, len)`, so it goes through `temen_leng`'s `POSIX_OPEN_ADAPTER` at link and arrives
 /// here as a bare `open` instead. Binding it here directly read the flags word as the path length.
-fn nim_posix_op(name: &str) -> u32 {
-    if name.starts_with("sysWrite") {
-        temen_posix::OP_WRITE
-    } else if name.starts_with("sysRead") {
-        temen_posix::OP_READ
-    } else if name.starts_with("sysClose") {
-        temen_posix::OP_CLOSE
-    } else if name.starts_with("sysLseek") {
-        temen_posix::OP_LSEEK
-    } else if name.starts_with("getcwd") {
+enum NimImport {
+    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
+    Stdout,
+    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
+    /// file operation, and binding it to the compute shim's `{ return }` stub made `quit` a no-op.
+    Exit,
+    /// The POSIX open adapter's forward: a bare `open` taking the `(ptr, len, flags)` the op wants.
+    Open,
+    /// A retained nimony syscall leaf → the matching `temen_posix` op.
+    Posix(u32),
+}
+
+/// How [`run_io_capture`] binds one retained import — and, by the same answer, whether the #760
+/// probe should call it an **unbound leaf**.
+///
+/// One table consulted by both. They were two: the binder matched on `write`/`open` and then a
+/// prefix chain, while the probe carried its own hardcoded `["sysWrite", "sysRead", "sysClose",
+/// "sysLseek", "getcwd"]`. Adding `cExitSys` to `temen_leng::POSIX_SERVED_LEAVES` taught the binder
+/// about it and left the probe reporting it unbound from its copy — the second route through one
+/// behaviour that INVARIANTS #15 is about. `None` means nothing serves this leaf.
+fn nim_import_binding(name: &str) -> Option<NimImport> {
+    Some(match name {
+        "write" => NimImport::Stdout,
+        "open" => NimImport::Open,
+        n if n.starts_with("cExitSys") => NimImport::Exit,
+        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
+        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
+        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
+        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
         // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
         // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
-        temen_posix::OP_GETCWD
-    } else {
-        panic!("unmapped nimony syscall import `{name}` — extend nim_posix_op");
-    }
+        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        _ => return None,
+    })
 }
 
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
@@ -836,27 +854,27 @@ fn run_io_capture(
     let make = std::sync::Arc::new(make);
     let mut imports = temen_run::Imports::new();
     for imp in &m.imports {
-        // The guest libc's `write` is a §3e **STREAM cap**, not a nim-name syscall leaf: it is the
-        // ordinary powerbox stdout, granted as such. Everything else is a retained nimony syscall.
-        if imp.name == "write" {
-            imports = imports.provide(imp.name.clone(), temen_run::HostCap::stdout());
-            continue;
-        }
-        // The POSIX open adapter's forward (`temen_leng::POSIX_OPEN_ADAPTER`): a bare `open` taking
-        // the `(ptr, len, flags)` the personality's op wants.
-        if imp.name == "open" {
-            let make = std::sync::Arc::clone(&make);
-            imports = imports.provide(
-                imp.name.clone(),
-                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)()),
+        let Some(kind) = nim_import_binding(&imp.name) else {
+            panic!(
+                "unmapped nimony import `{}` — extend nim_import_binding",
+                imp.name
             );
-            continue;
-        }
-        let make = std::sync::Arc::clone(&make);
-        imports = imports.provide(
-            imp.name.clone(),
-            temen_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
-        );
+        };
+        let cap = match kind {
+            NimImport::Stdout => temen_run::HostCap::stdout(),
+            // `quit` bottoms out here (`quit` -> `cExit` -> `cExitSys`, all `noreturn`), so this
+            // must be a capability that actually ends the program.
+            NimImport::Exit => temen_run::HostCap::exit(),
+            NimImport::Open => {
+                let make = std::sync::Arc::clone(&make);
+                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+            }
+            NimImport::Posix(op) => {
+                let make = std::sync::Arc::clone(&make);
+                temen_run::HostCap::host_proc(op, move || (*make)())
+            }
+        };
+        imports = imports.provide(imp.name.clone(), cap);
     }
     for (path, bytes) in seed {
         posix.write_file(path, bytes);
@@ -2235,7 +2253,14 @@ fn nifler2_links_through_leng() {
         eprintln!("SKIP nifler2_links_through_leng ({src:?} absent — v0.6.2+ only)");
         return;
     }
-    let out = std::env::temp_dir().join("nifler2_spike_bin");
+    // One output path **per source**. A shared path is a stale-oracle trap: `nimony c` is cached, so
+    // a probe whose binary is already up to date rewrites nothing, and the native side of the
+    // comparison is then whichever program the *previous* probe built — a hexer run leaves a hexer
+    // binary that the next nifler2 run happily diffs against. Name the binary after the source.
+    let out = std::env::temp_dir().join(format!(
+        "nifler2_spike_bin_{}",
+        rel.replace(['/', '\\', '.'], "_")
+    ));
     let started = std::time::Instant::now();
     let st = Command::new("nimony")
         .args([
@@ -2259,35 +2284,89 @@ fn nifler2_links_through_leng() {
 
     let mut mods = Vec::new();
     collect_x_nif(&root.join("nimcache"), &mut mods);
-    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so a previous
-    // `--isMain` build's program module is still sitting there — two `main`s, and the link fails
-    // `DuplicateSymbol("main")`. Keep the one this build just wrote (its `.x.nif` is the newest of
-    // them); every other module in the closure is a library module with no `main`.
+    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so it accumulates the
+    // modules of **every** program ever built there — a previous `nifler2` build's as well as this
+    // one's. Sweeping all of them in is wrong twice over: two `main`s fail the link
+    // `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
+    // cross-module references need not resolve in *this* program.
+    //
+    // Take the program's own module set instead of patching the symptom. nimony writes one
+    // `<stem>.c` per module into the program's own build directory (`nimcache/<program stem>/`), so
+    // that directory's `.c` stems are exactly this program's closure. Restricting to it drops the
+    // foreign modules *and* their `main`s together — one rule instead of a duplicate-`main` hack
+    // that left the rest of the foreign program in the link.
+    //
+    // The program module is identified as before (the newest `.x.nif` carrying `main`), because the
+    // build directory is named after it. If that directory is absent — an older toolchain, or a
+    // layout change — fall back to keeping the newest `main` and sweeping the rest, which is what
+    // this did before and is merely imprecise rather than wrong.
     let mains: Vec<usize> = mods
         .iter()
         .enumerate()
         .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
         .map(|(i, _)| i)
         .collect();
-    if mains.len() > 1 {
-        let keep = *mains
-            .iter()
-            .max_by_key(|&&i| {
-                let stem = &mods[i].0;
-                x_nif_mtime(&root.join("nimcache"), stem)
+    if !mains.is_empty() {
+        // Which of them is *this* program? Not the newest: `nimony c` is cached, so a run whose
+        // output is already up to date rewrites nothing and mtime then names whichever program was
+        // built last — the hexer probe and the nifler2 probe would both select hexer, and the
+        // nifler2 run would silently link hexer's closure. A program module's own `.x.nif` carries
+        // its source path in its line info (60 hits for `src/hexer/hexer.nim` in hexer's, 0 in every
+        // other program module's), so match on the source we were actually asked to build. Fall back
+        // to newest-by-mtime when nothing matches, which is the old behaviour.
+        let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(&rel));
+        let keep = by_src.unwrap_or_else(|| {
+            *mains
+                .iter()
+                .max_by_key(|&&i| {
+                    let stem = &mods[i].0;
+                    x_nif_mtime(&root.join("nimcache"), stem)
+                })
+                .expect("a newest program module")
+        });
+        if by_src.is_none() {
+            eprintln!("  nifler2: no program module names `{rel}` — falling back to newest `main`");
+        }
+        let keep_stem = mods[keep].0.clone();
+        let build_dir = root.join("nimcache").join(&keep_stem);
+        let own: std::collections::HashSet<String> = std::fs::read_dir(&build_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                e.path()
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.strip_suffix(".c"))
+                    .map(|s| s.to_string())
             })
-            .expect("a newest program module");
-        eprintln!(
-            "  nifler2: {} program modules in the cache, keeping `{}`",
-            mains.len(),
-            mods[keep].0
-        );
-        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
-        for i in drop.into_iter().rev() {
-            mods.remove(i);
+            .collect();
+        if own.is_empty() {
+            eprintln!(
+                "  nifler2: no build dir for `{keep_stem}` — keeping newest `main` only ({} program modules)",
+                mains.len()
+            );
+            let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+            for i in drop.into_iter().rev() {
+                mods.remove(i);
+            }
+        } else {
+            let before = mods.len();
+            mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
+            eprintln!(
+                "  nifler2: program `{keep_stem}` owns {} modules; dropped {} foreign of {before}",
+                own.len(),
+                before - mods.len()
+            );
         }
     }
     eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
+    if let Ok(want) = std::env::var("NIM_CLOSURE_HAS") {
+        eprintln!(
+            "  nifler2: closure contains `{want}`: {}",
+            mods.iter().any(|(s, _)| *s == want)
+        );
+    }
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
@@ -2317,14 +2396,8 @@ fn nifler2_links_through_leng() {
                 .imports
                 .iter()
                 .map(|i| i.name.as_str())
-                .filter(|n| {
-                    // `write` is the guest libc's §3e STREAM cap; `open` is the POSIX open adapter's
-                    // forward. The rest are nimony syscall leaves. All bound at instantiation.
-                    !["write", "open"].contains(n)
-                        && !["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]
-                            .iter()
-                            .any(|p| n.starts_with(p))
-                })
+                // Ask the binder, rather than keeping a second list of what it binds.
+                .filter(|n| nim_import_binding(n).is_none())
                 .collect();
             eprintln!(
                 "  nifler2: imports: {:?}",
@@ -2372,6 +2445,25 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mk oracle dir");
     std::fs::write(dir.join("in.nim"), SRC).expect("write in.nim");
+    // Extra inputs, so a phase can be driven over **real work** rather than an argv it rejects.
+    // `NIM_NIFLER2_SEED=/a.nif=/host/a.nif,/b.nif=…` seeds each into the guest memfs *and* drops it
+    // in the oracle's cwd under the same basename, so both sides read identical bytes. Without it a
+    // hexer/nimsem/lengc probe only ever compares a usage message: proof that the phase starts and
+    // exits like native, not that it compiles like native.
+    let extra: Vec<(String, Vec<u8>)> = std::env::var("NIM_NIFLER2_SEED")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let (guest, host) = e.split_once('=').expect("seed is guestpath=hostpath");
+            let bytes = std::fs::read(host).unwrap_or_else(|e| panic!("read seed {host}: {e}"));
+            let base = std::path::Path::new(guest)
+                .file_name()
+                .expect("seed needs a basename");
+            std::fs::write(dir.join(base), &bytes).expect("write oracle seed");
+            (guest.to_string(), bytes)
+        })
+        .collect();
     // The oracle runs the **same argv** the guest gets (minus `argv[0]`), so a probe program with no
     // arguments is its own oracle on stdout and `nifler2 parse` is one on the written file.
     let argv: Vec<String> = std::env::var("NIM_NIFLER2_ARGS")
@@ -2379,8 +2471,20 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         .split_whitespace()
         .skip(1)
         .map(|a| {
-            a.replace("/in.nim", "in.nim")
-                .replace("/out.nif", "out.nif")
+            // The guest reads absolute memfs paths; the oracle runs in a real cwd. Rewrite each
+            // seeded path to its basename so both sides name the same bytes.
+            let mut a = a
+                .replace("/in.nim", "in.nim")
+                .replace("/out.nif", "out.nif");
+            for (guest, _) in &extra {
+                if let Some(base) = std::path::Path::new(guest)
+                    .file_name()
+                    .and_then(|b| b.to_str())
+                {
+                    a = a.replace(guest.as_str(), base);
+                }
+            }
+            a
         })
         .collect();
     let st = Command::new(native_bin)
@@ -2394,7 +2498,9 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             String::from_utf8_lossy(&st.stderr)
         );
     }
-    let want = std::fs::read(dir.join("out.nif")).unwrap_or_default();
+    // Which file the run is expected to produce — `out.nif` unless the caller's argv names another.
+    let out_name = std::env::var("NIM_NIFLER2_OUT").unwrap_or_else(|_| "out.nif".into());
+    let want = std::fs::read(dir.join(&out_name)).unwrap_or_default();
     if !st.stdout.is_empty() {
         eprintln!(
             "  nifler2: native stdout {:?}",
@@ -2419,7 +2525,9 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             .collect(),
         ..RunConfig::default()
     };
-    let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &[("/in.nim", SRC.as_bytes())]);
+    let mut seeds: Vec<(&str, &[u8])> = vec![("/in.nim", SRC.as_bytes())];
+    seeds.extend(extra.iter().map(|(g, b)| (g.as_str(), b.as_slice())));
+    let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &seeds);
     let out = posix.stdout();
     if !out.is_empty() {
         eprintln!(
@@ -2427,18 +2535,34 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             elide(&String::from_utf8_lossy(&out))
         );
     }
+    // **Assert**, do not narrate. Every arm here used to be an `eprintln!`, `DIFFERS` included, so
+    // the run reported success whatever came out — the headline "byte-identical" line was a print
+    // statement and the probe could not fail on a wrong answer. A comparison that cannot fail is not
+    // a comparison.
     if want.is_empty() {
-        return; // a probe run: stdout above is the whole comparison
+        // A program invoked with no file to write (`hexer` with no args) is its own oracle on
+        // stdout: native and Temen ran the same argv, so the bytes must match.
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&st.stdout),
+            "stdout must match native (no output file to compare)"
+        );
+        eprintln!(
+            "  nifler2: ✅ stdout BYTE-IDENTICAL to native ({} bytes) — compiled with no C \
+             compiler, running on Temen",
+            out.len()
+        );
+        return;
     }
-    match posix.read_file("/out.nif") {
-        None => eprintln!("  nifler2: wrote no /out.nif"),
+    match posix.read_file(&format!("/{out_name}")) {
+        None => panic!("wrote no /out.nif, but native wrote {} bytes", want.len()),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
              no C compiler, runs on Temen",
             got.len()
         ),
-        Some(got) => eprintln!(
-            "  nifler2: DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
+        Some(got) => panic!(
+            "DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
             got.len(),
             want.len(),
             elide(&String::from_utf8_lossy(&got)),

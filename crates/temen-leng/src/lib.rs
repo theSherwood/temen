@@ -236,6 +236,7 @@ fn translate_object_module(
     c_global_defs: &[String],
     c_global_aliases: &[(String, String)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
+    pooled_funcrefs: &crate::dethash::HashSet<String>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
@@ -254,6 +255,11 @@ fn translate_object_module(
     }
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
+    // The whole-program funcref pool, adopted before any body is emitted: a proc *this* unit
+    // defines must carry the funcref ABI's leading `$sp` when **any** unit funcrefs it, and only the
+    // pool can say so. `module_with_names` runs `compute_funcref_targets` (the locally-visible uses)
+    // first, so this widens that set rather than replacing it.
+    t.import_funcref_targets(&root, stem, pooled_funcrefs);
     let (text, export_names) = match sel {
         Select::Whole => t.module_with_names(&root)?,
         Select::Names(names) => {
@@ -312,6 +318,8 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         None,
+        // A standalone object has no siblings, so no cross-unit funcref can exist to pool.
+        &crate::dethash::HashSet::default(),
     )?))
 }
 
@@ -333,6 +341,8 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         None,
+        // A standalone object has no siblings, so no cross-unit funcref can exist to pool.
+        &crate::dethash::HashSet::default(),
     )?))
 }
 
@@ -620,6 +630,20 @@ fn link_selected_with_extra(
             &pooled_c_global_defs,
         ));
     }
+    // **Funcref-target pool**, built after `pooled_proc_params` because that table is what tells a
+    // unit whether an atom in value position names a sibling's proc. Whole-program by necessity: the
+    // funcref ABI gives a target a leading `$sp`, and the unit that *defines* a proc cannot see that
+    // a *sibling* takes its address — `funcref_targets`' own doc has said "pooled across the link"
+    // since it was written, but nothing pooled it. Feeds both the frame pre-scan below and the real
+    // translation, which must agree on every proc's arity.
+    let mut pooled_funcrefs: crate::dethash::HashSet<String> = crate::dethash::HashSet::default();
+    for ((stem, _, _), root) in units.iter().zip(&roots) {
+        pooled_funcrefs.extend(translate::Translator::export_funcref_uses(
+            root,
+            stem,
+            &pooled_proc_params,
+        )?);
+    }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
     for (stem, src, _) in units {
@@ -629,6 +653,8 @@ fn link_selected_with_extra(
             stem,
             &pooled,
             &pooled_sret,
+            &pooled_proc_params,
+            &pooled_funcrefs,
         )?);
     }
     // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
@@ -697,6 +723,7 @@ fn link_selected_with_extra(
                 &pooled_c_global_defs,
                 &pooled_c_global_aliases,
                 tls_layout.as_ref(),
+                &pooled_funcrefs,
             )?))
         })
         .collect::<Result<_, LengError>>()?;
@@ -1487,12 +1514,20 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
     compute_shim_unit(nim_compute_exports(units)?.0)
 }
 
-/// Bottom-edge leaves the **POSIX personality** serves for real, so [`nim_posix_runtime`] leaves them
-/// to the host instead of binding [`POWERBOX_COMPUTE_SHIM`]'s fail-closed stub. Each one's C ABI is
-/// what the matching `temen_posix` op already takes, so no adapter stands between them — a leaf that
-/// *does* need reconciling (a NUL-terminated path where the op wants `(ptr, len)`) belongs in
-/// [`POSIX_OPEN_ADAPTER`] instead, not here.
-const POSIX_SERVED_LEAVES: &[&str] = &["getcwd"];
+/// Bottom-edge leaves the **host** serves for real, so [`nim_posix_runtime`] leaves them to it
+/// instead of binding [`POWERBOX_COMPUTE_SHIM`]'s stub. Each is passed through with its C ABI
+/// unchanged — a leaf that needs reconciling (a NUL-terminated path where the op wants `(ptr, len)`)
+/// belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
+///
+/// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
+///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
+///   exists.
+/// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
+///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
+///   and the program runs on past the error path that called it. nimsem printed `command expected`
+///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
+///   error path is built on `quit`, so on this route none of them ended the program.
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys"];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.
