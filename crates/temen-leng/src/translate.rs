@@ -3528,6 +3528,27 @@ impl<'a> FuncGen<'a> {
                     let idx = self.expr_typed(&a[1], ValType::I64)?;
                     Ok((self.add_scaled(pv, idx.id, esize), pdesc))
                 }
+                // An **aggregate rvalue where an lvalue is expected** — `[TagA, TagB][i]`, a
+                // constant array literal indexed by a runtime value. hexer emits it for table
+                // lookups (`lifter.nim`'s `addParLe([ParLe, ParRi][k])`). There is no existing
+                // object to take the address of, so materialize the constructor into a frame temp
+                // — the same `agg_rvalue_temp` a call argument uses, not a second route — and let
+                // `at`/`dot`/`pat` index off that address.
+                //
+                // The frame prescan already agrees: `at`/`dot`/`pat` are not build-in-place slots,
+                // so `agg_temp_bytes_at` counts a constructor under them as materializing. This
+                // arm makes emission match the reservation that was already being made.
+                //
+                // Read-only by construction: an array literal is not an assignable location in
+                // Nim, so nimony never emits one as an assignment target. A scalar-typed
+                // constructor is not an aggregate, so it still fail-closes below.
+                t @ Some("oconstr" | "aconstr") => match self.agg_rvalue_temp(node)? {
+                    Some(materialized) => Ok(materialized),
+                    None => Err(LengError::Unsupported(format!(
+                        "lvalue `{}` of non-aggregate type",
+                        t.unwrap_or("?")
+                    ))),
+                },
                 other => Err(LengError::Unsupported(format!(
                     "lvalue `{}`",
                     other.unwrap_or("<headless>")
