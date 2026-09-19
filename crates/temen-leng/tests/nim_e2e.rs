@@ -2488,18 +2488,34 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             elide(&String::from_utf8_lossy(&out))
         );
     }
+    // **Assert**, do not narrate. Every arm here used to be an `eprintln!`, `DIFFERS` included, so
+    // the run reported success whatever came out — the headline "byte-identical" line was a print
+    // statement and the probe could not fail on a wrong answer. A comparison that cannot fail is not
+    // a comparison.
     if want.is_empty() {
-        return; // a probe run: stdout above is the whole comparison
+        // A program invoked with no file to write (`hexer` with no args) is its own oracle on
+        // stdout: native and Temen ran the same argv, so the bytes must match.
+        assert_eq!(
+            String::from_utf8_lossy(&out),
+            String::from_utf8_lossy(&st.stdout),
+            "stdout must match native (no output file to compare)"
+        );
+        eprintln!(
+            "  nifler2: ✅ stdout BYTE-IDENTICAL to native ({} bytes) — compiled with no C \
+             compiler, running on Temen",
+            out.len()
+        );
+        return;
     }
     match posix.read_file("/out.nif") {
-        None => eprintln!("  nifler2: wrote no /out.nif"),
+        None => panic!("wrote no /out.nif, but native wrote {} bytes", want.len()),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
              no C compiler, runs on Temen",
             got.len()
         ),
-        Some(got) => eprintln!(
-            "  nifler2: DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
+        Some(got) => panic!(
+            "DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
             got.len(),
             want.len(),
             elide(&String::from_utf8_lossy(&got)),
