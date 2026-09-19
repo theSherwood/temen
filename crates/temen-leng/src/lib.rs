@@ -248,6 +248,12 @@ fn translate_object_module(
             (text, names.iter().map(|s| s.to_string()).collect())
         }
     };
+    // #1593: the same type can be laid out by the unit that declares it *and* by the pooled table
+    // every other unit imports. A disagreement between the two is invisible downstream — both sides
+    // verify, they just read different bytes — so dump both on request and compare.
+    if let Ok(want) = std::env::var("TEMEN_LENG_DUMP_LAYOUT") {
+        t.dump_layouts(&want, stem);
+    }
     let mut module = temen_text::parse_module(&text).map_err(|e| {
         LengError::Malformed(format!(
             "emitted IR failed to parse: {e:?}\n--- IR ---\n{text}"
@@ -508,30 +514,49 @@ fn link_selected_with_extra(
 ) -> Result<Module, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
     // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
-    // module), and the base is inlined into the derived layout at translate time — so a single
-    // per-module pass exports a lossy layout (missing every inherited field) whenever the base is
-    // cross-module. Pool to a **fixpoint** instead: each round re-exports with the prior round's
-    // pool visible, so a chain of any depth is fully inlined. Inlining only *adds* fields, so the
-    // summed field count is monotonic and converges; the unit count bounds the max chain depth.
+    // module), and a field can *be* an object another unit defines — and both are resolved at
+    // translate time, so a single per-module pass exports a lossy layout: missing every inherited
+    // field when the base is cross-module, and sizing every cross-module aggregate *field* as the
+    // scalar placeholder `scan_lenient` falls back to. Pool to a **fixpoint** instead: each round
+    // re-exports with the prior round's pool visible, so a chain of any depth resolves.
+    //
+    // **The signal is the whole table, not the field count** (#1593). Inlining a base adds fields, so
+    // a field-count comparison sees it; a round that only corrects a *size* does not change the count
+    // at all. `Parser { lex: Lexer; tok: Token; dest: TokenBuf }` stopped one round early with its
+    // three aggregate fields still sized as 8-byte placeholders: `lex` at +0 and `tok` at +60 when
+    // `Lexer` is 76 bytes, so the fields **overlapped** and writing one clobbered the next. Every unit
+    // agreed on that layout — it is not a cross-unit disagreement — which is why nothing downstream
+    // could see it, and why nifler2 parsed into a `Parser` whose fields scribbled over each other.
+    // Comparing the tables directly costs one extra round and cannot miss a change of either kind.
     let roots: Vec<_> = units
         .iter()
         .map(|(_, src, _)| nif::parse(src).map_err(LengError::Parse))
         .collect::<Result<_, _>>()?;
     let mut pooled: Vec<(String, translate::Layout)> = Vec::new();
-    let mut prev_fields = usize::MAX;
-    for _ in 0..=units.len() {
+    let mut converged = false;
+    // Each round resolves one more level of nesting/inheritance, so the bound is the depth of the
+    // deepest chain — at most one link per unit, plus a round to observe the fixed point.
+    for _ in 0..=units.len() + 1 {
         let mut next: Vec<(String, translate::Layout)> = Vec::new();
         for ((stem, _, _), root) in units.iter().zip(&roots) {
             next.extend(translate::Translator::export_types_pooled(
                 root, stem, &pooled,
             )?);
         }
-        let fields: usize = next.iter().map(|(_, l)| l.field_count()).sum();
-        pooled = next;
-        if fields == prev_fields {
+        if next == pooled {
+            converged = true;
             break;
         }
-        prev_fields = fields;
+        pooled = next;
+    }
+    // Fail closed rather than compile against a layout table still in motion: every offset in the
+    // program is read off this, and a stale one is silent memory corruption, not a link error.
+    if !converged {
+        return Err(LengError::Unsupported(format!(
+            "cross-module type layouts did not converge in {} rounds — a layout that is still \
+             changing would place fields at offsets the defining unit disagrees with",
+            units.len() + 2
+        )));
     }
     // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
     // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
@@ -587,6 +612,18 @@ fn link_selected_with_extra(
             stem,
             &pooled_c_global_defs,
         ));
+    }
+    if let Ok(want) = std::env::var("TEMEN_LENG_DUMP_LAYOUT") {
+        for (name, layout) in &pooled {
+            if name.contains(&want) {
+                if let translate::Layout::Object { fields, size } = layout {
+                    eprintln!("[layout POOLED] {name}: object size={size}");
+                    for (f, off, d) in fields {
+                        eprintln!("[layout POOLED]   +{off:<4} {f} : {d:?}");
+                    }
+                }
+            }
+        }
     }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).

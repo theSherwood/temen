@@ -323,7 +323,7 @@ pub(crate) struct FnPtrSig {
 
 /// What a computed lvalue address points at — a scalar (with load/store width) or a named
 /// aggregate (whose fields/elements are reached by further `dot`/`at`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TyDesc {
     /// A full-width scalar: `i32`/`i64`/`f32`/`f64`, loaded/stored with the plain `iN.load`/`store`.
     Scalar(ValType),
@@ -366,7 +366,7 @@ impl TyDesc {
 }
 
 /// The in-memory layout of a named aggregate type (`(type :Name … Body)`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Layout {
     /// `(object … (fld :f … T)*)` — fields packed at natural size (consistent within temen-leng;
     /// C-ABI/SysV offsets are a later refinement for host interop).
@@ -380,18 +380,6 @@ pub(crate) enum Layout {
         elem_size: u64,
         size: u64,
     },
-}
-
-impl Layout {
-    /// Number of laid-out fields (0 for an array) — the convergence signal for the linker's
-    /// type-pooling fixpoint: inlining a cross-module base only *adds* fields, so the summed field
-    /// count grows monotonically until every inheritance chain is fully resolved.
-    pub(crate) fn field_count(&self) -> usize {
-        match self {
-            Layout::Object { fields, .. } => fields.len(),
-            Layout::Array { .. } => 0,
-        }
-    }
 }
 
 pub(crate) struct Translator {
@@ -1532,6 +1520,33 @@ impl Translator {
                 Some(_) => Ok(TyDesc::Scalar(ValType::I64)),
                 None => Err(LengError::Malformed("expected a type".into())),
             },
+        }
+    }
+
+    /// **Layout dump** (`TEMEN_LENG_DUMP_LAYOUT=<substring>`): print every resolved type whose name
+    /// contains `want`, with its size and each field's offset and descriptor, tagged with the unit
+    /// that computed it. A cross-unit layout disagreement (#1593) is invisible in the emitted IR —
+    /// both sides verify, they just read different bytes — so the only way to see one is to put the
+    /// two units' tables side by side.
+    pub fn dump_layouts(&self, want: &str, tag: &str) {
+        let mut names: Vec<&String> = self.types.keys().filter(|n| n.contains(want)).collect();
+        names.sort();
+        for n in names {
+            match &self.types[n] {
+                Layout::Object { fields, size } => {
+                    eprintln!("[layout {tag}] {n}: object size={size}");
+                    for (f, off, d) in fields {
+                        eprintln!("[layout {tag}]   +{off:<4} {f} : {d:?}");
+                    }
+                }
+                Layout::Array {
+                    elem,
+                    elem_size,
+                    size,
+                } => eprintln!(
+                    "[layout {tag}] {n}: array size={size} elem_size={elem_size} elem={elem:?}"
+                ),
+            }
         }
     }
 
