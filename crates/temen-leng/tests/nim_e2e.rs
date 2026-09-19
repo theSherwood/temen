@@ -14,43 +14,7 @@
 
 use std::process::Command;
 use temen_interp::Value;
-use temen_ir::{LinkUnit, Module};
-
-/// The runtime shim's function indices, keyed by the C symbol each bottom-edge import lowers to.
-/// Longest-prefix wins so `atomicCompareExchangeN` is not shadowed by a shorter atomic name.
-const SHIM_BINDINGS: &[(&str, u32)] = &[
-    ("cExitSys", 0),
-    ("cGetpid", 1),
-    ("cKill", 2),
-    ("c_memcpy", 3),
-    ("c_memcmp", 4),
-    ("c_memset", 5),
-    ("mmap", 6),
-    ("atomicLoadN", 7),
-    ("atomicStoreN", 8),
-    ("atomicCompareExchangeN", 9),
-    ("atomicExchangeN", 10),
-    ("atomicAddFetch", 11),
-    ("atomicSubFetch", 12),
-    ("bswap64", 13),
-    ("ctz64", 14),
-    ("clz64", 15),
-    ("cWriteErr", 16),
-    ("dlopen", 17),
-    ("dlclose", 18),
-    ("dlsym", 19),
-];
-
-/// The shim function bound to a **bottom-edge C** import, or `None` for a cross-module nimony symbol
-/// (`ini`, a proc defined in a sibling module) — those resolve against the other link units, not the
-/// runtime shim. Longest-prefix wins so `atomicCompareExchangeN` isn't shadowed by a shorter atomic.
-fn shim_index(name: &str) -> Option<u32> {
-    SHIM_BINDINGS
-        .iter()
-        .filter(|(p, _)| name.starts_with(p))
-        .max_by_key(|(p, _)| p.len())
-        .map(|(_, i)| *i)
-}
+use temen_ir::Module;
 
 /// Locate the nimony toolchain. Honours `NIMONY_BIN`/`NIM_BIN` (directories holding `nimony`/`nim`),
 /// else looks for `nimony` on `PATH`. Returns the `PATH` value to run the compiler under (nimony
@@ -163,38 +127,6 @@ fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
 /// modules actually reference — discovered from each module's compiled object, so the mangled atomic
 /// symbol names never have to be hard-coded.
 fn link_with_runtime(mods: &[(String, String)]) -> Module {
-    // Discover the real import names from the **system module** only (stem `sysv…`). Every
-    // bottom-edge C import (`mmap`, `memcpy`, the atomics, …) originates there, and — unlike a
-    // program module that references a cross-module aggregate type such as `string.0.sysv…` — the
-    // system module is self-contained, so it compiles standalone (no pooled types) for discovery.
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_encode::decode_unit(
-            &temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-                .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
-        )
-        .expect("decode object");
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    // Bind only the bottom-edge C imports to the shim; cross-module nimony imports (`ini`, sibling
-    // procs) are left for the other link units to resolve.
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
-
     // Order the **program module first** (the `system` module — stem `sysv…` — last), the convention
     // `link` builds on: the first unit's first proc is func 0, the natural entry, and the C `main`/init
     // chain lives in the program module. `collect_x_nif`'s directory order is filesystem-dependent, so
@@ -206,6 +138,9 @@ fn link_with_runtime(mods: &[(String, String)]) -> Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
+    // The compute-shim link unit comes from the library's own leaf table — one route through the
+    // bottom edge. A test-local copy of that table went stale the moment a leaf was added.
+    let runtime = temen_leng::nim_compute_shim_unit(&units).expect("compute shim unit");
     let m = temen_leng::link_whole_with_runtime(&units, vec![runtime])
         .unwrap_or_else(|e| panic!("link with runtime: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -517,6 +452,82 @@ fn nim_write_runs_under_the_powerbox() {
     );
 }
 
+/// **#763 — the guest can read its own command line.** The synthesized powerbox `_start`
+/// ([`temen_leng`'s `synth_start_unit`]) used to hand `main` a literal `argc = 0` and the fixed
+/// empty `argv`/`envp` vectors, so *every* nim program on this route saw no arguments however the
+/// host was invoked: nimony's `std/cmdline` reads the `cmdCount`/`cmdLine` globals the generated
+/// `main` parks its parameters in, so `paramCount()` returned `-1` and `paramStr(i)` returned `""`.
+/// That silently capped the route at argv-free programs — a real tool (`nifler2 parse in out`) does
+/// nothing without one.
+///
+/// `_start` now parses the §3e args buffer the host seeds at `module_args_base` into real
+/// `argv[]`/`envp[]` arrays. The gate is end-to-end through the standard powerbox: hand
+/// `run_powerbox_cfg` an argv and assert the guest prints back what it was given, `argv[0]`
+/// included. `getEnv` covers the `envp[]` half — the same walk (#1422) that must never see a NULL
+/// vector pointer.
+#[test]
+fn nim_reads_its_argv_and_env_under_the_powerbox() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nimport std/cmdline\nimport std/envvars\n\
+         write(stdout, $paramCount())\n\
+         for i in 0..paramCount():\n\x20 write(stdout, \"|\")\n\x20 write(stdout, paramStr(i))\n\
+         write(stdout, \"|\")\nwrite(stdout, getEnv(\"TEMEN_ARGV_PROBE\"))\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let run = temen_run::run_powerbox_cfg(
+        &m,
+        &[],
+        &[
+            b"prog".as_slice(),
+            b"parse".as_slice(),
+            b"/in.nim".as_slice(),
+        ],
+        &[b"TEMEN_ARGV_PROBE=seen".as_slice()],
+        None,
+        temen_run::Quota::default(),
+    )
+    .unwrap_or_else(|e| panic!("run_powerbox_cfg: {e}"));
+    // `paramCount()` is `argc - 1` (nim excludes `argv[0]`), and `paramStr(0)` is the program name.
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "2|prog|parse|/in.nim|seen",
+        "the guest sees the argv and envp the host seeded"
+    );
+}
+
+/// An argv-free run must stay exactly as it was: the host seeds no buffer, `_start` reads the zeroed
+/// region back as `argc = envc = 0`, and builds the one-entry NULL-terminated vectors by the same
+/// code path. This is why there is no second, no-args entry to keep in step (INVARIANTS #15).
+#[test]
+fn nim_with_no_argv_sees_an_empty_command_line() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\nimport std/cmdline\nwrite(stdout, $paramCount())\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let m =
+        temen_leng::link_nim_powerbox(&units, None).unwrap_or_else(|e| panic!("bridge link: {e}"));
+    let run = temen_run::run_powerbox(&m, &[]).unwrap_or_else(|e| panic!("run_powerbox: {e}"));
+    assert_eq!(run.stdout, b"-1", "`argc = 0` ⇒ nim's `paramCount()` is -1");
+}
+
 /// **#1400 — a cross-module call widens narrow args to the callee's param type.** `std/strutils`
 /// (like `std/unicode` and `std/times`) has a proc that passes a narrow (`i32`) result to a
 /// cross-module callee whose real parameter is `int` (`i64`). Pre-fix, `call_import` derived the
@@ -732,36 +743,17 @@ fn nim_powerbox_seeds_heap_words_to_window_top() {
 fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // Bind the pure-compute bottom edge to the shim (as `link_with_runtime`), but via the *manifest*
     // link so the raw-syscall leaves survive as host-bound imports rather than fail-closing.
-    let mut import_names: Vec<String> = Vec::new();
-    for (stem, src) in mods.iter().filter(|(stem, _)| stem.starts_with("sysv")) {
-        let obj = temen_encode::decode_unit(
-            &temen_leng::compile_whole_object(&temen_leng::WholeModule { stem, src })
-                .unwrap_or_else(|e| panic!("compile {stem}: {e}")),
-        )
-        .expect("decode object");
-        for imp in &obj.imports {
-            if import_names.iter().all(|n| n != &imp.name) {
-                import_names.push(imp.name.clone());
-            }
-        }
-    }
-    const SHIM: &str = include_str!("../src/powerbox_compute_shim.temt.txt");
-    let shim = temen_text::parse_module(SHIM).expect("runtime shim parses");
-    let exports: Vec<(String, u32)> = import_names
-        .iter()
-        .filter_map(|n| shim_index(n).map(|i| (n.clone(), i)))
-        .collect();
-    let runtime = LinkUnit {
-        module: shim,
-        exports,
-        ..Default::default()
-    };
     let mut ordered: Vec<&(String, String)> = mods.iter().collect();
     ordered.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
     let units: Vec<temen_leng::WholeModule> = ordered
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
+    // The **POSIX-personality runtime**: the true syscalls stay retained imports for the personality
+    // to bind by name below, so this deliberately does not take `nim_powerbox_runtime`'s stdout-only
+    // adapter. It is the same runtime the file-I/O and nifler2 routes take — one route through this
+    // bottom edge, whether the program prints or also opens files.
+    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
     // Link with a synthesized **powerbox `_start`** at function 0: it reads the post-link data-stack
     // base (`data.top` → `powerbox_entry_sp`, page-aligned above the globals) and calls the C-shaped
     // `main($sp, argc, argv, envp)` with `argc/argv/envp = 0` — a real powerbox entry, not a
@@ -769,7 +761,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
     // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
     // index.
-    let m = temen_leng::link_whole_powerbox_manifest(&units, vec![runtime])
+    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
         .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
@@ -786,8 +778,9 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // (`instantiate_with_imports` → `Instance::run`), not a hand-wired host-binding harness. Each
     // engine gets its own fresh personality (separate fd table + stdout buffer); a divergence in the
     // two captured streams is a real engine bug on the W3 syscall seam.
-    let interp_out = run_io_capture(&m, temen_run::Backend::TreeWalk);
-    let jit_out = run_io_capture(&m, temen_run::Backend::Jit);
+    let cfg = temen_run::RunConfig::default();
+    let interp_out = run_io_capture(&m, temen_run::Backend::TreeWalk, &cfg, &[]).stdout();
+    let jit_out = run_io_capture(&m, temen_run::Backend::Jit, &cfg, &[]).stdout();
     assert_eq!(
         interp_out, jit_out,
         "§9 interp/JIT parity on the POSIX syscall I/O seam"
@@ -800,17 +793,23 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
 /// not the C name, so the powerbox's by-C-name resolver doesn't reach it — this is the small
 /// nimony→personality name map that lets the retained leaves bind to `temen_posix`'s fd-based ops
 /// (whose signatures match the nim ABI exactly).
+///
+/// `sysOpen` is deliberately absent: C's `open` takes a NUL-terminated `char*` where the personality
+/// wants `(ptr, len)`, so it goes through `temen_leng`'s `POSIX_OPEN_ADAPTER` at link and arrives
+/// here as a bare `open` instead. Binding it here directly read the flags word as the path length.
 fn nim_posix_op(name: &str) -> u32 {
     if name.starts_with("sysWrite") {
         temen_posix::OP_WRITE
     } else if name.starts_with("sysRead") {
         temen_posix::OP_READ
-    } else if name.starts_with("sysOpen") {
-        temen_posix::OP_OPEN
     } else if name.starts_with("sysClose") {
         temen_posix::OP_CLOSE
     } else if name.starts_with("sysLseek") {
         temen_posix::OP_LSEEK
+    } else if name.starts_with("getcwd") {
+        // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
+        // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
+        temen_posix::OP_GETCWD
     } else {
         panic!("unmapped nimony syscall import `{name}` — extend nim_posix_op");
     }
@@ -818,10 +817,17 @@ fn nim_posix_op(name: &str) -> u32 {
 
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
 /// embedding (`Instance`), with every retained nim-name syscall import bound to a single shared
-/// **POSIX personality**. Returns the bytes the guest `write`-to-fd-1'd (`Posix::stdout`). The
-/// program uses no posix `malloc`/`mmap` (its own runtime shim serves those), so the personality's
-/// heap arena is unused and passed empty.
-fn run_io_capture(m: &Module, backend: temen_run::Backend) -> Vec<u8> {
+/// **POSIX personality**. Returns the personality itself, so the caller reads back whatever it cares
+/// about — the bytes the guest `write`-to-fd-1'd (`Posix::stdout`), or a file it wrote to the memfs.
+/// `seed` stages the memfs before `_start` (the files the guest will `open`), and `config` carries
+/// the argv/env the guest is run with. The program uses no posix `malloc`/`mmap` (its own runtime
+/// shim serves those), so the personality's heap arena is unused and passed empty.
+fn run_io_capture(
+    m: &Module,
+    backend: temen_run::Backend,
+    config: &temen_run::RunConfig,
+    seed: &[(&str, &[u8])],
+) -> temen_posix::Posix {
     // One personality shared across every bound name (one fd table, one stdout buffer): the factory
     // closes over a single `inner`, so each per-name grant re-mints a handler over the same state.
     // `temen_posix::cap` hands back an opaque `impl Fn` (no `Clone`), so wrap it in an `Arc` and share
@@ -830,17 +836,46 @@ fn run_io_capture(m: &Module, backend: temen_run::Backend) -> Vec<u8> {
     let make = std::sync::Arc::new(make);
     let mut imports = temen_run::Imports::new();
     for imp in &m.imports {
+        // The guest libc's `write` is a §3e **STREAM cap**, not a nim-name syscall leaf: it is the
+        // ordinary powerbox stdout, granted as such. Everything else is a retained nimony syscall.
+        if imp.name == "write" {
+            imports = imports.provide(imp.name.clone(), temen_run::HostCap::stdout());
+            continue;
+        }
+        // The POSIX open adapter's forward (`temen_leng::POSIX_OPEN_ADAPTER`): a bare `open` taking
+        // the `(ptr, len, flags)` the personality's op wants.
+        if imp.name == "open" {
+            let make = std::sync::Arc::clone(&make);
+            imports = imports.provide(
+                imp.name.clone(),
+                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)()),
+            );
+            continue;
+        }
         let make = std::sync::Arc::clone(&make);
         imports = imports.provide(
             imp.name.clone(),
             temen_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
         );
     }
+    for (path, bytes) in seed {
+        posix.write_file(path, bytes);
+    }
     let inst = temen_run::instantiate_with_imports(m.clone(), imports)
         .unwrap_or_else(|e| panic!("instantiate manifest module: {e}"));
-    inst.run(backend, &temen_run::RunConfig::default())
-        .unwrap_or_else(|e| panic!("run `_start` on {backend:?}: {e}"));
-    posix.stdout()
+    if let Err(e) = inst.run(backend, config) {
+        // A guest that wrote before it died names its own problem — the plain `?` dropped that with
+        // the personality. Print what it managed to say, then fail.
+        let out = posix.stdout();
+        if !out.is_empty() {
+            eprintln!(
+                "  guest stdout before the trap: {:?}",
+                elide(&String::from_utf8_lossy(&out))
+            );
+        }
+        panic!("run `_start` on {backend:?}: {e}");
+    }
+    posix
 }
 
 /// Richer end-to-end I/O over the same chain — output that actually *formats*, exercising the
@@ -2074,4 +2109,340 @@ fn elide(s: &str) -> String {
         return s.to_string();
     }
     format!("{}…{}", &s[..100], &s[s.len() - 40..])
+}
+
+/// The modification time of `<stem>.x.nif` under `dir` (searched recursively), or the epoch when it
+/// cannot be read — how the spike tells this build's program module from a previous one's left in the
+/// shared `nimcache`.
+#[cfg(test)]
+fn x_nif_mtime(dir: &std::path::Path, stem: &str) -> std::time::SystemTime {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return std::time::UNIX_EPOCH;
+    };
+    let mut best = std::time::UNIX_EPOCH;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            best = best.max(x_nif_mtime(&p, stem));
+        } else if p.file_name().and_then(|n| n.to_str()) == Some(&format!("{stem}.x.nif")) {
+            if let Ok(t) = e.metadata().and_then(|m| m.modified()) {
+                best = best.max(t);
+            }
+        }
+    }
+    best
+}
+
+/// **A nim program reads and writes real files** through the POSIX personality — the route
+/// [`temen_leng::nim_posix_runtime`] links: the compute shim plus `POSIX_OPEN_ADAPTER`, with the
+/// syscalls left as retained manifest imports the host binds to `temen_posix`'s fd ops over an
+/// in-memory filesystem.
+///
+/// `link_nim_powerbox`'s bottom edge cannot do this at all (its `sysOpen` is a `{ return -1 }` stub
+/// for stdout-only programs), so until now nothing on the leng route had ever opened a file. This is
+/// the smallest program that does, and the gate for the ABI reconciliation the route needs: C's
+/// `open` takes a NUL-terminated `char*` where every `temen_posix` path op takes `(ptr, len)`.
+#[test]
+fn nim_reads_and_writes_files_through_the_posix_personality() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP: nimony toolchain not found (set NIMONY_BIN/NIM_BIN or install on PATH)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         try:\n\
+         \x20 let s = readFile(\"/in.txt\")\n\
+         \x20 write(stdout, s)\n\
+         \x20 writeFile(\"/out.txt\", s & \"!\")\n\
+         except:\n\
+         \x20 write(stdout, \"IO FAILED\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let posix = run_io_capture(
+        &m,
+        temen_run::Backend::TreeWalk,
+        &temen_run::RunConfig::default(),
+        &[("/in.txt", b"hello from the memfs")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&posix.stdout()),
+        "hello from the memfs",
+        "the guest read a seeded memfs file and printed it"
+    );
+    assert_eq!(
+        posix.read_file("/out.txt").as_deref(),
+        Some(b"hello from the memfs!".as_slice()),
+        "the guest wrote a new memfs file"
+    );
+}
+
+/// **#763 spike — `nifler2` through the no-C path.** Today's `nifler.temen` is built
+/// `nifler.nim → (stock nim c) → C → clang → bitcode → temen-llvm-translate`, and that clang hop is
+/// exactly the "no C compiler" dependency the capstone exists to remove. v0.6.2 ships **nifler2**,
+/// which hexer's own builder calls "a NIMONY program" — it has no stock-compiler dependency, so it
+/// can go `nimony c → Leng → link_nim_powerbox` with no C anywhere.
+///
+/// This compiles the real `src/nifler2/nifler2.nim` **in the nimony tree** (its imports are relative,
+/// so it cannot be copied into a scratch dir the way [`compile_to_leng`] does for a source string)
+/// and links its whole `.x.nif` closure. It is the same route as the corpus — `collect_x_nif` then
+/// `link_nim_powerbox` — parameterized by *where the source lives*, not a second copy of it.
+///
+/// Gated on `NIM_NIFLER2=1`: the compile is minutes and the closure is 10× the corpus, far past what
+/// the per-PR suite should carry. Reports how far it gets rather than asserting, until it lands.
+///
+/// **Where it stands:** it runs the real parse. `nifler2 parse /in.nim /out.nif` reads the seeded
+/// memfs file and writes a `/out.nif` whose header is byte-identical to the native nifler2's. The
+/// body is not: the guest trips `[Assertion Failure] beginRead with unclosed tags` and emits the
+/// header alone, where native emits the parsed `(stmts …)` — so `parseModule` leaves a tag open on
+/// Temen. That is a translator correctness bug, and this is its reproducer.
+///
+/// Getting here took three edges, each of which looked like the last one's cause: a `MemoryFault`
+/// that was really `argc = 0` (`_start` passed no argv, so `getopt()` saw nothing); then
+/// `cannot read the input file`, which was `link_nim_powerbox`'s stdout-only `sysOpen` stub; then
+/// the same message again from `getcwd` returning NULL. Two memory hypotheses were tested and
+/// disproved along the way (run window 64 MiB/256 MiB/1 GiB, heap 11 MiB → 251 MiB, all identical),
+/// which is what pointed at the bottom edge rather than the sizing.
+///
+/// **Knobs**, for bisecting from the outside: `NIM_NIFLER2_SRC` picks a different in-tree program
+/// (a smaller probe against the same parser), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SL`
+/// its window.
+#[test]
+fn nifler2_links_through_leng() {
+    if std::env::var("NIM_NIFLER2").is_err() {
+        eprintln!("SKIP nifler2_links_through_leng (set NIM_NIFLER2=1)");
+        return;
+    }
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nifler2_links_through_leng (no nimony toolchain)");
+        return;
+    };
+    // The nimony source root is the parent of the `bin/` the toolchain lives in.
+    let bin = std::env::var("NIMONY_BIN").expect("NIMONY_BIN");
+    let root = std::path::Path::new(&bin).parent().expect("nimony root");
+    // `NIM_NIFLER2_SRC` points at a different program in the same tree — a smaller probe against the
+    // same parser, compiled and linked by this one route rather than a copy of it.
+    let rel = std::env::var("NIM_NIFLER2_SRC").unwrap_or_else(|_| "src/nifler2/nifler2.nim".into());
+    let src = root.join(&rel);
+    if !src.exists() {
+        eprintln!("SKIP nifler2_links_through_leng ({src:?} absent — v0.6.2+ only)");
+        return;
+    }
+    let out = std::env::temp_dir().join("nifler2_spike_bin");
+    let started = std::time::Instant::now();
+    let st = Command::new("nimony")
+        .args([
+            "c",
+            "-d:release",
+            "--silentMake",
+            &format!("--out:{}", out.display()),
+            &rel,
+        ])
+        .current_dir(root)
+        .env("PATH", &path)
+        .output()
+        .expect("run nimony on nifler2");
+    assert!(
+        st.status.success(),
+        "nimony c nifler2 failed:\n{}\n{}",
+        String::from_utf8_lossy(&st.stdout),
+        String::from_utf8_lossy(&st.stderr)
+    );
+    eprintln!("  nifler2: nimony c ok in {}s", started.elapsed().as_secs());
+
+    let mut mods = Vec::new();
+    collect_x_nif(&root.join("nimcache"), &mut mods);
+    // The tree has one shared `nimcache` and nimony takes no `--nimcache`, so a previous
+    // `--isMain` build's program module is still sitting there — two `main`s, and the link fails
+    // `DuplicateSymbol("main")`. Keep the one this build just wrote (its `.x.nif` is the newest of
+    // them); every other module in the closure is a library module with no `main`.
+    let mains: Vec<usize> = mods
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
+        .map(|(i, _)| i)
+        .collect();
+    if mains.len() > 1 {
+        let keep = *mains
+            .iter()
+            .max_by_key(|&&i| {
+                let stem = &mods[i].0;
+                x_nif_mtime(&root.join("nimcache"), stem)
+            })
+            .expect("a newest program module");
+        eprintln!(
+            "  nifler2: {} program modules in the cache, keeping `{}`",
+            mains.len(),
+            mods[keep].0
+        );
+        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+        for i in drop.into_iter().rev() {
+            mods.remove(i);
+        }
+    }
+    eprintln!("  nifler2: {} modules in the Leng closure", mods.len());
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    // The **POSIX personality route**, not `link_nim_powerbox`: that one's `SYSCALL_ADAPTER` is a
+    // stdout-only bottom edge (`sysOpen` → `-1`, `sysRead` → `0`), so a program that reads a file
+    // cannot work on it at all. Linking against the compute shim *alone* leaves the true syscalls as
+    // retained manifest imports, which `run_io_capture` binds to `temen_posix`'s real fd ops over an
+    // in-memory filesystem — the same route `run_io_program` already uses for stdout, with files.
+    let mut runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    if let Some(libc) = guest_libc() {
+        runtime.extend(temen_leng::nim_libc_units(&libc, &units).expect("guest libc units"));
+    }
+    match temen_leng::link_whole_powerbox_manifest(&units, runtime) {
+        Ok(m) => {
+            dump_module("nifler2", &m);
+            let v = temen_verify::verify_module(&m);
+            eprintln!(
+                "  nifler2: LINKED — {} funcs, {} imports, verify {:?}",
+                m.funcs.len(),
+                m.imports.len(),
+                v.map(|_| "ok")
+            );
+            // The five raw syscalls are *meant* to survive here — the POSIX personality binds them
+            // by name at instantiation. Anything else is a leaf nothing serves.
+            let unbound: Vec<&str> = m
+                .imports
+                .iter()
+                .map(|i| i.name.as_str())
+                .filter(|n| {
+                    // `write` is the guest libc's §3e STREAM cap; `open` is the POSIX open adapter's
+                    // forward. The rest are nimony syscall leaves. All bound at instantiation.
+                    !["write", "open"].contains(n)
+                        && !["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]
+                            .iter()
+                            .any(|p| n.starts_with(p))
+                })
+                .collect();
+            eprintln!(
+                "  nifler2: imports: {:?}",
+                m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+            );
+            if !unbound.is_empty() {
+                eprintln!("  nifler2: unbound leaves: {}", unbound.join(", "));
+                return;
+            }
+            if let Some(mem) = m.memory.as_ref() {
+                let win = 1u64 << mem.size_log2;
+                let brk = temen_ir::powerbox_entry_sp(&m) + temen_ir::POWERBOX_STACK_RESERVE;
+                eprintln!(
+                    "  nifler2: window 2^{} = {} MiB · heap [{}, {}) = {} MiB",
+                    mem.size_log2,
+                    win >> 20,
+                    brk,
+                    win,
+                    (win - brk) >> 20
+                );
+            }
+            nifler2_run_vs_native(&m, &out);
+        }
+        Err(e) => eprintln!("  nifler2: LINK FAILED — {e}"),
+    }
+}
+
+/// Drive the Temen-linked nifler2 over an in-memory fs and diff its `.nif` against the **native**
+/// nifler2 binary the same `nimony c` just produced — the same oracle shape as
+/// `temen-run/tests/nifler_asset.rs`, which does this for the LLVM-built `nifler.temen`.
+///
+/// The guest runs on the **POSIX personality** ([`run_io_capture`]): the retained `sysOpen`/
+/// `sysRead`/`sysWrite`/`sysClose`/`sysLseek` leaves bind to `temen_posix`'s real fd ops over an
+/// in-memory filesystem seeded with the input, and the argv `_start` now marshals reaches nifler2's
+/// own `paramStr` — the two things this route needed that the stdout-only `link_nim_powerbox` edge
+/// could never supply.
+#[cfg(test)]
+fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
+    use temen_run::{Backend, Limits, RunConfig};
+    const SRC: &str = "let x = 5\n";
+
+    // Native oracle: run in a scratch cwd with the input named `in.nim`, so the path nifler2 embeds
+    // in the NIF header matches what the guest sees at `/in.nim` (`fs::norm` strips the leading `/`).
+    let dir = std::env::temp_dir().join("nifler2_oracle");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mk oracle dir");
+    std::fs::write(dir.join("in.nim"), SRC).expect("write in.nim");
+    // The oracle runs the **same argv** the guest gets (minus `argv[0]`), so a probe program with no
+    // arguments is its own oracle on stdout and `nifler2 parse` is one on the written file.
+    let argv: Vec<String> = std::env::var("NIM_NIFLER2_ARGS")
+        .unwrap_or_else(|_| "nifler2 parse in.nim out.nif".into())
+        .split_whitespace()
+        .skip(1)
+        .map(|a| {
+            a.replace("/in.nim", "in.nim")
+                .replace("/out.nif", "out.nif")
+        })
+        .collect();
+    let st = Command::new(native_bin)
+        .args(&argv)
+        .current_dir(&dir)
+        .output()
+        .expect("run native nifler2");
+    if !st.status.success() {
+        eprintln!(
+            "  nifler2: native oracle failed: {}",
+            String::from_utf8_lossy(&st.stderr)
+        );
+    }
+    let want = std::fs::read(dir.join("out.nif")).unwrap_or_default();
+    if !st.stdout.is_empty() {
+        eprintln!(
+            "  nifler2: native stdout {:?}",
+            elide(&String::from_utf8_lossy(&st.stdout))
+        );
+    }
+
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: None,
+            ..Limits::default()
+        },
+        // `NIM_NIFLER2_SL` overrides the window so the need can be *measured* rather than argued —
+        // the same knob #1591 wanted and did not have.
+        memory_size_log2: std::env::var("NIM_NIFLER2_SL")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        args: std::env::var("NIM_NIFLER2_ARGS")
+            .unwrap_or_else(|_| "nifler2 parse /in.nim /out.nif".into())
+            .split_whitespace()
+            .map(|a| a.as_bytes().to_vec())
+            .collect(),
+        ..RunConfig::default()
+    };
+    let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &[("/in.nim", SRC.as_bytes())]);
+    let out = posix.stdout();
+    if !out.is_empty() {
+        eprintln!(
+            "  nifler2: stdout {:?}",
+            elide(&String::from_utf8_lossy(&out))
+        );
+    }
+    if want.is_empty() {
+        return; // a probe run: stdout above is the whole comparison
+    }
+    match posix.read_file("/out.nif") {
+        None => eprintln!("  nifler2: wrote no /out.nif"),
+        Some(got) if got == want => eprintln!(
+            "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
+             no C compiler, runs on Temen",
+            got.len()
+        ),
+        Some(got) => eprintln!(
+            "  nifler2: DIFFERS — temen {} bytes, native {} bytes\n    temen:  {:?}\n    native: {:?}",
+            got.len(),
+            want.len(),
+            elide(&String::from_utf8_lossy(&got)),
+            elide(&String::from_utf8_lossy(&want))
+        ),
+    }
 }
