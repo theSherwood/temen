@@ -797,22 +797,40 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
 /// `sysOpen` is deliberately absent: C's `open` takes a NUL-terminated `char*` where the personality
 /// wants `(ptr, len)`, so it goes through `temen_leng`'s `POSIX_OPEN_ADAPTER` at link and arrives
 /// here as a bare `open` instead. Binding it here directly read the flags word as the path length.
-fn nim_posix_op(name: &str) -> u32 {
-    if name.starts_with("sysWrite") {
-        temen_posix::OP_WRITE
-    } else if name.starts_with("sysRead") {
-        temen_posix::OP_READ
-    } else if name.starts_with("sysClose") {
-        temen_posix::OP_CLOSE
-    } else if name.starts_with("sysLseek") {
-        temen_posix::OP_LSEEK
-    } else if name.starts_with("getcwd") {
+enum NimImport {
+    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
+    Stdout,
+    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
+    /// file operation, and binding it to the compute shim's `{ return }` stub made `quit` a no-op.
+    Exit,
+    /// The POSIX open adapter's forward: a bare `open` taking the `(ptr, len, flags)` the op wants.
+    Open,
+    /// A retained nimony syscall leaf → the matching `temen_posix` op.
+    Posix(u32),
+}
+
+/// How [`run_io_capture`] binds one retained import — and, by the same answer, whether the #760
+/// probe should call it an **unbound leaf**.
+///
+/// One table consulted by both. They were two: the binder matched on `write`/`open` and then a
+/// prefix chain, while the probe carried its own hardcoded `["sysWrite", "sysRead", "sysClose",
+/// "sysLseek", "getcwd"]`. Adding `cExitSys` to `temen_leng::POSIX_SERVED_LEAVES` taught the binder
+/// about it and left the probe reporting it unbound from its copy — the second route through one
+/// behaviour that INVARIANTS #15 is about. `None` means nothing serves this leaf.
+fn nim_import_binding(name: &str) -> Option<NimImport> {
+    Some(match name {
+        "write" => NimImport::Stdout,
+        "open" => NimImport::Open,
+        n if n.starts_with("cExitSys") => NimImport::Exit,
+        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
+        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
+        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
+        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
         // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
         // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
-        temen_posix::OP_GETCWD
-    } else {
-        panic!("unmapped nimony syscall import `{name}` — extend nim_posix_op");
-    }
+        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        _ => return None,
+    })
 }
 
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
@@ -836,27 +854,27 @@ fn run_io_capture(
     let make = std::sync::Arc::new(make);
     let mut imports = temen_run::Imports::new();
     for imp in &m.imports {
-        // The guest libc's `write` is a §3e **STREAM cap**, not a nim-name syscall leaf: it is the
-        // ordinary powerbox stdout, granted as such. Everything else is a retained nimony syscall.
-        if imp.name == "write" {
-            imports = imports.provide(imp.name.clone(), temen_run::HostCap::stdout());
-            continue;
-        }
-        // The POSIX open adapter's forward (`temen_leng::POSIX_OPEN_ADAPTER`): a bare `open` taking
-        // the `(ptr, len, flags)` the personality's op wants.
-        if imp.name == "open" {
-            let make = std::sync::Arc::clone(&make);
-            imports = imports.provide(
-                imp.name.clone(),
-                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)()),
+        let Some(kind) = nim_import_binding(&imp.name) else {
+            panic!(
+                "unmapped nimony import `{}` — extend nim_import_binding",
+                imp.name
             );
-            continue;
-        }
-        let make = std::sync::Arc::clone(&make);
-        imports = imports.provide(
-            imp.name.clone(),
-            temen_run::HostCap::host_proc(nim_posix_op(&imp.name), move || (*make)()),
-        );
+        };
+        let cap = match kind {
+            NimImport::Stdout => temen_run::HostCap::stdout(),
+            // `quit` bottoms out here (`quit` -> `cExit` -> `cExitSys`, all `noreturn`), so this
+            // must be a capability that actually ends the program.
+            NimImport::Exit => temen_run::HostCap::exit(),
+            NimImport::Open => {
+                let make = std::sync::Arc::clone(&make);
+                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+            }
+            NimImport::Posix(op) => {
+                let make = std::sync::Arc::clone(&make);
+                temen_run::HostCap::host_proc(op, move || (*make)())
+            }
+        };
+        imports = imports.provide(imp.name.clone(), cap);
     }
     for (path, bytes) in seed {
         posix.write_file(path, bytes);
@@ -2378,14 +2396,8 @@ fn nifler2_links_through_leng() {
                 .imports
                 .iter()
                 .map(|i| i.name.as_str())
-                .filter(|n| {
-                    // `write` is the guest libc's §3e STREAM cap; `open` is the POSIX open adapter's
-                    // forward. The rest are nimony syscall leaves. All bound at instantiation.
-                    !["write", "open"].contains(n)
-                        && !["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]
-                            .iter()
-                            .any(|p| n.starts_with(p))
-                })
+                // Ask the binder, rather than keeping a second list of what it binds.
+                .filter(|n| nim_import_binding(n).is_none())
                 .collect();
             eprintln!(
                 "  nifler2: imports: {:?}",

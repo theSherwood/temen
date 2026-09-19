@@ -1514,12 +1514,20 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
     compute_shim_unit(nim_compute_exports(units)?.0)
 }
 
-/// Bottom-edge leaves the **POSIX personality** serves for real, so [`nim_posix_runtime`] leaves them
-/// to the host instead of binding [`POWERBOX_COMPUTE_SHIM`]'s fail-closed stub. Each one's C ABI is
-/// what the matching `temen_posix` op already takes, so no adapter stands between them — a leaf that
-/// *does* need reconciling (a NUL-terminated path where the op wants `(ptr, len)`) belongs in
-/// [`POSIX_OPEN_ADAPTER`] instead, not here.
-const POSIX_SERVED_LEAVES: &[&str] = &["getcwd"];
+/// Bottom-edge leaves the **host** serves for real, so [`nim_posix_runtime`] leaves them to it
+/// instead of binding [`POWERBOX_COMPUTE_SHIM`]'s stub. Each is passed through with its C ABI
+/// unchanged — a leaf that needs reconciling (a NUL-terminated path where the op wants `(ptr, len)`)
+/// belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
+///
+/// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
+///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
+///   exists.
+/// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
+///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
+///   and the program runs on past the error path that called it. nimsem printed `command expected`
+///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
+///   error path is built on `quit`, so on this route none of them ended the program.
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys"];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.
