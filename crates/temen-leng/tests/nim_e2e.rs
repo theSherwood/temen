@@ -2445,6 +2445,25 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mk oracle dir");
     std::fs::write(dir.join("in.nim"), SRC).expect("write in.nim");
+    // Extra inputs, so a phase can be driven over **real work** rather than an argv it rejects.
+    // `NIM_NIFLER2_SEED=/a.nif=/host/a.nif,/b.nif=…` seeds each into the guest memfs *and* drops it
+    // in the oracle's cwd under the same basename, so both sides read identical bytes. Without it a
+    // hexer/nimsem/lengc probe only ever compares a usage message: proof that the phase starts and
+    // exits like native, not that it compiles like native.
+    let extra: Vec<(String, Vec<u8>)> = std::env::var("NIM_NIFLER2_SEED")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let (guest, host) = e.split_once('=').expect("seed is guestpath=hostpath");
+            let bytes = std::fs::read(host).unwrap_or_else(|e| panic!("read seed {host}: {e}"));
+            let base = std::path::Path::new(guest)
+                .file_name()
+                .expect("seed needs a basename");
+            std::fs::write(dir.join(base), &bytes).expect("write oracle seed");
+            (guest.to_string(), bytes)
+        })
+        .collect();
     // The oracle runs the **same argv** the guest gets (minus `argv[0]`), so a probe program with no
     // arguments is its own oracle on stdout and `nifler2 parse` is one on the written file.
     let argv: Vec<String> = std::env::var("NIM_NIFLER2_ARGS")
@@ -2452,8 +2471,20 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         .split_whitespace()
         .skip(1)
         .map(|a| {
-            a.replace("/in.nim", "in.nim")
-                .replace("/out.nif", "out.nif")
+            // The guest reads absolute memfs paths; the oracle runs in a real cwd. Rewrite each
+            // seeded path to its basename so both sides name the same bytes.
+            let mut a = a
+                .replace("/in.nim", "in.nim")
+                .replace("/out.nif", "out.nif");
+            for (guest, _) in &extra {
+                if let Some(base) = std::path::Path::new(guest)
+                    .file_name()
+                    .and_then(|b| b.to_str())
+                {
+                    a = a.replace(guest.as_str(), base);
+                }
+            }
+            a
         })
         .collect();
     let st = Command::new(native_bin)
@@ -2467,7 +2498,9 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             String::from_utf8_lossy(&st.stderr)
         );
     }
-    let want = std::fs::read(dir.join("out.nif")).unwrap_or_default();
+    // Which file the run is expected to produce — `out.nif` unless the caller's argv names another.
+    let out_name = std::env::var("NIM_NIFLER2_OUT").unwrap_or_else(|_| "out.nif".into());
+    let want = std::fs::read(dir.join(&out_name)).unwrap_or_default();
     if !st.stdout.is_empty() {
         eprintln!(
             "  nifler2: native stdout {:?}",
@@ -2492,7 +2525,9 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             .collect(),
         ..RunConfig::default()
     };
-    let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &[("/in.nim", SRC.as_bytes())]);
+    let mut seeds: Vec<(&str, &[u8])> = vec![("/in.nim", SRC.as_bytes())];
+    seeds.extend(extra.iter().map(|(g, b)| (g.as_str(), b.as_slice())));
+    let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &seeds);
     let out = posix.stdout();
     if !out.is_empty() {
         eprintln!(
@@ -2519,7 +2554,7 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         );
         return;
     }
-    match posix.read_file("/out.nif") {
+    match posix.read_file(&format!("/{out_name}")) {
         None => panic!("wrote no /out.nif, but native wrote {} bytes", want.len()),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
