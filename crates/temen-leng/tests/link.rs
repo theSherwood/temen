@@ -392,6 +392,74 @@ fn nested_cross_module_types_resolve() {
     );
 }
 
+/// **#1593 — the type-pooling fixpoint has to run until the *offsets* stop moving.** A three-unit
+/// nesting chain `Outer -> Middle -> Inner`, each link in a different unit, is the shortest shape
+/// that catches a fixpoint which stops one round early.
+///
+/// Each round resolves one more level: round 1 lays `Inner` correctly and sizes `Middle`'s and
+/// `Outer`'s cross-module aggregate fields as the 8-byte scalar placeholder; round 2 fixes `Middle`
+/// but still uses round 1's `Middle` inside `Outer`. The old convergence signal was the **summed
+/// field count**, which round 2 leaves unchanged — no field is added, only a size corrected — so the
+/// loop stopped there and froze an `Outer` whose `m` field still claimed 8 bytes while `Middle`
+/// really needs 24. `y` then landed *inside* `m`, and writing one scribbled over the other.
+///
+/// With the stale table `Outer` is 24 bytes with `y` at +16, while `Middle` really needs 24 — so `y`
+/// lands exactly on `m.x`. The proc writes `m.i.b`, then `m.x`, then `y`, and returns `m.x` plus
+/// `m.i.b`'s displacement from what it was set to: either overlap shows up, and a correct layout
+/// returns the value passed in. This is what nifler2's `Parser { lex: Lexer; tok: Token; dest:
+/// TokenBuf }` hit (#763) — three cross-module aggregate fields, all overlapping.
+#[test]
+fn three_deep_cross_module_nesting_lays_fields_out_disjointly() {
+    let mod_c = "\
+(stmts
+ (type :Inner.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64)))))";
+    let mod_b = "\
+(stmts
+ (type :Middle.0. . (object . (fld :i.0 . Inner.0.modc) (fld :x.0 . (i +64)))))";
+    let mod_a = "\
+(stmts
+ (type :Outer.0. . (object . (fld :m.0 . Middle.0.modb) (fld :y.0 . (i +64)))))";
+    let mod_u = "\
+(stmts
+ (proc :get.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :o.0 . Outer.0.moda .)
+   (asgn (dot (dot (dot o.0 m.0 0) i.0 0) b.0 0) 11)
+   (asgn (dot (dot o.0 m.0 0) x.0 0) v.0)
+   (asgn (dot o.0 y.0 0) 7)
+   (ret (add (i +64) (dot (dot o.0 m.0 0) x.0 0)
+             (sub (i +64) (dot (dot (dot o.0 m.0 0) i.0 0) b.0 0) 11))))))";
+    let linked = temen_leng::link_units(&[
+        LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["get.0."],
+        },
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &[],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &[],
+        },
+        LengModule {
+            stem: "modc",
+            src: mod_c,
+            names: &[],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(
+        run(&linked, 0, &[20480, 33]),
+        33,
+        "no field may overlap another — 7 here means the pooled `Outer` froze with `m` \
+         sized from the round before `Middle` settled"
+    );
+}
+
 #[test]
 fn cross_module_sret_call_with_oconstr_arg() {
     // Regression (#760): an aggregate **rvalue** — an `(oconstr …)` literal — passed to a
