@@ -540,6 +540,19 @@ pub(crate) struct Translator {
     /// (a proc funcref'd in a sibling unit must still carry `$sp`). See [`funcref_value`] /
     /// [`emit_call.dyn`].
     funcref_targets: HashSet<String>,
+    /// **Cross-module funcref slots** — a sibling unit's proc taken as a *value* (stored into a
+    /// dispatch record, passed as a callback), mapped to a hidden 8-byte slot in this unit's data.
+    /// `Inst::RefFunc` takes a func **index** immediate, and this unit has no index for another
+    /// unit's proc, so the instruction stream cannot name one. The data image can: the slot carries
+    /// a [`temen_ir::DataFuncref`] reloc under the callee's global name, the linker writes the
+    /// merged funcidx into it when it places this unit, and [`funcref_value`] loads the `i32` back.
+    /// Identity is preserved — every unit referencing the same proc resolves to the one funcidx,
+    /// which a per-unit forwarding wrapper would not do.
+    xmod_funcref_slots: HashMap<String, u64>,
+    /// [`xmod_funcref_slots`] as `(offset, already-global name)` reloc requests. Kept apart from
+    /// [`funcref_inits`](Self::funcref_inits), whose names are *local* and get this unit's stem
+    /// appended; these are already stem-suffixed by the module that wrote them.
+    xmod_funcref_inits: Vec<(u64, String)>,
     /// **Tier-2 TLS mode** (NIM.md §3d). When set, a `tvar` (thread-var) is lowered to the per-vCPU
     /// TLS block instead of a plain window global: each `tvar` gets an offset in [`tls_vars`] and its
     /// accesses become `vcpu.tls.get() + off` (the fs/gs-base recipe). Off (the default) is Tier 1 —
@@ -609,6 +622,8 @@ impl Translator {
             ext_proc_params: HashMap::default(),
             ext_proc_rets: HashMap::default(),
             funcref_targets: HashSet::default(),
+            xmod_funcref_slots: HashMap::default(),
+            xmod_funcref_inits: Vec::new(),
             tls_mode: false,
             tls_vars: HashMap::default(),
             tls_block_size: 0,
@@ -1046,6 +1061,16 @@ impl Translator {
                 at: *at,
                 name: format!("{sym}{stem}"),
             })
+            // Cross-module funcref slots: the name already carries the *defining* unit's stem, so
+            // appending this unit's would name a proc nothing exports.
+            .chain(
+                self.xmod_funcref_inits
+                    .iter()
+                    .map(|(at, sym)| temen_ir::DataFuncref {
+                        at: *at,
+                        name: sym.clone(),
+                    }),
+            )
             .collect()
     }
 
@@ -2208,6 +2233,8 @@ impl Translator {
         stem: &str,
         ext_types: &[(String, Layout)],
         ext_sret: &[(String, TyDesc)],
+        ext_proc_params: &[ProcParamSig],
+        pooled_funcrefs: &HashSet<String>,
     ) -> Result<Vec<(String, bool, Vec<String>)>, LengError> {
         let mut t = Translator::new();
         // Enumerating proc frames; tolerate unresolvable cross-module aggregates.
@@ -2225,7 +2252,12 @@ impl Translator {
         t.collect_globals(root)?;
         // A funcref target / indirect caller is frame-needing under the funcref ABI (`proc_needs_frame`
         // consults `funcref_targets`), so the fixpoint pre-scan must see the same set the real pass does.
+        // Same inputs as the real pass, or the pre-scan and emission disagree about which procs
+        // carry the funcref ABI's `$sp` — the `CallArgCountMismatch` class the comment above
+        // records. A sibling's funcref of *this* unit's proc is only visible through the pool.
+        t.import_proc_params(ext_proc_params);
         t.compute_funcref_targets(root)?;
+        t.import_funcref_targets(root, stem, pooled_funcrefs);
         t.collect_varargs_imports(root)?;
         // A proc that calls an **sret** proc materializes a result temp → is frame-needing. So the
         // frame predicate (`proc_needs_frame` → `agg_temp_bytes`) must know which callees are sret:
@@ -2506,8 +2538,92 @@ impl Translator {
                 proc_names.insert(sym_def(&item.args()[0])?);
             }
         }
-        collect_funcref_targets(root, &proc_names, &mut self.funcref_targets);
+        // Scan for **sibling units' procs** taken as funcrefs too, not just this module's. nimony
+        // builds dispatch records out of them (`cps.nim` stores `coro_transform`'s
+        // `transformCoroutineDecl` into a `trCoroutine` field), and without this the name falls
+        // through to a data-symbol reference no unit exports — a fail-closed `Unresolved` at link.
+        // `ext_proc_params` is the linker's pooled table of every proc in the program under its
+        // global name, so it is exactly the "is this atom a sibling's proc" oracle.
+        let mut scan = proc_names.clone();
+        scan.extend(self.ext_proc_params.keys().cloned());
+        let mut found: HashSet<String> = HashSet::default();
+        collect_funcref_targets(root, &scan, &mut found);
+        // Deterministic slot order: `found` is a hash set, and a data offset that moved with hash
+        // iteration would make the emitted module non-reproducible.
+        let mut xmod: Vec<String> = Vec::new();
+        for name in found {
+            if proc_names.contains(&name) {
+                self.funcref_targets.insert(name);
+            } else {
+                xmod.push(name);
+            }
+        }
+        xmod.sort();
+        for name in xmod {
+            if self.xmod_funcref_slots.contains_key(&name) {
+                continue;
+            }
+            // One 8-byte slot per distinct callee, past the globals `collect_globals` just laid out
+            // (it runs first and leaves the cursor in `globals_top`). The link-mode data image is
+            // `vec![0u8; globals_top]`, so widening the cursor reserves zero-filled space for free.
+            let off = self.globals_top;
+            self.globals_top += 8;
+            self.xmod_funcref_slots.insert(name.clone(), off);
+            self.xmod_funcref_inits.push((off, name));
+        }
         Ok(())
+    }
+
+    /// Every proc name this unit takes as a **funcref**, under its *global* (stem-suffixed) name —
+    /// the pool feeding [`import_funcref_targets`]. A local proc is suffixed with this unit's
+    /// `stem`; a sibling's is already global and passes through. The linker needs the whole-program
+    /// union *before* translating any unit, because the funcref ABI gives a target a leading `$sp`
+    /// and the unit that **defines** a proc cannot see that a **sibling** funcrefs it.
+    pub fn export_funcref_uses(
+        root: &Node,
+        stem: &str,
+        ext_proc_params: &[ProcParamSig],
+    ) -> Result<Vec<String>, LengError> {
+        let mut local: HashSet<String> = HashSet::default();
+        for item in root.args() {
+            if item.tag() == Some("proc") && !is_bodyless_proc(item) {
+                local.insert(sym_def(&item.args()[0])?);
+            }
+        }
+        let mut scan = local.clone();
+        scan.extend(ext_proc_params.iter().map(|p| p.0.clone()));
+        let mut found: HashSet<String> = HashSet::default();
+        collect_funcref_targets(root, &scan, &mut found);
+        let mut out: Vec<String> = found
+            .into_iter()
+            .map(|n| {
+                if local.contains(&n) {
+                    format!("{n}{stem}")
+                } else {
+                    n
+                }
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// Adopt the whole-program funcref-target pool: a proc **this** unit defines is compiled
+    /// frame-needing (the funcref ABI's leading `$sp`) when any unit in the program takes it as a
+    /// funcref, not merely when this one does. Call after [`compute_funcref_targets`], which has
+    /// already added the locally-visible uses.
+    pub fn import_funcref_targets(&mut self, root: &Node, stem: &str, pooled: &HashSet<String>) {
+        for item in root.args() {
+            if item.tag() != Some("proc") || is_bodyless_proc(item) {
+                continue;
+            }
+            let Ok(name) = sym_def(&item.args()[0]) else {
+                continue;
+            };
+            if pooled.contains(&format!("{name}{stem}")) {
+                self.funcref_targets.insert(name);
+            }
+        }
     }
 
     /// A proc's **own** frame need — computed exactly as `proc_body` decides `frame_size > 0`, so the
@@ -4010,6 +4126,17 @@ impl<'a> FuncGen<'a> {
                 let id = self.fresh();
                 self.cur_buf
                     .push_str(&format!("  v{id} = ref.func {idx}\n"));
+                return Ok(id);
+            }
+            // A **sibling unit's** proc as a value. No local func index exists for it and
+            // `ref.func` takes an index immediate, so read the funcidx the linker wrote into this
+            // unit's hidden slot (`xmod_funcref_slots`) instead.
+            if let Some(&off) = self.t.xmod_funcref_slots.get(name) {
+                let addr = self.emit_data_self(off);
+                let id = self.fresh();
+                self.used_memory = true;
+                self.cur_buf
+                    .push_str(&format!("  v{id} = i32.load v{addr}\n"));
                 return Ok(id);
             }
         }
