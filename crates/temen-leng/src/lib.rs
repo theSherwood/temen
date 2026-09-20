@@ -1522,12 +1522,15 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 /// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
 ///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
 ///   exists.
+/// - `fstat` → the matching `temen_posix` op. Bound to the shim it reports **size 0**, so
+///   `memfiles.open` (`open` + `fstat` + `mmap`) maps every file as empty and the program reads a
+///   zero-length buffer rather than its input — #1595.
 /// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
 ///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
 ///   and the program runs on past the error path that called it. nimsem printed `command expected`
 ///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
 ///   error path is built on `quit`, so on this route none of them ended the program.
-const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys"];
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys", "fstat"];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.

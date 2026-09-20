@@ -216,6 +216,19 @@ pub const OP_TCGETWINSIZE: u32 = 56;
 /// to fake `/dev/tty` unconditionally, which is wrong for a non-terminal fd.
 pub const OP_TTYNAME: u32 = 57;
 
+/// `fstat(fd, buf) -> 0 | -errno`: the **by-fd** twin of [`OP_STAT`], filling a real Linux/amd64
+/// `struct stat` at `buf`.
+///
+/// Unlike [`OP_STAT`], whose 16-byte `{mode, size}` is a Temen-private convention its own callers
+/// agree on, this writes the **ABI layout the guest's own headers declare** — 144 bytes, `st_mode`
+/// (u32) at 24 and `st_size` (i64) at 48, per nimony's `std/posix/posix.nim` ("Linux/amd64 `struct
+/// stat`"). It has to: `memfiles.open` declares `Stat` itself and reads `stat.st_size` at *its*
+/// offset, so a convenient short struct would be read as a garbage size rather than rejected.
+///
+/// Added for #1595 — nim's `memfiles.open` is `open` + `fstat` + `mmap`, and with `fstat` stubbed
+/// fail-closed to `0` every mapped file looked **empty**.
+pub const OP_FSTAT: u32 = 58;
+
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
 /// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
@@ -383,6 +396,15 @@ const F_DUPFD_CLOEXEC: i64 = 1030;
 /// that is a prefix of some file key (or `"/"`) is a directory.
 const S_IFREG: i64 = 0o100000; // regular file (| 0o644 perms)
 const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
+const S_IFIFO: i64 = 0o010000; // FIFO/pipe — what a non-file fd stats as
+
+/// Linux/amd64 `struct stat` geometry, as the **guest's own** headers declare it (nimony
+/// `std/posix/posix.nim`): 144 bytes, `st_mode` (u32) at 24, `st_size` (i64) at 48. Used by
+/// [`OP_FSTAT`], which must match the caller's layout exactly — [`OP_STAT`]'s short
+/// `{mode, size}` is a separate, Temen-private convention and is *not* this.
+const STAT_SIZE: usize = 144;
+const STAT_MODE_OFF: usize = 24;
+const STAT_SIZE_OFF: usize = 48;
 
 // The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
 // NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
@@ -1569,6 +1591,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "environ" => OP_ENVIRON,
         "clock_gettime" | "clock" => OP_CLOCK,
         "stat" | "lstat" => OP_STAT,
+        "fstat" => OP_FSTAT,
         "opendir" => OP_OPENDIR,
         "readdir" => OP_READDIR,
         "closedir" => OP_CLOSEDIR,
@@ -2324,6 +2347,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_RENAME => st.rename(args, mem),
                 OP_RMDIR => st.rmdir(args, mem),
                 OP_STAT => st.stat(args, mem),
+                OP_FSTAT => st.fstat(args, mem),
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
                 OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
@@ -4429,6 +4453,43 @@ impl Ctx<'_> {
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&mode.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
+        mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// `fstat(fd, buf) -> 0 | -errno`: fill a Linux/amd64 `struct stat` for an open fd.
+    ///
+    /// Only `st_mode` and `st_size` are populated; the rest of the 144 bytes are zeroed. That is
+    /// what the callers on this route read (`memfiles.open` takes `st_size` and nothing else), and
+    /// a zero is honest for fields a flat memfs has no answer for — an invented inode or mtime
+    /// would be a plausible-looking lie of exactly the kind #1595 was.
+    ///
+    /// A non-file fd (a pipe, a socket, stdio) stats as a FIFO with size 0 rather than failing:
+    /// `fstat` on a pipe is legal POSIX. An unknown fd is `EBADF`.
+    fn fstat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let buf = (*args.get(1).ok_or(Trap::Malformed)?) as u64;
+        let (mode, size) = match self.fd(fd) {
+            Some(FdEntry::File(of)) => {
+                let path = {
+                    let of = of.lock().unwrap_or_else(|e| e.into_inner());
+                    of.path.clone()
+                };
+                let perms = if self.w.executables.contains(&path) {
+                    0o755
+                } else {
+                    0o644
+                };
+                let len = self.w.files.get(&path).map_or(0, |f| f.len()) as i64;
+                (S_IFREG | perms, len)
+            }
+            Some(_) => (S_IFIFO | 0o600, 0),
+            None => return Ok(vec![EBADF]),
+        };
+        let mut out = vec![0u8; STAT_SIZE];
+        out[STAT_MODE_OFF..STAT_MODE_OFF + 4].copy_from_slice(&(mode as u32).to_le_bytes());
+        out[STAT_SIZE_OFF..STAT_SIZE_OFF + 8].copy_from_slice(&size.to_le_bytes());
         mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
         Ok(vec![0])
     }
@@ -6899,6 +6960,58 @@ block 0 (vph: i32) {\n\
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
+    }
+
+    #[test]
+    fn fstat_reports_the_size_at_the_abi_offset() {
+        // #1595. `memfiles.open` is `open` + `fstat` + `mmap`, and it reads `stat.st_size` at the
+        // offset **its own headers** declare — 48, per nimony's Linux/amd64 `struct stat`. Bound to
+        // the compute shim's stub this came back 0, so every mapped file looked empty and the
+        // program parsed a zero-length buffer instead of its input.
+        //
+        // Pins the geometry, not just the value: a short `{mode, size}` struct like `OP_STAT`'s
+        // would put the size at offset 8 and be read as garbage rather than rejected.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/tmp/a", b"hello");
+
+        let mut win = vec![0u8; WIN];
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+
+        let fd = st.open(&[0, 6, 0], Some(&mut mem)).unwrap()[0];
+        assert!(fd >= 0, "open succeeded: {fd}");
+        assert_eq!(st.fstat(&[fd, 500], Some(&mut mem)).unwrap()[0], 0);
+        let size = i64::from_le_bytes(
+            mem.read_bytes(500 + STAT_SIZE_OFF as u64, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(size, 5, "st_size at offset {STAT_SIZE_OFF}");
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            mode,
+            (S_IFREG | 0o644) as u32,
+            "st_mode at offset {STAT_MODE_OFF}"
+        );
+        // Everything else stays zero — an invented inode or mtime would be the same class of
+        // plausible-looking lie that made this bug take a day to find.
+        assert_eq!(
+            mem.read_bytes(500, 8).unwrap(),
+            vec![0u8; 8],
+            "st_dev zeroed"
+        );
+
+        // A non-file fd is legal to fstat (POSIX): a FIFO, size 0. An unknown fd is EBADF.
+        assert_eq!(st.fstat(&[1, 500], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.fstat(&[999, 500], Some(&mut mem)).unwrap()[0], EBADF);
     }
 
     #[test]

@@ -829,6 +829,9 @@ fn nim_import_binding(name: &str) -> Option<NimImport> {
         // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
         // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
         n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        // #1595: `memfiles.open` sizes a mapping with `fstat`, so the shim's 0-returning stub made
+        // every mapped file look empty.
+        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
         _ => return None,
     })
 }
