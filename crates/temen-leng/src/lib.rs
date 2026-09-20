@@ -1357,6 +1357,14 @@ func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.c
 ///
 /// This unit exports `sysOpen`'s nim signature, walks the string to its NUL in the guest, and forwards
 /// `(ptr, len, flags)`. `open` itself stays a manifest import the host binds to the personality.
+///
+/// **Two entry points, same walk** (#1595). `syncio` reaches the bottom edge as `sysOpen`
+/// — `(ptr, i32 flags, i64 mode) -> i32` — but `std/posix`'s own `open`, which `memfiles.open`
+/// calls, is `(ptr, i32 flags, i32 mode) -> i32`. Only `sysOpen` was routed here; plain `open` stayed
+/// on the compute shim's fail-closed stub (func 20, "report failure"), so `readFile` worked while
+/// **memory-mapping the same file failed** — the second half of #1595, and invisible until something
+/// mapped a file. Func 0 serves the `sysOpen` shape, func 1 the `open` shape; the differing `mode`
+/// width is why one func cannot serve both (the link checks import shape, #1524).
 const POSIX_OPEN_ADAPTER: &str = "\
 import 0 \"open\" (i64, i64, i64) -> (i64)
 
@@ -1375,6 +1383,85 @@ block 2 (v0: i64, v1: i32, v2: i64) {
   v5 = call.import 0 (v0, v3, v4)
   v6 = i32.wrap_i64 v5
   return v6
+  }
+}
+
+func (i64, i32, i32) -> (i32) {
+block 0 (v0: i64, v1: i32, v2: i32) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i32, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i32, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = i64.extend_i32_s v1
+  v5 = call.import 0 (v0, v3, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}";
+
+/// The private alias under which [`nim_posix_runtime`] re-exports the compute shim's **anonymous**
+/// `mmap` so [`POSIX_MMAP_ADAPTER`] can call it. The shim IR is unchanged — only the export list
+/// gains a second name for the same func, so there is still one allocator.
+const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
+
+/// The **POSIX-personality mmap adapter** — the second place nimony's C bottom edge and this
+/// sandbox disagree, after [`POSIX_OPEN_ADAPTER`].
+///
+/// nim reads a file by **mapping** it: `nifreader.open` → `vfsOpenMmap` → `memfiles.open`, which is
+/// `open` + `fstat` + `mmap(fd)`. The compute shim's `mmap` is the guest **heap bump allocator**
+/// (hands out `[brk, brk+len)`, advancing `POWERBOX_HEAP_BRK`) and ignores `fd` entirely, so a
+/// file-backed mapping came back as uninitialized heap. With `fstat` also stubbed to 0 the result
+/// was an empty buffer, and hexer asserted in `jumpTo` on a zero-length file (#1595).
+///
+/// This unit owns the `mmap` name on the POSIX route and **composes what already works**: it calls
+/// the shim's allocator through [`MMAP_ANON_ALIAS`] for the pages, then — when `fd` is a real
+/// descriptor — seeks and reads the file into them. An anonymous request (`fd == -1`, every
+/// allocator call) returns the pages untouched, so the hot path is one extra forwarding call.
+///
+/// **It stays in the guest, like the shim.** A nested child links these same units and needs
+/// nothing granted at any depth; no new capability crosses a sandbox boundary, and the heap
+/// ceiling check (#1060) stays where it is. A §13 `SharedRegion` premap is the zero-copy upgrade
+/// behind this same symbol when a copy stops being cheap enough.
+///
+/// **Fails closed on a short read.** A partial fill is indistinguishable downstream from a truncated
+/// file, so anything other than exactly `len` bytes returns `MAP_FAILED` (-1) and nim's
+/// `memfiles.open` raises — the caller sees "cannot open", never a half-filled buffer.
+const POSIX_MMAP_ADAPTER: &str = "\
+import 0 \"__temen_mmap_anon\" (i64, i64, i32, i32, i32, i64) -> (i64)
+import 1 \"read\" (i64, i64, i64) -> (i64)
+import 2 \"lseek\" (i64, i64, i64) -> (i64)
+
+func (i64, i64, i32, i32, i32, i64) -> (i64) {
+block 0 (v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i64) {
+  v6 = call.import 0 (v0, v1, v2, v3, v4, v5)
+  v7 = i32.const 0
+  v8 = i32.lt_s v4 v7
+  br_if v8 1(v6) 2(v6, v1, v4, v5)
+  }
+block 1 (v0: i64) {
+  return v0
+  }
+block 2 (v0: i64, v1: i64, v2: i32, v3: i64) {
+  v4 = i64.extend_i32_s v2
+  v5 = i64.const 0
+  v6 = call.import 2 (v4, v3, v5)
+  v7 = i64.const 0
+  v8 = i64.lt_s v6 v7
+  br_if v8 4() 3(v0, v1, v4)
+  }
+block 3 (v0: i64, v1: i64, v2: i64) {
+  v3 = call.import 1 (v2, v0, v1)
+  v4 = i64.eq v3 v1
+  br_if v4 1(v0) 4()
+  }
+block 4 () {
+  v0 = i64.const -1
+  return v0
   }
 }";
 
@@ -1522,12 +1609,15 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 /// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
 ///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
 ///   exists.
+/// - `fstat` → the matching `temen_posix` op. Bound to the shim it reports **size 0**, so
+///   `memfiles.open` (`open` + `fstat` + `mmap`) maps every file as empty and the program reads a
+///   zero-length buffer rather than its input — #1595.
 /// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
 ///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
 ///   and the program runs on past the error path that called it. nimsem printed `command expected`
 ///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
 ///   error path is built on `quit`, so on this route none of them ended the program.
-const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys"];
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys", "fstat"];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.
@@ -1548,19 +1638,60 @@ pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit
     // `temen_posix` op, whose `getcwd(buf, size) -> buf` is the C ABI unchanged.
     compute_exports.retain(|(n, _)| !POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)));
     // `sysOpen`'s nim name is only known once the program is linked (pass 1's retained imports).
-    let opens: Vec<(String, u32)> = m1
+    let mut opens: Vec<(String, u32)> = m1
         .imports
         .iter()
         .filter(|i| i.name.starts_with("sysOpen"))
         .map(|i| (i.name.clone(), 0))
         .collect();
+    // `std/posix`'s plain `open` (what `memfiles.open` calls) is a *compute leaf* bound to the
+    // shim's fail-closed stub, not a retained import — so it never reached the adapter and every
+    // memory-mapped read failed while `readFile` worked (#1595). Take the name off the shim and
+    // give it the adapter's second entry point, whose `mode` is `i32` rather than `sysOpen`'s `i64`.
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("open"))
+            .map(|(n, _)| (n.clone(), 1)),
+    );
+    compute_exports.retain(|(n, _)| !n.starts_with("open"));
     let open_adapter = temen_ir::LinkUnit {
         module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
             .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,
         exports: opens,
         ..Default::default()
     };
-    Ok(vec![compute_shim_unit(compute_exports)?, open_adapter])
+    // **`mmap` changes hands** (#1595). nim maps files to read them, and the shim's `mmap` is the
+    // heap bump allocator — it ignores `fd`, so a file-backed mapping is uninitialized heap. Hand
+    // the name to `POSIX_MMAP_ADAPTER` and re-export the shim's func to it under a private alias,
+    // so the allocator itself is still the one the shim owns.
+    let mmaps: Vec<(String, u32)> = compute_exports
+        .iter()
+        .filter(|(n, _)| n.starts_with("mmap"))
+        .map(|(n, _)| (n.clone(), 0))
+        .collect();
+    let mmap_adapter = if mmaps.is_empty() {
+        // A program that never maps anything (it links no `mmap` leaf) needs no adapter, and
+        // adding one would leave `read`/`lseek` imports nothing binds.
+        None
+    } else {
+        let anon_idx = compute_exports
+            .iter()
+            .find(|(n, _)| n.starts_with("mmap"))
+            .map(|(_, i)| *i)
+            .expect("mmaps is non-empty");
+        compute_exports.retain(|(n, _)| !n.starts_with("mmap"));
+        compute_exports.push((MMAP_ANON_ALIAS.to_string(), anon_idx));
+        Some(temen_ir::LinkUnit {
+            module: temen_text::parse_module(POSIX_MMAP_ADAPTER)
+                .map_err(|e| LengError::Malformed(format!("posix mmap adapter parse: {e:?}")))?,
+            exports: mmaps,
+            ..Default::default()
+        })
+    };
+    let mut out = vec![compute_shim_unit(compute_exports)?, open_adapter];
+    out.extend(mmap_adapter);
+    Ok(out)
 }
 
 /// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).
