@@ -821,6 +821,10 @@ fn nim_import_binding(name: &str) -> Option<NimImport> {
     Some(match name {
         "write" => NimImport::Stdout,
         "open" => NimImport::Open,
+        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
+        // the shim's allocator handed it.
+        "read" => NimImport::Posix(temen_posix::OP_READ),
+        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
         n if n.starts_with("cExitSys") => NimImport::Exit,
         n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
         n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
@@ -2163,6 +2167,55 @@ fn x_nif_mtime(dir: &std::path::Path, stem: &str) -> std::time::SystemTime {
 /// for stdout-only programs), so until now nothing on the leng route had ever opened a file. This is
 /// the smallest program that does, and the gate for the ABI reconciliation the route needs: C's
 /// `open` takes a NUL-terminated `char*` where every `temen_posix` path op takes `(ptr, len)`.
+#[test]
+fn nim_memory_maps_a_file_through_the_posix_personality() {
+    // #1595. nim reads a file by **mapping** it: `memfiles.open` is `open` + `fstat` + `mmap(fd)`.
+    // Both of the last two were fail-closed compute-shim stubs — `fstat` reported size 0, and the
+    // shim's `mmap` is the heap bump allocator, which ignores `fd` and hands back uninitialized
+    // pages. So every mapped file read as empty, and hexer asserted in `jumpTo` on a zero-length
+    // buffer rather than compiling its input.
+    //
+    // This is the small, fast version of that path: map a seeded file and read its bytes back.
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_memory_maps_a_file_through_the_posix_personality (no toolchain)");
+        return;
+    };
+    let mods = compile_to_leng(
+        &path,
+        "import std/syncio\n\
+         import std/memfiles\n\
+         try:\n\
+         \x20 var mf = memfiles.open(\"/in.txt\")\n\
+         \x20 write(stdout, \"size=\" & $mf.size & \"|\")\n\
+         \x20 var s = newString(mf.size)\n\
+         \x20 for i in 0 ..< mf.size:\n\
+         \x20   s[i] = cast[ptr UncheckedArray[char]](mf.mem)[i]\n\
+         \x20 write(stdout, s)\n\
+         \x20 mf.close()\n\
+         except:\n\
+         \x20 write(stdout, \"MMAP FAILED\")\n",
+    );
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+        .unwrap_or_else(|e| panic!("posix-route link: {e}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    let posix = run_io_capture(
+        &m,
+        temen_run::Backend::TreeWalk,
+        &temen_run::RunConfig::default(),
+        &[("/in.txt", b"mapped bytes")],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&posix.stdout()),
+        "size=12|mapped bytes",
+        "the mapping must carry the file's real size and its real bytes"
+    );
+}
+
 #[test]
 fn nim_reads_and_writes_files_through_the_posix_personality() {
     let Some(path) = toolchain_path() else {
