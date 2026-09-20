@@ -886,7 +886,20 @@ fn run_io_capture(
     for (path, bytes) in seed {
         posix.write_file(path, bytes);
     }
-    let inst = temen_run::instantiate_with_imports(m.clone(), imports)
+    // Apply the window override **here**, before instantiating. `RunConfig::memory_size_log2` is
+    // honoured by `open_coop_session`, `run_with_caps_and_host`, `debug_run_with_caps`,
+    // `run_with_caps_parallel` and `run_diff` — but *not* by the `run` this path calls, so setting
+    // it was a silent no-op. `NIM_NIFLER2_SL` is documented as existing so a window need can be
+    // "measured rather than argued", and it measured nothing: a 1 MiB window produced the identical
+    // fault as 256 MiB, which is impossible for a guest whose heap alone is 23 MiB.
+    let mut m = m.clone();
+    if let Some(size_log2) = config.memory_size_log2 {
+        m.memory = Some(temen_ir::Memory {
+            size_log2,
+            shadow: None,
+        });
+    }
+    let inst = temen_run::instantiate_with_imports(m, imports)
         .unwrap_or_else(|e| panic!("instantiate manifest module: {e}"));
     if let Err(e) = inst.run(backend, config) {
         // A guest that wrote before it died names its own problem — the plain `?` dropped that with
