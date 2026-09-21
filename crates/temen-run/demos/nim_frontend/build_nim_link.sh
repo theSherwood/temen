@@ -55,5 +55,5 @@ TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 
 echo "[4/4] prep_temen (decode/verify/bytecode-compile) + gzip the committed asset ..."
 cargo run --release -p temen-run --example prep_temen -- "$CACHE/nl_raw.temen" "$CACHE/nim-link.temen"
-gzip -9 -c "$CACHE/nim-link.temen" > "$HERE/fixtures/nim-link.temen.gz"
+gzip -9 -n -c "$CACHE/nim-link.temen" > "$HERE/fixtures/nim-link.temen.gz"
 echo "done: $HERE/fixtures/nim-link.temen.gz ($(du -h "$HERE/fixtures/nim-link.temen.gz" | cut -f1))"

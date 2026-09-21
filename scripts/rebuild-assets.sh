@@ -212,7 +212,7 @@ if want nim_phases; then
     ok=1
     for p in nimsem hexer; do
       if [ -f "$E2E_OUT/$p.temen" ] && validate "$E2E_OUT/$p.temen"; then
-        gzip -9 -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
+        gzip -9 -n -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
       else
         ok=0
       fi

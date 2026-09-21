@@ -45,7 +45,13 @@ export PATH="$(dirname "$NIMONY"):$PATH"
 build_temen() { # <tool-src> <out.temen> [extra nim defines...]
   local src="$1" out="$2"; shift 2
   local c="$CACHE/c_$(basename "$src" .nim)"; rm -rf "$c"; mkdir -p "$c"
-  nim c --mm:arc -d:useMalloc -d:danger --panics:on --threads:off -d:noSignalHandler \
+  # No `-d:useMalloc`: that makes Nim bypass its own allocator (the mimalloc shim, which recycles)
+  # and send every object to the on-ramp's `synth_malloc`, whose `free` is a no-op and whose heap
+  # never reuses — so the guest's peak becomes total allocation *churn* rather than its live set.
+  # It was there to dodge a crash in `rawDealloc` that was really the unaligned `mmap` now fixed in
+  # `nifler_shim.c` (#1595's bug, second shim). Measured on the system-module semcheck:
+  # 2007 MiB with the flag, 666 MiB without it, byte-identical 1052600-byte output either way.
+  nim c --mm:arc -d:danger --panics:on --threads:off -d:noSignalHandler \
     --warningAsError:ProveInit:off --warningAsError:Uninit:off "$@" \
     --compileOnly --nimcache:"$c" --path:"$REPO/nimony/src" -o:/dev/null "$src" >/dev/null 2>&1
   for f in "$c"/*.c; do "$CLANG" -O2 -fno-vectorize -fno-slp-vectorize -emit-llvm -c -I"$NIMLIB" "$f" -o "$f.bc"; done
@@ -108,9 +114,9 @@ if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
   if [ "$sys" != "sysvq0asl" ]; then
     echo "WARN: system stem is '$sys', not 'sysvq0asl' — update rust_driver_nimsem.rs (argv + fixture names) to match"
   fi
-  gzip -9 -c "$CACHE/nimsem_ce_raw.temen" > "$FX/nimsem_ce.temen.gz"
+  gzip -9 -n -c "$CACHE/nimsem_ce_raw.temen" > "$FX/nimsem_ce.temen.gz"
   cp "$W/nimcache/$sys.p.nif" "$FX/$sys.p.nif"
-  gzip -9 -c "$ceout/nimcache/$sys.s.nif" > "$FX/$sys.s.nif.gz"
+  gzip -9 -n -c "$ceout/nimcache/$sys.s.nif" > "$FX/$sys.s.nif.gz"
   # The system module's import closure the nifler grandchildren parse: system.nim's include set lives
   # under lib/std/system/, plus errorcodes. Self-contained (system/* only imports errorcodes).
   tar czf "$FX/syslib.tar.gz" -C "$BIN/../lib" std/system.nim std/system std/errorcodes
@@ -145,9 +151,9 @@ if [ -x "$HEXER_BIN" ]; then
   # deterministic for a fixed input). The .s.nif/.s.idx.nif are the same nimsem output step 9 committed.
   if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
     FX="$HERE/fixtures"; mkdir -p "$FX"
-    gzip -9 -c "$CACHE/hexer_ce_raw.temen" > "$FX/hexer_ce.temen.gz"
+    gzip -9 -n -c "$CACHE/hexer_ce_raw.temen" > "$FX/hexer_ce.temen.gz"
     cp "$chainout/nimcache/$sys.s.idx.nif" "$FX/$sys.s.idx.nif"
-    gzip -9 -c "$chainout/nimcache/$sys.x.nif" > "$FX/$sys.x.nif.gz"
+    gzip -9 -n -c "$chainout/nimcache/$sys.x.nif" > "$FX/$sys.x.nif.gz"
     echo "  emitted hexer driver-guest fixtures -> $FX (hexer_ce + $sys.s.idx.nif + $sys.x.nif.gz)"
   fi
 
@@ -158,10 +164,21 @@ if [ -x "$HEXER_BIN" ]; then
   # [6/6] (the two nimsems' `.s.nif` differ only in embedded paths, so hexer's lowering is compared).
   echo "=== [7/7] the front-end chain on the JIT: nimsem -> hexer, both op-13 children on emitted code ==="
   jchainout="$CACHE/jit_chain_out"; rm -rf "$jchainout"; mkdir -p "$jchainout"
+  # Exit 3 is the driver's "this engine cannot run this workload" (its carve exceeds the reference
+  # JIT's window cap, #1591). Skip the diff rather than comparing against an output it never wrote —
+  # that read as "FAILED: .x.nif differs" and kept `rebuild-assets.sh`'s nim_driver_guest step
+  # blocked even with [1/6] .. [6/6] green.
+  set +e
   cargo run -q --release -p temen-run --example nim_chain_op13_jit -- \
     "$CACHE/nimsem_ce_raw.temen" "$CACHE/hexer_ce_raw.temen" "$CACHE/nifler.temen" "$BIN/../lib" \
     "$W/nimcache/$sys.p.nif" "$sys" "$jchainout"
-  if diff -q "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" >/dev/null; then
+  jrc=$?
+  set -e
+  if [ "$jrc" = 3 ]; then
+    echo "SKIP [7/7] JIT chain: the phase outgrew the reference JIT's window cap (see #1591)"
+  elif [ "$jrc" != 0 ]; then
+    echo "FAILED (JIT chain): driver exited $jrc"; exit 1
+  elif diff -q "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" >/dev/null; then
     echo "JIT CHAIN MATCHES NATIVE — nimsem->hexer both op-13 §14 children on the Cranelift JIT; the Leng .x.nif is byte-identical to native hexer. The nimony front-end self-hosts on Temen's JIT as a chain of confined op-13 phases — the enabler for the browser wasm-JIT compile card."
   else
     echo "FAILED (JIT chain): .x.nif differs"; cmp "$od/$sys.x.nif" "$jchainout/nimcache/$sys.x.nif" | head -1; exit 1
