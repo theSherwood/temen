@@ -396,8 +396,10 @@ block 5 (vi6: i64) {{
 /// The elapsed-time bound is the pin on the wake route itself (`thread_notify` →
 /// `Domain::wake_child_tasks`). Without it the pair still finishes — an idle worker's cadence
 /// sweep is the correctness backstop — but every handoff then waits out a sweep. Measured on this
-/// box: 0.16s with the route, 4.17s with it mutated out. The threshold sits between, with a wide
-/// margin on both sides.
+/// 4-core box: 0.16s with the route, 4.17s with it mutated out. The broken figure is wall-clock
+/// (400 handoffs × the 20 ms cadence) and so is machine-independent; the healthy one is real work
+/// and will be slower on a loaded 2-core runner. The threshold is placed between with room on both
+/// sides — well over any plausible healthy run, comfortably under the 4 s floor of a broken one.
 #[test]
 fn two_child_tasks_ping_pong_through_the_futex_without_waiting_on_the_sweep() {
     let p = module(&parent(TAIL_SUM));
@@ -411,7 +413,7 @@ fn two_child_tasks_ping_pong_through_the_futex_without_waiting_on_the_sweep() {
     );
     let elapsed = start.elapsed();
     assert!(
-        elapsed < std::time::Duration::from_millis(1200),
+        elapsed < std::time::Duration::from_millis(2000),
         "400 handoffs took {elapsed:?} — the notify wake route is not reaching parked tasks"
     );
 }
