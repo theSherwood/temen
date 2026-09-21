@@ -5049,6 +5049,92 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// How a retained nimony syscall import is served — the **one** table for the no-C (Leng) bottom
+/// edge, consulted both by the binder and by anything reporting unbound leaves.
+///
+/// They were two: a binder matching `write`/`open` then a prefix chain, and a probe carrying its own
+/// hardcoded list. Teaching one about a newly served leaf left the other reporting it unbound — the
+/// second route through one behaviour that INVARIANTS #15 is about.
+#[derive(Clone, Copy, Debug)]
+pub enum NimImport {
+    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
+    Stdout,
+    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
+    /// file operation, and the compute shim's `{ return }` stub made `quit` a no-op, so every nim
+    /// CLI error path ran on past the `quit` that should have ended it.
+    Exit,
+    /// `temen_leng`'s `POSIX_OPEN_ADAPTER` forward: a bare `open` taking the `(ptr, len, flags)` the
+    /// op wants. Binding C's `open` directly reads the flags word as the path length.
+    Open,
+    /// A retained nimony syscall leaf → the matching `temen_posix` op.
+    Posix(u32),
+}
+
+/// Which [`NimImport`] serves `name`, or `None` if nothing does.
+pub fn nim_import_binding(name: &str) -> Option<NimImport> {
+    Some(match name {
+        "write" => NimImport::Stdout,
+        "open" => NimImport::Open,
+        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
+        // the shim's allocator handed it.
+        "read" => NimImport::Posix(temen_posix::OP_READ),
+        // The path-ABI adapter's other forwards (#1595): nim writes files atomically, so a file
+        // write is write-temp + rename, with an unlink on the failure path.
+        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
+        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
+        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
+        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
+        // read at the declared `st_mode`/`st_size` offsets answers garbage, so `fileExists` is false
+        // for every file and a compiler cannot find its own inputs.
+        "statp" => NimImport::Posix(temen_posix::OP_STATP),
+        n if n.starts_with("cExitSys") => NimImport::Exit,
+        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
+        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
+        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
+        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
+        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        n if n.starts_with("chdir") => NimImport::Posix(temen_posix::OP_CHDIR),
+        // #1595: `memfiles.open` sizes a mapping with `fstat`, so a 0-returning stub made every
+        // mapped file look empty.
+        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
+        _ => return None,
+    })
+}
+
+/// Bind every retained import of a no-C nim module to one shared **POSIX personality**, returning
+/// the [`Imports`] and the personality itself (so a caller reads back stdout, or a file the guest
+/// wrote). Unserved names are returned rather than panicked on — a caller that wants them fatal can
+/// say so, and a probe reporting "unbound leaves" wants the list.
+pub fn nim_posix_imports(
+    module: &Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+) -> (Imports, Vec<String>) {
+    let _ = posix;
+    let mut imports = Imports::new();
+    let mut unbound = Vec::new();
+    for imp in &module.imports {
+        let Some(kind) = nim_import_binding(&imp.name) else {
+            unbound.push(imp.name.clone());
+            continue;
+        };
+        let cap = match kind {
+            NimImport::Stdout => HostCap::stdout(),
+            NimImport::Exit => HostCap::exit(),
+            NimImport::Open => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+            }
+            NimImport::Posix(op) => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(op, move || (*make)())
+            }
+        };
+        imports = imports.provide(imp.name.clone(), cap);
+    }
+    (imports, unbound)
+}
+
 /// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
 /// subdirectories. Deduplicated by stem, first one wins.
 pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
