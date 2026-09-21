@@ -326,7 +326,18 @@ pub(crate) struct FnPtrSig {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TyDesc {
     /// A full-width scalar: `i32`/`i64`/`f32`/`f64`, loaded/stored with the plain `iN.load`/`store`.
-    Scalar(ValType),
+    ///
+    /// `unsigned` records what `int_ty_signed` already knows at construction and this used to
+    /// discard. Leng's `eq`/`neq`/`lt`/`le` carry **no type node** — unlike `div`/`shr`/the arith
+    /// forms — so [`Translator::compare`] has to recover signedness from its operands, and an
+    /// lvalue's only witness is its `TyDesc`. Without the bit, every comparison of a `uint64` field
+    /// lowered to `lt_s`, which is right for every value below `2^63` and wrong above it (#1612:
+    /// nimsem's `10 <= high(uint64)` came out false, so an integer literal could never adopt a
+    /// `uint64` parameter). Sub-word integers already carried it as `Narrow::signed`.
+    Scalar {
+        ty: ValType,
+        unsigned: bool,
+    },
     /// A **sub-word integer** — 1 or 2 bytes (`u8`/`i8`/`u16`/`i16`, e.g. `char`) — loaded and
     /// stored with `iN.load8/16`/`store8/16`. Its SSA value type is `i32` (the load zero-/sign-
     /// extends per `signed`). nimony reads these through pointer casts (`=destroy` checks a string's
@@ -354,9 +365,22 @@ pub(crate) enum TyDesc {
 impl TyDesc {
     /// The machine type of a value held in one SSA slot / scalar memory cell (a pointer is `i64`);
     /// `None` for a `Narrow` char cell or an aggregate (handled on their own paths).
+    /// Whether this describes an **unsigned integer** — the question Leng's untyped `eq`/`neq`/
+    /// `lt`/`le` forms cannot answer from the node alone (#1612). A pointer is not one: nimony
+    /// compares pointers for identity, and `eq`/`ne` are signedness-agnostic anyway.
+    fn is_unsigned_int(&self) -> bool {
+        match self {
+            TyDesc::Scalar { ty, unsigned } => {
+                *unsigned && !matches!(ty, ValType::F32 | ValType::F64)
+            }
+            TyDesc::Narrow { signed, .. } => !*signed,
+            _ => false,
+        }
+    }
+
     fn scalar_ty(&self) -> Option<ValType> {
         match self {
-            TyDesc::Scalar(t) => Some(*t),
+            TyDesc::Scalar { ty: t, .. } => Some(*t),
             TyDesc::Ptr(_) => Some(ValType::I64),
             // A funcref value is an `i32` function index (its 8-byte slot notwithstanding).
             TyDesc::FnPtr(_) => Some(ValType::I32),
@@ -868,7 +892,11 @@ impl Translator {
                                 // (`int_store_width` → `None`) and handled just below.
                                 self.data_inits
                                     .push((off, (v as u64).to_le_bytes()[..w].to_vec()));
-                            } else if let TyDesc::Scalar(ValType::F32 | ValType::F64) = &desc {
+                            } else if let TyDesc::Scalar {
+                                ty: ValType::F32 | ValType::F64,
+                                ..
+                            } = &desc
+                            {
                                 // A **float scalar global** (`var pi = 3.14`, `let x = foo[float]()`
                                 // → `(conv (f 64) 123)`). Fold the constant to its little-endian
                                 // float bytes and seed the window, exactly as the int-scalar case
@@ -972,8 +1000,16 @@ impl Translator {
                             // (An `Rtti` vtable now materializes above; this remains for genuinely
                             // opaque RTTI internals whose bytes no translatable code reads.)
                             const VT_PLACEHOLDER: u64 = 64;
-                            self.globals
-                                .insert(name, (off, TyDesc::Scalar(ValType::I64)));
+                            self.globals.insert(
+                                name,
+                                (
+                                    off,
+                                    TyDesc::Scalar {
+                                        ty: ValType::I64,
+                                        unsigned: false,
+                                    },
+                                ),
+                            );
                             off += VT_PLACEHOLDER;
                         }
                     }
@@ -1170,18 +1206,24 @@ impl Translator {
                     (
                         es,
                         a.len().saturating_sub(1) * es,
-                        TyDesc::FlexArray(Box::new(ed.unwrap_or(TyDesc::Scalar(ValType::I64)))),
+                        TyDesc::FlexArray(Box::new(ed.unwrap_or(TyDesc::Scalar {
+                            ty: ValType::I64,
+                            unsigned: false,
+                        }))),
                     )
                 }
                 _ => return Ok(None),
             };
             let w = elem_size.min(8);
             let mut bytes = vec![0u8; total];
-            let felem = TyDesc::Scalar(if elem_size == 4 {
-                ValType::F32
-            } else {
-                ValType::F64
-            });
+            let felem = TyDesc::Scalar {
+                ty: if elem_size == 4 {
+                    ValType::F32
+                } else {
+                    ValType::F64
+                },
+                unsigned: false,
+            };
             for (i, v) in a[1..].iter().enumerate() {
                 let off = i * elem_size;
                 if let Some(n) = int_literal(v) {
@@ -1251,7 +1293,10 @@ impl Translator {
             let off = *off as usize;
             if let Some(v) = int_literal(&ka[1]) {
                 let w = match fdesc {
-                    TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
+                    TyDesc::Scalar {
+                        ty: ValType::I32 | ValType::F32,
+                        ..
+                    } => 4,
                     _ => 8,
                 };
                 if bytes.len() < off + w {
@@ -1329,7 +1374,13 @@ impl Translator {
                     // dynamic dispatch; `dy` feeds `of`/type-name display, tolerant of a null here.
                     None => {}
                 }
-            } else if matches!(fdesc, TyDesc::Scalar(ValType::F32 | ValType::F64)) {
+            } else if matches!(
+                fdesc,
+                TyDesc::Scalar {
+                    ty: ValType::F32 | ValType::F64,
+                    ..
+                }
+            ) {
                 // A **float field** value (`(kv x 1.0)`, `(kv y 2.0)` — nimony emits object consts
                 // with float members, e.g. a shared 2-D `Shape`). Fold to the field's-width float
                 // bits. `const_float_bytes` fails closed if the value isn't a foldable float or the
@@ -1356,8 +1407,11 @@ impl Translator {
     /// Byte size of a type descriptor.
     fn sizeof(&self, d: &TyDesc) -> u64 {
         match d {
-            TyDesc::Scalar(ValType::I32 | ValType::F32) => 4,
-            TyDesc::Scalar(_) => 8,
+            TyDesc::Scalar {
+                ty: ValType::I32 | ValType::F32,
+                ..
+            } => 4,
+            TyDesc::Scalar { .. } => 8,
             TyDesc::Ptr(_) => 8,
             TyDesc::FnPtr(_) => 8, // a full pointer-word slot, though accessed as an i32 index
             TyDesc::FlexArray(_) => 0, // a size-0 inline tail
@@ -1503,9 +1557,15 @@ impl Translator {
                     Ok(TyDesc::FnPtr(Box::new(self.proctype_sig(t)?)))
                 }
                 Some(t) if t.tag() != Some("void") => Ok(TyDesc::Ptr(Box::new(self.tydesc(t)?))),
-                _ => Ok(TyDesc::Scalar(ValType::I64)),
+                _ => Ok(TyDesc::Scalar {
+                    ty: ValType::I64,
+                    unsigned: false,
+                }),
             },
-            Some("f") => Ok(TyDesc::Scalar(float_ty(node)?)),
+            Some("f") => Ok(TyDesc::Scalar {
+                ty: float_ty(node)?,
+                unsigned: false,
+            }),
             // A sub-word integer (`u8`/`i8`/`u16`/`i16`, `char`) is a `Narrow` scalar — loaded and
             // stored at its true width, not widened to a 4/8-byte access.
             Some("i" | "u" | "c") => {
@@ -1523,13 +1583,22 @@ impl Translator {
                         } else if bytes <= 16 {
                             Ok(TyDesc::Narrow { bytes: 2, signed })
                         } else {
-                            Ok(TyDesc::Scalar(ValType::I32))
+                            Ok(TyDesc::Scalar {
+                                ty: ValType::I32,
+                                unsigned: !signed,
+                            })
                         }
                     }
-                    _ => Ok(TyDesc::Scalar(vt)),
+                    _ => Ok(TyDesc::Scalar {
+                        ty: vt,
+                        unsigned: !signed,
+                    }),
                 }
             }
-            Some(_) => Ok(TyDesc::Scalar(int_ty(node)?)),
+            Some(_) => Ok(TyDesc::Scalar {
+                ty: int_ty(node)?,
+                unsigned: false,
+            }),
             None => match node.as_atom() {
                 // A bare-symbol type is an aggregate only if it's a declared object/array; any other
                 // named type (enum, distinct int, proctype, opaque external) is an integer scalar —
@@ -1542,7 +1611,10 @@ impl Translator {
                 Some(name) if self.ty_aliases.contains_key(name) => {
                     Ok(self.ty_aliases[name].clone())
                 }
-                Some(_) => Ok(TyDesc::Scalar(ValType::I64)),
+                Some(_) => Ok(TyDesc::Scalar {
+                    ty: ValType::I64,
+                    unsigned: false,
+                }),
                 None => Err(LengError::Malformed("expected a type".into())),
             },
         }
@@ -1782,7 +1854,10 @@ impl Translator {
                                 fields.push((
                                     RTTI_VT_FIELD.to_string(),
                                     0,
-                                    TyDesc::Scalar(ValType::I64),
+                                    TyDesc::Scalar {
+                                        ty: ValType::I64,
+                                        unsigned: false,
+                                    },
                                 ));
                                 off = 8;
                             }
@@ -1971,8 +2046,16 @@ impl Translator {
         self.own_stem = own_stem.to_string();
         for (name, &off) in layout {
             self.ext_tls_layout.insert(name.clone(), off);
-            self.tls_vars
-                .insert(name.clone(), (off, TyDesc::Scalar(ValType::I64)));
+            self.tls_vars.insert(
+                name.clone(),
+                (
+                    off,
+                    TyDesc::Scalar {
+                        ty: ValType::I64,
+                        unsigned: false,
+                    },
+                ),
+            );
         }
     }
 
@@ -2990,10 +3073,10 @@ impl Translator {
         // Spilled scalar params get a frame slot too (their incoming value is stored there at entry).
         for (pn, _) in &spill_params {
             if !mem.contains_key(pn) {
-                let desc = local_desc
-                    .get(pn)
-                    .cloned()
-                    .unwrap_or(TyDesc::Scalar(ValType::I64));
+                let desc = local_desc.get(pn).cloned().unwrap_or(TyDesc::Scalar {
+                    ty: ValType::I64,
+                    unsigned: false,
+                });
                 let sz = self.sizeof(&desc);
                 mem.insert(pn.clone(), (frame_size, desc));
                 frame_size += sz.max(8);
@@ -3511,7 +3594,10 @@ impl<'a> FuncGen<'a> {
                         .ext_globals
                         .get(name)
                         .cloned()
-                        .unwrap_or(TyDesc::Scalar(ValType::I64));
+                        .unwrap_or(TyDesc::Scalar {
+                            ty: ValType::I64,
+                            unsigned: false,
+                        });
                     let addr = self.emit_data_sym(&cname, 0);
                     return Ok((addr, desc));
                 }
@@ -3555,7 +3641,13 @@ impl<'a> FuncGen<'a> {
                 // symbol is a miscompile, so it falls to the error below instead (#1480).
                 if self.t.link_mode && !self.local_desc.contains_key(name) {
                     let addr = self.emit_data_sym(name, 0);
-                    return Ok((addr, TyDesc::Scalar(ValType::I64)));
+                    return Ok((
+                        addr,
+                        TyDesc::Scalar {
+                            ty: ValType::I64,
+                            unsigned: false,
+                        },
+                    ));
                 }
                 Err(LengError::Unsupported(format!(
                     "`{name}` is not an addressable lvalue"
@@ -3733,7 +3825,7 @@ impl<'a> FuncGen<'a> {
     fn load_lvalue(&mut self, node: &Node) -> Result<Val, LengError> {
         let (addr, desc) = self.lvalue_addr(node)?;
         match desc {
-            TyDesc::Scalar(ty) => {
+            TyDesc::Scalar { ty, .. } => {
                 let id = self.fresh();
                 self.used_memory = true;
                 self.cur_buf
@@ -3818,7 +3910,7 @@ impl<'a> FuncGen<'a> {
             return self.assign_aggregate(addr, &desc, rhs);
         }
         let ty = match desc {
-            TyDesc::Scalar(t) => t,
+            TyDesc::Scalar { ty: t, .. } => t,
             TyDesc::Ptr(_) => ValType::I64,
             TyDesc::Narrow { .. } => unreachable!("handled above"),
             TyDesc::FnPtr(_) => unreachable!("handled above"),
@@ -4078,7 +4170,7 @@ impl<'a> FuncGen<'a> {
     /// constructs/copies via [`assign_aggregate`].
     fn store_member(&mut self, addr: u32, desc: &TyDesc, expr: &Node) -> Result<(), LengError> {
         match desc {
-            TyDesc::Scalar(ty) => {
+            TyDesc::Scalar { ty, .. } => {
                 let v = self.expr_typed(expr, *ty)?;
                 self.used_memory = true;
                 self.cur_buf
@@ -5080,9 +5172,10 @@ impl<'a> FuncGen<'a> {
     fn arith_ty(&self, node: &Node) -> Result<(ValType, bool, u32), LengError> {
         if node.tag().is_none() && node.as_atom().is_some() {
             return match self.t.tydesc(node)? {
-                TyDesc::Scalar(vt @ (ValType::I32 | ValType::I64)) => {
-                    Ok((vt, false, if vt == ValType::I64 { 64 } else { 32 }))
-                }
+                TyDesc::Scalar {
+                    ty: vt @ (ValType::I32 | ValType::I64),
+                    ..
+                } => Ok((vt, false, if vt == ValType::I64 { 64 } else { 32 })),
                 TyDesc::Narrow { bytes, signed } => Ok((
                     if bytes > 4 {
                         ValType::I64
@@ -5320,6 +5413,14 @@ impl<'a> FuncGen<'a> {
     fn operand_unsigned(&self, node: &Node) -> bool {
         if let Some(sym) = node.as_atom() {
             return self.unsigned.contains(sym) || self.t.unsigned_globals.contains(sym);
+        }
+        // An **lvalue** — a field, an element, a deref — carries its unsignedness in its declared
+        // type, not in its syntax, so ask the type. This was the #1612 hole: `a.val < b.val` on a
+        // `uint64` field is syntactically none of the cases below, fell through to `false`, and
+        // lowered to `lt_s`. That is right for every value under `2^63` and wrong above it, so it
+        // stayed invisible until nimsem compared a literal against `high(uint64)`.
+        if matches!(node.tag(), Some("dot" | "at" | "pat" | "deref")) {
+            return self.lvalue_type(node).is_some_and(|d| d.is_unsigned_int());
         }
         match node.tag() {
             // `(suf <lit> "u32")` — a suffixed unsigned literal.
@@ -6389,8 +6490,12 @@ fn const_scalar_int(node: &Node) -> Option<i64> {
 /// aggregates, so a float/aggregate global falls through to its own materialization path.
 fn int_store_width(desc: &TyDesc) -> Option<usize> {
     match desc {
-        TyDesc::Scalar(ValType::I32) => Some(4),
-        TyDesc::Scalar(ValType::I64) => Some(8),
+        TyDesc::Scalar {
+            ty: ValType::I32, ..
+        } => Some(4),
+        TyDesc::Scalar {
+            ty: ValType::I64, ..
+        } => Some(8),
         TyDesc::Narrow { bytes, .. } => Some(*bytes as usize),
         _ => None,
     }
@@ -6403,7 +6508,9 @@ fn const_float_bytes(init: &Node, desc: &TyDesc) -> Result<Vec<u8>, LengError> {
     #[cfg(feature = "float")]
     if let Some(f) = const_float(init) {
         return Ok(match desc {
-            TyDesc::Scalar(ValType::F32) => (f as f32).to_bits().to_le_bytes().to_vec(),
+            TyDesc::Scalar {
+                ty: ValType::F32, ..
+            } => (f as f32).to_bits().to_le_bytes().to_vec(),
             _ => f.to_bits().to_le_bytes().to_vec(),
         });
     }
