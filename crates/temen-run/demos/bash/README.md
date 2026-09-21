@@ -280,7 +280,7 @@ viability evidence. The only gap was a *missing* coreutil: `tr` wasn't staged, s
 (word frequency) produced nothing. Added a small chibicc-safe `tr` (`SET1→SET2` translate, `-d`
 delete, `\n`/`\t` escapes, `a-z` ranges) to `posix_utils` + `stage_bin.sh`. (Also noted: deep
 recursion through `$(...)` command-substitution — e.g. un-memoized fib(10) — is *correct* but slow,
-since each call forks a subshell and svm forks are heavier than native; a perf characteristic, not a
+since each call forks a subshell and temen forks are heavier than native; a perf characteristic, not a
 bug.) Pinned by three whole-program capstone scripts (quicksort, the state-machine parse, the
 `tr`+`sort` word-frequency counter).
 

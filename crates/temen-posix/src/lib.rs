@@ -1528,7 +1528,7 @@ impl Posix {
         let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.executables.insert(path.to_string());
         if !st.files.contains_key(path) {
-            st.file_put(path.to_string(), b"\x7fSVM".to_vec());
+            st.file_put(path.to_string(), b"\x7fTEMEN".to_vec());
         }
     }
 
