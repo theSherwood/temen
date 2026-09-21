@@ -45,7 +45,13 @@ export PATH="$(dirname "$NIMONY"):$PATH"
 build_temen() { # <tool-src> <out.temen> [extra nim defines...]
   local src="$1" out="$2"; shift 2
   local c="$CACHE/c_$(basename "$src" .nim)"; rm -rf "$c"; mkdir -p "$c"
-  nim c --mm:arc -d:useMalloc -d:danger --panics:on --threads:off -d:noSignalHandler \
+  # No `-d:useMalloc`: that makes Nim bypass its own allocator (the mimalloc shim, which recycles)
+  # and send every object to the on-ramp's `synth_malloc`, whose `free` is a no-op and whose heap
+  # never reuses — so the guest's peak becomes total allocation *churn* rather than its live set.
+  # It was there to dodge a crash in `rawDealloc` that was really the unaligned `mmap` now fixed in
+  # `nifler_shim.c` (#1595's bug, second shim). Measured on the system-module semcheck:
+  # 2007 MiB with the flag, 666 MiB without it, byte-identical 1052600-byte output either way.
+  nim c --mm:arc -d:danger --panics:on --threads:off -d:noSignalHandler \
     --warningAsError:ProveInit:off --warningAsError:Uninit:off "$@" \
     --compileOnly --nimcache:"$c" --path:"$REPO/nimony/src" -o:/dev/null "$src" >/dev/null 2>&1
   for f in "$c"/*.c; do "$CLANG" -O2 -fno-vectorize -fno-slp-vectorize -emit-llvm -c -I"$NIMLIB" "$f" -o "$f.bc"; done

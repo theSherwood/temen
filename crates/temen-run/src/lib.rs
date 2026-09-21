@@ -5001,12 +5001,16 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// | 1 GiB | fault at `0x40000000` (+0) |
 /// | 2 GiB | joined 0, output byte-identical (path-normalized) to native |
 ///
-/// The **top-level** run of the same work peaks at 2043 MiB RSS, so a child wastes nothing — that is
-/// simply the cost on nimony's allocator, and the old floor of 256 MiB was never going to do. (Worth
-/// stating, because raising a constant until a failure stops is also how a leak gets buried: had
-/// top-level peaked far lower, the floor would have been the wrong fix.) The floor is 32 rather than
-/// 31 because 2 GiB clears the real peak by ~5 MiB — 0.25%, one stdlib module from regressing — and
-/// a carve is demand-paged address space, so the headroom costs no RAM.
+/// Those numbers were taken against a guest built with `-d:useMalloc`, which made Nim bypass its own
+/// allocator and send every object to the on-ramp's `synth_malloc` — whose `free` is a no-op, so the
+/// peak was total allocation *churn* rather than the live set. That flag existed to dodge a crash in
+/// `rawDealloc` that was really an unaligned `mmap` (#1595's bug in a second shim). With the
+/// alignment fixed and the flag dropped, the same work peaks at **666 MiB** instead of 2007 MiB, for
+/// byte-identical output — so the floor is 30 (1 GiB), the first power of two that clears it.
+///
+/// Worth stating why the measurement came first: raising a constant until a failure stops is how a
+/// leak gets buried. Here the top-level run and the op-13 child agreed at every step, which is what
+/// said the child wasted nothing — and what left the allocator as the only remaining explanation.
 ///
 /// **One floor, not six.** This formula was copied into `nimsem_child_driver`, `nim_chain_op13`
 /// (twice), `nim_chain_op13_jit` (twice) and `nim_link_fs_asset`, each with its own comment
@@ -5018,8 +5022,8 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// `TEMEN_NIM_PHASE_SL` overrides the floor, for re-measuring. (It replaces the narrower
 /// `TEMEN_NIMSEM_CHILD_SL`, which named only one of the phases that share this budget.)
 pub fn nim_phase_carve_log2(declared_size_log2: u32) -> u32 {
-    /// The measured floor; see the table above.
-    const FLOOR: u32 = 32;
+    /// The measured floor; see the table above. 1 GiB clears the 666 MiB peak.
+    const FLOOR: u32 = 30;
     let floor = std::env::var("TEMEN_NIM_PHASE_SL")
         .ok()
         .and_then(|v| v.parse().ok())
