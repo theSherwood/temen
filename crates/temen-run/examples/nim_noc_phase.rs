@@ -15,11 +15,28 @@
 //! C shim, so it takes the real fork/exec path, which this personality does not serve — there is no
 //! `execve` op and argv[0] is a shell.
 //!
-//! Seeding the stdlib *and* a matching `nimcache` makes the question moot: every dependency already
-//! has a current `.p.nif`, the freshness check passes, and nothing is spawned. That is the same
-//! staging the LLVM drivers do ("seeded 287 files into the shared memfs") and it isolates what is
-//! actually under test — whether the phase *compiles correctly* when built with no C compiler.
-//! Serving fork/exec for real is a separate piece of work.
+//! Seeding the stdlib *and* a matching `nimcache` does **not** avoid that, and it is worth recording
+//! why: the `.p.nif` stems are **path-derived**. The guest resolves `lib/system/basic_types.nim` and
+//! wants `nimcache/basu363p61.p.nif`; a native run computed its stem from an absolute stdlib path
+//! and produced a different one. The freshness check can never match, so `m` shells out however much
+//! is seeded. Serving fork/exec is the real answer, and it is its own piece of work — `OP_FORK` is a
+//! genuine return-twice clone, but no op exposes the `Host`'s FORK.md §8.6 `execve` image-replace,
+//! and argv[0] is a shell.
+//!
+//! **What does run today, byte-exact.** `nimsem x <module>.s.nif` — index generation — is
+//! self-contained: it walks the semchecked module and emits `(index (checksum …))`, no dependency
+//! resolution, no shell-out. A no-C-built nimsem produces a `.idx.nif` **byte-identical to native**,
+//! checksum included, which means it walked the whole 1.39 MB input and hashed it the same:
+//!
+//! ```text
+//! cargo run --release -p temen-run --example nim_noc_phase -- \
+//!   nimsem_noc.temen .nimtool/nimony/lib <proj>/nimcache /nimcache/<sys>.s.idx.nif \
+//!   -- nimsem x nimcache/<sys>.s.nif
+//! ```
+//!
+//! That is nimsem doing real compiler work, compiled with no C compiler. The full `m` semantic check
+//! is a larger job than index generation and remains blocked on exec — stated plainly so the two are
+//! not confused.
 
 use std::path::Path;
 
