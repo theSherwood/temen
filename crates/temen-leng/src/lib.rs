@@ -1365,10 +1365,18 @@ func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.c
 /// **memory-mapping the same file failed** — the second half of #1595, and invisible until something
 /// mapped a file. Func 0 serves the `sysOpen` shape, func 1 the `open` shape; the differing `mode`
 /// width is why one func cannot serve both (the link checks import shape, #1524).
+///
+/// Funcs 2–4 are `unlink`, `rename` and `stat`, here for the same reason and doing the same walk.
+/// `stat` is the one that decides whether a compiler can *start*: nimony's `fileExists` is
+/// `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, so on the shim's fail-closed stub no file it
+/// looked for existed, and nimsem's first act on a real module was `cannot find <input>`. It
+/// forwards to `statp`, the by-path op that writes the **declared** `struct stat` — not `stat`,
+/// whose short `{mode, size}` a caller with its own `Stat` reads as a garbage mode.
 const POSIX_OPEN_ADAPTER: &str = "\
 import 0 \"open\" (i64, i64, i64) -> (i64)
 import 1 \"unlink\" (i64, i64) -> (i64)
 import 2 \"rename\" (i64, i64, i64, i64) -> (i64)
+import 3 \"statp\" (i64, i64, i64) -> (i64)
 
 func (i64, i32, i64) -> (i32) {
 block 0 (v0: i64, v1: i32, v2: i64) { br 1(v0, v1, v0) }
@@ -1448,6 +1456,23 @@ block 4 (v0: i64, v1: i64, v2: i64, v3: i64) {
   v5 = call.import 2 (v0, v1, v2, v4)
   v6 = i32.wrap_i64 v5
   return v6
+  }
+}
+
+func (i64, i64) -> (i32) {
+block 0 (v0: i64, v1: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = call.import 3 (v0, v3, v1)
+  v5 = i32.wrap_i64 v4
+  return v5
   }
 }";
 
@@ -1719,7 +1744,23 @@ pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit
             .filter(|(n, _)| n.starts_with("c_rename"))
             .map(|(n, _)| (n.clone(), 3)),
     );
-    compute_exports.retain(|(n, _)| !n.starts_with("unlink") && !n.starts_with("c_rename"));
+    // `stat`/`lstat` (the memfs has no symlinks, so they are the same answer). This is the leaf that
+    // decides whether the *compiler* can run at all: every `fileExists` on the shim's stub said no,
+    // so nimsem quit with `cannot find <input>` before doing any work. `fstat` is deliberately not
+    // matched — it takes an fd, needs no walk, and the host serves it directly
+    // (`POSIX_SERVED_LEAVES`).
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("stat") || n.starts_with("lstat"))
+            .map(|(n, _)| (n.clone(), 4)),
+    );
+    compute_exports.retain(|(n, _)| {
+        !n.starts_with("unlink")
+            && !n.starts_with("c_rename")
+            && !n.starts_with("stat")
+            && !n.starts_with("lstat")
+    });
     let open_adapter = temen_ir::LinkUnit {
         module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
             .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,

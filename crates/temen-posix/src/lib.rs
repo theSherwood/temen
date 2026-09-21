@@ -229,6 +229,20 @@ pub const OP_TTYNAME: u32 = 57;
 /// fail-closed to `0` every mapped file looked **empty**.
 pub const OP_FSTAT: u32 = 58;
 
+/// `statp(path_ptr, path_len, buf) -> 0 | -errno`: the **by-path** twin of [`OP_FSTAT`], writing the
+/// same Linux/amd64 `struct stat` that the guest's own headers declare.
+///
+/// Distinct from [`OP_STAT`] only in its **result layout**, not its behaviour — both resolve a memfs
+/// path to the same `(st_mode, st_size)` through [`Posix::stat_of_path`], and this one writes it
+/// through the same [`write_linux_stat`] `fstat` uses. `OP_STAT`'s short `{mode, size}` is the
+/// convention the Rust-std port (`rust-temen/temen-pal.rs`) already reads, so it stays; a C caller
+/// that declares `Stat` itself needs the declared offsets or it reads garbage.
+///
+/// Added for #1595: nimony's `fileExists` is `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, so with
+/// the `stat` leaf answering fail-closed, **every** file the compiler looked for was missing —
+/// nimsem's first act on a real module is `cannot find <input>`.
+pub const OP_STATP: u32 = 59;
+
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
 /// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
@@ -400,11 +414,25 @@ const S_IFIFO: i64 = 0o010000; // FIFO/pipe — what a non-file fd stats as
 
 /// Linux/amd64 `struct stat` geometry, as the **guest's own** headers declare it (nimony
 /// `std/posix/posix.nim`): 144 bytes, `st_mode` (u32) at 24, `st_size` (i64) at 48. Used by
-/// [`OP_FSTAT`], which must match the caller's layout exactly — [`OP_STAT`]'s short
+/// [`OP_FSTAT`] and [`OP_STATP`], which must match the caller's layout exactly — [`OP_STAT`]'s short
 /// `{mode, size}` is a separate, Temen-private convention and is *not* this.
 const STAT_SIZE: usize = 144;
 const STAT_MODE_OFF: usize = 24;
 const STAT_SIZE_OFF: usize = 48;
+
+/// Write `(mode, size)` into the guest's `buf` as a Linux/amd64 `struct stat`. Every other field is
+/// zero: that is what the callers on this route read, and a zero is honest for what a flat memfs has
+/// no answer for — an invented inode or mtime would be a plausible-looking lie.
+///
+/// The one place these offsets are applied, shared by the by-fd ([`OP_FSTAT`]) and by-path
+/// ([`OP_STATP`]) entries, so the two can never drift apart.
+fn write_linux_stat(mem: &mut dyn GuestMem, buf: u64, mode: i64, size: i64) -> Result<(), Trap> {
+    let mut out = vec![0u8; STAT_SIZE];
+    out[STAT_MODE_OFF..STAT_MODE_OFF + 4].copy_from_slice(&(mode as u32).to_le_bytes());
+    out[STAT_SIZE_OFF..STAT_SIZE_OFF + 8].copy_from_slice(&size.to_le_bytes());
+    mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+    Ok(())
+}
 
 // The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
 // NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
@@ -1592,6 +1620,8 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "clock_gettime" | "clock" => OP_CLOCK,
         "stat" | "lstat" => OP_STAT,
         "fstat" => OP_FSTAT,
+        // The memfs has no symlinks, so `lstat == stat` on this route too.
+        "statp" | "lstatp" => OP_STATP,
         "opendir" => OP_OPENDIR,
         "readdir" => OP_READDIR,
         "closedir" => OP_CLOSEDIR,
@@ -1924,6 +1954,8 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
         ("tcsetattr", 2),    // 55
         ("tcgetwinsize", 2), // 56
         ("ttyname", 3),      // 57
+        ("fstat", 2),        // 58
+        ("statp", 3),        // 59
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -2348,6 +2380,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_RMDIR => st.rmdir(args, mem),
                 OP_STAT => st.stat(args, mem),
                 OP_FSTAT => st.fstat(args, mem),
+                OP_STATP => st.statp(args, mem),
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
                 OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
@@ -4480,6 +4513,29 @@ impl Ctx<'_> {
             || !self.dir_children(path).is_empty()
     }
 
+    /// What a memfs path stats as: `(st_mode, st_size)`, or `None` for a path that is neither a file
+    /// key nor a directory (`-ENOENT` to every caller). A file key is `S_IFREG` with its byte length;
+    /// a directory (a prefix of some key, or `"/"`) is `S_IFDIR` size 0.
+    ///
+    /// The **one** place a path becomes a stat result, whatever layout the caller wants it in —
+    /// [`Self::stat`] writes it as the short Temen-private struct, [`Self::statp`] as the declared
+    /// Linux one. `path` must already be [`Self::resolve`]d.
+    fn stat_of_path(&self, path: &str) -> Option<(i64, i64)> {
+        if let Some(f) = self.w.files.get(path) {
+            // #801 — a registered executable carries the exec bits; a plain file does not.
+            let perms = if self.w.executables.contains(path) {
+                0o755
+            } else {
+                0o644
+            };
+            Some((S_IFREG | perms, f.len() as i64))
+        } else if self.is_dir(path) {
+            Some((S_IFDIR | 0o755, 0))
+        } else {
+            None
+        }
+    }
+
     /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
     /// (`{ i64 st_mode; i64 st_size; }`, 16 bytes) for a memfs path. A file key is `S_IFREG` with its
     /// byte length; a directory (a prefix of some key, or `"/"`) is `S_IFDIR` size 0; anything else is
@@ -4494,17 +4550,7 @@ impl Ctx<'_> {
             return Ok(vec![EINVAL]);
         };
         let path = self.resolve(&path);
-        let (mode, size) = if let Some(f) = self.w.files.get(&path) {
-            // #801 — a registered executable carries the exec bits; a plain file does not.
-            let perms = if self.w.executables.contains(&path) {
-                0o755
-            } else {
-                0o644
-            };
-            (S_IFREG | perms, f.len() as i64)
-        } else if self.is_dir(&path) {
-            (S_IFDIR | 0o755, 0)
-        } else {
+        let Some((mode, size)) = self.stat_of_path(&path) else {
             return Ok(vec![ENOENT]);
         };
         let mut out = Vec::with_capacity(16);
@@ -4544,10 +4590,29 @@ impl Ctx<'_> {
             Some(_) => (S_IFIFO | 0o600, 0),
             None => return Ok(vec![EBADF]),
         };
-        let mut out = vec![0u8; STAT_SIZE];
-        out[STAT_MODE_OFF..STAT_MODE_OFF + 4].copy_from_slice(&(mode as u32).to_le_bytes());
-        out[STAT_SIZE_OFF..STAT_SIZE_OFF + 8].copy_from_slice(&size.to_le_bytes());
-        mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+        write_linux_stat(mem, buf, mode, size)?;
+        Ok(vec![0])
+    }
+
+    /// `statp(path_ptr, path_len, buf) -> 0 | -errno`: [`Self::stat`]'s answer in [`Self::fstat`]'s
+    /// layout — the by-path stat a C caller that declares its own `Stat` needs (see [`OP_STATP`]).
+    ///
+    /// Same resolution, same layout writer, different entry: no second notion of what a path stats
+    /// as, and no second copy of the Linux offsets.
+    fn statp(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let buf = (*args.get(2).ok_or(Trap::Malformed)?) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let path = self.resolve(&path);
+        let Some((mode, size)) = self.stat_of_path(&path) else {
+            return Ok(vec![ENOENT]);
+        };
+        write_linux_stat(mem, buf, mode, size)?;
         Ok(vec![0])
     }
 
@@ -7131,6 +7196,67 @@ block 0 (vph: i32) {\n\
         // A non-file fd is legal to fstat (POSIX): a FIFO, size 0. An unknown fd is EBADF.
         assert_eq!(st.fstat(&[1, 500], Some(&mut mem)).unwrap()[0], 0);
         assert_eq!(st.fstat(&[999, 500], Some(&mut mem)).unwrap()[0], EBADF);
+    }
+
+    #[test]
+    fn statp_answers_by_path_in_the_declared_layout() {
+        // #1595. nimony's `fileExists` is `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, reading
+        // `st_mode` at the offset **its own headers** declare (24). `OP_STAT` answers the same
+        // question in a 16-byte `{mode, size}`, which puts the mode at offset 0 — so a C caller
+        // reads `st_dev` as the mode, `S_ISREG` is false, and every file it looks for is missing.
+        // That is why nimsem could not start: `cannot find <input>` before any work.
+        //
+        // Asserts both layouts off the same path, so the split cannot silently collapse.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/tmp/a", b"hello");
+
+        let mut win = vec![0u8; WIN];
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+
+        assert_eq!(st.statp(&[0, 6, 500], Some(&mut mem)).unwrap()[0], 0);
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mode, (S_IFREG | 0o644) as u32, "S_ISREG must hold");
+        let size = i64::from_le_bytes(
+            mem.read_bytes(500 + STAT_SIZE_OFF as u64, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(size, 5);
+
+        // A directory is `S_IFDIR`, so `dirExists` works too — the half that a compose of
+        // `open` + `fstat` + `close` could not have served.
+        win[..4].copy_from_slice(b"/tmp");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.statp(&[0, 4, 500], Some(&mut mem)).unwrap()[0], 0);
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mode, (S_IFDIR | 0o755) as u32, "S_ISDIR must hold");
+
+        // And the short form still answers where it always did, at *its* offsets — the two are
+        // different layouts of one lookup, not two notions of what a path is.
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.stat(&[0, 6, 600], Some(&mut mem)).unwrap()[0], 0);
+        let short_size = i64::from_le_bytes(mem.read_bytes(608, 8).unwrap().try_into().unwrap());
+        assert_eq!(short_size, 5, "OP_STAT keeps its 16-byte convention");
+
+        // A path that is neither file nor directory is ENOENT, not a zeroed struct.
+        win[..3].copy_from_slice(b"/no");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.statp(&[0, 3, 500], Some(&mut mem)).unwrap()[0], ENOENT);
     }
 
     #[test]
