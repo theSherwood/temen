@@ -840,6 +840,9 @@ fn nim_import_binding(name: &str) -> Option<NimImport> {
         // #1595: `memfiles.open` sizes a mapping with `fstat`, so the shim's 0-returning stub made
         // every mapped file look empty.
         n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
+        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
+        // would be read at the declared `st_mode`/`st_size` offsets and answer garbage.
+        "statp" => NimImport::Posix(temen_posix::OP_STATP),
         _ => return None,
     })
 }
@@ -2289,22 +2292,30 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
 /// Gated on `NIM_NIFLER2=1`: the compile is minutes and the closure is 10× the corpus, far past what
 /// the per-PR suite should carry. Reports how far it gets rather than asserting, until it lands.
 ///
-/// **Where it stands:** it runs the real parse. `nifler2 parse /in.nim /out.nif` reads the seeded
-/// memfs file and writes a `/out.nif` whose header is byte-identical to the native nifler2's. The
-/// body is not: the guest trips `[Assertion Failure] beginRead with unclosed tags` and emits the
-/// header alone, where native emits the parsed `(stmts …)` — so `parseModule` leaves a tag open on
-/// Temen. That is a translator correctness bug, and this is its reproducer.
+/// **Where it stands:** `nifler2 parse /in.nim /out.nif` writes a `.nif` **byte-identical** to the
+/// native binary's, and so does `hexer` on a real module (374 bytes) — the phases below the Leng
+/// backend compile with no C compiler anywhere. `nimsem` links (12.7k funcs), verifies, and matches
+/// native on its own argv handling; driving it over a whole module is the open end.
 ///
-/// Getting here took three edges, each of which looked like the last one's cause: a `MemoryFault`
-/// that was really `argc = 0` (`_start` passed no argv, so `getopt()` saw nothing); then
-/// `cannot read the input file`, which was `link_nim_powerbox`'s stdout-only `sysOpen` stub; then
-/// the same message again from `getcwd` returning NULL. Two memory hypotheses were tested and
-/// disproved along the way (run window 64 MiB/256 MiB/1 GiB, heap 11 MiB → 251 MiB, all identical),
-/// which is what pointed at the bottom edge rather than the sizing.
+/// Getting here took nine edges, each of which looked like the last one's cause. Three were argv and
+/// stdout-stub shaped: `argc = 0` (`_start` passed no argv, so `getopt()` saw nothing), then
+/// `cannot read the input file` from `link_nim_powerbox`'s stdout-only `sysOpen` stub, then the same
+/// message from `getcwd` returning NULL. The other six were the **bottom edge under a real
+/// personality** (#1595): `fstat` stubbed to 0 (so every mapped file looked empty), `mmap` ignoring
+/// its `fd` (so a file mapping was uninitialized heap), `std/posix`'s own `open` left on the shim
+/// (so `readFile` worked while mapping the same file failed), relative paths never resolved against
+/// the cwd, `mmap` returning unaligned memory (so nim's `pageAddr(p) = p & ~0xFFF` found the wrong
+/// chunk header), and `rename`/`unlink` stubbed (so nim's atomic temp-then-rename write failed
+/// *after* the compile succeeded). Two memory hypotheses were tested and disproved early (run window
+/// 64 MiB/256 MiB/1 GiB, heap 11 MiB → 251 MiB, all identical), which is what pointed at the bottom
+/// edge rather than the sizing.
 ///
 /// **Knobs**, for bisecting from the outside: `NIM_NIFLER2_SRC` picks a different in-tree program
-/// (a smaller probe against the same parser), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SL`
-/// its window.
+/// (a smaller probe against the same parser, or another phase — `src/hexer/hexer.nim`,
+/// `src/nimony/nimsem.nim`), `NIM_NIFLER2_ARGS` the guest's argv, `NIM_NIFLER2_SEED` the inputs to
+/// seed into both the guest memfs and the oracle's cwd (so a phase is driven over **real work**
+/// rather than an argv it rejects), `NIM_NIFLER2_OUT` the file to compare, `NIM_NIFLER2_SL` the
+/// window.
 #[test]
 fn nifler2_links_through_leng() {
     if std::env::var("NIM_NIFLER2").is_err() {
@@ -2530,10 +2541,15 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         .map(|e| {
             let (guest, host) = e.split_once('=').expect("seed is guestpath=hostpath");
             let bytes = std::fs::read(host).unwrap_or_else(|e| panic!("read seed {host}: {e}"));
-            let base = std::path::Path::new(guest)
-                .file_name()
-                .expect("seed needs a basename");
-            std::fs::write(dir.join(base), &bytes).expect("write oracle seed");
+            // Mirror the guest path's **whole shape** into the oracle cwd, not just its basename: a
+            // compiler phase looks for its inputs where its config says they live (`nimcache/x.p.nif`),
+            // so flattening to a basename would have the two sides read different trees.
+            let rel = guest.trim_start_matches('/');
+            let at = dir.join(rel);
+            if let Some(p) = at.parent() {
+                std::fs::create_dir_all(p).expect("mk oracle seed dir");
+            }
+            std::fs::write(&at, &bytes).expect("write oracle seed");
             (guest.to_string(), bytes)
         })
         .collect();
@@ -2550,21 +2566,21 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
                 .replace("/in.nim", "in.nim")
                 .replace("/out.nif", "out.nif");
             for (guest, _) in &extra {
-                if let Some(base) = std::path::Path::new(guest)
-                    .file_name()
-                    .and_then(|b| b.to_str())
-                {
-                    a = a.replace(guest.as_str(), base);
-                }
+                a = a.replace(guest.as_str(), guest.trim_start_matches('/'));
             }
             a
         })
         .collect();
-    let st = Command::new(native_bin)
-        .args(&argv)
-        .current_dir(&dir)
-        .output()
-        .expect("run native nifler2");
+    // The oracle runs under the **toolchain's own PATH**: a phase is allowed to shell out to a
+    // sibling (nimsem runs `nifler` to parse a dependency), and without this the native side fails
+    // with `/bin/sh: nifler: not found` while the guest fails for an unrelated reason — two
+    // different failures compared against each other, which is not an oracle.
+    let mut oracle = Command::new(native_bin);
+    oracle.args(&argv).current_dir(&dir);
+    if let Some(p) = toolchain_path() {
+        oracle.env("PATH", p);
+    }
+    let st = oracle.output().expect("run native nifler2");
     if !st.status.success() {
         eprintln!(
             "  nifler2: native oracle failed: {}",
