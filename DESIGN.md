@@ -3483,8 +3483,11 @@ migration unsafe, no new one), each resume its own guard bracket over the *task'
 the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
 the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
 existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
-the futex cell now carries the task's waker, `notify` fires it after delivering the status, an idle
-worker fires a timed wait's deadline, and the §5 kill cell is re-checked on the parked cadence. Every
+**one** wake reaches every parked task and each re-checks its own predicate in the loop it already
+has — `Domain::wake_all_parked` extended to tasks, so a `notify`, a vCPU exit, the §5 kill path and
+teardown all arrive by the same route, and an idle worker sweeps the parked set on the bounded
+`KILL_RECHECK` cadence to fire deadlines. No per-task waker, no second deadline store, no second
+runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
 resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
 exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps
 a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). Run

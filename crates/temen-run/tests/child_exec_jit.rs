@@ -340,3 +340,78 @@ fn two_carve_children_copy_back_under_a_lane_cap() {
         assert_eq!(mem[69632 + 2048], 172, "child B's carve (cap {cap})");
     }
 }
+
+/// A futex ping-pong side: wait until the turn word (region byte 0) reads `mine`, hand the turn to
+/// `other` and notify, `rounds` times. Returns `rounds`.
+fn pingpong(mine: i32, other: i32, rounds: i64) -> String {
+    format!(
+        r#"memory 17
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vz = i64.const 0
+  br 1(vz)
+}}
+block 1 (vi: i64) {{
+  vn = i64.const {rounds}
+  vlt = i64.lt_u vi vn
+  br_if vlt 2(vi) 5(vi)
+}}
+block 2 (vi2: i64) {{
+  vt = i64.const 65536
+  vcur = i32.atomic.load vt
+  vmine = i32.const {mine}
+  veq = i32.eq vcur vmine
+  br_if veq 4(vi2) 3(vi2)
+}}
+block 3 (vi3: i64) {{
+  vt3 = i64.const 65536
+  vother3 = i32.const {other}
+  vinf = i64.const -1
+  vs = i32.atomic.wait vt3 vother3 vinf
+  br 2(vi3)
+}}
+block 4 (vi4: i64) {{
+  vt4 = i64.const 65536
+  vother4 = i32.const {other}
+  i32.atomic.store vt4 vother4
+  vone = i32.const 1
+  vw = atomic.notify vt4 vone
+  vstep = i64.const 1
+  vi5 = i64.add vi4 vstep
+  br 1(vi5)
+}}
+block 5 (vi6: i64) {{
+  return vi6
+  }}
+}}
+"#
+    )
+}
+
+/// **Child-to-child pipelining.** Two detached children hand a turn word back and forth over a
+/// shared pre-mapped region, 200 rounds each, under a parent lane cap of 1 — so the pair can only
+/// make progress if each `notify` promptly re-offers the parked sibling *and* the parked one's lane
+/// is free for it. Both complete their rounds: `1000·200 + 200`.
+///
+/// The elapsed-time bound is the pin on the wake route itself (`thread_notify` →
+/// `Domain::wake_child_tasks`). Without it the pair still finishes — an idle worker's cadence
+/// sweep is the correctness backstop — but every handoff then waits out a sweep. Measured on this
+/// box: 0.16s with the route, 4.17s with it mutated out. The threshold sits between, with a wide
+/// margin on both sides.
+#[test]
+fn two_child_tasks_ping_pong_through_the_futex_without_waiting_on_the_sweep() {
+    let p = module(&parent(TAIL_SUM));
+    let a = module(&pingpong(0, 1, 200));
+    let b = module(&pingpong(1, 0, 200));
+    let start = std::time::Instant::now();
+    assert_eq!(
+        run_jit(&p, &a, &b, 1),
+        200_200,
+        "both sides completed 200 rounds"
+    );
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_millis(1200),
+        "400 handoffs took {elapsed:?} — the notify wake route is not reaching parked tasks"
+    );
+}

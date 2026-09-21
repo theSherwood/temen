@@ -487,7 +487,19 @@ impl Nursery {
             child_fuel_cells: Mutex::new(Vec::new()),
             futex_sched,
             children: Mutex::new(Vec::new()),
-            child_exec: crate::child_exec::ChildExec::new(futex_sched, epoch_addr),
+            child_exec: {
+                let e = crate::child_exec::ChildExec::new(futex_sched);
+                // D66 — the domain wakes parked tasks with its other parked waiters (a `notify`, a
+                // vCPU exit, the kill path, teardown), so it needs a ref. SAFETY: a nonzero
+                // `futex_sched` is the run's live `Domain`, which outlives this nursery.
+                if futex_sched != 0 {
+                    unsafe {
+                        (*(futex_sched as *const crate::os_thread_rt::Domain))
+                            .set_child_exec(std::sync::Arc::clone(&e))
+                    };
+                }
+                e
+            },
             grant_parent_domain: std::sync::atomic::AtomicU64::new(0),
             grant_parent_lane_cap: std::sync::atomic::AtomicI64::new(-1),
             durable: AtomicBool::new(false),

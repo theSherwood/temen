@@ -3614,15 +3614,21 @@ pub mod lanes {
         chain.iter().any(|&(_, cap)| cap >= 0)
     }
 
-    /// Try to take every lane in `chain` for a task about to run: each bounded entry must have room
-    /// (`running < cap`); on success every entry's count rises. All-or-nothing, so a task never
-    /// holds a child lane without the enclosing ones — which is what makes "a task counts against
-    /// its own lane and every ancestor's" a single check.
+    /// Whether every bounded lane in `chain` has room right now — the admission predicate. A
+    /// dispatcher scanning its queue for a runnable task asks this without taking anything, then
+    /// takes with [`enter`] under the *same* lock, so the answer cannot go stale in between.
+    pub fn bounded_fits(running: &BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
+        chain.iter().all(|&(domain, cap)| {
+            cap < 0 || running.get(&domain).copied().unwrap_or(0) < cap as usize
+        })
+    }
+
+    /// Take every lane in `chain` for a task about to run: [`bounded_fits`] must hold, and then
+    /// every entry's count rises. All-or-nothing, so a task never holds a child lane without the
+    /// enclosing ones — which is what makes "a task counts against its own lane and every
+    /// ancestor's" a single check.
     pub fn enter(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
-        if chain
-            .iter()
-            .any(|&(d, cap)| cap >= 0 && running.get(&d).copied().unwrap_or(0) as i64 >= cap)
-        {
+        if !bounded_fits(running, chain) {
             return false;
         }
         for &(d, _) in chain {

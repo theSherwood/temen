@@ -20,7 +20,7 @@
 //!
 //! **Env-swap rules** (the D66 checklist R1–R5): each resume is its own `run_guarded_range` bracket
 //! over the *task's* fault range (R1); the per-thread state the child reads through TLS — its fiber
-//! runtime (`CURRENT_RT`), `vcpu.tls`, the current-task word — is seeded on entry and saved/reset on
+//! runtime (`CURRENT_RT`), `vcpu.tls`, the in-task flag — is seeded on entry and saved/reset on
 //! exit of every resume, and every reader on a fiber stack is `#[inline(never)]` (R2, #1466); a
 //! finished or faulted task is never resumed (R3: the slot's `finish` closes the claim); a trap is
 //! attributed to the task's own cell, never the run's (R4); the window base is baked at first entry
@@ -28,8 +28,8 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use temen_fiber::{Fiber, State};
 use temen_ir::lanes;
@@ -46,8 +46,9 @@ use crate::{mem, vcpu_tls, CompiledModule, TrapKind};
 /// `StackOverflow` cleanly instead of relying on the OS guard.
 const TASK_STACK: usize = 1 << 18;
 
-/// How often idle workers re-check the §5 kill cell and any parked task's deadline when no wake
-/// arrives — the same cadence a parked 1:1 vCPU uses (`os_thread_rt::KILL_RECHECK`).
+/// How often an idle worker re-offers the parked tasks so each re-checks its own predicate (a
+/// passed deadline, the §5 kill cell, a torn-down domain) — the same bounded cadence a parked 1:1
+/// vCPU uses (`os_thread_rt::KILL_RECHECK`), one timer for the pool instead of one per parked task.
 const RECHECK: Duration = Duration::from_millis(20);
 
 /// The limit-taking buffer-ABI trampoline a task's fiber body enters the child through
@@ -211,58 +212,20 @@ extern "C" fn resume_shim(
     }
 }
 
-/// A parked task's wake handle, attached to the futex cell it parks on ([`current_waker`]).
-#[derive(Clone)]
-pub(crate) struct TaskWaker {
-    exec: Weak<ChildExec>,
-    id: u64,
-}
-
-impl TaskWaker {
-    /// Mark the task woken: runnable now if it is parked, or remembered so its in-flight park
-    /// lands runnable (the executor's no-lost-wake discipline, see [`ChildExec::wake`]).
-    pub(crate) fn fire(&self) {
-        if let Some(e) = self.exec.upgrade() {
-            e.wake(self.id);
-        }
-    }
-}
-
 thread_local! {
-    /// The `(executor, task)` this worker is running on behalf of, or `(null, 0)`. Seeded around
-    /// every resume so a park site inside the child can find its waker without being told.
-    static CURRENT: std::cell::Cell<(usize, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Whether this OS thread is inside a child-task resume. The futex thunk reads it to skip the
+    /// one transient park a *guest* fiber's resumer polls away — a task has no such resumer, so an
+    /// already-resolved wait must return at once rather than wait for the next sweep.
+    static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The waker for the task running on **this** thread, if any (`None` on the root, a 1:1 vCPU, or a
-/// worker between tasks). `#[inline(never)]`: read on a fiber stack after a possible migration
-/// (#1466).
+/// Is this OS thread running a child-domain task right now?
+///
+/// `#[inline(never)]` is load-bearing (#1466): this is read on a fiber stack after a possible
+/// migration, and an inlined copy would let LLVM serve it from the *suspending* thread's TLS block.
 #[inline(never)]
-pub(crate) fn current_waker() -> Option<TaskWaker> {
-    let (exec, id) = CURRENT.with(|c| c.get());
-    if exec == 0 {
-        return None;
-    }
-    // SAFETY: a nonzero `exec` is the `Arc<ChildExec>` the running worker holds (seeded around this
-    // resume), so a weak ref minted from it is sound.
-    let arc = unsafe { Arc::from_raw(exec as *const ChildExec) };
-    let weak = Arc::downgrade(&arc);
-    std::mem::forget(arc);
-    Some(TaskWaker { exec: weak, id })
-}
-
-/// Register (`Some`) or clear (`None`) the running task's park deadline — a timed futex wait's
-/// firing point, since no resumer polls a task: an idle worker re-dispatches it once due.
-#[inline(never)]
-pub(crate) fn set_park_deadline(deadline: Option<Instant>) {
-    if let Some(w) = current_waker() {
-        if let Some(e) = w.exec.upgrade() {
-            let mut g = lock(&e.state);
-            if let Some(t) = g.tasks.get_mut(&w.id) {
-                t.deadline = deadline;
-            }
-        }
-    }
+pub(crate) fn in_task() -> bool {
+    IN_TASK.with(|c| c.get())
 }
 
 /// Per-task executor bookkeeping. `task` is `None` while a worker holds the task (running).
@@ -272,17 +235,15 @@ struct Entry {
     parked: bool,
     /// A wake arrived (possibly while the task was still running toward its park).
     woken: bool,
-    /// A timed wait's deadline; the idle loop turns a due one into a wake.
-    deadline: Option<Instant>,
 }
 
 struct ExecState {
     tasks: HashMap<u64, Entry>,
+    /// Runnable tasks, FIFO. A task whose lane is full stays here — [`ChildExec::pick`] scans past
+    /// it rather than shuffling it to a second queue, so there is one runnable set, not two.
     runnable: VecDeque<u64>,
     /// D66 — per-domain running counts, the lane gate's state (`temen_ir::lanes`).
     lane_running: BTreeMap<usize, usize>,
-    /// Runnable tasks refused a lane; re-offered whenever a lane is released.
-    lane_waiters: VecDeque<u64>,
     next_id: u64,
     workers: Vec<std::thread::JoinHandle<()>>,
     idle_workers: usize,
@@ -301,29 +262,19 @@ pub(crate) struct ChildExec {
     /// The run's `Domain` (`0` = none): live/parked accounting for the 1:1 vCPUs' deadlock
     /// predicate, and the futex broadcast a finished child issues.
     dom: usize,
-    /// The §5 kill cell (`0` = unarmed): idle workers re-check it so a parked task unwinds on a kill.
-    epoch_addr: usize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// True iff the kill-path is armed and fired (mirror of `os_thread_rt::epoch_fired`).
-fn epoch_fired(addr: usize) -> bool {
-    // SAFETY: a non-zero `addr` is the run's live interrupt cell (an `AtomicU64`), outliving the run.
-    addr != 0
-        && unsafe { (*(addr as *const std::sync::atomic::AtomicU64)).load(Ordering::Relaxed) != 0 }
-}
-
 impl ChildExec {
-    pub(crate) fn new(dom: usize, epoch_addr: usize) -> Arc<ChildExec> {
+    pub(crate) fn new(dom: usize) -> Arc<ChildExec> {
         Arc::new(ChildExec {
             state: Mutex::new(ExecState {
                 tasks: HashMap::new(),
                 runnable: VecDeque::new(),
                 lane_running: BTreeMap::new(),
-                lane_waiters: VecDeque::new(),
                 next_id: 1,
                 workers: Vec::new(),
                 idle_workers: 0,
@@ -332,7 +283,6 @@ impl ChildExec {
             cv: Condvar::new(),
             quiescent: Condvar::new(),
             dom,
-            epoch_addr,
         })
     }
 
@@ -365,7 +315,6 @@ impl ChildExec {
                 task: Some(Box::new(task)),
                 parked: false,
                 woken: false,
-                deadline: None,
             },
         );
         g.runnable.push_back(id);
@@ -390,25 +339,15 @@ impl ChildExec {
         }
     }
 
-    /// Wake task `id` (see [`TaskWaker::fire`]).
-    pub(crate) fn wake(&self, id: u64) {
+    /// Make every parked task runnable so it re-checks its own park predicate. This is the whole
+    /// wake mechanism: a `notify`, a kill, a vCPU exit and run teardown all reach it through
+    /// [`Domain::wake_all_parked`], and an idle worker's cadence sweep fires deadlines with it.
+    /// A task that re-checks and is still unsatisfied simply parks again.
+    pub(crate) fn wake_all_parked_locked(&self) {
         let mut g = lock(&self.state);
-        let Some(e) = g.tasks.get_mut(&id) else {
-            return;
-        };
-        e.woken = true;
-        if e.parked {
-            e.parked = false;
-            e.deadline = None;
-            if let Some(d) = self.domain() {
-                d.task_unparked();
-            }
-            g.runnable.push_back(id);
-            self.cv.notify_one();
-        }
+        self.wake_all_parked(&mut g);
     }
 
-    /// Wake every parked task so it re-checks its park predicate (kill / teardown).
     fn wake_all_parked(&self, g: &mut ExecState) {
         let ids: Vec<u64> = g
             .tasks
@@ -420,7 +359,6 @@ impl ChildExec {
             let e = g.tasks.get_mut(&id).expect("listed");
             e.parked = false;
             e.woken = true;
-            e.deadline = None;
             if let Some(d) = self.domain() {
                 d.task_unparked();
             }
@@ -429,42 +367,21 @@ impl ChildExec {
         self.cv.notify_all();
     }
 
-    /// Fire the deadlines that have passed (a timed wait's firing point).
-    fn fire_due(&self, g: &mut ExecState, now: Instant) {
-        let due: Vec<u64> = g
-            .tasks
-            .iter()
-            .filter(|(_, e)| e.parked && e.deadline.is_some_and(|d| d <= now))
-            .map(|(&id, _)| id)
-            .collect();
-        for id in due {
-            let e = g.tasks.get_mut(&id).expect("listed");
-            e.parked = false;
-            e.woken = true;
-            e.deadline = None;
-            if let Some(d) = self.domain() {
-                d.task_unparked();
-            }
-            g.runnable.push_back(id);
-        }
-    }
-
-    /// Pop the next runnable task that can take its lanes now; a refused one waits on the lane.
+    /// The next runnable task whose whole lane chain has room, taking its lanes. A task refused a
+    /// lane keeps its place in the queue; a later release simply makes the next scan admit it.
     fn pick(&self, g: &mut ExecState) -> Option<u64> {
-        while let Some(id) = g.runnable.pop_front() {
-            let Some(e) = g.tasks.get_mut(&id) else {
-                continue;
-            };
-            let Some(t) = e.task.as_ref() else {
-                continue; // already held by a worker (a double wake): its re-insert requeues it
-            };
-            if lanes::enter(&mut g.lane_running, &t.chain) {
-                e.woken = false;
-                return Some(id);
-            }
-            g.lane_waiters.push_back(id);
-        }
-        None
+        let admit = g.runnable.iter().position(|id| {
+            g.tasks
+                .get(id)
+                .and_then(|e| e.task.as_ref())
+                .is_some_and(|t| lanes::bounded_fits(&g.lane_running, &t.chain))
+        })?;
+        let id = g.runnable.remove(admit).expect("position is in range");
+        let chain = g.tasks[&id].task.as_ref().expect("scanned").chain.clone();
+        let took = lanes::enter(&mut g.lane_running, &chain);
+        debug_assert!(took, "the scan proved the chain fits under this same lock");
+        g.tasks.get_mut(&id).expect("scanned").woken = false;
+        Some(id)
     }
 
     fn worker_loop(self: Arc<Self>, worker: u64) {
@@ -480,28 +397,23 @@ impl ChildExec {
                         return;
                     }
                     g.idle_workers += 1;
-                    let now = Instant::now();
-                    let next = g
-                        .tasks
-                        .values()
-                        .filter(|e| e.parked)
-                        .filter_map(|e| e.deadline)
-                        .min()
-                        .map(|d| d.saturating_duration_since(now));
-                    let armed = self.epoch_addr != 0;
-                    g = match (next, armed) {
-                        (None, false) => self.cv.wait(g).unwrap_or_else(|e| e.into_inner()),
-                        (next, _) => {
-                            let to = next.unwrap_or(RECHECK).min(RECHECK);
-                            self.cv
-                                .wait_timeout(g, to)
-                                .unwrap_or_else(|e| e.into_inner())
-                                .0
-                        }
+                    // A parked task has no resumer polling it, so the pool re-offers every parked
+                    // task on a bounded cadence and each one re-checks its own predicate — a passed
+                    // deadline, a fired kill cell, a torn-down domain — in the loop it already has
+                    // (`fiber_futex_wait`). One sweep for all three, rather than a second copy of
+                    // each condition here. A prompt wake (a `notify`, teardown) does not wait for
+                    // the cadence: it arrives through `Domain::wake_all_parked`.
+                    let sweeping = g.tasks.values().any(|e| e.parked);
+                    g = if sweeping {
+                        self.cv
+                            .wait_timeout(g, RECHECK)
+                            .unwrap_or_else(|e| e.into_inner())
+                            .0
+                    } else {
+                        self.cv.wait(g).unwrap_or_else(|e| e.into_inner())
                     };
                     g.idle_workers -= 1;
-                    self.fire_due(&mut g, Instant::now());
-                    if epoch_fired(self.epoch_addr) {
+                    if sweeping {
                         self.wake_all_parked(&mut g);
                     }
                 };
@@ -512,14 +424,10 @@ impl ChildExec {
                     .expect("picked task is present");
                 (id, task)
             };
-            let outcome = self.run_once(id, &mut task, worker);
+            let outcome = self.run_once(&mut task, worker);
             let mut task = Some(task);
             let mut g = lock(&self.state);
             lanes::leave(&mut g.lane_running, &task.as_ref().expect("held").chain);
-            // A released lane re-offers every lane waiter (the cheap wake-all; a refused one
-            // simply re-queues).
-            let waiters: Vec<u64> = g.lane_waiters.drain(..).collect();
-            g.runnable.extend(waiters);
             match outcome {
                 Outcome::Parked => {
                     let shutdown = g.shutdown;
@@ -559,7 +467,7 @@ impl ChildExec {
 
     /// One residency: claim the task, seed this thread's per-task state, resume its fiber under a
     /// guard bracket over its own fault range, classify the yield, reset the thread.
-    fn run_once(self: &Arc<Self>, id: u64, task: &mut ChildTask, worker: u64) -> Outcome {
+    fn run_once(&self, task: &mut ChildTask, worker: u64) -> Outcome {
         assert!(
             task.slot.claim_for_worker(worker),
             "child task dispatched while claimed"
@@ -567,7 +475,7 @@ impl ChildExec {
         let prev_rt = fiber_rt::set_current(&mut *task.rt as *mut FiberRuntime);
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
-        CURRENT.with(|c| c.set((Arc::as_ptr(self) as usize, id)));
+        IN_TASK.with(|c| c.set(true));
         task.rt.push_active(Arc::clone(&task.slot));
         let fib = task
             .slot
@@ -590,7 +498,7 @@ impl ChildExec {
             )
         };
         task.rt.pop_active();
-        CURRENT.with(|c| c.set((0, 0)));
+        IN_TASK.with(|c| c.set(false));
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
         fiber_rt::set_current(prev_rt);
@@ -651,7 +559,7 @@ impl ChildExec {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
-            for (_, e) in g.tasks.iter_mut() {
+            for e in g.tasks.values_mut() {
                 if e.parked {
                     if let Some(t) = &e.task {
                         t.trap
