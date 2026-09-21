@@ -71,21 +71,9 @@ fn unit_via_temeno(m: temen_ir::Module, tag: &str) -> LinkUnit {
     }
 }
 
-/// Build the chibicc fork once per test binary, returning the path to its binary.
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .expect("run `make` to build the chibicc fork");
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// The self-host demo directory (`cc1_main.c`, the emit-object libc, and the self-host prelude).
 #[cfg(target_os = "linux")]

@@ -2,11 +2,14 @@
 //! `clang -O2` + temen-llvm (optimized). Same backend, so the ratio isolates frontend IR quality.
 //! Run: cargo test -p temen-llvm --release --test frontend_bench -- --nocapture --ignored
 use std::hint::black_box;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
 use temen_jit::{compile_and_run, JitOutcome};
+
+#[path = "../../temen/tests/support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 // The bench's C kernel sources (run + main, exactly as in bench/src/main.rs).
 const ALU: &str = "long run(long n){\n  long acc = 0;\n  for (long i = 0; i < n; i++)\n    \
@@ -30,24 +33,11 @@ const HASH: &str = "static long mix(long h, long x){\n  h ^= x;\n  h *= 10995116
     int main(){ return (int)run(0); }\n";
 
 fn chibicc_ir(name: &str, src: &str) -> (temen_ir::Module, u32, Vec<i64>) {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let dir = root.join("frontend/chibicc");
-    assert!(Command::new("make")
-        .arg("-s")
-        .current_dir(&dir)
-        .status()
-        .unwrap()
-        .success());
     let base = std::env::temp_dir().join(format!("fb_chi_{name}"));
     let cf = base.with_extension("c");
     let irf = base.with_extension("temen");
     std::fs::write(&cf, src).unwrap();
-    assert!(Command::new(dir.join("chibicc"))
+    assert!(Command::new(chibicc())
         .args(["-cc1", "--emit-ir", "-cc1-input"])
         .arg(&cf)
         .arg("-cc1-output")

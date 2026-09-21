@@ -15,15 +15,9 @@
 
 #[path = "support/grant_hooks.rs"]
 mod grant_hooks_mod;
-#[path = "support/repo_root.rs"]
-mod repo_root_mod;
 use grant_hooks_mod::grant_hooks;
 
-use repo_root_mod::repo_root;
-
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 use temen_interp::{run_capture_reserved_with_host, Host, StreamRole, Trap, Value};
 use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
@@ -34,20 +28,9 @@ const WIN: usize = 256 << 10;
 const CARVE: u64 = 128 << 10; // the command's carve (its declared `memory 17` = 128 KiB)
 const ARGS_BASE: u64 = 16384 + 128; // guard + POWERBOX_ARGS_BASE (#1059: chibicc reads argv one 16 KiB NULL guard up)
 
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// Compile `src` with `--child-entry` (spawnable §14 child ABI).
 fn child_ir(src: &str) -> String {
