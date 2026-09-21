@@ -4985,9 +4985,24 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
-/// Append a trap-time backtrace to a trap message, innermost frame first. An empty trace leaves the
-/// message untouched, so an engine that records none says nothing rather than printing a bare header.
-fn with_backtrace(msg: String, bt: &[temen_interp::IrPc], m: &Module) -> String {
+/// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
+/// frame first. An empty trace leaves the message untouched, so an engine that records none says
+/// nothing rather than printing a bare header.
+///
+/// `bt` and `fault` are **passed in**, not read from
+/// [`temen_interp::last_capture_backtrace`]/[`temen_interp::last_capture_fault_addr`] here: those
+/// thread-locals describe the last *interpreter* run, and a formatter that reaches for them itself
+/// would decorate a JIT trap with a stale trace from some earlier run. The caller knows which run it
+/// is reporting; this only formats.
+///
+/// Public so an op-13 child driver can report its child's trap the same way a top-level run does
+/// (#1591) — the child's frames and its own window-relative address, named from the child's module.
+pub fn with_backtrace(
+    msg: String,
+    bt: &[temen_interp::IrPc],
+    fault: Option<u64>,
+    m: &Module,
+) -> String {
     if bt.is_empty() {
         return msg;
     }
@@ -5003,7 +5018,7 @@ fn with_backtrace(msg: String, bt: &[temen_interp::IrPc], m: &Module) -> String 
             .unwrap_or_default()
     };
     let mut out = msg;
-    if let Some(addr) = temen_interp::last_capture_fault_addr() {
+    if let Some(addr) = fault {
         out.push_str(&format!(
             "\n--- faulting address: {addr:#x} (window-relative) ---"
         ));
@@ -6363,7 +6378,7 @@ impl Instance {
             Ok(o) => o,
             Err(e) => {
                 return Err(trap_err_with_output(
-                    with_backtrace(e, &trap_bt, m),
+                    with_backtrace(e, &trap_bt, temen_interp::last_capture_fault_addr(), m),
                     &host.stdout_bytes(),
                     &host.stderr_bytes(),
                 ))
