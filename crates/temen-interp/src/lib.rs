@@ -3154,7 +3154,7 @@ pub fn run_capture_reserved_with_host(
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
     });
-    let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
+    let (r, bt, _fiber) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     // Snapshot past the backed prefix to also cover reserved-tail pages the guest grew (the §1a
     // growth path), matching the JIT's `_with_host` capture span so the escape-oracle byte-compares
     // them too.
@@ -3162,7 +3162,26 @@ pub fn run_capture_reserved_with_host(
         .as_ref()
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
+    LAST_CAPTURE_BACKTRACE.with(|c| *c.borrow_mut() = bt);
     (r, snap)
+}
+
+thread_local! {
+    /// The trap-time backtrace of the most recent [`run_capture_reserved_with_host`] on this thread.
+    ///
+    /// `drive` has always produced one here; this path threw it away (`let (r, ..) = …`), so a guest
+    /// run **with argv** — which is every real program, since args force the seeded-memory path —
+    /// reported a bare `MemoryFault` with no location. A thread-local keeps the existing return type
+    /// (and its callers) untouched while making the trace reachable; a run overwrites it, and it is
+    /// only meaningful immediately after one.
+    static LAST_CAPTURE_BACKTRACE: core::cell::RefCell<Vec<IrPc>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The trap-time backtrace of the last [`run_capture_reserved_with_host`] on this thread — innermost
+/// frame first, empty if that run finished cleanly or none has happened.
+pub fn last_capture_backtrace() -> Vec<IrPc> {
+    LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
 }
 
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s

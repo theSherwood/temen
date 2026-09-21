@@ -4985,6 +4985,40 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// Append a trap-time backtrace to a trap message, innermost frame first. An empty trace leaves the
+/// message untouched, so an engine that records none says nothing rather than printing a bare header.
+fn with_backtrace(msg: String, bt: &[temen_interp::IrPc], m: &Module) -> String {
+    if bt.is_empty() {
+        return msg;
+    }
+    const FRAMES: usize = 12; // the innermost frames are the useful ones; a deep stack is noise
+                              // Name each frame from the module's export table where it can. A linked nim program exports its
+                              // procs under their global names, so most frames resolve to a real symbol — "func 10309" alone
+                              // is a number, `sysFatal.0.sysvq0asl` is a lead.
+    let name_of = |f: u32| -> String {
+        m.exports
+            .iter()
+            .find(|e| e.func == f)
+            .map(|e| format!(" `{}`", e.name))
+            .unwrap_or_default()
+    };
+    let mut out = msg;
+    out.push_str("\n--- guest backtrace (innermost first) ---");
+    for pc in bt.iter().take(FRAMES) {
+        out.push_str(&format!(
+            "\n  func {}{} block {} inst {}",
+            pc.func,
+            name_of(pc.func),
+            pc.block,
+            pc.inst
+        ));
+    }
+    if bt.len() > FRAMES {
+        out.push_str(&format!("\n  … {} more frames", bt.len() - FRAMES));
+    }
+    out
+}
+
 fn trap_err_with_output(msg: String, stdout: &[u8], stderr: &[u8]) -> String {
     const TAIL: usize = 8192; // last N bytes — a runaway guest can produce a lot; the tail is the useful part
     let tail = |b: &[u8]| -> String {
@@ -5253,6 +5287,48 @@ fn run_jit(
 /// the tree-walker for modules the engine doesn't lower (matching `TreeWalk` exactly there). Shared by
 /// [`Instance::run`] and the [`Instance::run_diff`] oracle so both seed args identically.
 fn run_interp(
+    backend: Backend,
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: Option<&[u8]>,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    run_interp_traced(backend, m, func, args, fuel, init_mem, host).0
+}
+
+/// [`run_interp`], plus the **trap-time backtrace** (innermost frame first) when the engine records
+/// one. A bare `MemoryFault` on a large guest is nearly unactionable — "it faulted somewhere in
+/// 10,554 functions" — and the JIT path has folded its backtrace into the error since it was
+/// written while the interpreter path dropped it on the floor. Only the tree-walk arm carries one
+/// today; every other arm returns an empty trace rather than pretending to have one.
+fn run_interp_traced(
+    backend: Backend,
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: Option<&[u8]>,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<temen_interp::IrPc>) {
+    if let (Backend::TreeWalk, None) = (backend, init_mem) {
+        let (r, bt, _fiber) = temen_interp::run_with_host_traced(m, func, args, fuel, host);
+        return (r, bt);
+    }
+    let r = run_interp_untraced(backend, m, func, args, fuel, init_mem, host);
+    // The seeded-memory arm is the one that matters in practice: `RunConfig::init_mem` is `Some`
+    // whenever the guest has argv or env, so every real program takes it. Its backtrace comes back
+    // through `last_capture_backtrace`, read immediately after the run it describes.
+    let bt = if matches!(backend, Backend::TreeWalk) && init_mem.is_some() {
+        temen_interp::last_capture_backtrace()
+    } else {
+        Vec::new()
+    };
+    (r, bt)
+}
+
+fn run_interp_untraced(
     backend: Backend,
     m: &Module,
     func: FuncIdx,
@@ -6254,10 +6330,11 @@ impl Instance {
         } else {
             backend
         };
+        let mut trap_bt: Vec<temen_interp::IrPc> = Vec::new();
         let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
                 let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
-                let r = run_interp(
+                let (r, bt) = run_interp_traced(
                     backend,
                     m,
                     0,
@@ -6266,6 +6343,7 @@ impl Instance {
                     init_mem.as_deref(),
                     &mut host,
                 );
+                trap_bt = bt;
                 outcome_from_interp(r)
             }
             Backend::Jit => match run_jit(m, &[], &mut host, &config.limits, init_mem.as_deref()) {
@@ -6280,7 +6358,7 @@ impl Instance {
             Ok(o) => o,
             Err(e) => {
                 return Err(trap_err_with_output(
-                    e,
+                    with_backtrace(e, &trap_bt, m),
                     &host.stdout_bytes(),
                     &host.stderr_bytes(),
                 ))
