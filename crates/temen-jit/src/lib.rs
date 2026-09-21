@@ -185,7 +185,14 @@ pub const fn fiber_supported() -> bool {
 /// (128, 256] MiB, needing a 256 MiB child carve and thus a 512 MiB parent window. `mmap` is
 /// lazy (RSS follows touched pages, not the reservation), so the VA bump is cheap and real fuzz
 /// seeds — far below even the old cap — are unaffected.
-const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
+///
+/// **The (128, 256] MiB premise above is stale** (#1591, measured 2026-09-21). nimsem semchecking the
+/// system module peaks at **2043 MiB** RSS — the top-level run and the op-13 child agree, so it is the
+/// real cost, not a child-path leak. It needs a 2 GiB carve, and a carve is a hard ceiling (a child's
+/// `mapped == reserved`), so the front-end chain does **not** fit here any more and
+/// `nim_chain_op13_jit` now skips rather than failing. Moving this constant re-opens an owner-approved
+/// decision on the reference JIT's per-window backing policy, so it is left alone pending that call.
+pub const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,

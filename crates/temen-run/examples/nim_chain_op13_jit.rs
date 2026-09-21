@@ -220,6 +220,23 @@ fn main() {
 
     // ---- Phase 1: nimsem (op-13 JIT child, exec re-granted) — semcheck the system module. -------------
     let nimsem_carve = temen_run::nim_phase_carve_log2(nimsem.memory.unwrap().size_log2 as u32);
+    // The reference JIT caps a window at `MAX_JIT_WINDOW_LOG2`; a phase carve of `n` needs a parent
+    // window of `n + 1`. When the phase outgrows that, say so and stop — the alternative is an
+    // `Unsupported` panic that takes `build_frontend.sh` down with it under `set -e`, and with it the
+    // `nim_driver_guest` asset rebuild, for a step that cannot run on this engine either way.
+    //
+    // It is not a regression: below the cap the phase exhausts its carve instead (measured — at a
+    // 256 MiB carve this driver reports `Trapped(MemoryFault)`). The JIT's own comment sized the cap
+    // for a "(128, 256] MiB" peak that is now 2043 MiB. See #1591.
+    if nimsem_carve + 1 > temen_jit::MAX_JIT_WINDOW_LOG2 as u32 {
+        eprintln!(
+            "SKIP nim_chain_op13_jit: the phase needs a 2^{nimsem_carve} carve (parent 2^{}), over \
+             the reference JIT's 2^{} window cap — see #1591",
+            nimsem_carve + 1,
+            temen_jit::MAX_JIT_WINDOW_LOG2,
+        );
+        return;
+    }
     let win1 = 1u64 << (nimsem_carve + 1);
     let mut h1 = Host::new();
     let fs1 = grant_fs(&mut h1, &factory);
