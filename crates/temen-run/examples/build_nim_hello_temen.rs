@@ -22,27 +22,49 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    let mut args = std::env::args().skip(1);
-    let nim = args
-        .next()
-        .expect("usage: build_nim_hello_temen <prog.nim> <out.temen>");
-    let out = args
-        .next()
-        .expect("usage: build_nim_hello_temen [--posix] <prog.nim> <out.temen>");
-    let posix = std::env::args().any(|a| a == "--posix");
-    let (nim, out) = if nim == "--posix" {
-        (
-            out.clone(),
-            args.next().expect("usage: --posix <src> <out>"),
-        )
-    } else {
-        (nim, out)
+    // `[--posix] [--root <tree>] <src> <out.temen>`.
+    //
+    // `--root` compiles **in tree**, the way nimony is normally invoked: `<src>` is then relative to
+    // `<tree>`, which is also the string nimony records in each module's line info and therefore the
+    // one `nim_program_closure` matches on. A nimony phase's imports are relative so it cannot be
+    // copied to a scratch dir, and running from the file's own directory instead creates a second
+    // `nimcache` beside the source and records a path that matches nothing.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let posix = argv.iter().any(|a| a == "--posix");
+    let root = argv
+        .iter()
+        .position(|a| a == "--root")
+        .and_then(|i| argv.get(i + 1).cloned());
+    let positional: Vec<&String> = {
+        let mut skip_next = false;
+        argv.iter()
+            .filter(|a| {
+                if skip_next {
+                    skip_next = false;
+                    return false;
+                }
+                if *a == "--root" {
+                    skip_next = true;
+                    return false;
+                }
+                *a != "--posix"
+            })
+            .collect()
     };
+    let [nim, out] = positional.as_slice() else {
+        panic!("usage: build_nim_hello_temen [--posix] [--root <tree>] <prog.nim> <out.temen>");
+    };
+    let (nim, out) = (nim.to_string(), out.to_string());
 
-    // Run `nimony c --isMain` in the source's directory; collect the emitted `.x.nif` modules.
+    // Run `nimony c --isMain`; collect the emitted `.x.nif` modules.
     let nim_path = Path::new(&nim);
-    let dir = nim_path.parent().unwrap_or(Path::new("."));
-    let file = nim_path.file_name().expect("nim file name");
+    let root_path = root.as_deref().map(Path::new);
+    let dir = root_path.unwrap_or_else(|| nim_path.parent().unwrap_or(Path::new(".")));
+    let file: &Path = if root_path.is_some() {
+        nim_path
+    } else {
+        Path::new(nim_path.file_name().expect("nim file name"))
+    };
     let path_env = std::env::var("PATH").unwrap_or_default();
     let mut prefix = Vec::new();
     if let Ok(d) = std::env::var("NIMONY_BIN") {
@@ -71,7 +93,15 @@ fn main() {
     // scratch dir) shares one `nimcache` with every other program built there. Narrow to this
     // program's own closure, or the link sees two `main`s.
     if let Some(note) = temen_run::nim_program_closure(&dir.join("nimcache"), &nim, &mut mods) {
-        eprintln!("  {note}");
+        // A fallback means the closure belongs to some *other* program. Linking it anyway writes a
+        // plausible artifact for the wrong source and reports success — which is what happened the
+        // first time this ran: 581 funcs written where nimsem has ~12,725, under the message
+        // "wrote ... a real Nim program". Refuse instead.
+        panic!(
+            "{note}\n    `{nim}` names no module in {:?} — refusing to link a different program's \
+             closure. For an in-tree source pass `--root <tree> <path-relative-to-tree>`.",
+            dir.join("nimcache")
+        );
     }
     assert!(
         mods.iter().any(|(s, _)| s.starts_with("sysv")),
