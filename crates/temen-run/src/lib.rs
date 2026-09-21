@@ -5003,6 +5003,11 @@ fn with_backtrace(msg: String, bt: &[temen_interp::IrPc], m: &Module) -> String 
             .unwrap_or_default()
     };
     let mut out = msg;
+    if let Some(addr) = temen_interp::last_capture_fault_addr() {
+        out.push_str(&format!(
+            "\n--- faulting address: {addr:#x} (window-relative) ---"
+        ));
+    }
     out.push_str("\n--- guest backtrace (innermost first) ---");
     for pc in bt.iter().take(FRAMES) {
         out.push_str(&format!(

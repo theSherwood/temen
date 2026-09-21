@@ -3163,6 +3163,9 @@ pub fn run_capture_reserved_with_host(
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     LAST_CAPTURE_BACKTRACE.with(|c| *c.borrow_mut() = bt);
+    LAST_CAPTURE_FAULT.with(|c| {
+        *c.borrow_mut() = mem.as_ref().and_then(|mm| mm.peek_fault_rel());
+    });
     (r, snap)
 }
 
@@ -3182,6 +3185,24 @@ thread_local! {
 /// frame first, empty if that run finished cleanly or none has happened.
 pub fn last_capture_backtrace() -> Vec<IrPc> {
     LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
+}
+
+thread_local! {
+    /// The window-relative faulting address of the last [`run_capture_reserved_with_host`], the
+    /// companion to [`LAST_CAPTURE_BACKTRACE`]. `Inspector::fault_addr` already reported this to the
+    /// DAP layer; a plain run had no way to see it.
+    static LAST_CAPTURE_FAULT: core::cell::RefCell<Option<u64>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// The window-relative address of the last [`run_capture_reserved_with_host`]'s `MemoryFault`
+/// (a NULL deref is `0`); `None` if that run did not fault on an address.
+///
+/// Worth more than it looks next to a backtrace: a **small** address says the pointer was never
+/// initialized, a **wild** one says the arithmetic that produced it was wrong. Those point at
+/// different bugs, and the backtrace alone does not separate them.
+pub fn last_capture_fault_addr() -> Option<u64> {
+    LAST_CAPTURE_FAULT.with(|c| *c.borrow())
 }
 
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
