@@ -3599,6 +3599,52 @@ pub const MAX_FIBERS: usize = 1 << 24;
 /// cumulative, so there it bounds *total* spawns (stricter, but containment holds either way).
 pub const MAX_VCPUS: usize = 1 << 16;
 
+/// D66 — the **lane arithmetic** every scheduler's dispatch calls (INVARIANTS #3 ruling 2026-09-21):
+/// parallelism is a granted resource bounded at dispatch. A task carries a *lane chain* — `(domain,
+/// cap)` for its own domain and every ancestor, innermost first — and may be on a worker only while
+/// every bounded cap in the chain has room; it holds those lanes exactly while on the worker. Shared
+/// by the interpreter's two drivers and the JIT's child-domain executor, so the 6/2/2 answer is one
+/// function, not three (INVARIANTS #15). Pure over a running-count map; no locking policy here.
+pub mod lanes {
+    use alloc::collections::BTreeMap;
+
+    /// Whether `chain` has any bounded cap at all. `false` for every run that sets no lane cap —
+    /// the hot-path gate: such a task takes no scheduler lock around its run.
+    pub fn bounded(chain: &[(usize, i64)]) -> bool {
+        chain.iter().any(|&(_, cap)| cap >= 0)
+    }
+
+    /// Try to take every lane in `chain` for a task about to run: each bounded entry must have room
+    /// (`running < cap`); on success every entry's count rises. All-or-nothing, so a task never
+    /// holds a child lane without the enclosing ones — which is what makes "a task counts against
+    /// its own lane and every ancestor's" a single check.
+    pub fn enter(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
+        if chain
+            .iter()
+            .any(|&(d, cap)| cap >= 0 && running.get(&d).copied().unwrap_or(0) as i64 >= cap)
+        {
+            return false;
+        }
+        for &(d, _) in chain {
+            *running.entry(d).or_insert(0) += 1;
+        }
+        true
+    }
+
+    /// Release every lane in `chain` (the task parked, yielded or finished). Exact inverse of
+    /// [`enter`]; a zero entry is removed so the map stays the size of the live domain set.
+    pub fn leave(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) {
+        for &(d, _) in chain {
+            if let Some(n) = running.get_mut(&d) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    running.remove(&d);
+                }
+            }
+        }
+    }
+}
+
 /// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
 /// (`thread.spawn`) a run may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb
 /// ceilings. The **single** quota type shared by both runtimes (re-exported as `temen_interp::Quota` and

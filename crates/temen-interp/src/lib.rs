@@ -6683,41 +6683,9 @@ fn run_deadlocked(s: &Sched) -> bool {
             .any(|v| matches!(v.pending, Some(Pending::ReapPid { .. })))
 }
 
-/// D66 — whether a lane chain has any bounded cap at all. `false` for every run that sets no lane
-/// cap, which is the hot-path gate: such a vCPU takes neither scheduler lock around its run.
-fn lane_bounded(chain: &[(usize, i64)]) -> bool {
-    chain.iter().any(|&(_, cap)| cap >= 0)
-}
-
-/// D66 — try to take every lane in `chain` for a task about to run: each bounded entry must have room
-/// (`running < cap`); on success every entry's count rises. All-or-nothing, so a task never holds a
-/// child lane without the enclosing ones — which is what makes "a task counts against its own lane
-/// and every ancestor's" a single check.
-fn lane_enter(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
-    if chain
-        .iter()
-        .any(|&(d, cap)| cap >= 0 && running.get(&d).copied().unwrap_or(0) as i64 >= cap)
-    {
-        return false;
-    }
-    for &(d, _) in chain {
-        *running.entry(d).or_insert(0) += 1;
-    }
-    true
-}
-
-/// D66 — release every lane in `chain` (the task parked, yielded or finished). Exact inverse of
-/// [`lane_enter`]; a zero entry is removed so the map stays the size of the live domain set.
-fn lane_leave(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) {
-    for &(d, _) in chain {
-        if let Some(n) = running.get_mut(&d) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                running.remove(&d);
-            }
-        }
-    }
-}
+/// D66 — the lane arithmetic, shared with the JIT's child-domain executor through
+/// [`temen_ir::lanes`] so the 6/2/2 answer is one function (INVARIANTS #15). See there.
+use temen_ir::lanes::{bounded as lane_bounded, enter as lane_enter, leave as lane_leave};
 
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
