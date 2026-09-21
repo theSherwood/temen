@@ -1367,6 +1367,8 @@ func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.c
 /// width is why one func cannot serve both (the link checks import shape, #1524).
 const POSIX_OPEN_ADAPTER: &str = "\
 import 0 \"open\" (i64, i64, i64) -> (i64)
+import 1 \"unlink\" (i64, i64) -> (i64)
+import 2 \"rename\" (i64, i64, i64, i64) -> (i64)
 
 func (i64, i32, i64) -> (i32) {
 block 0 (v0: i64, v1: i32, v2: i64) { br 1(v0, v1, v0) }
@@ -1399,6 +1401,51 @@ block 2 (v0: i64, v1: i32, v2: i64) {
   v3 = i64.sub v2 v0
   v4 = i64.extend_i32_s v1
   v5 = call.import 0 (v0, v3, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}
+
+func (i64) -> (i32) {
+block 0 (v0: i64) { br 1(v0, v0) }
+block 1 (v0: i64, v1: i64) {
+  v2 = i32.load8_u v1
+  v3 = i32.eqz v2
+  v4 = i64.const 1
+  v5 = i64.add v1 v4
+  br_if v3 2(v0, v1) 1(v0, v5)
+  }
+block 2 (v0: i64, v1: i64) {
+  v2 = i64.sub v1 v0
+  v3 = call.import 1 (v0, v2)
+  v4 = i32.wrap_i64 v3
+  return v4
+  }
+}
+
+func (i64, i64) -> (i32) {
+block 0 (v0: i64, v1: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.sub v2 v0
+  br 3(v0, v3, v1, v1)
+  }
+block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i32.load8_u v3
+  v5 = i32.eqz v4
+  v6 = i64.const 1
+  v7 = i64.add v3 v6
+  br_if v5 4(v0, v1, v2, v3) 3(v0, v1, v2, v7)
+  }
+block 4 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.sub v3 v2
+  v5 = call.import 2 (v0, v1, v2, v4)
   v6 = i32.wrap_i64 v5
   return v6
   }
@@ -1655,6 +1702,24 @@ pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit
             .map(|(n, _)| (n.clone(), 1)),
     );
     compute_exports.retain(|(n, _)| !n.starts_with("open"));
+    // `unlink` and `c_rename`, for the same reason and by the same route. nim writes a file
+    // **atomically** — `vfs.writeBytes` writes a temp then renames it into place, and removes the
+    // temp if anything fails — so a stubbed `rename` means every file write fails at the last step,
+    // after the work is done. Both need the NUL walk: C passes terminated strings where the ops take
+    // `(ptr, len)`, exactly as `open` does.
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("unlink"))
+            .map(|(n, _)| (n.clone(), 2)),
+    );
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("c_rename"))
+            .map(|(n, _)| (n.clone(), 3)),
+    );
+    compute_exports.retain(|(n, _)| !n.starts_with("unlink") && !n.starts_with("c_rename"));
     let open_adapter = temen_ir::LinkUnit {
         module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
             .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,

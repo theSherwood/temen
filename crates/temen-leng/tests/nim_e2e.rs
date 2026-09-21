@@ -824,6 +824,10 @@ fn nim_import_binding(name: &str) -> Option<NimImport> {
         // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
         // the shim's allocator handed it.
         "read" => NimImport::Posix(temen_posix::OP_READ),
+        // The path-ABI adapter's other two forwards (#1595): nim writes files atomically, so a
+        // file write is write-temp + rename, with an unlink on the failure path.
+        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
+        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
         "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
         n if n.starts_with("cExitSys") => NimImport::Exit,
         n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
