@@ -3474,8 +3474,9 @@ until their children become scheduler tasks (slices 2–3), which is when their 
 Σ accounting arrive. Also: the §15 ceiling on every §14 path (#1590) and the OS-thread spawn failure
 as a value with the budget un-spent (#1587).
 
-*The child-domain executor on the JIT* (#1600 slice 2, `temen-jit/src/child_exec.rs`): a **detached**
-child (op 15) is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+*The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
+non-durable §14 child — the **carve** children of ops 0/5/8/11/13 and the **detached** children of
+op 15 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
 carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
 on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
 migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
@@ -3495,6 +3496,17 @@ preemption (a task that never parks holds its lane until it returns — the inte
 round-robin has no twin); a domain's own `thread.spawn` vCPUs stay 1:1 and are counted by
 `max_vcpus`, not lanes; nested carve children (ops 0/5/8/11/13) still take one OS thread each; the
 task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap, no longer a 2 MiB OS stack).
+
+*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`,
+`spawn_granted_child` and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
+file-join-slot / release-on-failure — collapse into one `file_task`, parameterised by what actually
+differs: how the window is seeded (a carve image, or data segments plus payload), whether a
+`copy_back` writes it back at finish (a carve child: the parent is the superset), and the lane chain.
+`run_child_code`, `run_child_code_then` and `run_detached_child_then` are gone with the OS threads
+they drove, and so is `Nursery::child_threads` — run teardown is the executor's quiescence alone.
+A carve child has no lane of its own to be granted, so it runs in its parent's: the hook family
+carries the parent's `(domain, lane cap)`, read once when the family is built. What was three
+propagation sites for every future scheduling change (invariant 14's burden) is one.
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 

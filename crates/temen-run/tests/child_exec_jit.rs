@@ -265,3 +265,78 @@ fn run_teardown_unwinds_a_detached_child_parked_forever() {
     assert_eq!(run_jit(&p, &a, &b, -1), 7);
     assert_eq!(run_jit(&p, &a, &b, 1), 7, "under a cap too");
 }
+
+/// Two **carve** children (Instantiator op 0, same module) under a parent lane cap of 1. A carve
+/// child's window is a private image of its carve, written back at finish — so this pins the new
+/// copy-back path *and* that the carve path goes through the same dispatch gate without wedging:
+/// each child stores a marker in its own 4 KiB carve and returns a value the parent joins. Both
+/// carves carry their marker afterwards, and the parent sees `42 + 43`.
+const TWO_CARVE_CHILDREN: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  vf1 = i64.const 1
+  vf2 = i64.const 2
+  voa = i64.const 65536
+  vob = i64.const 69632
+  vlog = i64.const 12
+  vq = i64.const 0
+  vca = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (vf1, voa, vlog, vq)
+  vcb = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (vf2, vob, vlog, vq)
+  vja = call.cap 6 1 (i32) -> (i64) v0 (vca)
+  vjb = call.cap 6 1 (i32) -> (i64) v0 (vcb)
+  vr = i64.add vja vjb
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 2048
+  vm = i64.const 171
+  i64.store va vm
+  vr = i64.const 42
+  return vr
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  va = i64.const 2048
+  vm = i64.const 172
+  i64.store va vm
+  vr = i64.const 43
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn two_carve_children_copy_back_under_a_lane_cap() {
+    let m = module(TWO_CARVE_CHILDREN);
+    let run = |cap: i64| -> (i64, Vec<u8>) {
+        let mut host = Host::new();
+        host.set_lane_cap(cap);
+        let inst = host.grant_instantiator(0, 1u64 << 17);
+        let (jo, mem) = compile_and_run_capture_reserved_with_host_ex(
+            &m,
+            0,
+            &[inst as i64],
+            &[],
+            temen_ir::DEFAULT_RESERVED_LOG2,
+            temen_run::cap_thunk,
+            &mut host as *mut Host as *mut c_void,
+            Some(temen_run::module_resolver),
+            Some(grant_hooks(&mut host as *mut Host)),
+        )
+        .expect("jit run");
+        match jo {
+            JitOutcome::Returned(ref v) => (v.first().copied().unwrap_or(-1), mem),
+            ref o => panic!("jit ended abnormally: {o:?}"),
+        }
+    };
+    for cap in [1i64, 2, -1] {
+        let (r, mem) = run(cap);
+        assert_eq!(r, 85, "both carve children joined (cap {cap})");
+        // The copy-back: each child's marker landed in *its own* carve, at carve offset 2048.
+        assert_eq!(mem[65536 + 2048], 171, "child A's carve (cap {cap})");
+        assert_eq!(mem[69632 + 2048], 172, "child B's carve (cap {cap})");
+    }
+}

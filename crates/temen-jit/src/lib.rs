@@ -904,6 +904,13 @@ pub struct GrantChildHooks {
     ///
     /// Null is legal only when the hooks are never invoked.
     pub parent_ctx: *mut core::ffi::c_void,
+    /// D66 — the parent domain's `(id, lane cap)`, read off the parent host when this family is
+    /// built (the same call that chooses the pointer above). A **carve** child (ops 0/5/8/11/13)
+    /// runs in its parent's lane — it has no lane of its own to be granted — so the executor gates
+    /// it on this alone; a detached child's `GrantChild` carries the same pair plus its own lane.
+    /// `-1` = unbounded.
+    pub parent_domain: u64,
+    pub parent_lane_cap: i64,
 }
 
 /// Register / clear a granted child's serve context on its shared powerbox — see
@@ -5622,108 +5629,6 @@ pub(crate) fn compile_nondurable_child(
         0,   // an empty powerbox holds no `Jit` — the natural table,
         shadow,
     )
-}
-
-/// PROCESS.md S1: run an already-compiled non-durable §14 child confined to the carve
-/// `[parent_mem_base + sub_base, … + 2^size_log2)`. Because [`compile_child`] bakes only the size
-/// mask and the window **base is a runtime arg** to `run_guarded`, one compiled child runs at *any*
-/// carve offset — the property the compile cache relies on. Allocates the child's own fresh guarded
-/// window, seeds it from the carve (the §14 data plane is shared memory), runs under the re-entrant
-/// detect-and-kill guard, and copies the result window back into the carve (the parent is the
-/// superset). Non-durable only: no ctx-0 / shadow seeding and no freeze-unwind export (a non-durable
-/// run never freezes), so this is the `compile_child_and_run` body minus all its durable branches.
-///
-/// # Safety
-/// `code` is a live compiled child (kept alive by the cache for the call), held by raw pointer —
-/// **no `&CompiledModule` may be live across the run**: a child holding a `Jit` grant re-enters its
-/// module (`define_extra`/`install`) through the pointer its powerbox registered while its guest is
-/// suspended in the `call.cap` (the root's `run_raw` discipline). `[parent_mem_base + sub_base, …
-/// + child_size)` is committed parent-window memory (the `Instantiator` bounded the carve to the
-/// holder's range). `args` matches the entry's arity.
-#[cfg(fiber_rt)]
-pub(crate) unsafe fn run_child_code(
-    code: *const CompiledModule,
-    sub_base: u64,
-    child_size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: &[i64],
-    n_results: usize,
-) -> (i64, i64) {
-    run_child_code_then(
-        code,
-        sub_base,
-        child_size_log2,
-        parent_mem_base,
-        args,
-        n_results,
-        || (),
-    )
-}
-
-/// [`run_child_code`] with a **teardown hook** that runs after the copy-back but **before the child
-/// window is freed**. A granted child (Instantiator op 8/11/13) releases its powerbox `Host` here:
-/// the host's region-canon purge guard forgets `[child_base, +size)` when it drops, and running that
-/// while the window's VA range is still reserved means the purge can never erase entries a *later*
-/// window at a reused address just recorded (S1b/S1c canonical futex keys). The plain non-durable
-/// child passes `|| ()` — its empty powerbox installs no hook.
-///
-/// # Safety
-/// As [`run_child_code`].
-#[cfg(fiber_rt)]
-pub(crate) unsafe fn run_child_code_then(
-    code: *const CompiledModule,
-    sub_base: u64,
-    child_size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: &[i64],
-    n_results: usize,
-    teardown: impl FnOnce(),
-) -> (i64, i64) {
-    // Read the two raw pointers the guarded call needs up front; no reference into `*code` survives
-    // past here (see the safety contract).
-    let (entry_code, fn_table_ptr) = (
-        (*code).tramp_code,
-        (*code).fn_table.as_ptr() as *const core::ffi::c_void,
-    );
-    let child_size = 1u64 << child_size_log2;
-    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
-    let child_base = child_window.base();
-    {
-        // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = child_size.
-        let src =
-            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
-        child_window.rw_mut().copy_from_slice(src);
-    }
-    let mut results = vec![0i64; n_results];
-    let mut trap_cell: i64 = 0;
-    // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (baked size mask; a
-    // width-overrun hits this window's guard page); the guard is re-entrant so a child fault is
-    // caught here, not propagated to the parent's frame.
-    let faulted = mem::run_guarded(
-        &child_window,
-        entry_code,
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        child_base,
-        fn_table_ptr,
-        &mut trap_cell,
-    );
-    if faulted {
-        trap_cell = mem::FAULT_TRAP;
-    }
-    child_window.restore_rw();
-    {
-        // The parent (superset) now sees the child's writes: copy the carve back.
-        let dst = std::slice::from_raw_parts_mut(
-            parent_mem_base.add(sub_base as usize),
-            child_size as usize,
-        );
-        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
-    }
-    // Run the teardown (e.g. free a granted child's powerbox host) while `child_window` is alive —
-    // see the doc comment: the host's region-canon purge must precede the window VA becoming reusable.
-    teardown();
-    (results.first().copied().unwrap_or(0), trap_cell)
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)

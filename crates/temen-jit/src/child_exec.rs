@@ -1,6 +1,6 @@
-//! **Child-domain executor** (DESIGN.md §23, D66) — detached §14 children (`instantiate_detached`,
-//! Instantiator op 15) run as **tasks on a bounded pool of platform workers**, not one OS thread
-//! each. A task is a platform-owned fiber ([`FiberSlot::platform`]) carrying the child's own window,
+//! **Child-domain executor** (DESIGN.md §23, D66) — every non-durable §14 child (the carve children
+//! of Instantiator ops 0/5/8/11/13 and the detached children of op 15) runs as a **task on a bounded
+//! pool of platform workers**, not one OS thread each. A task is a platform-owned fiber ([`FiberSlot::platform`]) carrying the child's own window,
 //! trap cell and fiber execution context; any worker may resume it (migration under the same
 //! single-owner claim guest fibers use), and a task that parks — a futex `wait` inside the child —
 //! hands its worker back instead of holding an OS thread, so a lane-bounded parent can run N
@@ -56,6 +56,13 @@ const RECHECK: Duration = Duration::from_millis(20);
 type LimitedEntry =
     extern "C" fn(*const i64, *mut i64, *mut u8, *const core::ffi::c_void, *mut i64, u64);
 
+/// A **carve** child's copy-back: the parent is the superset, so the child's window image is
+/// written back into its carve at finish. `None` for a detached child (its window is its own).
+pub(crate) type CopyBack = Box<dyn FnOnce(&[u8]) + Send>;
+
+/// A task's one-shot teardown: release the child powerbox, return its lane.
+pub(crate) type Teardown = Box<dyn FnOnce() + Send>;
+
 /// A raw pointer that crosses to a worker under the executor's ownership discipline (documented at
 /// each construction site).
 struct SendRaw<T>(T);
@@ -72,7 +79,9 @@ pub(crate) struct ChildTask {
     /// The child's own fiber execution context — published as `CURRENT_RT` for each resume so the
     /// futex thunk's "inside a fiber ⇒ park the fiber" arm sees this task.
     rt: Box<FiberRuntime>,
-    /// The child's window (moves with the task; `GuestWindow: Send`).
+    /// The child's window — its own for a detached child, a private image of the parent's carve
+    /// for a carve child (seeded by `init`, written back by `copy_back`). Moves with the task
+    /// (`GuestWindow: Send`).
     window: mem::GuestWindow,
     fault: (usize, usize),
     /// The task's own trap cell (R4). Heap-stable: baked into the child's frames at first entry.
@@ -88,9 +97,13 @@ pub(crate) struct ChildTask {
     /// Saved `vcpu.tls` register between residencies (R2: task-level, not thread-level).
     tls: i64,
     done: Arc<ChildDone>,
+    /// A **carve** child's copy-back: runs once at finish over the task's window image, before
+    /// `teardown` — the parent (superset) then sees the child's writes. `None` for a detached child
+    /// (its window is its own; nothing to copy anywhere).
+    copy_back: Option<CopyBack>,
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
-    teardown: Option<Box<dyn FnOnce() + Send>>,
+    teardown: Option<Teardown>,
 }
 
 // SAFETY: a task moves between workers only through the executor's queue, and is touched only by
@@ -118,8 +131,9 @@ impl ChildTask {
         n_results: usize,
         chain: Vec<(usize, i64)>,
         done: Arc<ChildDone>,
-        teardown: Box<dyn FnOnce() + Send>,
-    ) -> Result<ChildTask, Box<dyn FnOnce() + Send>> {
+        copy_back: Option<CopyBack>,
+        teardown: Teardown,
+    ) -> Result<ChildTask, Teardown> {
         let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
         let base = window.base();
         init(window.rw_mut());
@@ -168,6 +182,7 @@ impl ChildTask {
             chain,
             tls: 0,
             done,
+            copy_back,
             teardown: Some(teardown),
         })
     }
@@ -611,6 +626,9 @@ impl ChildExec {
         let trap = task.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         task.window.restore_rw();
+        if let Some(c) = task.copy_back.take() {
+            c(task.window.rw_mut());
+        }
         if let Some(t) = task.teardown.take() {
             t();
         }

@@ -2334,7 +2334,21 @@ impl CapCtx {
 /// a shared `Arc<Mutex<Host>>`), so they are the same function either way.
 pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     let locked = ctx.is_locked();
+    // D66 — the parent's lane coordinates, read now (before any guest runs) so a carve child's task
+    // is gated on its parent's lane without a hook call at every spawn.
+    // SAFETY: `ctx` is the live parent host in the shape it declares (the contract of this fn).
+    let (parent_domain, parent_lane_cap) = unsafe {
+        match ctx {
+            CapCtx::Raw(h) => ((*h).domain_id(), (*h).lane_cap()),
+            CapCtx::Locked(m) => {
+                let g = (*m).lock().unwrap_or_else(|e| e.into_inner());
+                (g.domain_id(), g.lane_cap())
+            }
+        }
+    };
     temen_jit::GrantChildHooks {
+        parent_domain,
+        parent_lane_cap,
         build: if locked {
             grant_child_build_locked
         } else {
@@ -2432,6 +2446,8 @@ pub unsafe extern "C" fn grant_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -2441,10 +2457,10 @@ pub unsafe extern "C" fn grant_child_build(
                 as_handle,
                 grant_handle: cg,
                 jit_table_log2,
-                domain: 0,
-                lane_cap: -1,
-                parent_domain: 0,
-                parent_lane_cap: -1,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }
