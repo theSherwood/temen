@@ -2624,6 +2624,18 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
             elide(&String::from_utf8_lossy(&out))
         );
     }
+    // **And stderr**, which this probe used to throw away. nim's `quit(msg)` writes its message
+    // there, so a phase that rejected its input exited cleanly with an empty stdout and no output
+    // file, and the only thing the probe could say was "wrote no output" — the diagnosis was sitting
+    // in a buffer nobody read. Every phase failure this probe has chased so far was a run that told
+    // you what was wrong if you listened on the right fd.
+    let err = posix.stderr();
+    if !err.is_empty() {
+        eprintln!(
+            "  nifler2: stderr {:?}",
+            elide(&String::from_utf8_lossy(&err))
+        );
+    }
     // **Assert**, do not narrate. Every arm here used to be an `eprintln!`, `DIFFERS` included, so
     // the run reported success whatever came out — the headline "byte-identical" line was a print
     // statement and the probe could not fail on a wrong answer. A comparison that cannot fail is not
@@ -2644,7 +2656,13 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
         return;
     }
     match posix.read_file(&format!("/{out_name}")) {
-        None => panic!("wrote no /out.nif, but native wrote {} bytes", want.len()),
+        None => panic!(
+            "wrote no /{out_name}, but native wrote {} bytes\n    guest stdout: {:?}\n    \
+             guest stderr: {:?}",
+            want.len(),
+            elide(&String::from_utf8_lossy(&out)),
+            elide(&String::from_utf8_lossy(&err)),
+        ),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \
              no C compiler, runs on Temen",
