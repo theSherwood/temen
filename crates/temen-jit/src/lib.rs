@@ -186,13 +186,24 @@ pub const fn fiber_supported() -> bool {
 /// lazy (RSS follows touched pages, not the reservation), so the VA bump is cheap and real fuzz
 /// seeds — far below even the old cap — are unaffected.
 ///
-/// **The (128, 256] MiB premise above is stale** (#1591, measured 2026-09-21). nimsem semchecking the
-/// system module peaks at **2043 MiB** RSS — the top-level run and the op-13 child agree, so it is the
-/// real cost, not a child-path leak. It needs a 2 GiB carve, and a carve is a hard ceiling (a child's
-/// `mapped == reserved`), so the front-end chain does **not** fit here any more and
-/// `nim_chain_op13_jit` now skips rather than failing. Moving this constant re-opens an owner-approved
-/// decision on the reference JIT's per-window backing policy, so it is left alone pending that call.
-pub const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
+/// **Re-measured 2026-09-21 (#1591, #1603): 29 → 31.** The premise above was accurate when written,
+/// then two of our own defects inflated the workload past it. `nifler_shim.c`'s `mmap` was not
+/// page-aligned, so Nim's allocator — which recovers a chunk header with `pageAddr(p) = p & ~0xFFF`
+/// — crashed in `rawDealloc`; that was worked around with `-d:useMalloc`, which routes every object
+/// to the on-ramp's `synth_malloc`, whose `free` is a no-op. The guest's peak then tracked total
+/// allocation *churn* rather than its live set: 2007 MiB. With the alignment fixed and the flag
+/// dropped it is **666 MiB** for byte-identical output — still 2.6x the original (128, 256], so the
+/// chain needs a 1 GiB carve and hence a 2 GiB parent window.
+///
+/// Raising the cap is safe in the sense that matters: it is **not** a confinement boundary. Masking
+/// enforces that (DESIGN §4 / INVARIANTS #2); this is a guard rail so a fuzzed or malformed module
+/// cannot ask the reference JIT for an absurd allocation. The cost is address space, not RAM — the
+/// mapping is lazy, so RSS follows touched pages, and a guest that needs 666 MiB needs it on every
+/// engine. `MAX_JIT_RESERVED_LOG2` has allowed 1 TiB of reserved VA all along.
+///
+/// (Recorded honestly because the line above says "owner-approved": the *figure* went stale, the
+/// decision behind it did not, and what actually changed was on our side of the boundary.)
+pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
