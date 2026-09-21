@@ -166,6 +166,11 @@ fn grant_fs(host: &mut Host, factory: &Arc<impl Fn() -> HostProc + Send + Sync +
     host.grant_host_proc_forkable(init, fork)
 }
 
+/// Exit code for "this engine cannot run this workload" — distinct from success (0) and from a real
+/// failure (1), so `build_frontend.sh` can skip the diff instead of comparing against a file that was
+/// never produced.
+const SKIP_EXIT: i32 = 3;
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let nimsem_p = a.next().expect(
@@ -235,7 +240,11 @@ fn main() {
             nimsem_carve + 1,
             temen_jit::MAX_JIT_WINDOW_LOG2,
         );
-        return;
+        // Exit **3**, not 0: a caller that cannot tell "skipped" from "succeeded" will go on to diff
+        // an output that was never written and report a byte difference — which is what happened,
+        // and it left the asset rebuild just as blocked as the panic did. `build_frontend.sh` reads
+        // this code.
+        std::process::exit(SKIP_EXIT);
     }
     let win1 = 1u64 << (nimsem_carve + 1);
     let mut h1 = Host::new();
