@@ -98,7 +98,7 @@ block 2 () {
   br 3(vz)
 }
 block 3 (vi: i64) {
-  vlim = i64.const 20000000
+  vlim = i64.const 2000000
   vlt = i64.lt_u vi vlim
   vone3 = i64.const 1
   vi1 = i64.add vi vone3
@@ -209,6 +209,11 @@ fn run_interp(p: &temen_ir::Module, a: &temen_ir::Module, b: &temen_ir::Module, 
 /// of 1 never share a worker instant: the lane is taken at each resume and every resume is gated
 /// on the whole chain. (Without the cap this program reports violations on ≥2 cores — the mutation
 /// the pin was checked against; deliberately not asserted, as in the interpreter's twin.)
+///
+/// The spin count is sized for the **interpreter** side, which dominates the runtime: the oracle
+/// walks every iteration of both children, where the JIT compiles them. At 2M it costs a couple of
+/// seconds and still opens an overlap window wide enough for the no-cap mutation to report
+/// violations; at 20M it cost 27s of CI time for no extra signal.
 #[test]
 fn a_parent_lane_cap_of_one_serializes_two_detached_children_on_the_jit() {
     let p = module(&parent(TAIL_VIOLATIONS));

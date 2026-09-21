@@ -3496,9 +3496,25 @@ guard — the interpreter's sweep, D37) instead of hanging the join. The child e
 **limit-taking** variant of its one trampoline (`build_trampoline(.., with_limit)`, one flag not a
 second family), so its prologue checks guard the fiber stack. JIT frontier, still open on #1600: no
 preemption (a task that never parks holds its lane until it returns — the interpreter's quantum
-round-robin has no twin); a domain's own `thread.spawn` vCPUs stay 1:1 and are counted by
-`max_vcpus`, not lanes; nested carve children (ops 0/5/8/11/13) still take one OS thread each; the
-task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap, no longer a 2 MiB OS stack).
+round-robin has no twin); the task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap,
+no longer a 2 MiB OS stack).
+
+*Broad lanes* (owner ruling 2026-09-21): a lane bounds **all** concurrency in a subtree, not only its
+child domains. The interpreter always read it that way — its `dispatch` gates `thread.spawn` siblings
+like any other task — while the JIT gated nothing on that path, so the same program under the same cap
+ran four siblings at once on one engine and one at a time on the other. The JIT's 1:1 vCPUs now take a
+lane before guest code and give it back after; the *mapping* stays 1:1 (D56 unchanged), what the lane
+bounds is how many may be **running** — the thread exists, it queues. The counts live on the `Domain`
+because a child-subtree task and a `thread.spawn` vCPU of the parent draw on the same root lane: two
+maps would enforce the cap twice and hand out double what was granted. The load-bearing half is that
+**every park gives the lane back** (`thread.wait`, `thread.join`, the §14 child join, the fiber-idle
+wait), since under a cap of 1 a waiter that kept its lane would prevent the very peer that would
+satisfy it from running; each release sits outside the lock that park takes, because blocking for a
+lane while holding it would stop the thread that would release it. A vCPU queued for a lane is
+deliberately **not** counted in `Domain::parked`: it is runnable, and counting it would let a peer's
+infinite wait see quiescence and call a queue a deadlock. A lane of `0` is unsatisfiable rather than
+slow, and answers `ThreadFault` on both engines (INVARIANTS #5 — never a hang). Cross-engine pins in
+`temen-run/tests/vcpu_lanes_jit.rs`.
 
 *One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`,
 `spawn_granted_child` and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /

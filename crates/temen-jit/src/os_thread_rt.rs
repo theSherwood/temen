@@ -317,9 +317,17 @@ pub(crate) enum FutexKey {
 /// Per-absolute-page `(backing identity, region byte offset of the page start)` recorded by every §13
 /// `map`, so the futex thunks can canonicalize an address (below). Process-global because the JIT futex
 /// itself is process-global (real OS threads); keyed **absolutely** so a thunk needs only `phys`, never
-/// the window base. Concurrent runs live at distinct window addresses (distinct pages); a sequential
-/// run reusing a virtual address is protected by the teardown/unmap purge ([`region_canon_forget_window`]).
-/// Real-runtime only — regions are not part of the loom futex model.
+/// the window base.
+///
+/// **Address reuse is a known hazard here** (#1608, open). Two runs never hold the same virtual
+/// address at the same time, but they reuse it over time — a freed reservation is handed straight
+/// back out, and in a process running several domains that happens constantly — while the purge runs
+/// from the host's teardown, i.e. *after* the reservation is released. A dying run can therefore
+/// forget pages a live one already recorded. Moving the purge into `GuestWindow::drop` (the one
+/// moment the range is provably still ours) is the fix and it is written up on #1608; it is not
+/// applied here because it aborts the windows nextest lane in the manner #1575 documents, which
+/// cannot be debugged without a Windows box. Real-runtime only — regions are not part of the loom
+/// futex model.
 #[cfg(not(loom))]
 static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (u64, u64)>>> =
     std::sync::OnceLock::new();
@@ -349,7 +357,8 @@ pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u6
 }
 
 /// Forget every canonical mapping in the absolute window `[base, base + size)` — called at `unmap` and
-/// at run teardown so a reused virtual address never inherits a stale region identity.
+/// at run teardown so a reused virtual address never inherits a stale region identity. The teardown
+/// caller no longer holds the address by then; see [`REGION_MAP`] and #1608.
 #[cfg(not(loom))]
 pub fn region_canon_forget_window(base: u64, size: u64) {
     let page = mem::page_size() as u64;
