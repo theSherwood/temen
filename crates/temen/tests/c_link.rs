@@ -34,10 +34,15 @@ use repo_root_mod::repo_root;
 
 #[cfg(target_os = "linux")]
 use std::io::Write;
+// Only the Linux-only self-host half (`emit_object_real`, `chibicc_ref`, the TU-closure helpers)
+// still needs these — the shared chibicc builder moved to `support/chibicc.rs`, so ungated they are
+// unused everywhere else, which `-D warnings` catches on macOS and not here.
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 
 use temen_interp::Value;
