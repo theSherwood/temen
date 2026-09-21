@@ -118,13 +118,32 @@ fn main() {
     // `--posix` leaves them as **retained manifest imports** a host binds to a real `temen_posix`
     // personality. A compiler phase needs the latter: it opens, reads and writes files, and (for
     // nimsem) spawns `nifler` through an `exec` cap.
+    // The **prebuilt guest libc** (`LIBC_SERVED`): `snprintf`/`strtod`/libm, which no hand-written
+    // shim reasonably carries. Without it those stay unbound manifest imports and the program cannot
+    // be instantiated — which is how a real phase first failed here, on 24 unbound trig leaves
+    // (`arctan.0.`, `cos.1.`, …) that `std/math` declares and nimsem's closure pulls in. The compute
+    // shim does not serve libm; `nim_libc_units` does.
+    let libc = std::env::var("TEMEN_PG_LIBC")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            let d = Path::new("browser/web/assets/pg_libc.temeno");
+            d.exists().then(|| d.to_path_buf())
+        })
+        .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("read libc {p:?}: {e}")));
     let module = if posix {
-        let runtime = temen_leng::nim_posix_runtime(&units)
+        let mut runtime = temen_leng::nim_posix_runtime(&units)
             .unwrap_or_else(|e| panic!("nim posix runtime: {e}"));
+        if let Some(libc) = libc.as_deref() {
+            runtime.extend(
+                temen_leng::nim_libc_units(libc, &units)
+                    .unwrap_or_else(|e| panic!("nim libc units: {e}")),
+            );
+        }
         temen_leng::link_whole_powerbox_manifest(&units, runtime)
             .unwrap_or_else(|e| panic!("nim→posix bridge: {e}"))
     } else {
-        temen_leng::link_nim_powerbox(&units, None)
+        temen_leng::link_nim_powerbox(&units, libc.as_deref())
             .unwrap_or_else(|e| panic!("nim→powerbox bridge: {e}"))
     };
     // Verify before shipping (the escape-freedom floor, DESIGN §2a) and sanity-check the entry shape.
