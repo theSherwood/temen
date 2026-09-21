@@ -1908,12 +1908,9 @@ fn run_inner(
     // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
     // §14 nursery before the guest runs (the nursery only exists when the module holds an
     // `Instantiator`). `None` leaves op 8 an inert `CapFault`.
-    #[cfg(fiber_rt)]
-    if let Some(n) = &cm._nursery {
-        n.set_grant_hooks(grant_child);
-    }
-    #[cfg(not(fiber_rt))]
-    let _ = grant_child;
+    // Through the one setter, so the nursery hooks and the domain's lane are installed together
+    // (they come from the same host and must agree).
+    cm.set_grant_child_hooks(grant_child);
     cm.run(args, init_mem, snapshot_cap)
 }
 
@@ -3696,6 +3693,15 @@ impl CompiledModule {
         if let Some(n) = &self._nursery {
             n.set_grant_hooks(hooks);
         }
+        // D66 — the same call installs this run's own lane: the hooks already carry the host's
+        // `(domain_id, lane_cap)` (that is how a §14 child's chain gets its parent entry), and the
+        // domain needs the identical pair so its 1:1 vCPUs and its children's tasks draw on **one**
+        // lane rather than two copies of the cap. Done here rather than at the nursery so a module
+        // that only uses `thread.*` — and therefore has no nursery at all — is still bounded.
+        #[cfg(fiber_rt)]
+        if let (Some(d), Some(h)) = (&self.domain, hooks.as_ref()) {
+            d.set_lane_chain(h.parent_domain, h.parent_lane_cap);
+        }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
     }
@@ -4087,7 +4093,37 @@ impl CompiledModule {
         if let Some(fc) = &(*this).freeze_ctl {
             fc.publish(mem_base as usize);
         }
-        let faulted = if seed_faulted {
+        // D66 — the root vCPU takes a lane like any other task before it runs guest code, and gives
+        // it back when its computation ends. Without this the root would be exempt from the cap its
+        // own children are held to, which is the whole of INVARIANTS #3 read backwards. A run with
+        // no cap has an empty chain and skips every line of this.
+        #[cfg(fiber_rt)]
+        let root_lane = (*this)
+            .domain
+            .as_ref()
+            .map(|d| d.lane_chain())
+            .unwrap_or_default();
+        #[cfg(fiber_rt)]
+        let root_has_lane = match &(*this).domain {
+            // The root is the first task of its domain, so this only ever waits when a cap of 0
+            // makes it unsatisfiable — which is a `ThreadFault`, matching the interpreter.
+            Some(d) => d.lane_acquire(&root_lane, || false),
+            None => true,
+        };
+        #[cfg(fiber_rt)]
+        if !root_has_lane {
+            (*(trap_cell.as_ptr() as *const AtomicI64))
+                .compare_exchange(
+                    0,
+                    TrapKind::ThreadFault as i64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .ok();
+        }
+        #[cfg(not(fiber_rt))]
+        let root_has_lane = true;
+        let faulted = if seed_faulted || !root_has_lane {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
         } else {
@@ -4101,6 +4137,14 @@ impl CompiledModule {
                 trap_cell.as_ptr(),
             )
         };
+        // The root's computation has ended: its lane goes back, so a still-running child task or a
+        // spawned vCPU queued behind it can take it (teardown below joins them).
+        #[cfg(fiber_rt)]
+        if root_has_lane {
+            if let Some(d) = &(*this).domain {
+                d.lane_give_back(&root_lane);
+            }
+        }
         if let Some(fc) = &(*this).freeze_ctl {
             fc.retire();
         }

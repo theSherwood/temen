@@ -1988,52 +1988,82 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
         }
     };
     drop(children);
-    // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
-    // child ran synchronously, so its cell is already `Some` and this returns without waiting; an
-    // async (op-0/5/8/11/13) child parks here until its thread publishes the outcome, with a bounded
-    // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
-    // bakes that same cell, so it unwinds too).
-    let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
-    let (result, trap) = loop {
-        if let Some(outcome) = *st {
-            break outcome;
-        }
-        // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
-        // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
-        // teardown). We must not return a bare `0` and lean on "the parent traps at its next epoch
-        // poll": unlike a spinning caller, a parent that does `join` then `return` has **no** back-edge
-        // or function-entry between this call and its `return`, so there is no next poll — the `0` would
-        // flow straight out as a clean `Returned`, silently dropping the kill (ISSUES.md I33). Setting
-        // the trap cell makes the outcome `Trapped(OutOfFuel)` regardless of a subsequent poll, matching
-        // the child's own kill and the interpreter's runaway-nesting semantics.
-        if epoch_fired(rt.epoch_addr) {
-            *trap_out = TrapKind::OutOfFuel as i64;
-            return 0;
-        }
-        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
-        // trap/exit from any vCPU of the parent domain — or the root's completion (the internal
-        // DOMAIN_DONE sentinel) — ends the domain; a sibling vCPU parked here joining a nested
-        // child returns so its trailing trap-propagation guard (which checks this same cell)
-        // unwinds it. Observed on the same bounded re-check cadence as the kill-path above; the
-        // atomic load matches the cell's cross-thread contract (an `AtomicI64`'s storage).
-        if (*(trap_out as *const core::sync::atomic::AtomicI64))
-            .load(core::sync::atomic::Ordering::Relaxed)
-            != 0
-        {
-            return 0;
-        }
-        st = done
-            .cv
-            .wait_timeout(st, std::time::Duration::from_millis(20))
-            .unwrap_or_else(|e| e.into_inner())
-            .0;
-    };
-    if trap != 0 {
-        *trap_out = trap; // a child trap propagates to the parent on join
-        0
-    } else {
-        result
+    // D66 — a parent joining its §14 child holds no lane while it waits. Load-bearing under a cap of
+    // 1: the child task cannot be dispatched at all until the joining vCPU steps aside, so without
+    // this every bounded `instantiate`-then-`join` would deadlock. Released before the completion
+    // cell's lock, re-taken after — blocking for a lane while holding that lock would stop the child
+    // from publishing the very outcome being waited for. SAFETY: a nonzero `futex_sched` is the
+    // run's live `Domain`, which outlives every child.
+    let dom = (rt.futex_sched != 0)
+        .then(|| unsafe { &*(rt.futex_sched as *const crate::os_thread_rt::Domain) });
+    let lane = dom.map(|d| d.lane_chain()).unwrap_or_default();
+    if let Some(d) = dom {
+        d.lane_give_back(&lane);
     }
+    let result = (|| -> i64 {
+        // Park on the completion cell until the child's OS thread fills it (S1c async children). A durable
+        // child ran synchronously, so its cell is already `Some` and this returns without waiting; an
+        // async (op-0/5/8/11/13) child parks here until its thread publishes the outcome, with a bounded
+        // re-check so a §5 host interrupt on the parent's `epoch_addr` still unwinds a waiter (the child
+        // bakes that same cell, so it unwinds too).
+        let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+        let (result, trap) = loop {
+            if let Some(outcome) = *st {
+                break outcome;
+            }
+            // §5 kill-path: the host set the parent's interrupt cell — stop waiting and **propagate
+            // `OutOfFuel` right here** (the child bakes the same cell, so it unwinds too, and is joined at
+            // teardown). We must not return a bare `0` and lean on "the parent traps at its next epoch
+            // poll": unlike a spinning caller, a parent that does `join` then `return` has **no** back-edge
+            // or function-entry between this call and its `return`, so there is no next poll — the `0` would
+            // flow straight out as a clean `Returned`, silently dropping the kill (ISSUES.md I33). Setting
+            // the trap cell makes the outcome `Trapped(OutOfFuel)` regardless of a subsequent poll, matching
+            // the child's own kill and the interpreter's runaway-nesting semantics.
+            if epoch_fired(rt.epoch_addr) {
+                *trap_out = TrapKind::OutOfFuel as i64;
+                return 0;
+            }
+            // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
+            // trap/exit from any vCPU of the parent domain — or the root's completion (the internal
+            // DOMAIN_DONE sentinel) — ends the domain; a sibling vCPU parked here joining a nested
+            // child returns so its trailing trap-propagation guard (which checks this same cell)
+            // unwinds it. Observed on the same bounded re-check cadence as the kill-path above; the
+            // atomic load matches the cell's cross-thread contract (an `AtomicI64`'s storage).
+            if (*(trap_out as *const core::sync::atomic::AtomicI64))
+                .load(core::sync::atomic::Ordering::Relaxed)
+                != 0
+            {
+                return 0;
+            }
+            st = done
+                .cv
+                .wait_timeout(st, std::time::Duration::from_millis(20))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        };
+        if trap != 0 {
+            *trap_out = trap; // a child trap propagates to the parent on join
+            0
+        } else {
+            result
+        }
+    })();
+    // Back from the park: re-take the lane before the parent's guest code runs again.
+    if let Some(d) = dom {
+        if !d.lane_acquire(&lane, || {
+            // SAFETY: the run's live interrupt cell / trap cell.
+            epoch_fired(rt.epoch_addr)
+                || unsafe {
+                    (*(trap_out as *const core::sync::atomic::AtomicI64))
+                        .load(core::sync::atomic::Ordering::Relaxed)
+                        != 0
+                }
+        }) {
+            *trap_out = TrapKind::ThreadFault as i64;
+            return 0;
+        }
+    }
+    result
 }
 
 /// PROCESS.md S3 `poll(child) -> 0 running | 1 returned | 2 trapped` (JIT). An **async** child (S1c,

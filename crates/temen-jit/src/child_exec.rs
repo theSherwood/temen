@@ -26,13 +26,12 @@
 //! attributed to the task's own cell, never the run's (R4); the window base is baked at first entry
 //! and the window moves with the task (R5 — `GuestWindow: Send`).
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use temen_fiber::{Fiber, State};
-use temen_ir::lanes;
 
 use crate::fiber_rt::{self, FiberRuntime, FiberSlot, SharedFiberTable};
 use crate::instantiator_rt::ChildDone;
@@ -242,8 +241,6 @@ struct ExecState {
     /// Runnable tasks, FIFO. A task whose lane is full stays here — [`ChildExec::pick`] scans past
     /// it rather than shuffling it to a second queue, so there is one runnable set, not two.
     runnable: VecDeque<u64>,
-    /// D66 — per-domain running counts, the lane gate's state (`temen_ir::lanes`).
-    lane_running: BTreeMap<usize, usize>,
     next_id: u64,
     workers: Vec<std::thread::JoinHandle<()>>,
     idle_workers: usize,
@@ -274,7 +271,6 @@ impl ChildExec {
             state: Mutex::new(ExecState {
                 tasks: HashMap::new(),
                 runnable: VecDeque::new(),
-                lane_running: BTreeMap::new(),
                 next_id: 1,
                 workers: Vec::new(),
                 idle_workers: 0,
@@ -343,6 +339,15 @@ impl ChildExec {
     /// wake mechanism: a `notify`, a kill, a vCPU exit and run teardown all reach it through
     /// [`Domain::wake_all_parked`], and an idle worker's cadence sweep fires deadlines with it.
     /// A task that re-checks and is still unsatisfied simply parks again.
+    /// D66 — a lane was given back somewhere in this domain (by a 1:1 vCPU, say): re-offer the
+    /// queue, so a task that `pick` refused for want of a lane is reconsidered. Without this an idle
+    /// worker sleeps on its condvar until something *else* wakes it, which for a run whose only
+    /// other activity is the vCPU that just stepped aside is never.
+    pub(crate) fn notify_workers(&self) {
+        let _g = lock(&self.state);
+        self.cv.notify_all();
+    }
+
     pub(crate) fn wake_all_parked_locked(&self) {
         let mut g = lock(&self.state);
         self.wake_all_parked(&mut g);
@@ -370,16 +375,22 @@ impl ChildExec {
     /// The next runnable task whose whole lane chain has room, taking its lanes. A task refused a
     /// lane keeps its place in the queue; a later release simply makes the next scan admit it.
     fn pick(&self, g: &mut ExecState) -> Option<u64> {
+        // The lane counts live on the `Domain`, shared with its own 1:1 vCPUs — a task of this
+        // subtree and a `thread.spawn` vCPU of the parent draw on the *same* lane, so a private map
+        // here would enforce the cap twice and hand out double the granted parallelism. Taking the
+        // domain's lane lock while holding this one is the one lock order used anywhere; nothing
+        // takes this lock while holding that one.
+        let dom = self.domain();
         let admit = g.runnable.iter().position(|id| {
             g.tasks
                 .get(id)
                 .and_then(|e| e.task.as_ref())
-                .is_some_and(|t| lanes::bounded_fits(&g.lane_running, &t.chain))
+                .is_some_and(|t| match dom {
+                    Some(d) => d.lane_try_enter(&t.chain),
+                    None => true, // no domain ⇒ no lanes to honour (the durable nested nursery)
+                })
         })?;
         let id = g.runnable.remove(admit).expect("position is in range");
-        let chain = g.tasks[&id].task.as_ref().expect("scanned").chain.clone();
-        let took = lanes::enter(&mut g.lane_running, &chain);
-        debug_assert!(took, "the scan proved the chain fits under this same lock");
         g.tasks.get_mut(&id).expect("scanned").woken = false;
         Some(id)
     }
@@ -425,9 +436,14 @@ impl ChildExec {
                 (id, task)
             };
             let outcome = self.run_once(&mut task, worker);
+            // The lane goes back before anything else: a peer 1:1 vCPU or sibling task may be
+            // queued behind it. `lane_give_back` touches only the domain's lane lock, so it is safe
+            // to call before taking this executor's.
+            if let Some(d) = self.domain() {
+                d.lane_give_back(&task.chain);
+            }
             let mut task = Some(task);
             let mut g = lock(&self.state);
-            lanes::leave(&mut g.lane_running, &task.as_ref().expect("held").chain);
             match outcome {
                 Outcome::Parked => {
                     let shutdown = g.shutdown;
