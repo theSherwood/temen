@@ -5135,6 +5135,53 @@ pub fn nim_posix_imports(
     (imports, unbound)
 }
 
+/// **Run one no-C nimony phase** over a shared POSIX personality, with `argv`.
+///
+/// The single route every no-C driver takes: bind the module's retained imports with
+/// [`nim_posix_imports`], refuse if any name is unserved, instantiate, and run with `argv` as the
+/// guest's argument vector. `module` is taken by value because instantiation consumes it, and a
+/// caller running the same phase twice must hand over a fresh copy on purpose — a second run inside
+/// one instance would see the first run's globals and heap, which for a compiler phase is not a
+/// rerun at all.
+///
+/// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
+/// and the trap alone does not.
+pub fn nim_noc_run(
+    module: Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    argv: &[String],
+) -> Result<(), String> {
+    let (imports, unbound) = nim_posix_imports(&module, posix, make);
+    if !unbound.is_empty() {
+        return Err(format!(
+            "unbound nimony imports (extend `nim_import_binding`): {unbound:?}"
+        ));
+    }
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: None,
+            ..Limits::default()
+        },
+        args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        ..RunConfig::default()
+    };
+    let inst =
+        instantiate_with_imports(module, imports).map_err(|e| format!("instantiate: {e}"))?;
+    inst.run(Backend::TreeWalk, &cfg).map_err(|e| {
+        let err = posix.stderr();
+        if err.is_empty() {
+            format!("run failed: {e}")
+        } else {
+            format!(
+                "run failed: {e}\n--- guest stderr ---\n{}",
+                String::from_utf8_lossy(&err)
+            )
+        }
+    })?;
+    Ok(())
+}
+
 /// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
 ///
 /// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
