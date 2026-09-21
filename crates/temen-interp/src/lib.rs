@@ -27217,8 +27217,10 @@ impl Mem {
     /// (set by the NULL-guard arm of [`check_prot`]) first, then falls back to [`last_fault`] — which
     /// a top-level unmapped/read-only fault leaves set at the offending address (a satisfied §14
     /// recoverable fault clears it via `take_fault`, so no stale value survives). Non-clearing, so it
-    /// does not disturb the §14 pager. `None` when no address was recorded — e.g. a pure out-of-window
-    /// fault (address unknown, honest).
+    /// does not disturb the §14 pager. An **out-of-window** refusal records the address it was asked
+    /// for here too ([`Self::report_out_of_window`], #1591) — it used to record nothing, which left
+    /// the confinement boundary as the one fault that could not say what it refused. `None` now means
+    /// no fatal memory fault happened at all.
     pub(crate) fn peek_fault_rel(&self) -> Option<u64> {
         let raw = match self.fault_report.load(Ordering::Relaxed) {
             NO_FAULT => self.last_fault.load(Ordering::Relaxed),
@@ -27309,7 +27311,33 @@ impl Mem {
                                                             // cleared and `take_fault` returns `None` for the coroutine path to propagate the trap.
         self.window
             .checked_reserved(addr, offset, width)
-            .ok_or(Trap::MemoryFault)
+            .ok_or_else(|| self.report_out_of_window(addr, offset))
+    }
+
+    /// Record the address an **out-of-window** access asked for, and return the trap (#1591).
+    ///
+    /// It goes in [`Self::fault_report`], not `last_fault`: the latter is the recoverable-page-fault
+    /// channel, and a `take_fault` that answered `Some` here would let the §14 coroutine path treat a
+    /// confinement refusal as something its pager could satisfy. The NULL-guard arm of
+    /// [`Self::check_prot`] already splits them for that reason; this is the same split.
+    ///
+    /// Until now this case recorded nothing, so [`Self::peek_fault_rel`] answered `None` and the
+    /// diagnostic read "MemoryFault" with no location — which is the *least* affordable place to
+    /// have none. An out-of-window access is the confinement boundary doing its job (DESIGN §4), and
+    /// the address it refused is the whole content of the report: `0x8000_0000` past a 32 MiB carve
+    /// is a wild pointer, one byte past the end is an off-by-one, and the trap alone cannot tell
+    /// them apart. #1591's op-13 nimsem child is exactly this case — it faults out of its carve, and
+    /// the child's window dies with it.
+    ///
+    /// Stored absolute (`base + (addr+offset)`) so `peek_fault_rel`'s subtraction hands back the
+    /// window-relative address the guest actually named. Wrapping, because the arithmetic that
+    /// produced a rejected address is allowed to have overflowed — reporting the wrapped value is
+    /// honest about what was asked for, where saturating would invent a different question.
+    fn report_out_of_window(&self, addr: u64, offset: u64) -> Trap {
+        let rel = addr.wrapping_add(offset);
+        self.fault_report
+            .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
+        Trap::MemoryFault
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -27351,7 +27379,9 @@ impl Mem {
         self.last_fault.store(NO_FAULT, Ordering::Relaxed);
         // The span-OOB arithmetic is temen-mask's `span_checked` — the one fuzzed reference the JIT's
         // `confine_span` must emit (INVARIANTS #2's "one masking regime").
-        self.window.span_checked(addr, len).ok_or(Trap::MemoryFault)
+        self.window
+            .span_checked(addr, len)
+            .ok_or_else(|| self.report_out_of_window(addr, 0))
     }
 
     /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
@@ -30505,6 +30535,42 @@ block 0 (vsp: i64, v0: i64) {
         );
     }
 
+    /// #1591 — an **out-of-window** access names the address it was refused.
+    ///
+    /// The confinement boundary (DESIGN §4) was the one fault that recorded nothing: `peek_fault_rel`
+    /// answered `None`, so the report read `MemoryFault` with no location. That is the least
+    /// affordable place to have none — a wildly out-of-range address and a one-byte overrun are
+    /// different bugs and the trap alone cannot separate them.
+    ///
+    /// Asserts the *value*, and that a NULL-guard fault still reports its own address, so the two
+    /// arms cannot be conflated.
+    #[test]
+    fn an_out_of_window_access_names_the_address_it_asked_for() {
+        // `memory 16` — a 64 KiB window. `0x7fff_0000` is far outside it, and outside the reserved
+        // domain, so it is refused by `confine_checked` before any page check.
+        let m = parse_module(
+            r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 2147418112
+  v1 = i64.load v0
+  return v1
+  }
+}
+"#,
+        )
+        .unwrap();
+        let mut fuel = 10_000u64;
+        let (r, ..) = run_traced(&m, 0, &[], &mut fuel);
+        assert_eq!(r, Err(Trap::MemoryFault));
+        assert_eq!(
+            last_capture_fault_addr(),
+            Some(0x7fff_0000),
+            "the address the guest asked for, window-relative"
+        );
+    }
+
+    /// The sibling dereferences a small constant inside the unconditional NULL guard (#964), so it
     /// The sibling dereferences a small constant inside the unconditional NULL guard (#964), so it
     /// takes a `MemoryFault` at a **known** address while the root sits in a long timed wait.
     const SIBLING_FAULTS_IN_THE_NULL_GUARD: &str = r#"memory 16
