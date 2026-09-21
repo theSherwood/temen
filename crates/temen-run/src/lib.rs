@@ -5049,6 +5049,108 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
+/// subdirectories. Deduplicated by stem, first one wins.
+pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_x_nif(&p, out);
+        } else if let Some(stem) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".x.nif"))
+        {
+            if out.iter().all(|(s, _)| s != stem) {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    out.push((
+                        stem.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Narrow a shared `nimcache`'s modules to the closure of **one** program, named by the source path
+/// it was built from (`src_rel`, e.g. `src/nimony/nimsem.nim`).
+///
+/// An in-tree `nimcache` accumulates the modules of *every* program ever built there, and nimony
+/// takes no `--nimcache`. Linking all of them is wrong twice over: two `main`s are a
+/// `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
+/// cross-module references need not resolve in this program.
+///
+/// nimony writes one `<stem>.c` per module into the program's own build directory
+/// (`nimcache/<program stem>/`), so that directory's `.c` stems are exactly this program's closure —
+/// which drops the foreign modules *and* their `main`s together, one rule instead of a
+/// duplicate-`main` hack that leaves the rest of the foreign program in the link.
+///
+/// The program module is the one carrying `main` **whose own `.x.nif` names `src_rel` in its line
+/// info** — not the newest. `nimony c` is cached, so a run whose output is already up to date
+/// rewrites nothing and mtime then names whichever program was built last: a hexer probe and a
+/// nifler2 probe would both select hexer, and the nifler2 run would silently link hexer's closure.
+///
+/// Falls back to newest-by-mtime when nothing names `src_rel`, and to "keep that one `main`, sweep
+/// the rest" when the build directory is absent (an older toolchain, or a layout change) — imprecise
+/// rather than wrong. Returns the reason when it falls back, for the caller to report.
+pub fn nim_program_closure(
+    nimcache: &std::path::Path,
+    src_rel: &str,
+    mods: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let mains: Vec<usize> = mods
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
+        .map(|(i, _)| i)
+        .collect();
+    if mains.is_empty() {
+        return None;
+    }
+    let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(src_rel));
+    let note = by_src
+        .is_none()
+        .then(|| format!("no program module names `{src_rel}` — falling back to newest `main`"));
+    let keep = by_src.unwrap_or_else(|| {
+        *mains
+            .iter()
+            .max_by_key(|&&i| {
+                std::fs::metadata(nimcache.join(format!("{}.x.nif", mods[i].0)))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .expect("a newest program module")
+    });
+    let keep_stem = mods[keep].0.clone();
+    let own: std::collections::HashSet<String> = std::fs::read_dir(nimcache.join(&keep_stem))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".c"))
+                .map(|s| s.to_string())
+        })
+        .collect();
+    if own.is_empty() {
+        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+        for i in drop.into_iter().rev() {
+            mods.remove(i);
+        }
+        return Some(format!(
+            "no build dir for `{keep_stem}` — keeping that `main` only"
+        ));
+    }
+    mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
+    note
+}
+
 /// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
 ///
 /// A child carve is a **hard** ceiling. `Mem::nested_view` builds `Window::sub(.., 1 << size_log2)`

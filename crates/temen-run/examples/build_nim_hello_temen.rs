@@ -28,7 +28,16 @@ fn main() {
         .expect("usage: build_nim_hello_temen <prog.nim> <out.temen>");
     let out = args
         .next()
-        .expect("usage: build_nim_hello_temen <prog.nim> <out.temen>");
+        .expect("usage: build_nim_hello_temen [--posix] <prog.nim> <out.temen>");
+    let posix = std::env::args().any(|a| a == "--posix");
+    let (nim, out) = if nim == "--posix" {
+        (
+            out.clone(),
+            args.next().expect("usage: --posix <src> <out>"),
+        )
+    } else {
+        (nim, out)
+    };
 
     // Run `nimony c --isMain` in the source's directory; collect the emitted `.x.nif` modules.
     let nim_path = Path::new(&nim);
@@ -57,7 +66,13 @@ fn main() {
     assert!(status.success(), "nimony c failed");
 
     let mut mods: Vec<(String, String)> = Vec::new();
-    collect_x_nif(&dir.join("nimcache"), &mut mods);
+    temen_run::collect_x_nif(&dir.join("nimcache"), &mut mods);
+    // An **in-tree** build (a nimony phase, whose imports are relative so it cannot be copied to a
+    // scratch dir) shares one `nimcache` with every other program built there. Narrow to this
+    // program's own closure, or the link sees two `main`s.
+    if let Some(note) = temen_run::nim_program_closure(&dir.join("nimcache"), &nim, &mut mods) {
+        eprintln!("  {note}");
+    }
     assert!(
         mods.iter().any(|(s, _)| s.starts_with("sysv")),
         "no `system` module in {:?}",
@@ -68,8 +83,20 @@ fn main() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let module = temen_leng::link_nim_powerbox(&units, None)
-        .unwrap_or_else(|e| panic!("nim→powerbox bridge: {e}"));
+    // Two runtimes over one compute half (see `temen_leng::nim_posix_runtime`): the default folds
+    // the syscalls onto the single STREAM `write` cap — right for a program that only prints — while
+    // `--posix` leaves them as **retained manifest imports** a host binds to a real `temen_posix`
+    // personality. A compiler phase needs the latter: it opens, reads and writes files, and (for
+    // nimsem) spawns `nifler` through an `exec` cap.
+    let module = if posix {
+        let runtime = temen_leng::nim_posix_runtime(&units)
+            .unwrap_or_else(|e| panic!("nim posix runtime: {e}"));
+        temen_leng::link_whole_powerbox_manifest(&units, runtime)
+            .unwrap_or_else(|e| panic!("nim→posix bridge: {e}"))
+    } else {
+        temen_leng::link_nim_powerbox(&units, None)
+            .unwrap_or_else(|e| panic!("nim→powerbox bridge: {e}"))
+    };
     // Verify before shipping (the escape-freedom floor, DESIGN §2a) and sanity-check the entry shape.
     temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify: {e:?}"));
     assert!(
@@ -79,30 +106,14 @@ fn main() {
     let bytes = temen_encode::encode_module(&module);
     std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("write {out}: {e}"));
     eprintln!(
-        "wrote {out} ({} bytes, {} funcs) — a real Nim program as a runnable powerbox module",
+        "wrote {out} ({} bytes, {} funcs, {} imports) — a real Nim program as a runnable {} module",
         bytes.len(),
-        module.funcs.len()
+        module.funcs.len(),
+        module.imports.len(),
+        if posix {
+            "posix-personality"
+        } else {
+            "powerbox"
+        },
     );
-}
-
-fn collect_x_nif(dir: &Path, out: &mut Vec<(String, String)>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_x_nif(&p, out);
-        } else if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
-            if let Some(stem) = name.strip_suffix(".x.nif") {
-                if out.iter().all(|(s, _)| s != stem) {
-                    let bytes = std::fs::read(&p).unwrap();
-                    out.push((
-                        stem.to_string(),
-                        String::from_utf8_lossy(&bytes).into_owned(),
-                    ));
-                }
-            }
-        }
-    }
 }
