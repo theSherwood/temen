@@ -472,7 +472,72 @@ impl SharedFiberTable {
     fn free_slot(&self, slot: usize) {
         self.lock().free.push(Reverse(slot));
     }
+}
 
+impl FiberSlot {
+    /// D66 — a **platform-owned** slot: the fiber a child-domain task runs on. Lives in no guest
+    /// table (it is not a `cont.new` handle, spends no §15 fiber quota, and is never resolvable by
+    /// a guest), but is an ordinary `FiberSlot` otherwise, so the single-owner claim, `running_on`,
+    /// and `event_park` work unchanged — which is what lets the futex thunk's "inside a fiber ⇒
+    /// park the fiber" branch serve a child task with no second park mechanism (INVARIANTS #15).
+    /// Non-durable only for now: a durable run still refuses op 15, so no shadow region is wired.
+    pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
+        Arc::new(FiberSlot {
+            own: Ownership::new_owned_at(0),
+            running_on: AtomicU64::new(NOT_RUNNING),
+            fiber: Mutex::new(Some(Box::new(fiber))),
+            shadow_sp: AtomicU64::new(0),
+            func: -1,
+            sp: 0,
+            event_park: AtomicBool::new(false),
+            consumed: AtomicBool::new(false),
+            pending: Mutex::new(None),
+        })
+    }
+
+    /// D66 — whether the task's last yield was an event park (a futex/join wait inside it), as the
+    /// resume seam reads it. The executor classifies a `State::Yielded` with this.
+    pub(crate) fn took_event_park(&self) -> bool {
+        self.event_park.load(Ordering::Relaxed)
+    }
+
+    /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).
+    pub(crate) fn claim_for_worker(&self, worker: u64) -> bool {
+        if !self.own.claim() {
+            return false;
+        }
+        let prev = self.running_on.swap(worker, Ordering::AcqRel);
+        assert!(
+            prev == NOT_RUNNING,
+            "single-owner violation: child task claimed while running on worker {prev}"
+        );
+        true
+    }
+
+    /// D66 — release after a yield (the task parked): back to the pool, claimable by any worker.
+    pub(crate) fn release_to_pool(&self) {
+        self.running_on.store(NOT_RUNNING, Ordering::Release);
+        self.own.suspend_to_pool();
+    }
+
+    /// D66 — retire after the body returned.
+    pub(crate) fn finish_task(&self) {
+        self.running_on.store(NOT_RUNNING, Ordering::Release);
+        self.own.finish();
+    }
+
+    /// D66 — the raw fiber, for the executor's resume (the slot must be claimed).
+    pub(crate) fn fiber_ptr(&self) -> Option<*mut Fiber> {
+        self.fiber
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .map(|b| &mut **b as *mut Fiber)
+    }
+}
+
+#[allow(dead_code)] // keeps the impl block below intact for the table's own methods
+impl SharedFiberTable {
     /// Durable **thaw** re-seeding (DURABILITY.md §12.8 slice 3.3.3): re-create a frozen fiber at
     /// the next slot (dense, matching the freeze) as a fresh `OWNED` fiber — so a thaw `cont.resume`
     /// claims it (`Start`) and re-enters its entry under `REWINDING`, rebuilding then re-parking it —
@@ -650,6 +715,16 @@ impl FiberRuntime {
         self.call_tramp = Some(t);
     }
 
+    /// D66 — the executor's resume bracket: record the task's slot as the innermost live resume on
+    /// this runtime (what [`current_fiber_slot`] reads, so the futex thunk parks the task), and
+    /// clear it when the resume returns. The resumer-side twin of `fiber_resume`'s push/pop.
+    pub(crate) fn push_active(&mut self, slot: Arc<FiberSlot>) {
+        self.active_slots.push(slot);
+    }
+    pub(crate) fn pop_active(&mut self) {
+        self.active_slots.pop();
+    }
+
     /// Arm the **durable** fiber-switch swap for this run (DURABILITY.md §12.8): record the window
     /// base and whether this is a durable run, so the resume swap can re-point the active shadow-SP
     /// word per context. Called by the entry path once the window is allocated. A non-durable run
@@ -737,6 +812,29 @@ unsafe fn make_fiber(
             (*current()).yielders.pop();
             result
         }
+    })
+}
+
+/// D66 — the fiber a **child-domain task** runs on (`child_exec`): `body` enters the child once
+/// (through its limit-taking trampoline, with this fiber's stack low bound), and the yielder is
+/// pushed on / popped off the *resuming* thread's runtime exactly as [`make_fiber`] does, so an
+/// event park inside the child (`fiber_event_park`) finds it — the one park mechanism, reused.
+///
+/// # Safety
+/// The body runs only under an executor resume with the task's runtime published as `CURRENT_RT`.
+pub(crate) unsafe fn make_task_fiber(
+    stack: usize,
+    body: impl FnOnce(u64) + 'static,
+) -> Option<Fiber> {
+    Fiber::new(stack, move |y: &Yielder, _arg: u64| -> u64 {
+        // SAFETY: as `make_fiber` — `current()` is the resuming thread's live runtime, re-read at
+        // each use (the body's start and return may be on different workers).
+        unsafe {
+            (*current()).yielders.push(y as *const Yielder);
+            body(y.stack_low());
+            (*current()).yielders.pop();
+        }
+        0
     })
 }
 

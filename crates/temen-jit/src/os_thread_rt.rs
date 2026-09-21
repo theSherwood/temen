@@ -270,6 +270,10 @@ struct FutexEntry {
 struct FiberWaitCell {
     /// [`PENDING_WAIT`] while queued; a `WAIT_*` status once the event fired.
     status: AtomicI32,
+    /// D66 — when the parked fiber is a **child-domain task** (`child_exec`), the handle that
+    /// makes it runnable again; `notify` fires it after delivering the status. `None` for a guest
+    /// fiber (its resumer polls it, as before).
+    waker: Option<crate::child_exec::TaskWaker>,
 }
 
 /// [`FiberWaitCell::status`] sentinel: no event yet. Distinct from every `WAIT_*` status; 0 is
@@ -280,6 +284,7 @@ const PENDING_WAIT: i32 = i32::MIN;
 fn fiber_cell_new() -> std::sync::Arc<FiberWaitCell> {
     std::sync::Arc::new(FiberWaitCell {
         status: AtomicI32::new(PENDING_WAIT),
+        waker: crate::child_exec::current_waker(),
     })
 }
 
@@ -481,6 +486,20 @@ impl Domain {
         lock(&self.threads).live -= 1;
         let _g = lock(&self.futex);
         self.futex_cv.notify_all();
+    }
+
+    /// D66 — a child-domain task parked (an event park inside it): it counts as blocked for the
+    /// 1:1 vCPUs' deadlock predicate (`live > parked`), exactly as a parked OS-thread child did
+    /// through its `ParkGuard`; the futex broadcast lets an infinite waiter re-evaluate now.
+    pub(crate) fn task_parked(&self) {
+        self.parked.fetch_add(1, Ordering::AcqRel);
+        let _g = lock(&self.futex);
+        self.futex_cv.notify_all();
+    }
+
+    /// D66 — the task is runnable again (woken, due, or poisoned).
+    pub(crate) fn task_unparked(&self) {
+        self.parked.fetch_sub(1, Ordering::AcqRel);
     }
 
     fn env(&self) -> Env {
@@ -1778,10 +1797,37 @@ unsafe fn fiber_futex_wait(
             // queueing — but still park once below, so the resumer sees the one transient
             // `FIBER_PARKED` the oracle's register-then-recheck shows (fiber_parks.rs).
             cell.status.store(WAIT_NOT_EQUAL, Ordering::Release);
+            // D66 — a child-domain task has no polling resumer: its executor must know the park
+            // is already satisfied, or the one transient park would be its last.
+            if let Some(w) = &cell.waker {
+                w.fire();
+            }
         } else {
             g.entry(key).or_default().fibers.push(cell.clone());
         }
     }
+    // D66 — a task's timed wait fires at the deadline on an idle worker, not at a poll.
+    if cell.waker.is_some() {
+        crate::child_exec::set_park_deadline(deadline);
+    }
+    let status = fiber_futex_wait_loop(dom, slot, key, &cell, deadline, unwind_base, trap_out);
+    if cell.waker.is_some() {
+        crate::child_exec::set_park_deadline(None);
+    }
+    status
+}
+
+/// The park loop of [`fiber_futex_wait`]: park, re-enter on a poll (or an executor resume),
+/// resolve or park again.
+unsafe fn fiber_futex_wait_loop(
+    dom: &Domain,
+    slot: &std::sync::Arc<fiber_rt::FiberSlot>,
+    key: FutexKey,
+    cell: &std::sync::Arc<FiberWaitCell>,
+    deadline: Option<Instant>,
+    unwind_base: u64,
+    trap_out: u64,
+) -> i32 {
     loop {
         fiber_rt::fiber_event_park(slot);
         // Re-entered: a `cont.resume` polled this fiber. Completed?
@@ -1796,14 +1842,14 @@ unsafe fn fiber_futex_wait(
             || load_trap(trap_out as *mut i64) != 0
             || (unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base))
         {
-            fiber_wait_deregister(dom, key, &cell);
+            fiber_wait_deregister(dom, key, cell);
             return WAIT_WOKEN;
         }
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
                 // The deadline passed: fire the timeout at this poll. A notify that raced us
                 // and already consumed the cell wins with its own status.
-                if fiber_wait_deregister(dom, key, &cell) {
+                if fiber_wait_deregister(dom, key, cell) {
                     return WAIT_TIMED_OUT;
                 }
                 return cell.status.load(Ordering::Acquire);
@@ -2072,6 +2118,7 @@ fn futex_notify(
     key: FutexKey,
     count: u32,
 ) -> u32 {
+    let mut wakers: Vec<crate::child_exec::TaskWaker> = Vec::new();
     let woken = {
         let mut g = lock(futex);
         match g.get_mut(&key) {
@@ -2091,6 +2138,10 @@ fn futex_notify(
                 let take = ((count - os) as usize).min(e.fibers.len());
                 for c in e.fibers.drain(..take) {
                     c.status.store(WAIT_WOKEN, Ordering::Release);
+                    // D66 — a child-domain task: make it runnable (after the lock, below).
+                    if let Some(w) = &c.waker {
+                        wakers.push(w.clone());
+                    }
                 }
                 if e.waiters == 0 && e.fibers.is_empty() {
                     g.remove(&key);
@@ -2102,6 +2153,9 @@ fn futex_notify(
     };
     if woken > 0 {
         cv.notify_all();
+    }
+    for w in wakers {
+        w.fire();
     }
     woken
 }

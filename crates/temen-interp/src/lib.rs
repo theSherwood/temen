@@ -19073,6 +19073,12 @@ pub struct Host {
     /// D66 — the domain that spawned this one (its [`Host::domain_id`]), `None` for a root. Set by
     /// [`Host::spawn_child_powerbox`] on every §14 builder path, so a child's lane chain can be walked.
     parent_domain: Option<u64>,
+    /// D66 — the lane [`Host::admit_detached_spawn`] just reserved, waiting for the builder that
+    /// follows it to stamp on the child ([`Host::spawn_detached_child`] consumes it). The JIT's op-15
+    /// thunk admits and builds through two hooks with no channel between them; this is that channel,
+    /// on the one object both hooks hold. The interpreter's arm sets the child's cap directly and
+    /// never reads it (its `take` and `build` are one arm), so it is inert there.
+    pending_child_lane: Option<i64>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -19751,6 +19757,7 @@ impl Host {
             lane_cap: -1,    // D66 — unbounded by default
             granted_lanes: 0,
             parent_domain: None,
+            pending_child_lane: None,
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -22081,6 +22088,7 @@ impl Host {
             self.give_lane(lane);
             return None;
         }
+        self.pending_child_lane = Some(lane);
         Some(lane)
     }
 
@@ -24770,8 +24778,12 @@ impl Host {
         // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
         // this builder's to decide.
         let durable = self.durable;
+        // D66 — the lane the admission that preceded this build reserved (the JIT path's two-hook
+        // sequence); `None` ⇒ unbounded, which is also what an un-admitted build gets.
+        let lane = self.pending_child_lane.take().unwrap_or(-1);
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
         ch.set_durable(durable);
+        ch.set_lane_cap(lane);
         Some((ch, cinst, cas))
     }
 

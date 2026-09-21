@@ -53,6 +53,12 @@ pub(crate) struct GuestWindow {
     total: usize,  // full reservation length: reserved (page-rounded) + one guard page
 }
 
+// D66 — a child-domain task owns its window and is resumed by whichever worker claims it, so the
+// window moves between OS threads. Sound: an mmap reservation has no thread affinity; every access
+// goes through the resumed child's own frames on the thread running it, and `Drop` releases from
+// whichever thread finishes the task. The raw pointer is the only reason `Send` is not derived.
+unsafe impl Send for GuestWindow {}
+
 impl GuestWindow {
     /// Reserve `reserved` bytes (page-rounded) + a guard page as inaccessible, then commit the
     /// `mapped` backed prefix read/write. `reserved` is raised to at least `mapped`.

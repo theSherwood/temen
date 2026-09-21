@@ -36,9 +36,9 @@ use temen_ir::errno::EINVAL;
 /// child's *own* thread — until then `join` parks on `cv` and `poll` reports *running* (`0`); a
 /// synchronous (durable) child's cell is `Some` before `instantiate` returns. `Arc` so `join` can
 /// clone it and drop the `children` lock before parking (no lock held across a wait).
-struct ChildDone {
-    state: Mutex<Option<(i64, i64)>>,
-    cv: Condvar,
+pub(crate) struct ChildDone {
+    pub(crate) state: Mutex<Option<(i64, i64)>>,
+    pub(crate) cv: Condvar,
 }
 
 /// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
@@ -323,6 +323,9 @@ pub(crate) struct Nursery {
     /// teardown** ([`Nursery::join_children`]) before the parent window is freed — no child thread may
     /// outlive the window it copies to/from. Empty on a run with only synchronous children.
     child_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// D66 — the child-domain executor **detached** children (op 15) run on: migrating tasks over
+    /// a lane-bounded worker pool (`child_exec`), replacing one OS thread per detached child.
+    child_exec: std::sync::Arc<crate::child_exec::ChildExec>,
     /// DURABILITY.md §4: the run is **durable** (set by [`Nursery::set_durable`] at run entry —
     /// the durable flag is applied after compile, where this nursery is built). A durable run's
     /// `instantiate`/`coro_spawn` **fail closed** (`-EINVAL`): this child runner re-compiles and
@@ -373,6 +376,8 @@ pub(crate) struct Nursery {
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
     /// #1587 — [`crate::BudgetMemGiver`]: returns a taken quota when the OS-thread spawn fails.
     grant_budget_mem_give: std::sync::atomic::AtomicUsize,
+    /// D66 — [`crate::LaneGiver`]: a reaped child task returns its lane to the parent.
+    grant_lane_give: std::sync::atomic::AtomicUsize,
     /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
     /// [`crate::PremapApply`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`).
     grant_premap_admit: std::sync::atomic::AtomicUsize,
@@ -445,6 +450,7 @@ impl Nursery {
             futex_sched,
             children: Mutex::new(Vec::new()),
             child_threads: Mutex::new(Vec::new()),
+            child_exec: crate::child_exec::ChildExec::new(futex_sched, epoch_addr),
             durable: AtomicBool::new(false),
             my_task,
             task_counter,
@@ -455,6 +461,7 @@ impl Nursery {
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
+            grant_lane_give: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
@@ -486,7 +493,7 @@ impl Nursery {
     }
 
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t, rs, bd, mt, mg, pc, pa, ps, pp) = match hooks {
+        let (b, bn, r, bi, m, t, rs, bd, mt, mg, lg, pc, pa, ps, pp) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
@@ -498,18 +505,20 @@ impl Nursery {
                 h.build_detached as usize,
                 h.budget_mem_take as usize,
                 h.budget_mem_give as usize,
+                h.lane_give as usize,
                 h.parent_ctx as usize,
                 h.premap_admit as usize,
                 h.premap_stage as usize,
                 h.premap_apply as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_build_detached.store(bd, Ordering::Release);
         self.grant_budget_mem_take.store(mt, Ordering::Release);
         self.grant_budget_mem_give.store(mg, Ordering::Release);
+        self.grant_lane_give.store(lg, Ordering::Release);
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
@@ -642,6 +651,9 @@ impl Nursery {
         for h in handles {
             let _ = h.join();
         }
+        // D66 — and every detached child task: parked ones are poisoned so they unwind, runnable
+        // ones finish, then the workers are joined.
+        self.child_exec.shutdown_and_join();
         // CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted
         // live-impls hold their own counted refs, so a parent-held offer handle stays valid at the
         // host layer; the run is over regardless). After the joins above, so no child thread still
@@ -1112,6 +1124,10 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         as_handle: 0,
         grant_handle: 0,
         jit_table_log2: 0,
+        domain: 0,
+        lane_cap: -1,
+        parent_domain: 0,
+        parent_lane_cap: -1,
     };
     if build(
         rt.grant_ctx(),
@@ -1463,6 +1479,10 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         as_handle: 0,
         grant_handle: 0,
         jit_table_log2: 0,
+        domain: 0,
+        lane_cap: -1,
+        parent_domain: 0,
+        parent_lane_cap: -1,
     };
     if build(
         rt.grant_ctx(),
@@ -1570,8 +1590,7 @@ unsafe fn spawn_detached_child(
     args: Vec<i64>,
     n_results: usize,
     release: crate::GrantChildReleaser,
-    gc_ctx: *mut core::ffi::c_void,
-    retained_ctx: *mut core::ffi::c_void,
+    gc: &crate::GrantChild,
     trap_out: *mut i64,
     // #1587 — the funding budget + the window bytes `instantiate_detached` already took from it, so
     // a spawn that fails *after* that commit can hand them back.
@@ -1579,10 +1598,11 @@ unsafe fn spawn_detached_child(
     child_size: u64,
 ) -> i32 {
     struct SendRaw<T>(T);
-    // SAFETY: `gc_ctx` is a heap `Host` handed over wholesale to the child thread (`Host: Send`),
-    // untouched by the parent after this call. No window pointer crosses: the child mints its own.
+    // SAFETY: `gc.ctx` is a heap `Host` handed over wholesale to the child task (`Host: Send`),
+    // untouched by the parent after this call; `grant_ctx` is the parent host the hooks were
+    // registered with (they lock it). No window pointer crosses: the task mints its own.
     unsafe impl<T> Send for SendRaw<T> {}
-    let ctx = SendRaw(gc_ctx);
+    let (gc_ctx, retained_ctx) = (gc.ctx, gc.retained_ctx);
     let code = std::sync::Arc::new(code);
     {
         let rs = rt.grant_register_serve.load(Ordering::Acquire);
@@ -1595,76 +1615,88 @@ unsafe fn spawn_detached_child(
         state: Mutex::new(None),
         cv: Condvar::new(),
     });
-    let done2 = std::sync::Arc::clone(&done);
     let futex_sched = rt.futex_sched;
-    // #1586 — reserve a §15 live-vCPU slot before taking a host thread. A detached child is one real
-    // OS thread on this backend, so without this a parent could hold concurrency its ancestors never
-    // granted it (INVARIANTS #3). SAFETY: a nonzero `futex_sched` is the run's live `Domain`,
-    // outliving every (joined) child.
+    // #1586 — reserve a §15 live-vCPU slot before filing the task, so a parent cannot hold more
+    // concurrency than its ancestors granted (INVARIANTS #3). SAFETY: a nonzero `futex_sched` is
+    // the run's live `Domain`, outliving every task.
     if futex_sched != 0
         && !unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).try_child_start() }
     {
         unsafe { *trap_out = TrapKind::ThreadFault as i64 };
         return 0;
     }
-    let handle = std::thread::Builder::new()
-        .name("temen-child".into())
-        .spawn(move || {
-            let ctx = ctx;
-            mem::install_guard();
-            // SAFETY: per this function's contract; the teardown frees the child powerbox exactly
-            // once, from the only thread still holding it.
-            let (r, t) = unsafe {
-                crate::run_detached_child_then(
-                    std::sync::Arc::as_ptr(&code),
-                    mapped_log2,
-                    reserved_log2,
-                    |rw| {
-                        for (off, bytes) in &seeds {
-                            let off = *off as usize;
-                            if let Some(end) = off.checked_add(bytes.len()) {
-                                if end <= rw.len() {
-                                    rw[off..end].copy_from_slice(bytes);
-                                }
-                            }
+    // The task's teardown: release the child powerbox and return its lane to the parent — once,
+    // after its last residency, from whichever worker finishes it.
+    let (ctx, parent_ctx) = (SendRaw(gc_ctx), SendRaw(rt.grant_ctx()));
+    let lane_give = rt.grant_lane_give.load(Ordering::Acquire);
+    let lane = gc.lane_cap;
+    let teardown: Box<dyn FnOnce() + Send> = Box::new(move || {
+        let (ctx, parent_ctx) = (ctx, parent_ctx);
+        // SAFETY: per this function's contract; the powerbox is freed exactly once, here.
+        unsafe { release(ctx.0) };
+        if lane_give != 0 {
+            // SAFETY: a nonzero address is the embedder's registered `LaneGiver`; `parent_ctx` is
+            // the parent host it was registered with.
+            let give: crate::LaneGiver = unsafe { core::mem::transmute(lane_give) };
+            unsafe { give(parent_ctx.0, lane) };
+        }
+    });
+    // D66 — the lane chain the executor gates this task on: the parent's lane over the child's.
+    let chain = vec![
+        (gc.parent_domain as usize, gc.parent_lane_cap),
+        (gc.domain as usize, gc.lane_cap),
+    ];
+    let premap_ctx = SendRaw(gc_ctx);
+    // SAFETY: `code` was compiled by `compile_child_windowed` for `(mapped_log2, reserved_log2)`;
+    // `args` matches the entry (checked by the caller).
+    let task = unsafe {
+        crate::child_exec::ChildTask::new(
+            code,
+            mapped_log2,
+            reserved_log2,
+            |rw| {
+                for (off, bytes) in &seeds {
+                    let off = *off as usize;
+                    if let Some(end) = off.checked_add(bytes.len()) {
+                        if end <= rw.len() {
+                            rw[off..end].copy_from_slice(bytes);
                         }
-                    },
-                    // The op-15 pre-mapped region, aliased onto the fresh window by the host hook
-                    // (the child powerbox's own `map` path); none staged ⇒ nothing to do.
-                    |base, mapped, reserved| match premap_apply {
-                        // SAFETY: `ctx.0` is the child powerbox this thread owns; the window is live.
-                        Some(apply) => apply(ctx.0, base, mapped, reserved) != 0,
-                        None => true,
-                    },
-                    &args,
-                    n_results,
-                    || release(ctx.0),
-                )
-            };
-            let mut st = done2.state.lock().unwrap_or_else(|e| e.into_inner());
-            *st = Some((r, t));
-            done2.cv.notify_all();
-            // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
+                    }
+                }
+            },
+            // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the
+            // child powerbox's own `map` path); none staged ⇒ nothing to do.
+            |base, mapped, reserved| match premap_apply {
+                // SAFETY: `premap_ctx.0` is the child powerbox this task owns; the window is live.
+                Some(apply) => apply(premap_ctx.0, base, mapped, reserved) != 0,
+                None => true,
+            },
+            args,
+            n_results,
+            chain,
+            std::sync::Arc::clone(&done),
+            teardown,
+        )
+    };
+    let task = match task {
+        Ok(t) => t,
+        // The child never runs: a refused pre-map alias or a refused task stack. Tear down now
+        // (powerbox + lane), un-spend the window bytes (#1587), release the §15 reservation, and
+        // answer as the OS-thread path did — a `CapFault` outcome for the alias, `-EINVAL` for the
+        // stack refusal (the one post-commit refusal, INVARIANTS #5).
+        Err(teardown) => {
+            teardown();
+            let give_addr = rt.grant_budget_mem_give.load(Ordering::Acquire);
+            if give_addr != 0 {
+                // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`.
+                let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(give_addr) };
+                unsafe { give(rt.grant_ctx(), budget, child_size) };
+            }
             if futex_sched != 0 {
                 unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
             }
-        });
-    // #1587 — the OS refused the thread. This is the one refusal on the detached path that happens
-    // *after* `budget_mem_take` committed, so it must un-spend: give the window bytes back through the
-    // grant hooks, release the §15 reservation, and answer `-EINVAL` like every other admission
-    // failure (INVARIANTS #5) — never unwind into the host.
-    let Ok(handle) = handle else {
-        let give_addr = rt.grant_budget_mem_give.load(Ordering::Acquire);
-        if give_addr != 0 {
-            // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`; `grant_ctx`
-            // is the parent host it was registered with.
-            let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(give_addr) };
-            unsafe { give(rt.grant_ctx(), budget, child_size) };
+            return EINVAL as i32;
         }
-        if futex_sched != 0 {
-            unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
-        }
-        return EINVAL as i32;
     };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
@@ -1672,10 +1704,7 @@ unsafe fn spawn_detached_child(
     child.retained = retained_ctx as usize;
     children.push(child);
     drop(children);
-    rt.child_threads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push(handle);
+    rt.child_exec.spawn(task);
     slot as i32
 }
 
@@ -1820,6 +1849,10 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         as_handle: 0,
         grant_handle: 0,
         jit_table_log2: 0,
+        domain: 0,
+        lane_cap: -1,
+        parent_domain: 0,
+        parent_lane_cap: -1,
     };
     if build(
         rt.grant_ctx(),
@@ -1904,8 +1937,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         args,
         n_results,
         release,
-        gc.ctx,
-        gc.retained_ctx,
+        &gc,
         trap_out,
         budget as i32,
         child_size,

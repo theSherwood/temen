@@ -3474,6 +3474,28 @@ until their children become scheduler tasks (slices 2–3), which is when their 
 Σ accounting arrive. Also: the §15 ceiling on every §14 path (#1590) and the OS-thread spawn failure
 as a value with the budget un-spent (#1587).
 
+*The child-domain executor on the JIT* (#1600 slice 2, `temen-jit/src/child_exec.rs`): a **detached**
+child (op 15) is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
+on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
+migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
+the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
+the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
+existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
+the futex cell now carries the task's waker, `notify` fires it after delivering the status, an idle
+worker fires a timed wait's deadline, and the §5 kill cell is re-checked on the parked cadence. Every
+resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
+exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps
+a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). Run
+teardown poisons a task parked forever (its cell reads `DOMAIN_DONE`; it unwinds through its trailing
+guard — the interpreter's sweep, D37) instead of hanging the join. The child enters through a
+**limit-taking** variant of its one trampoline (`build_trampoline(.., with_limit)`, one flag not a
+second family), so its prologue checks guard the fiber stack. JIT frontier, still open on #1600: no
+preemption (a task that never parks holds its lane until it returns — the interpreter's quantum
+round-robin has no twin); a domain's own `thread.spawn` vCPUs stay 1:1 and are counted by
+`max_vcpus`, not lanes; nested carve children (ops 0/5/8/11/13) still take one OS thread each; the
+task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap, no longer a 2 MiB OS stack).
+
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
 Audit date **2026-06-10** (register formerly `AUDIT.md`; deleted when every finding

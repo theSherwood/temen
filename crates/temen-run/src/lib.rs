@@ -2253,6 +2253,7 @@ locked_parent_hook!(
     budget_mem_give,
     (budget: i32, bytes: u64) -> ()
 );
+locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
 locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
@@ -2359,6 +2360,7 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_give
         },
+        lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
         } else {
@@ -2439,6 +2441,10 @@ pub unsafe extern "C" fn grant_child_build(
                 as_handle,
                 grant_handle: cg,
                 jit_table_log2,
+                domain: 0,
+                lane_cap: -1,
+                parent_domain: 0,
+                parent_lane_cap: -1,
             };
             1
         }
@@ -3003,16 +3009,19 @@ pub unsafe extern "C" fn premap_apply(
 pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
     let parent = &mut *(ctx as *mut Host);
     // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
-    // a lane wider than the parent's cap refuses before any `mem` is taken. This backend's children
-    // are OS threads the parent host cannot see finish (no reap credit yet — #1600 slices 2–4), so the
-    // lane is returned at once: single-spawn parity with the other engines, lasting accounting later.
-    match parent.admit_detached_spawn(budget, bytes) {
-        Some(lane) => {
-            parent.give_lane(lane);
-            1
-        }
-        None => 0,
-    }
+    // the funding budget's lane is reserved against the parent's Σ and its `mem` taken, or neither.
+    // The lane rides to the builder that follows (`Host::pending_child_lane`) and comes back through
+    // [`lane_give`] when the child-domain executor reaps the task.
+    i32::from(parent.admit_detached_spawn(budget, bytes).is_some())
+}
+
+/// D66 — a reaped detached child returns its lane to the parent ([`temen_jit::LaneGiver`]).
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.give_lane(lane);
 }
 
 /// #1587 — the undo of [`budget_mem_take`] for a spawn that failed after the take
@@ -3096,6 +3105,11 @@ unsafe fn finish_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            // D66 — the lane chain the executor gates this child's dispatch on: the child's own
+            // `(domain, cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child`
+            // stamped) under the parent's.
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -3105,6 +3119,10 @@ unsafe fn finish_child_build(
                 as_handle,
                 jit_table_log2,
                 grant_handle: 0,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }
