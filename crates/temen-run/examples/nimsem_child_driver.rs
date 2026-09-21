@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value};
+use temen_interp::{
+    run_with_host_traced, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value,
+};
 use temen_run::exec::{domain_exec_with_fs, DomainProgram};
 use temen_run::{instantiate, HostCap, Limits};
 
@@ -201,7 +203,11 @@ fn main() {
     let modh = host.grant_module(&nimsem);
 
     let mut fuel = 2_000_000_000_000u64;
-    let r = run_with_host(
+    // `_traced`, not the plain `run_with_host`: the trap this driver exists to report belongs to the
+    // op-13 **child**, whose window dies with its outcome, so `Err(t)` alone is a bare `MemoryFault`
+    // with nothing left to ask (#1591). The backtrace it returns is the first-wins trap-origin
+    // capture — the child's frames, not the parent's join site.
+    let (r, trap_bt, _fiber) = run_with_host_traced(
         &parent,
         0,
         &[
@@ -232,7 +238,19 @@ fn main() {
     match &r {
         Ok(v) => eprintln!("nimsem child joined: {v:?}"),
         Err(t) => {
-            eprintln!("nimsem child trapped: {t:?}");
+            // The child's module names the frames: they are its funcs, not the parent driver's. The
+            // faulting address is worth as much as the trace — a small one says the pointer was
+            // never initialized, a wild one says the arithmetic that produced it was wrong, and the
+            // backtrace alone does not separate them.
+            eprintln!(
+                "{}",
+                temen_run::with_backtrace(
+                    format!("nimsem child trapped: {t:?}"),
+                    &trap_bt,
+                    temen_interp::last_capture_fault_addr(),
+                    &nimsem,
+                )
+            );
             exit(1);
         }
     }

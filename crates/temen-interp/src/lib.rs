@@ -2724,6 +2724,7 @@ fn drive_over_cell(
                             fuel: *fuel,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     if parent == id {
@@ -2980,6 +2981,7 @@ fn drive_over_cell(
                             fuel: *fuel,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     if parent == id {
@@ -3068,8 +3070,17 @@ fn drive_over_cell(
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
     // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
     // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
-    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
-    (out.result, trap_bt, trap_fiber)
+    let origin = trap_origin.unwrap_or(TrapOrigin {
+        bt: out.trap_bt,
+        fiber: out.trap_fiber,
+        fault: out.trap_fault,
+    });
+    // Every run entry point funnels through here, so recording the diagnostic once at this point
+    // gives all of them the trace — `run_capture_reserved_with_host` used to do it for itself, which
+    // left `run_with_host` (the op-13 child drivers' entry) with no way to see either.
+    LAST_CAPTURE_BACKTRACE.with(|c| *c.borrow_mut() = origin.bt.clone());
+    LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = origin.fault);
+    (out.result, origin.bt, origin.fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -3163,6 +3174,47 @@ pub fn run_capture_reserved_with_host(
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     (r, snap)
+}
+
+thread_local! {
+    /// The trap-time backtrace of the most recent run on this thread, recorded by [`drive`] — so
+    /// every entry point has one, not just the handful that return a [`TracedRun`].
+    ///
+    /// `drive` has always produced one; `run_capture_reserved_with_host` threw it away
+    /// (`let (r, ..) = …`), so a guest run **with argv** — which is every real program, since args
+    /// force the seeded-memory path — reported a bare `MemoryFault` with no location. A thread-local
+    /// keeps the existing return types (and their callers) untouched while making the trace
+    /// reachable; a run overwrites it, and it is only meaningful immediately after one. Nested runs
+    /// resolve the way you want: the inner `drive` returns first, so the outermost writes last.
+    static LAST_CAPTURE_BACKTRACE: core::cell::RefCell<Vec<IrPc>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if that run
+/// finished cleanly or none has happened. This is the **trap-origin** capture (first vCPU to trap),
+/// so a child domain's trap names the child's frames, not the parent's join site.
+pub fn last_capture_backtrace() -> Vec<IrPc> {
+    LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
+}
+
+thread_local! {
+    /// The window-relative faulting address of the last run, the companion to
+    /// [`LAST_CAPTURE_BACKTRACE`] and recorded with it. `Inspector::fault_addr` already reported this
+    /// to the DAP layer; a plain run had no way to see it. #1591 — it rides the trap-origin capture,
+    /// so it survives an op-13 **child**'s trap, whose `Mem` is dropped at the join.
+    static LAST_CAPTURE_FAULT: core::cell::RefCell<Option<u64>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// The window-relative address of the last run's `MemoryFault` (a NULL deref is `0`); `None` if that
+/// run did not fault on an address. For a nested (op-13) child it is relative to the child's own
+/// carve — the frame its backtrace is already in.
+///
+/// Worth more than it looks next to a backtrace: a **small** address says the pointer was never
+/// initialized, a **wild** one says the arithmetic that produced it was wrong. Those point at
+/// different bugs, and the backtrace alone does not separate them.
+pub fn last_capture_fault_addr() -> Option<u64> {
+    LAST_CAPTURE_FAULT.with(|c| *c.borrow())
 }
 
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
@@ -4590,6 +4642,21 @@ struct Outcome {
     /// The handle uses the cross-backend `(generation << FIBER_GEN_SHIFT) | slot` encoding, so it
     /// compares equal to the JIT's for the same fiber.
     trap_fiber: Option<i64>,
+    /// The **window-relative address** this vCPU's `MemoryFault` named, when it trapped on one
+    /// (#1591). Read off the vCPU's own [`Mem`] before it is dropped, so a *child* domain's fault
+    /// address survives the join propagation that flattens its trap to a bare `Err(Trap)` — the
+    /// parent's window has no record of it. `None` on a clean finish or a non-address trap.
+    trap_fault: Option<u64>,
+}
+
+/// What the first vCPU to trap recorded about *its own* trap — the run-shared, first-wins capture
+/// [`Sched::trap_origin`] holds and [`drive`] reports, rather than the root's join-site residue.
+struct TrapOrigin {
+    bt: Vec<IrPc>,
+    fiber: Option<i64>,
+    /// The window-relative faulting address (#1591). For a nested (op-13) child this is relative to
+    /// the child's own carve, which is the frame its own backtrace is in.
+    fault: Option<u64>,
 }
 
 /// The trapping vCPU's running-fiber handle for [`Outcome::trap_fiber`]: `-1` when the root is running
@@ -5259,13 +5326,13 @@ struct Sched {
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
     /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
     freeze_on_quiesce: bool,
-    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
-    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
-    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
-    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
-    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
-    /// `Domain` trap-capture handoff. `None` on a clean run.
-    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
+    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
+    /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
+    /// join), so the root's own outcome would name the join site, not the origin. `drive` reads this
+    /// instead, so the trap diagnostic names *where the guest actually trapped* — the interpreter
+    /// counterpart to the JIT's `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<TrapOrigin>,
 }
 
 impl Scheduler {
@@ -6378,6 +6445,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         fuel: v.fuel,
         trap_bt: Vec::new(), // the *origin's* backtrace is already in `trap_origin` (first-wins)
         trap_fiber: None,
+        trap_fault: None,
     };
     let id = v.id;
     // #1217 — a reaped client child releases its services' parked `svc.wait` too.
@@ -7145,6 +7213,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     Vec::new()
                 };
                 let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                // #1591: and the address it faulted on, off this vCPU's own window. A nested (op-13)
+                // child's `Mem` dies with its outcome, so reading it here is the only chance — the
+                // join propagation that reaches `drive` carries a bare `Err(Trap)`.
+                let trap_fault = result
+                    .is_err()
+                    .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
+                    .flatten();
                 // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
@@ -7174,6 +7249,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     fuel: v.fuel,
                     trap_bt,
                     trap_fiber,
+                    trap_fault,
                 };
                 drop(v);
                 let mut s = sched.lock();
@@ -7193,8 +7269,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
                 // true origin. A clean finish leaves it untouched.
                 if outcome.result.is_err() {
-                    s.trap_origin
-                        .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+                    s.trap_origin.get_or_insert_with(|| TrapOrigin {
+                        bt: outcome.trap_bt.clone(),
+                        fiber: outcome.trap_fiber,
+                        fault: outcome.trap_fault,
+                    });
                 }
                 // #863 hygiene — a **fork twin** finishing notifies its personalities: the exit
                 // hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with the raw
@@ -8068,6 +8147,7 @@ fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
         fuel: v.fuel,
         trap_bt: Vec::new(), // the origin's own Done recorded the true backtrace
         trap_fiber: None,
+        trap_fault: None,
     };
     let id = v.id;
     drop(v);
@@ -8394,6 +8474,10 @@ impl SchedDriver {
                         Vec::new()
                     };
                     let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                    let trap_fault = result
+                        .is_err()
+                        .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
+                        .flatten();
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
                     let outcome = Outcome {
                         result,
@@ -8401,6 +8485,7 @@ impl SchedDriver {
                         fuel: v.fuel,
                         trap_bt,
                         trap_fiber,
+                        trap_fault,
                     };
                     drop(v);
                     let mut s = det.lock();
@@ -8488,6 +8573,7 @@ impl SchedDriver {
                             fuel: 0,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     s.live -= 1;
@@ -30390,6 +30476,58 @@ block 0 (vsp: i64, v0: i64) {
             "trap origin names the trapping sibling, not the torn-down root: {bt:?}"
         );
     }
+
+    /// #1591 — a **sibling's** faulting address survives the propagation that flattens its trap.
+    ///
+    /// A child domain's window dies with its `Outcome`, so by the time the run's result reaches a
+    /// caller there is nothing left to ask. The driver for the op-13 nimsem child reported a bare
+    /// `MemoryFault` for exactly this reason. The address now rides the first-wins `trap_origin`
+    /// capture alongside the backtrace, so it names the faulting frame's window, not the root's.
+    ///
+    /// `0x800` is the address the real bug landed on (#1595): inside the NULL guard, which is what
+    /// says "this pointer was never initialized" rather than "the arithmetic was wrong". Asserting
+    /// the *value* is the point — a diagnostic that reports some address is not a diagnostic.
+    #[test]
+    fn a_siblings_fault_address_outlives_its_window() {
+        let m = parse_module(SIBLING_FAULTS_IN_THE_NULL_GUARD).unwrap();
+        let mut fuel = 10_000_000u64;
+        let (r, bt, _fiber) = run_traced(&m, 0, &[], &mut fuel);
+        assert_eq!(r, Err(Trap::MemoryFault));
+        assert_eq!(
+            bt.first().map(|pc| pc.func),
+            Some(1),
+            "the trapping sibling, not the torn-down root: {bt:?}"
+        );
+        assert_eq!(
+            last_capture_fault_addr(),
+            Some(0x800),
+            "the address the sibling faulted on"
+        );
+    }
+
+    /// The sibling dereferences a small constant inside the unconditional NULL guard (#964), so it
+    /// takes a `MemoryFault` at a **known** address while the root sits in a long timed wait.
+    const SIBLING_FAULTS_IN_THE_NULL_GUARD: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = i64.const 16392
+  v3 = i32.const 0
+  v4 = i64.const 8000000000
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 42
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 2048
+  v2 = i64.load v1
+  return v2
+  }
+}
+"#;
 
     /// (d) explorer: root return with a parked daemon — every seed yields the root's `Ok`,
     /// with the daemon reaped, not scheduled to its (logical) timeout.
