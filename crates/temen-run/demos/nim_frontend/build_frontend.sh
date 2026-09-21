@@ -108,9 +108,9 @@ if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
   if [ "$sys" != "sysvq0asl" ]; then
     echo "WARN: system stem is '$sys', not 'sysvq0asl' — update rust_driver_nimsem.rs (argv + fixture names) to match"
   fi
-  gzip -9 -c "$CACHE/nimsem_ce_raw.temen" > "$FX/nimsem_ce.temen.gz"
+  gzip -9 -n -c "$CACHE/nimsem_ce_raw.temen" > "$FX/nimsem_ce.temen.gz"
   cp "$W/nimcache/$sys.p.nif" "$FX/$sys.p.nif"
-  gzip -9 -c "$ceout/nimcache/$sys.s.nif" > "$FX/$sys.s.nif.gz"
+  gzip -9 -n -c "$ceout/nimcache/$sys.s.nif" > "$FX/$sys.s.nif.gz"
   # The system module's import closure the nifler grandchildren parse: system.nim's include set lives
   # under lib/std/system/, plus errorcodes. Self-contained (system/* only imports errorcodes).
   tar czf "$FX/syslib.tar.gz" -C "$BIN/../lib" std/system.nim std/system std/errorcodes
@@ -145,9 +145,9 @@ if [ -x "$HEXER_BIN" ]; then
   # deterministic for a fixed input). The .s.nif/.s.idx.nif are the same nimsem output step 9 committed.
   if [ "${TEMEN_NIMSEM_EMIT_ASSET:-0}" = 1 ]; then
     FX="$HERE/fixtures"; mkdir -p "$FX"
-    gzip -9 -c "$CACHE/hexer_ce_raw.temen" > "$FX/hexer_ce.temen.gz"
+    gzip -9 -n -c "$CACHE/hexer_ce_raw.temen" > "$FX/hexer_ce.temen.gz"
     cp "$chainout/nimcache/$sys.s.idx.nif" "$FX/$sys.s.idx.nif"
-    gzip -9 -c "$chainout/nimcache/$sys.x.nif" > "$FX/$sys.x.nif.gz"
+    gzip -9 -n -c "$chainout/nimcache/$sys.x.nif" > "$FX/$sys.x.nif.gz"
     echo "  emitted hexer driver-guest fixtures -> $FX (hexer_ce + $sys.s.idx.nif + $sys.x.nif.gz)"
   fi
 
