@@ -194,6 +194,10 @@ use temen_ir::Module;
 /// v22 (#1502): a `Budget` handle is durable — `B_BUDGET` carries its remaining quotas verbatim, and
 /// the thaw runs the embedder's budget hook (attenuate-only) before pinning the table. An artifact
 /// whose domain holds no `Budget` is byte-identical to v21.
+/// v28 (D66 / #1586): `B_BUDGET` carries a fifth field, `lane` — the lane a child spawned with the
+/// budget receives (INVARIANTS #3 ruling 2026-09-21). `-1` = unbounded, which is what every budget
+/// minted before D66 carries, so a thawed pre-lane budget confers exactly what it did.
+///
 /// v27 (#1361): `B_MODULE` — a §14 module grant the granting host attested **freezable** is durable,
 /// carried as its 32-byte §4 content digest. The module bytes never ride the artifact (D-scope); the
 /// restoring host re-grants the same module and the digest re-resolves the handle against it, the
@@ -207,7 +211,7 @@ use temen_ir::Module;
 /// v25 (#1440): `B_FREEZE_AUTHORITY` — freeze authority is a durable binding, so a thawed parent
 /// still holds it over its thawed child. An artifact whose domain holds none is byte-identical to
 /// v24 but for the version field.
-const FORMAT_VERSION: u16 = 27;
+const FORMAT_VERSION: u16 = 28;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -1569,7 +1573,7 @@ fn write_binding(b: &mut Vec<u8>, binding: &DurableBinding) {
         }
         DurableBinding::Budget(q) => {
             b.push(B_BUDGET);
-            for f in [q.fuel, q.mem, q.spawn, q.channel] {
+            for f in [q.fuel, q.mem, q.spawn, q.channel, q.lane] {
                 write_uleb(b, f as u64);
             }
         }
@@ -1637,6 +1641,7 @@ fn read_binding(r: &mut Reader) -> Result<DurableBinding, RestoreError> {
                 mem: field()?,
                 spawn: field()?,
                 channel: field()?,
+                lane: field()?,
             })
         }
         _ => return Err(RestoreError::Malformed),

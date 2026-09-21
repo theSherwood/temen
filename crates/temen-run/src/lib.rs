@@ -2249,6 +2249,11 @@ locked_parent_hook!(
     (budget: i32, bytes: u64) -> i32
 );
 locked_parent_hook!(
+    budget_mem_give_locked,
+    budget_mem_give,
+    (budget: i32, bytes: u64) -> ()
+);
+locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
     (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
@@ -2348,6 +2353,11 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
             budget_mem_take_locked
         } else {
             budget_mem_take
+        },
+        budget_mem_give: if locked {
+            budget_mem_give_locked
+        } else {
+            budget_mem_give
         },
         premap_admit: if locked {
             premap_admit_locked
@@ -2992,7 +3002,27 @@ pub unsafe extern "C" fn premap_apply(
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
 pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
     let parent = &mut *(ctx as *mut Host);
-    i32::from(parent.budget_mem_take(budget, bytes))
+    // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
+    // a lane wider than the parent's cap refuses before any `mem` is taken. This backend's children
+    // are OS threads the parent host cannot see finish (no reap credit yet — #1600 slices 2–4), so the
+    // lane is returned at once: single-spawn parity with the other engines, lasting accounting later.
+    match parent.admit_detached_spawn(budget, bytes) {
+        Some(lane) => {
+            parent.give_lane(lane);
+            1
+        }
+        None => 0,
+    }
+}
+
+/// #1587 — the undo of [`budget_mem_take`] for a spawn that failed after the take
+/// ([`temen_jit::BudgetMemGiver`]): return `bytes` to `budget` on the parent `Host`.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.budget_mem_give(budget, bytes);
 }
 
 /// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative

@@ -115,37 +115,45 @@ fn spawn_child_on_thread(
     {
         return None;
     }
-    Some(
-        std::thread::Builder::new()
-            .name("temen-child".into())
-            .spawn(move || {
-                let base = base; // move the wrapper into the thread
-                mem::install_guard();
-                // SAFETY: `code` is a live `Arc<CompiledModule>` held by this closure (passed by raw
-                // pointer — see `run_child_code`); the carve is committed parent memory the Instantiator
-                // bounded; `args` matches the entry arity (caller-checked).
-                let (r, t) = unsafe {
-                    crate::run_child_code(
-                        std::sync::Arc::as_ptr(&code),
-                        sub_base,
-                        child_size_log2,
-                        base.0,
-                        &args,
-                        n_results,
-                    )
-                };
-                let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
-                *st = Some((r, t));
-                done.cv.notify_all();
-                // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
-                if futex_sched != 0 {
-                    unsafe {
-                        (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished()
-                    };
-                }
-            })
-            .expect("spawn a §14 child OS thread"),
-    )
+    let spawned = std::thread::Builder::new()
+        .name("temen-child".into())
+        .spawn(move || {
+            let base = base; // move the wrapper into the thread
+            mem::install_guard();
+            // SAFETY: `code` is a live `Arc<CompiledModule>` held by this closure (passed by raw
+            // pointer — see `run_child_code`); the carve is committed parent memory the Instantiator
+            // bounded; `args` matches the entry arity (caller-checked).
+            let (r, t) = unsafe {
+                crate::run_child_code(
+                    std::sync::Arc::as_ptr(&code),
+                    sub_base,
+                    child_size_log2,
+                    base.0,
+                    &args,
+                    n_results,
+                )
+            };
+            let mut st = done.state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = Some((r, t));
+            done.cv.notify_all();
+            // SAFETY: as `child_started` above — the domain outlives this (joined) thread.
+            if futex_sched != 0 {
+                unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+            }
+        });
+    match spawned {
+        Ok(h) => Some(h),
+        // #1587 — the OS refused a thread (EAGAIN at the thread limit, stack VA exhausted). Release
+        // the §15 reservation taken above and refuse as a value the caller already maps, never
+        // unwind: op 0 is guest-callable, and a guest must not be able to abort the host by driving
+        // the OS to its limit. SAFETY: as the reservation above.
+        Err(_) => {
+            if futex_sched != 0 {
+                unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+            }
+            None
+        }
+    }
 }
 
 /// S1c for **granted** children (Instantiator ops 8/11/13) — spawn the per-spawn-compiled child on
@@ -238,8 +246,15 @@ unsafe fn spawn_granted_child(
             if futex_sched != 0 {
                 unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
             }
-        })
-        .expect("spawn a §14 granted-child OS thread");
+        });
+    // #1587 — see `spawn_child_on_thread`: a refused OS thread is a probeable `-EINVAL`, with the
+    // §15 reservation released, never a host abort.
+    let Ok(handle) = handle else {
+        if futex_sched != 0 {
+            unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+        }
+        return EINVAL as i32;
+    };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
     let mut child = Child::pending(done);
@@ -356,6 +371,8 @@ pub(crate) struct Nursery {
     /// inert `CapFault`, like the other grant ops without hooks).
     grant_build_detached: std::sync::atomic::AtomicUsize,
     grant_budget_mem_take: std::sync::atomic::AtomicUsize,
+    /// #1587 — [`crate::BudgetMemGiver`]: returns a taken quota when the OS-thread spawn fails.
+    grant_budget_mem_give: std::sync::atomic::AtomicUsize,
     /// Op-15 pre-mapped region hooks ([`crate::PremapAdmit`] / [`crate::PremapStage`] /
     /// [`crate::PremapApply`]; 0 = none ⇒ a spawn asking for one is an inert `CapFault`).
     grant_premap_admit: std::sync::atomic::AtomicUsize,
@@ -437,6 +454,7 @@ impl Nursery {
             grant_build_named: std::sync::atomic::AtomicUsize::new(0),
             grant_build_detached: std::sync::atomic::AtomicUsize::new(0),
             grant_budget_mem_take: std::sync::atomic::AtomicUsize::new(0),
+            grant_budget_mem_give: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_admit: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_stage: std::sync::atomic::AtomicUsize::new(0),
             grant_premap_apply: std::sync::atomic::AtomicUsize::new(0),
@@ -468,7 +486,7 @@ impl Nursery {
     }
 
     pub(crate) fn set_grant_hooks(&self, hooks: Option<crate::GrantChildHooks>) {
-        let (b, bn, r, bi, m, t, rs, bd, mt, pc, pa, ps, pp) = match hooks {
+        let (b, bn, r, bi, m, t, rs, bd, mt, mg, pc, pa, ps, pp) = match hooks {
             Some(h) => (
                 h.build as usize,
                 h.build_named as usize,
@@ -479,17 +497,19 @@ impl Nursery {
                 h.register_serve as usize,
                 h.build_detached as usize,
                 h.budget_mem_take as usize,
+                h.budget_mem_give as usize,
                 h.parent_ctx as usize,
                 h.premap_admit as usize,
                 h.premap_stage as usize,
                 h.premap_apply as usize,
             ),
-            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+            None => (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
         };
         self.grant_build.store(b, Ordering::Release);
         self.grant_build_named.store(bn, Ordering::Release);
         self.grant_build_detached.store(bd, Ordering::Release);
         self.grant_budget_mem_take.store(mt, Ordering::Release);
+        self.grant_budget_mem_give.store(mg, Ordering::Release);
         self.grant_premap_admit.store(pa, Ordering::Release);
         self.grant_premap_stage.store(ps, Ordering::Release);
         self.grant_premap_apply.store(pp, Ordering::Release);
@@ -1553,6 +1573,10 @@ unsafe fn spawn_detached_child(
     gc_ctx: *mut core::ffi::c_void,
     retained_ctx: *mut core::ffi::c_void,
     trap_out: *mut i64,
+    // #1587 — the funding budget + the window bytes `instantiate_detached` already took from it, so
+    // a spawn that fails *after* that commit can hand them back.
+    budget: i32,
+    child_size: u64,
 ) -> i32 {
     struct SendRaw<T>(T);
     // SAFETY: `gc_ctx` is a heap `Host` handed over wholesale to the child thread (`Host: Send`),
@@ -1624,8 +1648,24 @@ unsafe fn spawn_detached_child(
             if futex_sched != 0 {
                 unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
             }
-        })
-        .expect("spawn a §5 detached-child OS thread");
+        });
+    // #1587 — the OS refused the thread. This is the one refusal on the detached path that happens
+    // *after* `budget_mem_take` committed, so it must un-spend: give the window bytes back through the
+    // grant hooks, release the §15 reservation, and answer `-EINVAL` like every other admission
+    // failure (INVARIANTS #5) — never unwind into the host.
+    let Ok(handle) = handle else {
+        let give_addr = rt.grant_budget_mem_give.load(Ordering::Acquire);
+        if give_addr != 0 {
+            // SAFETY: a nonzero address is the embedder's registered `BudgetMemGiver`; `grant_ctx`
+            // is the parent host it was registered with.
+            let give: crate::BudgetMemGiver = unsafe { core::mem::transmute(give_addr) };
+            unsafe { give(rt.grant_ctx(), budget, child_size) };
+        }
+        if futex_sched != 0 {
+            unsafe { (*(futex_sched as *const crate::os_thread_rt::Domain)).child_finished() };
+        }
+        return EINVAL as i32;
+    };
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = children.len();
     let mut child = Child::pending(done);
@@ -1867,6 +1907,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         gc.ctx,
         gc.retained_ctx,
         trap_out,
+        budget as i32,
+        child_size,
     )
 }
 

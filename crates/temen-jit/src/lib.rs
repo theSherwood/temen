@@ -782,6 +782,12 @@ pub struct BudgetTaken {
 pub type BudgetMemTaker =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i32;
 
+/// #1587 — the undo of a [`BudgetMemTaker`] whose spawn then failed *after* the take: return `bytes`
+/// to `budget` on the parent. The OS-thread spawn is the one refusal on the detached path that
+/// happens after the commit, so without this a guest that trips it leaks its allowance per attempt.
+pub type BudgetMemGiver =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64);
+
 /// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
 /// child_off)`): may the parent's `SharedRegion` `region` be aliased whole into a child window of
 /// `child_size` bytes at `child_off`? `1` admitted, `0` refused (bad geometry — the spawn answers
@@ -836,6 +842,8 @@ pub struct GrantChildHooks {
     pub build_detached: GrantNamedChildBuilder,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
+    /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
+    pub budget_mem_give: BudgetMemGiver,
     /// Op-15 pre-mapped region — the three host sides of one child-side `map` (see [`PremapAdmit`],
     /// [`PremapStage`], [`PremapApply`]).
     pub premap_admit: PremapAdmit,

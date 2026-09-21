@@ -3461,6 +3461,19 @@ The existing empirical net carries over unchanged: the randomized-migration inte
 (`fiber_fuzz`), the single-owner runtime assert at the resume seam, ASan with fiber-switch
 annotations, `jit_threads` concurrent-steal stress. Slices and order: **#1600**.
 
+**Landed so far.** *Lanes on the interpreter* (#1600 slice 4, the oracle half): `Budget.lane` as the
+fifth budget field (a ceiling `split` bounds by the holder's cap and never draws down; codec v28);
+`Host::lane_cap` / `parent_domain` / `granted_lanes` with the one detached-spawn admission every engine
+calls (`Host::admit_detached_spawn` — lane reserved and `mem` taken, or neither); a per-vCPU lane
+chain; dispatch-time gating on **both** interpreter drivers (`dispatch` and the exploration driver —
+`lane_enter`/`lane_leave`, held exactly while on a worker), with lane-blocked tasks swept at teardown
+and left out of the deadlock predicate's external-wake list on purpose (a lane of `0` faults rather
+than hangs); the reap credit on `join`/`detach`. The bytecode engine and the JIT call the same
+admission and return the lane at once — single-spawn parity (a lane wider than the cap refuses) —
+until their children become scheduler tasks (slices 2–3), which is when their enforcement and lasting
+Σ accounting arrive. Also: the §15 ceiling on every §14 path (#1590) and the OS-thread spawn failure
+as a value with the budget un-spent (#1587).
+
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
 Audit date **2026-06-10** (register formerly `AUDIT.md`; deleted when every finding
