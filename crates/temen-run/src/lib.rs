@@ -5135,6 +5135,63 @@ pub fn nim_posix_imports(
     (imports, unbound)
 }
 
+/// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
+///
+/// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
+/// of the module name, then `uhash` of the *shortest* spelling of the path rendered in base 36,
+/// least-significant digit first. `uhash` (`nimony/src/lib/tinyhashes.nim`) is a Jenkins
+/// one-at-a-time over `u32`, deliberately independent of nim's own `hash` because the value ends up
+/// inside NIF files.
+///
+/// **Why we need it.** nimsem does not take dependency `.p.nif` files by name; it computes the stem
+/// and looks for that file. Seeding a `nimcache` produced by a native run does not line up, because
+/// the stem is a hash of the *path* and the two runs see different path layouts — the finding that
+/// closed off the "just stage the cache" idea in #1609. Computing it here means a driver can write
+/// the file nimsem will actually ask for.
+///
+/// `search_paths` mirrors nimony's `--path` list: the shortest of the given spelling and each
+/// `<search>/`-stripped one wins, exactly as `moduleSuffix` picks the shortest `relativePath`. Only
+/// the prefix case is handled — a path outside every search path keeps the spelling it came in with,
+/// where nim would render a `../` walk. Every layout a seeded memfs produces is a prefix case, and a
+/// wrong stem is visible immediately (nimsem re-parses) rather than silently wrong.
+pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
+    /// `tinyhashes.uhash` — mix each byte, then finish. All arithmetic wraps at 32 bits.
+    fn uhash(s: &str) -> u32 {
+        let mut h: u32 = 0;
+        for &c in s.as_bytes() {
+            h = h.wrapping_add(c as u32);
+            h = h.wrapping_add(h << 10);
+            h ^= h >> 6;
+        }
+        h = h.wrapping_add(h << 3);
+        h ^= h >> 11;
+        h.wrapping_add(h << 15)
+    }
+    const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    let mut f = path;
+    for sp in search_paths {
+        let sp = sp.trim_end_matches('/');
+        if let Some(rest) = path
+            .strip_prefix(sp)
+            .and_then(|r| r.strip_prefix('/'))
+            .filter(|r| r.len() < f.len())
+        {
+            f = rest;
+        }
+    }
+    let name = f.rsplit('/').next().unwrap_or(f);
+    let stem = name.rsplit_once('.').map_or(name, |(base, _)| base);
+
+    let mut out: String = stem.chars().take(3).collect();
+    let mut id = uhash(f);
+    while id > 0 {
+        out.push(BASE36[(id % 36) as usize] as char);
+        id /= 36;
+    }
+    out
+}
+
 /// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
 /// subdirectories. Deduplicated by stem, first one wins.
 pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
@@ -7628,6 +7685,45 @@ block 0 (vaddr: i64) {
         assert!(
             folds_to_oracle(&m),
             "the one routing predicate (all three call sites) folds it off the JIT"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nim_module_suffix_tests {
+    //! #1609 — pin [`nim_module_suffix`] against stems a **guest actually asked for**, not against
+    //! the port's own arithmetic. If the two ever disagree nimsem silently re-parses a dependency
+    //! it was handed, which is the failure this exists to stop.
+    use super::nim_module_suffix;
+
+    #[test]
+    fn it_reproduces_the_stem_a_running_nimsem_asked_for() {
+        // Observed verbatim from a no-C nimsem run over a memfs holding the stdlib at `lib/`:
+        //   FAILURE: nifler --portablePaths --deps parse lib/system/basic_types.nim \
+        //            nimcache/basu363p61.p.nif
+        // The *source* is spelled relative to the cwd; the *stem* is hashed from the shortest
+        // spelling, which is the one relative to the `lib` search path — the two differ, and that
+        // difference is the whole reason a hand-guessed stem never matched.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["lib"]),
+            "basu363p61"
+        );
+        // Without the search path the cwd-relative spelling is hashed instead, and the stem differs.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &[]),
+            "bas9s4yu5"
+        );
+    }
+
+    #[test]
+    fn the_prefix_is_three_characters_of_the_module_name() {
+        // `PrefixLen = 3`, and a name shorter than that contributes all of itself.
+        assert!(nim_module_suffix("system/basic_types.nim", &[]).starts_with("bas"));
+        assert!(nim_module_suffix("a/os.nim", &["a"]).starts_with("os"));
+        // A longer search path that does not match leaves the spelling alone.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["other"]),
+            nim_module_suffix("lib/system/basic_types.nim", &[])
         );
     }
 }
