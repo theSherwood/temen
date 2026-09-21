@@ -21,9 +21,7 @@
 mod repo_root_mod;
 use repo_root_mod::repo_root;
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use temen_interp::{
@@ -113,21 +111,9 @@ fn powerbox(h: &mut Host, win: u64, block_for: std::time::Duration) -> [Value; 7
     handles.map(Value::I32)
 }
 
-/// Build the chibicc fork once per test binary, returning the path to its binary.
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .expect("run `make` to build the chibicc fork");
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// Compile a C source string to our text IR via the frontend.
 fn c_to_ir(src: &str) -> String {

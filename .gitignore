@@ -10,6 +10,10 @@
 # `nimony`/`nativenif` themselves are git submodules, and their in-tree build outputs (bin/, nimcache)
 # are ignored by the submodules' own .gitignore.
 /nim-src
+# nimony's in-tree build cache. `build_nim_hello_temen --root .` compiles a phase the way nimony is
+# normally invoked — from the tree root — so the cache nimony writes beside the project lands here,
+# at the REPO root, not inside the submodule its own .gitignore covers.
+/nimcache
 **/*.rs.bk
 rustc-ice-*.txt
 crates/temen-llvm/tests/fixtures/leng_probe/Cargo.lock

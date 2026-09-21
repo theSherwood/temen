@@ -1,2 +1,3 @@
 *.o
 /chibicc
+/.build.lock

@@ -25,9 +25,7 @@ use grant_hooks_mod::grant_hooks;
 
 use repo_root_mod::repo_root;
 
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use temen_interp::{bytecode, run_capture_reserved_with_host, Host, StreamRole, Trap};
@@ -36,21 +34,9 @@ use temen_run::cap_thunk;
 use temen_text::parse_module as parse_module_raw;
 use temen_verify::verify_module;
 
-/// Build the chibicc fork once per test binary.
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .expect("run `make` to build the chibicc fork");
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// Compile a C source string to text IR via the frontend.
 fn c_to_ir(src: &str) -> String {

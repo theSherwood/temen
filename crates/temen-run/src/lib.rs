@@ -5051,6 +5051,298 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// How a retained nimony syscall import is served — the **one** table for the no-C (Leng) bottom
+/// edge, consulted both by the binder and by anything reporting unbound leaves.
+///
+/// They were two: a binder matching `write`/`open` then a prefix chain, and a probe carrying its own
+/// hardcoded list. Teaching one about a newly served leaf left the other reporting it unbound — the
+/// second route through one behaviour that INVARIANTS #15 is about.
+#[derive(Clone, Copy, Debug)]
+pub enum NimImport {
+    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
+    Stdout,
+    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
+    /// file operation, and the compute shim's `{ return }` stub made `quit` a no-op, so every nim
+    /// CLI error path ran on past the `quit` that should have ended it.
+    Exit,
+    /// `temen_leng`'s `POSIX_OPEN_ADAPTER` forward: a bare `open` taking the `(ptr, len, flags)` the
+    /// op wants. Binding C's `open` directly reads the flags word as the path length.
+    Open,
+    /// A retained nimony syscall leaf → the matching `temen_posix` op.
+    Posix(u32),
+}
+
+/// Which [`NimImport`] serves `name`, or `None` if nothing does.
+pub fn nim_import_binding(name: &str) -> Option<NimImport> {
+    Some(match name {
+        "write" => NimImport::Stdout,
+        "open" => NimImport::Open,
+        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
+        // the shim's allocator handed it.
+        "read" => NimImport::Posix(temen_posix::OP_READ),
+        // The path-ABI adapter's other forwards (#1595): nim writes files atomically, so a file
+        // write is write-temp + rename, with an unlink on the failure path.
+        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
+        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
+        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
+        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
+        // read at the declared `st_mode`/`st_size` offsets answers garbage, so `fileExists` is false
+        // for every file and a compiler cannot find its own inputs.
+        "statp" => NimImport::Posix(temen_posix::OP_STATP),
+        n if n.starts_with("cExitSys") => NimImport::Exit,
+        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
+        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
+        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
+        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
+        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        n if n.starts_with("chdir") => NimImport::Posix(temen_posix::OP_CHDIR),
+        // #1595: `memfiles.open` sizes a mapping with `fstat`, so a 0-returning stub made every
+        // mapped file look empty.
+        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
+        _ => return None,
+    })
+}
+
+/// Bind every retained import of a no-C nim module to one shared **POSIX personality**, returning
+/// the [`Imports`] and the personality itself (so a caller reads back stdout, or a file the guest
+/// wrote). Unserved names are returned rather than panicked on — a caller that wants them fatal can
+/// say so, and a probe reporting "unbound leaves" wants the list.
+pub fn nim_posix_imports(
+    module: &Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+) -> (Imports, Vec<String>) {
+    let _ = posix;
+    let mut imports = Imports::new();
+    let mut unbound = Vec::new();
+    for imp in &module.imports {
+        let Some(kind) = nim_import_binding(&imp.name) else {
+            unbound.push(imp.name.clone());
+            continue;
+        };
+        let cap = match kind {
+            NimImport::Stdout => HostCap::stdout(),
+            NimImport::Exit => HostCap::exit(),
+            NimImport::Open => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+            }
+            NimImport::Posix(op) => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(op, move || (*make)())
+            }
+        };
+        imports = imports.provide(imp.name.clone(), cap);
+    }
+    (imports, unbound)
+}
+
+/// **Run one no-C nimony phase** over a shared POSIX personality, with `argv`.
+///
+/// The single route every no-C driver takes: bind the module's retained imports with
+/// [`nim_posix_imports`], refuse if any name is unserved, instantiate, and run with `argv` as the
+/// guest's argument vector. `module` is taken by value because instantiation consumes it, and a
+/// caller running the same phase twice must hand over a fresh copy on purpose — a second run inside
+/// one instance would see the first run's globals and heap, which for a compiler phase is not a
+/// rerun at all.
+///
+/// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
+/// and the trap alone does not.
+pub fn nim_noc_run(
+    module: Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    argv: &[String],
+) -> Result<(), String> {
+    let (imports, unbound) = nim_posix_imports(&module, posix, make);
+    if !unbound.is_empty() {
+        return Err(format!(
+            "unbound nimony imports (extend `nim_import_binding`): {unbound:?}"
+        ));
+    }
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: None,
+            ..Limits::default()
+        },
+        args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        ..RunConfig::default()
+    };
+    let inst =
+        instantiate_with_imports(module, imports).map_err(|e| format!("instantiate: {e}"))?;
+    inst.run(Backend::TreeWalk, &cfg).map_err(|e| {
+        let err = posix.stderr();
+        if err.is_empty() {
+            format!("run failed: {e}")
+        } else {
+            format!(
+                "run failed: {e}\n--- guest stderr ---\n{}",
+                String::from_utf8_lossy(&err)
+            )
+        }
+    })?;
+    Ok(())
+}
+
+/// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
+///
+/// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
+/// of the module name, then `uhash` of the *shortest* spelling of the path rendered in base 36,
+/// least-significant digit first. `uhash` (`nimony/src/lib/tinyhashes.nim`) is a Jenkins
+/// one-at-a-time over `u32`, deliberately independent of nim's own `hash` because the value ends up
+/// inside NIF files.
+///
+/// **Why we need it.** nimsem does not take dependency `.p.nif` files by name; it computes the stem
+/// and looks for that file. Seeding a `nimcache` produced by a native run does not line up, because
+/// the stem is a hash of the *path* and the two runs see different path layouts — the finding that
+/// closed off the "just stage the cache" idea in #1609. Computing it here means a driver can write
+/// the file nimsem will actually ask for.
+///
+/// `search_paths` mirrors nimony's `--path` list: the shortest of the given spelling and each
+/// `<search>/`-stripped one wins, exactly as `moduleSuffix` picks the shortest `relativePath`. Only
+/// the prefix case is handled — a path outside every search path keeps the spelling it came in with,
+/// where nim would render a `../` walk. Every layout a seeded memfs produces is a prefix case, and a
+/// wrong stem is visible immediately (nimsem re-parses) rather than silently wrong.
+pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
+    /// `tinyhashes.uhash` — mix each byte, then finish. All arithmetic wraps at 32 bits.
+    fn uhash(s: &str) -> u32 {
+        let mut h: u32 = 0;
+        for &c in s.as_bytes() {
+            h = h.wrapping_add(c as u32);
+            h = h.wrapping_add(h << 10);
+            h ^= h >> 6;
+        }
+        h = h.wrapping_add(h << 3);
+        h ^= h >> 11;
+        h.wrapping_add(h << 15)
+    }
+    const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    let mut f = path;
+    for sp in search_paths {
+        let sp = sp.trim_end_matches('/');
+        if let Some(rest) = path
+            .strip_prefix(sp)
+            .and_then(|r| r.strip_prefix('/'))
+            .filter(|r| r.len() < f.len())
+        {
+            f = rest;
+        }
+    }
+    let name = f.rsplit('/').next().unwrap_or(f);
+    let stem = name.rsplit_once('.').map_or(name, |(base, _)| base);
+
+    let mut out: String = stem.chars().take(3).collect();
+    let mut id = uhash(f);
+    while id > 0 {
+        out.push(BASE36[(id % 36) as usize] as char);
+        id /= 36;
+    }
+    out
+}
+
+/// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
+/// subdirectories. Deduplicated by stem, first one wins.
+pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_x_nif(&p, out);
+        } else if let Some(stem) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".x.nif"))
+        {
+            if out.iter().all(|(s, _)| s != stem) {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    out.push((
+                        stem.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Narrow a shared `nimcache`'s modules to the closure of **one** program, named by the source path
+/// it was built from (`src_rel`, e.g. `src/nimony/nimsem.nim`).
+///
+/// An in-tree `nimcache` accumulates the modules of *every* program ever built there, and nimony
+/// takes no `--nimcache`. Linking all of them is wrong twice over: two `main`s are a
+/// `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
+/// cross-module references need not resolve in this program.
+///
+/// nimony writes one `<stem>.c` per module into the program's own build directory
+/// (`nimcache/<program stem>/`), so that directory's `.c` stems are exactly this program's closure —
+/// which drops the foreign modules *and* their `main`s together, one rule instead of a
+/// duplicate-`main` hack that leaves the rest of the foreign program in the link.
+///
+/// The program module is the one carrying `main` **whose own `.x.nif` names `src_rel` in its line
+/// info** — not the newest. `nimony c` is cached, so a run whose output is already up to date
+/// rewrites nothing and mtime then names whichever program was built last: a hexer probe and a
+/// nifler2 probe would both select hexer, and the nifler2 run would silently link hexer's closure.
+///
+/// Falls back to newest-by-mtime when nothing names `src_rel`, and to "keep that one `main`, sweep
+/// the rest" when the build directory is absent (an older toolchain, or a layout change) — imprecise
+/// rather than wrong. Returns the reason when it falls back, for the caller to report.
+pub fn nim_program_closure(
+    nimcache: &std::path::Path,
+    src_rel: &str,
+    mods: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let mains: Vec<usize> = mods
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
+        .map(|(i, _)| i)
+        .collect();
+    if mains.is_empty() {
+        return None;
+    }
+    let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(src_rel));
+    let note = by_src
+        .is_none()
+        .then(|| format!("no program module names `{src_rel}` — falling back to newest `main`"));
+    let keep = by_src.unwrap_or_else(|| {
+        *mains
+            .iter()
+            .max_by_key(|&&i| {
+                std::fs::metadata(nimcache.join(format!("{}.x.nif", mods[i].0)))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .expect("a newest program module")
+    });
+    let keep_stem = mods[keep].0.clone();
+    let own: std::collections::HashSet<String> = std::fs::read_dir(nimcache.join(&keep_stem))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".c"))
+                .map(|s| s.to_string())
+        })
+        .collect();
+    if own.is_empty() {
+        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+        for i in drop.into_iter().rev() {
+            mods.remove(i);
+        }
+        return Some(format!(
+            "no build dir for `{keep_stem}` — keeping that `main` only"
+        ));
+    }
+    mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
+    note
+}
+
 /// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
 ///
 /// A child carve is a **hard** ceiling. `Mem::nested_view` builds `Window::sub(.., 1 << size_log2)`
@@ -7442,6 +7734,45 @@ block 0 (vaddr: i64) {
         assert!(
             folds_to_oracle(&m),
             "the one routing predicate (all three call sites) folds it off the JIT"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nim_module_suffix_tests {
+    //! #1609 — pin [`nim_module_suffix`] against stems a **guest actually asked for**, not against
+    //! the port's own arithmetic. If the two ever disagree nimsem silently re-parses a dependency
+    //! it was handed, which is the failure this exists to stop.
+    use super::nim_module_suffix;
+
+    #[test]
+    fn it_reproduces_the_stem_a_running_nimsem_asked_for() {
+        // Observed verbatim from a no-C nimsem run over a memfs holding the stdlib at `lib/`:
+        //   FAILURE: nifler --portablePaths --deps parse lib/system/basic_types.nim \
+        //            nimcache/basu363p61.p.nif
+        // The *source* is spelled relative to the cwd; the *stem* is hashed from the shortest
+        // spelling, which is the one relative to the `lib` search path — the two differ, and that
+        // difference is the whole reason a hand-guessed stem never matched.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["lib"]),
+            "basu363p61"
+        );
+        // Without the search path the cwd-relative spelling is hashed instead, and the stem differs.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &[]),
+            "bas9s4yu5"
+        );
+    }
+
+    #[test]
+    fn the_prefix_is_three_characters_of_the_module_name() {
+        // `PrefixLen = 3`, and a name shorter than that contributes all of itself.
+        assert!(nim_module_suffix("system/basic_types.nim", &[]).starts_with("bas"));
+        assert!(nim_module_suffix("a/os.nim", &["a"]).starts_with("os"));
+        // A longer search path that does not match leaves the spelling alone.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["other"]),
+            nim_module_suffix("lib/system/basic_types.nim", &[])
         );
     }
 }
