@@ -68,6 +68,22 @@ note missed). The thaw may **attenuate** a carried budget through an embedder ho
 (`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
 ⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
 
+**Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
+(2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
+and it moves down the graph like every other. Until D66 no runtime represented it per domain —
+`max_vcpus` bounds task *count* (parked tasks included), host parallelism was a global worker count,
+and on the JIT a §14 detached child was one OS thread, so a parent held whatever the OS allowed. Now a
+domain holds a **lane cap**, checked when a worker picks one of its tasks and released on
+park/yield/finish. A parent grants a child a lane ≤ its own cap, with Σ granted lanes ≤ the parent's
+cap enforced at grant time, and a running task counts against its own lane and every enclosing one.
+The model is a **ceiling**, not a transfer: the parent's own tasks may fill any lane it holds,
+including a child's — so 6 / 2 / 2 is *A up to 6, B ≤ 2 contended with A, C ≤ 2 contended with A, B
+and C never contending with each other*. This was chosen over the `split`-style hard partition the
+other three budget dimensions use, accepting that a parent can absorb a child's lane in exchange for
+not stranding idle capacity; revisit if a workload needs the guarantee. *Violated by:* a §14 spawn
+path that takes a worker without a lane, or a grant that exceeds the grantor's cap. (DESIGN.md §23
+"Child-domain scheduling".)
+
 ## 4. Host = mechanism, guest = policy
 
 The host's inter-domain layer is a waiter table, wake plumbing, and lifecycle cleanup —
