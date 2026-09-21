@@ -2616,6 +2616,8 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
     };
     let mut seeds: Vec<(&str, &[u8])> = vec![("/in.nim", SRC.as_bytes())];
     seeds.extend(extra.iter().map(|(g, b)| (g.as_str(), b.as_slice())));
+    let seeded: std::collections::HashSet<String> =
+        seeds.iter().map(|(p, _)| (*p).to_string()).collect();
     let posix = run_io_capture(m, Backend::TreeWalk, &cfg, &seeds);
     let out = posix.stdout();
     if !out.is_empty() {
@@ -2658,10 +2660,15 @@ fn nifler2_run_vs_native(m: &temen_ir::Module, native_bin: &std::path::Path) {
     match posix.read_file(&format!("/{out_name}")) {
         None => panic!(
             "wrote no /{out_name}, but native wrote {} bytes\n    guest stdout: {:?}\n    \
-             guest stderr: {:?}",
+             guest stderr: {:?}\n    the guest wrote: {:?}",
             want.len(),
             elide(&String::from_utf8_lossy(&out)),
             elide(&String::from_utf8_lossy(&err)),
+            posix
+                .file_names()
+                .into_iter()
+                .filter(|n| !seeded.contains(n))
+                .collect::<Vec<_>>(),
         ),
         Some(got) if got == want => eprintln!(
             "  nifler2: ✅ BYTE-IDENTICAL to native ({} bytes) — the real Nim parser, compiled with \

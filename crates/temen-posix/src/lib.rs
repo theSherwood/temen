@@ -412,6 +412,17 @@ const S_IFREG: i64 = 0o100000; // regular file (| 0o644 perms)
 const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
 const S_IFIFO: i64 = 0o010000; // FIFO/pipe — what a non-file fd stats as
 
+/// An embedder-supplied path as a memfs key: absolute, since every key is. A leading `/` is
+/// optional for the caller's convenience — `"g"` and `"/g"` are the same file — which is what lets
+/// a seed and the guest's own `open` of the same name meet in one entry.
+fn rooted(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
 /// Linux/amd64 `struct stat` geometry, as the **guest's own** headers declare it (nimony
 /// `std/posix/posix.nim`): 144 bytes, `st_mode` (u32) at 24, `st_size` (i64) at 48. Used by
 /// [`OP_FSTAT`] and [`OP_STATP`], which must match the caller's layout exactly — [`OP_STAT`]'s short
@@ -1177,22 +1188,37 @@ impl Posix {
     }
 
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
+    /// The path is [`rooted`]: `"g"` and `"/g"` name the same file, as they do on a real filesystem.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
-            .insert(path.to_string(), bytes.to_vec());
+            .insert(rooted(path), bytes.to_vec());
     }
 
-    /// Read a memfs file back — how an embedder/test inspects what the guest wrote.
+    /// Read a memfs file back — how an embedder/test inspects what the guest wrote. [`rooted`], so
+    /// it finds the file whichever spelling the guest created it under.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
-            .get(path)
+            .get(&rooted(path))
             .cloned()
+    }
+
+    /// Every memfs path that currently exists, sorted — how an embedder/test sees what the guest
+    /// **actually** produced, rather than only whether one guessed-at path is there.
+    ///
+    /// The difference matters when a guest writes nothing to stdout or stderr and the expected
+    /// output file is absent: "wrote no `X`" cannot distinguish "wrote nothing" from "wrote it
+    /// somewhere else", and those point at different bugs.
+    pub fn file_names(&self) -> Vec<String> {
+        let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = st.files.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
@@ -3078,35 +3104,25 @@ impl Ctx<'_> {
         format!("/{}", out.join("/"))
     }
 
-    /// Resolve a guest path for a **lookup**, against the working directory (#1596).
+    /// Resolve a guest path against the working directory (#1596) — the **only** way a path becomes
+    /// a memfs key.
     ///
-    /// The personality has always stored a `cwd`, returned it from `getcwd` and let `chdir` set it,
-    /// while no path op consulted it — so `chdir` succeeded and changed nothing observable, and a
-    /// relative path could not reach a file stored under an absolute key. hexer hit that as soon as
-    /// it could map files at all: it derives its sibling index relatively, asked for
-    /// `foo.s.idx.nif`, and the memfs held `/foo.s.idx.nif`.
+    /// Every key is absolute, so this is just [`Self::join_cwd`]. It used to be a *fallback*: take
+    /// the path verbatim when it already named something, join against the cwd only when it did not.
+    /// That was written to preserve relative keys that seeds had already created, and it left `"g"`
+    /// and `"/g"` able to coexist as distinct entries — an anomaly its own doc named, with
+    /// "canonicalizing keys at creation is the real answer" as the deferred fix.
     ///
-    /// This is deliberately a **fallback, not a rewrite**. The memfs is flat and keyed by whatever
-    /// string created the entry, so relative keys are real and already in use — `write_file("g", …)`
-    /// seeds exactly that, and a guest opening `"g"` has always matched it verbatim. Rewriting every
-    /// relative path to an absolute one broke five existing tests that depend on it. So: take the
-    /// path as given when it already names something, fall back to the cwd-joined form when it does
-    /// not, and otherwise leave it alone — which keeps creation landing under the name the guest
-    /// used. The only behaviour that changes is a relative path that missed verbatim and hits once
-    /// resolved.
+    /// It came due. A path that names **nothing yet** matches neither key, so a create always took
+    /// the verbatim branch: `lengc c nimcache/x.x.nif` from cwd `/` wrote `nimcache/x.c`, reported
+    /// success, and the 436 KB it had just generated was invisible to anything asking for
+    /// `/nimcache/x.c`. A pipeline where one tool writes relative and the next reads absolute — which
+    /// is every nimony phase — could not hand a file along.
     ///
-    /// That leaves `"g"` and `"/g"` able to coexist as distinct entries. That anomaly predates this
-    /// and is not fixed here; canonicalizing keys at creation is the real answer, and a larger one.
+    /// The seeds that motivated the fallback are canonical now too ([`Posix::write_file`] roots its
+    /// path), so both spellings still reach the same file and the special case is simply gone.
     fn resolve(&self, path: &str) -> String {
-        if path.starts_with('/') || self.w.files.contains_key(path) || self.is_dir(path) {
-            return path.to_string();
-        }
-        let joined = self.join_cwd(path);
-        if self.w.files.contains_key(&joined) || self.is_dir(&joined) {
-            joined
-        } else {
-            path.to_string()
-        }
+        self.join_cwd(path)
     }
 
     fn lseek(&mut self, args: &[i64]) -> i64 {
@@ -7137,13 +7153,20 @@ block 0 (vph: i32) {\n\
             "/etc/passwd",
             "`..` clamps at the root rather than escaping it"
         );
-        // Resolution is a **fallback**, not a rewrite: a relative name matching nothing is handed
-        // back unchanged, so a create still lands under the name the guest used.
-        assert_eq!(st.resolve("nothing-here.txt"), "nothing-here.txt");
-        // And a memfs entry stored under a *relative* key stays reachable by that exact key — the
-        // property five existing tests depend on, which a blanket rewrite broke. (`g` is seeded up
-        // top with the others: `ctx!` holds the personality lock, so seeding after it deadlocks.)
-        assert_eq!(st.resolve("g"), "g");
+        // Resolution is now a **rewrite**, not a fallback: a name that matches nothing still becomes
+        // an absolute key, so a *create* lands where a later absolute open will find it. As a
+        // fallback it did the opposite — `lengc` wrote 436 KB to `nimcache/x.c` and the next reader
+        // asked for `/nimcache/x.c`.
+        assert_eq!(st.resolve("nothing-here.txt"), "/sub/nothing-here.txt");
+        // And the seed spelled without a leading slash is the same file as the one with it: the
+        // embedder's paths are rooted, so `"g"` and `"/g"` cannot become two entries. (`g` is seeded
+        // up top with the others: `ctx!` holds the personality lock, so seeding after it deadlocks.)
+        assert_eq!(st.resolve("/g"), "/g");
+        win_write(&mut mem, 600, b"/g");
+        assert!(
+            st.open(&[600, 2, 0], Some(&mut mem)).unwrap()[0] >= 0,
+            "the `\"g\"` seed is reachable as `/g` — one entry, not two"
+        );
     }
 
     #[test]
