@@ -244,7 +244,7 @@ if want nim_driver_guest; then
      && validate /tmp/rebuild_nim_link.temen; then
     note "nim_link ✓ (nim-link.temen.gz)"
   else
-    note "nim_link SKIP/✗ (rustc +1.81.0 + rust-src + llvm-18 — see build_nim_link.sh)"
+    note "nim_link SKIP/✗ (rustc + rust-src + llvm-link/opt of rustc\'s LLVM major — see below)"
   fi
   # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
   # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
@@ -353,7 +353,13 @@ if [ "${#SKIPPED[@]}" -gt 0 ]; then
   echo "      RUSTFLAGS=\"-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals -Clink-arg=--shared-memory\" \\"
   echo "      cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown"
   echo "    (see .github/workflows/ci.yml for the full flag set); the LLVM steps need the LLVM whose"
-  echo "    major matches rustc's on PATH (scripts/ci/install-llvm.sh)."
+  echo "    major matches rustc's on PATH (scripts/ci/install-llvm.sh). CI puts it there via"
+  echo "    GITHUB_PATH; locally nothing does, so if the distro\'s unversioned llvm-link is older"
+  echo "    than rustc\'s LLVM (\`rustc -vV | grep LLVM\`) prefix the run with"
+  echo "      PATH=/usr/lib/llvm-\$(grep -oP \'LLVM_MAJOR=\\K[0-9]+\' scripts/ci/install-llvm.sh)/bin:\$PATH"
+  echo "    A mismatch reads as a *parse* error on rustc\'s own IR (\`expected \')\' at end of"
+  echo "    argument list\` on an attribute the older tool has never heard of), not as a version"
+  echo "    complaint \u2014 which is why the note above used to blame a missing toolchain."
   echo
 fi
 echo "Also (non-CI, but tracked) browser/tests/fixtures/*.temen — the display/reactor/onramp Rust-test"
