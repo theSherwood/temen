@@ -37,7 +37,7 @@
 
 use crate::fiber_rt::{self, FiberCallTramp, FiberRuntime, SharedFiberTable};
 use crate::{mem, FnEntry, TrapKind};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -224,6 +224,20 @@ pub(crate) struct Domain {
     /// D66 — the child-domain executor whose parked tasks this domain's wakes must also reach
     /// ([`Domain::wake_child_tasks`]).
     child_exec: Mutex<Option<std::sync::Arc<crate::child_exec::ChildExec>>>,
+    /// D66 — **the run's lane counts**, per domain id: how many tasks of each domain are running
+    /// right now. One map for the whole run, deliberately: this domain's own 1:1 vCPUs and every
+    /// §14 child task of its child-domain executor count against the *same* root-domain lane, so
+    /// two maps would enforce the cap twice over and hand out double the granted parallelism.
+    lanes: Mutex<BTreeMap<usize, usize>>,
+    /// Signalled whenever a lane is given back, for the 1:1 vCPUs blocked waiting for one. (The
+    /// executor's workers wait on their own condvar and are woken alongside.)
+    lane_cv: Condvar,
+    /// D66 — the lane chain **this domain's own vCPUs** run under: `[(domain id, cap)]`, or empty
+    /// when the run set no cap (then every gate below is skipped and the hot path is untouched).
+    /// Installed at run entry from the host's `(domain_id, lane_cap)`; a §14 JIT child cannot
+    /// `thread.spawn` (`compile_child_windowed` rejects it), so the only vCPUs gated here are the
+    /// root domain's, and the chain is one entry long.
+    lane_chain: Mutex<Vec<(usize, i64)>>,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -303,9 +317,17 @@ pub(crate) enum FutexKey {
 /// Per-absolute-page `(backing identity, region byte offset of the page start)` recorded by every §13
 /// `map`, so the futex thunks can canonicalize an address (below). Process-global because the JIT futex
 /// itself is process-global (real OS threads); keyed **absolutely** so a thunk needs only `phys`, never
-/// the window base. Concurrent runs live at distinct window addresses (distinct pages); a sequential
-/// run reusing a virtual address is protected by the teardown/unmap purge ([`region_canon_forget_window`]).
-/// Real-runtime only — regions are not part of the loom futex model.
+/// the window base.
+///
+/// **Address reuse is a known hazard here** (#1608, open). Two runs never hold the same virtual
+/// address at the same time, but they reuse it over time — a freed reservation is handed straight
+/// back out, and in a process running several domains that happens constantly — while the purge runs
+/// from the host's teardown, i.e. *after* the reservation is released. A dying run can therefore
+/// forget pages a live one already recorded. Moving the purge into `GuestWindow::drop` (the one
+/// moment the range is provably still ours) is the fix and it is written up on #1608; it is not
+/// applied here because it aborts the windows nextest lane in the manner #1575 documents, which
+/// cannot be debugged without a Windows box. Real-runtime only — regions are not part of the loom
+/// futex model.
 #[cfg(not(loom))]
 static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (u64, u64)>>> =
     std::sync::OnceLock::new();
@@ -335,7 +357,8 @@ pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u6
 }
 
 /// Forget every canonical mapping in the absolute window `[base, base + size)` — called at `unmap` and
-/// at run teardown so a reused virtual address never inherits a stale region identity.
+/// at run teardown so a reused virtual address never inherits a stale region identity. The teardown
+/// caller no longer holds the address by then; see [`REGION_MAP`] and #1608.
 #[cfg(not(loom))]
 pub fn region_canon_forget_window(base: u64, size: u64) {
     let page = mem::page_size() as u64;
@@ -391,6 +414,9 @@ impl Domain {
             concurrent_durable: AtomicBool::new(false),
             parked: AtomicUsize::new(0),
             child_exec: Mutex::new(None),
+            lanes: Mutex::new(BTreeMap::new()),
+            lane_cv: Condvar::new(),
+            lane_chain: Mutex::new(Vec::new()),
         }
     }
 
@@ -485,6 +511,97 @@ impl Domain {
         lock(&self.threads).live -= 1;
         let _g = lock(&self.futex);
         self.futex_cv.notify_all();
+    }
+
+    /// D66 — install the lane chain this domain's own vCPUs run under (see [`Domain::lane_chain`]).
+    /// Called once at run entry, before any guest code; `cap < 0` leaves the run unbounded.
+    pub(crate) fn set_lane_chain(&self, domain: u64, cap: i64) {
+        *lock(&self.lane_chain) = if cap < 0 {
+            Vec::new()
+        } else {
+            vec![(domain as usize, cap)]
+        };
+    }
+
+    /// The chain a vCPU of *this* domain runs under (empty = unbounded).
+    pub(crate) fn lane_chain(&self) -> Vec<(usize, i64)> {
+        lock(&self.lane_chain).clone()
+    }
+
+    /// D66 — take every lane in `chain` if all of them have room, without waiting. Takes only the
+    /// lane lock, so a caller may hold its own scheduler lock across it (the child-domain executor
+    /// does, while picking); nothing in this file takes a scheduler lock while holding this one.
+    pub(crate) fn lane_try_enter(&self, chain: &[(usize, i64)]) -> bool {
+        temen_ir::lanes::enter(&mut lock(&self.lanes), chain)
+    }
+
+    /// D66 — give every lane in `chain` back (the vCPU parked, or finished) and wake **both** kinds
+    /// of waiter: the 1:1 vCPUs blocked in [`Domain::lane_acquire`], and the child-domain
+    /// executor's workers, whose `pick` may have refused a task for want of exactly this lane.
+    ///
+    /// Waking the executor is not optional. Its idle workers sleep on their own condvar with no
+    /// timeout, so a task refused a lane is reconsidered only when something signals them — and on a
+    /// run whose only other activity is the vCPU that just stepped aside, nothing else ever would.
+    ///
+    /// The lane lock is dropped before either wake, so this may be called from inside the executor
+    /// (it must not be called while holding the executor's own lock).
+    pub(crate) fn lane_give_back(&self, chain: &[(usize, i64)]) {
+        if chain.is_empty() {
+            return;
+        }
+        {
+            let mut g = lock(&self.lanes);
+            temen_ir::lanes::leave(&mut g, chain);
+        }
+        self.lane_cv.notify_all();
+        let exec = lock(&self.child_exec).clone();
+        if let Some(e) = exec {
+            e.notify_workers();
+        }
+    }
+
+    /// D66 — block until every lane in `chain` has room, then take them. `true` = taken and the
+    /// caller may run guest code.
+    ///
+    /// `false` means it must not, for one of two reasons, and the caller treats both the same way
+    /// (do not run; unwind): a cap of **0**, which no amount of waiting can satisfy — the
+    /// interpreter surfaces an unsatisfiable lane as a `ThreadFault` rather than a hang, and so do
+    /// we, here by refusing up front — or `abort()`, the caller's kill/teardown predicate.
+    ///
+    /// A vCPU waiting here is **not** counted in [`Domain::parked`]: it is runnable, merely queued
+    /// behind a lane, and counting it would let a peer's infinite `atomic.wait` see full quiescence
+    /// and declare a deadlock that was only ever a queue.
+    ///
+    /// Must not be called while holding any other lock in this file: it blocks, and the thread that
+    /// would release the lane may need those.
+    pub(crate) fn lane_acquire(&self, chain: &[(usize, i64)], abort: impl Fn() -> bool) -> bool {
+        if chain.is_empty() {
+            return true;
+        }
+        if chain.iter().any(|&(_, cap)| cap == 0) {
+            return false; // unsatisfiable by construction
+        }
+        let mut g = lock(&self.lanes);
+        loop {
+            if temen_ir::lanes::enter(&mut g, chain) {
+                return true;
+            }
+            if abort() {
+                return false;
+            }
+            #[cfg(not(loom))]
+            {
+                g = self
+                    .lane_cv
+                    .wait_timeout(g, KILL_RECHECK)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+            }
+            #[cfg(loom)]
+            {
+                g = self.lane_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+        }
     }
 
     /// D66 — a child-domain task parked (an event park inside it): it counts as blocked for the
@@ -891,6 +1008,16 @@ fn run_child(a: SpawnArgs) {
         .as_mut()
         .map(|b| fiber_rt::set_current(&mut **b as *mut FiberRuntime));
 
+    // D66 — parallelism is a granted resource, bounded at dispatch. A spawned vCPU is 1:1 with an
+    // OS thread (D56 is unchanged), but it may only *run* while its domain's lane has room: the
+    // thread exists, it simply queues. Unbounded runs (no cap) skip this entirely. SAFETY: `a.dom`
+    // is the run's live `Domain`, joined before it drops.
+    let dom = unsafe { &*a.dom };
+    let chain = dom.lane_chain();
+    let got_lane = dom.lane_acquire(&chain, || {
+        // SAFETY: the run's live interrupt cell / trap cell, as everywhere in this file.
+        epoch_fired(env.epoch_addr) || unsafe { load_trap(env.trap_out) } != 0
+    });
     let mut call = ChildCall {
         env,
         code: a.code,
@@ -898,20 +1025,34 @@ fn run_child(a: SpawnArgs) {
         arg: a.arg,
         ret: 0,
     };
+    // A vCPU that could not take a lane never runs guest code: a cap of 0 is unsatisfiable, which
+    // the interpreter surfaces as a `ThreadFault` rather than a hang, and a kill/teardown abort is
+    // already carrying its own trap. SAFETY: the run's live trap cell.
+    if !got_lane {
+        unsafe {
+            if load_trap(env.trap_out) == 0 {
+                store_trap(env.trap_out, TrapKind::ThreadFault as i64);
+            }
+        }
+    }
     // SAFETY: `child_entry` honours the `Entry` ABI; `call` outlives the run; a guest fault in the
     // window range unwinds back here (this vCPU's stack is abandoned — the domain is being killed).
-    let faulted = unsafe {
-        mem::run_guarded_range(
-            child_entry as *const () as *const u8,
-            &mut call as *mut ChildCall as *const i64,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            env.fault_lo,
-            env.fault_hi,
-        )
-    };
+    let faulted = got_lane
+        && unsafe {
+            mem::run_guarded_range(
+                child_entry as *const () as *const u8,
+                &mut call as *mut ChildCall as *const i64,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                env.fault_lo,
+                env.fault_hi,
+            )
+        };
+    if got_lane {
+        dom.lane_give_back(&chain);
+    }
     // §12.8 4A.5 follow-up B: a concurrent durable child that **owns fibers** must flatten the ones it
     // parked into their shadow regions — its own `freeze_drive`, the concurrent mirror of
     // `run_child_inline`'s (the root's drive ran before this child existed). Run it while the child's
@@ -1628,46 +1769,63 @@ pub(crate) unsafe extern "C" fn thread_join(
     } else {
         0
     };
-    let mut st = lock(&done.state);
-    // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
-    // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
-    let _pg = ParkGuard::new(&dom.parked);
-    loop {
-        if let Some((result, trap)) = *st {
-            if trap != 0 {
-                store_trap(trap_out as *mut i64, trap);
+    // D66 — a joiner holds no lane while it waits. Under a cap of 1 this is load-bearing: the child
+    // being joined cannot run at all until the joiner steps aside. Released before the completion
+    // cell's lock is taken and re-taken after it is dropped — blocking for a lane while holding that
+    // lock would stop the child from ever publishing the result being waited for.
+    let lane = dom.lane_chain();
+    dom.lane_give_back(&lane);
+    let result = (|| -> i64 {
+        let mut st = lock(&done.state);
+        // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
+        // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
+        let _pg = ParkGuard::new(&dom.parked);
+        loop {
+            if let Some((result, trap)) = *st {
+                if trap != 0 {
+                    store_trap(trap_out as *mut i64, trap);
+                }
+                return result;
             }
-            return result;
+            if epoch_fired(epoch_addr) {
+                return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
+            }
+            // SAFETY: on a durable run `mem_base` is the committed window base, offset 0 RW for the run.
+            if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+                return 0; // freeze in progress — return so the join's trailing safepoint unwinds
+            }
+            // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
+            // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
+            // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
+            // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
+            // Woken promptly by [`Domain::wake_all_parked`].
+            // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
+            if unsafe { load_trap(trap_out as *mut i64) } != 0 {
+                return 0;
+            }
+            // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
+            // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
+            #[cfg(not(loom))]
+            if epoch_addr != 0 || unwind_base != 0 {
+                st = done
+                    .cv
+                    .wait_timeout(st, KILL_RECHECK)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0;
+                continue;
+            }
+            st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
         }
-        if epoch_fired(epoch_addr) {
-            return 0; // killed — unwind to guest code, which traps OutOfFuel at its next poll
-        }
-        // SAFETY: on a durable run `mem_base` is the committed window base, offset 0 RW for the run.
-        if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
-            return 0; // freeze in progress — return so the join's trailing safepoint unwinds
-        }
-        // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): a
-        // trap/exit from any vCPU — or the root's completion (the internal DOMAIN_DONE sentinel) —
-        // ends the domain; sibling outcomes are unobservable past teardown. Return so the join's
-        // trailing trap-propagation guard (which checks this same cell) unwinds this thread.
-        // Woken promptly by [`Domain::wake_all_parked`].
-        // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
-        if unsafe { load_trap(trap_out as *mut i64) } != 0 {
-            return 0;
-        }
-        // A timeout wait so the kill (`epoch_addr`) and freeze (`unwind_base`) re-checks above run
-        // periodically even when no `notify` arrives; a plain `wait` only when neither is armed.
-        #[cfg(not(loom))]
-        if epoch_addr != 0 || unwind_base != 0 {
-            st = done
-                .cv
-                .wait_timeout(st, KILL_RECHECK)
-                .unwrap_or_else(|e| e.into_inner())
-                .0;
-            continue;
-        }
-        st = done.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+    })();
+    // Back from the park; re-take the lane before the guest runs again.
+    if !dom.lane_acquire(&lane, || {
+        // SAFETY: the run's live interrupt cell / the caller's live trap cell.
+        epoch_fired(epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+    }) {
+        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+        return 0;
     }
+    result
 }
 
 /// The low `width`-byte mask (`width` ∈ {1,2,4,8}).
@@ -1747,6 +1905,13 @@ pub(crate) unsafe extern "C" fn thread_wait(
             trap_out,
         );
     }
+    // D66 — a parked vCPU holds no lane. This is what makes a bounded domain composable rather than
+    // deadlock-prone: under a cap of 1, a vCPU that waits must let its peer run, or the notify it is
+    // waiting for can never be issued. Given back *before* the park and re-taken after, both outside
+    // the futex lock `futex_wait` takes internally — blocking for a lane while holding that lock
+    // would stop the very peer that would release it.
+    let lane = dom.lane_chain();
+    dom.lane_give_back(&lane);
     // Canonical key (S1b/S1c): a region-mapped page keys on `(backing, region offset)` so aliases at
     // different window offsets rendezvous; a plain page keys on the absolute address as before. The
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
@@ -1772,6 +1937,16 @@ pub(crate) unsafe extern "C" fn thread_wait(
         // SAFETY: `trap_out` is the caller's live trap cell (an `AtomicI64`'s storage).
         || unsafe { load_trap(trap_out as *mut i64) } != 0,
     );
+    // Back from the park: re-take the lane before any guest code runs again. An abort (kill or a
+    // torn-down domain) leaves it untaken and the caller's trailing guard unwinds, exactly as the
+    // wait statuses below do.
+    if !dom.lane_acquire(&lane, || {
+        // SAFETY: the run's live interrupt cell / the caller's live trap cell.
+        epoch_fired(dom.env().epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+    }) {
+        store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+        return 0;
+    }
     // §12.8 concurrent-thaw stage 2: an infinite wait with no possible notifier left is a guest deadlock —
     // surface it as `ThreadFault` (matching the interpreter), never as a guest-visible wait status.
     #[cfg(not(loom))]
@@ -1951,9 +2126,22 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // still compiles under `--cfg loom`.
         #[cfg(not(loom))]
         {
-            let g = lock(&dom.futex);
-            let _pg = ParkGuard::new(&dom.parked);
-            let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+            // D66 — this vCPU is idling until its fiber's event fires, so it holds no lane while it
+            // waits (see `thread_wait`). Released and re-taken outside the futex lock.
+            let lane = dom.lane_chain();
+            dom.lane_give_back(&lane);
+            {
+                let g = lock(&dom.futex);
+                let _pg = ParkGuard::new(&dom.parked);
+                let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+            }
+            if !dom.lane_acquire(&lane, || {
+                // SAFETY: the run's live interrupt cell / trap cell.
+                epoch_fired(dom.env().epoch_addr) || unsafe { load_trap(trap_out as *mut i64) } != 0
+            }) {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                return value;
+            }
         }
         #[cfg(loom)]
         {

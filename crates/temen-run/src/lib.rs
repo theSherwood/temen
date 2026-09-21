@@ -154,6 +154,7 @@ const CLI_JIT_TABLE_LOG2: u8 = 10;
 /// PROCESS.md S1b/S1c — a teardown guard for the canonical-key futex region registry: forgets every
 /// mapping in `[base, base+reserved)` when dropped (the recorder closure that owns it is held for the
 /// run and released at teardown), so a reused window virtual address never inherits a stale identity.
+/// It runs *after* the window's reservation is released, which is the race #1608 is open on.
 struct WindowRegionPurge {
     base: u64,
     reserved: u64,
@@ -2922,7 +2923,8 @@ fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
     }
     let base = mem_base as u64;
     // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
-    // so a later run reusing the virtual address never inherits a stale region identity.
+    // so a later run reusing the virtual address never inherits a stale region identity. NOTE this
+    // runs *after* the window's reservation is released, which is the race #1608 is open on.
     let purge = WindowRegionPurge {
         base,
         reserved: mem_reserved,
