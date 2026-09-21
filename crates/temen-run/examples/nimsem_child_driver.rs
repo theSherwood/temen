@@ -161,32 +161,8 @@ fn main() {
     .expect("decode nimsem_ce.temen");
     temen_verify::verify_module(&nimsem).expect("nimsem verifies");
     let decl = nimsem.memory.as_ref().expect("nimsem window").size_log2 as u32;
-    // `>=` the declared window; the floor is what nimsem's system semcheck actually peaks at.
-    //
-    // **Measured, not guessed** (#1591). A child carve is a *hard* ceiling: `Mem::nested_view` builds
-    // `Window::sub(.., 1 << size_log2)`, where mapped == reserved, so unlike a top-level run — which
-    // gets `DEFAULT_RESERVED_LOG2` = 1 TiB of reserved tail to grow into — a child cannot grow one
-    // byte past its carve. The old floor of 28 (256 MiB) was far under what this semcheck needs, and
-    // the failure read as a bare `MemoryFault` because an out-of-window refusal recorded no address.
-    // Now that it does, the sweep reads:
-    //
-    //     256 MiB → fault at 0x10003f10   (+16144 past the end)
-    //     512 MiB → fault at 0x20010460   (+66656)
-    //       1 GiB → fault at 0x40000000   (+0)
-    //       2 GiB → joined 0, output byte-identical (path-normalized) to native
-    //
-    // The top-level run of the same work peaks at **2043 MiB** of RSS, so the child is not wasting
-    // anything — that is simply what nimony's system semcheck costs on this allocator, and 256 MiB
-    // was never going to be enough. 2 GiB clears it by ~5 MiB, which is 0.25% and one stdlib module
-    // away from regressing, so the floor is 32. The carve is address space, demand-paged: 4 GiB vs
-    // 2 GiB costs no additional RAM, only headroom.
-    //
-    // `TEMEN_NIMSEM_CHILD_SL` still overrides it, for re-measuring when the allocator changes.
-    let floor: u32 = std::env::var("TEMEN_NIMSEM_CHILD_SL")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32);
-    let child_sl = (decl + 3).max(floor);
+    // The carve floor is measured, documented and shared — see `temen_run::nim_phase_carve_log2`.
+    let child_sl = temen_run::nim_phase_carve_log2(decl);
     let carve_off = 1u64 << child_sl;
     let parent_win = 1u64 << (child_sl + 1);
 

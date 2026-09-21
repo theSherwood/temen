@@ -153,7 +153,7 @@ fn in_guest_memfs_link_matches_native_link_nim_powerbox() {
 
     // Carve the child ~512 MiB (its no-free bump heap), a window at least its declared size.
     let decl = child.memory.as_ref().expect("child window").size_log2 as u32;
-    let child_sl = (decl + 3).max(29);
+    let child_sl = temen_run::nim_phase_carve_log2(decl);
     let carve_off = 1u64 << child_sl;
     let parent = temen_text::parse_module(&parent_src(child_sl, carve_off)).expect("parse parent");
     temen_verify::verify_module(&parent).expect("verify parent");

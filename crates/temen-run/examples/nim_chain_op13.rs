@@ -198,7 +198,7 @@ fn main() {
         .collect();
 
     // ---- Phase 1: nimsem (op-13 child, exec re-granted) — semcheck the system module. -----------------
-    let nimsem_carve = (nimsem.memory.unwrap().size_log2 as u32 + 3).max(28); // 256 MiB (no-GC peak)
+    let nimsem_carve = temen_run::nim_phase_carve_log2(nimsem.memory.unwrap().size_log2 as u32);
     let win1 = 1u64 << (nimsem_carve + 1);
     let mut h1 = Host::new();
     let fs1 = grant_fs(&mut h1, &factory);
@@ -239,7 +239,7 @@ fn main() {
     );
 
     // ---- Phase 2: hexer (op-13 child) — lower the .s.nif nimsem just wrote into the shared store. ------
-    let hexer_carve = (hexer.memory.unwrap().size_log2 as u32 + 3).max(28); // system module lowering peaks high (no GC)
+    let hexer_carve = temen_run::nim_phase_carve_log2(hexer.memory.unwrap().size_log2 as u32);
     let mut h2 = Host::new();
     let fs2 = grant_fs(&mut h2, &factory);
     let out2 = h2.grant_stream(StreamRole::Out);

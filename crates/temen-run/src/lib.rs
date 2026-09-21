@@ -4985,6 +4985,50 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
+///
+/// A child carve is a **hard** ceiling. `Mem::nested_view` builds `Window::sub(.., 1 << size_log2)`
+/// with mapped == reserved, so unlike a top-level run — which gets `DEFAULT_RESERVED_LOG2` (1 TiB)
+/// of reserved tail to grow into — a child cannot grow one byte past what it was given. Guess low
+/// and the phase dies partway through real work.
+///
+/// **Measured** (#1591), sweeping the op-13 nimsem child over nimony's system semcheck:
+///
+/// | carve | outcome |
+/// |---|---|
+/// | 256 MiB | fault at `0x10003f10` (+16144 past the end) |
+/// | 512 MiB | fault at `0x20010460` (+66656) |
+/// | 1 GiB | fault at `0x40000000` (+0) |
+/// | 2 GiB | joined 0, output byte-identical (path-normalized) to native |
+///
+/// The **top-level** run of the same work peaks at 2043 MiB RSS, so a child wastes nothing — that is
+/// simply the cost on nimony's allocator, and the old floor of 256 MiB was never going to do. (Worth
+/// stating, because raising a constant until a failure stops is also how a leak gets buried: had
+/// top-level peaked far lower, the floor would have been the wrong fix.) The floor is 32 rather than
+/// 31 because 2 GiB clears the real peak by ~5 MiB — 0.25%, one stdlib module from regressing — and
+/// a carve is demand-paged address space, so the headroom costs no RAM.
+///
+/// **One floor, not six.** This formula was copied into `nimsem_child_driver`, `nim_chain_op13`
+/// (twice), `nim_chain_op13_jit` (twice) and `nim_link_fs_asset`, each with its own comment
+/// asserting its own peak, and each went stale independently — `nim_chain_op13`'s pair still said
+/// "256 MiB (no-GC peak)" while the phase it sized had long outgrown it, which is what made
+/// `build_frontend.sh` step 6 trap. A number that must be re-measured when the allocator moves can
+/// only live in one place (INVARIANTS #15).
+///
+/// `TEMEN_NIM_PHASE_SL` overrides the floor, for re-measuring. (It replaces the narrower
+/// `TEMEN_NIMSEM_CHILD_SL`, which named only one of the phases that share this budget.)
+pub fn nim_phase_carve_log2(declared_size_log2: u32) -> u32 {
+    /// The measured floor; see the table above.
+    const FLOOR: u32 = 32;
+    let floor = std::env::var("TEMEN_NIM_PHASE_SL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FLOOR);
+    // `+3` keeps the carve comfortably above whatever the module itself declares, for the phases
+    // whose declared window is already large.
+    (declared_size_log2 + 3).max(floor)
+}
+
 /// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
 /// frame first. An empty trace leaves the message untouched, so an engine that records none says
 /// nothing rather than printing a bare header.
