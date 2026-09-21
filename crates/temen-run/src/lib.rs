@@ -2249,6 +2249,12 @@ locked_parent_hook!(
     (budget: i32, bytes: u64) -> i32
 );
 locked_parent_hook!(
+    budget_mem_give_locked,
+    budget_mem_give,
+    (budget: i32, bytes: u64) -> ()
+);
+locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
+locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
     (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
@@ -2328,7 +2334,21 @@ impl CapCtx {
 /// a shared `Arc<Mutex<Host>>`), so they are the same function either way.
 pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     let locked = ctx.is_locked();
+    // D66 — the parent's lane coordinates, read now (before any guest runs) so a carve child's task
+    // is gated on its parent's lane without a hook call at every spawn.
+    // SAFETY: `ctx` is the live parent host in the shape it declares (the contract of this fn).
+    let (parent_domain, parent_lane_cap) = unsafe {
+        match ctx {
+            CapCtx::Raw(h) => ((*h).domain_id(), (*h).lane_cap()),
+            CapCtx::Locked(m) => {
+                let g = (*m).lock().unwrap_or_else(|e| e.into_inner());
+                (g.domain_id(), g.lane_cap())
+            }
+        }
+    };
     temen_jit::GrantChildHooks {
+        parent_domain,
+        parent_lane_cap,
         build: if locked {
             grant_child_build_locked
         } else {
@@ -2349,6 +2369,12 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_take
         },
+        budget_mem_give: if locked {
+            budget_mem_give_locked
+        } else {
+            budget_mem_give
+        },
+        lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
         } else {
@@ -2420,6 +2446,8 @@ pub unsafe extern "C" fn grant_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -2429,6 +2457,10 @@ pub unsafe extern "C" fn grant_child_build(
                 as_handle,
                 grant_handle: cg,
                 jit_table_log2,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }
@@ -2992,7 +3024,30 @@ pub unsafe extern "C" fn premap_apply(
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
 pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
     let parent = &mut *(ctx as *mut Host);
-    i32::from(parent.budget_mem_take(budget, bytes))
+    // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
+    // the funding budget's lane is reserved against the parent's Σ and its `mem` taken, or neither.
+    // The lane rides to the builder that follows (`Host::pending_child_lane`) and comes back through
+    // [`lane_give`] when the child-domain executor reaps the task.
+    i32::from(parent.admit_detached_spawn(budget, bytes).is_some())
+}
+
+/// D66 — a reaped detached child returns its lane to the parent ([`temen_jit::LaneGiver`]).
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.give_lane(lane);
+}
+
+/// #1587 — the undo of [`budget_mem_take`] for a spawn that failed after the take
+/// ([`temen_jit::BudgetMemGiver`]): return `bytes` to `budget` on the parent `Host`.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.budget_mem_give(budget, bytes);
 }
 
 /// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative
@@ -3066,6 +3121,11 @@ unsafe fn finish_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            // D66 — the lane chain the executor gates this child's dispatch on: the child's own
+            // `(domain, cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child`
+            // stamped) under the parent's.
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -3075,6 +3135,10 @@ unsafe fn finish_child_build(
                 as_handle,
                 jit_table_log2,
                 grant_handle: 0,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }

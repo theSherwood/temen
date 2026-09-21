@@ -1368,7 +1368,14 @@ fn admit_detached_child(
         || !payload_ok
         || !premap_ok
         || host.is_durable()
-        || !host.budget_mem_take(budget, child_size)
+        || match host.admit_detached_spawn(budget, child_size) {
+            // D66 — see the resumable arm: single-spawn lane parity, lane returned at once.
+            Some(lane) => {
+                host.give_lane(lane);
+                false
+            }
+            None => true,
+        }
     {
         return Ok(None);
     }
@@ -4661,9 +4668,24 @@ impl<'p> Vcpu<'p> {
             return Ok(None);
         }
         // Admission = the budget's quota take (the commit; every refusal above charged nothing).
+        // D66 — one admission call, shared with the tree-walker (`Host::admit_detached_spawn`): the
+        // funding budget's lane is checked against this domain's cap and its `mem` taken, or neither.
+        // This engine's detached children are serviced by the embedder's driver, whose join/detach
+        // does not yet return a lane, so the lane is given straight back here: the engines agree on
+        // the single-spawn answer (a lane wider than the cap refuses) and the lasting Σ accounting
+        // lands with that driver's lane slice (#1600).
+        let admit = |h: &mut Host| -> bool {
+            match h.admit_detached_spawn(budget, child_size) {
+                Some(lane) => {
+                    h.give_lane(lane);
+                    true
+                }
+                None => false,
+            }
+        };
         let admitted = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().budget_mem_take(budget, child_size),
-            None => self.host.budget_mem_take(budget, child_size),
+            Some(m) => admit(&mut m.lock_unpoisoned()),
+            None => admit(&mut self.host),
         };
         if !admitted {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));

@@ -46,7 +46,14 @@ trap 'rm -rf "$tmp"' EXIT
 
 # Retries for the same reason the other fetch steps carry them (I34): a transient CDN hiccup should
 # cost seconds, not a red run.
-curl -sSLf --retry 5 --retry-delay 2 \
+#
+# **Exponential, not fixed.** `--retry-delay 2` pinned every gap at 2s, so five retries spent their
+# whole budget inside ~11 seconds — which is shorter than a real outage. A windows-latest run lost
+# exactly that way (six consecutive 504s from `get.nexte.st`, red before a line was compiled).
+# Dropping `--retry-delay` restores curl's own backoff (1s, 2s, 4s, …) and `--retry-max-time` bounds
+# the whole attempt, so a blip of up to ~2 minutes costs seconds of waiting instead of a red run and
+# a manual re-run. A genuinely down endpoint still fails, just later and for a real reason.
+curl -sSLf --retry 8 --retry-max-time 150 --connect-timeout 20 \
   "https://get.nexte.st/${NEXTEST_VERSION}/${platform}" -o "$tmp/nextest.tar.gz"
 
 # macOS ships `shasum`, not GNU coreutils' `sha256sum`.

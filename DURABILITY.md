@@ -1057,7 +1057,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
 | `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
-| `Budget(BudgetState)` (#1502, v22) | fuel, mem, spawn, channel — the **remaining** quotas (`-1` = unbounded) | re-minted into `Host::budgets` at its captured slot; the thaw's **budget hook** (`set_budget_thaw_hook`) may attenuate, never raise; no hook ⇒ verbatim |
+| `Budget(BudgetState)` (#1502, v22; `lane` D66, v28) | fuel, mem, spawn, channel — the **remaining** quotas (`-1` = unbounded) — plus `lane`, the parallelism lane a child spawned with the budget receives: a **ceiling** the thaw may attenuate like the rest, never a stock (INVARIANTS #3 ruling 2026-09-21) | re-minted into `Host::budgets` at its captured slot; the thaw's **budget hook** (`set_budget_thaw_hook`) may attenuate, never raise; no hook ⇒ verbatim |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
 presence in a live, non-drainable state makes the subtree non-snapshottable, so

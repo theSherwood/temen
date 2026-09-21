@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
-# Pre-push hook — fast local mirror of CI's `check` job (build · test · fmt · clippy).
+# Pre-push hook — fast local mirror of CI's gating lint/compile jobs, plus the workspace tests.
 #
-# Purpose: catch the boring, common failures (formatting, lints, a broken build, a
-# failing test on your host target) *before* they cost a CI round-trip. It is a
-# convenience for fast feedback, NOT the authoritative gate — the CI matrix
-# (Windows/macOS, miri/asan/tsan/loom, fuzz, differential) still runs on the PR and
-# is what actually protects `main`. See AGENTS.md and `.github/workflows_src/README.md`.
+# Purpose: catch the boring, common failures (formatting, lints, a broken build, a failing test on
+# your host target) *before* they cost a CI round-trip. It is a convenience for fast feedback, NOT
+# the authoritative gate — the CI matrix (Windows/macOS runtime, miri/asan/tsan/loom, fuzz,
+# differential) still runs on the PR and is what actually protects `main`.
+#
+# The lint/compile half lives in `scripts/ci/local-gate.sh`, which this calls: one list of gates
+# with two entry points (the hook, and a manual run), rather than two lists that drift. That script
+# is also what pins the toolchain — it reads CI's `RUST_STABLE` out of the workflow, because a
+# clippy clean on a *different* rustc than CI's is not a signal (a `for_kv_map` error once failed
+# two CI jobs while the same command passed locally on an older toolchain). See AGENTS.md and
+# `.github/workflows_src/README.md`.
 #
 # Enable (opt-in, per-clone):   git config core.hooksPath .githooks
 #   or run:                     scripts/ci/install-git-hooks.sh
 #
 # Escape hatches:
 #   TEMEN_HOOK_SKIP=1        git push   # skip the hook entirely (same as `git push --no-verify`)
-#   TEMEN_HOOK_SKIP_TESTS=1  git push   # run fmt+clippy+build, skip the (slower) test step
-#
-# Note the `--workspace` flags below do NOT cover the crates the root manifest `exclude`s
-# (`temen-llvm`, `temen-webgpu`, `fuzz`, `bench`); `scripts/ci/check-excluded.sh` is what covers those.
+#   TEMEN_HOOK_SKIP_TESTS=1  git push   # run the lint/compile gate, skip the (slower) test step
+#   TEMEN_GATE_SKIP_CROSS=1  git push   # skip the windows-gnu cross-check inside the gate
+#   TEMEN_GATE_INSTALL=1     git push   # let the gate install a missing toolchain/component/target
 set -euo pipefail
 
 if [ "${TEMEN_HOOK_SKIP:-0}" = "1" ]; then
@@ -48,18 +53,20 @@ run() {
 }
 
 echo "pre-push: running the fast CI subset (set TEMEN_HOOK_SKIP=1 to bypass)…"
-run cargo fmt --all --check
-run cargo clippy --workspace --all-targets -- -D warnings
-run cargo build --workspace
-# The four crates the workspace `exclude`s are invisible to every `--workspace` command above, so a
-# change to a shared signature can compile clean here and still break them (that is how a
-# `temen-llvm` break reached CI, and how `temen-webgpu` sat un-compilable for three weeks). Checked
-# through the same script CI runs, reading the exclude list from `Cargo.toml` so it cannot drift.
-run bash scripts/ci/check-excluded.sh
+
+# fmt · clippy (workspace + the stack-check lane) · excluded crates · windows-gnu cross-check,
+# all on the toolchain CI pins.
+run bash scripts/ci/local-gate.sh
+
+# Build and test on that same toolchain, so a pass here means what it means on CI. `--workspace`
+# does NOT cover the four crates the root manifest `exclude`s; the gate above ran
+# `check-excluded.sh` for those.
+toolchain="$(bash scripts/ci/local-gate.sh --print-toolchain)"
+run rustup run "$toolchain" cargo build --workspace
 if [ "${TEMEN_HOOK_SKIP_TESTS:-0}" = "1" ]; then
   echo "pre-push: TEMEN_HOOK_SKIP_TESTS=1 — skipping tests."
 else
-  run cargo test --workspace
+  run rustup run "$toolchain" cargo test --workspace
 fi
 
 echo "pre-push: OK — the CI matrix still runs the full gate on your PR."
