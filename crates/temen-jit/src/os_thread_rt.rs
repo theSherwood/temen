@@ -2261,34 +2261,41 @@ fn futex_wait(
         }
         match deadline {
             None => {
-                // Armed (real build): bounded re-check so an *infinite* wait still observes a kill or a
-                // freeze even when no `notify` arrives.
+                // §12.8 concurrent-thaw stage 2/3: deadlock detection. If no other vCPU is live *and
+                // not itself parked*, no `notify` can ever arrive — a parked waiter can't notify
+                // itself, and a wasm wait returns only on notify/timeout, not on a plain value
+                // change — so this infinite wait can never be satisfied. Fail closed (#5: an error is
+                // a value, never a hang) rather than re-check forever.
+                //
+                // **Unconditional (#1623).** This check and the bounded re-check below used to sit
+                // inside an `epoch_addr != 0 || unwind_base != 0` guard, with a `#[cfg(loom)]` copy of
+                // the check for the model. So on an ordinary run with no kill path and no durable
+                // window — neither armed — control fell through to an *untimed* `cv.wait` that
+                // re-evaluated nothing, and the detector did not exist: a lone infinite wait hung the
+                // host forever, with the `ThreadFault` its own caller promises two lines away
+                // unreachable. The JIT does not clamp an infinite wait the way the interpreter does,
+                // so `None` is an ordinary production path, not just the model's. One check now, for
+                // every run shape and for loom (#15).
+                if !peers_live() {
+                    break WAIT_DEADLOCK;
+                }
+                // Real build: a bounded re-check, so an infinite wait still observes a kill, a freeze,
+                // or the last peer exiting even when no `notify` arrives. Under loom there are no
+                // timeouts and none is needed — every state change that could satisfy or refute this
+                // wait notifies this `cv` under this lock — a `notify`, or a peer going non-live
+                // (`child_finished` / `run_child` drop `live` and wake) — so the model re-evaluates
+                // on each wakeup.
                 #[cfg(not(loom))]
-                if epoch_addr != 0 || unwind_base != 0 {
-                    // §12.8 concurrent-thaw stage 2: deadlock detection. If no other vCPU is live, no
-                    // `notify` can ever arrive (a parked waiter can't notify itself, and a wasm wait
-                    // returns only on notify/timeout — not on a plain value change), so this infinite wait
-                    // can never be satisfied. Fail closed rather than re-check forever. Detected within
-                    // `KILL_RECHECK` of the last peer exiting (run_child drops `live` as each finishes).
-                    if !peers_live() {
-                        break WAIT_DEADLOCK;
-                    }
+                {
                     g = cv
                         .wait_timeout(g, KILL_RECHECK)
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
-                    continue;
                 }
-                // §12.8 concurrent-thaw stage 3: the same deadlock check, modeled under loom. loom has no
-                // timeouts (so the real-build `wait_timeout` re-check above is compiled out), but it *does*
-                // explore the peer-exit↔consumer-wait interleavings: a peer that goes non-live notifies
-                // this `cv`, and we re-evaluate `peers_live` on each wakeup, so an infinite wait with no
-                // possible notifier resolves to `WAIT_DEADLOCK` instead of blocking the model forever.
                 #[cfg(loom)]
-                if !peers_live() {
-                    break WAIT_DEADLOCK;
+                {
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 }
-                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             // loom's `Condvar` models no timeouts; the loom test only exercises the infinite-wait path
             // (`deadline = None`), so the timed branch is real-build-only.
@@ -2513,6 +2520,97 @@ mod loom_tests {
             assert_eq!(
                 status, WAIT_DEADLOCK,
                 "no possible notifier left ⇒ deadlock detected, not an infinite block",
+            );
+        });
+    }
+
+    /// #1600 slice 7(c) — the deadlock predicate itself, over the **real** shape rather than a
+    /// modeled flag: a `live` count behind its mutex and the `parked` counter [`ParkGuard`] moves,
+    /// composed exactly as `thread_wait` composes them (`lock(&dom.threads).live > dom.parked`).
+    ///
+    /// The case that matters, and the one the lone-waiter model above cannot reach: a **mutual**
+    /// deadlock. Two vCPUs park on different keys, each waiting for a store only the other would
+    /// make. Neither can be satisfied, and both must come back `WAIT_DEADLOCK` under every
+    /// interleaving — not just whichever parked last.
+    ///
+    /// What carries it is the **exit** wake, and the model pins that rather than assuming it. The
+    /// waiter that parks second checks `peers_live` *after* its own `ParkGuard` increment, so it
+    /// sees `live == parked` and breaks without needing to be woken at all. The first is already
+    /// asleep, and loom has no timeouts — what frees it is the second one finishing: dropping `live`
+    /// and notifying the futex condvar, the pairing `Domain::child_finished` and `run_child` do.
+    /// Without that wake the survivor sits at `live(2) > parked(1)` forever.
+    ///
+    /// Worth recording because the first attempt got it backwards: I added a notify to `ParkGuard`
+    /// on the theory that the sleeping waiter had to learn its peer had blocked, and this model is
+    /// what showed it was never needed — the tests pass identically without it, so it came back out.
+    #[test]
+    fn loom_a_mutual_deadlock_resolves_for_both_waiters() {
+        loom::model(|| {
+            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
+            let cv = Arc::new(Condvar::new());
+            // The real predicate's two halves: `live` counts vCPUs that have not finished, `parked`
+            // is the shared counter each `ParkGuard` bumps. (`parked` stays the std type
+            // `futex_wait` takes, as in the lone-waiter model above.)
+            let live = Arc::new(Mutex::new(2usize));
+            let parked = Arc::new(AtomicUsize::new(0));
+            const KEY_A: u64 = 0x3000;
+            const KEY_B: u64 = 0x3008;
+
+            let spawn_waiter = |key: u64,
+                                futex: Arc<Mutex<HashMap<FutexKey, FutexEntry>>>,
+                                cv: Arc<Condvar>,
+                                live: Arc<Mutex<usize>>,
+                                parked: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let status = {
+                        let (lv, pk) = (Arc::clone(&live), Arc::clone(&parked));
+                        futex_wait(
+                            &futex,
+                            &cv,
+                            FutexKey::Anon(key),
+                            || true, // the word only the *other* waiter would store never changes
+                            None,
+                            0,
+                            0,
+                            &parked,
+                            // The production predicate, verbatim: a notifier must be a live vCPU
+                            // that is not itself parked.
+                            move || {
+                                *lv.lock().unwrap_or_else(|e| e.into_inner())
+                                    > pk.load(Ordering::Acquire)
+                            },
+                            || false, // no domain teardown in this model
+                        )
+                    };
+                    // This vCPU is done. Drop it from `live` and wake the futex waiters, exactly as
+                    // `Domain::child_finished` / `run_child` do — without this the surviving waiter
+                    // never sees the count fall and the model hangs.
+                    *live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                    let _g = futex.lock().unwrap_or_else(|e| e.into_inner());
+                    cv.notify_all();
+                    status
+                })
+            };
+
+            let a = spawn_waiter(
+                KEY_A,
+                Arc::clone(&futex),
+                Arc::clone(&cv),
+                Arc::clone(&live),
+                Arc::clone(&parked),
+            );
+            let b = spawn_waiter(
+                KEY_B,
+                Arc::clone(&futex),
+                Arc::clone(&cv),
+                Arc::clone(&live),
+                Arc::clone(&parked),
+            );
+            let (sa, sb) = (a.join().unwrap(), b.join().unwrap());
+            assert_eq!(
+                (sa, sb),
+                (WAIT_DEADLOCK, WAIT_DEADLOCK),
+                "both halves of a mutual deadlock must resolve, not just the one that parked last",
             );
         });
     }
