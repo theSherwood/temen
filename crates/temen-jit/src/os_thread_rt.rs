@@ -2202,6 +2202,10 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     trap_out: u64,
 ) -> i64 {
     let dom = &*sched;
+    // #1639 — set when the previous pass read the run as quiescent; a deadlock verdict needs the
+    // reading to survive the re-poll at the top of this loop (see the test below).
+    #[cfg(not(loom))]
+    let mut confirming = false;
     loop {
         let value = fiber_rt::fiber_resume(handle, arg, status_out, trap_out);
         // Done (guest suspend / return), a trap in flight, or not event-parked: hand back to the
@@ -2234,6 +2238,35 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 let self_resolving = fiber_rt::park_is_self_resolving(handle);
                 let g = lock(&dom.futex);
                 let _pg = (!self_resolving).then(|| ParkGuard::new(&dom.parked));
+                // #1639 — an indefinite fiber wait that no live vCPU can ever notify is
+                // unsatisfiable, and idling on it is a hang with no error anywhere (INVARIANTS #5).
+                // Same predicate `futex_wait` breaks `WAIT_DEADLOCK` on, asked here because this
+                // vCPU — not the fiber — is the one holding the run open, and with this waiter
+                // already counted by the guard above, so a lone driver sees `live == parked`.
+                //
+                // **Confirmed across a re-poll, never on one reading.** `futex_wait` can decide from
+                // a single observation because it owns its wait cell: it breaks out on a claimed
+                // `cell.status` under this same lock *before* testing `peers_live`, so a wake it has
+                // already been granted always wins. This vCPU has no such cell — the park belongs to
+                // the *fiber*, and the only way to observe a granted wake is the `fiber_resume` at
+                // the top of this loop. So between that poll and this test a peer can notify the
+                // fiber and exit, dropping `live` to just this vCPU while the fiber is already
+                // runnable with its wake merely unobserved — quiescent by this predicate, not
+                // deadlocked. Deciding there trapped a correct program (the cross-vCPU-notify gate,
+                // red on Windows where the peer reliably won that window).
+                //
+                // Requiring the reading to survive one `KILL_RECHECK` and the re-poll that follows
+                // it closes that gap without a second predicate: a granted wake is picked up by the
+                // next `fiber_resume` and leaves this loop, while a genuine deadlock — nothing live
+                // to change the answer — still reads quiescent and fails closed, 20 ms later.
+                let quiescent = !self_resolving
+                    && lock(&dom.threads).live <= dom.parked.load(Ordering::Acquire);
+                if quiescent && confirming {
+                    drop(g);
+                    store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                    return value;
+                }
+                confirming = quiescent;
                 let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
             }
             if !dom.lane_acquire(&lane, || {

@@ -292,3 +292,67 @@ fn a_vcpu_idling_on_a_timed_fiber_wait_does_not_deadlock_a_sibling() {
     // the JIT's answer was a divergence from it, not merely a wrong number.
     pin_all(A_TIMED_FIBER_WAKES_A_SIBLING, 0);
 }
+
+/// **#1639 — an unsatisfiable untimed fiber wait is an error, not a hang.**
+///
+/// The root drives a fiber whose `atomic.wait` has no timeout and no possible notifier: it is the
+/// only vCPU, so nothing can ever store or notify the word. Before the fix the JIT idled in
+/// `fiber_resume_block` **forever** (INVARIANTS #5 — an error is a value, never a hang), and the
+/// oracle answered `WAIT_TIMED_OUT` after a full 10 s, decided by the `MAX_WAIT` anti-wedge
+/// backstop rather than by any predicate. Both now fail closed promptly, as #1623/#1624 made the
+/// 1:1 shape do.
+///
+/// **Bytecode is deliberately not pinned here, and that is the point.** It still answers
+/// `WAIT_TIMED_OUT` for this shape *and* for the 1:1 shape — a live oracle divergence tracked in
+/// #1638. Naming the exclusion is the lesson from that issue: `futex_deadlock_jit.rs` pinned two of
+/// three backends without saying so, which is exactly how the divergence shipped unnoticed.
+const UNSATISFIABLE_FIBER_WAIT: &str = r#"memory 16
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vf = ref.func 1
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vv = cont.resume.block vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vw = i64.const 16384
+  ve = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vw ve vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+"#;
+
+/// Well under the 10 s `MAX_WAIT` backstop, well over CI jitter: the verdict must come from the
+/// deadlock predicate, not from the clamp that used to decide it.
+const PROMPT: std::time::Duration = std::time::Duration::from_secs(4);
+
+#[test]
+fn an_unsatisfiable_fiber_wait_faults_promptly_on_the_oracle_and_the_jit() {
+    for backend in [Backend::TreeWalk, Backend::Jit] {
+        let module = temen_text::parse_module(UNSATISFIABLE_FIBER_WAIT).expect("parse");
+        temen_verify::verify_module(&module).expect("verify");
+        let instance = instantiate(module).expect("instantiate");
+        let t0 = std::time::Instant::now();
+        let err = instance
+            .run(backend, &RunConfig::default())
+            .expect_err("an unsatisfiable wait must not come back as a value");
+        let dt = t0.elapsed();
+        assert!(
+            err.to_string().contains("ThreadFault"),
+            "{backend:?}: expected a ThreadFault, got {err} in {dt:?}"
+        );
+        // Both halves: the right answer *and* not by waiting the backstop out. A fix that traded
+        // the hang for a 10 s timeout would satisfy the first assertion alone.
+        assert!(
+            dt < PROMPT,
+            "{backend:?}: verdict must come from the predicate, not the 10 s backstop: {dt:?}"
+        );
+    }
+}
