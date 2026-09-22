@@ -14,7 +14,12 @@
 //! rule is why the code-origin column's *unit* module is [`Entry`] — a parameter of the one probe
 //! generator — rather than a second copy of it with a different signature line.
 
-#![allow(dead_code)] // each consumer uses a subset
+// This module is compiled into each test binary separately, and each uses a subset — so every
+// helper is "never used" in the binaries that do not call it. The allow is unavoidable, and the
+// cost is that a helper nothing calls *anywhere* is invisible too: `probe_module_typed` sat
+// orphaned here after its last caller moved to `probe_module_with`. Check by hand when removing a
+// call site; the compiler will not.
+#![allow(dead_code)]
 
 use temen_interp::{Host, StreamRole};
 use temen_parity::frontier::Capability;
@@ -263,11 +268,18 @@ pub enum Entry {
 /// serviced answer (the op reached its seam and a driver drove it), so only a driver's own gates
 /// produce any other verdict.
 pub fn probe_module(iface: u32, op: u32, argc: usize) -> temen_ir::Module {
-    probe_module_typed(iface, op, argc, "i64")
+    probe_module_with(iface, op, argc, "i64", &[])
 }
 
-/// [`probe_module_typed`] with `overrides` replacing individual zero arguments — `(index, value)`
-/// pairs from a [`Row::mint`] entry. See that field for why zeros alone are not enough.
+/// **The base-module probe.** `result` picks the call's declared result type and `overrides` replaces
+/// individual zero arguments — `(index, value)` pairs from a [`Row::mint`] entry; see that field for
+/// why zeros alone are not enough.
+///
+/// `result` is a parameter rather than a constant because the lowering's arms are keyed by
+/// `(type_id, op)` *and* the call signature, so an op whose real result is `i32` is not reached by an
+/// `i64`-returning call — it falls through to the generic dispatch, which for some interfaces is
+/// rejected at compile time rather than at the call. A sweep that fixes the result type therefore
+/// mistakes "miscalled" for "unsupported".
 pub fn probe_module_with(
     iface: u32,
     op: u32,
@@ -288,15 +300,6 @@ pub fn unit_module_with(
     overrides: &[(usize, i64)],
 ) -> temen_ir::Module {
     build_probe(Entry::Unit, iface, op, argc, result, overrides)
-}
-
-/// [`probe_module`] with the call's declared **result type** chosen by the caller. The lowering's
-/// arms are keyed by `(type_id, op)` *and* the call signature, so an op whose real result is `i32`
-/// is not reached by an `i64`-returning call — it falls through to the generic dispatch, which for
-/// some interfaces is rejected at compile time rather than at the call. A sweep that fixes the
-/// result type therefore mistakes "miscalled" for "unsupported".
-pub fn probe_module_typed(iface: u32, op: u32, argc: usize, result: &str) -> temen_ir::Module {
-    build_probe(Entry::Base, iface, op, argc, result, &[])
 }
 
 fn build_probe(
