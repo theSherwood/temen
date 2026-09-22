@@ -451,21 +451,31 @@ pub fn region_canon_forget_window(base: u64, size: u64, owner: u64) {
 /// region-`map`ped, else `Anon(phys)`.
 fn futex_key_of(phys: u64) -> FutexKey {
     #[cfg(not(loom))]
-    {
-        let page = mem::page_size() as u64;
-        if let Some(&RegionRecord {
-            backing,
-            region_off,
-            ..
-        }) = region_map()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(phys / page))
-        {
-            return FutexKey::Region(backing, region_off + phys % page);
-        }
+    if let Some((backing, off)) = region_canon_lookup(phys) {
+        return FutexKey::Region(backing, off);
     }
     FutexKey::Anon(phys)
+}
+
+/// The canonical `(backing, region byte offset)` recorded for the byte at absolute address `phys`, or
+/// `None` if its page is not region-`map`ped — the lookup [`futex_key_of`] is built on, and the one
+/// place the registry is read (#15).
+///
+/// Public because it is the only way to ask the registry what it believes, which is what a lost
+/// wakeup comes down to: two vCPUs of one run disagreeing about a key. #1608's owner scoping is
+/// tested through it, and an embedder debugging a stuck rendezvous wants the same question answered.
+#[cfg(not(loom))]
+pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
+    let page = mem::page_size() as u64;
+    let &RegionRecord {
+        backing,
+        region_off,
+        ..
+    } = region_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(phys / page))?;
+    Some((backing, region_off + phys % page))
 }
 
 impl Domain {
@@ -2486,63 +2496,6 @@ fn futex_notify(
         cv.notify_all();
     }
     woken
-}
-
-#[cfg(all(test, not(loom)))]
-mod region_owner_tests {
-    use super::*;
-
-    /// #1608 — **a purge forgets only its own run's entries.**
-    ///
-    /// The teardown purge runs after the window's reservation is released and spans the whole
-    /// reservation, so without the owner test a dying run erased entries belonging to whichever run
-    /// had since been handed those addresses. That is not theoretical: `child_exec_jit`'s ping-pong
-    /// test wedged 9 runs in 50 at `--test-threads=6` before this, and 0 in 50 after, because a
-    /// waiter parked on `Region(..)` while the notifier — reading the map after the erase —
-    /// computed `Anon(..)` for the same address and woke nobody.
-    ///
-    /// Addresses here are synthetic map keys, not mappings, and deliberately far from any real
-    /// window so this test cannot disturb a run sharing the process.
-    #[test]
-    fn a_dead_runs_purge_leaves_a_live_runs_entry_alone() {
-        let page = mem::page_size() as u64;
-        let abs = 0x5a5a_0000_0000u64;
-        let (dead, live) = (region_canon_new_owner(), region_canon_new_owner());
-
-        region_canon_record(abs, page, 42, 0, live);
-        assert_eq!(futex_key_of(abs), FutexKey::Region(42, 0));
-
-        // The dead run's teardown purge covers this page — it is only *its* reservation by the time
-        // it runs, so it must leave the live run's entry alone.
-        region_canon_forget_window(abs - page, page * 4, dead);
-        assert_eq!(
-            futex_key_of(abs),
-            FutexKey::Region(42, 0),
-            "another run's purge erased a live entry: the waiter and the notifier would now \
-             compute different keys for this address, and the wakeup would be lost",
-        );
-
-        // The owner's own purge still works, so a reused address inherits nothing.
-        region_canon_forget_window(abs - page, page * 4, live);
-        assert_eq!(futex_key_of(abs), FutexKey::Anon(abs));
-    }
-
-    /// A record by a live run replaces a dead one's entry for the same recycled page — correct,
-    /// because holding the reservation proves the previous owner is gone.
-    #[test]
-    fn a_live_run_takes_over_a_recycled_page() {
-        let page = mem::page_size() as u64;
-        let abs = 0x5a5a_1000_0000u64;
-        let (first, second) = (region_canon_new_owner(), region_canon_new_owner());
-
-        region_canon_record(abs, page, 3, 0, first);
-        region_canon_record(abs, page, 7, 0, second);
-        assert_eq!(futex_key_of(abs), FutexKey::Region(7, 0));
-
-        // The first owner's late purge must not take the second's entry with it.
-        region_canon_forget_window(abs, page, first);
-        assert_eq!(futex_key_of(abs), FutexKey::Region(7, 0));
-    }
 }
 
 #[cfg(all(test, loom))]
