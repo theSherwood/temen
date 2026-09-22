@@ -246,6 +246,15 @@ fn audited_coverage_does_not_regress() {
 /// which is only actionable if the reader can find out what is being done about it; a gap with no
 /// ticket is how an in-flight axis quietly becomes a parked one, which is exactly what INVARIANTS
 /// #14 forbids ("closed, in flight, or a recorded exception — never parked").
+///
+/// "Names an issue" means a `#` followed by a number, not merely a `#` somewhere in the note: the
+/// notes carry prose, section marks and stray punctuation, so a bare-hash check passes text that
+/// tracks nothing — which is the state this assertion exists to catch.
+///
+/// It is a **shape** check and stops there. `INVARIANTS #14` is spelled exactly like issue #14, so a
+/// note citing an invariant instead of a ticket still passes; resolving a reference would mean
+/// asking GitHub, which a unit test must not do. The bar is "a reader is pointed somewhere
+/// numbered", which is the part a cheap check can honestly hold.
 #[test]
 fn every_known_gap_names_its_issue() {
     for c in Capability::ALL {
@@ -254,14 +263,45 @@ fn every_known_gap_names_its_issue() {
                 continue;
             }
             assert!(
-                cell.note.contains('#'),
-                "{}/{}: a `NotYet` cell must cite the issue tracking the gap, got {:?}",
+                cites_an_issue(cell.note),
+                "{}/{}: a `NotYet` cell must cite the issue tracking the gap (`#1234`), got {:?}",
                 c.name(),
                 axis.short(),
                 cell.note,
             );
         }
     }
+}
+
+/// Whether `note` carries a `#1234`-shaped issue reference.
+fn cites_an_issue(note: &str) -> bool {
+    note.split('#')
+        .skip(1)
+        .any(|rest| rest.starts_with(|ch: char| ch.is_ascii_digit()))
+}
+
+/// [`cites_an_issue`] is the whole strength of the assertion above, so it is pinned directly —
+/// including the shapes the old `contains('#')` let through.
+#[test]
+fn a_cited_issue_is_a_hash_followed_by_a_number() {
+    for yes in [
+        "join (op 1) traps ThreadFault on the oracle (#1573)",
+        "#1578",
+        "two of them, #1573 and #1578",
+    ] {
+        assert!(cites_an_issue(yes), "{yes:?} cites an issue");
+    }
+    for no in [
+        "the spawn family reaches drive_nested's catch-all",
+        "see DESIGN §22 #approach",
+        "trailing hash #",
+        "",
+    ] {
+        assert!(!cites_an_issue(no), "{no:?} does not cite an issue");
+    }
+    // The limit of a shape check, pinned so nobody reads more into it than it holds: an invariant
+    // reference is spelled like an issue reference and passes.
+    assert!(cites_an_issue("INVARIANTS #14 forbids parking this"));
 }
 
 /// **The `Module` durability row's conditional half (#1361).** The cell is `Conditional` because the
