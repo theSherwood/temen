@@ -4584,13 +4584,20 @@ const WAIT_WOKEN: i32 = 0;
 const WAIT_NOT_EQUAL: i32 = 1;
 const WAIT_TIMED_OUT: i32 = 2;
 
-/// Upper bound on how long a `<ty>.atomic.wait` will actually block, regardless of the guest's
-/// requested timeout (and what a negative — "infinite" — timeout is clamped to). Since the
-/// domain-lifetime decision (DESIGN.md §12 "Domain lifetime & teardown", owner 2026-07-24) this is a
-/// **pure anti-wedge backstop**, never semantics: teardown wakes or drops parked waiters directly
-/// (root completion / a domain's trap ends them; a run never "waits out" a daemon), so the cap only
-/// bounds a genuinely-missed wake — keeping the host live against a bug, not shaping guest-visible
-/// behavior.
+/// How long a worker will sleep before re-evaluating — a **re-check tick, not a deadline** (#1641).
+///
+/// This used to cap the wait itself, "regardless of the guest's requested timeout". The doc claimed
+/// that was "a pure anti-wedge backstop, never semantics … not shaping guest-visible behavior", and
+/// that was false: a guest asking for a 30 s wait was handed `WAIT_TIMED_OUT` at 10 s, an ordinary
+/// finite timeout truncated to a third of itself. The claim held only for waits something *else*
+/// ends (teardown, a `notify`) and was never checked against a guest deadline longer than the cap.
+///
+/// The liveness need was real — a worker with nothing to sleep on wedges forever if a wake is ever
+/// missed — but a clamp buys it by corrupting semantics. Capping the *sleep* buys the same thing
+/// for free: the worker wakes on the tick, finds nothing due, and sleeps again, which no guest can
+/// observe. The guest's own deadline decides its status; an infinite wait that can never be
+/// satisfied is ended by the deadlock predicate (#1624/#1639), which answers the question directly
+/// instead of approximating it with a timer.
 const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Maximum worker OS threads the executor will spawn for one run (the "N" of M:N). Capped at the
@@ -4726,7 +4733,8 @@ enum Blocked {
     /// `notify` match on (region-canonical for aliased pages — S1b); `addr` is the confined absolute
     /// address the driver re-reads to compare against `expected` under its lock (the futex
     /// compare-and-park atomicity — the value lives at a real address, the queue at a canonical key).
-    /// Woken by a matching `notify` or after `timeout_ns` (already `MAX_WAIT`-clamped). The driver
+    /// Woken by a matching `notify` or after `timeout_ns` — the guest's own, **unclamped** (#1641).
+    /// The driver
     /// turns `timeout_ns` into a deadline on *its* clock — wall-clock for the real pool, a logical
     /// clock for the explorer.
     Wait {
@@ -4735,11 +4743,12 @@ enum Blocked {
         expected: u64,
         width: u32,
         timeout_ns: u64,
-        /// The guest asked to wait **forever** (a negative timeout), so `timeout_ns` is the
-        /// [`MAX_WAIT`] backstop rather than a deadline anyone asked for. The clamp is "a pure
-        /// anti-wedge backstop, never semantics", and that distinction is load-bearing for
-        /// freeze-on-quiesce (#1584): a park that will wake on its own is not a quiesced run, but
-        /// a park that only the backstop can end is — so the flag has to survive the clamp.
+        /// The guest asked to wait **forever** (a negative timeout). `timeout_ns` is then
+        /// meaningless — since #1641 an indefinite wait arms no timer on either driver, rather than
+        /// carrying a [`MAX_WAIT`] deadline nobody asked for — so every consumer must read this
+        /// flag *before* `timeout_ns`. Load-bearing for freeze-on-quiesce (#1584) and for the
+        /// deadlock predicate (#1624/#1639): a park that wakes on its own deadline is not a
+        /// quiesced run; one that only a `notify` can end is.
         indefinite: bool,
     },
     /// Blocked inside a capability call **through `handle`** (§3.6 slice 1: a blocking stream
@@ -6927,9 +6936,14 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                         let now = Instant::now();
                         if dl > now {
                             s.parked += 1;
+                            // #1641 — sleep at most one `MAX_WAIT` tick, then re-evaluate. Capping
+                            // the *sleep* keeps the anti-wedge property (a missed wake is noticed
+                            // within the tick) without the cap ever deciding a guest-visible
+                            // status: waking early, finding nothing due, and sleeping again is
+                            // invisible to the guest. Capping the *deadline* is what was not.
                             let (g, _) = sched
                                 .work
-                                .wait_timeout(s, dl - now)
+                                .wait_timeout(s, (dl - now).min(MAX_WAIT))
                                 .unwrap_or_else(|e| e.into_inner());
                             s = g;
                             s.parked -= 1;
@@ -6949,7 +6963,15 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                             continue;
                         }
                         s.parked += 1;
-                        s = sched.work.wait(s).unwrap_or_else(|e| e.into_inner());
+                        // #1641 — the same bounded re-check for the no-timer case, which an
+                        // infinite wait now reaches (it arms no timer). `run_deadlocked` above is
+                        // the real answer for an unsatisfiable park; this tick only bounds how long
+                        // a *missed* wake — a bug, not a guest behaviour — goes unnoticed.
+                        let (g, _) = sched
+                            .work
+                            .wait_timeout(s, MAX_WAIT)
+                            .unwrap_or_else(|e| e.into_inner());
+                        s = g;
                         s.parked -= 1;
                     }
                 }
@@ -7537,7 +7559,10 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 timeout_ns,
                 indefinite,
             }) => {
-                let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
+                // #1641 — `timeout_ns` is the guest's own, unclamped; an indefinite wait has no
+                // deadline to arm at all (`indefinite` says so, `timeout_ns` is then meaningless).
+                let deadline =
+                    (!indefinite).then(|| Instant::now() + Duration::from_nanos(timeout_ns));
                 let mut s = sched.lock();
                 // §12 domain-lifetime park gate (owner 2026-07-24): never park into a torn-down world.
                 let Some(mut v) = park_gate(&mut s, v) else {
@@ -7553,8 +7578,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 } else {
                     let wid = s.next_wid;
                     s.next_wid += 1;
-                    s.timers.push(Reverse((deadline, wid, key)));
-                    // #1584 — remember whether that deadline is the guest's or only the backstop.
+                    if let Some(dl) = deadline {
+                        s.timers.push(Reverse((dl, wid, key)));
+                    }
+                    // #1584 — a park only the run itself can end, so the deadlock predicate and
+                    // freeze-on-quiesce can tell it from one that wakes on its own deadline.
                     v.wait_indefinite = indefinite;
                     s.wait_waiters
                         .entry(key)
@@ -8201,7 +8229,12 @@ struct DetSched {
 
 struct DetWaiter {
     key: FutexKey,
-    deadline: u64, // logical ns
+    /// Logical-ns deadline, or `None` for an indefinite wait (#1641). The explorer used to lean on
+    /// the `MAX_WAIT` clamp to give every wait a deadline its clock could advance to — so an
+    /// infinite wait ended in a `WAIT_TIMED_OUT` the guest never asked for, the same defect the
+    /// wall-clock driver had. With no deadline it simply is not a clock-advance candidate, and a
+    /// quiescent run of only indefinite waiters takes the deadlock exit below.
+    deadline: Option<u64>,
     vcpu: Box<VCpu>,
 }
 
@@ -8553,13 +8586,17 @@ impl SchedDriver {
                                 return DriverStop::Done; // all done
                             }
                             // No one runnable: fire the earliest timeout (or deadlock if none).
+                            // #1641 — only a waiter with a deadline is a clock-advance candidate.
+                            // None left (every remaining wait is indefinite) is the same quiescent
+                            // deadlock as no waiters at all: nothing can make the run progress.
                             let Some(idx) = (0..s.wait_waiters.len())
+                                .filter(|&i| s.wait_waiters[i].deadline.is_some())
                                 .min_by_key(|&i| s.wait_waiters[i].deadline)
                             else {
                                 return DriverStop::Done; // live > 0 but quiescent: a join-deadlock
                             };
                             let mut w = s.wait_waiters.remove(idx);
-                            s.clock = s.clock.max(w.deadline);
+                            s.clock = s.clock.max(w.deadline.unwrap_or(s.clock));
                             w.vcpu.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
                             s.runnable.push(w.vcpu);
                             continue;
@@ -8721,17 +8758,18 @@ impl SchedDriver {
                     expected,
                     width,
                     timeout_ns,
-                    // The explorer has no freeze-on-quiesce and no wall clock: it *advances* its
-                    // logical clock to the earliest deadline when nothing is runnable, so the
-                    // backstop is already how it ends an infinite wait. Nothing to carry.
-                    indefinite: _,
+                    // #1641 — carried now. The explorer advances its logical clock to the earliest
+                    // deadline when nothing is runnable; while the clamp gave an infinite wait a
+                    // deadline, that advance *was* how it ended one — with a timeout the guest
+                    // never asked for. An indefinite wait has no deadline to advance to.
+                    indefinite,
                 }) => {
                     let mut s = det.lock();
                     if v.atomic_value(addr, width) != expected {
                         v.pending = Some(Pending::Wait(WAIT_NOT_EQUAL));
                         s.runnable.push(v);
                     } else {
-                        let deadline = s.clock.saturating_add(timeout_ns);
+                        let deadline = (!indefinite).then(|| s.clock.saturating_add(timeout_ns));
                         s.wait_waiters.push(DetWaiter {
                             key,
                             deadline,
@@ -15386,11 +15424,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // same `SharedRegion` byte rendezvous), while `addr` stays the absolute address the
                     // driver re-reads for the compare-and-park.
                     let key = m.futex_key(base);
-                    let wait = if to_ns < 0 {
-                        MAX_WAIT
-                    } else {
-                        Duration::from_nanos(to_ns as u64).min(MAX_WAIT)
-                    };
+                    // #1641 — the guest's timeout, **unclamped**. `MAX_WAIT` used to cap this,
+                    // which meant a guest asking for 30 s was handed `WAIT_TIMED_OUT` at 10 s: the
+                    // backstop deciding a guest-visible status, which its own doc says it never
+                    // does. `None` is an infinite wait — it carries no deadline at all now, rather
+                    // than a backstop deadline dressed up as one, so nothing can mistake it for a
+                    // time the guest asked for. Liveness moved to where it belongs: the worker's
+                    // sleep is capped instead (see `MAX_WAIT`), and an infinite wait that can never
+                    // be satisfied is ended by the deadlock predicate (#1624/#1639), not a timer.
+                    let wait = (to_ns >= 0).then(|| Duration::from_nanos(to_ns as u64));
                     if *cur != ROOT_FIBER {
                         if let SchedRef::Real(sr) = sched {
                             let regc = Arc::clone(registry);
@@ -15399,7 +15441,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let mut sg = sr.lock();
                                 let wid = sg.next_wid;
                                 sg.next_wid += 1;
-                                sg.timers.push(Reverse((Instant::now() + wait, wid, key)));
+                                if let Some(w) = wait {
+                                    sg.timers.push(Reverse((Instant::now() + w, wid, key)));
+                                }
                                 sg.wait_waiters.entry(key).or_default().push((
                                     wid,
                                     Waiter::Fiber {
@@ -15427,7 +15471,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         addr: base,
                         expected: exp,
                         width,
-                        timeout_ns: wait.as_nanos() as u64,
+                        timeout_ns: wait.map_or(0, |w| w.as_nanos() as u64),
                         indefinite: to_ns < 0,
                     }));
                 }
