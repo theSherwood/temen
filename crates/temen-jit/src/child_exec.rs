@@ -230,8 +230,15 @@ pub(crate) fn in_task() -> bool {
 /// Per-task executor bookkeeping. `task` is `None` while a worker holds the task (running).
 struct Entry {
     task: Option<Box<ChildTask>>,
-    /// Parked (yielded on an event park) and not yet woken — counted in `Domain::parked`.
+    /// Parked (yielded on an event park) and not yet woken. Drives the cadence sweep and the
+    /// teardown poison; **not** the same question as [`Self::counted`].
     parked: bool,
+    /// #1631 — whether this park was counted in `Domain::parked`. A park that carries its own
+    /// deadline is not, because that counter's one reader is the futex deadlock predicate
+    /// `live > parked` and a task sleeping on a deadline is a potential notifier, not a blocked
+    /// one. Tracked separately so the wake decrements exactly what the park incremented: keying
+    /// the decrement off `parked` instead would underflow the counter on every timed park.
+    counted: bool,
     /// A wake arrived (possibly while the task was still running toward its park).
     woken: bool,
 }
@@ -310,6 +317,7 @@ impl ChildExec {
             Entry {
                 task: Some(Box::new(task)),
                 parked: false,
+                counted: false,
                 woken: false,
             },
         );
@@ -364,8 +372,11 @@ impl ChildExec {
             let e = g.tasks.get_mut(&id).expect("listed");
             e.parked = false;
             e.woken = true;
-            if let Some(d) = self.domain() {
-                d.task_unparked();
+            // #1631 — decrement exactly what the park incremented (see `Entry::counted`).
+            if std::mem::take(&mut e.counted) {
+                if let Some(d) = self.domain() {
+                    d.task_unparked();
+                }
             }
             g.runnable.push_back(id);
         }
@@ -445,7 +456,7 @@ impl ChildExec {
             let mut task = Some(task);
             let mut g = lock(&self.state);
             match outcome {
-                Outcome::Parked => {
+                Outcome::Parked { self_resolving } => {
                     let shutdown = g.shutdown;
                     let e = g.tasks.get_mut(&id).expect("running task is filed");
                     if shutdown {
@@ -461,8 +472,14 @@ impl ChildExec {
                         g.runnable.push_back(id);
                     } else {
                         e.parked = true;
-                        if let Some(d) = self.domain() {
-                            d.task_parked();
+                        // #1631 — a park that wakes on its own deadline is a potential notifier, so
+                        // it stays out of the deadlock predicate's count. It is still `parked` for
+                        // the cadence sweep, which is what fires that deadline.
+                        if !self_resolving {
+                            e.counted = true;
+                            if let Some(d) = self.domain() {
+                                d.task_parked();
+                            }
                         }
                     }
                 }
@@ -527,8 +544,10 @@ impl ChildExec {
             // The child compiles with no `cont.*` env, so the only yield a task can make is the
             // futex thunk's event park.
             Some(State::Yielded(_)) if task.slot.took_event_park() => {
+                // Read the park's own answer before the slot goes back to the pool (#1631).
+                let self_resolving = task.slot.took_self_resolving_park();
                 task.slot.release_to_pool();
-                Outcome::Parked
+                Outcome::Parked { self_resolving }
             }
             Some(State::Yielded(_)) => {
                 // Unreachable by construction; fail closed rather than resume an unknown yield.
@@ -607,6 +626,10 @@ impl ChildExec {
 }
 
 enum Outcome {
-    Parked,
+    /// Event-parked. `self_resolving` is #1631's question: does this park come back on its own
+    /// deadline (so it should not count toward `Domain::parked`)?
+    Parked {
+        self_resolving: bool,
+    },
     Finished,
 }

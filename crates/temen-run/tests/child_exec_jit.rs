@@ -422,3 +422,54 @@ fn two_child_tasks_ping_pong_through_the_futex_without_waiting_on_the_sweep() {
         "400 handoffs took {elapsed:?} — the notify wake route is not reaching parked tasks"
     );
 }
+
+/// A child task that sleeps on its **own** deadline and then wakes the root: a 50 ms timed wait on
+/// a word nobody stores (so it times out), then store-and-notify the word the root is parked on.
+const SLEEP_THEN_NOTIFY: &str = r#"memory 17
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  vx = i64.const 65552
+  ve = i32.const 0
+  vt = i64.const 50000000
+  vs = i32.atomic.wait vx ve vt
+  vx2 = i64.const 65556
+  vone = i32.const 1
+  i32.atomic.store vx2 vone
+  vn = atomic.notify vx2 vone
+  vr = i64.extend_i32_u vn
+  return vr
+  }
+}
+"#;
+
+/// The root parks **indefinitely** on the word the child will notify, then joins both children and
+/// returns its own wait status.
+const TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD: &str = "vx2 = i64.const 65556
+  ve2 = i32.const 0
+  vinf = i64.const -1
+  vs2 = i32.atomic.wait vx2 ve2 vinf
+  vja = call.cap 6 1 (i32) -> (i64) v0 (vca)
+  vjb = call.cap 6 1 (i32) -> (i64) v0 (vcb)
+  vs64 = i64.extend_i32_u vs2
+  return vs64";
+
+/// **#1631 — a task asleep on its own deadline is a notifier, not a deadlock.**
+///
+/// The root waits indefinitely for a notify that a child task will send once its *timed* wait
+/// expires. That task comes back by itself, so it is a potential notifier — but the executor
+/// counted every park in `Domain::parked`, whose one reader is `live > parked`. At the moment the
+/// root parked, `live(2) == parked(2)` and the root killed a correct program with `ThreadFault`.
+///
+/// This is #1625's case 1 one layer down: there it was a *timed* 1:1 `futex_wait` counted as
+/// blocked, here a timed task park. #1625 noted the possibility and explicitly did not confirm it;
+/// this is the confirmation, and unlike either of that issue's cases it is also an oracle
+/// divergence — the interpreter answered `WAIT_WOKEN` throughout.
+#[test]
+fn a_task_asleep_on_its_own_deadline_is_not_a_deadlock() {
+    let p = module(&parent(TAIL_ROOT_WAITS_FOR_A_SLEEPING_CHILD));
+    let a = module(SLEEP_THEN_NOTIFY);
+    let b = module(TRIVIAL);
+    // WAIT_WOKEN (0) on both engines: the root is woken by the task, not failed closed.
+    assert_eq!(run_interp(&p, &a, &b, -1), 0, "the oracle");
+    assert_eq!(run_jit(&p, &a, &b, -1), 0);
+}

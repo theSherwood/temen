@@ -132,7 +132,9 @@ pub fn fiber_active() -> bool {
 /// ([`fiber_active`] is `true`) — the same contract as the futex thunk's event park.
 pub unsafe fn fiber_park_current() {
     let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
-    fiber_rt::fiber_event_park(&slot);
+    // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
+    // counts as parked.
+    fiber_rt::fiber_event_park(&slot, false);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled

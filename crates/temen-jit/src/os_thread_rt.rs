@@ -2110,7 +2110,10 @@ unsafe fn fiber_futex_wait_loop(
                 return st;
             }
         }
-        fiber_rt::fiber_event_park(slot);
+        // #1631 — a park with its own deadline comes back by itself, so it is a potential
+        // notifier and must not count toward `Domain::parked`. Same rule the OS park applies to a
+        // timed `futex_wait` (#1625); this is the task half of it.
+        fiber_rt::fiber_event_park(slot, deadline.is_some());
         // Re-entered: a `cont.resume` polled this fiber. Completed?
         let st = cell.status.load(Ordering::Acquire);
         if st != PENDING_WAIT {
@@ -2222,8 +2225,15 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
             let lane = dom.lane_chain();
             dom.lane_give_back(&lane);
             {
+                // #1631 — count this vCPU as blocked only if the fiber it is driving cannot end its
+                // own wait. When that wait carries a deadline the fiber completes by itself, this
+                // re-poll picks it up and the vCPU runs on — so it is a potential notifier, and
+                // counting it let a *sibling*'s indefinite wait read `live == parked` and trap a
+                // correct program. Same rule as the OS park (#1625) and the task park, asked of the
+                // one park this vCPU is actually waiting on.
+                let self_resolving = fiber_rt::park_is_self_resolving(handle);
                 let g = lock(&dom.futex);
-                let _pg = ParkGuard::new(&dom.parked);
+                let _pg = (!self_resolving).then(|| ParkGuard::new(&dom.parked));
                 let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
             }
             if !dom.lane_acquire(&lane, || {

@@ -235,3 +235,60 @@ fn no_loop_blocking_resume_wakes_on_cross_vcpu_notify_all_backends() {
         );
     }
 }
+
+/// **#1631 — a vCPU idling on a *timed* fiber wait is a notifier, not a deadlock.**
+///
+/// The root parks on an indefinite `atomic.wait`. A sibling vCPU drives a fiber through
+/// `cont.resume.block`; that fiber's wait carries its own 50 ms deadline, after which it stores the
+/// root's word and notifies it. So the sibling *will* run on and the root *will* be woken.
+///
+/// `fiber_resume_block` counted the idling vCPU in `Domain::parked` unconditionally, so at the
+/// moment the root parked `live(2) == parked(2)`, `peers_live()` read false, and the root failed
+/// itself closed with `ThreadFault` against a sibling that was about to wake it. The oracle
+/// answered `WAIT_WOKEN` throughout — the third instance of the same miscount, after a timed
+/// `futex_wait` (#1625) and a timed D66 task park (#1631).
+const A_TIMED_FIBER_WAKES_A_SIBLING: &str = r#"memory 16
+export 0 func "_start" 0
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  va = i64.const 16392
+  ve = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait va ve vinf
+  vst64 = i64.extend_i32_u vst
+  return vst64
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vf = ref.func 2
+  vz = i64.const 0
+  vk = cont.new vf vz
+  vs, vv = cont.resume.block vk vz
+  return vv
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vw = i64.const 16384
+  ve = i32.const 0
+  vto = i64.const 50000000
+  vst = i32.atomic.wait vw ve vto
+  v2 = i64.const 16392
+  vone = i32.const 1
+  i32.atomic.store v2 vone
+  vn = atomic.notify v2 vone
+  vr = i64.extend_i32_u vn
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn a_vcpu_idling_on_a_timed_fiber_wait_does_not_deadlock_a_sibling() {
+    // WAIT_WOKEN (0): the root is notified, not failed closed. Pinned on the oracle too, because
+    // the JIT's answer was a divergence from it, not merely a wrong number.
+    pin_all(A_TIMED_FIBER_WAKES_A_SIBLING, 0);
+}
