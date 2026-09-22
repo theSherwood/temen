@@ -11,7 +11,8 @@
 //! These runs arm nothing on purpose. That is the shape that hung.
 
 use core::ffi::c_void;
-use temen_interp::Host;
+use std::time::{Duration, Instant};
+use temen_interp::{run_with_host, Host, Trap};
 use temen_jit::compile_and_run_capture_reserved_with_host_ex;
 
 fn module(text: &str) -> temen_ir::Module {
@@ -38,6 +39,24 @@ fn jit_unarmed(m: &temen_ir::Module) -> Result<temen_jit::JitOutcome, String> {
     .map_err(|e| format!("{e:?}"))?;
     Ok(jo)
 }
+
+/// Run `m` on the tree-walking oracle. Returns its `Trap` and how long the run took — the elapsed
+/// time is half the assertion for #1624, because the bug it fixed was *also* a ten-second stall.
+fn interp_trap(m: &temen_ir::Module) -> (Trap, Duration) {
+    let mut host = Host::new();
+    let mut fuel = u64::MAX;
+    let t0 = Instant::now();
+    let r = run_with_host(m, 0, &[], &mut fuel, &mut host);
+    let dt = t0.elapsed();
+    match r {
+        Err(t) => (t, dt),
+        Ok(v) => panic!("an unsatisfiable wait must not return a value, got {v:?} in {dt:?}"),
+    }
+}
+
+/// Well under the interpreter's 10 s `MAX_WAIT` backstop, well over CI jitter: proof the verdict came
+/// from the deadlock predicate and not from the clamp that used to decide it.
+const PROMPT: Duration = Duration::from_secs(4);
 
 /// The lone waiter: an infinite wait on a word nothing will ever store or notify, with no sibling
 /// that could notify it. `live == parked == 1`, so no notify can ever arrive.
@@ -66,23 +85,39 @@ fn a_lone_infinite_wait_ends_instead_of_hanging_an_unarmed_jit_run() {
     );
 }
 
-// The oracle is **not** pinned alongside these, and that is a finding rather than an omission:
-// it answers the same program `WAIT_TIMED_OUT` after ten seconds, not `ThreadFault`. Its
-// `run_deadlocked` predicate never consults `wait_waiters`, so an unsatisfiable futex wait is ended
-// by the `MAX_WAIT` anti-wedge backstop instead of being detected — even though `thread_wait`'s own
-// comment says the JIT surfaces `WAIT_DEADLOCK` as a `ThreadFault` *"matching the interpreter"*.
-// It does not match. Which status is right is a semantics call, filed as #1624; a ten-second test
-// pinning a behaviour we think is wrong would be poor value here.
+/// **The oracle agrees, and promptly (#1624).** `thread_wait` has always claimed it surfaces
+/// `WAIT_DEADLOCK` as a `ThreadFault` *"matching the interpreter"*. It did not: `run_deadlocked` never
+/// consulted `wait_waiters`, so a futex-parked vCPU was invisible to it and the run was ended by the
+/// `MAX_WAIT` anti-wedge backstop instead — ten seconds, then `WAIT_TIMED_OUT`, a status nobody asked
+/// for, chosen by a constant whose own doc calls it "never semantics".
+///
+/// Both halves are pinned here, because a fix that traded the wrong status for the wrong latency
+/// would satisfy the first assertion alone.
+#[test]
+fn the_oracle_faults_on_a_lone_infinite_wait_without_waiting_out_the_backstop() {
+    let (trap, dt) = interp_trap(&module(LONE_INFINITE_WAIT));
+    assert_eq!(
+        trap,
+        Trap::ThreadFault,
+        "an unsatisfiable wait is an error, not a timeout ({dt:?})"
+    );
+    assert!(
+        dt < PROMPT,
+        "the verdict must come from the predicate, not the 10 s MAX_WAIT backstop: took {dt:?}"
+    );
+}
 
 /// **A mutual deadlock resolves for both vCPUs.** The root spawns a sibling; each parks in an
 /// infinite wait on a word only the *other* would ever store. Both are blocked, so `live == parked`
 /// and neither can be satisfied — the "mutual" half of the predicate's own comment, which the
 /// lone-waiter case above does not reach.
 ///
-/// This is the case that made the fix more than hoisting a check. The first waiter to park is
-/// already asleep when the second one makes `live == parked` true, so detection used to wait for a
-/// poll; `ParkGuard` now wakes the key's condvar as it increments `parked`, which is also what lets
-/// loom model this at all (it has no timeouts).
+/// The **exit** wake is what carries it, not the park. The waiter that parks second checks
+/// `peers_live` after its own park is counted, so it breaks without being woken at all; the first is
+/// freed by the second one finishing — a completing vCPU drops `live` and broadcasts, as
+/// `Domain::child_finished` and `run_child` do. (An earlier draft of #1623 added a notify to
+/// `ParkGuard` on the theory that the sleeping waiter had to learn its peer had blocked. Mutating it
+/// back out showed the loom model and both of these tests passing without it, so it came out again.)
 const MUTUAL_DEADLOCK: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {

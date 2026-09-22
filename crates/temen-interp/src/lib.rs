@@ -6789,6 +6789,31 @@ fn quiesced_parks_only(s: &Sched) -> bool {
     })
 }
 
+/// #1624 — is every remaining futex park **unsatisfiable**, so that the only thing still keeping the
+/// run alive is the [`MAX_WAIT`] backstop?
+///
+/// [`run_deadlocked`] answers "no external wake channel is open and every worker is idle", but it is
+/// only ever consulted on the no-timer path — and an *infinite* `atomic.wait` is clamped to
+/// [`MAX_WAIT`], so it always carries a `timers` entry and the worker slept on that instead. A futex-
+/// parked vCPU was therefore invisible to deadlock detection: the same program the JIT fails closed
+/// with `ThreadFault` sat here for ten seconds and then handed the guest `WAIT_TIMED_OUT` — a timeout
+/// nobody asked for, decided by a constant whose own doc calls it "a pure anti-wedge backstop, never
+/// semantics". That made the backstop into semantics, which is the #1584 shape all over again.
+///
+/// Conservative in exactly the two places [`quiesced_parks_only`] is, and for the same reasons. A
+/// waiter the guest gave a **real** timeout will wake and run on, so it is a potential notifier, not a
+/// deadlock participant — one of those and the run is not deadlocked. And a futex-parked **fiber** is
+/// the freeze driver's business, so it blocks the verdict too. `svc_timers` must be empty for the same
+/// reason a real deadline disqualifies: a service deadline is a wake that will arrive.
+fn futex_parks_unsatisfiable(s: &Sched) -> bool {
+    !s.wait_waiters.is_empty()
+        && s.svc_timers.is_empty()
+        && s.wait_waiters.values().flatten().all(|(_, w)| match w {
+            Waiter::VCpu(v) => v.wait_indefinite,
+            Waiter::Fiber { .. } => false,
+        })
+}
+
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
 fn worker_loop(sched: &Arc<Scheduler>) {
@@ -6860,6 +6885,18 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                             s.runnable.push_back(v);
                         }
                     }
+                    continue;
+                }
+                // #1624: every futex park is indefinite and nothing else can wake the run, so the
+                // pending `timers` deadlines are all [`MAX_WAIT`] backstops — sleeping on them buys
+                // ten seconds and a misleading `WAIT_TIMED_OUT`. Fail closed now, with the same
+                // `ThreadFault` the no-timer path below produces and the JIT's `WAIT_DEADLOCK`
+                // already produces, so the two engines agree (INVARIANTS #5: an error is a value,
+                // never a delay). A freeze-on-quiesce arm is handled just above and wins — a freeze
+                // is not a deadlock.
+                if futex_parks_unsatisfiable(&s) && run_deadlocked(&s) {
+                    teardown_run(&mut s);
+                    sched.work.notify_all();
                     continue;
                 }
                 let dl_futex = s.timers.peek().map(|Reverse((dl, _, _))| *dl);
