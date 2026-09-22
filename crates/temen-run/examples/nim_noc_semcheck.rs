@@ -32,11 +32,15 @@
 //! whole leaf set is retained as real imports rather than fail-closed stubs, those imports are
 //! bound to the personality, and this run installs the signal/caller-request door `fork` rides.
 //!
-//! What is left is **#1621**: a nim module reaches its personality through `call.import`, and that
-//! dispatch arm *drains and discards* the caller request ("degrade to the poll answer"), so `fork`
-//! answers `-ENOSYS` and `execShellCmd` reports failure having never called `execve`. The
-//! `call.cap`/`call.sym` arms act on the request; the import arm does not. Until that is closed,
-//! `--sh` fails with the message above and the hand-crank remains the working path.
+//! The exec path itself now works: #1621 (the `call.import` arm dropped the caller request, so
+//! `fork` answered `-ENOSYS`) is fixed, and so is the argv replacement behind it. Run this with a
+//! three-line probe registered in place of the shell and nimsem forks, `execve`s, the image is
+//! replaced, and the probe runs on the shared personality reading its `argc`/`argv`.
+//!
+//! What is left is **#1628**: `demos/shell` has only ever been compiled as a *root* module
+//! (`c_to_ir`, never `--child-entry`), and does not start as a command — it never reaches `main`.
+//! That is about the demo, not the VM. Until it is sorted `--sh` fails and the hand-crank below
+//! remains the working path.
 //!
 //! **A live cross-check on the cache-stem port.** `temen_run::nim_module_suffix` reimplements
 //! nimony's `moduleSuffix`. Every request the guest makes is a chance to check it against the real
@@ -255,8 +259,8 @@ fn main() {
             dump_cache(&posix, out_p);
             panic!(
                 "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
-                 failed: {outcome:?}\nIf this is the `call.import` drain (#1621), the guest saw \
-                 `fork` answer -ENOSYS and never reached `execve`."
+                 failed: {outcome:?}\nA shell that never reaches `main` is #1628; try a \
+                 three-line probe command in its place to tell that apart from an exec fault."
             );
         }
         let Some(argv) = failed_nifler_command(&said) else {
