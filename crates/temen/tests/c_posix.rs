@@ -3322,6 +3322,76 @@ int main(void) {{\n\
     );
 }
 
+/// The `demos/shell` sources, compiled here as a **command** rather than a root program — the
+/// three files `c_shell.rs` already builds, reached the other way.
+const SH_SHIM: &str = include_str!("../../temen-run/demos/shell/shim.c");
+const SH_RING: &str = include_str!("../../temen-run/demos/shell/ring.c");
+const SH_MAIN: &str = include_str!("../../temen-run/demos/shell/shell_main.c");
+
+/// A caller window big enough to exec the shell into: `exec_module` reuses the caller's window, so
+/// it admits a command only if the command's declared memory fits. The shell declares 2^22.
+const WIN_PAD_23: &str = "static char xs_win_pad23_[6000000];\n";
+
+/// #1628 — **the real shell, exec'd as a command, is refused — and the refusal is the right one.**
+///
+/// Registering `demos/shell` at `/bin/sh` is #1609's last step, and it does not work. The reason
+/// is not a startup path, which is what the absence of any output suggested: it is an **authority
+/// declaration**. The shell is written as a *root* program with the full powerbox, and `ring.c`'s
+/// pipeline runner (STAGE1.md item 6) makes it declare `__as_region`, `__rg_granule`/`map`/`unmap`,
+/// `__spawn` and `__join` — all `Required`. A §14 child's manifest walk binds a fixed allow-list
+/// (the `__px_*` vtable, and `vm_*` to the child's own auto-granted `AddressSpace`); region carving
+/// and spawning are not on it, so `bind_child_manifest` refuses at `__as_region` and the exec
+/// answers `-EINVAL`.
+///
+/// That refusal is correct as specified: a separate-module child's manifest describes *that
+/// child's* own needs, so an unmet `Required` import is a real instantiation failure and §3.3 says
+/// withhold. An exec'd command cannot quietly acquire authority its caller never had.
+///
+/// So this pins the refusal rather than the fix: `-EINVAL`, probeable, caller still running. What
+/// it takes to make `/bin/sh` work is a design decision recorded on #1628 — the shell has to
+/// declare the pipeline capabilities as optional and degrade without them, or be built without
+/// them. When that lands, this test flips to asserting `40`.
+#[test]
+fn c_execve_refuses_the_real_shell_for_undeclarable_authority() {
+    let sh = format!("{SH_SHIM}\n{SH_RING}\n{SH_MAIN}");
+    let src = format!(
+        "{WIN_PAD_23}\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static char *av[] = {{ \"/bin/sh\", \"-c\", \"true\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    long r = __px_execve(0, (long)\"/bin/sh\", (long)av, 0);\n\
+    return (int)(-r);   /* never reached on success; otherwise the errno */\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  /* The caller survives a refused exec and keeps its own personality. */\n\
+  __px_write(0, 1, (long)\"alive\", 5);\n\
+  return 40 + ((status >> 8) & 0xff);\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/sh", &sh);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(62)],
+        "40 + EINVAL(22): the shell declares `Required` region/spawn authority a §14 child is not \
+         given, so the manifest walk withholds (#1628). 40 = it ran and `true` exited 0"
+    );
+    assert_eq!(
+        e.stdout, b"alive",
+        "a refused exec leaves the caller running with its personality intact"
+    );
+}
+
 /// #1609 — the **whole-`execve` personality op** (`OP_EXECVE`), the route a guest with no
 /// `exec.c` of its own takes. Deliberately the same scenario as
 /// `c_execve_runs_a_px_linked_command` above, with the one difference that matters: that test
