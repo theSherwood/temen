@@ -178,6 +178,7 @@ fn semcheck(
     let mut served: Vec<String> = Vec::new();
     loop {
         let before = posix.stdout().len();
+        let before_err = posix.stderr().len();
         let outcome = temen_run::nim_noc_run_with_commands(
             nimsem.clone(),
             posix,
@@ -186,6 +187,10 @@ fn semcheck(
             commands,
         );
         let said = String::from_utf8_lossy(&posix.stdout()[before..]).into_owned();
+        // A guest says *why* it could not run something on **stderr**, and nothing else here looks
+        // there — so an exec that fails inside `/bin/sh` reads as a bare `FAILURE: bin/nifler …`
+        // from nimsem with the actual diagnosis thrown away.
+        let said_err = String::from_utf8_lossy(&posix.stderr()[before_err..]).into_owned();
         if posix.read_file(produced).is_some() {
             return served.len();
         }
@@ -193,7 +198,7 @@ fn semcheck(
             // With `/bin/sh` registered nimsem spawns nifler itself, so reaching here means the
             // real exec path did not work — serving it from outside would hide exactly the thing
             // this mode exists to prove. See the module docs for the one blocker that remains.
-            eprint!("--- nimsem said ---\n{said}");
+            eprint!("--- nimsem said ---\n{said}--- stderr ---\n{said_err}");
             dump_cache(posix, out_p);
             panic!(
                 "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
@@ -209,7 +214,7 @@ fn semcheck(
         // shell-out loop does, and the no-progress guard covers both.
         if let Some(stem) = missing_semchecked(&said) {
             let Some(src) = sources.get(&stem) else {
-                eprint!("--- nimsem said ---\n{said}");
+                eprint!("--- nimsem said ---\n{said}--- stderr ---\n{said_err}");
                 dump_cache(posix, out_p);
                 panic!(
                     "nimsem wants nimcache/{stem}.s.nif but no seeded source hashes to that stem \
@@ -257,7 +262,7 @@ fn semcheck(
             continue;
         }
         let Some(argv) = failed_nifler_command(&said) else {
-            eprint!("--- nimsem said ---\n{said}");
+            eprint!("--- nimsem said ---\n{said}--- stderr ---\n{said_err}");
             dump_cache(posix, out_p);
             panic!("nimsem wrote no {produced} and asked for no shell-out: {outcome:?}");
         };

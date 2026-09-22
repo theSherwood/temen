@@ -10757,23 +10757,31 @@ enum CallerRequest {
     /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
     /// still running (POSIX: `execve` returns only on failure).
     ExecRefused,
+    /// Bench this vCPU until `child` exits — a blocking `waitpid`/`wait4`. Unlike fork/exec this
+    /// one **rewinds**: the op re-executes on wake and reaps from the personality's now-retired
+    /// table entry. [`REAP_ANY_CHILD`] is the `wait(-1)` wildcard.
+    Reap(TaskId),
 }
 
 /// #799/#1609/#1621 — service the **caller request** a host op left in the door, identically
 /// however the op was reached.
 ///
-/// `fork` and `exec` are requests, not parks: the op fires one and returns a placeholder, and the
-/// drive loop acts on it at once. Both need the same gate — only a **root fiber on the real
-/// scheduler** can be handed to the fork engine or have its image replaced — and a context that
-/// fails it keeps the placeholder.
+/// `fork`, `exec` and a blocking `waitpid`'s bench are requests, not postures: the op fires one and
+/// returns a placeholder, and the drive loop acts on it at once. All three need the same gate —
+/// only a **root fiber on the real scheduler** can be handed to the fork engine, have its image
+/// replaced, or be benched — and a context that fails it keeps the placeholder (for `waitpid` that
+/// is the historical `-ECHILD` poll).
 ///
 /// This lived twice, in the `call.cap` and `call.sym` arms. `call.import` had neither: it drained
 /// the request and dropped it, so an op reached as an import could not fork or exec at all. That
 /// is invisible to a chibicc guest, whose `__px_*` calls arrive as `call.cap`/`call.sym`, and
 /// fatal to a no-C nim module, whose personality ops arrive as imports — `fork` answered
 /// `-ENOSYS`, nim read `pid < 0` as "fork failed", and `execShellCmd` reported failure having
-/// never called `execve` (#1621). One decision, three callers, so a fourth call form cannot
-/// quietly acquire a fourth answer (INVARIANTS #15).
+/// never called `execve` (#1621). The reap bench joined it in #1609, from the other half of the
+/// same split: `call.cap`/`call.sym` each carried their own copy of the park and the import routes
+/// carried none, so an import-routed `wait4` answered `-ECHILD` without ever benching. One
+/// decision, four callers, so a fifth call form cannot quietly acquire a fifth answer
+/// (INVARIANTS #15).
 ///
 /// Read parking is deliberately **not** here: it legitimately differs per arm (an import-routed
 /// blocking read keeps its historical 0-EOF rather than parking), and that posture is a separate
@@ -10796,6 +10804,14 @@ fn service_caller_request(
     }
     match ev {
         ParkEvent::ForkSelf => CallerRequest::Fork,
+        // #1609 — a blocking `waitpid`'s bench. This was the one caller request still decided per
+        // arm (`call.cap`/`call.sym` parked on it; `call.import`/`call.dyn` dropped it), which is
+        // the #1621 asymmetry over again: an import-routed `wait4` answered `-ECHILD` at once, so
+        // nim's `execShellCmd` reported failure for a command that had in fact run.
+        ParkEvent::TaskExit(id) => CallerRequest::Reap(id),
+        // #802 rung 3 — the any-child bench: the sentinel flows through the same rewind+park; the
+        // drive loop's insert translates it to the per-parent key.
+        ParkEvent::TaskExitAny => CallerRequest::Reap(REAP_ANY_CHILD),
         // The op resolved the path against the command registry and packed argv/envp into the
         // powerbox args region, so only the resolved command handle rides the request.
         ParkEvent::ExecSelf { cmd } => {
@@ -10804,7 +10820,6 @@ fn service_caller_request(
                 None => CallerRequest::ExecRefused,
             }
         }
-        _ => CallerRequest::None,
     }
 }
 
@@ -14189,20 +14204,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // `waitpid`) or clone the caller (`fork`). Taken here like every transient
                     // (consume-everywhere).
                     let request = hg.take_park_request();
-                    let reap_park = match request {
-                        Some(ParkEvent::TaskExit(id)) => Some(id),
-                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
-                        // rewind+park; the drive loop's insert translates it to the per-parent key.
-                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
-                        _ => None,
-                    };
+                    // Whether that request is a blocking `waitpid`'s bench — needed *here*, under
+                    // the host lock, only as the `sig_intr` predicate below. The park itself is
+                    // [`service_caller_request`]'s decision ([`CallerRequest::Reap`]), taken once
+                    // for every call form after the lock drops.
+                    let reap_park = matches!(
+                        request,
+                        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+                    );
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park. (`fork`
                     // does not participate: POSIX fork is not interruptible — it succeeds or EAGAINs.)
                     let sig_intr = (pipe_park.is_some()
                         || pipe_write_park.is_some()
-                        || reap_park.is_some())
+                        || reap_park)
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -14244,23 +14260,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
-                    // #799 — bench a blocking `waitpid` on its child's exit: the pipe discipline
-                    // exactly (rewind so the op re-executes on wake and reaps from the
-                    // personality's now-retired table entry; a consumed interrupt completes
-                    // `-EINTR`; SA_RESTART re-parks via the re-executed op's re-request).
-                    if let Some(child) = reap_park {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            if sig_intr {
-                                frames[top].vals.push(Reg::from_i64(EINTR));
-                                eintr_done = true;
-                            } else {
-                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
-                                return Ok(Inner::Park(Blocked::ReapWait { child }));
-                            }
-                        }
-                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
-                    }
-                    // #799/#1609 — the `fork`/`exec` caller requests, serviced by the one
+                    // #799/#1609 — the `fork`/`exec`/reap caller requests, serviced by the one
                     // decision every call form shares (#1621).
                     let mut exec_refused = false;
                     match service_caller_request(
@@ -14275,6 +14275,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // The pipe-park discipline exactly: rewind so the op re-executes on wake
+                        // and reaps the retired entry; a consumed interrupt completes `-EINTR`
+                        // instead (SA_RESTART re-parks via the re-executed op's re-request).
+                        CallerRequest::Reap(child) => {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
                         CallerRequest::None => {}
                     }
                     if !eintr_done {
@@ -14470,6 +14482,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // Rewind and bench: the op re-executes on wake and reaps the retired
+                        // entry. No `-EINTR` arm — this route declines the interrupt posture for
+                        // blocking ops generally (see the read-parking note on the servicer), and
+                        // a wait that benches is strictly better than one that never could.
+                        CallerRequest::Reap(child) => {
+                            frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                            return Ok(Inner::Park(Blocked::ReapWait { child }));
+                        }
                         CallerRequest::None => {}
                     }
                     if exec_refused {
@@ -14613,18 +14633,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #799 — a personality caller request (blocking `waitpid` / `fork`); this
                     // named-import route is where a shim-linked guest's calls land.
                     let request = hg.take_park_request();
-                    let reap_park = match request {
-                        Some(ParkEvent::TaskExit(id)) => Some(id),
-                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
-                        // rewind+park; the drive loop's insert translates it to the per-parent key.
-                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
-                        _ => None,
-                    };
+                    // Whether that request is a blocking `waitpid`'s bench — needed *here*, under
+                    // the host lock, only as the `sig_intr` predicate below. The park itself is
+                    // [`service_caller_request`]'s decision ([`CallerRequest::Reap`]), taken once
+                    // for every call form after the lock drops.
+                    let reap_park = matches!(
+                        request,
+                        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+                    );
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `call.cap` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some()
                         || pipe_write_park.is_some()
-                        || reap_park.is_some())
+                        || reap_park)
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -14655,20 +14676,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
-                    // #799 — bench a blocking `waitpid` (see the `call.cap` arm for the shape).
-                    if let Some(child) = reap_park {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            if sig_intr {
-                                frames[top].vals.push(Reg::from_i64(EINTR));
-                                eintr_done = true;
-                            } else {
-                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
-                                return Ok(Inner::Park(Blocked::ReapWait { child }));
-                            }
-                        }
-                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
-                    }
-                    // #799/#1609 — the `fork`/`exec` caller requests (see the `call.cap` arm).
+                    // #799/#1609 — the `fork`/`exec`/reap caller requests (see the `call.cap` arm).
                     let mut exec_refused = false;
                     match service_caller_request(
                         request,
@@ -14682,6 +14690,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // The pipe-park discipline exactly: rewind so the op re-executes on wake
+                        // and reaps the retired entry; a consumed interrupt completes `-EINTR`
+                        // instead (SA_RESTART re-parks via the re-executed op's re-request).
+                        CallerRequest::Reap(child) => {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
                         CallerRequest::None => {}
                     }
                     if let Some(pipe) = pipe_wake {
@@ -14759,6 +14779,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // Rewind and bench: the op re-executes on wake and reaps the retired
+                        // entry. No `-EINTR` arm — this route declines the interrupt posture for
+                        // blocking ops generally (see the read-parking note on the servicer), and
+                        // a wait that benches is strictly better than one that never could.
+                        CallerRequest::Reap(child) => {
+                            frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                            return Ok(Inner::Park(Blocked::ReapWait { child }));
+                        }
                         CallerRequest::None => {}
                     }
                     if exec_refused {
