@@ -18844,6 +18844,40 @@ fn translate_inst(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Res
             }
             return Ok(());
         }
+        // `store <N x i1>`: a **mask** lives as per-lane `0`/`1` values in the `agg` side-table, not
+        // as a scalar, so the generic path below would `ctx.operand` it and fail ("value … not
+        // available in block") — the `store i128` hazard immediately below, one type over. LLVM's
+        // in-memory layout for `<N x i1>` is bit-packed, lane `k` at bit `k`, occupying
+        // `ceil(N/8)` bytes; [`pack_mask_bits`] builds exactly that integer (the same one
+        // `bitcast <N x i1> to iN` yields, which is why they share it).
+        //
+        // rustc reaches this through hashbrown's SwissTable: a 16-byte control group is loaded as
+        // `<16 x i8>`, compared to a splat, and the resulting `<16 x i1>` is spilled with the rest
+        // of the iterator state. It is not vectorized *code* — it is a library that names a vector
+        // type directly — so `-Cno-vectorize-*` does not avoid it.
+        if let Some(n) = i1_vector_lanes(st.value.get_type(types).as_ref()) {
+            let op = match n {
+                0..=8 => temen_ir::StoreOp::I32_8,
+                9..=16 => temen_ir::StoreOp::I32_16,
+                17..=32 => temen_ir::StoreOp::I32,
+                33..=64 => temen_ir::StoreOp::I64,
+                _ => {
+                    return Err(Error::Unsupported(format!(
+                        "store of a {n}-lane mask (over 64 lanes has no integer container)"
+                    )))
+                }
+            };
+            let addr = ctx.operand(&st.address)?;
+            let lanes = mask_operand(ctx, &st.value, n)?;
+            let value = pack_mask_bits(ctx, &lanes, n > 32);
+            ctx.push_effect(Inst::Store {
+                op,
+                addr,
+                value,
+                offset: 0,
+            });
+            return Ok(());
+        }
         // `store i128`: write the `(lo, hi)` pair as two i64 stores — lo at the base, hi at base+8 —
         // mirroring the `load i128` layout below (temen-IR has no 128-bit type; an i128 lives as an
         // `agg` pair). The generic path below would `ctx.operand` the i128 value as a scalar and fail
@@ -20960,46 +20994,7 @@ fn lower_mask(ctx: &mut BlockCtx, instr: &Instruction, types: &Types) -> Result<
             let lanes = mask_operand(ctx, &x.operand, n)?;
             let to_bits = int_bits(x.to_type.as_ref())
                 .ok_or_else(|| Error::Unsupported("mask bitcast to non-int".into()))?;
-            // Lanes are `0`/`1` in `i32`; OR each into its bit position. `iN` with `N ≤ 32` builds in
-            // an `i32` container, wider in `i64` (extend each lane first).
-            let wide = to_bits > 32;
-            let lane_ty = if wide { IntTy::I64 } else { IntTy::I32 };
-            let mut acc = ctx.push(if wide {
-                Inst::ConstI64(0)
-            } else {
-                Inst::ConstI32(0)
-            });
-            for (i, &l) in lanes.iter().enumerate() {
-                let lw = if wide {
-                    ctx.push(Inst::Convert {
-                        op: ConvOp::ExtendI32U,
-                        a: l,
-                    })
-                } else {
-                    l
-                };
-                let shifted = if i == 0 {
-                    lw
-                } else {
-                    let sh = ctx.push(if wide {
-                        Inst::ConstI64(i as i64)
-                    } else {
-                        Inst::ConstI32(i as i32)
-                    });
-                    ctx.push(Inst::IntBin {
-                        ty: lane_ty,
-                        op: BinOp::Shl,
-                        a: lw,
-                        b: sh,
-                    })
-                };
-                acc = ctx.push(Inst::IntBin {
-                    ty: lane_ty,
-                    op: BinOp::Or,
-                    a: acc,
-                    b: shifted,
-                });
-            }
+            let acc = pack_mask_bits(ctx, &lanes, to_bits > 32);
             finish(ctx, &x.dest, acc)?;
             Ok(true)
         }
@@ -21059,6 +21054,53 @@ fn lower_mask_bitwise(
 /// Record `dest`'s scalarized mask lanes. A mask's `N` lanes live in the `agg` table (an `[i32; N]`
 /// `agg_layout` is recorded in `scan_func`), so the value crosses block edges via the per-field
 /// fan-out in `block_params`/`branch_args` — the `<N x i1>` analog of [`BlockCtx::bind_wide`].
+/// Pack a mask's per-lane `0`/`1` values into **one integer, lane `k` at bit `k`** — LLVM's
+/// in-memory and `bitcast`-to-`iN` layout for `<N x i1>`.
+///
+/// `wide` selects the container: an `i32` holds up to 32 lanes, an `i64` beyond that (each lane is
+/// zero-extended first). Shared by the `bitcast <N x i1> to iN` lowering (SIMD "movemask") and by
+/// `store <N x i1>` — one definition of the bit order, because the two must agree byte for byte.
+fn pack_mask_bits(ctx: &mut BlockCtx, lanes: &[ValIdx], wide: bool) -> ValIdx {
+    let lane_ty = if wide { IntTy::I64 } else { IntTy::I32 };
+    let mut acc = ctx.push(if wide {
+        Inst::ConstI64(0)
+    } else {
+        Inst::ConstI32(0)
+    });
+    for (i, &l) in lanes.iter().enumerate() {
+        let lw = if wide {
+            ctx.push(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: l,
+            })
+        } else {
+            l
+        };
+        let shifted = if i == 0 {
+            lw
+        } else {
+            let sh = ctx.push(if wide {
+                Inst::ConstI64(i as i64)
+            } else {
+                Inst::ConstI32(i as i32)
+            });
+            ctx.push(Inst::IntBin {
+                ty: lane_ty,
+                op: BinOp::Shl,
+                a: lw,
+                b: sh,
+            })
+        };
+        acc = ctx.push(Inst::IntBin {
+            ty: lane_ty,
+            op: BinOp::Or,
+            a: acc,
+            b: shifted,
+        });
+    }
+    acc
+}
+
 fn bind_mask(ctx: &mut BlockCtx, dest: &Name, lanes: Vec<ValIdx>) {
     if let Some(&vid) = ctx.s.name2id.get(dest) {
         ctx.agg.insert(vid, lanes);

@@ -1,32 +1,30 @@
 (.nif27)
 (.vendor "Nifler")
 (.dialect "nim-parsed")
-(stmts@,1,../../../home/user/vm/nimony/lib/std/system.nim
+(stmts@,1,../../../home/user/temen/nimony/lib/std/system.nim
  (comment)
  (pragmas@,2
   (kv@9 feature~7 "lenientnils"@2))
- (pragmas@,3
-  (kv@9 feature~7 "staticContracts"@2))
- (include@,5 "system/basic_types"@8)
- (iterator@,7 unpack@9 x . .
+ (include@,4 "system/basic_types"@8)
+ (iterator@,6 unpack@9 x . .
   (params@G)untyped@4
   (pragmas@S
    (kv@7 magic~5 Unpack@2)). .)
- (func@,9 unpackToCall@5 . . .
+ (func@,8 unpackToCall@5 . . .
   (params@H
    (param@1 fn . . untyped@4 .)).
   (pragmas@V
    (kv@7 magic~5 Unpack@2)). .)
- (const@G,C isMainModule~E x
+ (const@G,B isMainModule~E x
   (pragmas
    (kv@7 magic~5 "IsMainModule"@2))bool@R false@Y)
- (const@7,D Inf~5 x
+ (const@7,C Inf~5 x
   (pragmas
    (kv@7 magic~5 "Inf"@2))float64@I 0.0@S)
- (const@7,F NaN~5 x
+ (const@7,E NaN~5 x
   (pragmas
    (kv@7 magic~5 "NaN"@2))float64@I 0.0@S)
- (func@,M
+ (func@,L
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . .
@@ -36,7 +34,7 @@
    (param@7 i . . int@3 .))untyped@G
   (pragmas@i
    (kv@7 magic~5 "TupAt"@2)). .)
- (func@,N
+ (func@,M
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 I . . . .)
@@ -48,7 +46,7 @@
   (mut@O T@4)
   (pragmas@k
    (kv@7 magic~5 "ArrAt"@2)). .)
- (func@,O
+ (func@,N
   (quoted@5 \5B\5D@1) x . .
   (params@A
    (param@1 x . . cstring@3 .)
@@ -56,7 +54,7 @@
   (mut@M char@4)
   (pragmas@f
    (kv@7 magic~5 "Pat"@2)). .)
- (func@,P
+ (func@,O
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -68,7 +66,7 @@
   (mut@a T@4)
   (pragmas@t
    (kv@7 magic~5 "Pat"@2)). .)
- (func@,Q
+ (func@,P
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -79,7 +77,7 @@
   (mut@W T@4)
   (pragmas@p
    (kv@7 magic~5 "Pat"@2)). .)
- (template@,R
+ (template@,Q
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 T . .
@@ -92,7 +90,7 @@
    (asgn@7
     (par~7
      (at@2 x~1 i@1))elem@2)))
- (template@,T
+ (template@,S
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 I . . . .)
@@ -106,7 +104,7 @@
    (asgn@7
     (par~7
      (at@2 x~1 i@1))elem@2)))
- (template@,V
+ (template@,U
   (quoted@9 \5B\5D=@1) x . .
   (params@F
    (param@1 x . . cstring@3 .)
@@ -116,7 +114,7 @@
    (asgn@7
     (par~7
      (at@2 x~1 i@1))elem@2)))
- (template@,X
+ (template@,W
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 T . . . .))
@@ -130,7 +128,7 @@
    (asgn@7
     (par~7
      (at@2 x~1 i@1))elem@2)))
- (template@,Z
+ (template@,Y
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 T . . . .))
@@ -143,7 +141,7 @@
    (asgn@7
     (par~7
      (at@2 x~1 i@1))elem@2)))
- (func@,c
+ (func@,b
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -153,7 +151,7 @@
   (mut@C T@4)
   (pragmas@V
    (kv@7 magic~5 "Deref"@2)noSideEffect@I). .)
- (func@,d
+ (func@,c
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -163,7 +161,7 @@
   (mut@C T@4)
   (pragmas@V
    (kv@7 magic~5 "Deref"@2)noSideEffect@I). .)
- (template@,e
+ (template@,d
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 T . . . .))
@@ -175,7 +173,7 @@
    (asgn@6
     (par~6
      (at@2 x~1))val@2)))
- (template@,g
+ (template@,f
   (quoted@9 \5B\5D=@1) x .
   (typevars@F
    (typevar@1 T . . . .))
@@ -187,39 +185,33 @@
    (asgn@6
     (par~6
      (at@2 x~1))val@2)))
- (include@,j "system/arithmetics"@8)
- (include@,l "system/comparisons"@8)
- (func@,n old@5 x . .
-  (params@9
-   (param@1 x . . int@3 .))int@A
-  (pragmas@N
-   (kv@B semantics~9 "old"@2)).
-  (stmts@k x))
- (func@,t defined@5 x . .
+ (include@,i "system/arithmetics"@8)
+ (include@,k "system/comparisons"@8)
+ (func@,m defined@5 x . .
   (params@D
    (param@1 x . . untyped@3 .))bool@E
   (pragmas@W
    (kv@7 magic~5 Defined@2)). .)
- (func@,v declared@5 x . .
+ (func@,o declared@5 x . .
   (params@E
    (param@1 x . . untyped@3 .))bool@E
   (pragmas@X
    (kv@7 magic~5 Declared@2)). .)
- (func@,y astToStr@5 x .
+ (func@,r astToStr@5 x .
   (typevars@E
    (typevar@1 T . . . .))
   (params@H
    (param@1 x . . T@3 .))string@8
   (pragmas@W
    (kv@7 magic~5 AstToStr@2)). .)
- (func@,12 compiles@5 x . .
+ (func@,v compiles@5 x . .
   (params@E
    (param@1 x . . untyped@3 .))bool@E
   (pragmas@X
    (kv@7 magic~5 Compiles@2)). .)
- (const@2,1E NegTen . . .
+ (const@2,17 NegTen . . .
   (bracket@9 "-0"~7,1 "-1"~1,1 "-2"@5,1 "-3"@B,1 "-4"@H,1 "-5"~7,2 "-6"~1,2 "-7"@5,2 "-8"@B,2 "-9"@H,2))
- (func@,1I
+ (func@,1B
   (quoted@5 $@1) x . .
   (params@9
    (param@1 x . . uint64@3 .))string@D . .
@@ -253,23 +245,27 @@
           (infix@2 == y~2 0u@3)
           (stmts@A
            (break .))))))
-      (var@4,8 lo . . . 0@5)
-      (var@4,9 hi . . .
-       (infix@F \2D
+      (let@4,5 last . . .
+       (infix@H \2D
         (dot~4 result~6 len@1)1@1))
-      (while@,A
-       (infix@9 < lo~3 hi@2)
+      (var@4,6 i . . . 0@4)
+      (let@4,7 b . . .
+       (infix@F div
+        (dot~5 result~6 len@1)2@4))
+      (while@,8
+       (infix@8 < i~2 b@2)
        (stmts@2,1
         (let@4 ch . . .
-         (at@B result~6 lo@1))
-        (asgn@B,1
-         (at~5 result~6 lo@1)
-         (at@8 result~6 hi@1))
-        (asgn@B,2
-         (at~5 result~6 hi@1)ch@2)
-        (cmd@,3 inc lo@4)
-        (cmd@,4 dec hi@4))))))))
- (func@,1e
+         (at@B result~6 i@1))
+        (asgn@A,1
+         (at~4 result~6 i@1)
+         (at@8 result~6
+          (infix@5 \2D last~4 i@1)))
+        (asgn@F,2
+         (at~9 result~6
+          (infix@5 \2D last~4 i@1))ch@2)
+        (cmd@,3 inc i@4))))))))
+ (func@,1U
   (quoted@5 $@1) x . .
   (params@9
    (param@1 x . . int64@3 .))string@C . .
@@ -315,7 +311,7 @@
       (asgn@7 result~7
        (prefix@2 $
         (cast@1 uint64@5 x@D))))))))
- (func@,1s
+ (func@,1i
   (quoted@5 $@1) x . .
   (params@9
    (param@1 x . . int32@3 .))string@C . .
@@ -323,7 +319,7 @@
    (prefix $
     (par@1
      (call@6 int64~5 x@1)))))
- (func@,1v addInt@5 x . .
+ (func@,1l addInt@5 x . .
   (params@C
    (param@1 s . .
     (mut@3 string@4).)
@@ -333,7 +329,7 @@
    (cmd@1
     (dot s~1 add@1)
     (prefix@5 $ x@1))))
- (func@,1y addInt@5 x . .
+ (func@,1o addInt@5 x . .
   (params@C
    (param@1 s . .
     (mut@3 string@4).)
@@ -343,7 +339,7 @@
    (cmd@1
     (dot s~1 add@1)
     (prefix@5 $ x@1))))
- (func@,21
+ (func@,1r
   (quoted@5 $@1) x . .
   (params@9
    (param@1 b . . bool@3 .))string@B . .
@@ -353,7 +349,7 @@
      (stmts@3 "true"))
     (else@D
      (stmts@6 "false")))))
- (func@,24
+ (func@,1u
   (quoted@5 $@1) x .
   (typevars@9
    (typevar@1 T . . enum@3 .))
@@ -361,7 +357,7 @@
    (param@1 x . . T@3 .))string@8
   (pragmas@X
    (kv@7 magic~5 "EnumToStr"@2)noSideEffect@M). .)
- (type@H,27 Stringable~C x . .
+ (type@H,1x Stringable~C x . .
   (concept@2 . . .
    (stmts~H,1
     (comment)
@@ -369,7 +365,7 @@
      (quoted@5 $@1). . .
      (params@8
       (param@1 x . . Self@3 .))string@B . . .))))
- (func@,2D addr@5 x .
+ (func@,23 addr@5 x .
   (typevars@A
    (typevar@1 T . . . .))
   (params@D
@@ -377,7 +373,7 @@
   (ptr@8 T@4)
   (pragmas@R
    (kv@7 magic~5 "Addr"@2)noSideEffect@H). .)
- (func@,2F unsafeAddr@5 x .
+ (func@,25 unsafeAddr@5 x .
   (typevars@G
    (typevar@1 T . . . .))
   (params@J
@@ -385,7 +381,7 @@
   (ptr@8 T@4)
   (pragmas@X
    (kv@7 magic~5 "Addr"@2)noSideEffect@H). .)
- (func@,2H sizeof@5 x .
+ (func@,27 sizeof@5 x .
   (typevars@C
    (typevar@1 T . . . .))
   (params@F
@@ -393,7 +389,7 @@
     (at@B typedesc~8 T@1).))int@I
   (pragmas@b
    (kv@7 magic~5 "SizeOf"@2)noSideEffect@J). .)
- (template@,2K sizeof@9 x .
+ (template@,2A sizeof@9 x .
   (typevars@G
    (typevar@1 T . . . .))
   (params@J
@@ -401,7 +397,7 @@
   (stmts@2,1
    (comment)
    (call@6,1 sizeof~6 T@1)))
- (func@,2O
+ (func@,2E
   (quoted@5 =@1 destroy@2) x .
   (typevars@G
    (typevar@1 T . . . .))
@@ -409,7 +405,7 @@
    (param@1 x . . T@3 .)).
   (pragmas@Q
    (kv@7 magic~5 "Destroy"@2)noSideEffect@K). .)
- (func@,2P
+ (func@,2F
   (quoted@5 =@1 dup@2) x .
   (typevars@C
    (typevar@1 T . . . .))
@@ -417,7 +413,7 @@
    (param@1 x . . T@3 .))T@8
   (pragmas@P
    (kv@7 magic~5 "Dup"@2)noSideEffect@G). .)
- (func@,2Q
+ (func@,2G
   (quoted@5 =@1 copy@2) x .
   (typevars@D
    (typevar@1 T . . . .))
@@ -427,7 +423,7 @@
    (param@E src . . T@5 .)).
   (pragmas@c
    (kv@7 magic~5 "Copy"@2)noSideEffect@H). .)
- (func@,2R
+ (func@,2H
   (quoted@5 =@1 wasMoved@2) x .
   (typevars@H
    (typevar@1 T . . . .))
@@ -436,7 +432,7 @@
     (mut@3 T@4).)).
   (pragmas@V
    (kv@7 magic~5 "WasMoved"@2)noSideEffect@L). .)
- (func@,2S
+ (func@,2I
   (quoted@5 =@1 sink@2) x .
   (typevars@D
    (typevar@1 T . . . .))
@@ -446,7 +442,7 @@
    (param@E src . . T@5 .)).
   (pragmas@c
    (kv@7 magic~5 "SinkHook"@2)noSideEffect@L). .)
- (func@,2T
+ (func@,2J
   (quoted@5 =@1 trace@2) x .
   (typevars@E
    (typevar@1 T . . . .))
@@ -456,14 +452,14 @@
    (param@B env . . pointer@5 .)).
   (pragmas@g
    (kv@7 magic~5 "Trace"@2)noSideEffect@I). .)
- (func@,2V ensureMove@5 x .
+ (func@,2L ensureMove@5 x .
   (typevars@G
    (typevar@1 T . . . .))
   (params@J
    (param@1 x . . T@3 .))T@8
   (pragmas@T
    (kv@7 magic~5 "EnsureMove"@2)noSideEffect@N). .)
- (func@,2Y move@5 x .
+ (func@,2O move@5 x .
   (typevars@A
    (typevar@1 T . . . .))
   (params@D
@@ -475,7 +471,7 @@
    (asgn@7,1 result~7 x@2)
    (call@B,2
     (quoted~B =@1 wasMoved@2)x@1)))
- (template@,2d len@9 x .
+ (template@,2T len@9 x .
   (typevars@D
    (typevar@1 I . . . .)
    (typevar@4 T . . . .))
@@ -493,7 +489,7 @@
      (dot@I
       (call~D low~3
        (at@6 array~5 I@1 T@4))int@1))1@2)))
- (template@,2h len@9 x .
+ (template@,2X len@9 x .
   (typevars@D
    (typevar@1 I . . . .)
    (typevar@4 T . . . .))
@@ -504,7 +500,7 @@
    (comment)
    (call@3,2 len~3
     (at@6 array~5 I@1 T@4))))
- (func@,2m swap@5 x .
+ (func@,2c swap@5 x .
   (typevars@A
    (typevar@1 T . . . .))
   (params@D
@@ -518,14 +514,14 @@
    (let@4,1 tmp . . . x@6)
    (asgn@2,2 x~2 y@2)
    (asgn@2,3 y~2 tmp@2)))
- (template@,2s
+ (template@,2i
   (quoted@9 in@1) x . .
   (params@E
    (param@1 x . . untyped@6 .)
    (param@4 y . . untyped@3 .))untyped@H . .
   (stmts@2,1
    (call@8 contains~8 y@1 x@4)))
- (template@,2v
+ (template@,2l
   (quoted@9 notin@1) x . .
   (params@H
    (param@1 x . . untyped@6 .)
@@ -533,7 +529,7 @@
   (stmts@2,1
    (prefix not
     (call@C contains~8 y@1 x@4))))
- (func@,2y
+ (func@,2o
   (quoted@5 is@1) x .
   (typevars@A
    (typevar@1 T . . . .)
@@ -543,7 +539,7 @@
    (param@7 y . . S@3 .))bool@E
   (pragmas@Z
    (kv@7 magic~5 "Is"@2)noSideEffect@F). .)
- (template@,30
+ (template@,2q
   (quoted@9 isnot@1) x . .
   (params@H
    (param@1 x . . untyped@6 .)
@@ -552,29 +548,22 @@
    (prefix not
     (par@4
      (infix@3 is x~2 y@3)))))
- (include@,33 "system/iterators"@8)
- (include@,34 "system/defaults"@8)
- (include@,36 "system/countbits_impl"@8)
- (include@,37 "system/setops"@8)
- (include@,39 "system/ctypes"@8)
- (when@,3B
-  (elif@5
-   (call@7 defined~7 embedded@1)
-   (stmts~3,3
-    (include "system/semihosting"@8))))
- (include@,3G "system/exits"@8)
- (include@,3H "system/atomintrin"@8)
- (include@,3I "system/memory"@8)
- (template@,3K linear@9 x . .
+ (include@,2t "system/iterators"@8)
+ (include@,2u "system/defaults"@8)
+ (include@,2w "system/countbits_impl"@8)
+ (include@,2x "system/setops"@8)
+ (include@,2z "system/ctypes"@8)
+ (include@,31 "system/exits"@8)
+ (include@,32 "system/atomintrin"@8)
+ (include@,33 "system/memory"@8)
+ (template@,35 linear@9 x . .
   (params@G).
   (pragmas@J pragma@2). .)
- (include@,3R "system/seqimpl"@8)
- (include@,3S "system/stringimpl"@8)
- (include@,3T "system/openarrays"@8)
- (include@,3U "system/hashes"@8)
- (include@,3Y "$MM"@8)
- (include@,3Z "system/refops"@8)
- (func@,3b newConstr@5 . .
+ (include@,3C "system/seqimpl"@8)
+ (include@,3D "system/stringimpl"@8)
+ (include@,3E "system/openarrays"@8)
+ (include@,3G "system/arcops"@8)
+ (func@,3I newConstr@5 . .
   (typevars@E
    (typevar@1 T . . . .))
   (params@H
@@ -582,7 +571,7 @@
     (at@B typedesc~8 T@1).))T@I
   (pragmas@b
    (kv@7 magic~5 "NewRef"@2)nodecl@J). .)
- (func@,3c new@5 x .
+ (func@,3J new@5 x .
   (typevars@9
    (typevar@1 T . .
     (ref@3).))
@@ -593,17 +582,17 @@
   (stmts@f
    (asgn@2 x~2
     (call@B newConstr~9 T@1))))
- (template@,3e runnableExamples@9 x . .
+ (template@,3L runnableExamples@9 x . .
   (params@Q
    (param@1 body . . untyped@6 .)).
   (pragmas@g untyped@2).
   (stmts@2,1
    (discard "ignore runnable examples"@8)))
- (func@,3h overflowFlag@5 x . .
+ (func@,3O overflowFlag@5 x . .
   (params@I)bool@4
   (pragmas@R
    (kv@7 magic~5 "OverflowFlag"@2)). .)
- (template@,3j ord@9 x .
+ (template@,3Q ord@9 x .
   (typevars@D
    (typevar@1 T . .
     (infix@A | Ordinal~7 enum@1).))
@@ -612,9 +601,9 @@
   (stmts@2,1
    (comment)
    (call@3,2 int~3 x@1)))
- (include@,3o "system/panics"@8)
- (include@,3q "system/dyncalls"@8)
- (func@,3s
+ (include@,3V "system/panics"@8)
+ (include@,3X "system/dyncalls"@8)
+ (func@,3Z
   (quoted@5 of@1) x .
   (typevars@A
    (typevar@1 T . . . .)
@@ -625,14 +614,14 @@
     (at@B typedesc~8 S@1).))bool@O
   (pragmas@j
    (kv@7 magic~5 "Of"@2)noSideEffect@F). .)
- (func@,3u procCall@5 x .
+ (func@,3b procCall@5 x .
   (typevars@E
    (typevar@1 T . . . .))
   (params@H
    (param@1 x . . T@3 .))untyped@8
   (pragmas@X
    (kv@7 magic~5 "ProcCall"@2)). .)
- (type@8,3x Rtti~6 x . .
+ (type@8,3e Rtti~6 x . .
   (object@2 .
    (fld~6,1 dl . . int@4 .)
    (fld~6,2 dy . .
@@ -640,14 +629,14 @@
      (at@I UncheckedArray~E uint32@1)).)
    (fld~6,3 mt . .
     (at@I UncheckedArray~E pointer@1).)))
- (func@,42 getRtti@5 . . .
+ (func@,3j getRtti@5 . . .
   (params@C
    (param@1 dummy . . pointer@7 .))
   (ptr@I Rtti@4)
   (pragmas@d nodecl@2 noinit@A).
   (stmts@y
    (discard "patched by vtables.nim"@8)))
- (type@P,45 ComparableAndNegatable~N . . .
+ (type@P,3m ComparableAndNegatable~N . . .
   (concept@2 . . .
    (stmts~N,1
     (func
@@ -659,7 +648,7 @@
      (quoted@5 \2D@1). . .
      (params@8
       (param@1 x . . Self@3 .))Self@B . . .))))
- (func@,49 abs@5 x .
+ (func@,3q abs@5 x .
   (typevars@9
    (typevar@1 T . . ComparableAndNegatable@3 .))
   (params@a
@@ -674,13 +663,13 @@
       (prefix \2D x@1)))
     (else@D
      (stmts@6 x)))))
- (template@,4D isNil@9 x . .
+ (template@,3u isNil@9 x . .
   (params@F
    (param@1 s . . cstring@3 .))bool@E . .
   (stmts@a
    (infix@2 == s~2
     (nil@3))))
- (func@,4F chr@5 x . .
+ (func@,3w chr@5 x . .
   (params@9
    (param@1 u . .
     (at@8 range~5
@@ -690,46 +679,46 @@
    (comment)
    (call@4,1 char~4
     (dot@2 u~1 int@1))))
- (include@,4J "system/formatfloat"@8)
- (include@,4L "errorcodes/errorcodes"@8)
- (var@E,4N localErr~A x
+ (include@,40 "system/formatfloat"@8)
+ (include@,42 "errorcodes/errorcodes"@8)
+ (var@E,44 localErr~A x
   (pragmas threadvar@2)ErrorCode@F .)
- (type@K,4Q ContinuationProc~I x . .
+ (type@K,47 ContinuationProc~I x . .
   (proctype@7 ....
    (params
     (param@1 coro . .
      (ptr@6 CoroutineBase@4).))Continuation@R
    (pragmas@e nimcall@2)..))
- (type@G,4R Continuation~E x . .
+ (type@G,48 Continuation~E x . .
   (object@2 .
    (fld~C,1 fn~2 x . ContinuationProc@3 .)
    (fld~B,2 env~3 x .
     (ptr@3 CoroutineBase@4).)))
- (type@H,4U CoroutineBase~F x . .
+ (type@H,4B CoroutineBase~F x . .
   (object@2 RootObj@A
    (fld~9,1 caller~6 x . Continuation@3 .)
    (fld~9,2 callee~6 x .
     (ptr@3 CoroutineBase@4).)))
- (method@,4Y cancel@7 x . .
+ (method@,4F cancel@7 x . .
   (params@E
    (param@1 coro . .
     (ptr@6 CoroutineBase@4).)). . .
   (stmts@2,1
    (discard "to override"@8)))
- (func@,4b delay@5 x . .
+ (func@,4I delay@5 x . .
   (params@B)Continuation@4
   (pragmas@S
    (kv@7 magic~5 "Delay"@2)). .)
- (func@,4g delay@5 x . .
+ (func@,4N delay@5 x . .
   (params@B
    (param@1 x . . typed@3 .))Continuation@C
   (pragmas@a
    (kv@7 magic~5 "Delay"@2)). .)
- (proc@,4k suspend@5 x . .
+ (proc@,4R suspend@5 x . .
   (params@D).
   (pragmas@G
    (kv@7 magic~5 "Suspend"@2)). .)
- (proc@,4o trivialTick@5 . . .
+ (proc@,4V trivialTick@5 . . .
   (params@G
    (param@1 c . . Continuation@3 .))Continuation@J . .
   (stmts@2,1
@@ -737,26 +726,26 @@
     (call@6
      (dot~3 c~1 fn@1)
      (dot@2 c~1 env@1)))))
- (type@D,4v Scheduler~B x . .
+ (type@D,4c Scheduler~B x . .
   (proctype@7 ....
    (params
     (param@1 c . . Continuation@3 .))Continuation@J
    (pragmas@W nimcall@2)..))
- (var@4,4y scheduler . . Scheduler@B trivialTick@N)
- (proc@,4z setScheduler@5 x . .
+ (var@4,4f scheduler . . Scheduler@B trivialTick@N)
+ (proc@,4g setScheduler@5 x . .
   (params@I
    (param@1 handler . . Scheduler@9 .)).
   (pragmas@d inline@2).
   (stmts@2,2
    (asgn@A scheduler~A handler@2)))
- (proc@,53 advance@5 x . .
+ (proc@,4k advance@5 x . .
   (params@D
    (param@1 c . . Continuation@3 .))Continuation@J . .
   (stmts@2,1
    (comment)
    (asgn@7,2 result~7
     (call@B scheduler~9 c@1))))
- (proc@,58 complete@5 x . .
+ (proc@,4p complete@5 x . .
   (params@E
    (param@1 c . . Continuation@3 .)). . .
   (stmts@2,1
@@ -768,7 +757,7 @@
     (stmts@2,1
      (asgn@2 c~2
       (call@B scheduler~9 c@1))))))
- (proc@,5K parked@5 x . .
+ (proc@,51 parked@5 x . .
   (params@C
    (param@1 c . . Continuation@3 .))bool@J
   (pragmas@a inline@2).
@@ -781,7 +770,7 @@
     (infix@A !=
      (dot~5 c~1 env@1)
      (nil@3)))))
- (proc@,5P stopping@5 x . .
+ (proc@,56 stopping@5 x . .
   (params@E
    (param@1 c . . Continuation@3 .))bool@J
   (pragmas@c inline@2).
@@ -790,7 +779,7 @@
    (infix@5,1 ==
     (dot~4 c~1 fn@1)
     (nil@3))))
- (proc@,5T finished@5 x . .
+ (proc@,5A finished@5 x . .
   (params@E
    (param@1 c . . Continuation@3 .))bool@J
   (pragmas@c inline@2).
@@ -803,7 +792,7 @@
     (infix@A ==
      (dot~5 c~1 env@1)
      (nil@3)))))
- (proc@,5d finalizeCoroutine@5 x . .
+ (proc@,5K finalizeCoroutine@5 x . .
   (params@N
    (param@1 c . .
     (mut@3 Continuation@4).)). . .
@@ -833,7 +822,7 @@
       (asgn@6,4
        (dot~5 c~1 env@1)
        (nil@2)))))))
- (func@,5x
+ (func@,5e
   (quoted@5 ==@1) x .
   (typevars@A
    (typevar@1 T . .
@@ -857,7 +846,7 @@
        (stmts@A
         (ret false@7))))))
    (ret@,3 true@7)))
- (func@,63
+ (func@,5k
   (quoted@5 ==@1) x .
   (typevars@A
    (typevar@1 T . . Equatable@3 .))
@@ -897,8 +886,8 @@
        (stmts~1,1
         (ret false@7))))))
    (ret@,C true@7)))
- (const@6,6I HexChars . . . "0123456789ABCDEF"@B)
- (func@,6K addEscapedChar@5 x . .
+ (const@6,5z HexChars . . . "0123456789ABCDEF"@B)
+ (func@,61 addEscapedChar@5 x . .
   (params@K
    (param@1 s . .
     (mut@3 string@4).)
@@ -997,7 +986,7 @@
        (at@9 HexChars~8
         (call@4 int~3
          (infix@3 and n~2 15@4)))))))))
- (func@,6z addQuoted@5 x .
+ (func@,6g addQuoted@5 x .
   (typevars@F
    (typevar@1 T . . . .))
   (params@I
@@ -1062,26 +1051,20 @@
       (call@5
        (dot~4 s~1 add@1)
        (prefix@1 $ x@1)))))))
- (type@B,7n Natural~9 x . .
-  (at@7 range~5
-   (infix@3 \2E\2E 0~2
-    (call@7 high~4 int@1))))
- (type@C,7z Positive~A x . .
-  (at@7 range~5
-   (infix@3 \2E\2E 1~2
-    (call@7 high~4 int@1))))
- (type@G,83 HSlice~E x
+ (type@B,7V Natural~9 x . . int@2)
+ (type@C,7a Positive~A x . . int@2)
+ (type@G,7e HSlice~E x
   (typevars~7
    (typevar@1 T . . . .)
    (typevar@4 U . . . .)).
   (object@2 .
    (fld~D,1 a~1 x . T@3 .)
    (fld~D,2 b~1 x . U@3 .)))
- (type@C,86 Slice~A x
+ (type@C,7h Slice~A x
   (typevars~4
    (typevar@1 T . . . .)).
   (at@8 HSlice~6 T@1 T@4))
- (func@,88
+ (func@,7j
   (quoted@5 \2E\2E@1) x .
   (typevars@A
    (typevar@1 T . . . .)
@@ -1100,7 +1083,7 @@
      (at~6 HSlice~6 T@1 U@4)
      (kv@2 a~1 a@2)
      (kv@8 b~1 b@2)))))
- (func@,8K
+ (func@,7v
   (quoted@5 \2E\2E<@1) x .
   (typevars@B
    (typevar@1 T . . Ordinal@6 .)
@@ -1120,7 +1103,7 @@
      (kv@2 a~1 a@2)
      (kv@8 b~1
       (call@6 pred~4 b@1))))))
- (func@,8S contains@5 x .
+ (func@,83 contains@5 x .
   (typevars@E
    (typevar@1 T . . Comparable@3 .))
   (params@T
@@ -1139,15 +1122,15 @@
      (par@4
       (infix@5 <
        (dot~3 s~1 b@1)x@2))))))
- (type@I,8X BackwardsIndex~G x . .
+ (type@I,88 BackwardsIndex~G x . .
   (distinct@2 int@9))
- (template@,8a
+ (template@,8B
   (quoted@9 ^@1) x . .
   (params@D
    (param@1 x . . int@3 .))BackwardsIndex@A . .
   (stmts@e
    (call@E BackwardsIndex~E x@1)))
- (template@,8d
+ (template@,8E
   (quoted@9 \5B\5D@1) x .
   (typevars@E
    (typevar@1 T . . . .))
@@ -1161,7 +1144,7 @@
     (infix@7 \2D
      (dot~5 s~1 len@1)
      (call@5 int~3 i@1)))))
- (template@,8g
+ (template@,8H
   (quoted@9 \5B\5D@1) x .
   (typevars@E
    (typevar@1 T . . . .))
@@ -1175,7 +1158,7 @@
     (infix@7 \2D
      (dot~5 s~1 len@1)
      (call@5 int~3 i@1)))))
- (template@,8j
+ (template@,8K
   (quoted@9 \5B\5D@1) x . .
   (params@E
    (param@1 s . . string@3 .)
@@ -1186,7 +1169,7 @@
     (infix@7 \2D
      (dot~5 s~1 len@1)
      (call@5 int~3 i@1)))))
- (template@,8m
+ (template@,8N
   (quoted@9 \2E\2E^@1) x . .
   (params@F
    (param@1 a . . untyped@6 .)
@@ -1195,7 +1178,7 @@
    (comment)
    (infix@2,2 \2E\2E a~2
     (prefix@3 ^ b@1))))
- (func@,8x
+ (func@,8Y
   (quoted@5 \5B\5D@1) x . .
   (params@A
    (param@1 s . . string@3 .)
@@ -1208,7 +1191,7 @@
     (call@8 substr~6 s@1
      (dot@5 x~1 a@1)
      (dot@A x~1 b@1)))))
- (func@,92
+ (func@,8d
   (quoted@5 \5B\5D@1) x . .
   (params@A
    (param@1 s . . string@3 .)
@@ -1224,7 +1207,7 @@
       (dot~5 s~1 len@1)
       (call@5 int~3
        (dot@2 x~1 b@1)))))))
- (func@,96
+ (func@,8h
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -1272,7 +1255,7 @@
         (dot~8 s~1 rawData@1)
         (infix@2 \2B a~1 i@1))))
      (cmd@,1 inc i@4)))))
- (func@,9I
+ (func@,8t
   (quoted@5 \5B\5D@1) x .
   (typevars@A
    (typevar@1 T . . . .))
@@ -1294,27 +1277,27 @@
         (dot~5 s~1 len@1)
         (call@5 int~3
          (dot@2 x~1 b@1)))))))))
- (type@E,9N TypeOfMode~C x . .
+ (type@E,8y TypeOfMode~C x . .
   (enum@2 .
    (efld~C,1 typeOfProc . . . .)
    (efld~C,2 typeOfIter . . . .)))
- (proc@,9R typeof@5 x . .
+ (proc@,92 typeof@5 x . .
   (params@C
    (param@1 x . . untyped@3 .)
    (param@D mode . . . typeOfIter@7))typedesc@X
   (pragmas@s
    (kv@7 magic~5 TypeOf@2)). .)
- (proc@,9U allocFrame@5 x . .
+ (proc@,95 allocFrame@5 x . .
   (params@G
    (param@1 size . . int@6 .))
   (ptr@D CoroutineBase@4). .
   (stmts@2,1
    (comment)
-   (asgn@7,J result~7
+   (asgn@7,1 result~7
     (cast@2
      (ptr@5 CoroutineBase@4)
-     (call@U alloc0~6 size@1)))))
- (proc@,9q deallocFrame@5 x . .
+     (call@T alloc~5 size@1)))))
+ (proc@,99 deallocFrame@5 x . .
   (params@I
    (param@1 frame . .
     (ptr@7 CoroutineBase@4).)). . .
@@ -1327,31 +1310,9 @@
       (nil@3))
      (stmts~1,1
       (call@7 dealloc~7 frame@1))))))
- (type@D,9w Exception~B x . .
+ (type@D,9F Exception~B x . .
   (object@2 RootObj@A
    (fld~8,1 msg~3 x . string@3 .)))
- (var@9,9z exc~5 x
+ (var@9,9I exc~5 x
   (pragmas threadvar@2)
-  (ref@F Exception@4).)
- (proc@,A1 newException@5 x .
-  (typevars@I
-   (typevar@1 T . . . .))
-  (params@L
-   (param@1 exceptn . .
-    (at@H typedesc~8 T@1).)
-   (param@N message . . string@9 .))
-  (ref@f T@4)
-  (pragmas@16 inline@2 untyped@A).
-  (stmts@2,1
-   (comment)
-   (call@3,2 new~3 result@1)
-   (asgn@B,3
-    (dot~5 result~6 msg@1)message@2)))
- (proc@,A7 instantiationInfo@5 x . .
-  (params@N)
-  (tuple@4
-   (kv@A filename string@A)
-   (kv@S line int@6)
-   (kv@d column int@8))
-  (pragmas@1D
-   (kv@7 magic~5 "InstantiationInfo"@2)). .))
+  (ref@F Exception@4).))
