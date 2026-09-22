@@ -182,14 +182,14 @@ fi
 # committed. Regenerate them here with `TEMEN_NIFLER_EMIT_ASSET=1` when the module or a fixture drifts.
 if [ "${TEMEN_NIFLER_EMIT_ASSET:-0}" = 1 ]; then
   echo "=== [6/6] emit committed asset + fixtures (TEMEN_NIFLER_EMIT_ASSET=1) ==="
-  gzip -9 -c "$CACHE/nifler.temen" > "$REPO/browser/web/assets/nifler.temen.gz"
+  gzip -9 -n -c "$CACHE/nifler.temen" > "$REPO/browser/web/assets/nifler.temen.gz"
   echo "  browser/web/assets/nifler.temen.gz $(stat -c%s "$REPO/browser/web/assets/nifler.temen.gz") B (from $(stat -c%s "$CACHE/nifler.temen") B raw)"
   # The child-entry variant, for the op-13 toolchain-free gate (`tests/nifler_child_asset.rs`, if present).
   # Only when step 5b actually validated it — see TEMEN_NIFLER_SKIP_CE above.
   if [ "${TEMEN_NIFLER_SKIP_CE:-0}" = 1 ]; then
     echo "  nifler_ce.temen.gz NOT emitted (step 5b was skipped, so it is unvalidated)"
   else
-    gzip -9 -c "$CACHE/nifler_ce_raw.temen" > "$HERE/nifler_ce.temen.gz"
+    gzip -9 -n -c "$CACHE/nifler_ce_raw.temen" > "$HERE/nifler_ce.temen.gz"
     echo "  nifler_ce.temen.gz $(stat -c%s "$HERE/nifler_ce.temen.gz") B (from $(stat -c%s "$CACHE/nifler_ce_raw.temen") B raw)"
   fi
   mkdir -p "$HERE/expected"

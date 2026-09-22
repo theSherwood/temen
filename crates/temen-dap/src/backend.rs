@@ -521,6 +521,28 @@ pub struct BytecodeBackend {
     /// `Ladder` (unbounded) keyed on the turn; the ladder itself is the same type the tree-walker and
     /// the reactor timeline use (`temen_interp::moment`, #1460).
     checkpoints: Ladder,
+    /// Whether the **undo journal** (#1556) is armed on the live run — the backward half of time
+    /// travel, beside the checkpoint ladder's forward half.
+    ///
+    /// On by default because the measured cost is now small: `journal_cost` puts an armed session at
+    /// **1.0×–1.6×** of an unarmed one and the retained history at **0.02%–5.4%** of the window across
+    /// gradient / mandelzoom / forth / chibicc. In exchange `step_back` undoes in ~0.1 ms instead of
+    /// rebuilding the run and replaying to the target — 422× and 556× cheaper on forth and chibicc
+    /// respectively, and that gap widens with session length, because undo does not care how far from
+    /// a checkpoint the target is.
+    ///
+    /// Cleared the first time a run turns out not to be journalable, exactly as `checkpointing` is:
+    /// the replay `seek` is always available and is what serves those sessions.
+    journaling: bool,
+
+    /// How many backward steps this session served by **undo** and by **replay**, respectively.
+    ///
+    /// A fallback path that silently never fires is indistinguishable from one that always does, and
+    /// the whole point of the journal is which of the two served the step. `backward_counts` exposes
+    /// it so a test can assert the wiring is live rather than merely harmless.
+    undo_steps: usize,
+    replay_steps: usize,
+
     /// Whether checkpointing is still active. Cleared (and the ladder dropped) the first time a stride
     /// boundary falls outside the [`ScheduledDebugRun::snapshot`] subset (a
     /// fiber/coroutine/§14-child seam, a non-pristine memory layout, or a host that grew unrestorable
@@ -624,6 +646,11 @@ impl BytecodeBackend {
             &parked_cap,
             &tape,
         )?;
+        // Arm the undo journal on the live run from the first turn — `step_back` can only undo history
+        // it recorded, so arming lazily would leave the first stretch of every session on the replay
+        // path. `fresh()` arms each rebuild the same way.
+        let mut run = run;
+        run.set_journal_armed(true);
         Some(BytecodeBackend {
             run,
             module,
@@ -645,6 +672,9 @@ impl BytecodeBackend {
             rev_trace: None,
             checkpoints: Ladder::new(CHECKPOINT_STRIDE, 0, 0),
             checkpointing: true,
+            journaling: true,
+            undo_steps: 0,
+            replay_steps: 0,
             access_sink: None,
             sched_trace: false,
             seed,
@@ -662,6 +692,27 @@ impl BytecodeBackend {
         self.access_sink = Some(sink);
     }
 
+    /// Arm or disarm the **undo journal** for this session (#1556). On by default; turning it off
+    /// puts every backward step back on the rebuild-and-replay `seek`, which is what served them
+    /// before the journal existed and remains the fallback for anything undo declines.
+    pub fn set_journaling(&mut self, on: bool) {
+        self.journaling = on;
+        self.run.set_journal_armed(on);
+    }
+
+    /// Replace the journal's retention policy (#1558) for this session — how much history stays at
+    /// level 1, the byte ceiling past which the oldest is dropped, and the continuation stride.
+    pub fn set_journal_policy(&mut self, policy: temen_interp::journal::JournalPolicy) {
+        self.run.set_journal_policy(policy);
+    }
+
+    /// `(backward steps served by undo, by replay)` — test/introspection hook (#1556). The journal
+    /// serves a `step_back` whose target it holds; everything else falls through to the rebuild-and-
+    /// replay `seek`, which is always available.
+    pub fn backward_counts(&self) -> (usize, usize) {
+        (self.undo_steps, self.replay_steps)
+    }
+
     /// Number of time-travel checkpoints currently in the ladder — test/introspection hook (mirrors
     /// `Inspector::checkpoint_count`). `0` for a run not yet seeked far enough to lay one down, or one
     /// outside the checkpointable subset (an event-parked fiber, a mid-invoke task, a non-pristine
@@ -674,8 +725,46 @@ impl BytecodeBackend {
     /// (recording + replaying `tape`) when `self.powerbox`, else deny-all, with the schedule seed —
     /// the base a reverse `seek`/rev-trace probe re-drives from, so a re-executed powerbox run sees
     /// identical cap inputs.
+    /// Go back to global turn `t` — by **undo** when the journal holds it, else by the `seek` replay.
+    ///
+    /// The journal (#1556) makes the backward step incremental: it puts the window back from its
+    /// pre-images and the continuation from the nearest segment boundary, in place, instead of
+    /// rebuilding the run and re-driving it from the nearest checkpoint. Everything a rebuild has to
+    /// re-install — breakpoints, the access sink, the trace tape, forced switches, recorded writes,
+    /// the watches — is simply still installed, because the run object never went away. That is most
+    /// of why undo is the cheaper path, and all of why it is the *simpler* one.
+    ///
+    /// Falls through to `seek` whenever the journal declines: a turn outside the recorded history, one
+    /// whose pre-images the byte budget dropped, or a run outside the invertible subset (a stateful
+    /// capability, a mid-invoke task, an event-parked fiber). Undo never half-rewinds — it declines
+    /// and `seek` serves, which is the same fail-closed rule the journal keeps internally.
+    fn rewind_to(&mut self, t: u64) -> Stop {
+        if !self.journaling || !self.run.can_undo_to(t) {
+            self.replay_steps += 1;
+            return self.seek(t);
+        }
+        if !self.run.undo_to(t) {
+            self.replay_steps += 1;
+            return self.seek(t);
+        }
+        self.undo_steps += 1;
+        // The undo re-executed the tail of a segment, so the run may be sitting on a breakpoint op
+        // again; arm the skip so a forward `continue` makes progress instead of re-reporting it. The
+        // same thing `seek` does after its replay.
+        if let Some(pc) = self.run.frame_pc(0) {
+            if self.breakpoints.contains(&pc) {
+                self.run.arm_breakpoint_skip();
+            }
+        }
+        // No `capture_tape` here, unlike `seek`: undo runs no *new* ground. The turns it re-executes
+        // already happened once and their cap crossings are already in the tape — that is exactly what
+        // `undo_to` re-serves them from.
+        self.apply_watches();
+        self.step_stop()
+    }
+
     fn fresh(&self) -> Option<ScheduledDebugRun> {
-        build_run(
+        let run = build_run(
             &self.module,
             self.func,
             &self.args,
@@ -688,7 +777,13 @@ impl BytecodeBackend {
             &self.host_caps,
             &self.parked_cap,
             &self.tape,
-        )
+        );
+        // A rebuilt run carries the journal too, so a `seek` backward leaves a session that can then
+        // `step_back` by undo rather than by another rebuild.
+        run.map(|mut r| {
+            r.set_journal_armed(self.journaling);
+            r
+        })
     }
 
     /// Drive a freshly rebuilt (and possibly checkpoint-restored) `run` forward to global turn `t`,
@@ -937,8 +1032,9 @@ impl Debuggee for BytecodeBackend {
             .rev()
             .find(|(c, d)| *c < now && *d <= now_depth)
             .map_or(0, |(c, _)| *c);
-        self.seek(target)
+        self.rewind_to(target)
     }
+
     fn seek(&mut self, t: u64) -> Stop {
         let mut fuel = self.fuel;
         // Rebuild a fresh run and replay `t` turns — the schedule is deterministic, so this reproduces

@@ -34,6 +34,12 @@ temen-wasm-jit = { path = "../crates/temen-wasm-jit" } # backend 4, fuzzed for c
 wasmi = { version = "0.47", features = ["simd"] }
 
 [[bin]]
+name = "trap_walk"
+path = "fuzz_targets/trap_walk.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "opt_ssa_roundtrip"
 path = "fuzz_targets/opt_ssa_roundtrip.rs"
 test = false

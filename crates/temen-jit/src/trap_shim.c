@@ -19,6 +19,7 @@
 #define _GNU_SOURCE
 #include <setjmp.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +37,11 @@ static _Thread_local volatile uintptr_t g_hi = 0;
  * here, while the guest stack is intact: a siglongjmp unwinds back onto the same stack the post-fault
  * host code then reuses, so the frames would be gone by the time the host could walk them. */
 extern void temen_store_trap_frame(uintptr_t pc, uintptr_t fp);
+/* The walk's own recovery (#1487). It reads the guest's stack, and the guest chooses what is in it, so
+ * a planted frame link can steer it onto an unmapped page. `temen_walk_in_progress` says this thread is
+ * mid-walk; `temen_walk_abort` returns to the walk's recovery point with the backtrace truncated. */
+extern int temen_walk_in_progress(void);
+extern void temen_walk_abort(void);
 
 /* Memory-fault capture: extract the faulting (pc, fp) from the signal ucontext and hand off the walk.
  * Async-signal-safe: only the ucontext read + the (stack-reading, TLS-writing) store. */
@@ -83,6 +89,15 @@ static void temen_chain(struct sigaction *old, int sig, siginfo_t *info, void *u
 
 static void temen_handler(int sig, siginfo_t *info, void *uc) {
     uintptr_t addr = (uintptr_t)info->si_addr;
+    /* Our own backtrace walk faulted (#1487). This test comes **first**, before the arming and range
+     * tests: by the time the walk runs we have already cleared `g_armed`, so the nested fault would
+     * otherwise fall through to `temen_chain` → `SIG_DFL` → `raise` and kill the host on what was a
+     * recoverable guest fault. Nor would keeping `g_armed` set across the walk do: that only recovers
+     * a walk fault landing inside `[g_lo, g_hi)`, and it would re-enter `siglongjmp(g_buf)` from a
+     * half-written capture. Unwind the walk instead; the guest's original trap is reported below on
+     * the way out, with whatever frames the walk had published. */
+    if (temen_walk_in_progress())
+        temen_walk_abort(); /* does not return */
     /* SIGILL = the confinement bounds-check trap (Cranelift `trapnz` → `ud2`/`udf`, the memory-fault
      * lowering, DESIGN.md §4/§5). Unlike a guard-page SIGSEGV, `si_addr` is the faulting *instruction*
      * PC (in JIT code), not a window data address, so the [lo,hi) range test does not apply: an
@@ -106,8 +121,21 @@ static void temen_handler(int sig, siginfo_t *info, void *uc) {
     temen_chain(sig == SIGBUS ? &g_old_bus : &g_old_segv, sig, info, uc);
 }
 
-/* Install the handler once (idempotent enough for a std::sync::Once caller). */
+/* Install the handler. **Idempotent, and it has to be**: `sigaction` hands back the *previous*
+ * disposition, so a second install saves our own handler as `g_old_*`, and `temen_chain` then calls
+ * `temen_handler` from `temen_handler` — an unkillable spin on the first fault we decline, which is
+ * far worse than the crash it replaces.
+ *
+ * `mem.rs`'s `install_guard` orders the real call behind a `std::sync::Once`, which is what makes the
+ * install itself well-defined; the test-and-set here is so that a *direct* caller (a second one, or
+ * two at once) cannot reach the self-chaining state. A loser returns without waiting: under the
+ * `Once` there are no losers, and for a caller outside that contract "possibly not installed yet" is
+ * a far better failure than an unkillable spin. */
+static atomic_flag g_installed = ATOMIC_FLAG_INIT;
+
 void temen_install_trap_handler(void) {
+    if (atomic_flag_test_and_set(&g_installed))
+        return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = temen_handler;

@@ -1074,7 +1074,8 @@ links, a span backstop, a 64-frame cap — so a corrupt chain terminates, async-
   `trap_capture.c` thread-local across the resume seam (`temen_set_current_fiber`, save/restore-bracketed
   around `(*fib).resume` exactly like the durable shadow-SP swap — stack-disciplined for nested
   resumes), and every capture path stashes it: unix memory-fault (`temen_store_trap_frame`) + explicit
-  (`temen_capture_explicit_trap`) read it directly, the Windows VEH snapshots it (`temen_current_fiber`).
+  (`temen_capture_explicit_trap`) read it directly; the Windows VEH gets it for free now that its
+  memory-fault capture goes through the same C helper.
   It rides through `take_trap_frame` → the `Domain` handoff → `CompiledModule::last_trap_fiber()`
   (`Some(handle)` for a fiber, `Some(-1)` for the root, `None` on a clean run), and the kill message
   names it (`… [fiber N] …`). Captured *at the trap instant*, so migration can't misattribute it — the
@@ -1134,6 +1135,36 @@ so div-by-zero / `unreachable` / `OutOfFuel` / indirect-call-type traps capture 
 (ISSUES I5 — **resolved**, `windows-latest` confirmed green). Per-fiber naming under work-stealing
 migration (ISSUES I6) landed as Stage 4 above (`temen_set_current_fiber` / `last_trap_fiber()`,
 `jit_per_fiber_trap.rs`).
+
+**The walk carries its own fault recovery (#1487).** Its loop bounds the *arithmetic* — aligned,
+non-null, strictly-increasing links, an 8 MiB span, the frame cap — but nothing there establishes that
+a link is **mapped**, and nothing can: the walk reads the guest's own stack and the guest chooses what
+is in it. The bad link is not hypothetical — the JIT entry trampoline spills `mem_base` into a frame
+slot, so where the walk steps out of guest frames it can read the *window base*, whose first page is
+the `PROT_NONE` null guard. That fault used to kill the **host**: on unix the walk runs from the
+SIGSEGV handler *after* it has disarmed, so the nested fault fell through to `SIG_DFL`. A best-effort
+backtrace must never be able to take down the run it describes, still less hand a guest an
+availability break on the confinement *recovery* path. So `temen_guarded_walk` brackets the walk
+(`sigsetjmp` on unix, `__try`/`__except` under MSVC) and each trap detector asks
+`temen_walk_in_progress()` **before** its own range test and stands down; the capture publishes `pc`,
+the fiber and each frame *as it goes*, so an aborted walk yields a truncated backtrace rather than
+none. Bounding the walk to the thread's stack instead would be wrong here: fibers switch stacks, and
+`g_current_fiber` exists precisely so a trap is attributed across that seam — the clamp would silently
+truncate every backtrace taken on a fiber.
+
+The walk is fuzzed (`fuzz/fuzz_targets/trap_walk.rs`, `cargo +nightly fuzz run trap_walk`) against the
+property the bracket exists for: for *arbitrary* chain contents the host survives, the walk terminates,
+and the capture stays within the frame cap. Arbitrary is the right input because the guest writes its
+own stack. Measured at ~3% of executions taking a recovered fault, so the target reaches the path it
+gates rather than passing trivially.
+
+**The recovery is unix-only for now, and windows still keeps two walks.** The VEH's memory-fault
+capture has its own Rust `walk_fp_chain` and its own capture thread-locals, while explicit traps go
+through the C helper — one behaviour, two paths (INVARIANTS #15), so the guard above reaches only the
+second of them there. Collapsing the two (routing the VEH's capture through `temen_store_trap_frame`,
+as unix does) was tried and reverted: it aborts `pal_guard_catches_tail_fault_not_in_window` with
+`0xc0000005` under `cargo nextest` — one process per test — while the *same commit* passes all 25 lib
+tests under `cargo test`, where they share a process. That difference is the lead; #1575 carries it.
 
 ---
 
@@ -2360,6 +2391,70 @@ byte_budget }` is applied once per op; it is deliberately static, and a later ad
 fixed values for computed ones at the same call sites without changing the shape. A compaction is
 never revisited.
 
-Open: wiring journal-backed `step_back` into the DAP backend, DURABILITY.md **R4** (§13 shared-region
-edges — a design call, since a `Backed`/`SharedRegion` page has writers the journal cannot see), and
-real-program cost measurements (the bail criteria on #1557).
+**Measured, and the measurement moved the design.** `cargo run --release -p temen-run --example
+journal_cost` runs real guests on the debug engine armed and unarmed and reports the #1556 bail
+criteria. The first run said the journal cost **124.9×** on chibicc and **13.4×** on forth — far past
+any defensible factor. Turning per-op state capture off and re-running attributed **94%** and **83%**
+of that to one thing: a `ScheduledContinuation` clone per op, whose cost scales with **frame depth**,
+not with the window. #1556 had said not to do that — *"the continuation is snapshotted at segment
+boundaries rather than inverted per-op"* — and the first implementation did it per op anyway.
+
+`JournalPolicy::state_stride` is that boundary, and `undo_to(t)` now restores the nearest boundary at
+or before `t` and re-executes the remainder (bounded by the stride, using `tick`, which honours no
+breakpoint or watch checks because this is re-execution of turns that already happened). Window
+pre-images stay per-op, so the window is exact at every turn and only the continuation needs the short
+replay. At the chosen stride of 256:
+
+**What the intra-segment replay rests on, and why it is not a new bet.** Re-executing to reach `t`
+needs those turns to run the same way twice — but that is the assumption reverse debugging has always
+made, not one the journal introduces. `seek` replays too, from turn 0 or the nearest ladder rung
+(stride 1024); undo replays at most `state_stride` (256). Same premise, strictly less of it, and
+`dap_checkpoints.rs`'s warm≡cold oracle is the standing test of it. It is in fact the *weaker* form:
+`seek` re-derives state by rebuilding a run from scratch, while undo restores a cloned continuation in
+the same process, so anything that could differ between a rebuilt run and the original is never
+re-derived at all.
+
+What holds it up:
+
+- **Pure compute, one op per turn, lowest-index-runnable** — `tick`'s contract, and the debug engine is
+  the interpreter: JIT tier-up is never enabled on it, so a replay never crosses tiers.
+- **Nondeterministic inputs are recorded, not re-derived.** `is_recorded_input` covers `CLOCK`, stream
+  reads and `HOST_PROC`; `undo_to` arms `replay_cap_tape` *before* restoring the host cursor, so
+  re-execution re-serves the taped answers instead of calling a live closure
+  (`undoing_across_cap_calls_re_serves_the_recorded_inputs`).
+- **What cannot be recorded fails closed** — `Host::journal_invertible`: the §3.6 serve queue (it
+  drains, so it is not append-only), a capability's opaque declared state, a mid-invoke task, an
+  event-parked fiber. Those journal no state entry, `can_undo_to` declines, and `seek` serves.
+
+**Floats are not a hazard here, and it is worth saying why rather than assuming it.** The IR's scalar
+float unops are `abs`/`neg`/`sqrt`, all IEEE-754 correctly rounded and therefore bit-exact; there are
+**no transcendentals** (`sin`/`cos`/`exp`/`pow`/`log`) anywhere in the interpreter, which is where
+implementation-defined results would otherwise come from. FMA is an explicit op lowered to `mul_add` —
+the correctly-rounded IEEE FMA — not a compiler contraction, so there is no "did it fuse this time"
+question. NaN payloads are *preserved* rather than canonicalized, and deterministically so:
+`temen-opt`'s constant folder is pinned bit-for-bit against the interpreter including payloads and the
+wasm min/max/nearest rules (DESIGN.md §20c, the peval const-folder's coverage list).
+
+Three things *would* break it, none of which this path does: replaying on a different binary or
+machine (an in-process undo is immune; a **serialized** moment is not, which is a constraint on the §12
+codec and #1459 rather than here), adding a libm-backed float op to the IR or enabling fast-math/FTZ
+(which would break `seek` identically — worth a note on the IR if transcendentals ever land), and the
+parallel driver's real races, which #1454 already records as capture-only.
+
+| guest | slowdown | level 2 held | vs window | undo vs replay |
+| --- | --- | --- | --- | --- |
+| gradient (bulk framebuffer) | 1.23× | 13.9 KiB | 5.43% | — |
+| mandelzoom | 1.00× | 0.1 KiB | 0.02% | 7× |
+| forth (real interpreter) | 1.23× | 3.1 KiB | 0.31% | **422×** |
+| chibicc (real compiler) | 1.62× | 13.4 KiB | 0.66% | **556×** |
+
+Both bail criteria pass: the level-2 bound holds everywhere (a compacted segment is never worse than
+the snapshot it replaces), and the slowdown is 1.0–1.6×. Journaling is armed by default in the DAP
+backend on that basis, and `backward_counts()` reports which path served each backward step so the
+wiring cannot silently stop being used.
+
+Open: DURABILITY.md **R4** (§13 shared-region edges — a design call, since a `Backed`/`SharedRegion`
+page has writers the journal cannot see); a byte budget below one `state_stride` of writes leaves every
+anchor under the floor and turns undo off quietly rather than shortening it (#1558); and the
+level-2 measured bound against #1459's per-moment page-scan cost, which #1556 asks for and which needs
+#1459 to exist first.

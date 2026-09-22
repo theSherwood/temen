@@ -32,23 +32,64 @@ pub fn a_module() -> temen_ir::Module {
 /// the authority to be *named* by another capability's op. Such a row is still swept (see
 /// [`PROBE_BEYOND`]): the claim is that nothing reaches either gate, which is worth failing on
 /// rather than assuming.
+/// Real argument values a row's ops need, as `(op, argument index, value)` — see [`Row::mint`].
+pub type RealArgs = Vec<(u32, usize, i64)>;
+
+/// Mint a row's powerbox and handle, plus the real argument values its ops need.
+pub type Mint = Box<dyn Fn() -> (Host, i32, RealArgs)>;
+
 pub struct Row {
     pub cap: Capability,
     pub iface: u32,
     pub ops: &'static [u32],
-    pub mint: Box<dyn Fn() -> (Host, i32)>,
+    /// Mint the powerbox and this row's handle, **plus** any real argument values its ops need —
+    /// `(op, argument index, value)`. Built by [`rows`]; most rows return an empty vec.
+    ///
+    /// Real values have to come from the mint rather than a constant, because a handle's numeric
+    /// value is whatever the grant table hands out. Hardcoding one produces a *forged* handle that
+    /// every driver rightly rejects — which looks like agreement while the interesting path goes
+    /// untested. (#1570 was exactly that: with a forged module handle the two drivers agreed, and
+    /// with a real one they did not.)
+    ///
+    /// The sweep otherwise passes **zeros**, which is deliberate: a `-EINVAL` or a trap is a
+    /// serviced answer, so zeros are enough to ask "can this driver run this op at all". They are
+    /// *not* enough to ask "do the drivers agree about a **valid** call", because a zero handle is
+    /// forged and every driver rightly rejects it before reaching the interesting code. #1570 is
+    /// exactly that trap: op 13's drivers agreed on a forged module handle while disagreeing about a
+    /// real one, so a zeros-only probe would have scored the cell green over a live divergence.
+    pub mint: Mint,
 }
+
+/// `instantiate_module_named`'s argument slots the probe fills with real values: the `Module` handle
+/// (argument 0) and a `size_log2` matching that module's declared memory (argument 5). Arguments 1
+/// and 2 are `grants_ptr`/`grants_n`, and 3/4/6 are entry/off/quota, which zeros suit.
+///
+/// With zeros in both of these the call dies at its handle resolve (`CapFault`), so the admission
+/// path where the drivers differed (#1570) went untested. With them, the sweep reaches admission and
+/// the two drivers' answers are comparable. It does not reach a *completed* spawn with a non-empty
+/// grant list — that needs records planted in the parent window — so the column's claim is agreement
+/// through admission, which is where the divergence was.
+pub const OP13_MODULE_ARG: usize = 0;
+pub const OP13_SIZE_LOG2_ARG: usize = 5;
+/// The declared memory of [`a_module`], the module the probe grants.
+pub const PROBE_MODULE_SIZE_LOG2: i64 = 15;
 
 /// How far past a no-op capability's (empty) interface to probe when checking that nothing on it
 /// reaches either gate.
 pub const PROBE_BEYOND: u32 = 4;
 
 pub fn rows() -> Vec<Row> {
-    let row = |cap, iface, ops, mint| Row {
-        cap,
-        iface,
-        ops,
-        mint,
+    // Most rows need no real argument values: wrap a plain `(Host, handle)` mint.
+    let row = |cap, iface, ops, mint: Box<dyn Fn() -> (Host, i32)>| -> Row {
+        Row {
+            cap,
+            iface,
+            ops,
+            mint: Box::new(move || {
+                let (h, x) = mint();
+                (h, x, Vec::new())
+            }),
+        }
     };
     use temen_ir::cap_id as c;
     vec![
@@ -118,16 +159,27 @@ pub fn rows() -> Vec<Row> {
         // The spawn family: instantiate/join (0/1), the module spawns (5/13), child_offer (14),
         // instantiate_detached (15), instantiate_rec (17). The coroutine variants (6/7) are the
         // legacy residue the lowering rejects wholesale.
-        row(
-            Capability::Instantiator,
-            c::INSTANTIATOR,
-            &[0, 1, 5, 6, 7, 13, 14, 15, 17],
-            Box::new(|| {
+        Row {
+            cap: Capability::Instantiator,
+            iface: c::INSTANTIATOR,
+            ops: &[0, 1, 5, 6, 7, 13, 14, 15, 17],
+            // op 13 (`instantiate_module_named`) takes a real `Module` handle in argument
+            // `OP13_MODULE_ARG`; with the sweep's zero there it never gets past its handle resolve,
+            // so the valid-handle path where the drivers differed (#1570) went untested.
+            mint: Box::new(|| {
                 let mut h = Host::new();
                 let x = h.grant_instantiator(0, 1 << 16);
-                (h, x)
+                let modh = h.grant_module(&a_module());
+                (
+                    h,
+                    x,
+                    vec![
+                        (13, OP13_MODULE_ARG, modh as i64),
+                        (13, OP13_SIZE_LOG2_ARG, PROBE_MODULE_SIZE_LOG2),
+                    ],
+                )
             }),
-        ),
+        },
         row(
             Capability::ModuleLoader,
             c::MODULE_LOADER,
@@ -197,17 +249,43 @@ pub fn probe_module(iface: u32, op: u32, argc: usize) -> temen_ir::Module {
     probe_module_typed(iface, op, argc, "i64")
 }
 
+/// [`probe_module_typed`] with `overrides` replacing individual zero arguments — `(index, value)`
+/// pairs from a [`Row::real_args`] entry. See that field for why zeros alone are not enough.
+pub fn probe_module_with(
+    iface: u32,
+    op: u32,
+    argc: usize,
+    result: &str,
+    overrides: &[(usize, i64)],
+) -> temen_ir::Module {
+    build_probe(iface, op, argc, result, overrides)
+}
+
 /// [`probe_module`] with the call's declared **result type** chosen by the caller. The lowering's
 /// arms are keyed by `(type_id, op)` *and* the call signature, so an op whose real result is `i32`
 /// is not reached by an `i64`-returning call — it falls through to the generic dispatch, which for
 /// some interfaces is rejected at compile time rather than at the call. A sweep that fixes the
 /// result type therefore mistakes "miscalled" for "unsupported".
 pub fn probe_module_typed(iface: u32, op: u32, argc: usize, result: &str) -> temen_ir::Module {
+    build_probe(iface, op, argc, result, &[])
+}
+
+fn build_probe(
+    iface: u32,
+    op: u32,
+    argc: usize,
+    result: &str,
+    overrides: &[(usize, i64)],
+) -> temen_ir::Module {
     let mut body = String::new();
     let mut args = String::new();
     let mut params = String::new();
     for i in 0..argc {
-        body.push_str(&format!("  va{i} = i64.const 0\n"));
+        let v = overrides
+            .iter()
+            .find(|(idx, _)| *idx == i)
+            .map_or(0, |(_, v)| *v);
+        body.push_str(&format!("  va{i} = i64.const {v}\n"));
         if i > 0 {
             args.push_str(", ");
             params.push_str(", ");

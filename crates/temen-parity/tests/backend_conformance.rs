@@ -32,7 +32,7 @@
 
 mod support;
 use std::ffi::c_void;
-use support::capability_probe::{probe_module_typed, rows, Row, MAX_ARGC, PROBE_BEYOND};
+use support::capability_probe::{probe_module_with, rows, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::{bytecode, Host, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
@@ -74,8 +74,16 @@ fn verdict(out: Result<Vec<Value>, Trap>) -> Verdict {
 }
 
 /// The tree-walk interpreter — the oracle (DESIGN §3): its answers define the axis.
-fn oracle(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str) -> Verdict {
-    let m = probe_module_typed(iface, op, argc, res);
+fn oracle(
+    mut host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     let mut fuel = 1_000_000u64;
     verdict(temen_interp::run_with_host(
         &m,
@@ -87,8 +95,16 @@ fn oracle(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &s
 }
 
 /// The bytecode interpreter, held bit-exact against the oracle.
-fn bytecode(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str) -> Verdict {
-    let m = probe_module_typed(iface, op, argc, res);
+fn bytecode(
+    mut host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     let mut fuel = 1_000_000u64;
     match bytecode::compile_and_run_with_host(&m, 0, &[Value::I32(handle)], &mut fuel, &mut host) {
         None => Verdict::Declined, // outside the bytecode subset — folds to the oracle
@@ -97,8 +113,16 @@ fn bytecode(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: 
 }
 
 /// The Cranelift JIT, driven through the reference host trampoline an embedder supplies.
-fn cranelift(mut host: Host, handle: i32, iface: u32, op: u32, argc: usize, res: &str) -> Verdict {
-    let m = probe_module_typed(iface, op, argc, res);
+fn cranelift(
+    mut host: Host,
+    handle: i32,
+    iface: u32,
+    op: u32,
+    argc: usize,
+    res: &str,
+    real: &[(usize, i64)],
+) -> Verdict {
+    let m = probe_module_with(iface, op, argc, res, real);
     // SAFETY: `cap_thunk`'s contract — `ctx` is a live `*mut Host` that outlives the run below.
     let out = temen_jit::compile_and_run_with_host(
         &m,
@@ -129,8 +153,16 @@ fn shapes() -> impl Iterator<Item = (usize, &'static str)> {
 fn divergences(row: &Row, op: u32) -> Vec<(String, &'static str, Verdict, Verdict)> {
     let mut out = Vec::new();
     for (argc, res) in shapes() {
-        let (h, x) = (row.mint)();
-        let want = oracle(h, x, row.iface, op, argc, res);
+        let (h, x, real) = (row.mint)();
+        // Real argument values this row declares for `op` (see `Row::mint`): a handle the sweep's
+        // zeros cannot stand in for, because a zero handle is forged and never reaches the code a
+        // backend could actually differ in.
+        let real: Vec<(usize, i64)> = real
+            .iter()
+            .filter(|(o, _, _)| *o == op)
+            .map(|(_, idx, v)| (*idx, *v))
+            .collect();
+        let want = oracle(h, x, row.iface, op, argc, res, &real);
         // The oracle found no arm: the harness miscalled this shape, so there is nothing to compare.
         if want == Verdict::Miscalled {
             continue;
@@ -138,12 +170,12 @@ fn divergences(row: &Row, op: u32) -> Vec<(String, &'static str, Verdict, Verdic
         for (name, run) in [
             (
                 "bytecode",
-                bytecode as fn(Host, i32, u32, u32, usize, &str) -> Verdict,
+                bytecode as fn(Host, i32, u32, u32, usize, &str, &[(usize, i64)]) -> Verdict,
             ),
             ("cranelift", cranelift),
         ] {
-            let (h, x) = (row.mint)();
-            let got = run(h, x, row.iface, op, argc, res);
+            let (h, x, _) = (row.mint)();
+            let got = run(h, x, row.iface, op, argc, res, &real);
             // Declining is conforming: the backend folded to the oracle (invariant 9).
             if got == Verdict::Declined || got == want {
                 continue;
@@ -245,7 +277,7 @@ fn join_traps_differently_on_the_oracle_and_the_cranelift_thunk() {
 fn the_wasm_jit_declines_every_capability_call() {
     for row in rows() {
         let op = row.ops.first().copied().unwrap_or(0);
-        let m = probe_module_typed(row.iface, op, 0, "i64");
+        let m = probe_module_with(row.iface, op, 0, "i64", &[]);
         assert!(
             temen_wasm_jit::compile_module(&m).is_err(),
             "{}: the wasm-JIT emitted a module containing `call.cap` — if it now emits cap calls, \

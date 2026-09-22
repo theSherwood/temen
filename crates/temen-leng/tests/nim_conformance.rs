@@ -468,7 +468,12 @@ const FIXTURES: &[Fixture] = &[
         // exceptions: `raise <ErrorCode>` in a `{.raises.}` routine, caught by `except ErrorCode`.
         // `ErrorCode`/`ValueError` are `include`d into `system`, so no import. (#980)
         feature: "exceptions (raise/try/except)",
-        source: "proc mayFail(x: int): int {.raises.} =\n  if x < 0: raise ValueError\n  else: x * 2\nproc safe(x: int): int =\n  try: mayFail(x)\n  except ErrorCode: -1\nlet r = safe(21)\n",
+        // Statement-form `if`, not `if x < 0: raise ValueError else: x * 2`: that expression form
+        // does not compile under nimony v0.6.2 — nimsem's `xelim` cannot type an `if` whose branch
+        // `raise`s and aborts (#1589). Upstream, and it never reaches Leng, so it would read here as
+        // a frontend gap in a feature that in fact works. `tests/nim_diff/exceptions.nim` took the
+        // same shape for the same reason.
+        source: "proc mayFail(x: int): int {.raises.} =\n  if x < 0:\n    raise ValueError\n  result = x * 2\nproc safe(x: int): int =\n  try: mayFail(x)\n  except ErrorCode: -1\nlet r = safe(21)\n",
         expected: 42,
         // Runs (#980): hexer lowers `raise`/`try`/`except` to the error-flag model — a proc that can
         // raise returns a `(ErrorCode, value)` tuple; the caller branches on the code and `jmp`s to the

@@ -282,7 +282,9 @@ jobs:
       # nested paged scalar page check with the page-op bounce serviced on a real vCPU, #1151), live_mapped
       # (interp⇄wasm-JIT mask-only tier over a guest-shaped window: the emitted bound reads the driver-synced
       # live "mapped" global, #810) and pagestate (interp⇄wasm-JIT paged tier over randomized multi-run page
-      # tables, #810), and the durable freeze/thaw family (interp + JIT). Keep this list in lockstep with
+      # tables, #810), trap_walk (the trap-time backtrace walk's own fault recovery, #1487 — its input is the
+      # guest's stack, so arbitrary contents must terminate and must not take the host down with them),
+      # and the durable freeze/thaw family (interp + JIT). Keep this list in lockstep with
       # fuzz/fuzz_targets/*.rs.
       matrix:
         target:
@@ -298,6 +300,7 @@ jobs:
             roundtrip,
             onramp_diff,
             opt_sccp,
+            trap_walk,
             opt_ssa_roundtrip,
             coverage_walk,
             paged_walk,

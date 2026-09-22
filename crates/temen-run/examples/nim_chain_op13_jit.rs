@@ -166,6 +166,11 @@ fn grant_fs(host: &mut Host, factory: &Arc<impl Fn() -> HostProc + Send + Sync +
     host.grant_host_proc_forkable(init, fork)
 }
 
+/// Exit code for "this engine cannot run this workload" — distinct from success (0) and from a real
+/// failure (1), so `build_frontend.sh` can skip the diff instead of comparing against a file that was
+/// never produced.
+const SKIP_EXIT: i32 = 3;
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let nimsem_p = a.next().expect(
@@ -219,7 +224,28 @@ fn main() {
         .collect();
 
     // ---- Phase 1: nimsem (op-13 JIT child, exec re-granted) — semcheck the system module. -------------
-    let nimsem_carve = (nimsem.memory.unwrap().size_log2 as u32 + 3).max(28); // 256 MiB (no-GC peak)
+    let nimsem_carve = temen_run::nim_phase_carve_log2(nimsem.memory.unwrap().size_log2 as u32);
+    // The reference JIT caps a window at `MAX_JIT_WINDOW_LOG2`; a phase carve of `n` needs a parent
+    // window of `n + 1`. When the phase outgrows that, say so and stop — the alternative is an
+    // `Unsupported` panic that takes `build_frontend.sh` down with it under `set -e`, and with it the
+    // `nim_driver_guest` asset rebuild, for a step that cannot run on this engine either way.
+    //
+    // It is not a regression: below the cap the phase exhausts its carve instead (measured — at a
+    // 256 MiB carve this driver reports `Trapped(MemoryFault)`). The JIT's own comment sized the cap
+    // for a "(128, 256] MiB" peak that is now 2043 MiB. See #1591.
+    if nimsem_carve + 1 > temen_jit::MAX_JIT_WINDOW_LOG2 as u32 {
+        eprintln!(
+            "SKIP nim_chain_op13_jit: the phase needs a 2^{nimsem_carve} carve (parent 2^{}), over \
+             the reference JIT's 2^{} window cap — see #1591",
+            nimsem_carve + 1,
+            temen_jit::MAX_JIT_WINDOW_LOG2,
+        );
+        // Exit **3**, not 0: a caller that cannot tell "skipped" from "succeeded" will go on to diff
+        // an output that was never written and report a byte difference — which is what happened,
+        // and it left the asset rebuild just as blocked as the panic did. `build_frontend.sh` reads
+        // this code.
+        std::process::exit(SKIP_EXIT);
+    }
     let win1 = 1u64 << (nimsem_carve + 1);
     let mut h1 = Host::new();
     let fs1 = grant_fs(&mut h1, &factory);
@@ -260,7 +286,7 @@ fn main() {
     );
 
     // ---- Phase 2: hexer (op-13 JIT child) — lower the .s.nif nimsem just wrote into the shared store. --
-    let hexer_carve = (hexer.memory.unwrap().size_log2 as u32 + 3).max(28); // system module lowering peaks high (no GC)
+    let hexer_carve = temen_run::nim_phase_carve_log2(hexer.memory.unwrap().size_log2 as u32);
     let mut h2 = Host::new();
     let fs2 = grant_fs(&mut h2, &factory);
     let out2 = h2.grant_stream(StreamRole::Out);

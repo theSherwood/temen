@@ -34,14 +34,14 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `PipeEnd` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
-| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | 🚧 | ❔ | 🔶 |
+| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | ❔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ❔ | ✅ |
-| `Module` | ✅ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `Module` | ✅ | 🔶 | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `ModuleLoader` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `JitCode` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `Blocking` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
-| `HostProc` | 🔶 | ⛔ | ✅ | ❔ | ✅ | ❔ | ✅ |
+| `HostProc` | 🔶 | 🔶 | ✅ | ❔ | ✅ | ❔ | ✅ |
 | `Offer` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `LiveImpl` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 
@@ -60,14 +60,13 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
 - *backend* 🚧 — join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)
-- *concurrency* 🚧 — child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)
 - *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**
 - *nesting* ⛔ — index-carrying: the child is granted a sub-budget by split/transfer, not the handle
 
 **`Module`**
-- *durability* ⛔ — NonDurableKind::Module — re-granted by the embedder after restore
+- *durability* 🔶 — durable iff the grant is attested freezable (#1361): the artifact carries the §4 content digest and the restoring host re-grants the module. An un-attested grant is still NonDurableKind::Module
 
 **`ModuleLoader`**
 - *nesting* ⛔ — not in `can_regrant`: a child that may mint modules must be granted one explicitly
@@ -82,7 +81,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`HostProc`**
 - *nesting* 🔶 — only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot
-- *durability* ⛔ — NonDurableKind::HostProc — the host closure cannot be serialized
+- *durability* 🔶 — durable iff the grant carries a registered **name** (#1455): the closure cannot be serialized, but the name is a reconstruction rule the thaw's registrar acts on. An unnamed one is still NonDurableKind::HostProc
 
 **`Offer`**
 - *durability* ⛔ — NonDurableKind::Offer — an out-of-line reference to the offering domain

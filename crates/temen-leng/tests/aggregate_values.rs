@@ -82,3 +82,43 @@ fn real_nimony_oconstr() {
     assert_eq!(run(&m, 0, &[sp, 3, 4]), 7);
     assert_eq!(run(&m, 0, &[sp, 100, 200]), 300);
 }
+
+#[test]
+fn array_literal_indexed_by_a_runtime_value() {
+    // #760: `[10, 20, 30][i]` — a constant array literal in *lvalue* position, indexed by a
+    // runtime value. hexer emits exactly this for table lookups (`lifter.nim` does
+    // `addParLe(c.dest, [ParLe, ParRi][k])`), and it was the first construct standing between
+    // hexer and the pure no-C path: `lvalue_addr`'s `at` arm recursed into a base that is not an
+    // lvalue. There is no object to address, so the literal materializes into a frame temp.
+    //
+    // Indexing is by a *parameter*, not a constant, so constant-folding cannot turn this back
+    // into the `var a = [...]` case `array_constructor_then_index` already covers.
+    let leng = "\
+(stmts
+ (type :Arr3.0. . (array (i +64) 3))
+ (proc :pick.0 (params (param :i.0 . (i +64))) (i +64) .
+  (stmts .
+   (ret (at (aconstr Arr3.0. 10 20 30) i.0)))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    let sp = 20480;
+    assert_eq!(run(&m, 0, &[sp, 0]), 10);
+    assert_eq!(run(&m, 0, &[sp, 1]), 20);
+    assert_eq!(run(&m, 0, &[sp, 2]), 30);
+}
+
+#[test]
+fn object_literal_field_read_without_a_local() {
+    // The `dot` sibling of the above: an object constructor in lvalue position, never bound to a
+    // local. Same materialization path, different accessor — pinned so a future narrowing of the
+    // `aconstr` arm to arrays alone fails here rather than silently regressing `oconstr`.
+    let leng = "\
+(stmts
+ (type :Pt.0. . (object . (fld :x.0 . (i +64)) (fld :y.0 . (i +64))))
+ (proc :gety.0 (params (param :b.0 . (i +64))) (i +64) .
+  (stmts .
+   (ret (dot (oconstr Pt.0. (kv x.0 7) (kv y.0 b.0)) y.0 0)))))";
+    let m = temen_leng::translate(leng).unwrap_or_else(|e| panic!("translate: {e}"));
+    let sp = 20480;
+    assert_eq!(run(&m, 0, &[sp, 42]), 42);
+    assert_eq!(run(&m, 0, &[sp, -5]), -5);
+}

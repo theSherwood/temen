@@ -50,9 +50,12 @@
 //! of *answers*, not of refusals: the op-15 gap #1531 closed was a driver returning a different
 //! value, not refusing, so a column that only asked "does it trap" would have scored it `Full`.
 //!
-//! Its first rendering found one: `child_offer` answers `-EINVAL` on the coop driver and traps on
-//! the parallel one (#1566). The same four rows that need a live unit or peer stay `Unaudited` here
-//! as on the debugger column.
+//! Its first rendering found two, both on the `Instantiator` row, and both are now fixed:
+//! `child_offer` answered `-EINVAL` on the coop driver and trapped on the parallel one (#1566), and
+//! op 13 declined *every* spawn on the parallel driver with `Trap::Malformed` while never binding
+//! its child's import manifest (#1570). Both drivers now share one child-host build, so the row is
+//! `Full`. The same four rows that need a live unit or peer stay `Unaudited` here as on the debugger
+//! column.
 //!
 //! The remaining three axes are populated as their predicates become locatable; until then their
 //! cells read `Unaudited`, which is the point — an unaudited cell is visible, countable, and cannot
@@ -264,11 +267,6 @@ const K: Cell = Cell {
     status: Status::Full,
     note: "",
 };
-/// The one concurrency-axis gap the column's first rendering found (#1566): `child_offer` (op 14)
-/// answers `-EINVAL` on the cooperative driver and **traps** `ThreadFault` on the parallel one, so a
-/// guest probing a stale child handle survives on one driver and dies on the other — INVARIANTS #5
-/// (errors are values) and #9 (refuse probeably, never diverge). A `NotYet`, not a `Declines`: the
-/// op works, the two drivers disagree about how it fails.
 /// `Full` on the **backend** axis: every engine that runs cap calls answers as the oracle does.
 /// `tests/backend_conformance.rs` drives each of the row's ops on the tree-walk oracle, the bytecode
 /// tier and Cranelift (through `temen_run::cap_thunk`, the reference host trampoline) and compares
@@ -289,11 +287,6 @@ const JOIN_TRAP_DIVERGES: Cell = Cell {
     status: Status::NotYet,
     note:
         "join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)",
-};
-
-const CHILD_OFFER_DIVERGES: Cell = Cell {
-    status: Status::NotYet,
-    note: "child_offer (op 14) answers -EINVAL on the coop driver and traps on the parallel one (#1566)",
 };
 
 const fn declines(note: &'static str) -> Cell {
@@ -368,7 +361,7 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             F,
             JOIN_TRAP_DIVERGES,
             U,
-            CHILD_OFFER_DIVERGES,
+            K,
             U,
             conditional(
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \
@@ -390,11 +383,17 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             U,
             F],
 
-        // An immutable instantiable artifact: shared into the child (FORK.md §8.6), but its host-side
-        // registration cannot be serialized, so the embedder re-grants after restore.
+        // An immutable instantiable artifact: shared into the child (FORK.md §8.6). Durable only when
+        // the granting host attested it **freezable** (§4) — then the artifact names it by content
+        // digest and the restoring host re-grants the bytes (#1361).
         Capability::Module => [
             F,
-            declines("NonDurableKind::Module — re-granted by the embedder after restore"),
+            Cell {
+                status: Status::Conditional,
+                note: "durable iff the grant is attested freezable (#1361): the artifact carries the \
+                       §4 content digest and the restoring host re-grants the module. An un-attested \
+                       grant is still NonDurableKind::Module",
+            },
             B,
             U,
             K,
@@ -439,7 +438,12 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
                 status: Status::Conditional,
                 note: "only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot",
             },
-            declines("NonDurableKind::HostProc — the host closure cannot be serialized"),
+            Cell {
+                status: Status::Conditional,
+                note: "durable iff the grant carries a registered **name** (#1455): the closure \
+                       cannot be serialized, but the name is a reconstruction rule the thaw's \
+                       registrar acts on. An unnamed one is still NonDurableKind::HostProc",
+            },
             B,
             U,
             K,

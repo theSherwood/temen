@@ -291,7 +291,7 @@ fn a_grown_durable_guest_survives_freeze_serialize_restore_resume() {
         &mut thost,
         false, // bytes already restored into the backing — do not re-init data segments
         rreserved,
-        Some(&entries),
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &entries).as_ref(),
     );
     assert_eq!(
         thawed.expect("resume runs to completion"),

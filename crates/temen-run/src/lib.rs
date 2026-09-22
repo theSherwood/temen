@@ -154,6 +154,7 @@ const CLI_JIT_TABLE_LOG2: u8 = 10;
 /// PROCESS.md S1b/S1c — a teardown guard for the canonical-key futex region registry: forgets every
 /// mapping in `[base, base+reserved)` when dropped (the recorder closure that owns it is held for the
 /// run and released at teardown), so a reused window virtual address never inherits a stale identity.
+/// It runs *after* the window's reservation is released, which is the race #1608 is open on.
 struct WindowRegionPurge {
     base: u64,
     reserved: u64,
@@ -2249,6 +2250,12 @@ locked_parent_hook!(
     (budget: i32, bytes: u64) -> i32
 );
 locked_parent_hook!(
+    budget_mem_give_locked,
+    budget_mem_give,
+    (budget: i32, bytes: u64) -> ()
+);
+locked_parent_hook!(lane_give_locked, lane_give, (lane: i64) -> ());
+locked_parent_hook!(
     premap_admit_locked,
     premap_admit,
     (region: i32, child_off: u64, child_size: u64, trap_out: *mut i64) -> i32
@@ -2328,7 +2335,21 @@ impl CapCtx {
 /// a shared `Arc<Mutex<Host>>`), so they are the same function either way.
 pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
     let locked = ctx.is_locked();
+    // D66 — the parent's lane coordinates, read now (before any guest runs) so a carve child's task
+    // is gated on its parent's lane without a hook call at every spawn.
+    // SAFETY: `ctx` is the live parent host in the shape it declares (the contract of this fn).
+    let (parent_domain, parent_lane_cap) = unsafe {
+        match ctx {
+            CapCtx::Raw(h) => ((*h).domain_id(), (*h).lane_cap()),
+            CapCtx::Locked(m) => {
+                let g = (*m).lock().unwrap_or_else(|e| e.into_inner());
+                (g.domain_id(), g.lane_cap())
+            }
+        }
+    };
     temen_jit::GrantChildHooks {
+        parent_domain,
+        parent_lane_cap,
         build: if locked {
             grant_child_build_locked
         } else {
@@ -2349,6 +2370,12 @@ pub fn production_grant_hooks(ctx: CapCtx) -> temen_jit::GrantChildHooks {
         } else {
             budget_mem_take
         },
+        budget_mem_give: if locked {
+            budget_mem_give_locked
+        } else {
+            budget_mem_give
+        },
+        lane_give: if locked { lane_give_locked } else { lane_give },
         premap_admit: if locked {
             premap_admit_locked
         } else {
@@ -2420,6 +2447,8 @@ pub unsafe extern "C" fn grant_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -2429,6 +2458,10 @@ pub unsafe extern "C" fn grant_child_build(
                 as_handle,
                 grant_handle: cg,
                 jit_table_log2,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }
@@ -2890,7 +2923,8 @@ fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
     }
     let base = mem_base as u64;
     // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
-    // so a later run reusing the virtual address never inherits a stale region identity.
+    // so a later run reusing the virtual address never inherits a stale region identity. NOTE this
+    // runs *after* the window's reservation is released, which is the race #1608 is open on.
     let purge = WindowRegionPurge {
         base,
         reserved: mem_reserved,
@@ -2992,7 +3026,30 @@ pub unsafe extern "C" fn premap_apply(
 /// `ctx` is the live `*mut Host` (the cap thunk's parent host).
 pub unsafe extern "C" fn budget_mem_take(ctx: *mut c_void, budget: i32, bytes: u64) -> i32 {
     let parent = &mut *(ctx as *mut Host);
-    i32::from(parent.budget_mem_take(budget, bytes))
+    // D66 — the same one-call admission the interpreter engines use (`Host::admit_detached_spawn`):
+    // the funding budget's lane is reserved against the parent's Σ and its `mem` taken, or neither.
+    // The lane rides to the builder that follows (`Host::pending_child_lane`) and comes back through
+    // [`lane_give`] when the child-domain executor reaps the task.
+    i32::from(parent.admit_detached_spawn(budget, bytes).is_some())
+}
+
+/// D66 — a reaped detached child returns its lane to the parent ([`temen_jit::LaneGiver`]).
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn lane_give(ctx: *mut c_void, lane: i64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.give_lane(lane);
+}
+
+/// #1587 — the undo of [`budget_mem_take`] for a spawn that failed after the take
+/// ([`temen_jit::BudgetMemGiver`]): return `bytes` to `budget` on the parent `Host`.
+///
+/// # Safety
+/// `ctx` is the live `*mut Host` (the cap thunk's parent host).
+pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u64) {
+    let parent = &mut *(ctx as *mut Host);
+    parent.budget_mem_give(budget, bytes);
 }
 
 /// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative
@@ -3066,6 +3123,11 @@ unsafe fn finish_child_build(
             child.set_epoch_cell(parent.epoch_cell());
             // #1296 — the table reservation a re-granted `Jit` carried into the child (0 ⇒ none).
             let jit_table_log2 = child.jit_table_log2();
+            // D66 — the lane chain the executor gates this child's dispatch on: the child's own
+            // `(domain, cap)` (the cap `admit_detached_spawn` reserved and `spawn_detached_child`
+            // stamped) under the parent's.
+            let (domain, lane_cap) = (child.domain_id(), child.lane_cap());
+            let (parent_domain, parent_lane_cap) = (parent.domain_id(), parent.lane_cap());
             let shared = std::sync::Arc::new(Mutex::new(child));
             let retained = std::sync::Arc::clone(&shared);
             *out = temen_jit::GrantChild {
@@ -3075,6 +3137,10 @@ unsafe fn finish_child_build(
                 as_handle,
                 jit_table_log2,
                 grant_handle: 0,
+                domain,
+                lane_cap,
+                parent_domain,
+                parent_lane_cap,
             };
             1
         }
@@ -4985,6 +5051,400 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
+/// How a retained nimony syscall import is served — the **one** table for the no-C (Leng) bottom
+/// edge, consulted both by the binder and by anything reporting unbound leaves.
+///
+/// They were two: a binder matching `write`/`open` then a prefix chain, and a probe carrying its own
+/// hardcoded list. Teaching one about a newly served leaf left the other reporting it unbound — the
+/// second route through one behaviour that INVARIANTS #15 is about.
+#[derive(Clone, Copy, Debug)]
+pub enum NimImport {
+    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
+    Stdout,
+    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
+    /// file operation, and the compute shim's `{ return }` stub made `quit` a no-op, so every nim
+    /// CLI error path ran on past the `quit` that should have ended it.
+    Exit,
+    /// `temen_leng`'s `POSIX_OPEN_ADAPTER` forward: a bare `open` taking the `(ptr, len, flags)` the
+    /// op wants. Binding C's `open` directly reads the flags word as the path length.
+    Open,
+    /// A retained nimony syscall leaf → the matching `temen_posix` op.
+    Posix(u32),
+}
+
+/// Which [`NimImport`] serves `name`, or `None` if nothing does.
+pub fn nim_import_binding(name: &str) -> Option<NimImport> {
+    Some(match name {
+        "write" => NimImport::Stdout,
+        "open" => NimImport::Open,
+        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
+        // the shim's allocator handed it.
+        "read" => NimImport::Posix(temen_posix::OP_READ),
+        // The path-ABI adapter's other forwards (#1595): nim writes files atomically, so a file
+        // write is write-temp + rename, with an unlink on the failure path.
+        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
+        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
+        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
+        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
+        // read at the declared `st_mode`/`st_size` offsets answers garbage, so `fileExists` is false
+        // for every file and a compiler cannot find its own inputs.
+        "statp" => NimImport::Posix(temen_posix::OP_STATP),
+        n if n.starts_with("cExitSys") => NimImport::Exit,
+        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
+        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
+        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
+        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
+        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
+        n if n.starts_with("chdir") => NimImport::Posix(temen_posix::OP_CHDIR),
+        // #1595: `memfiles.open` sizes a mapping with `fstat`, so a 0-returning stub made every
+        // mapped file look empty.
+        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
+        _ => return None,
+    })
+}
+
+/// Bind every retained import of a no-C nim module to one shared **POSIX personality**, returning
+/// the [`Imports`] and the personality itself (so a caller reads back stdout, or a file the guest
+/// wrote). Unserved names are returned rather than panicked on — a caller that wants them fatal can
+/// say so, and a probe reporting "unbound leaves" wants the list.
+pub fn nim_posix_imports(
+    module: &Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+) -> (Imports, Vec<String>) {
+    let _ = posix;
+    let mut imports = Imports::new();
+    let mut unbound = Vec::new();
+    for imp in &module.imports {
+        let Some(kind) = nim_import_binding(&imp.name) else {
+            unbound.push(imp.name.clone());
+            continue;
+        };
+        let cap = match kind {
+            NimImport::Stdout => HostCap::stdout(),
+            NimImport::Exit => HostCap::exit(),
+            NimImport::Open => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+            }
+            NimImport::Posix(op) => {
+                let make = std::sync::Arc::clone(&make);
+                HostCap::host_proc(op, move || (*make)())
+            }
+        };
+        imports = imports.provide(imp.name.clone(), cap);
+    }
+    (imports, unbound)
+}
+
+/// **Run one no-C nimony phase** over a shared POSIX personality, with `argv`.
+///
+/// The single route every no-C driver takes: bind the module's retained imports with
+/// [`nim_posix_imports`], refuse if any name is unserved, instantiate, and run with `argv` as the
+/// guest's argument vector. `module` is taken by value because instantiation consumes it, and a
+/// caller running the same phase twice must hand over a fresh copy on purpose — a second run inside
+/// one instance would see the first run's globals and heap, which for a compiler phase is not a
+/// rerun at all.
+///
+/// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
+/// and the trap alone does not.
+pub fn nim_noc_run(
+    module: Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    argv: &[String],
+) -> Result<(), String> {
+    let (imports, unbound) = nim_posix_imports(&module, posix, make);
+    if !unbound.is_empty() {
+        return Err(format!(
+            "unbound nimony imports (extend `nim_import_binding`): {unbound:?}"
+        ));
+    }
+    let cfg = RunConfig {
+        limits: Limits {
+            fuel: None,
+            ..Limits::default()
+        },
+        args: argv.iter().map(|a| a.as_bytes().to_vec()).collect(),
+        ..RunConfig::default()
+    };
+    let inst =
+        instantiate_with_imports(module, imports).map_err(|e| format!("instantiate: {e}"))?;
+    inst.run(Backend::TreeWalk, &cfg).map_err(|e| {
+        let err = posix.stderr();
+        if err.is_empty() {
+            format!("run failed: {e}")
+        } else {
+            format!(
+                "run failed: {e}\n--- guest stderr ---\n{}",
+                String::from_utf8_lossy(&err)
+            )
+        }
+    })?;
+    Ok(())
+}
+
+/// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.
+///
+/// A faithful port of `nimony/src/gear2/modnames.nim`'s `moduleSuffix`: the first three characters
+/// of the module name, then `uhash` of the *shortest* spelling of the path rendered in base 36,
+/// least-significant digit first. `uhash` (`nimony/src/lib/tinyhashes.nim`) is a Jenkins
+/// one-at-a-time over `u32`, deliberately independent of nim's own `hash` because the value ends up
+/// inside NIF files.
+///
+/// **Why we need it.** nimsem does not take dependency `.p.nif` files by name; it computes the stem
+/// and looks for that file. Seeding a `nimcache` produced by a native run does not line up, because
+/// the stem is a hash of the *path* and the two runs see different path layouts — the finding that
+/// closed off the "just stage the cache" idea in #1609. Computing it here means a driver can write
+/// the file nimsem will actually ask for.
+///
+/// `search_paths` mirrors nimony's `--path` list: the shortest of the given spelling and each
+/// `<search>/`-stripped one wins, exactly as `moduleSuffix` picks the shortest `relativePath`. Only
+/// the prefix case is handled — a path outside every search path keeps the spelling it came in with,
+/// where nim would render a `../` walk. Every layout a seeded memfs produces is a prefix case, and a
+/// wrong stem is visible immediately (nimsem re-parses) rather than silently wrong.
+pub fn nim_module_suffix(path: &str, search_paths: &[&str]) -> String {
+    /// `tinyhashes.uhash` — mix each byte, then finish. All arithmetic wraps at 32 bits.
+    fn uhash(s: &str) -> u32 {
+        let mut h: u32 = 0;
+        for &c in s.as_bytes() {
+            h = h.wrapping_add(c as u32);
+            h = h.wrapping_add(h << 10);
+            h ^= h >> 6;
+        }
+        h = h.wrapping_add(h << 3);
+        h ^= h >> 11;
+        h.wrapping_add(h << 15)
+    }
+    const BASE36: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+
+    let mut f = path;
+    for sp in search_paths {
+        let sp = sp.trim_end_matches('/');
+        if let Some(rest) = path
+            .strip_prefix(sp)
+            .and_then(|r| r.strip_prefix('/'))
+            .filter(|r| r.len() < f.len())
+        {
+            f = rest;
+        }
+    }
+    let name = f.rsplit('/').next().unwrap_or(f);
+    let stem = name.rsplit_once('.').map_or(name, |(base, _)| base);
+
+    let mut out: String = stem.chars().take(3).collect();
+    let mut id = uhash(f);
+    while id > 0 {
+        out.push(BASE36[(id % 36) as usize] as char);
+        id /= 36;
+    }
+    out
+}
+
+/// Every `<stem>.x.nif` (Leng) module under `dir`, as `(stem, text)`, recursing into build
+/// subdirectories. Deduplicated by stem, first one wins.
+pub fn collect_x_nif(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_x_nif(&p, out);
+        } else if let Some(stem) = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".x.nif"))
+        {
+            if out.iter().all(|(s, _)| s != stem) {
+                if let Ok(bytes) = std::fs::read(&p) {
+                    out.push((
+                        stem.to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// Narrow a shared `nimcache`'s modules to the closure of **one** program, named by the source path
+/// it was built from (`src_rel`, e.g. `src/nimony/nimsem.nim`).
+///
+/// An in-tree `nimcache` accumulates the modules of *every* program ever built there, and nimony
+/// takes no `--nimcache`. Linking all of them is wrong twice over: two `main`s are a
+/// `DuplicateSymbol("main")`, and the foreign modules that come with them are dead weight whose
+/// cross-module references need not resolve in this program.
+///
+/// nimony writes one `<stem>.c` per module into the program's own build directory
+/// (`nimcache/<program stem>/`), so that directory's `.c` stems are exactly this program's closure —
+/// which drops the foreign modules *and* their `main`s together, one rule instead of a
+/// duplicate-`main` hack that leaves the rest of the foreign program in the link.
+///
+/// The program module is the one carrying `main` **whose own `.x.nif` names `src_rel` in its line
+/// info** — not the newest. `nimony c` is cached, so a run whose output is already up to date
+/// rewrites nothing and mtime then names whichever program was built last: a hexer probe and a
+/// nifler2 probe would both select hexer, and the nifler2 run would silently link hexer's closure.
+///
+/// Falls back to newest-by-mtime when nothing names `src_rel`, and to "keep that one `main`, sweep
+/// the rest" when the build directory is absent (an older toolchain, or a layout change) — imprecise
+/// rather than wrong. Returns the reason when it falls back, for the caller to report.
+pub fn nim_program_closure(
+    nimcache: &std::path::Path,
+    src_rel: &str,
+    mods: &mut Vec<(String, String)>,
+) -> Option<String> {
+    let mains: Vec<usize> = mods
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, src))| src.contains("(exportc \"main\")"))
+        .map(|(i, _)| i)
+        .collect();
+    if mains.is_empty() {
+        return None;
+    }
+    let by_src = mains.iter().copied().find(|&i| mods[i].1.contains(src_rel));
+    let note = by_src
+        .is_none()
+        .then(|| format!("no program module names `{src_rel}` — falling back to newest `main`"));
+    let keep = by_src.unwrap_or_else(|| {
+        *mains
+            .iter()
+            .max_by_key(|&&i| {
+                std::fs::metadata(nimcache.join(format!("{}.x.nif", mods[i].0)))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .expect("a newest program module")
+    });
+    let keep_stem = mods[keep].0.clone();
+    let own: std::collections::HashSet<String> = std::fs::read_dir(nimcache.join(&keep_stem))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".c"))
+                .map(|s| s.to_string())
+        })
+        .collect();
+    if own.is_empty() {
+        let drop: Vec<usize> = mains.into_iter().filter(|&i| i != keep).collect();
+        for i in drop.into_iter().rev() {
+            mods.remove(i);
+        }
+        return Some(format!(
+            "no build dir for `{keep_stem}` — keeping that `main` only"
+        ));
+    }
+    mods.retain(|(stem, _)| *stem == keep_stem || own.contains(stem));
+    note
+}
+
+/// The window `size_log2` an op-13 **nimony phase child** (nimsem, hexer) needs for its carve.
+///
+/// A child carve is a **hard** ceiling. `Mem::nested_view` builds `Window::sub(.., 1 << size_log2)`
+/// with mapped == reserved, so unlike a top-level run — which gets `DEFAULT_RESERVED_LOG2` (1 TiB)
+/// of reserved tail to grow into — a child cannot grow one byte past what it was given. Guess low
+/// and the phase dies partway through real work.
+///
+/// **Measured** (#1591), sweeping the op-13 nimsem child over nimony's system semcheck:
+///
+/// | carve | outcome |
+/// |---|---|
+/// | 256 MiB | fault at `0x10003f10` (+16144 past the end) |
+/// | 512 MiB | fault at `0x20010460` (+66656) |
+/// | 1 GiB | fault at `0x40000000` (+0) |
+/// | 2 GiB | joined 0, output byte-identical (path-normalized) to native |
+///
+/// Those numbers were taken against a guest built with `-d:useMalloc`, which made Nim bypass its own
+/// allocator and send every object to the on-ramp's `synth_malloc` — whose `free` is a no-op, so the
+/// peak was total allocation *churn* rather than the live set. That flag existed to dodge a crash in
+/// `rawDealloc` that was really an unaligned `mmap` (#1595's bug in a second shim). With the
+/// alignment fixed and the flag dropped, the same work peaks at **666 MiB** instead of 2007 MiB, for
+/// byte-identical output — so the floor is 30 (1 GiB), the first power of two that clears it.
+///
+/// Worth stating why the measurement came first: raising a constant until a failure stops is how a
+/// leak gets buried. Here the top-level run and the op-13 child agreed at every step, which is what
+/// said the child wasted nothing — and what left the allocator as the only remaining explanation.
+///
+/// **One floor, not six.** This formula was copied into `nimsem_child_driver`, `nim_chain_op13`
+/// (twice), `nim_chain_op13_jit` (twice) and `nim_link_fs_asset`, each with its own comment
+/// asserting its own peak, and each went stale independently — `nim_chain_op13`'s pair still said
+/// "256 MiB (no-GC peak)" while the phase it sized had long outgrown it, which is what made
+/// `build_frontend.sh` step 6 trap. A number that must be re-measured when the allocator moves can
+/// only live in one place (INVARIANTS #15).
+///
+/// `TEMEN_NIM_PHASE_SL` overrides the floor, for re-measuring. (It replaces the narrower
+/// `TEMEN_NIMSEM_CHILD_SL`, which named only one of the phases that share this budget.)
+pub fn nim_phase_carve_log2(declared_size_log2: u32) -> u32 {
+    /// The measured floor; see the table above. 1 GiB clears the 666 MiB peak.
+    const FLOOR: u32 = 30;
+    let floor = std::env::var("TEMEN_NIM_PHASE_SL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(FLOOR);
+    // `+3` keeps the carve comfortably above whatever the module itself declares, for the phases
+    // whose declared window is already large.
+    (declared_size_log2 + 3).max(floor)
+}
+
+/// Append a trap-time backtrace, and the address the guest faulted on, to a trap message — innermost
+/// frame first. An empty trace leaves the message untouched, so an engine that records none says
+/// nothing rather than printing a bare header.
+///
+/// `bt` and `fault` are **passed in**, not read from
+/// [`temen_interp::last_capture_backtrace`]/[`temen_interp::last_capture_fault_addr`] here: those
+/// thread-locals describe the last *interpreter* run, and a formatter that reaches for them itself
+/// would decorate a JIT trap with a stale trace from some earlier run. The caller knows which run it
+/// is reporting; this only formats.
+///
+/// Public so an op-13 child driver can report its child's trap the same way a top-level run does
+/// (#1591) — the child's frames and its own window-relative address, named from the child's module.
+pub fn with_backtrace(
+    msg: String,
+    bt: &[temen_interp::IrPc],
+    fault: Option<u64>,
+    m: &Module,
+) -> String {
+    if bt.is_empty() {
+        return msg;
+    }
+    const FRAMES: usize = 12; // the innermost frames are the useful ones; a deep stack is noise
+                              // Name each frame from the module's export table where it can. A linked nim program exports its
+                              // procs under their global names, so most frames resolve to a real symbol — "func 10309" alone
+                              // is a number, `sysFatal.0.sysvq0asl` is a lead.
+    let name_of = |f: u32| -> String {
+        m.exports
+            .iter()
+            .find(|e| e.func == f)
+            .map(|e| format!(" `{}`", e.name))
+            .unwrap_or_default()
+    };
+    let mut out = msg;
+    if let Some(addr) = fault {
+        out.push_str(&format!(
+            "\n--- faulting address: {addr:#x} (window-relative) ---"
+        ));
+    }
+    out.push_str("\n--- guest backtrace (innermost first) ---");
+    for pc in bt.iter().take(FRAMES) {
+        out.push_str(&format!(
+            "\n  func {}{} block {} inst {}",
+            pc.func,
+            name_of(pc.func),
+            pc.block,
+            pc.inst
+        ));
+    }
+    if bt.len() > FRAMES {
+        out.push_str(&format!("\n  … {} more frames", bt.len() - FRAMES));
+    }
+    out
+}
+
 fn trap_err_with_output(msg: String, stdout: &[u8], stderr: &[u8]) -> String {
     const TAIL: usize = 8192; // last N bytes — a runaway guest can produce a lot; the tail is the useful part
     let tail = |b: &[u8]| -> String {
@@ -5253,6 +5713,48 @@ fn run_jit(
 /// the tree-walker for modules the engine doesn't lower (matching `TreeWalk` exactly there). Shared by
 /// [`Instance::run`] and the [`Instance::run_diff`] oracle so both seed args identically.
 fn run_interp(
+    backend: Backend,
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: Option<&[u8]>,
+    host: &mut Host,
+) -> Result<Vec<Value>, Trap> {
+    run_interp_traced(backend, m, func, args, fuel, init_mem, host).0
+}
+
+/// [`run_interp`], plus the **trap-time backtrace** (innermost frame first) when the engine records
+/// one. A bare `MemoryFault` on a large guest is nearly unactionable — "it faulted somewhere in
+/// 10,554 functions" — and the JIT path has folded its backtrace into the error since it was
+/// written while the interpreter path dropped it on the floor. Only the tree-walk arm carries one
+/// today; every other arm returns an empty trace rather than pretending to have one.
+fn run_interp_traced(
+    backend: Backend,
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: Option<&[u8]>,
+    host: &mut Host,
+) -> (Result<Vec<Value>, Trap>, Vec<temen_interp::IrPc>) {
+    if let (Backend::TreeWalk, None) = (backend, init_mem) {
+        let (r, bt, _fiber) = temen_interp::run_with_host_traced(m, func, args, fuel, host);
+        return (r, bt);
+    }
+    let r = run_interp_untraced(backend, m, func, args, fuel, init_mem, host);
+    // The seeded-memory arm is the one that matters in practice: `RunConfig::init_mem` is `Some`
+    // whenever the guest has argv or env, so every real program takes it. Its backtrace comes back
+    // through `last_capture_backtrace`, read immediately after the run it describes.
+    let bt = if matches!(backend, Backend::TreeWalk) && init_mem.is_some() {
+        temen_interp::last_capture_backtrace()
+    } else {
+        Vec::new()
+    };
+    (r, bt)
+}
+
+fn run_interp_untraced(
     backend: Backend,
     m: &Module,
     func: FuncIdx,
@@ -6254,10 +6756,11 @@ impl Instance {
         } else {
             backend
         };
+        let mut trap_bt: Vec<temen_interp::IrPc> = Vec::new();
         let folded = match backend {
             Backend::TreeWalk | Backend::Bytecode => {
                 let mut fuel = config.limits.fuel.unwrap_or(DEFAULT_FUEL);
-                let r = run_interp(
+                let (r, bt) = run_interp_traced(
                     backend,
                     m,
                     0,
@@ -6266,6 +6769,7 @@ impl Instance {
                     init_mem.as_deref(),
                     &mut host,
                 );
+                trap_bt = bt;
                 outcome_from_interp(r)
             }
             Backend::Jit => match run_jit(m, &[], &mut host, &config.limits, init_mem.as_deref()) {
@@ -6280,7 +6784,7 @@ impl Instance {
             Ok(o) => o,
             Err(e) => {
                 return Err(trap_err_with_output(
-                    e,
+                    with_backtrace(e, &trap_bt, temen_interp::last_capture_fault_addr(), m),
                     &host.stdout_bytes(),
                     &host.stderr_bytes(),
                 ))
@@ -6291,6 +6795,50 @@ impl Instance {
             stdout: host.take_stdout(),
             stderr: host.take_stderr(),
         })
+    }
+
+    /// Build a **debug run** of the powerbox entry, over the same granted `Host` that
+    /// [`run_with_caps`](Instance::run_with_caps) would build — same capability set, same names, same
+    /// quota and handoff, and the same argv/env blob seeded at `module_args_base`.
+    ///
+    /// This is what makes the debug engine usable on a *real* guest rather than on hand-written test
+    /// modules. #1455 lifted `Host::checkpoint_safe`'s refusal of cap-using guests (it reads
+    /// `every_host_proc_named()` now), but nothing assembled the powerbox for a `ScheduledDebugRun`,
+    /// so the "debug-tier time travel on cap-using guests" cell of #1454 stayed theoretical. The host
+    /// setup here is deliberately the *same code path* as `run_with_caps_and_host`'s — a second way to
+    /// grant a powerbox would be a second answer to what a guest is allowed to do (INVARIANTS #15).
+    ///
+    /// `None` when the module is outside the bytecode debug engine's subset (`ScheduledDebugRun::new_with_host`
+    /// declines), in which case the tree-walk `Inspector` is the engine that serves it.
+    pub fn debug_run_with_caps(
+        &self,
+        config: &RunConfig,
+        extra_caps: &[(&str, HostCap)],
+    ) -> Result<Option<temen_interp::bytecode::ScheduledDebugRun>, String> {
+        let owned = self.window_override(config);
+        let m = owned.as_ref().unwrap_or(&self.module);
+        let win = m.memory.map_or(0, |mc| 1u64 << mc.size_log2);
+        let init_mem = config.init_mem()?;
+
+        let mut host = Host::new();
+        host.stdin = config.stdin.clone();
+        host.set_quota(config.limits.quota());
+        host.set_handoff(config.handoff);
+        self.grant_caps(&mut host, win);
+        for (name, cap) in extra_caps {
+            let handle = (cap.grant)(&mut host, win);
+            host.register_cap_name(name, handle);
+        }
+
+        let Some(mut run) =
+            temen_interp::bytecode::ScheduledDebugRun::new_with_host(m, 0, &[], host)
+        else {
+            return Ok(None);
+        };
+        if let Some(init) = init_mem.as_deref() {
+            run.seed_mem(init);
+        }
+        Ok(Some(run))
     }
 
     /// Run the powerbox entry under the **parallel** driver (THREADS.md 4c): one OS thread per vCPU
@@ -7186,6 +7734,45 @@ block 0 (vaddr: i64) {
         assert!(
             folds_to_oracle(&m),
             "the one routing predicate (all three call sites) folds it off the JIT"
+        );
+    }
+}
+
+#[cfg(test)]
+mod nim_module_suffix_tests {
+    //! #1609 — pin [`nim_module_suffix`] against stems a **guest actually asked for**, not against
+    //! the port's own arithmetic. If the two ever disagree nimsem silently re-parses a dependency
+    //! it was handed, which is the failure this exists to stop.
+    use super::nim_module_suffix;
+
+    #[test]
+    fn it_reproduces_the_stem_a_running_nimsem_asked_for() {
+        // Observed verbatim from a no-C nimsem run over a memfs holding the stdlib at `lib/`:
+        //   FAILURE: nifler --portablePaths --deps parse lib/system/basic_types.nim \
+        //            nimcache/basu363p61.p.nif
+        // The *source* is spelled relative to the cwd; the *stem* is hashed from the shortest
+        // spelling, which is the one relative to the `lib` search path — the two differ, and that
+        // difference is the whole reason a hand-guessed stem never matched.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["lib"]),
+            "basu363p61"
+        );
+        // Without the search path the cwd-relative spelling is hashed instead, and the stem differs.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &[]),
+            "bas9s4yu5"
+        );
+    }
+
+    #[test]
+    fn the_prefix_is_three_characters_of_the_module_name() {
+        // `PrefixLen = 3`, and a name shorter than that contributes all of itself.
+        assert!(nim_module_suffix("system/basic_types.nim", &[]).starts_with("bas"));
+        assert!(nim_module_suffix("a/os.nim", &["a"]).starts_with("os"));
+        // A longer search path that does not match leaves the spelling alone.
+        assert_eq!(
+            nim_module_suffix("lib/system/basic_types.nim", &["other"]),
+            nim_module_suffix("lib/system/basic_types.nim", &[])
         );
     }
 }

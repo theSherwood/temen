@@ -411,12 +411,28 @@ double strtod(const char *s, char **endptr) {
  * through the map). An anonymous map (`fd < 0` / `MAP_ANONYMOUS`) is zeroed memory. `munmap` frees.
  * nifler never calls these (it parses `.nim` via stdio); they're the shared nimony-phase edge. */
 #include <sys/mman.h>
+#include <stdint.h>
+/* A map MUST be page-aligned. Nim's own allocator recovers a chunk's header with
+ * `pageAddr(p) = p & ~0xFFF`, so an unaligned map makes it read a header that is not there: a null
+ * `c.owner`, then a fault at a tiny address (`0x801`, inside the NULL guard) deep inside
+ * `rawDealloc`. The allocator under us (`synth_malloc`, the on-ramp's bump allocator) returns
+ * 16-byte-aligned blocks, so over-allocate and round up.
+ *
+ * This is #1595's `mmap`-alignment bug a second time, in the other shim — that one was the leng
+ * compute shim, this is the LLVM on-ramp's. Fixing it here is what lets a guest use Nim's own
+ * allocator at all, and that is worth ~8x: with `-d:useMalloc` every object goes to a bump
+ * allocator whose `free` is a no-op, so the peak is total churn (2007 MiB on the system-module
+ * semcheck) instead of the live set (245 MiB). */
+#define TEMEN_MAP_PAGE 4096u
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset) {
   (void)addr;
   (void)prot;
   if (length == 0) return MAP_FAILED;
-  void *p = malloc(length);
-  if (!p) return MAP_FAILED;
+  char *raw = (char *)malloc(length + TEMEN_MAP_PAGE - 1);
+  if (!raw) return MAP_FAILED;
+  /* `munmap` frees this aligned pointer rather than `raw`; harmless while `free` is a no-op, and
+   * the alignment slack is bounded by one page per map. */
+  void *p = (void *)(((uintptr_t)raw + TEMEN_MAP_PAGE - 1) & ~(uintptr_t)(TEMEN_MAP_PAGE - 1));
   if (fd < 0 || (flags & MAP_ANONYMOUS)) {
     memset(p, 0, length);
     return p;

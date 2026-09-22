@@ -38,9 +38,11 @@ fn main() {
             .try_compile("temen_trap_capture");
         if let Err(e) = res {
             // The windows-gnu *cross-check* (`cargo check/clippy --target …-windows-gnu` from a Linux
-            // runner) has no mingw C compiler and doesn't link, so a missing cross-compiler there is
-            // not fatal — the real windows build (MSVC on windows-latest) compiles this, and unix
-            // always has `cc`. Any other failure (a genuine compile error) still aborts.
+            // runner) doesn't link, so a *missing* cross-compiler there is not fatal — unix always
+            // has `cc`, and the real windows build (MSVC on windows-latest) compiles this. Note the
+            // stack-check lane installs `gcc-mingw-w64-x86-64` deliberately, so on CI that target
+            // does compile this file with mingw GCC: a windows arm here must handle the non-MSVC
+            // compiler rather than assume the file is skipped. Any genuine compile error still aborts.
             let missing_tool =
                 format!("{e:?}").contains("ToolNotFound") || e.to_string().contains("find tool");
             if on_windows && missing_tool {

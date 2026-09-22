@@ -1952,6 +1952,18 @@ primitive still wants a second consumer.
   Intra-domain mostly userspace; a host futex is needed only when a vCPU has no
   runnable fiber and must actually sleep. Cross-domain notify signals the other
   domain (slow path).
+- **`notify`'s count is a promise, and it is differentially pinned.** `notify(addr, n)`
+  wakes **at most `n`** waiters on that key — **oldest first**, in arrival order (owner ruling
+  2026-09-22) — and returns exactly how many it woke; the rest stay parked. FIFO because LIFO
+  starves: under steady notify traffic a waiter that parked early sits behind every later arrival
+  forever, and a guest work queue whose oldest waiter never runs is a hard failure to attribute. A guest lock or semaphore handing out one unit of
+  work per wake depends on that, so "woke more than it claimed" is a bug, not slack: it
+  is a thundering herd on one engine and the intended `n` on the other. One key therefore
+  holds **one** arrival-ordered waiter queue, whatever each waiter is parked as — a
+  1:1 vCPU's OS thread and an event-parked fiber queue the same kind of cell, and the
+  wake is latched in that cell rather than inferred from shared state, so a waiter reports
+  woken iff a `notify` claimed it. Two representations behind one key is how the JIT once
+  woke three OS waiters while reporting one (#1615, invariant #15).
 
 ### Memory model
 - **C/C++11 model** (relaxed / acquire / release / acq_rel / seq_cst; RMWs; thread
@@ -3224,7 +3236,7 @@ call *not-yet-loaded* code by name without recompiling the caller.
 
 ---
 
-## 23. Scheduling & migratable fibers (D56/D57)  [SETTLED — built, all slices landed]
+## 23. Scheduling & migratable fibers (D56/D57)  [SETTLED — built, all slices landed; D66 child-domain scheduling ADOPTED, staged]
 
 How the VM exposes concurrency, why, and how **stackful work-stealing over migratable
 fibers** was designed, staged, and verified. (Absorbed from the former `SCHEDULING.md`
@@ -3240,7 +3252,11 @@ when the track completed; the build history lives in the git log.)
 Plus the coordination glue that is *also* primitive-minimal: the `wait`/`notify` **futex**
 and **C11 atomics** over the shared window. Everything richer — mutexes, channels, M:N
 schedulers, work-stealing, async runtimes — is **guest-built** from those (D22/D56:
-*primitives, not policy; no scheduler in the VM*).
+*primitives, not policy; no scheduler in the VM*). **Scope (D66, below):** that rule is about a
+domain's *own* threads. Where a §14 **child domain** runs — which worker, when — is platform
+placement, the same kind of decision as its `Attestation.tier`, and the platform schedules child
+domains M:N over a bounded worker pool. A guest never observes a sibling domain's placement, so
+D22's double-scheduler objection does not arise between domains.
 
 **"Stackless tasks" are NOT a third primitive.** A stackless task is a function rewritten
 as a state machine (a struct of locals + a resume fn with a `switch` on a state field —
@@ -3355,6 +3371,173 @@ cross-thread race could escape the net. Accepted knowingly as the price of the c
 
 All three are *entirely guest code* over the two primitives — the D56/D57 thesis, proven
 three ways.
+
+### Child-domain scheduling (D66) — amends D22/D56/D57 in scope  [ADOPTED 2026-09-21, staged]
+
+**The gap D57 left.** D57's answer to "who builds M:N?" is *the guest, over fibers*. A fiber lives in
+its vCPU's window (its shadow arena is in-window), so that answer is unavailable for the one shape
+that owns a **separate window**: a §14 detached child (PROCESS.md §5). Such a child must be
+vCPU-shaped, and on the JIT a vCPU is one OS thread — so a parent with N detached children held N
+host threads, bounded only by the OS (#1586, #1587; the §15 ceiling itself was bypassed on every §14
+path until #1590). That is INVARIANTS #3 in the direction the owner named: *a parent must not consume
+resources beyond what it was given*, and "granted 2 threads" was not a quantity the runtime could even
+represent per domain — `max_vcpus` bounds task *count* (parked tasks included), and host parallelism
+was `MAX_WORKERS`, global.
+
+**The decision (owner rulings, 2026-09-21).**
+
+1. **Child domains are scheduled by the platform, M:N, migrating** — the interpreter's scheduler
+   shape (one run queue; a parked task is data in a waiter map and its worker moves on), ideally the
+   interpreter's scheduler itself made generic over the task type (INVARIANTS #15: one scheduler, two
+   task kinds). Naive global queue first; per-worker queues with affinity-preferring stealing when the
+   benchmark harness shows contention or locality cost — a queue refinement, not a redesign.
+2. **Threads within a domain stay 1:1.** `thread.spawn` is the guest's "give me a core" primitive and
+   D22's double-scheduler objection is real *for those*. D56 is unchanged for them.
+3. **Parallelism is a granted resource, bounded at dispatch.** A domain holds a **lane cap**: how
+   many tasks of its subtree may be *running* at once. Checked when a worker picks a task, released
+   on park/yield/finish. Distinct from the task-count bound (`max_vcpus`), which stays.
+4. **Ceiling with per-child lanes.** A grants B a lane of 2: B's subtree runs ≤ 2 at once; A's own
+   tasks may fill any lane A holds. Σ of a parent's granted lanes ≤ its own cap, enforced at grant
+   time; a task counts against its own lane and every enclosing one (the nested-`cpu.max` shape).
+   6 / 2 / 2 therefore reads: A up to 6; B ≤ 2 of those, contended with A only; C ≤ 2, contended with
+   A only; B and C never contend with each other. The parent *can* absorb a child's lane — that is
+   the ruling's chosen trade against stranded idle capacity; a hard partition (`split`-style transfer,
+   as `mem`/`fuel` do) was considered and declined for now.
+
+**Why this is an amendment in scope, not a reversal.** D56 removed the M:N executor for three
+reasons. Its TCB-risk objection was **re-accepted and paid by D57** for exactly the operation this
+needs — a native stack resumed on another OS thread under the loom-verified single-owner claim; a
+child-domain resume is that switch plus an env swap of `Send` data, and nothing a child *owns* is
+thread-affine (the per-thread state is the worker's: the trap shim's TLS and the guard bracket, both
+established afresh per resume, as they already are for a migrated fiber). Its policy-lock-in and
+double-scheduler objections were about a guest's own threads, which stay 1:1.
+
+**Why migrating rather than thread-affine.** Both need the same switchable stack and the same env
+swap per resume; the only difference is whether a parked task may resume on a different worker.
+Affine needs per-worker queues *plus* a placement heuristic (without one, a recursive subtree lands
+on its ancestor's worker while the others idle), is a third scheduler shape in the tree, cannot share
+the interpreter's scheduler, and starves a task pinned behind a long-running sibling until that
+sibling's fuel poll. Naive migrating is one queue — strictly less mechanism — and is the shape the
+oracle already explores exhaustively (`run_scheduled` / `explore_all`), so every JIT schedule is one
+the interpreter can reproduce. The one axis affine wins, cache locality, is what affinity-preferring
+stealing exists to recover.
+
+**Rules that make it sound** (each a confinement or host-kill hazard if broken):
+
+| # | rule | why |
+|---|---|---|
+| R1 | **Every resume is its own guard bracket** over *that child's* fault range (`run_guarded_range(child.fault_range())`); the range is never carried across a park | the range is how a SIGSEGV is classified — in-range ⇒ kill the guest, out-of-range ⇒ host bug, abort. A stale sibling range misclassifies **both ways**: a legitimate guest fault aborts the host; a real host bug is "recovered" and the guest continues on corrupted host state |
+| R2 | **The #1466 machine-code rule extends to every task-level TLS accessor** (`#[inline(never)]`), and the C TLS in `trap_capture.c` is pinned against LTO | LLVM hoists the thread-pointer above a stack switch at `opt-level ≥ 1`; a post-switch read is silently served from the *suspending* thread's block |
+| R3 | **A dead domain is never resumed**: dispatch checks kill/teardown before switching in; a parent's death sweeps its subtree (the interpreter's `drain_members`, "death is revocation") | a resumed dead child runs with a released powerbox |
+| R4 | **Trap attribution is by task identity**, beside the per-fiber handle (`g_current_fiber`) | a fault must name the child, not the worker that happened to run it; the trap-propagation guard reads the named cell |
+| R5 | `mem_base` is passed at a task's *first* entry only; the switch carries it thereafter | a wrong base at entry runs the child against another window — a #2 break. The interp↔JIT window-image differential in every nesting test is the net |
+
+**What it structurally replaces on the JIT** (`instantiator_rt.rs` / `os_thread_rt.rs`):
+`futex_wait`'s OS condvar park with its `KILL_RECHECK` loop over four conditions (kill cell, freeze
+word, teardown, `peers_live`) becomes a scheduler park whose four conditions are **wake sources**
+(kill ⇒ wake all; freeze ⇒ wake all with `dstate = UNWINDING`; teardown ⇒ subtree sweep; deadline ⇒
+timer), and `peers_live` becomes the interpreter's `run_deadlocked` predicate. `join` becomes a park on
+the child's completion. `Nursery::child_threads` + `join_children` disappear: teardown is "drive the
+scheduler until every child task has finished" (the interpreter's `worker_loop`). `Domain::cur_task`,
+whose doc reads "the inline vCPU currently executing on the **single** worker", becomes per-worker;
+`Domain::trap_capture`, a handoff from a *dying* thread, is published at the trapping task's
+park/finish. `run_detached_child_then` — today one synchronous call — becomes a **task struct** owning
+its `GuestWindow` (needs `unsafe impl Send`: an mmap reservation has no thread affinity), fiber stack,
+`gc_ctx`, result/trap buffers and `teardown` closure; teardown still runs while the window is alive.
+Unchanged, checked: the §5 interrupt cell (a baked address polled through a pointer), `Env` (per
+domain, set once; a child uses its *parent's* futex table), the `child_code` cache (`Send + Sync`),
+`temen-fiber`'s switch and stack arena.
+
+**What it buys, all at once.** Concurrency is conserved (#1586). Pool-starvation deadlock is
+impossible by construction — a park never holds a worker — so the only deadlocks left are the guest's
+own, which `run_deadlocked` turns into a `ThreadFault` rather than a hang. #1361's freeze harvest
+("run the driver until every vCPU finished, then claim `Outcome.mem`") becomes **one** implementation
+across all three engines instead of two-plus-a-different-shape, and the op-15 gate lift becomes a
+single change. #1584 closes by construction: every park is scheduler-owned, so the 4c-bis `dstate`
+poke reaches all of them and no child can veto its parent's freeze by parking. And child-domain
+scheduling becomes **deterministic under the interpreter's seeded policy** — the win D56 recorded
+losing when the executor was removed, recovered for the layer where it does not fight the guest.
+
+**Cost, honestly.**
+
+| piece | size |
+|---|---|
+| scheduler for JIT child tasks — the interpreter's, generic over task type | large; the #15 route |
+| `futex_wait` / `join` → scheduler parks with four wake sources + the deadlock predicate | large |
+| the child as a long-lived task struct | medium |
+| resume trampoline (fiber-resume entry edge + task identity + lane accounting) | small–medium |
+| dead-domain sweep at dispatch | small |
+| tests: stale-range misclassification impossible by construction; wrong-`mem_base` injection the differential must catch; the deadlock predicate under loom; the migration fuzz over scheduled children | medium |
+
+The existing empirical net carries over unchanged: the randomized-migration interp↔JIT differential
+(`fiber_fuzz`), the single-owner runtime assert at the resume seam, ASan with fiber-switch
+annotations, `jit_threads` concurrent-steal stress. Slices and order: **#1600**.
+
+**Landed so far.** *Lanes on the interpreter* (#1600 slice 4, the oracle half): `Budget.lane` as the
+fifth budget field (a ceiling `split` bounds by the holder's cap and never draws down; codec v28);
+`Host::lane_cap` / `parent_domain` / `granted_lanes` with the one detached-spawn admission every engine
+calls (`Host::admit_detached_spawn` — lane reserved and `mem` taken, or neither); a per-vCPU lane
+chain; dispatch-time gating on **both** interpreter drivers (`dispatch` and the exploration driver —
+`lane_enter`/`lane_leave`, held exactly while on a worker), with lane-blocked tasks swept at teardown
+and left out of the deadlock predicate's external-wake list on purpose (a lane of `0` faults rather
+than hangs); the reap credit on `join`/`detach`. The bytecode engine and the JIT call the same
+admission and return the lane at once — single-spawn parity (a lane wider than the cap refuses) —
+until their children become scheduler tasks (slices 2–3), which is when their enforcement and lasting
+Σ accounting arrive. Also: the §15 ceiling on every §14 path (#1590) and the OS-thread spawn failure
+as a value with the budget un-spent (#1587).
+
+*The child-domain executor on the JIT* (#1600 slices 2 and 5, `temen-jit/src/child_exec.rs`): every
+non-durable §14 child — the **carve** children of ops 0/5/8/11/13 and the **detached** children of
+op 15 — is a task — a platform-owned `FiberSlot` (in no guest table, spends no fiber quota)
+carrying the child's own window, trap cell and fiber execution context — on a pool of workers spawned
+on demand; any worker may resume it under the same single-owner claim guest fibers use (the D57
+migration unsafe, no new one), each resume its own guard bracket over the *task's* fault range (R1),
+the per-thread state seeded and reset at both edges of every residency (R2: `CURRENT_RT`, `vcpu.tls`,
+the current-task word — all `#[inline(never)]` readers). A futex `wait` inside the child takes the
+existing "inside a fiber ⇒ park the fiber" arm unchanged (INVARIANTS #15: no second park mechanism);
+**one** wake reaches every parked task and each re-checks its own predicate in the loop it already
+has — `Domain::wake_all_parked` extended to tasks, so a `notify`, a vCPU exit, the §5 kill path and
+teardown all arrive by the same route, and an idle worker sweeps the parked set on the bounded
+`KILL_RECHECK` cadence to fire deadlines. No per-task waker, no second deadline store, no second
+runnable queue: the executor's whole state is a task map, a FIFO and the per-domain lane counts. Every
+resume is gated on the task's lane chain with `temen_ir::lanes` — the oracle's arithmetic — held
+exactly while on a worker and released the moment it parks, so a child of a cap-1 parent never overlaps
+a sibling and a parked one never wedges a runnable one (the two pins, `child_exec_jit.rs`). Run
+teardown poisons a task parked forever (its cell reads `DOMAIN_DONE`; it unwinds through its trailing
+guard — the interpreter's sweep, D37) instead of hanging the join. The child enters through a
+**limit-taking** variant of its one trampoline (`build_trampoline(.., with_limit)`, one flag not a
+second family), so its prologue checks guard the fiber stack. JIT frontier, still open on #1600: no
+preemption (a task that never parks holds its lane until it returns — the interpreter's quantum
+round-robin has no twin); the task stack is the fiber arena's 256 KiB slot (a `StackOverflow` trap,
+no longer a 2 MiB OS stack).
+
+*Broad lanes* (owner ruling 2026-09-21): a lane bounds **all** concurrency in a subtree, not only its
+child domains. The interpreter always read it that way — its `dispatch` gates `thread.spawn` siblings
+like any other task — while the JIT gated nothing on that path, so the same program under the same cap
+ran four siblings at once on one engine and one at a time on the other. The JIT's 1:1 vCPUs now take a
+lane before guest code and give it back after; the *mapping* stays 1:1 (D56 unchanged), what the lane
+bounds is how many may be **running** — the thread exists, it queues. The counts live on the `Domain`
+because a child-subtree task and a `thread.spawn` vCPU of the parent draw on the same root lane: two
+maps would enforce the cap twice and hand out double what was granted. The load-bearing half is that
+**every park gives the lane back** (`thread.wait`, `thread.join`, the §14 child join, the fiber-idle
+wait), since under a cap of 1 a waiter that kept its lane would prevent the very peer that would
+satisfy it from running; each release sits outside the lock that park takes, because blocking for a
+lane while holding it would stop the thread that would release it. A vCPU queued for a lane is
+deliberately **not** counted in `Domain::parked`: it is runnable, and counting it would let a peer's
+infinite wait see quiescence and call a queue a deadlock. A lane of `0` is unsatisfiable rather than
+slow, and answers `ThreadFault` on both engines (INVARIANTS #5 — never a hang). Cross-engine pins in
+`temen-run/tests/vcpu_lanes_jit.rs`.
+
+*One filing for every child* (slice 5, INVARIANTS #15): `spawn_child_on_thread`,
+`spawn_granted_child` and `spawn_detached_child` — three near-copies of reserve-§15 / spawn-thread /
+file-join-slot / release-on-failure — collapse into one `file_task`, parameterised by what actually
+differs: how the window is seeded (a carve image, or data segments plus payload), whether a
+`copy_back` writes it back at finish (a carve child: the parent is the superset), and the lane chain.
+`run_child_code`, `run_child_code_then` and `run_detached_child_then` are gone with the OS threads
+they drove, and so is `Nursery::child_threads` — run teardown is the executor's quiescence alone.
+A carve child has no lane of its own to be granted, so it runs in its parent's: the hook family
+carries the parent's `(domain, lane cap)`, read once when the family is built. What was three
+propagation sites for every future scheduling change (invariant 14's burden) is one.
 
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
@@ -3597,3 +3780,4 @@ as open-ended, not a byproduct of the build.
 | D64 | **On-ramp SIMD target: compile guest C for a rich-128-bit profile (`-march=x86-64-v3 -mprefer-vector-width=128` on x86; NEON on ARM), not the `x86-64` baseline.** The LLVM on-ramp consumes **host** LP64 bitcode, so — unlike wasm, which is capped at the portable `simd128` op set for portability — temen-jit can target the *actual* CPU's richer 128-bit SIMD. The `x86-64` baseline (SSE2) is **poorer** than `simd128` (no `i32x4.mul`/`pmulld`, no wide widening muls), which under-vectorized guest code and made temen-jit look behind on array kernels; `x86-64-v3` (AVX2 — universal on x86 since ~2013) gives LLVM the ops `simd128` has, and `-mprefer-vector-width=128` keeps LLVM at 128-bit so **Cranelift never has to split a 256/512-bit vector** (it has no YMM/ZMM register class — D58). This is the axis where the host on-ramp *should* beat wasm (§1a's 64-bit/host-native advantage); the two frontend flags realize it. **+0 escape-TCB:** richer auto-vectorization only emits more **value-only** `v128` ops (verifier re-checks; D58); the confinement path is untouched. Cranelift still feature-detects the running CPU, so `x86-64-v3` bitcode **runs and verifies on any x64 host** (a rarer non-AVX2 host lowers the 128-bit ops via baseline encodings — correct, just slower). Also landed alongside: **fuse `sext(narrow load)` → a signed load** (`movsx (mem)` instead of `movzx`+register `movsx`) in temen-llvm's §3b load discipline — a correct scalar-signed-`short`/`char` win, +0 escape-TCB. | Settled (built — `bench/confine` temen lane + `embench` temen build on the target; signed-load fusion in temen-llvm) | The `confine` "parity/faster" reads (D63) were partly an artifact of the harness building the **wasm lanes without `-msimd128`** — comparing temen-jit-vectorized against Wasmtime-*scalar*. With SIMD on both sides the honest gap appeared (matmul 1.42×, edn 1.37×). Root-caused via A/B: the temen lane was under-targeting (SSE2), not a backend-codegen deficit — retargeting to `x86-64-v3` (128-wide) flips the vectorizable kernels to **parity-or-faster** (matmul 1.42→**0.91×**, matmul_eb 1.15→**1.04×**, fir 0.56→0.38×) and pulls the **embench geomean ahead of Wasmtime-w64 for the first time: temen-jit 1.96× vs wt64 2.00×** (was 2.12× vs 2.04×), all 19 kernels still `verify=1`. **Residual — `edn` stays ~1.43× at every frontend target** (not vectorization-availability): its codegen is **534 lane insert/extract ops (`vpinsr`/`vpextr`) vs 40 real `vpmulld`** — temen-jit lowers vector **integer width-conversions** (`<8×i16>`→`<8×i32>`→i64, edn's short→int→long DSP) by exploding to scalar lanes + repacking (`vec_explode`/`vec_implode`) instead of native SIMD widen/narrow (`vpmovsxwd`/`vpackssdw`). **Native widen/narrow landed (D65a) — but it revised this diagnosis.** Wiring the on-ramp's full-128 `sext`/`zext`→`swiden`/`uwiden` and 256→128 wrapping `trunc`→byte-`shuffle` cut edn's lane insert/extract ops **93% (563→39)** yet moved wall-clock only **~1.8% (temen÷wt64 1.478→1.452, clean same-machine A/B)** — so the scalarized width-conversions were **not** edn's dominant cost. **Per-kernel profiling (D65b) then root-caused the residual:** edn's gap is concentrated in the **dot-product MAC kernels** (`fir` 14.3×, `fir_no_red_ld` 8.0×, `mac` 8.0× temen÷native — ~75% of temen's edn time; the scalar/recursive kernels `latsynth`/`iir1`/`jpegdct` are 2–4×, i.e. fine). Their `long sum += (short)a*(short)b` vectorizes at **VF=2** (a `<2×i64>` accumulator — forced by the 128-bit cap on the `i64` accumulate), and temen **scalarizes the whole 2-lane sub-128 chain**: per-element `movswq` widening loads + `vpinsr` lane packs + shuffles (fir: 18 scalar-widen + 14 `vpinsr` + 14 shuffle + 48 `movq`) where native uses 4 `vpmovsxwq` + 2 `vpmuldq`. **The widening multiply is *not* the lever** (A/B-validated: replacing the `vpmullq` `mul <2×i64>` with a cheap `add` moved `fir` only ~6%, 5275→4938 ns — so `VExtMul` recognition was not built). The real cost is the pervasive **2-lane widening-load/pack scalarization**; closing it needs native sub-128 2-lane widen loads (`<2×i16>`→`<2×i64>` via one `pmovsxwq`), the fiddly packed-representation case D65a deliberately skipped, for an uncertain partial win — deferred. Native widen/narrow is kept as the **correct** lowering (matches wasm's `i32x4.extend_*`, +0 escape-TCB, smaller codegen) with a modest win, not the parity-closer this row implied. Caveat: baking a target into bitcode trades that artifact's portability (AVX2-compiled bitcode assumes AVX2) — wasm's portability/perf tradeoff, inverted in our favor for a JIT-per-host system (compile for the deployment baseline, or per-host). |
 | D63 | **Branchless per-access confinement (`select_spectre_guard`), superseding D38's `trapnz` + AND clamp — uniform for top-level *and* §14 nested windows.** A non-elided access lowers to `cmp; select_spectre_guard(oob, guard_offset, sub_base + addr+offset); load` — an out-of-bounds address is redirected (branchlessly, via cmov) to `guard_offset = round_up(win_reserved, page)`, the offset of the enclosing window's trailing guard page, so the access itself faults there (`MemoryFault`). Same architectural fault and same clear-fault-at-the-offending-access property as D38; same Spectre-v1 confinement (`select_spectre_guard` is a speculation barrier — a misspeculated OOB access also lands on the guard), via the **identical Cranelift primitive Wasmtime uses**. A **nested** sub-window redirects to the *parent's* guard (its own slice has committed parent memory on both sides, so redirecting to the child's `reserved` could alias the parent — a child→parent escape); redirecting the whole physical offset past `+ sub_base` lands an out-of-child access on the parent guard, never in the parent. In-process nesting is defense-in-depth, not a promised Spectre boundary (§2a). | Settled (supersedes D38's per-access shape; D38's escape-oracle contract unchanged) | The A/B (`confine` harness) refuted D38's "1-op AND beats Wasmtime's cmp→cmov" claim: the 40-bit reservation mask is not an x86 immediate, so the AND was a **RIP-relative load per access**, and the `trapnz` added a per-access **branch** — together ~1.06×/1.34× behind Wasmtime-w64 on `matmul`/`matmul_eb`. Branchless cmov-to-guard hoists the guard offset into a register and removes the branch, reaching **0.94×/0.97×** (parity/faster), with **nested windows on the same fast path** (no penalty). A `trapnz`-keeping cmov variant (clamp only) regressed (1.23×/1.55×) — the branch removal, not the cmov, is the win. **Guard target = `round_up(win_reserved, page)`, not `reserved`**: a sub-page window commits its prefix page-granularly, so only the page-aligned offset is `PROT_NONE` (caught by the escape oracle). Verification: OOB→`MemoryFault` + sub-window escape oracle (out-of-child faults, parent untouched) + `fuzz/mask` (the OOB predicate is unchanged) + escape oracle (§18) |
 | D65 | **The `rustbench` call-heavy gap to Wasmtime-w64 (`parse`/`bfs`, ~1.22× temen÷wt64) is diffuse — no single lever — after two hypotheses were measured and *rejected*.** On the six real-program `rustbench` workloads, temen-jit is **at parity-or-faster than wt64 on four** (hashmap 0.94×, vm 0.93×, sort 0.82×, base64 0.86×) and trails only on the two most **call/recursion-dense** (`parse` 14 call sites, `bfs` 13; the gap tracks call count). Two cheap env-gated A/Bs (throwaway, reverted) tested the obvious causes: **(1) the threaded-context ABI** — temen's natural CLIF ABI threads `(mem_base, fn_table_base, trap_out, stack_limit)` as explicit args through every call (vs Wasmtime's single pinned `vmctx` register), so a vmctx consolidation was the candidate fix. *Rejected*: doubling the threaded context to 8 args (`TEMEN_JIT_EXTRA_CTX`, verified in CLIF — 10-arg sigs, extras spilling to stack) produced **no systematic slowdown** on the call-heavy workloads (parse/bfs flat-to-faster, sign inconsistent = register-allocation noise), so arg marshalling is not the cost and a vmctx rewrite of the JIT ABI would not pay off. **(2) the per-entry checks** — temen emits `emit_epoch_check` (kill-poll) + `emit_stack_check` (`get_stack_pointer`+cmp+branch software stack guard) at every function entry, which wasm gets free via guard pages. *Minor*: skipping them (`TEMEN_JIT_SKIP_ENTRY_CHECKS`, measurement-only, drops a safety guard) recovered only **~6% on `parse`** (deepest recursion), ~3% on `vm`, and **~0% on `bfs`** — against a ±2% noise floor, a small diffuse cost, not the ~22% gap. | Settled (investigated; both fixes rejected on measurement — do not re-run without a new hypothesis) | The value is the **two negative results**: they cheaply pre-empted a risky JIT-ABI rewrite (vmctx) and a guard-disabling change, each of which measurement showed would deliver little. The residual gap is a handful of small per-call overheads (entry checks, call/ret, sp-threading) with no single dominant term — so per the prime directive (don't optimize the trusted core without a concrete measured win) the perf dig stops here. temen-jit is already "as fast as wasm" on real programs where it counts (4/6 workloads ahead). Method: `bench/rustbench` temen-jit ×native A/B under the two env flags; correctness cross-check stayed green throughout (the ABI perturbation was sound). |
+| D66 | **§14 child domains are platform-scheduled, M:N, migrating, over a bounded worker pool; threads *within* a domain stay 1:1; parallelism is a granted resource bounded at dispatch, ceiling with per-child lanes (§23 "Child-domain scheduling").** Amends D22/D56/D57 in *scope*, not direction: the no-scheduler rule is about a domain's own `thread.spawn` units (where the double-scheduler objection is real); where a *domain* runs is placement, like `Attestation.tier`, and no guest observes a sibling's. D57's guest-built M:N cannot reach a detached child (a fiber is in-window; a detached child owns its window), so on the JIT N detached children were N OS threads bounded by the OS (#1586/#1587) — a #3 break in the direction "a parent consumes what it was never granted". The migration unsafe is the one D57 already paid: same switch, same happens-before, plus an env swap of `Send` data; nothing a child owns is thread-affine. Migrating over affine because naive migrating is *one queue* (the oracle's shape, reproducible by `explore_all`) while affine is per-worker queues plus placement, a third scheduler shape, and cannot share the interpreter's scheduler. Sound under five rules (§23 R1–R5): every resume its own guard bracket over the child's fault range (a stale range misclassifies faults both ways); #1466 extended to task-level TLS; a dead domain never resumed; trap attribution by task identity; `mem_base` at first entry only. Buys, at once: conserved concurrency, no pool-starvation deadlock (a park never holds a worker), #1361's harvest as one implementation on all three engines, #1584 closed by construction, deterministic child-domain scheduling under the interp's seeded policy. Owner rulings 2026-09-21: C over B; dispatch-time parallelism over spawn-time count; ceiling with lanes over transfer (stranded capacity declined; a parent may absorb a child's lane). | Adopted (amends D22/D56/D57 in scope; staged) | The resource fix, the freeze fix (#1361) and the parked-child fix (#1584) were one decision; making them three would have built the JIT's harvest as a different shape and left "granted N threads" unrepresentable. Cost recorded in §23; slices in #1600 |

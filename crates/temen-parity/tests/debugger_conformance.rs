@@ -44,7 +44,7 @@
 //! countable; a cell scored on what the test happened to reach is a wish.
 
 mod support;
-use support::capability_probe::{probe_module, rows, Row, MAX_ARGC, PROBE_BEYOND};
+use support::capability_probe::{probe_module, rows, RealArgs, Row, MAX_ARGC, PROBE_BEYOND};
 use temen_interp::bytecode::{SchedStop, ScheduledDebugRun};
 use temen_interp::{Host, Trap, Value};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
@@ -81,10 +81,10 @@ fn drive(host: Host, handle: i32, iface: u32, op: u32, argc: usize) -> Option<Ve
 }
 
 /// The best verdict `op` reaches across the arity sweep, or `None` where every arity cap-faults.
-fn best(mint: &dyn Fn() -> (Host, i32), iface: u32, op: u32) -> Option<Verdict> {
+fn best(mint: &dyn Fn() -> (Host, i32, RealArgs), iface: u32, op: u32) -> Option<Verdict> {
     (0..MAX_ARGC)
         .filter_map(|argc| {
-            let (host, h) = mint();
+            let (host, h, _real) = mint();
             drive(host, h, iface, op, argc)
         })
         .max()

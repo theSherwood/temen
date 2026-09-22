@@ -1147,6 +1147,62 @@ fn compile_module_for(m: &Module) -> Option<Compiled> {
 /// quotas / zero-fuel children land here). `Err(CapFault)` = the handle vanished since the exec
 /// arm's peek (a shared-powerbox race). The fund rule is the tree-walker's: bounded fuel is
 /// `min(budget, parent_remaining)`, unbounded inherits the parent's remaining.
+/// §14 op-13 — build a **separate-module child's powerbox**, the one definition both drivers use
+/// (#1570). Parses the by-name grant list out of the parent window (`grants_n` × 16-byte
+/// `{name_off:u32, name_len:u32, handle:i32, _:u32}` records, the tree-walk arm's format), re-grants
+/// each named cap into a fresh child host via [`Host::spawn_named_child`], registers the running
+/// module as the child's own (§3.6: a separate-module child serves its *own* offers), and binds the
+/// child module's import manifest against that powerbox (IMPORTS.md phase 3 — a chibicc child's
+/// `write`/`read`/`exit` resolve here, or its first `write` would `CapFault`).
+///
+/// `Ok(None)` is a **probeable refusal** — a `required` import slot with nothing to bind, which the
+/// tree-walker answers `-EINVAL` for. `Err` is a trap: an unreadable record, a non-UTF-8 name, or a
+/// handle the parent may not re-grant.
+///
+/// Extracted from the cooperative arm so the OS-thread parallel driver can stop declining named
+/// grants outright (#1570). That driver returned `Trap::Malformed` for them, and never called
+/// `bind_child_manifest` at all — so even a grant-free child's imports went unbound there, where the
+/// cooperative driver binds them (INVARIANTS #9: one op, one answer, whichever loop is driving).
+fn named_child_host(
+    host: &mut Host,
+    pm: Option<&Mem>,
+    grants: Option<(u64, u64)>,
+    child_size: u64,
+    cmodule: &std::sync::Arc<Module>,
+) -> Result<Option<(Host, i32, i32)>, Trap> {
+    let (mut child_host, cinst, cas) = match grants {
+        Some((grants_ptr, grants_n)) => {
+            let m = pm.ok_or(Trap::Malformed)?;
+            let mut list: Vec<(String, i32)> = Vec::new();
+            for i in 0..grants_n {
+                let rec = m.read_window(grants_ptr + i * 16, 16)?;
+                let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+                let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+                let name = String::from_utf8(m.read_window(name_off, name_len)?)
+                    .map_err(|_| Trap::CapFault)?;
+                list.push((name, handle));
+            }
+            host.spawn_named_child(&list, child_size)
+                .ok_or(Trap::CapFault)?
+        }
+        None => {
+            let mut ch = Host::new();
+            let cinst = ch.grant_instantiator(0, child_size);
+            let cas = ch.grant_address_space(0, child_size);
+            (ch, cinst, cas)
+        }
+    };
+    child_host.set_self_module(cmodule);
+    if child_host
+        .bind_child_manifest(&cmodule.imports, &cmodule.types)
+        .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some((child_host, cinst, cas)))
+}
+
 fn take_spawn_budget(
     host: &mut Host,
     budget: i32,
@@ -1312,7 +1368,14 @@ fn admit_detached_child(
         || !payload_ok
         || !premap_ok
         || host.is_durable()
-        || !host.budget_mem_take(budget, child_size)
+        || match host.admit_detached_spawn(budget, child_size) {
+            // D66 — see the resumable arm: single-spawn lane parity, lane returned at once.
+            Some(lane) => {
+                host.give_lane(lane);
+                false
+            }
+            None => true,
+        }
     {
         return Ok(None);
     }
@@ -2592,7 +2655,7 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
         reserved_log2: u8,
-        prots: Option<&[(u64, u8)]>,
+        prots: Option<&super::PageMap>,
     ) -> (Result<Vec<Value>, Trap>, Option<Vec<(u64, u8)>>, u64) {
         let (out, info, mapped) = self.run_over_grown_info(
             func,
@@ -2603,7 +2666,6 @@ impl SharedProgram {
             seed_data,
             reserved_log2,
             prots,
-            0,    // no carried prefix — the seed's own contiguous tail still folds
             None, // no persistent table — the install-less legacy bounce
         );
         (out, info.map(|i| i.3), mapped)
@@ -2641,8 +2703,7 @@ impl SharedProgram {
         host: &mut Host,
         seed_data: bool,
         reserved_log2: u8,
-        prots: Option<&[(u64, u8)]>,
-        mapped: u64,
+        prots: Option<&super::PageMap>,
         table: Option<&std::sync::Arc<SharedSlots>>,
     ) -> (Result<Vec<Value>, Trap>, Option<MemMapInfo>, u64) {
         if func as usize >= self.n_funcs {
@@ -2660,8 +2721,11 @@ impl SharedProgram {
                 mm.init_data(&self.data);
             }
             mm.seed_null_guard(self.null_guard); // #964
-            if let Some(entries) = prots {
-                mm.seed_pages(mapped, entries);
+            if let Some(map) = prots {
+                // The map carries the prefix its entries are relative to, so the two cannot disagree —
+                // they were a `prots` slice and a `mapped` argument that had to be kept in step by
+                // every caller (#1456).
+                mm.seed_pages(map.mapped(), &map.entries());
             }
             mm
         });
@@ -2713,7 +2777,7 @@ impl SharedProgram {
         tierup: Option<TierUpConfig>,
         back: std::sync::Arc<super::Region>,
         reserved_log2: u8,
-        prots: &[(u64, u8)],
+        prots: &super::PageMap,
     ) -> Result<CoopRun, Trap> {
         if entry as usize >= self.n_funcs {
             return Err(Trap::Malformed);
@@ -2725,7 +2789,7 @@ impl SharedProgram {
         let mut mem = self.mem_size_log2.map(|sl| {
             let mut mm = Mem::with_reservation_over(reserved_log2, sl, back, self.shadow);
             mm.seed_null_guard(self.null_guard); // #964
-            mm.seed_pages(0, prots);
+            mm.seed_pages(prots.mapped(), &prots.entries());
             mm
         });
         let sched = CoopSched::new(&dom, entry, args, &mut fuel, &mut mem, &mut host, tierup)?;
@@ -4604,9 +4668,24 @@ impl<'p> Vcpu<'p> {
             return Ok(None);
         }
         // Admission = the budget's quota take (the commit; every refusal above charged nothing).
+        // D66 — one admission call, shared with the tree-walker (`Host::admit_detached_spawn`): the
+        // funding budget's lane is checked against this domain's cap and its `mem` taken, or neither.
+        // This engine's detached children are serviced by the embedder's driver, whose join/detach
+        // does not yet return a lane, so the lane is given straight back here: the engines agree on
+        // the single-spawn answer (a lane wider than the cap refuses) and the lasting Σ accounting
+        // lands with that driver's lane slice (#1600).
+        let admit = |h: &mut Host| -> bool {
+            match h.admit_detached_spawn(budget, child_size) {
+                Some(lane) => {
+                    h.give_lane(lane);
+                    true
+                }
+                None => false,
+            }
+        };
         let admitted = match self.shared_host {
-            Some(m) => m.lock_unpoisoned().budget_mem_take(budget, child_size),
-            None => self.host.budget_mem_take(budget, child_size),
+            Some(m) => admit(&mut m.lock_unpoisoned()),
+            None => admit(&mut self.host),
         };
         if !admitted {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
@@ -5781,8 +5860,17 @@ fn journal_state(
     host: &Host,
     clock: u64,
     turn: u64,
+    policy: &super::journal::JournalPolicy,
 ) {
     if !journal.is_armed() {
+        return;
+    }
+    // **Segment boundaries, not every op.** The clone below is every task's `Vm`, the fiber chain and
+    // the task states; its cost scales with frame depth and it dominated the journal on real guests
+    // (`JournalPolicy::state_stride` carries the measurements). Turn 0 is always a boundary so a run
+    // can always be undone to its start.
+    let stride = policy.state_stride.max(1);
+    if !turn.is_multiple_of(stride) {
         return;
     }
     let invertible = host.journal_invertible()
@@ -7907,6 +7995,23 @@ impl ScheduledDebugRun {
         })
     }
 
+    /// Seed the low bytes of the window before stepping — the argv/env blob a powerbox entry expects
+    /// at [`module_args_base`](temen_ir::module_args_base), which every non-trivial guest reads on the
+    /// way into `main`.
+    ///
+    /// Without this a debug run of an argv-taking guest starts with an empty args region and takes a
+    /// different path than the same guest under `run_with_caps` — so it is the difference between the
+    /// debug engine running toy modules and running the real ones. Call it before the first step;
+    /// afterwards it would be a write the journal never saw.
+    ///
+    /// Bytes past the window are ignored, exactly as the production seed does — confinement only
+    /// concerns `[0, size)`.
+    pub fn seed_mem(&mut self, init: &[u8]) {
+        if let Some(m) = self.mem.as_mut() {
+            m.seed(init);
+        }
+    }
+
     /// Replace the run-shared breakpoint set (fires in whichever thread reaches a pc in it).
     pub fn set_breakpoints(&mut self, bps: Vec<super::IrPc>) {
         self.breakpoints = bps;
@@ -7957,7 +8062,12 @@ impl ScheduledDebugRun {
     pub fn can_undo_to(&self, turn: u64) -> bool {
         // Undoing to where the run already stands is vacuously possible, and has no state entry of its
         // own: entries are recorded *before* each op, so the current turn's op has not run.
-        turn == self.turn || self.journal.can_undo_to(turn)
+        if turn == self.turn {
+            return true;
+        }
+        // Undo only goes backward. A turn past the run's own position is not history, and the
+        // nearest-at-or-before anchor lookup would otherwise happily answer with the last boundary.
+        turn < self.turn && self.journal.can_undo_to(turn)
     }
 
     /// Undo back to `turn`, putting the run where it stood **before** that turn's op ran: the window
@@ -7974,12 +8084,19 @@ impl ScheduledDebugRun {
         let Some(st) = self.journal.state_at(turn) else {
             return false;
         };
+        // Continuations ride segment boundaries, so the entry found is the boundary **at or before**
+        // the target. Undo lands there and re-executes the remainder forward — bounded by
+        // `JournalPolicy::state_stride`, and the window pre-images are per-op either way, so nothing
+        // about the *window* is approximated by this.
+        let anchor = st.coord;
         let cont = st.cont.clone();
         let cursor = st.cursor;
         // Window first: the pre-images are keyed on the turns being undone, and installing the
-        // continuation does not touch guest memory.
+        // continuation does not touch guest memory. Undo all the way to the anchor — the forward
+        // replay below re-runs the ops between it and the target, which re-writes exactly what was
+        // just reverted, so the window ends correct at `turn` either way.
         if let Some(m) = self.mem.as_mut() {
-            self.journal.undo_window_to(turn, m);
+            self.journal.undo_window_to(anchor, m);
         }
         // Verbatim (`readmit_parks = false`): an undo rewinds in place rather than re-executing, so a
         // task parked at that turn comes back parked.
@@ -7995,11 +8112,30 @@ impl ScheduledDebugRun {
             self.host.replay_cap_tape(taped);
         }
         self.host.restore_journal_cursor(&cursor);
-        self.turn = turn;
+        self.turn = anchor;
         self.clock = cont.clock;
         self.locate();
         self.last_watch = None;
-        true
+        // Re-execute the remainder of the segment. The journal stays armed, so the re-run re-records
+        // the same pre-images for those turns and the history is whole again afterwards — an undo to
+        // a position inside this stretch, next time, works exactly as this one did.
+        //
+        // Breakpoints and watchpoints are suppressed across the replay: it is *re-execution of turns
+        // that already happened*, not the user continuing, and a stop here would strand the run
+        // short of the position it was asked for. The same reasoning the DAP backend's `seek` replay
+        // applies to its own drive.
+        if anchor < turn {
+            // `tick` is the right primitive here and the reason this is sound: it advances the
+            // schedule by exactly one visible op, honouring no breakpoint / watch / step checks. This
+            // is re-execution of turns that already happened, not the user continuing, so a stop
+            // would strand the run short of the position it was asked for — and a `step` would
+            // advance by a *step*, which is not the same quantum as a turn.
+            let mut fuel = u64::MAX;
+            while self.turn < turn && self.tick(&mut fuel) {}
+            self.locate();
+            self.last_watch = None;
+        }
+        self.turn == turn
     }
 
     /// Resolve a source variable held in an SSA value to a value-watch target (#1229), in the
@@ -8294,7 +8430,15 @@ impl ScheduledDebugRun {
                 mem,
             );
             journal_state(
-                journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+                journal,
+                tasks,
+                extra_envs,
+                fibers,
+                source,
+                host,
+                *clock,
+                *turn,
+                journal_policy,
             );
             journal.apply_policy(*turn, journal_policy);
             // Slice 6: the turn record + the pre-advance snapshot the park/wake differ compares.
@@ -8431,7 +8575,15 @@ impl ScheduledDebugRun {
             mem,
         );
         journal_state(
-            journal, tasks, extra_envs, fibers, source, host, *clock, *turn,
+            journal,
+            tasks,
+            extra_envs,
+            fibers,
+            source,
+            host,
+            *clock,
+            *turn,
+            journal_policy,
         );
         journal.apply_policy(*turn, journal_policy);
         let trace_turn = *turn;
@@ -13114,73 +13266,27 @@ impl CoopSched {
                     // additionally re-grants a by-name cap list read from the parent window, so a spawned
                     // command resolves an inherited `stdout` by name (STAGE1.md — the shell "exec"
                     // primitive). The named build fails closed via the shared, fuzzed `spawn_named_child`.
-                    let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants
-                    {
-                        // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
-                        // records from the parent window (mirrors the tree-walk op-13 arm in lib.rs).
-                        let pm: Option<&Mem> = match tasks[ti].env {
-                            None => mem.as_ref(),
-                            Some(k) => extra_envs[k].mem.as_ref(),
-                        };
-                        let list: Result<Vec<(String, i32)>, Trap> = (|| {
-                            let m = pm.ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                list.push((name, handle));
+                    let pm: Option<&Mem> = match tasks[ti].env {
+                        None => mem.as_ref(),
+                        Some(k) => extra_envs[k].mem.as_ref(),
+                    };
+                    let (mut child_host, cinst, cas) =
+                        match named_child_host(host, pm, grants, child_size, &cmodule) {
+                            Ok(Some(triple)) => triple,
+                            // A `required` import slot with nothing to bind: probeable `-EINVAL`, as
+                            // the tree-walker answers, never a trap.
+                            Ok(None) => {
+                                tasks[ti]
+                                    .vt
+                                    .active
+                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
+                                continue;
                             }
-                            Ok(list)
-                        })();
-                        let list = match list {
-                            Ok(l) => l,
                             Err(t) => {
                                 complete(tasks, ti, Err(t));
                                 continue;
                             }
                         };
-                        match host.spawn_named_child(&list, child_size) {
-                            Some(triple) => triple,
-                            None => {
-                                complete(tasks, ti, Err(Trap::CapFault));
-                                continue;
-                            }
-                        }
-                    } else {
-                        let mut ch = Host::new();
-                        let cinst = ch.grant_instantiator(0, child_size);
-                        let cas = ch.grant_address_space(0, child_size);
-                        (ch, cinst, cas)
-                    };
-                    // §3.6: a separate-module child serves its OWN offers — enqueue admission,
-                    // handler resolution, and `child_offer` shape all read its module (tree-walk
-                    // lockstep: the spawn sets `self_module` from the grant).
-                    child_host.set_self_module(&cmodule);
-                    // IMPORTS.md phase 3 / §3.3: bind the child module's import manifest against its
-                    // granted powerbox — a chibicc child's generic imports (`write`/`read`/`exit`, and any
-                    // named grant) resolve here, so a compiled command actually does I/O rather than
-                    // `CapFault`ing on its first `write`. `spawn_named_child` registers the *names* but does
-                    // not bind the manifest, so the driver does it (the same `bind_child_manifest` the tree-
-                    // walker's op-13 arm and the JIT's `child_bind_imports` hook call). A `required` slot
-                    // with nothing to bind fails the spawn closed with a probeable `-EINVAL` (as the tree-
-                    // walker does), never a trap. Empty for a manifest-free child (imports is empty → Ok).
-                    if child_host
-                        .bind_child_manifest(&cmodule.imports, &cmodule.types)
-                        .is_err()
-                    {
-                        tasks[ti]
-                            .vt
-                            .active
-                            .set(dst, Reg::from_i32(super::EINVAL as i32));
-                        continue;
-                    }
                     let child_args = if want_as {
                         vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                     } else {
@@ -14563,14 +14669,31 @@ fn run_vcpu_parallel<'scope, 'env>(
             false, // #1157: the OS preempts real threads — no in-engine quantum needed here
         );
         match stop {
-            // §3.6 (I36 slice 2): the serve/call/offer trio runs only on the cooperative
-            // driver (`drive`); a serving module never reaches the parallel driver (the
-            // qualification veto refuses svc + threads together) — fail closed if it somehow
-            // does, rather than park unwakeably. I48 `BlockOnFiber` is likewise cooperative-only
+            // §3.6 (I36 slice 2): the serve/call pair runs only on the cooperative driver
+            // (`drive`); a serving module never reaches the parallel driver (the qualification veto
+            // refuses svc + threads together) — fail closed if it somehow does, rather than park
+            // unwakeably. (`child_offer` was grouped here until #1566; see the arm above.) I48 `BlockOnFiber` is likewise cooperative-only
             // (this path passes `cooperative: false`), so it never arises here — grouped in.
+            // §3.6 `child_offer` (op 14) — #1566. Unlike its neighbours below, this one **is**
+            // reachable here: the qualification veto that keeps a serving module off this driver
+            // covers the svc ops, and `child_offer` is an `Instantiator` op, so a single-vCPU guest
+            // that never spawns a thread reaches it with nothing refusing first. The capability
+            // itself is genuinely unavailable — minting a live offer needs the CALLEE's powerbox,
+            // and this driver moves each child's `Host` into that child's own OS thread, publishing
+            // only its result through `reg`, so the parent has no path to it (the same reason the
+            // browser's per-Worker driver fails closed on a stashed powerbox).
+            //
+            // But "unavailable" is a value, not a trap. The cooperative driver answers `-EINVAL`
+            // for a child it cannot resolve, so this answers the same: one op, one answer, whichever
+            // loop is driving (INVARIANTS #9), and a guest probing a stale child handle is not
+            // killed for the driver it happened to land on (#5 — errors are values, traps are for
+            // forgery). It used to be grouped into the fail-closed trap below on the premise that it
+            // could not arrive.
+            Ok(VcpuStop::ChildOffer { dst, .. }) => {
+                vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+            }
             Ok(VcpuStop::LiveCall { .. })
             | Ok(VcpuStop::SvcWait)
-            | Ok(VcpuStop::ChildOffer { .. })
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
             | Ok(VcpuStop::BlockOnFiber { .. })
@@ -15227,15 +15350,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                 grants,
                 budget,
             }) => {
-                // op 13 (named-grant spawn) / a §3d budget record is driven only by the cooperative
-                // single-thread `drive` path (the browser's wasm-safe entry); the OS-thread parallel
-                // driver declines them.
-                if grants.is_some() || budget != 0 {
-                    return (Err(Trap::Malformed), mem);
-                }
                 // Resolve + clone the granted module under the host lock (a forged/closed/wrong-type
-                // handle is an inert CapFault → trap).
-                let (cfuncs, cmem_log2, cdata, ctypes, cshadow) = {
+                // handle is an inert CapFault → trap). #1570: this comes **first**, before any
+                // feature check — the arm used to test `grants`/`budget` up front and answer
+                // `Trap::Malformed`, so a forged handle got that instead of the `CapFault` the
+                // cooperative driver gives it. Same op, same forged handle, one answer.
+                let (cfuncs, cmem_log2, cdata, ctypes, cshadow, cmodule) = {
                     let g = host.lock_unpoisoned();
                     match g.resolve_module(mh) {
                         Ok(grant) => (
@@ -15244,6 +15364,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             grant.data.clone(),
                             grant.types.clone(),
                             grant.shadow,
+                            std::sync::Arc::clone(&grant.module),
                         ),
                         Err(t) => return (Err(t), mem),
                     }
@@ -15309,15 +15430,56 @@ fn run_vcpu_parallel<'scope, 'env>(
                     mem.as_ref()
                         .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
                 };
-                let mut child_host = Host::new();
-                let cinst = child_host.grant_instantiator(0, child_size);
-                let cas = child_host.grant_address_space(0, child_size);
+                // #1570 — the child powerbox, through the same [`named_child_host`] the cooperative
+                // arm uses: the by-name grant list re-granted in, the running module registered, and
+                // the child module's import manifest bound. This driver used to decline grants
+                // outright *and* never bind the manifest, so even a grant-free child's imports went
+                // unbound here while the cooperative driver bound them. Re-granting works because
+                // the child's `Host` is still local at this point — it moves to the child's own OS
+                // thread below, which is exactly what op 15 already relies on.
+                let built = {
+                    let mut hg = host.lock_unpoisoned();
+                    named_child_host(&mut hg, mem.as_ref(), grants, child_size, &cmodule)
+                };
+                let (mut child_host, cinst, cas) = match built {
+                    Ok(Some(triple)) => triple,
+                    // A `required` import slot with nothing to bind: probeable, never a trap.
+                    Ok(None) => {
+                        vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                        continue;
+                    }
+                    Err(t) => return (Err(t), mem),
+                };
                 let child_args = if want_as {
                     vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                 } else {
                     vec![Value::I64(cinst as i64)]
                 };
-                let child_fuel = if quota <= 0 {
+                // A §3d budget record funds the spawn from a `Budget` rather than the `quota` scalar
+                // — the same `take_spawn_budget` the cooperative arm charges, so the two drivers
+                // spend the same quota for the same spawn.
+                let chan_cap = (budget != 0)
+                    .then(|| host.lock_unpoisoned().peek_budget(budget).map(|b| b.channel))
+                    .flatten();
+                let child_fuel = if budget != 0 {
+                    let taken = {
+                        let mut hg = host.lock_unpoisoned();
+                        take_spawn_budget(&mut hg, budget, child_size, fuel)
+                    };
+                    match taken {
+                        Err(t) => return (Err(t), mem),
+                        Ok(None) => {
+                            vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }
+                        Ok(Some(f)) => {
+                            if let Some(cap) = chan_cap {
+                                child_host.set_channel_cap(cap);
+                            }
+                            f
+                        }
+                    }
+                } else if quota <= 0 {
                     fuel
                 } else {
                     (quota as u64).min(fuel)

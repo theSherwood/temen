@@ -188,6 +188,22 @@ pub mod cap_id {
     /// `15` (`WINDOW_MINTER`) is **retired** (#1289 R2): minting a detached window is not a
     /// separate authority — it spends `Budget.mem` (iface 14). The id stays reserved (not reused)
     /// so old wire never collides.
+    /// **Freeze authority** (INVARIANTS #14 R1, PROCESS.md O14, #1440) — the authority to snapshot a
+    /// domain, carried as a capability rather than inferred from placement.
+    ///
+    /// A snapshot is a complete read of a window, so "may an ancestor freeze me?" is an exposure
+    /// question, and `self.attest`'s `freeze_exposed` bit is meant to answer it truthfully. It could
+    /// not: authority was implicit in nesting, so the bit reported a *placement* and the report was
+    /// conservative rather than true. Holding it as a `(base, size)` sub-range grant makes it
+    /// attenuate down the grant graph like every other authority (#3), survive freeze/thaw through the
+    /// value-typed re-grant path, and be *askable* — which is what the op-15 gate needs before it can
+    /// become "refuse unless a freeze-authority holder is registered" instead of refusing outright.
+    ///
+    /// Confers no operations: like `Module`, it is pure authority that other paths consult, so a
+    /// `call.cap` on it is an inert `CapFault`.
+    ///
+    /// `15` is retired (#1289 R2), so this takes `16`.
+    pub const FREEZE_AUTHORITY: u32 = 16;
     /// Base of the **guest-interface id space** (IMPORTS.md §3.2): ids for wired interface offers
     /// are interned per-`Host` from this base upward (`intern_interface` — the id ≡
     /// the structural op-signature list, the D59 rule applied to capability interfaces). Far above
@@ -3582,6 +3598,58 @@ pub const MAX_FIBERS: usize = 1 << 24;
 /// `ThreadFault` past it. The interpreter bounds *concurrently-live* vCPUs; the JIT's table is
 /// cumulative, so there it bounds *total* spawns (stricter, but containment holds either way).
 pub const MAX_VCPUS: usize = 1 << 16;
+
+/// D66 — the **lane arithmetic** every scheduler's dispatch calls (INVARIANTS #3 ruling 2026-09-21):
+/// parallelism is a granted resource bounded at dispatch. A task carries a *lane chain* — `(domain,
+/// cap)` for its own domain and every ancestor, innermost first — and may be on a worker only while
+/// every bounded cap in the chain has room; it holds those lanes exactly while on the worker. Shared
+/// by the interpreter's two drivers and the JIT's child-domain executor, so the 6/2/2 answer is one
+/// function, not three (INVARIANTS #15). Pure over a running-count map; no locking policy here.
+pub mod lanes {
+    use alloc::collections::BTreeMap;
+
+    /// Whether `chain` has any bounded cap at all. `false` for every run that sets no lane cap —
+    /// the hot-path gate: such a task takes no scheduler lock around its run.
+    pub fn bounded(chain: &[(usize, i64)]) -> bool {
+        chain.iter().any(|&(_, cap)| cap >= 0)
+    }
+
+    /// Whether every bounded lane in `chain` has room right now — the admission predicate. A
+    /// dispatcher scanning its queue for a runnable task asks this without taking anything, then
+    /// takes with [`enter`] under the *same* lock, so the answer cannot go stale in between.
+    pub fn bounded_fits(running: &BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
+        chain.iter().all(|&(domain, cap)| {
+            cap < 0 || running.get(&domain).copied().unwrap_or(0) < cap as usize
+        })
+    }
+
+    /// Take every lane in `chain` for a task about to run: [`bounded_fits`] must hold, and then
+    /// every entry's count rises. All-or-nothing, so a task never holds a child lane without the
+    /// enclosing ones — which is what makes "a task counts against its own lane and every
+    /// ancestor's" a single check.
+    pub fn enter(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) -> bool {
+        if !bounded_fits(running, chain) {
+            return false;
+        }
+        for &(d, _) in chain {
+            *running.entry(d).or_insert(0) += 1;
+        }
+        true
+    }
+
+    /// Release every lane in `chain` (the task parked, yielded or finished). Exact inverse of
+    /// [`enter`]; a zero entry is removed so the map stays the size of the live domain set.
+    pub fn leave(running: &mut BTreeMap<usize, usize>, chain: &[(usize, i64)]) {
+        for &(d, _) in chain {
+            if let Some(n) = running.get_mut(&d) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    running.remove(&d);
+                }
+            }
+        }
+    }
+}
 
 /// §15 **spawn quota** — host-configurable ceilings on how many fibers (`cont.new`) / vCPUs
 /// (`thread.spawn`) a run may create, *below* the fixed [`MAX_FIBERS`]/[`MAX_VCPUS`] anti-bomb

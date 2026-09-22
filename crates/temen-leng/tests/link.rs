@@ -25,6 +25,28 @@ fn run(m: &temen_ir::Module, idx: u32, args: &[i64]) -> i64 {
     n
 }
 
+/// Like [`run`], but pre-seed an i64 at `off` in the window first (both engines, parity).
+fn run_with_seed(m: &temen_ir::Module, idx: u32, args: &[i64], off: usize, val: i64) -> i64 {
+    temen_verify::verify_module(m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    // #1094: the NULL guard is unconditional, so seeds must clear `[0, POWERBOX_NULL_GUARD)`.
+    let mut seed = vec![0u8; 20480];
+    seed[off..off + 8].copy_from_slice(&val.to_le_bytes());
+    let ivals: Vec<Value> = args.iter().map(|&n| Value::I64(n)).collect();
+    let mut fuel = u64::MAX;
+    let (ir, _) = temen_interp::run_capture(m, idx, &ivals, &mut fuel, &seed);
+    let n = match ir.expect("interp").as_slice() {
+        [Value::I64(n)] => *n,
+        o => panic!("expected i64, got {o:?}"),
+    };
+    let (jout, _) = temen_jit::compile_and_run_capture(m, idx, args, &seed).expect("jit");
+    let jit = match jout {
+        temen_jit::JitOutcome::Returned(v) => v,
+        o => panic!("jit: {o:?}"),
+    };
+    assert_eq!(jit.as_slice(), &[n], "§9 interp/JIT parity");
+    n
+}
+
 /// Real nimony: `moda` imports `pkg/modb` and calls `helper`. `hexer` emits `moda`'s call as
 /// `helper.0.<modb-stem>`; `modb` defines `helper.0.` locally. Linking the two translated modules
 /// resolves the cross-module call to compiled Nim, and `useit(5) = helper(5) + 1 = 16`.
@@ -392,6 +414,74 @@ fn nested_cross_module_types_resolve() {
     );
 }
 
+/// **#1593 — the type-pooling fixpoint has to run until the *offsets* stop moving.** A three-unit
+/// nesting chain `Outer -> Middle -> Inner`, each link in a different unit, is the shortest shape
+/// that catches a fixpoint which stops one round early.
+///
+/// Each round resolves one more level: round 1 lays `Inner` correctly and sizes `Middle`'s and
+/// `Outer`'s cross-module aggregate fields as the 8-byte scalar placeholder; round 2 fixes `Middle`
+/// but still uses round 1's `Middle` inside `Outer`. The old convergence signal was the **summed
+/// field count**, which round 2 leaves unchanged — no field is added, only a size corrected — so the
+/// loop stopped there and froze an `Outer` whose `m` field still claimed 8 bytes while `Middle`
+/// really needs 24. `y` then landed *inside* `m`, and writing one scribbled over the other.
+///
+/// With the stale table `Outer` is 24 bytes with `y` at +16, while `Middle` really needs 24 — so `y`
+/// lands exactly on `m.x`. The proc writes `m.i.b`, then `m.x`, then `y`, and returns `m.x` plus
+/// `m.i.b`'s displacement from what it was set to: either overlap shows up, and a correct layout
+/// returns the value passed in. This is what nifler2's `Parser { lex: Lexer; tok: Token; dest:
+/// TokenBuf }` hit (#763) — three cross-module aggregate fields, all overlapping.
+#[test]
+fn three_deep_cross_module_nesting_lays_fields_out_disjointly() {
+    let mod_c = "\
+(stmts
+ (type :Inner.0. . (object . (fld :a.0 . (i +64)) (fld :b.0 . (i +64)))))";
+    let mod_b = "\
+(stmts
+ (type :Middle.0. . (object . (fld :i.0 . Inner.0.modc) (fld :x.0 . (i +64)))))";
+    let mod_a = "\
+(stmts
+ (type :Outer.0. . (object . (fld :m.0 . Middle.0.modb) (fld :y.0 . (i +64)))))";
+    let mod_u = "\
+(stmts
+ (proc :get.0. (params (param :v.0 . (i +64))) (i +64) .
+  (stmts .
+   (var :o.0 . Outer.0.moda .)
+   (asgn (dot (dot (dot o.0 m.0 0) i.0 0) b.0 0) 11)
+   (asgn (dot (dot o.0 m.0 0) x.0 0) v.0)
+   (asgn (dot o.0 y.0 0) 7)
+   (ret (add (i +64) (dot (dot o.0 m.0 0) x.0 0)
+             (sub (i +64) (dot (dot (dot o.0 m.0 0) i.0 0) b.0 0) 11))))))";
+    let linked = temen_leng::link_units(&[
+        LengModule {
+            stem: "modu",
+            src: mod_u,
+            names: &["get.0."],
+        },
+        LengModule {
+            stem: "moda",
+            src: mod_a,
+            names: &[],
+        },
+        LengModule {
+            stem: "modb",
+            src: mod_b,
+            names: &[],
+        },
+        LengModule {
+            stem: "modc",
+            src: mod_c,
+            names: &[],
+        },
+    ])
+    .unwrap_or_else(|e| panic!("link: {e}"));
+    assert_eq!(
+        run(&linked, 0, &[20480, 33]),
+        33,
+        "no field may overlap another — 7 here means the pooled `Outer` froze with `m` \
+         sized from the round before `Middle` settled"
+    );
+}
+
 #[test]
 fn cross_module_sret_call_with_oconstr_arg() {
     // Regression (#760): an aggregate **rvalue** — an `(oconstr …)` literal — passed to a
@@ -436,7 +526,7 @@ fn cross_module_aggregate_global_materializes() {
     // A **module-level aggregate global** whose constructor type is defined in a *sibling* module
     // (`var g = Pair(x: 9, y: 7)` where `Pair` lives in module `p`) — exactly nimony's `var s =
     // "…"`, where `string` is defined in `system`. The linker's funcref/frame **pre-scans**
-    // (`export_funcrefs`/`export_tls_vars`/`proc_frame_nodes`) run `collect_globals` on a fresh,
+    // (`export_globals`/`export_tls_vars`/`proc_frame_nodes`) run `collect_globals` on a fresh,
     // import-less translator just to enumerate funcref/thread-var globals; with no pooled sibling
     // types they can't fold this `oconstr` and previously **fail-closed there**, aborting the whole
     // link for *every* program with a module-level cross-module aggregate `var`. The pre-scans now
@@ -822,4 +912,56 @@ fn funcref_global_static_initializer() {
         "drive calls the materialized hook = dbl"
     );
     assert_eq!(run(&linked, 0, &[18432, -5]), -10);
+}
+
+#[test]
+fn a_siblings_proc_taken_as_a_funcref() {
+    // #760: unit `b` stores unit `a`'s proc into a dispatch record and calls through it. nimony
+    // builds exactly this — `cps.nim` puts `coro_transform`'s `transformCoroutineDecl` into a
+    // `trCoroutine` field — and it was the second construct standing between hexer and the pure
+    // no-C path, as `Unresolved("transformCoroutineDecl.0.cor8uhndx")`.
+    //
+    // Two things have to be true at once. The *using* unit needs a value for a proc it has no func
+    // index for (`Inst::RefFunc` takes an index immediate), and the *defining* unit has to give
+    // that proc the funcref ABI's leading `$sp` — which it can only know from the whole-program
+    // pool, since the use is in a sibling. Get either half wrong and this fails closed: an
+    // unresolved symbol, or a call-arity mismatch at verify.
+    let a = temen_leng::WholeModule {
+        stem: "moda",
+        src: "\
+(stmts
+ (proc :dbl.0. (params (param :x.0 . (i +64))) (i +64) .
+  (stmts . (ret (mul (i +64) x.0 2)))))",
+    };
+    let b = temen_leng::WholeModule {
+        stem: "modb",
+        src: "\
+(stmts
+ (type :IntFn.0. . (proctype . (params (param :x.0 . (i +64))) (i +64) (pragmas (nimcall))))
+ (type :Box.0. . (object . (fld :fn.0 . IntFn.0.) (fld :v.0 . (i +64))))
+ (proc :useit.0. (params (param :bx.0 . (ptr Box.0.))) (i +64) .
+  (stmts .
+   (asgn (dot (deref bx.0) fn.0 0) dbl.0.moda)
+   (ret (call (dot (deref bx.0) fn.0 0) (dot (deref bx.0) v.0 0))))))",
+    };
+    let m = temen_leng::link_whole_units(&[a, b]).unwrap_or_else(|e| panic!("link: {e}"));
+    // Box at 16512: `fn`@0 is overwritten by the store, `v`@8 seeded to 21. The func index is
+    // whichever slot the merge gave `useit`; find it by name rather than assuming an order.
+    let idx = m
+        .exports
+        .iter()
+        .find(|e| e.name == "useit.0.modb")
+        .unwrap_or_else(|| {
+            panic!(
+                "useit exported: {:?}",
+                m.exports.iter().map(|e| &e.name).collect::<Vec<_>>()
+            )
+        })
+        .func;
+    let bx = 16512usize;
+    assert_eq!(
+        run_with_seed(&m, idx, &[18432, bx as i64], bx + 8, 21),
+        42,
+        "dbl(21) called through a funcref to a sibling unit's proc"
+    );
 }
