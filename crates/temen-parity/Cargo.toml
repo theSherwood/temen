@@ -21,6 +21,7 @@ temen-text.workspace = true
 temen-interp.workspace = true
 temen-jit.workspace = true
 temen-wasm-jit.workspace = true
+temen-run = { path = "../temen-run" }
 
 [[bin]]
 # Regenerate the checked-in human-readable matrix (`OPS_PARITY.md`): `cargo run -p temen-parity`.
