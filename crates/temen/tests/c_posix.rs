@@ -3322,6 +3322,154 @@ int main(void) {{\n\
     );
 }
 
+/// #1609 — the **whole-`execve` personality op** (`OP_EXECVE`), the route a guest with no
+/// `exec.c` of its own takes. Deliberately the same scenario as
+/// `c_execve_runs_a_px_linked_command` above, with the one difference that matters: that test
+/// reaches the image-replace through the guest-side mechanism (`exec_resolve` + the
+/// `CAP_SELF_EXEC` self-op, both open-coded in `EXEC_C`), and this one hands the personality the
+/// whole call. Same command, same argv, same env, same reaped status — because both land on the
+/// same `build_exec_req`. That is the claim worth pinning: `OP_EXECVE` is a second *door*, not a
+/// second implementation.
+///
+/// This is the shape nimony needs. Its `std/os` inlines fork/execve/waitpid rather than routing
+/// through one interceptable `system()`, so a no-C nim program has no place to put an `exec.c`.
+#[test]
+fn c_px_execve_op_runs_a_command_without_guest_side_exec() {
+    const CMD: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+long __px_getenv(int cap, long name, long len);
+int main(int argc, char **argv) {
+  __px_write(0, 1, (long)"CMD!", 4);
+  char *v = (char *)__px_getenv(0, (long)"MARK", 4);
+  if (!v || v[0] != 'y') return 90;   /* the process (env) crossed the exec */
+  return argc;                        /* 2: argv crossed too */
+}
+"#;
+    // No `EXEC_C`: the guest declares the personality op and calls it directly.
+    let src = format!(
+        "{WIN_PAD_17}\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    __px_execve(0, (long)\"/bin/px\", (long)av, 0);\n\
+    return 99;   /* only reached on refusal — execve does not return on success */\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/px", CMD);
+        posix.set_env("MARK", "y");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "OP_EXECVE became the command: argv crossed (argc 2), env crossed, status reaped"
+    );
+    assert_eq!(
+        e.stdout, b"CMD!",
+        "the command ran on the SAME personality — one image-replace, not a spawn"
+    );
+}
+
+/// #1609 — [`OP_EXECVE`]'s refusals are **probeable errnos with the caller still running**, and
+/// resolution is the command registry and nothing else. The errno split is the one `execvp`'s
+/// PATH walk keys on (POSIX: remember an `EACCES`, keep searching past an `ENOENT`), so it has to
+/// hold on this route exactly as it does on `exec_resolve`'s.
+///
+/// The caller surviving all three is the real assertion: a failed `execve` that took the domain
+/// with it would be a trap where POSIX promises a return value.
+#[test]
+fn c_px_execve_op_refuses_probeably_and_the_caller_survives() {
+    let src = format!(
+        "{WIN_PAD_17}\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static char *av[] = {{ \"x\", 0 }};\n\
+int main(void) {{\n\
+  /* Nothing at the path at all. */\n\
+  if (__px_execve(0, (long)\"/bin/nope\", (long)av, 0) != -2) return 1;\n\
+  /* A real memfs file with no executable registration: present, but not a command. */\n\
+  if (__px_execve(0, (long)\"/data.txt\", (long)av, 0) != -13) return 2;\n\
+  /* A NULL argv is C-legal and must not fault. */\n\
+  if (__px_execve(0, (long)\"/bin/nope\", 0, 0) != -2) return 3;\n\
+  __px_write(0, 1, (long)\"alive\", 5);\n\
+  return 7;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |_host, posix| {
+        posix.write_file("/data.txt", b"not a command");
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(7)],
+        "-ENOENT for an unregistered path, -EACCES for an unregistered memfs file"
+    );
+    assert_eq!(
+        e.stdout, b"alive",
+        "the caller kept running through all three refusals (POSIX: execve returns only on failure)"
+    );
+}
+
+/// #1609 — the same `OP_EXECVE` round on the **bytecode engine**. Not a formality: the two tiers
+/// reach the image-replace by different routes. The tree-walker folds the request to
+/// `Inner::Exec` inside its eval loop; the bytecode engine has no eval loop to fold into, so its
+/// request arm surfaces `Outcome::Exec` to the cooperative driver — the very same outcome its
+/// op-14 arm produces, which is why `ExecSelf` needed no new `Outcome`/`VcpuStop` variant.
+///
+/// A tier that silently declined the request would leave the guest holding the `-ENOSYS`
+/// placeholder and `return 99`, so the assertion below is exactly the one that catches it.
+#[test]
+fn c_px_execve_op_runs_a_command_on_bytecode() {
+    const CMD: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+int main(int argc, char **argv) {
+  __px_write(0, 1, (long)"BC!", 3);
+  return argc;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"px\", \"z\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    __px_execve(0, (long)\"/bin/px\", (long)av, 0);\n\
+    return 99;\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  if (((status >> 8) & 0xff) != 2) return 200 + ((status >> 8) & 0xff);\n\
+  return 42;\n\
+}}\n"
+    );
+    let e = run_bytecode_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/px", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(42)],
+        "the bytecode tier serviced ParkEvent::ExecSelf through its existing Outcome::Exec"
+    );
+    assert_eq!(e.stdout, b"BC!", "the command ran on the same personality");
+}
+
 /// #801 rung 1 — **signature drift is a clean bind-time refusal, and the caller survives it**: a
 /// command declaring `__px_write` with the wrong arity fails the vtable's sig check, `execve`
 /// returns `-EINVAL` (POSIX: only on failure), and — the restore-path witness — the caller's own

@@ -16765,6 +16765,27 @@ impl Vm {
                                 self.pc = pc;
                                 return Ok(Outcome::ReapWait { child: None });
                             }
+                            // #1609 — `execve` through the personality. The personality already
+                            // resolved the path against its command registry and packed argv/envp
+                            // into the powerbox args region, so all that is left is the image
+                            // -replace the op-14 route already surfaces: reuse [`Outcome::Exec`]
+                            // verbatim rather than growing a parallel variant through the driver.
+                            // Empty grant list + entry 0 = the self-contained-command shape
+                            // `exec.c` passes; `size_log2` has been advisory since #773 (the real
+                            // bound is the caller's own window, checked in the builder). Advances
+                            // past the op like `fork`: a refused exec lands its errno in `dst`, a
+                            // successful one never returns to this activation.
+                            super::ParkEvent::ExecSelf { cmd } => {
+                                self.pc = pc + 1;
+                                return Ok(Outcome::Exec {
+                                    mh: cmd,
+                                    grants_ptr: 0,
+                                    grants_n: 0,
+                                    entry: 0,
+                                    size_log2: 0,
+                                    dst: *dst,
+                                });
+                            }
                         }
                     }
                     // #1080 rung 4 — a personality blocking pipe read/write rides this dispatch (a

@@ -2478,14 +2478,7 @@ fn drive_over_cell(
             // under this Host's lock, so the closure must not re-lock it).
             let park_cell = park_request.clone();
             source.set_park_request(Arc::new(move |ev| {
-                park_cell.store(
-                    match ev {
-                        ParkEvent::TaskExit(id) => id,
-                        ParkEvent::TaskExitAny => u64::MAX - 1,
-                        ParkEvent::ForkSelf => u64::MAX,
-                    },
-                    Ordering::SeqCst,
-                );
+                park_cell.store(ev.encode(), Ordering::SeqCst);
             }));
         }
     }
@@ -6027,14 +6020,7 @@ impl Scheduler {
             // #799 — the park-request closure, minted with the wake/stop/kill.
             let park_cell = park_request.clone();
             source.set_park_request(Arc::new(move |ev| {
-                park_cell.store(
-                    match ev {
-                        ParkEvent::TaskExit(id) => id,
-                        ParkEvent::TaskExitAny => u64::MAX - 1,
-                        ParkEvent::ForkSelf => u64::MAX,
-                    },
-                    Ordering::SeqCst,
-                );
+                park_cell.store(ev.encode(), Ordering::SeqCst);
             }));
         }
     }
@@ -10622,6 +10608,168 @@ fn handle_mem(
     }
 }
 
+/// FORK.md §8.6 / #1609 — build the **`execve` image-replace** request, or refuse it.
+///
+/// The one builder behind both routes to an image-replace: the self-namespace op 14
+/// (`exec_module`, what `demos/posix_libc/exec.c` calls) and the personality's
+/// [`ParkEvent::ExecSelf`] (what a guest's `execve()` reaches through `OP_EXECVE`). It was inlined
+/// in the op-14 arm; a second copy for the personality route would have been a second place for
+/// the admissibility rules — the window bound, the clean-root gate, the durable refusal, the grant
+/// regrant check — to drift, which is exactly the duplication INVARIANTS #15 is about. Everything
+/// fallible happens here, where a refusal is a clean errno that leaves the caller running;
+/// `dispatch`'s rebuild from the returned [`ExecReq`] is infallible.
+///
+/// `None` = refused; the caller completes its op with `-EINVAL` (POSIX: `execve` returns only on
+/// failure). `clean_root` is the caller's "no serve handler, root fiber" judgement.
+#[allow(clippy::too_many_arguments)]
+fn build_exec_req(
+    host: &Arc<Mutex<Host>>,
+    mem: Option<&Mem>,
+    sched: &SchedRef,
+    mh: i32,
+    grants_ptr: u64,
+    grants_n: u64,
+    entry: u64,
+    size_log2: i64,
+    durable: bool,
+    clean_root: bool,
+) -> Option<Box<ExecReq>> {
+    // Resolve the command module (forged handle → fail closed) into an owned `ChildMod`.
+    let cmod = {
+        let hg = host.lock_unpoisoned();
+        hg.resolve_module(mh).ok().map(|g| ChildMod {
+            funcs: g.funcs.clone(),
+            shadow: g.shadow,
+            memory_log2: g.memory_log2,
+            data: g.data.clone(),
+            durable: g.durable,
+            digest: g.digest,
+            imports: g.imports.clone(),
+            types: g.types.clone(),
+            module: Arc::clone(&g.module),
+        })
+    };
+    // Read + authority-check the inherited-cap grant list (same 16-byte record shape as
+    // op 13's named grants). Any bad record / non-regrantable handle fails the whole
+    // exec closed, before we mutate anything.
+    let grants: Option<Vec<(String, i32)>> = (|| {
+        let m = mem.as_ref()?;
+        let mut list = Vec::new();
+        for i in 0..grants_n {
+            let rec = m.read_window(grants_ptr + i * 16, 16).ok()?;
+            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
+            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
+            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
+            let name_bytes = m.read_window(name_off, name_len).ok()?;
+            let name = String::from_utf8(name_bytes).ok()?;
+            host.lock_unpoisoned().can_regrant(handle).then_some(())?;
+            list.push((name, handle));
+        }
+        Some(list)
+    })();
+    // Admissibility: a resolvable non-durable command whose declared window **fits the
+    // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
+    // window in place, so the command runs there iff its declared memory ≤ that window —
+    // a larger window is a safe superset, still masked to the actual size by invariant 2).
+    // The guest-passed `size_log2` is now advisory: the real bound is the caller's own
+    // window (`mem.window_size()`), so a shell whose window is bigger than the shim's
+    // hardcoded hint can exec a command that declares more memory than that hint. A real
+    // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
+    // fully-regrantable grant list are also required. Anything else is a probeable
+    // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
+    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
+    // (Instantiator).
+    // The real capacity bound is the caller's **backed prefix**
+    // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
+    // runs the command in the caller's window, and pages beyond the backed prefix
+    // have no physical backing — committing prot entries there admits accesses
+    // the backing cannot serve (observed: an ml-17 command in an ml-16 caller ran
+    // with its upper half silently absent and died on garbage pointers). A grown
+    // Rw tail is deliberately not counted (its backing depth is embedder-specific
+    // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
+    let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
+    let win_log2 = win_bytes
+        .is_power_of_two()
+        .then(|| win_bytes.trailing_zeros() as u8);
+    let entry_params = cmod
+        .as_ref()
+        .and_then(|cm| cm.funcs.get(entry as usize))
+        .filter(|f| bytecode::child_entry_ok(&f.params, &f.results))
+        .map(|f| f.params.len());
+    let admissible = !durable
+        && clean_root
+        && grants.is_some()
+        && (0..64).contains(&size_log2)
+        && entry_params.is_some()
+        && win_log2.is_some_and(|wl| {
+            cmod.as_ref()
+                .is_some_and(|cm| cm.memory_log2.is_some_and(|ml| ml <= wl))
+        });
+    // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
+    // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
+    // manifest bound, its module registered as the self module. Only then commit to the
+    // image-replace (the returned [`ExecReq`]), which `dispatch` completes infallibly. The command's
+    // window (its Instantiator/AddressSpace authority + the data-materialization bound) is
+    // the **caller's** window, not the guest's `size_log2` hint — it runs where the shell did.
+    let built = if admissible {
+        let child_size = 1u64 << win_log2.expect("admissible");
+        let cm = cmod.as_ref().expect("admissible");
+        let grants = grants.as_ref().expect("admissible");
+        let mut hg = host.lock_unpoisoned();
+        hg.spawn_named_child(grants, child_size)
+            .and_then(|(mut ch, ci, ca)| {
+                // #1080 — the personality carry (self_module, exit/signal/stop/park
+                // cells, host_procs, pipe-end re-install + exec-remap) is shared with
+                // the bytecode engine's exec arm via `Host::exec_carry`, so this
+                // TCB-sensitive logic lives once. On a manifest-bind failure it unwinds
+                // and returns `Err` → the exec refuses cleanly (caller keeps running).
+                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types)
+                    .ok()
+                    .map(|_remap| (ch, ci, ca, child_size))
+            })
+    } else {
+        None
+    };
+    match built {
+        Some((ch, cinst, cas, child_size)) => {
+            let cm = cmod.expect("built");
+            let want_as = entry_params == Some(2);
+            let mut entry_args = vec![Value::I64(cinst as i64)];
+            if want_as {
+                entry_args.push(Value::I64(cas as i64));
+            }
+            // FORK.md §8.6 — the old powerbox is about to be dropped by the image
+            // -replace: release its pipe write *and* read ends (the fork-inherited ones
+            // this exec did not carry into the new image) and wake any pipe that thereby
+            // reached 0 writers (→ EOF for its readers) or 0 readers (→ `-EPIPE` for its
+            // writers). The new image's grants already bumped their own ends
+            // (`install_pipe_end`), so the shared counts never dip through this.
+            let (zeroed_w, zeroed_r) = {
+                let hg = host.lock_unpoisoned();
+                (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
+            };
+            for pipe in zeroed_w {
+                sched.wake_pipe_readers(pipe);
+            }
+            for pipe in zeroed_r {
+                sched.wake_pipe_writers(pipe);
+            }
+            Some(Box::new(ExecReq {
+                null_guard: temen_ir::module_null_guard(),
+                funcs: cm.funcs,
+                types: cm.types,
+                data: cm.data,
+                entry,
+                child_size,
+                image_len: 1u64 << cm.memory_log2.unwrap_or(0),
+                host: ch,
+                entry_args,
+            }))
+        }
+        None => None,
+    }
+}
+
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     // This domain's shadow arena is a property of its window, fixed for the run — read once so the
     // placement calls below never re-borrow `v` while a frame or the registry is borrowed mutably.
@@ -12310,14 +12458,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #799 — and its park-request closure.
                                         let park_cell = ch.park_request.clone();
                                         source.set_park_request(Arc::new(move |ev| {
-                                            park_cell.store(
-                                                match ev {
-                                                    ParkEvent::TaskExit(id) => id,
-                                                    ParkEvent::TaskExitAny => u64::MAX - 1,
-                                                    ParkEvent::ForkSelf => u64::MAX,
-                                                },
-                                                Ordering::SeqCst,
-                                            );
+                                            park_cell.store(ev.encode(), Ordering::SeqCst);
                                         }));
                                     }
                                 }
@@ -12934,14 +13075,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // #799 — and its park-request closure.
                                         let park_cell = ch.park_request.clone();
                                         source.set_park_request(Arc::new(move |ev| {
-                                            park_cell.store(
-                                                match ev {
-                                                    ParkEvent::TaskExit(id) => id,
-                                                    ParkEvent::TaskExitAny => u64::MAX - 1,
-                                                    ParkEvent::ForkSelf => u64::MAX,
-                                                },
-                                                Ordering::SeqCst,
-                                            );
+                                            park_cell.store(ev.encode(), Ordering::SeqCst);
                                         }));
                                     }
                                 }
@@ -13572,141 +13706,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let grants_n = argn(2)? as u64;
                     let entry = argn(3)? as u64;
                     let size_log2 = argn(4)?;
-                    // Resolve the command module (forged handle → fail closed) into an owned `ChildMod`.
-                    let cmod = {
-                        let hg = host.lock_unpoisoned();
-                        hg.resolve_module(mh).ok().map(|g| ChildMod {
-                            funcs: g.funcs.clone(),
-                            shadow: g.shadow,
-                            memory_log2: g.memory_log2,
-                            data: g.data.clone(),
-                            durable: g.durable,
-                            digest: g.digest,
-                            imports: g.imports.clone(),
-                            types: g.types.clone(),
-                            module: Arc::clone(&g.module),
-                        })
-                    };
-                    // Read + authority-check the inherited-cap grant list (same 16-byte record shape as
-                    // op 13's named grants). Any bad record / non-regrantable handle fails the whole
-                    // exec closed, before we mutate anything.
-                    let grants: Option<Vec<(String, i32)>> = (|| {
-                        let m = mem.as_ref()?;
-                        let mut list = Vec::new();
-                        for i in 0..grants_n {
-                            let rec = m.read_window(grants_ptr + i * 16, 16).ok()?;
-                            let name_off =
-                                u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                            let name_len =
-                                u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                            let name_bytes = m.read_window(name_off, name_len).ok()?;
-                            let name = String::from_utf8(name_bytes).ok()?;
-                            host.lock_unpoisoned().can_regrant(handle).then_some(())?;
-                            list.push((name, handle));
-                        }
-                        Some(list)
-                    })();
-                    // Admissibility: a resolvable non-durable command whose declared window **fits the
-                    // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
-                    // window in place, so the command runs there iff its declared memory ≤ that window —
-                    // a larger window is a safe superset, still masked to the actual size by invariant 2).
-                    // The guest-passed `size_log2` is now advisory: the real bound is the caller's own
-                    // window (`mem.window_size()`), so a shell whose window is bigger than the shim's
-                    // hardcoded hint can exec a command that declares more memory than that hint. A real
-                    // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
-                    // fully-regrantable grant list are also required. Anything else is a probeable
-                    // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
-                    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
-                    // (Instantiator).
                     let clean_root = serve_run.is_none() && *cur == ROOT_FIBER;
-                    // The real capacity bound is the caller's **backed prefix**
-                    // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
-                    // runs the command in the caller's window, and pages beyond the backed prefix
-                    // have no physical backing — committing prot entries there admits accesses
-                    // the backing cannot serve (observed: an ml-17 command in an ml-16 caller ran
-                    // with its upper half silently absent and died on garbage pointers). A grown
-                    // Rw tail is deliberately not counted (its backing depth is embedder-specific
-                    // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
-                    let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
-                    let win_log2 = win_bytes
-                        .is_power_of_two()
-                        .then(|| win_bytes.trailing_zeros() as u8);
-                    let entry_params = cmod
-                        .as_ref()
-                        .and_then(|cm| cm.funcs.get(entry as usize))
-                        .filter(|f| bytecode::child_entry_ok(&f.params, &f.results))
-                        .map(|f| f.params.len());
-                    let admissible = !durable
-                        && clean_root
-                        && grants.is_some()
-                        && (0..64).contains(&size_log2)
-                        && entry_params.is_some()
-                        && win_log2.is_some_and(|wl| {
-                            cmod.as_ref()
-                                .is_some_and(|cm| cm.memory_log2.is_some_and(|ml| ml <= wl))
-                        });
-                    // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
-                    // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
-                    // manifest bound, its module registered as the self module. Only then commit to the
-                    // image-replace (`Inner::Exec`), which `dispatch` completes infallibly. The command's
-                    // window (its Instantiator/AddressSpace authority + the data-materialization bound) is
-                    // the **caller's** window, not the guest's `size_log2` hint — it runs where the shell did.
-                    let built = if admissible {
-                        let child_size = 1u64 << win_log2.expect("admissible");
-                        let cm = cmod.as_ref().expect("admissible");
-                        let grants = grants.as_ref().expect("admissible");
-                        let mut hg = host.lock_unpoisoned();
-                        hg.spawn_named_child(grants, child_size)
-                            .and_then(|(mut ch, ci, ca)| {
-                                // #1080 — the personality carry (self_module, exit/signal/stop/park
-                                // cells, host_procs, pipe-end re-install + exec-remap) is shared with
-                                // the bytecode engine's exec arm via `Host::exec_carry`, so this
-                                // TCB-sensitive logic lives once. On a manifest-bind failure it unwinds
-                                // and returns `Err` → the exec refuses cleanly (caller keeps running).
-                                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types)
-                                    .ok()
-                                    .map(|_remap| (ch, ci, ca, child_size))
-                            })
-                    } else {
-                        None
-                    };
-                    match built {
-                        Some((ch, cinst, cas, child_size)) => {
-                            let cm = cmod.expect("built");
-                            let want_as = entry_params == Some(2);
-                            let mut entry_args = vec![Value::I64(cinst as i64)];
-                            if want_as {
-                                entry_args.push(Value::I64(cas as i64));
-                            }
-                            // FORK.md §8.6 — the old powerbox is about to be dropped by the image
-                            // -replace: release its pipe write *and* read ends (the fork-inherited ones
-                            // this exec did not carry into the new image) and wake any pipe that thereby
-                            // reached 0 writers (→ EOF for its readers) or 0 readers (→ `-EPIPE` for its
-                            // writers). The new image's grants already bumped their own ends
-                            // (`install_pipe_end`), so the shared counts never dip through this.
-                            let (zeroed_w, zeroed_r) = {
-                                let hg = host.lock_unpoisoned();
-                                (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
-                            };
-                            for pipe in zeroed_w {
-                                sched.wake_pipe_readers(pipe);
-                            }
-                            for pipe in zeroed_r {
-                                sched.wake_pipe_writers(pipe);
-                            }
-                            return Ok(Inner::Exec(Box::new(ExecReq {
-                                null_guard: temen_ir::module_null_guard(),
-                                funcs: cm.funcs,
-                                types: cm.types,
-                                data: cm.data,
-                                entry,
-                                child_size,
-                                image_len: 1u64 << cm.memory_log2.unwrap_or(0),
-                                host: ch,
-                                entry_args,
-                            })));
-                        }
+                    match build_exec_req(
+                        host,
+                        mem.as_ref(),
+                        sched,
+                        mh,
+                        grants_ptr,
+                        grants_n,
+                        entry,
+                        size_log2,
+                        durable,
+                        clean_root,
+                    ) {
+                        Some(req) => return Ok(Inner::Exec(req)),
                         None if !call_sig(&cur_types, *sig).results.is_empty() => {
                             frames[top].vals.push(Reg::from_i64(EINVAL));
                         }
@@ -13996,6 +14009,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         _ => None,
                     };
                     let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
+                    // #1609 — `execve` through the personality: the op resolved the path against
+                    // the command registry and packed argv/envp into the powerbox args region, so
+                    // only the resolved command handle rides the request.
+                    let exec_self = match request {
+                        Some(ParkEvent::ExecSelf { cmd }) => Some(cmd),
+                        _ => None,
+                    };
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park. (`fork`
@@ -14068,9 +14088,43 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
                         return Ok(Inner::Park(Blocked::ForkSelf));
                     }
+                    // #1609 — the `execve` twin of the `fork` request above, through the same door
+                    // and the same root/real gate. Success **never returns**: the image-replace
+                    // destroys this continuation, which is what makes a guest's `execve(...);
+                    // exitnow(127)` run `exitnow` only on failure. A refusal replaces the op's
+                    // `-ENOSYS` placeholder with `-EINVAL` — probeable, caller still running
+                    // (POSIX: `execve` returns only on failure). A non-parkable context (a fiber,
+                    // the explorer) keeps `-ENOSYS`: exec is unavailable on that route, an error a
+                    // guest surfaces rather than a hang.
+                    let mut exec_refused = false;
+                    if let Some(cmd) = exec_self {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            match build_exec_req(
+                                host,
+                                mem.as_ref(),
+                                sched,
+                                cmd,
+                                0,
+                                0,
+                                0,
+                                0,
+                                durable,
+                                serve_run.is_none(),
+                            ) {
+                                Some(req) => return Ok(Inner::Exec(req)),
+                                None => exec_refused = true,
+                            }
+                        }
+                    }
                     if !eintr_done {
-                        for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        if exec_refused {
+                            if !call_sig(&cur_types, *sig).results.is_empty() {
+                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                            }
+                        } else {
+                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
+                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                            }
                         }
                     }
                 }
@@ -14377,6 +14431,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         _ => None,
                     };
                     let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
+                    // #1609 — `execve` through the personality: the op resolved the path against
+                    // the command registry and packed argv/envp into the powerbox args region, so
+                    // only the resolved command handle rides the request.
+                    let exec_self = match request {
+                        Some(ParkEvent::ExecSelf { cmd }) => Some(cmd),
+                        _ => None,
+                    };
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `call.cap` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some()
@@ -14429,6 +14490,34 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
                         return Ok(Inner::Park(Blocked::ForkSelf));
                     }
+                    // #1609 — the `execve` twin of the `fork` request above, through the same door
+                    // and the same root/real gate. Success **never returns**: the image-replace
+                    // destroys this continuation, which is what makes a guest's `execve(...);
+                    // exitnow(127)` run `exitnow` only on failure. A refusal replaces the op's
+                    // `-ENOSYS` placeholder with `-EINVAL` — probeable, caller still running
+                    // (POSIX: `execve` returns only on failure). A non-parkable context (a fiber,
+                    // the explorer) keeps `-ENOSYS`: exec is unavailable on that route, an error a
+                    // guest surfaces rather than a hang.
+                    let mut exec_refused = false;
+                    if let Some(cmd) = exec_self {
+                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
+                            match build_exec_req(
+                                host,
+                                mem.as_ref(),
+                                sched,
+                                cmd,
+                                0,
+                                0,
+                                0,
+                                0,
+                                durable,
+                                serve_run.is_none(),
+                            ) {
+                                Some(req) => return Ok(Inner::Exec(req)),
+                                None => exec_refused = true,
+                            }
+                        }
+                    }
                     if let Some(pipe) = pipe_wake {
                         sched.wake_pipe_readers(pipe);
                     }
@@ -14436,8 +14525,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         sched.wake_pipe_writers(pipe);
                     }
                     if !eintr_done {
-                        for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        if exec_refused {
+                            if !call_sig(&cur_types, *sig).results.is_empty() {
+                                frames[top].vals.push(Reg::from_i64(EINVAL));
+                            }
+                        } else {
+                            for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
+                                frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                            }
                         }
                     }
                 }
@@ -18852,6 +18947,57 @@ pub enum ParkEvent {
     /// with the twin's TaskId as the call's result, the twin with `0`. The one request where
     /// complete-with-value is mandatory on both sides — a rewound fork would fork twice.
     ForkSelf,
+    /// #1609 — `execve()` through the personality: replace the calling vCPU's image with the
+    /// registered command `cmd` (a `Module` handle the personality already resolved against its
+    /// command registry, so authority cannot broaden here — a guest can only become a program
+    /// someone granted it). Like [`Self::ForkSelf`] this is a request, not a park: the eval loop
+    /// builds the command's powerbox and hands `dispatch` the same [`Step::Exec`] the
+    /// self-namespace op 14 route produces, over the one shared builder ([`build_exec_req`]).
+    ///
+    /// **Success does not return** — the image-replace destroys the continuation, which is what
+    /// makes a guest's `execve(...); exitnow(127)` idiom correct. Every refusal is instead a
+    /// probeable errno completing the call (never a trap, never a hang): `-EINVAL` for an
+    /// unusable module or an unclean context, `-E2BIG` for a command whose declared window does
+    /// not fit the caller's — checked and refused, never truncated.
+    ExecSelf { cmd: i32 },
+}
+
+/// #1609 — the `park_request` cell's tag for [`ParkEvent::ExecSelf`]; the resolved command's
+/// `Module` handle rides the low 32 bits. Handles are non-negative, so this block cannot collide
+/// with [`ParkEvent::ForkSelf`]/[`ParkEvent::TaskExitAny`], which are this same tag at `-1`/`-2`.
+const EXEC_SELF_TAG: u64 = 0xFFFF_FFFF_0000_0000;
+
+impl ParkEvent {
+    /// The `park_request` cell encoding. This lived as five identical copies of the same `match`
+    /// at the five sites that install the request closure — which is precisely how a new variant
+    /// misses one and a request silently decodes as somebody else's park. It lives here once now;
+    /// [`Self::decode`] is its inverse and the two are pinned together by `park_event_roundtrip`.
+    ///
+    /// `0` is the cell's "no request" value, so no variant may encode to it: [`Self::TaskExit`]
+    /// carries a live `TaskId` (ids start at `1`) and the tagged variants sit at the top.
+    fn encode(self) -> u64 {
+        match self {
+            ParkEvent::TaskExit(id) => id,
+            ParkEvent::TaskExitAny => u64::MAX - 1,
+            ParkEvent::ForkSelf => u64::MAX,
+            ParkEvent::ExecSelf { cmd } => EXEC_SELF_TAG | (cmd as u32 as u64),
+        }
+    }
+
+    /// The inverse of [`Self::encode`] (`0` = no request). The two sentinels are matched before
+    /// the [`Self::ExecSelf`] block so the `-1`/`-2` aliases resolve to them, and the block itself
+    /// admits only non-negative handles.
+    fn decode(v: u64) -> Option<ParkEvent> {
+        match v {
+            0 => None,
+            u64::MAX => Some(ParkEvent::ForkSelf),
+            v if v == u64::MAX - 1 => Some(ParkEvent::TaskExitAny),
+            v if v >= EXEC_SELF_TAG && (v as u32) <= i32::MAX as u32 => Some(ParkEvent::ExecSelf {
+                cmd: v as u32 as i32,
+            }),
+            id => Some(ParkEvent::TaskExit(id)),
+        }
+    }
 }
 
 /// #796 — the ceiling on **nested** injected signal-handler frames per fiber. The source's
@@ -20660,12 +20806,7 @@ impl Host {
     /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], `u64::MAX - 1` =
     /// [`ParkEvent::TaskExitAny`], else the [`ParkEvent::TaskExit`] task id.
     fn take_park_request(&self) -> Option<ParkEvent> {
-        match self.park_request.swap(0, Ordering::SeqCst) {
-            0 => None,
-            u64::MAX => Some(ParkEvent::ForkSelf),
-            v if v == u64::MAX - 1 => Some(ParkEvent::TaskExitAny),
-            id => Some(ParkEvent::TaskExit(id)),
-        }
+        ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
     }
 
     /// FORK.md §8.6 — take the transient "the last pipe read must park" flag (`Some(pipe)`), so the
@@ -24989,14 +25130,7 @@ impl Host {
         let park_cell = self.park_request.clone();
         if let Some((_, source)) = self.signal_poll() {
             source.set_park_request(Arc::new(move |ev| {
-                park_cell.store(
-                    match ev {
-                        ParkEvent::TaskExit(id) => id,
-                        ParkEvent::TaskExitAny => u64::MAX - 1,
-                        ParkEvent::ForkSelf => u64::MAX,
-                    },
-                    Ordering::SeqCst,
-                );
+                park_cell.store(ev.encode(), Ordering::SeqCst);
             }));
         }
     }
@@ -31159,5 +31293,53 @@ mod channel_budget_tests {
         );
         // And the guest path is still refused at the zero cap.
         assert!(h.try_grant_pipe().is_none());
+    }
+}
+
+#[cfg(test)]
+mod park_event_encoding_tests {
+    //! #1609 — the `park_request` cell encoding. The cell is a single `AtomicU64`, so every
+    //! [`ParkEvent`] has to survive a round trip through one integer. This used to be five copies
+    //! of the same `match` at the five closure-install sites; it is one pair now, and these pin it
+    //! — in particular that [`ParkEvent::ExecSelf`]'s tagged block cannot swallow the two
+    //! sentinels that alias it at handle `-1`/`-2`, which is the failure a sixth copy would have
+    //! hidden.
+    use super::*;
+
+    #[test]
+    fn park_event_roundtrip() {
+        for ev in [
+            ParkEvent::TaskExit(1),
+            ParkEvent::TaskExit(u64::MAX - 2),
+            ParkEvent::TaskExitAny,
+            ParkEvent::ForkSelf,
+            ParkEvent::ExecSelf { cmd: 0 },
+            ParkEvent::ExecSelf { cmd: 7 },
+            ParkEvent::ExecSelf { cmd: i32::MAX },
+        ] {
+            assert_eq!(ParkEvent::decode(ev.encode()), Some(ev), "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn zero_is_no_request() {
+        assert_eq!(ParkEvent::decode(0), None);
+    }
+
+    #[test]
+    fn exec_self_block_does_not_swallow_the_sentinels() {
+        // `ForkSelf`/`TaskExitAny` are `EXEC_SELF_TAG` at handle `-1`/`-2`. Decoding must see
+        // them as themselves, never as an `ExecSelf` with a negative command handle.
+        assert_eq!(ParkEvent::decode(u64::MAX), Some(ParkEvent::ForkSelf));
+        assert_eq!(
+            ParkEvent::decode(u64::MAX - 1),
+            Some(ParkEvent::TaskExitAny)
+        );
+        // A handle with the sign bit set is not a handle: it stays a `TaskExit` id rather than
+        // decoding to a negative `ExecSelf`, so a forged cell cannot reach the exec builder.
+        assert!(matches!(
+            ParkEvent::decode(EXEC_SELF_TAG | 0x8000_0000),
+            Some(ParkEvent::TaskExit(_))
+        ));
     }
 }
