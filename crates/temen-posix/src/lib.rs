@@ -197,6 +197,51 @@ pub const OP_PIPE_ADOPT: u32 = 52;
 /// only the path→module policy (INVARIANTS #4).
 pub const OP_EXEC_RESOLVE: u32 = 53;
 
+/// #1609 — **`execve(path, argv, envp)`**: become the registered command at `path`. The one op a
+/// guest needs to replace its own image, for guests that have no `exec.c` to do it themselves —
+/// nimony's `std/os` inlines the fork/execve/waitpid trio rather than routing through a single
+/// interceptable `system()`, so a no-C nim program reaches this leaf directly.
+///
+/// **Resolution is the command registry and nothing else** — the same table [`OP_EXEC_RESOLVE`]
+/// consults, so authority cannot broaden: a guest can only become a program someone registered
+/// (`-ENOENT` for an unregistered path, `-EACCES` for a memfs file with no executable
+/// registration). The mechanism is unchanged and unduplicated: the op packs argv/envp into the
+/// powerbox args region and fires [`temen_interp::ParkEvent::ExecSelf`], which lands on the very
+/// same `build_exec_req` the `CAP_SELF_EXEC` route uses. The personality adds policy, not
+/// mechanism (INVARIANTS #4).
+///
+/// **Success does not return.** Every failure is a probeable negative errno with the caller still
+/// running, as POSIX requires: `-ENOENT`/`-EACCES` from the registry, `-E2BIG` when argv+envp
+/// overflow the args region (**checked and refused, never truncated**), `-EFAULT` for an
+/// unreadable pointer, `-EINVAL` for a non-UTF-8 path or a refused image-replace, `-ENOSYS` on a
+/// route with no request door (a fiber, the explorer).
+///
+/// **C-ABI-shaped, deliberately.** The personality ABI is otherwise explicit-length `(ptr, len)`,
+/// but nim declares `execve(path: cstring, argv, envp: cstringArray)` and there is no length to
+/// pass — the same reason `getcwd`/`getenv` already speak C's NUL-terminated convention here. The
+/// walks are bounded ([`EXECVE_MAX_VEC`], [`EXECVE_MAX_STR`]) so "no unbounded window scan" still
+/// holds.
+pub const OP_EXECVE: u32 = 60;
+
+/// #1609 — **`wait4(pid, status, options, rusage)`**: [`OP_WAITPID`] with the Linux syscall's
+/// fourth argument. nimony binds `wait4` rather than `waitpid` deliberately — "there is no
+/// `waitpid` Linux syscall — it is libc sugar for `wait4` with a NULL `rusage`", so its
+/// `std/posix` provides `waitpid` as an inline wrapper and `wait4` is the only symbol that
+/// reaches a host. Binding `wait4` to the 3-arg `OP_WAITPID` would be an arity mismatch and a
+/// bind-time refusal (#1524), so it gets its own row.
+///
+/// `rusage` must be NULL: this personality keeps no resource accounting, and quietly leaving a
+/// caller's `struct rusage` untouched would report zeros as though they were measured. A non-NULL
+/// pointer is `-EINVAL` — fail closed (invariant 9), and nothing nimony does passes one.
+pub const OP_WAIT4: u32 = 61;
+
+/// [`OP_EXECVE`] — the most argv/envp entries the pointer-array walk will follow, and the longest
+/// single string it will read. Bounds, not policy: the args region (16 KiB) refuses anything near
+/// these with `-E2BIG` long before they bite. They exist so a forged `char**` cannot walk the
+/// window.
+const EXECVE_MAX_VEC: u64 = 4096;
+const EXECVE_MAX_STR: u64 = 16384;
+
 /// #797 — the **termios control surface** as named ops (the libc `ioctl()`/`tcgetattr` shims
 /// multiplex onto these, keeping the vtable's signature checking meaningful). The personality's
 /// `struct termios` is a deliberately minimal 32 bytes: `{ i64 c_lflag; u8 c_cc[8] (packed i64);
@@ -461,6 +506,62 @@ fn write_linux_stat(
 /// One memfs file: its bytes and the write-clock tick they were last written at. The two live
 /// together so a write cannot update one and forget the other — every mutation goes through
 /// [`World::file_put`] or [`World::file_mut`], which stamp it.
+/// #1609 — read a **NUL-terminated** guest string at `ptr`, without the NUL. `None` when the
+/// pointer is unreadable or no terminator appears within [`EXECVE_MAX_STR`].
+///
+/// The personality ABI is explicit-length `(ptr, len)` precisely to avoid an unbounded window
+/// scan; `execve` has no length to be given (nim declares `cstring`/`cstringArray`), so the scan
+/// is bounded instead. It reads in chunks rather than byte at a time so a long path does not cost
+/// one dispatch per character, and never reads past the window (`read_bytes` bounds-checks and the
+/// chunk shrinks at the end).
+fn read_guest_cstr(mem: &dyn GuestMem, ptr: u64) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut at = ptr;
+    while (out.len() as u64) < EXECVE_MAX_STR {
+        // Shrink the chunk until it is inside the window, so a string ending near the top still
+        // reads (a fixed 256-byte probe would `None` on a path in the last 100 bytes).
+        let mut want = 256.min(EXECVE_MAX_STR - out.len() as u64);
+        let chunk = loop {
+            match mem.read_bytes(at, want) {
+                Some(c) => break c,
+                None if want > 1 => want /= 2,
+                None => return None,
+            }
+        };
+        match chunk.iter().position(|&b| b == 0) {
+            Some(i) => {
+                out.extend_from_slice(&chunk[..i]);
+                return Some(out);
+            }
+            None => {
+                out.extend_from_slice(&chunk);
+                at += chunk.len() as u64;
+            }
+        }
+    }
+    None
+}
+
+/// #1609 — read a **NULL-terminated array of guest pointers** to NUL-terminated strings (C's
+/// `char **`, nim's `cstringArray`), returning the strings. `None` on an unreadable pointer or a
+/// vector longer than [`EXECVE_MAX_VEC`]. A NULL array pointer is an empty vector, matching C's
+/// `execv(path, NULL)` and `execve(..., NULL)`.
+fn read_guest_cstr_vec(mem: &dyn GuestMem, ptr: u64) -> Option<Vec<Vec<u8>>> {
+    if ptr == 0 {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for i in 0..EXECVE_MAX_VEC {
+        let w = mem.read_bytes(ptr + i * 8, 8)?;
+        let sp = u64::from_le_bytes(w.try_into().ok()?);
+        if sp == 0 {
+            return Some(out);
+        }
+        out.push(read_guest_cstr(mem, sp)?);
+    }
+    None
+}
+
 #[derive(Default)]
 struct MemFile {
     bytes: Vec<u8>,
@@ -478,6 +579,9 @@ const O_ACCMODE: i64 = 3;
 const O_WRONLY: i64 = 1;
 const O_RDWR: i64 = 2;
 const EACCES: i64 = -13;
+/// #1609 — argv+envp do not fit the powerbox args region. POSIX's `execve` errno for exactly this,
+/// and the one the region's fixed 16 KiB makes reachable: **checked and refused, never truncated**.
+const E2BIG: i64 = -7;
 const ENOTTY: i64 = -25; // #797: not a terminal // #801: a memfs file without the executable registration
 /// #802 rung-3 tail — the **restart sentinel** (Linux's kernel-internal `ERESTART`): a terminal
 /// read that just STOPPED its caller (SIGTTIN) returns this instead of minting the input tag, and
@@ -1528,7 +1632,7 @@ impl Posix {
         let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.executables.insert(path.to_string());
         if !st.files.contains_key(path) {
-            st.file_put(path.to_string(), b"\x7fSVM".to_vec());
+            st.file_put(path.to_string(), b"\x7fTEMEN".to_vec());
         }
     }
 
@@ -1718,6 +1822,10 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "pipe" => OP_PIPE,
         "pipe_adopt" => OP_PIPE_ADOPT,
         "exec_resolve" => OP_EXEC_RESOLVE,
+        // #1609 — the whole-`execve` leaf. `nim_posix_runtime` retains this name as an import
+        // instead of binding it to the compute shim's fail-closed stub, so a no-C nim program's
+        // `execve` reaches the registry rather than returning `-1`.
+        "execve" => OP_EXECVE,
         "tcgetattr" => OP_TCGETATTR,
         "tcsetattr" => OP_TCSETATTR,
         "tcgetwinsize" => OP_TCGETWINSIZE,
@@ -1736,6 +1844,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "getppid" => OP_GETPPID,
         "fork" => OP_FORK,
         "waitpid" => OP_WAITPID,
+        "wait4" => OP_WAIT4,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
         "kill" => OP_KILL,
@@ -2036,6 +2145,8 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
         ("ttyname", 3),      // 57
         ("fstat", 2),        // 58
         ("statp", 3),        // 59
+        ("execve", 3),       // 60
+        ("wait4", 4),        // 61
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -2474,6 +2585,8 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_PIPE => st.pipe(args, mem),
                 OP_PIPE_ADOPT => st.pipe_adopt(args, mem),
                 OP_EXEC_RESOLVE => st.exec_resolve(args, mem),
+                OP_EXECVE => st.execve(args, mem),
+                OP_WAIT4 => st.wait4(args, mem),
                 OP_TCGETATTR => st.tcgetattr(args, mem),
                 OP_TCSETATTR => st.tcsetattr(args, mem),
                 OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
@@ -4828,20 +4941,131 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        if self.w.executables.contains(&path) {
-            if let Some((_, h, wl)) = self.w.commands.iter().find(|(n, _, _)| *n == path) {
+        Ok(vec![match self.resolve_exec_path(&path) {
+            Ok((h, _)) => h as i64,
+            Err(e) => e,
+        }])
+    }
+
+    /// #1609 — the **path → registered command** policy, shared by [`OP_EXEC_RESOLVE`] (which
+    /// reports it to a guest that will then drive `__vm_exec_module` itself) and [`OP_EXECVE`]
+    /// (which goes on to request the image-replace). One registry walk, one errno split, one heap
+    /// re-base stash: a second copy would be a second place for "what may a guest become?" to
+    /// drift, and that question is the whole confinement story of exec.
+    ///
+    /// `Ok((handle, window_log2))` for a registered executable; `Err(-EACCES)` for a memfs file
+    /// with no executable registration, `Err(-ENOENT)` for anything else.
+    fn resolve_exec_path(&mut self, path: &str) -> Result<(i32, u8), i64> {
+        if self.w.executables.contains(path) {
+            if let Some((_, h, wl)) = self.w.commands.iter().find(|(n, _, _)| n == path) {
                 // Stash the command's heap re-base for the exec this resolve precedes (consumed
                 // by the exec-remap hook on commit; overwritten by any later resolve, so a PATH
                 // walk's misses and a refused exec never leave a stale re-base behind).
                 let end = 1u64 << (*wl).min(63);
                 self.p.pending_exec_heap = Some((end / 4 * 3, end));
-                return Ok(vec![*h as i64]);
+                return Ok((*h, *wl));
             }
         }
-        if self.w.files.contains_key(&path) {
-            return Ok(vec![EACCES]);
+        if self.w.files.contains_key(path) {
+            return Err(EACCES);
         }
-        Ok(vec![ENOENT])
+        Err(ENOENT)
+    }
+
+    /// [`OP_WAIT4`] — `wait4(pid, status, options, rusage)`: [`Self::waitpid`] with the syscall's
+    /// fourth argument, which must be NULL (see [`OP_WAIT4`] for why a non-NULL one is refused
+    /// rather than ignored).
+    fn wait4(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        if *args.get(3).unwrap_or(&0) != 0 {
+            return Ok(vec![EINVAL]);
+        }
+        self.waitpid(&args[..3.min(args.len())], mem)
+    }
+
+    /// [`OP_EXECVE`] — `execve(path, argv, envp)`: become the registered command at `path`.
+    ///
+    /// Policy here, mechanism in the core: resolve against the command registry (and nothing
+    /// else), bound-walk the two C pointer arrays, check the window fit, pack argv/envp into the
+    /// powerbox args region, then fire [`temen_interp::ParkEvent::ExecSelf`] — which lands on the
+    /// same `build_exec_req` the `CAP_SELF_EXEC` route uses, so there is one image-replace, not two.
+    ///
+    /// On success this **never returns** (the image-replace destroys the continuation); the
+    /// `-ENOSYS` below is the no-door placeholder, the `fork` precedent.
+    ///
+    /// One honest residue: the args-region write happens before the core's final admissibility
+    /// pass, so a refusal there (an unclean context, a durable domain) leaves the region
+    /// overwritten under a still-running caller. `demos/posix_libc/exec.c` saves and restores
+    /// those bytes because it can see the refusal; an op cannot — the answer comes back after it
+    /// has returned. The refusals that remain reachable are all "this domain cannot exec at all"
+    /// conditions rather than per-call ones, because the two per-call failures — an unregistered
+    /// path and a command too big for this window — are both checked *above* the write.
+    fn execve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let path_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let argv_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
+        let envp_ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
+        let Some(path) = read_guest_cstr(mem, path_ptr) else {
+            return Ok(vec![EFAULT]);
+        };
+        let Ok(path) = String::from_utf8(path) else {
+            return Ok(vec![EINVAL]);
+        };
+        let (cmd, cmd_wl) = match self.resolve_exec_path(&path) {
+            Ok(v) => v,
+            Err(e) => return Ok(vec![e]),
+        };
+        // The §14 window ceiling, checked and refused rather than truncated: the image-replace
+        // reuses THIS window, so a command declaring more memory than the caller has cannot run
+        // here. `window_size` is the documented bound `exec_module` admits against; the core
+        // re-checks against the backed prefix and fails closed if that is stricter.
+        let win = mem.window_size();
+        if win == 0 || cmd_wl >= 64 || (1u64 << cmd_wl) > win {
+            return Ok(vec![E2BIG]);
+        }
+        let (Some(argv), Some(envp)) = (
+            read_guest_cstr_vec(mem, argv_ptr),
+            read_guest_cstr_vec(mem, envp_ptr),
+        ) else {
+            return Ok(vec![EFAULT]);
+        };
+        // #801 exec ABI: `{argc:i32, envc:i32}` then the NUL-packed strings, argv first.
+        let mut blob = Vec::with_capacity(64);
+        blob.extend_from_slice(&(argv.len() as i32).to_le_bytes());
+        blob.extend_from_slice(&(envp.len() as i32).to_le_bytes());
+        for sv in argv.iter().chain(envp.iter()) {
+            blob.extend_from_slice(sv);
+            blob.push(0);
+        }
+        let base = temen_ir::module_args_base();
+        if base + blob.len() as u64 > temen_ir::module_args_end() {
+            return Ok(vec![E2BIG]);
+        }
+        if mem.write_bytes(base, &blob).is_none() {
+            return Ok(vec![EFAULT]);
+        }
+        // POSIX: `execve` **replaces the argument vector**. The packed blob above is what a C crt
+        // reads, but the personality keeps its own vector too — what [`OP_ARGC`]/[`OP_ARGV`]
+        // answer — and leaving it alone means the new image is told the *previous* program's
+        // arguments. `demos/posix_libc/exec.c`'s route cannot fix this (the personality never sees
+        // the argv there); this op is the one route that knows, so it updates it. The shell demo
+        // found this immediately: `sh -c "<cmd>"` reads its flag through `argv`, saw nimsem's
+        // `--define:…` instead of `-c`, and silently fell through to its stdin read-eval loop.
+        //
+        // Lossy, deliberately: `p.args` is `String` and POSIX argv is bytes. The byte-exact form
+        // is the packed blob a crt reads; this vector is the personality's view, and a replacement
+        // character in a non-UTF-8 argument is better than refusing an otherwise valid exec.
+        //
+        // The **environment is not** replaced, matching this personality's established exec
+        // semantics (`c_execve_runs_a_px_linked_command` pins env crossing an `envp = NULL` exec):
+        // the env is process state the image-replace carries, like the fd table and the cwd.
+        self.p.args = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        if let Some(req) = self.p.park_req.clone() {
+            req(temen_interp::ParkEvent::ExecSelf { cmd });
+        }
+        Ok(vec![ENOSYS])
     }
 
     /// `exec_win(module_handle) -> size_log2 | -1`: the declared window of the registered command with

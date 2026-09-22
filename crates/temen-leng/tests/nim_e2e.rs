@@ -788,64 +788,22 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     interp_out
 }
 
-/// Map a retained nimony syscall import name to the POSIX-personality op it binds to. The nimony
-/// bottom edge (`sysWrite {.importc: "write".}` …) is spelled by the *nim* symbol (`sysWrite.0.`),
-/// not the C name, so the powerbox's by-C-name resolver doesn't reach it — this is the small
-/// nimony→personality name map that lets the retained leaves bind to `temen_posix`'s fd-based ops
-/// (whose signatures match the nim ABI exactly).
+/// The nimony-import → personality-op map, **`temen_run`'s own** (`nim_import_binding` /
+/// `NimImport`) rather than a copy of it.
 ///
-/// `sysOpen` is deliberately absent: C's `open` takes a NUL-terminated `char*` where the personality
-/// wants `(ptr, len)`, so it goes through `temen_leng`'s `POSIX_OPEN_ADAPTER` at link and arrives
-/// here as a bare `open` instead. Binding it here directly read the flags word as the path length.
-enum NimImport {
-    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
-    Stdout,
-    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
-    /// file operation, and binding it to the compute shim's `{ return }` stub made `quit` a no-op.
-    Exit,
-    /// The POSIX open adapter's forward: a bare `open` taking the `(ptr, len, flags)` the op wants.
-    Open,
-    /// A retained nimony syscall leaf → the matching `temen_posix` op.
-    Posix(u32),
-}
-
-/// How [`run_io_capture`] binds one retained import — and, by the same answer, whether the #760
-/// probe should call it an **unbound leaf**.
+/// This table has now been consolidated twice, for the same reason both times. First within this
+/// file: the binder matched on a prefix chain while the #760 probe carried its own hardcoded
+/// `["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]`, so adding `cExitSys` to
+/// `POSIX_SERVED_LEAVES` taught the binder about it and left the probe calling it unbound.
 ///
-/// One table consulted by both. They were two: the binder matched on `write`/`open` and then a
-/// prefix chain, while the probe carried its own hardcoded `["sysWrite", "sysRead", "sysClose",
-/// "sysLseek", "getcwd"]`. Adding `cExitSys` to `temen_leng::POSIX_SERVED_LEAVES` taught the binder
-/// about it and left the probe reporting it unbound from its copy — the second route through one
-/// behaviour that INVARIANTS #15 is about. `None` means nothing serves this leaf.
-fn nim_import_binding(name: &str) -> Option<NimImport> {
-    Some(match name {
-        "write" => NimImport::Stdout,
-        "open" => NimImport::Open,
-        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
-        // the shim's allocator handed it.
-        "read" => NimImport::Posix(temen_posix::OP_READ),
-        // The path-ABI adapter's other two forwards (#1595): nim writes files atomically, so a
-        // file write is write-temp + rename, with an unlink on the failure path.
-        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
-        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
-        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
-        n if n.starts_with("cExitSys") => NimImport::Exit,
-        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
-        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
-        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
-        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
-        // Served for real on this route (`temen_leng::POSIX_SERVED_LEAVES`) rather than by the
-        // compute shim's NULL-returning stub; `getcwd(buf, size) -> buf` is the C ABI unchanged.
-        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
-        // #1595: `memfiles.open` sizes a mapping with `fstat`, so the shim's 0-returning stub made
-        // every mapped file look empty.
-        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
-        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
-        // would be read at the declared `st_mode`/`st_size` offsets and answer garbage.
-        "statp" => NimImport::Posix(temen_posix::OP_STATP),
-        _ => return None,
-    })
-}
+/// Then across crates: this file kept a byte-identical copy of the library's public enum and
+/// table, and adding `fork`/`execve`/`wait4`/`exitnow` to `POSIX_SERVED_LEAVES` (#1609) made
+/// `memfiles.open`'s module retain `wait4` — which the library knew and the copy did not, so a
+/// test with nothing to do with exec failed in CI with `unmapped nimony import`. `temen-run`'s
+/// *library* does not depend on `temen-leng` (only its own tests do), so this dev-edge is already
+/// available and there is no reason for a second answer to "what serves this leaf?"
+/// (INVARIANTS #15).
+use temen_run::{nim_import_binding, NimImport};
 
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
 /// embedding (`Instance`), with every retained nim-name syscall import bound to a single shared

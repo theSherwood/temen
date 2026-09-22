@@ -42,6 +42,16 @@ mapfile -t LLS < <(ls "$DEPS"/*.ll | grep -v '/panic_unwind')
 # [2/4] llvm-link + prune to the closure reachable from main/malloc/free.
 echo "[2/4] llvm-link + opt (internalize,globaldce) ..."
 "$LINK" -S "${LLS[@]}" -o "$CACHE/leng.linked.ll"
+# rustc's allocator-shim marker: `__rust_no_alloc_shim_is_unstable_v2` is an EMPTY function the
+# standard allocator calls on every allocation path purely so that linking fails loudly when the
+# shim is absent. `build-std` compiles the caller but the definition lives in the shim rustc
+# normally synthesizes at link, which we never run — so it arrives here as an undefined extern with
+# ~150 call sites and stops the stub audit below. Give it the empty body it has upstream, rather
+# than widening the audit's allow-list: the audit exists to catch real libc gaps, and letting an
+# undefined symbol through would move the failure to translation. The name is v0-mangled into
+# rustc's own crate namespace and its hash changes per toolchain, so match on the readable tail.
+perl -0pi -e 's{^declare (void \@\S*__rust_no_alloc_shim_is_unstable\S*\(\))([^\n]*)$}
+               {define $1$2 {\n  ret void\n}}gm' "$CACHE/leng.linked.ll"
 "$OPT" -S -passes=internalize,globaldce \
   -internalize-public-api-list=main,malloc,free \
   "$CACHE/leng.linked.ll" -o "$CACHE/leng.legal.ll"

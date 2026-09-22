@@ -23,8 +23,15 @@ mkdir -p "$CACHE"
 
 command -v "rustc" >/dev/null || { echo "SKIP: rustc absent"; exit 0; }
 
+# `-Cno-vectorize-{loops,slp}`: the on-ramp has no lowering for a **vector mask** — an `icmp` over
+# `<N x iM>` yields `<N x i1>`, which LLVM stores bit-packed and Temen has no type for. The
+# auto-vectorizer reached that shape in `link_selected_with_extra` as temen-leng grew, and
+# translation stopped with "value … not available in block" (the `<16 x i1>` never landed in the
+# scalar map). Turning the vectorizer off is the honest fix at this layer: the guest targets a VM
+# with no SIMD, so vectorizing for it was never buying anything, and the alternative is teaching the
+# on-ramp a packed-mask representation to serve code that should not exist. Scalar IR translates.
 echo "[1/4] build-std (default rustc) ..."
-( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir -Zunstable-options -Cpanic=immediate-abort' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
+( cd "$GUEST" && RUSTFLAGS='--emit=llvm-ir -Zunstable-options -Cpanic=immediate-abort -Cno-vectorize-loops -Cno-vectorize-slp' CARGO_TARGET_DIR="$CACHE/target" RUSTC_BOOTSTRAP=1 \
     cargo build --release \
       -Zbuild-std=std,panic_abort \
       --target "$TRIPLE" --ignore-rust-version )

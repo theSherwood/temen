@@ -952,6 +952,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("close", ANY, 21),
     ("getdents64", ANY, 22),
     ("wait4", ANY, 23),
+    // #1609 — `execve` is still a fail-closed stub for the **powerbox** runtime (a stdout-only
+    // guest has nothing to become), but `nim_posix_runtime` withholds it via
+    // [`POSIX_SERVED_LEAVES` ] so it survives as a retained import bound to `temen_posix`'s
+    // `OP_EXECVE`. nimony's `std/os` inlines the fork/execve/waitpid trio instead of routing
+    // through one interceptable `system()`, so this leaf is the whole bottom edge of a no-C nim
+    // program's "run that command" — stubbed, a self-hosting nimsem cannot spawn nifler at all.
     ("execve", ANY, 24),
     ("clock_gettime", ANY, 25),
     // **The rest of the posix bottom edge** `std/os`/`paths`/`dirs`/`envvars`/`strtabs`/`appdirs`/
@@ -1689,7 +1695,16 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 ///   and the program runs on past the error path that called it. nimsem printed `command expected`
 ///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
 ///   error path is built on `quit`, so on this route none of them ended the program.
-const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys", "fstat"];
+/// - `fork` / `execve` / `wait4` / `exitnow` → the `temen_posix` process ops (#1609). These four
+///   join **together**, because `execShellCmd` is all of them or none: nimony's `os` inlines
+///   `fork` + `execve("/bin/sh", ["-c", cmd])` + `waitpid` (itself an inline wrapper over
+///   `wait4`), with `exitnow(127)` on the child's failure path. Any one left on the shim's
+///   fail-closed stub makes the whole sequence report failure, and *which* one is invisible from
+///   the outside — the symptom is only a non-zero shell-out. `execve` and `wait4` are what
+///   `OP_EXECVE`/`OP_WAIT4` exist to serve.
+const POSIX_SERVED_LEAVES: &[&str] = &[
+    "getcwd", "cExitSys", "fstat", "execve", "fork", "wait4", "exitnow",
+];
 
 /// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
 /// [`nim_powerbox_runtime`] makes, over the same compute half.

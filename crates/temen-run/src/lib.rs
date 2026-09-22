@@ -5108,6 +5108,15 @@ pub fn nim_import_binding(name: &str) -> Option<NimImport> {
         // #1595: `memfiles.open` sizes a mapping with `fstat`, so a 0-returning stub made every
         // mapped file look empty.
         n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
+        // #1609 — the whole-`execve` leaf. nimony's `os.execShellCmd` is fork + `execve("/bin/sh",
+        // ["-c", cmd])` + waitpid inlined, so this is the bottom edge of "run that command" for a
+        // no-C nim program: bound, a self-hosting nimsem spawns nifler itself; unbound, it cannot.
+        n if n.starts_with("execve") => NimImport::Posix(temen_posix::OP_EXECVE),
+        // The rest of `execShellCmd`'s sequence (#1609). `wait4` rather than `waitpid`: nimony
+        // binds the syscall and provides `waitpid` as an inline wrapper over it.
+        n if n.starts_with("fork") => NimImport::Posix(temen_posix::OP_FORK),
+        n if n.starts_with("wait4") => NimImport::Posix(temen_posix::OP_WAIT4),
+        n if n.starts_with("exitnow") => NimImport::Exit,
         _ => return None,
     })
 }
@@ -5163,6 +5172,29 @@ pub fn nim_noc_run(
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
     argv: &[String],
 ) -> Result<(), String> {
+    nim_noc_run_with_commands(module, posix, make, argv, &[])
+}
+
+/// [`nim_noc_run`], plus a **command registry** for this run: each `(path, module)` is granted on
+/// the guest's `Host` and registered as a filesystem executable, so the guest's own
+/// `execve(path, …)` ([`temen_posix::OP_EXECVE`], #1609) can become it.
+///
+/// This is what lets a no-C nim phase spawn its own helpers instead of a driver cranking the
+/// shell-out from outside: `nimsem`'s `deps.nim` reaches `os.execShellCmd`, which on posix is
+/// `fork` + `execve("/bin/sh", ["-c", cmd])` + `waitpid`, and every one of those now has a real
+/// implementation under it.
+///
+/// The grant rides `run_with_caps_and_host`'s existing per-run host hook — authority arrives down
+/// the grant graph (invariant 3), and a command the embedder did not pass is simply not there.
+/// [`nim_noc_run`] is this with an empty registry, so there is one run path, not two.
+pub fn nim_noc_run_with_commands(
+    module: Module,
+    posix: &temen_posix::Posix,
+    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    argv: &[String],
+    commands: &[(String, Module)],
+) -> Result<(), String> {
+    let make_for_setup = std::sync::Arc::clone(&make);
     let (imports, unbound) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
@@ -5179,17 +5211,44 @@ pub fn nim_noc_run(
     };
     let inst =
         instantiate_with_imports(module, imports).map_err(|e| format!("instantiate: {e}"))?;
-    inst.run(Backend::TreeWalk, &cfg).map_err(|e| {
-        let err = posix.stderr();
-        if err.is_empty() {
-            format!("run failed: {e}")
-        } else {
-            format!(
-                "run failed: {e}\n--- guest stderr ---\n{}",
-                String::from_utf8_lossy(&err)
-            )
+    // #1609 — install what a **process-shaped** run needs, which the plain import binding above
+    // does not: `nim_posix_imports` grants one `host_proc` per retained import and nothing else,
+    // so this lane had no async-signal door — and therefore no #799 **caller-request door**, which
+    // rides it. Without that door `fork` (op 51) answers `-ENOSYS`, nim's `execShellCmd` reads
+    // that as "fork failed", and the shell-out reports failure having never reached `execve` at
+    // all. The same four installs `posix_cap` does on the powerbox path, for the same reasons and
+    // in the same order: the forkable handler (a twin needs its own fd table/cwd/env over the
+    // shared memfs), the signal+request door, the #972 exec-remap hook, and the #801 op vtable, so
+    // an exec'd image's `__px_*` manifest binds through the coverage walk.
+    let fork_factory = temen_posix::cap_fork_factory(posix);
+    let make_proc = std::sync::Arc::clone(&make_for_setup);
+    let mut setup = |host: &mut temen_interp::Host| {
+        let handle =
+            host.grant_host_proc_forkable((*make_proc)(), std::sync::Arc::clone(&fork_factory));
+        let (door, armed) = temen_posix::cap_signal_source(posix);
+        host.set_signal_source(door, armed);
+        host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(posix));
+        let (names, sigs) = temen_posix::cap_vtable();
+        host.set_host_proc_vtable(handle, names, sigs);
+        // The commands this run may become, granted on the very host it uses.
+        for (path, m) in commands {
+            let wl = m.memory.map_or(0, |mc| mc.size_log2);
+            let h = host.grant_module(m);
+            posix.register_executable(path, h, wl);
         }
-    })?;
+    };
+    inst.run_with_caps_and_host(Backend::TreeWalk, &cfg, &[], Some(&mut setup))
+        .map_err(|e| {
+            let err = posix.stderr();
+            if err.is_empty() {
+                format!("run failed: {e}")
+            } else {
+                format!(
+                    "run failed: {e}\n--- guest stderr ---\n{}",
+                    String::from_utf8_lossy(&err)
+                )
+            }
+        })?;
     Ok(())
 }
 
