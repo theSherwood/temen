@@ -2433,7 +2433,11 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 v.a = addr as i64;
                 v.b = expected as i64;
                 v.c = width as i64;
-                v.d = timeout as i64;
+                // #1638 — an infinite wait crosses as the guest's own `-1`, not a `MAX_WAIT`
+                // stand-in. `worker.js` already reads a non-positive `d` as `Infinity`; that
+                // branch was simply unreachable while the engine clamped every infinite wait
+                // to 10 s here.
+                v.d = timeout.map_or(-1, |t| t as i64);
                 return PAR_WAIT;
             }
             bytecode::VcpuEvent::Notify { addr, count } => {

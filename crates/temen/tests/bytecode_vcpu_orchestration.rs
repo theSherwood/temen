@@ -166,7 +166,17 @@ impl Host {
         }
     }
     /// `memory.wait`: compare the futex word in the shared backing under the bucket lock, then park.
-    fn wait(&self, back: &Region, addr: u64, expected: u64, width: u32, timeout: u64) -> i32 {
+    /// `timeout` is the guest's own ns, or `None` for an infinite wait (#1638). This harness
+    /// host is the embedder here, so it picks its own backstop for the infinite case — the
+    /// kernels below all use finite timeouts.
+    fn wait(
+        &self,
+        back: &Region,
+        addr: u64,
+        expected: u64,
+        width: u32,
+        timeout: Option<u64>,
+    ) -> i32 {
         let waiter = {
             let mut buckets = self.futex.lock().unwrap();
             if back.atomic_load(addr, width) != expected {
@@ -183,7 +193,9 @@ impl Host {
             .cv
             .wait_timeout_while(
                 waiter.woken.lock().unwrap(),
-                std::time::Duration::from_nanos(timeout),
+                timeout.map_or(std::time::Duration::from_secs(10), |t| {
+                    std::time::Duration::from_nanos(t)
+                }),
                 |w| !*w,
             )
             .unwrap();

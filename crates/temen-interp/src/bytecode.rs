@@ -3257,7 +3257,8 @@ pub enum VcpuEvent {
         addr: u64,
         expected: u64,
         width: u32,
-        timeout: u64,
+        /// The guest's timeout in ns, or `None` for an infinite wait (#1638).
+        timeout: Option<u64>,
     },
     /// `memory.notify`: wake up to `count` waiters on `addr`, then call [`Vcpu::deliver_code`] with the
     /// number actually woken.
@@ -6529,7 +6530,9 @@ enum DbgTaskState {
     /// `deadline`; the status (`WAIT_WOKEN` / `WAIT_TIMED_OUT`) lands at `dst`.
     BlockedWait {
         key: u64,
-        deadline: u64,
+        /// Logical-clock deadline, or `None` for an infinite wait — which is therefore not a
+        /// clock-advance candidate in `dbg_pick_runnable` (#1638).
+        deadline: Option<u64>,
         dst: u32,
     },
     /// #1146 (deeper) — parked in a blocking **`Stream{In}` read** on an exhausted stdin under
@@ -7803,7 +7806,7 @@ fn dbg_wait(
     base: u64,
     expected: u64,
     width: u32,
-    timeout: u64,
+    timeout: Option<u64>,
     dst: u32,
 ) {
     let cur = mem
@@ -7818,7 +7821,9 @@ fn dbg_wait(
     } else {
         tasks[ti].state = DbgTaskState::BlockedWait {
             key: base,
-            deadline: clock.saturating_add(timeout),
+            // #1638: an infinite wait carries no deadline, so it is not a clock-advance
+            // candidate below — it ends by `notify` or not at all (the deadlock exit).
+            deadline: timeout.map(|t| clock.saturating_add(t)),
             dst,
         };
     }
@@ -7908,16 +7913,26 @@ fn dbg_pick_runnable(
                 Some(s) => runnable[(splitmix64(s ^ turn) % runnable.len() as u64) as usize],
             });
         }
+        // #1638 — only a waiter with a REAL deadline is a clock-advance candidate. `flatten`
+        // drops the indefinite ones, so "nothing runnable and every remaining waiter is
+        // indefinite" yields `None` here and takes the `?` deadlock exit this function already
+        // documented, instead of advancing the clock to a `MAX_WAIT` stand-in and handing the
+        // guest a `WAIT_TIMED_OUT` it never asked for.
         let next = tasks
             .iter()
             .filter_map(|t| match t.state {
-                DbgTaskState::BlockedWait { deadline, .. } => Some(deadline),
+                DbgTaskState::BlockedWait { deadline, .. } => deadline,
                 _ => None,
             })
             .min()?;
         *clock = (*clock).max(next);
         for t in tasks.iter_mut() {
-            if let DbgTaskState::BlockedWait { deadline, dst, .. } = t.state {
+            if let DbgTaskState::BlockedWait {
+                deadline: Some(deadline),
+                dst,
+                ..
+            } = t.state
+            {
                 if deadline <= *clock {
                     t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                     t.state = DbgTaskState::Runnable;
@@ -9453,7 +9468,10 @@ enum Outcome {
         base: u64,
         expected: u64,
         width: u32,
-        timeout: u64,
+        /// The guest's timeout in ns, or `None` for an infinite wait (#1638) — never a
+        /// `MAX_WAIT` stand-in, which is what used to make an infinite wait indistinguishable
+        /// from a 10 s one.
+        timeout: Option<u64>,
         dst: u32,
     },
     /// `memory.notify`: wake up to `count` waiters on `base`; the woken count lands at `dst`.
@@ -9586,13 +9604,14 @@ enum FiberState {
         wait_dst: u32,
         /// The confined wait address (the same key `TaskState::BlockedWait` parks on).
         key: u64,
-        /// Logical-clock deadline (`clock + timeout`), fired when no task is runnable.
-        deadline: u64,
+        /// Logical-clock deadline (`clock + timeout`), fired when no task is runnable;
+        /// `None` for an infinite wait, which is never a clock-advance candidate (#1638).
+        deadline: Option<u64>,
         /// Real-clock deadline (nanoseconds from [`sched_wall_now`]'s epoch), checked at each
         /// `cont.resume` poll of this fiber. Native: monotonic wall time. Wasm: a monotonic
         /// poll counter (no wall clock on `wasm32-unknown-unknown`), so a busy resume-poll loop
         /// still terminates — see [`sched_wall_now`].
-        real_deadline: u64,
+        real_deadline: Option<u64>,
         /// `Some(status)` once the event fired — the fiber is claimable and the next resume
         /// delivers the status; `None` while still blocked.
         woken: Option<i32>,
@@ -10479,7 +10498,8 @@ enum VcpuStop {
         base: u64,
         expected: u64,
         width: u32,
-        timeout: u64,
+        /// The guest's timeout in ns, or `None` for an infinite wait (#1638).
+        timeout: Option<u64>,
         dst: u32,
     },
     Notify {
@@ -10774,7 +10794,29 @@ fn step_vcpu(
                             unreachable!()
                         };
                         let fired = woken.take().or_else(|| {
-                            (sched_wall_now() >= *real_deadline).then_some(super::WAIT_TIMED_OUT)
+                            // #1638: an infinite wait has no real deadline to poll against, so
+                            // a busy resume-poll loop over one never fabricates a timeout here.
+                            //
+                            // MEASURED TRADE, recorded because it is a liveness *regression* in
+                            // one shape: a **non-blocking** `cont.resume` spin loop over an
+                            // unsatisfiable infinite fiber wait never idles this driver (the
+                            // resumer stays runnable), so the deadlock exit at idle is never
+                            // reached and the run now spins forever. Before this change it ended
+                            // — with `WAIT_TIMED_OUT` at 10.000979 s, i.e. only by the backstop
+                            // fabricating the very status #1638 is about.
+                            //
+                            // It is still the right trade, and not a free one: the tree-walk
+                            // oracle and the Cranelift JIT **both already hang on that exact
+                            // kernel**, measured before and after. Terminating here would make
+                            // the bytecode engine the one that answers where the oracle does
+                            // not — an INVARIANTS #9 divergence in the other direction, which is
+                            // what #1638 is a bug report about. So this path matches the oracle,
+                            // and the shared gap — no engine asks the deadlock predicate from a
+                            // resume poll, only at driver idle — is #1642, rather than papered
+                            // over in this one engine with a status the guest never asked for.
+                            real_deadline
+                                .filter(|dl| sched_wall_now() >= *dl)
+                                .map(|_| super::WAIT_TIMED_OUT)
                         });
                         let Some(st) = fired else {
                             // I48: a blocking resume of a still-parked fiber idles this task on the
@@ -11189,7 +11231,11 @@ enum TaskState {
     /// window, anonymous page) keys on its confined address — `FutexKey::Anon`, as before.
     BlockedWait {
         key: super::FutexKey,
-        deadline: u64,
+        /// Logical-clock deadline, or `None` for an infinite wait — which is therefore not a
+        /// clock-advance candidate at driver idle (#1638), so a run where every remaining
+        /// waiter is indefinite reaches `drive`'s deadlock exit instead of being handed a
+        /// `WAIT_TIMED_OUT` the guest never asked for.
+        deadline: Option<u64>,
         dst: u32,
     },
     /// §3.6 (I36 slice 2): parked in `svc.wait` on this task's own domain (its env's host); a
@@ -11902,10 +11948,17 @@ impl CoopSched {
                 }
                 // No runnable task: fire the earliest `wait` timeout — whole-vCPU waiters and
                 // event-parked fiber waiters alike (§3.6 slice 5a) — else it is a deadlock.
+                //
+                // #1638 — only a waiter with a REAL deadline is a candidate. An infinite wait
+                // carries `None` and is dropped here, so a run whose every remaining waiter is
+                // indefinite falls through to the `None` arm and reaches the deadlock this
+                // function's own doc already promised ("or deadlocks → `ThreadFault`, matching
+                // the deterministic explorer"). That path was unreachable while the `MAX_WAIT`
+                // clamp gave every infinite wait a deadline to advance to.
                 let next = tasks
                     .iter()
                     .filter_map(|t| match t.state {
-                        TaskState::BlockedWait { deadline, .. } => Some(deadline),
+                        TaskState::BlockedWait { deadline, .. } => deadline,
                         _ => None,
                     })
                     .chain(fibers.iter().filter_map(|f| match f {
@@ -11913,7 +11966,7 @@ impl CoopSched {
                             deadline,
                             woken: None,
                             ..
-                        } => Some(*deadline),
+                        } => *deadline,
                         _ => None,
                     }))
                     .min();
@@ -11921,7 +11974,12 @@ impl CoopSched {
                     Some(d) => {
                         *clock = (*clock).max(d);
                         for t in tasks.iter_mut() {
-                            if let TaskState::BlockedWait { deadline, dst, .. } = t.state {
+                            if let TaskState::BlockedWait {
+                                deadline: Some(deadline),
+                                dst,
+                                ..
+                            } = t.state
+                            {
                                 if deadline <= *clock {
                                     t.vt.active.set(dst, Reg::from_i32(super::WAIT_TIMED_OUT));
                                     t.state = TaskState::Runnable;
@@ -11933,7 +11991,7 @@ impl CoopSched {
                         // progress); its resumer's next `cont.resume` delivers the status.
                         for f in fibers.iter_mut() {
                             if let FiberState::WaitParked {
-                                deadline,
+                                deadline: Some(deadline),
                                 woken: w @ None,
                                 ..
                             } = f
@@ -13418,8 +13476,11 @@ impl CoopSched {
                             vm: fvm,
                             wait_dst: dst,
                             key: base,
-                            deadline: clock.saturating_add(timeout),
-                            real_deadline: sched_wall_deadline(timeout),
+                            // #1638: an infinite wait arms neither clock. It ends by `notify`,
+                            // by the park-time recheck, or not at all — and "not at all" is the
+                            // driver's deadlock exit, not a fabricated `WAIT_TIMED_OUT`.
+                            deadline: timeout.map(|t| clock.saturating_add(t)),
+                            real_deadline: timeout.map(sched_wall_deadline),
                             woken,
                         };
                         vt.active_id = rid;
@@ -13466,7 +13527,8 @@ impl CoopSched {
                     } else {
                         tasks[ti].state = TaskState::BlockedWait {
                             key,
-                            deadline: clock.saturating_add(timeout),
+                            // #1638: `None` for an infinite wait — see the fiber park above.
+                            deadline: timeout.map(|t| clock.saturating_add(t)),
                             dst,
                         };
                     }
@@ -14399,7 +14461,18 @@ impl Futex {
     /// token and park on it until `notify` wakes it (`WAIT_WOKEN`) or `timeout` ns elapse
     /// (`WAIT_TIMED_OUT`). Mirrors the cooperative `BlockedWait` arm; the per-token flag absorbs
     /// spurious condvar wakeups.
-    fn wait(&self, mem: &Mem, base: u64, expected: u64, width: u32, timeout: u64) -> i32 {
+    /// `timeout` is the guest's own, **unclamped** (#1641) — two waiters asking 30 s and 20 s
+    /// must not tie at a 10 s cap and wake in the wrong order.
+    ///
+    /// `None` (an infinite wait) is the one case this driver still backstops with [`MAX_WAIT`],
+    /// and that is a **known remaining gap**, not a semantics choice: the cooperative schedulers
+    /// answer an unsatisfiable infinite wait with the deadlock their clock already implies
+    /// (#1638), and the tree-walk oracle with `futex_parks_unsatisfiable` + `run_deadlocked`, but
+    /// this driver runs each vCPU on its own OS thread and has no cross-thread park census to ask.
+    /// Dropping the backstop here would trade a wrong status for an unbounded hang — the worse
+    /// half of INVARIANTS #9 — so it stays until that predicate exists. See #1638's closing note:
+    /// four engines each restating "can this wait ever be satisfied?" is the thing to fix.
+    fn wait(&self, mem: &Mem, base: u64, expected: u64, width: u32, timeout: Option<u64>) -> i32 {
         let waiter = {
             let mut buckets = self.buckets.lock().unwrap();
             // Compare-under-lock: the futex word lives in the shared backing (`atomic_value` reads it).
@@ -14417,7 +14490,7 @@ impl Futex {
             w
         };
         // Park on our own token (the bucket lock is released): woken by `notify`, or timed out.
-        let timeout = std::time::Duration::from_nanos(timeout);
+        let timeout = timeout.map_or(super::MAX_WAIT, std::time::Duration::from_nanos);
         let (flag, res) = waiter
             .cv
             .wait_timeout_while(waiter.woken.lock().unwrap(), timeout, |w| !*w)
@@ -17337,12 +17410,20 @@ impl Vm {
                     let to_ns = r!(*timeout).i64();
                     let m = mem.as_ref().ok_or(Trap::Malformed)?;
                     let base_addr = m.prepare_wait(a, *ty)?;
-                    let max = super::MAX_WAIT.as_nanos() as u64;
-                    let timeout = if to_ns < 0 {
-                        max
-                    } else {
-                        (to_ns as u64).min(max)
-                    };
+                    // #1638 / #1641 — the guest's timeout, **unclamped**, and `None` for an
+                    // infinite wait. `MAX_WAIT` used to collapse both of those into an ordinary
+                    // deadline, which is two bugs in one line: an infinite wait got a deadline
+                    // nobody asked for (the logical clock then advanced to it and delivered
+                    // `WAIT_TIMED_OUT` — the #1638 divergence from the oracle), and a finite wait
+                    // longer than the cap was silently truncated to it (two waiters asking 30 s
+                    // and 20 s tie at 10 s and wake in the wrong order — the #1641 shape, which
+                    // a logical clock does not excuse: it reorders the wakes either way).
+                    //
+                    // `None` is not "no deadline" as a special case for the schedulers to test —
+                    // it is the absence of a clock-advance candidate, so "nothing runnable and
+                    // every remaining waiter is indefinite" falls out of `.flatten().min()`
+                    // returning `None` and takes each scheduler's existing deadlock exit.
+                    let timeout = (to_ns >= 0).then_some(to_ns as u64);
                     let dst = *dst;
                     self.module = module;
                     self.cur = cur;
