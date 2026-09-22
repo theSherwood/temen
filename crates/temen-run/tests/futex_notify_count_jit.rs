@@ -205,7 +205,8 @@ fn a_notify_of_one_wakes_exactly_one_of_three_waiters_on_both_engines() {
 ///
 /// Registration order here is deterministic, not a race: `cont.resume` returns `FIBER_PARKED`
 /// only after the fiber has registered, and the root spawns the sibling afterwards. So the fiber
-/// is strictly the older waiter and the answer pins wake *order* across the two kinds, which a
+/// is strictly the older waiter, and under the #1617 arrival-order ruling it is the one a
+/// `notify(key, 1)` must claim. That pins wake *order* across the two kinds, which a
 /// three-of-a-kind test cannot.
 ///
 /// It also pins the liveness half of the unified queue: a wake spent on the **fiber** is latched
@@ -313,20 +314,24 @@ block 2 () {
 }
 "#;
 
-/// **A notify of 1 wakes 1, and both engines agree on which one.** `101` = one claimed, the
-/// *newest* waiter (the vCPU) woken, the fiber timed out. The JIT answered `110` — the oldest,
-/// the fiber — until `futex_notify` was made to drain the tail: the oracle's queue is a `Vec` it
-/// `pop()`s, so it wakes last-in-first-out, and this shape is the race-free way to see that.
+/// **A notify of 1 wakes 1, and both engines agree on which one.** `110` = one claimed, the
+/// *oldest* waiter (the fiber) woken, the vCPU timed out.
+///
+/// Arrival order is an owner ruling (#1617), not an accident. Before it, `Scheduler::notify`
+/// popped the tail — last-in-first-out, which is what `Vec::pop()` gives you rather than what
+/// anyone chose — so this program answered `101` there while the deterministic explorer's
+/// `notify`, which has always woken in insertion order, would have said `110`. FIFO cannot starve
+/// a waiter at the head; LIFO can. This shape is the race-free way to hold all three to it.
 #[test]
-fn a_notify_of_one_wakes_the_newest_of_a_fiber_and_a_vcpu_on_both_engines() {
+fn a_notify_of_one_wakes_the_oldest_of_a_fiber_and_a_vcpu_on_both_engines() {
     let m = module(NOTIFY_ONE_OF_A_FIBER_AND_A_VCPU);
     let (interp, jit) = both(&m);
     assert_eq!(
-        interp, 101,
-        "the oracle: one claimed, and it is the newer waiter — the vCPU"
+        interp, 110,
+        "the oracle: one claimed, and it is the older waiter — the fiber"
     );
     assert_eq!(
-        jit, 101,
+        jit, 110,
         "the JIT agrees on the count *and* on which waiter the count bought"
     );
 }

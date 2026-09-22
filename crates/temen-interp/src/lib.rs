@@ -5401,17 +5401,20 @@ impl Scheduler {
         process_timers(&mut self.lock());
     }
 
-    /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
+    /// Wake up to `count` vCPUs parked on `key`, **oldest first**; return how many were woken.
+    ///
+    /// Arrival order, not `Vec::pop()` order (owner ruling 2026-09-22, #1617). It used to pop the
+    /// tail, which woke last-in-first-out — an artefact of `pop()` being the cheap `Vec` operation
+    /// rather than a decision, and one that can starve a waiter that parked early: under steady
+    /// notify traffic every later arrival goes in front of it. It also disagreed with
+    /// [`DetSched::notify`], which has always woken in insertion order, so the model checker
+    /// explored an order the real pool never produced.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
         let mut woken: Vec<Waiter> = Vec::new();
         if let Some(q) = s.wait_waiters.get_mut(&key) {
-            while (woken.len() as u32) < count {
-                match q.pop() {
-                    Some((_, v)) => woken.push(v),
-                    None => break,
-                }
-            }
+            let take = (count as usize).min(q.len());
+            woken.extend(q.drain(..take).map(|(_, v)| v));
             if q.is_empty() {
                 s.wait_waiters.remove(&key);
             }

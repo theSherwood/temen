@@ -270,9 +270,9 @@ struct Threads {
 #[derive(Default)]
 struct FutexEntry {
     /// **Every** waiter parked on this key, in arrival order — an OS-thread vCPU and an event-parked
-    /// fiber alike, one [`WaitCell`] each. `notify` drains exactly its `count` from the **tail**
-    /// (newest first, as the oracle does) and marks those cells woken; a timeout / teardown exit
-    /// consumes its own cell
+    /// fiber alike, one [`WaitCell`] each. `notify` drains exactly its `count` from the **front**
+    /// (oldest first, as both interpreter drivers do) and marks those cells woken; a timeout /
+    /// teardown exit consumes its own cell
     /// ([`wait_deregister`]). Invariant: a cell is queued here iff its status is still
     /// [`PENDING_WAIT`] — every transition happens under the futex lock.
     ///
@@ -2322,7 +2322,7 @@ fn futex_wait(
     status
 }
 
-/// Futex wake core: claim **exactly** `count` of `key`'s parked waiters — newest first, OS-thread
+/// Futex wake core: claim **exactly** `count` of `key`'s parked waiters — oldest first, OS-thread
 /// vCPUs and event-parked fibers in one arrival order — and return how many there were to claim.
 ///
 /// The `notify_all` that follows is only how the OS waiters are roused to re-check; a waiter this
@@ -2342,16 +2342,13 @@ fn futex_notify(
                 // Statuses are delivered under this same lock, so a racing poll (fiber) or condvar
                 // wakeup (vCPU) either finds the cell queued or finds its status — never neither.
                 //
-                // **Newest first**, because that is what the oracle does: its queue is a `Vec` it
-                // `pop()`s. `futex_notify_count_jit.rs` makes a fiber register strictly before a
-                // vCPU (a `cont.resume` returns `FIBER_PARKED` only once the fiber is queued, and
-                // the spawn follows), so *which* of the two a `notify(key, 1)` claims is a
-                // deterministic, race-free differential — and it disagreed until this drained the
-                // tail. Whether last-in-first-out is the right policy is a question for both
-                // engines at once (#1617), not one the JIT answers on its own.
+                // **Oldest first** — arrival order, matching both interpreter drivers (owner ruling
+                // 2026-09-22, #1617). `futex_notify_count_jit.rs` makes a fiber register strictly
+                // before a vCPU (a `cont.resume` returns `FIBER_PARKED` only once the fiber is
+                // queued, and the spawn follows), so *which* of the two a `notify(key, 1)` claims
+                // is a deterministic, race-free differential rather than a matter of taste.
                 let take = (count as usize).min(e.waiters.len());
-                let from = e.waiters.len() - take;
-                for c in e.waiters.drain(from..) {
+                for c in e.waiters.drain(..take) {
                     c.status.store(WAIT_WOKEN, Ordering::Release);
                 }
                 if e.waiters.is_empty() {
