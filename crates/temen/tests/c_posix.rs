@@ -3338,11 +3338,20 @@ fn c_px_execve_op_runs_a_command_without_guest_side_exec() {
     const CMD: &str = r#"
 long __px_write(int cap, long fd, long buf, long len);
 long __px_getenv(int cap, long name, long len);
+long __px_argc(int cap);
+long __px_argv(int cap, long i, long buf, long cap2);
+static char a0[8];
 int main(int argc, char **argv) {
   __px_write(0, 1, (long)"CMD!", 4);
   char *v = (char *)__px_getenv(0, (long)"MARK", 4);
   if (!v || v[0] != 'y') return 90;   /* the process (env) crossed the exec */
-  return argc;                        /* 2: argv crossed too */
+  /* POSIX: execve REPLACES the argument vector — including the personality's own copy, which
+     is what `__px_argc`/`__px_argv` answer and what a guest with no C crt (the shell demo's
+     `sh -c`) reads. Left unreplaced it reports the *previous* program's arguments. */
+  if (__px_argc(0) != 2) return 91;
+  if (__px_argv(0, 0, (long)a0, 8) != 2) return 92;
+  if (a0[0] != 'p' || a0[1] != 'x' || a0[2] != 0) return 93;
+  return argc;                        /* 2: the crt's argv crossed too */
 }
 "#;
     // No `EXEC_C`: the guest declares the personality op and calls it directly.
@@ -3374,7 +3383,8 @@ int main(void) {{\n\
     assert_eq!(
         e.result,
         vec![Value::I32(42)],
-        "OP_EXECVE became the command: argv crossed (argc 2), env crossed, status reaped"
+        "OP_EXECVE became the command: argv crossed (both the crt's and the personality's), \
+         env crossed, status reaped"
     );
     assert_eq!(
         e.stdout, b"CMD!",

@@ -5043,6 +5043,25 @@ impl Ctx<'_> {
         if mem.write_bytes(base, &blob).is_none() {
             return Ok(vec![EFAULT]);
         }
+        // POSIX: `execve` **replaces the argument vector**. The packed blob above is what a C crt
+        // reads, but the personality keeps its own vector too — what [`OP_ARGC`]/[`OP_ARGV`]
+        // answer — and leaving it alone means the new image is told the *previous* program's
+        // arguments. `demos/posix_libc/exec.c`'s route cannot fix this (the personality never sees
+        // the argv there); this op is the one route that knows, so it updates it. The shell demo
+        // found this immediately: `sh -c "<cmd>"` reads its flag through `argv`, saw nimsem's
+        // `--define:…` instead of `-c`, and silently fell through to its stdin read-eval loop.
+        //
+        // Lossy, deliberately: `p.args` is `String` and POSIX argv is bytes. The byte-exact form
+        // is the packed blob a crt reads; this vector is the personality's view, and a replacement
+        // character in a non-UTF-8 argument is better than refusing an otherwise valid exec.
+        //
+        // The **environment is not** replaced, matching this personality's established exec
+        // semantics (`c_execve_runs_a_px_linked_command` pins env crossing an `envp = NULL` exec):
+        // the env is process state the image-replace carries, like the fd table and the cwd.
+        self.p.args = argv
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
         if let Some(req) = self.p.park_req.clone() {
             req(temen_interp::ParkEvent::ExecSelf { cmd });
         }

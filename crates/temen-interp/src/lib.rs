@@ -10621,6 +10621,73 @@ fn handle_mem(
 ///
 /// `None` = refused; the caller completes its op with `-EINVAL` (POSIX: `execve` returns only on
 /// failure). `clean_root` is the caller's "no serve handler, root fiber" judgement.
+/// #1621 — what the engine owes a caller whose host op fired a **caller request** through the
+/// #799 door. [`service_caller_request`] decides; the arm that called it acts.
+enum CallerRequest {
+    /// Nothing to do — no request, or a context that cannot service one. The op's own answer
+    /// stands (for `fork`/`exec` that is the `-ENOSYS` placeholder: unavailable on this route, an
+    /// error a guest surfaces rather than a hang).
+    None,
+    /// Hand this vCPU to the fork engine. No rewind, no result push — both copies resume past the
+    /// call through their return-twice `Pending::CapResult`.
+    Fork,
+    /// Replace this image. **Never returns**, which is what makes a guest's `execve(...);
+    /// exitnow(127)` run `exitnow` only on failure.
+    Exec(Box<ExecReq>),
+    /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
+    /// still running (POSIX: `execve` returns only on failure).
+    ExecRefused,
+}
+
+/// #799/#1609/#1621 — service the **caller request** a host op left in the door, identically
+/// however the op was reached.
+///
+/// `fork` and `exec` are requests, not parks: the op fires one and returns a placeholder, and the
+/// drive loop acts on it at once. Both need the same gate — only a **root fiber on the real
+/// scheduler** can be handed to the fork engine or have its image replaced — and a context that
+/// fails it keeps the placeholder.
+///
+/// This lived twice, in the `call.cap` and `call.sym` arms. `call.import` had neither: it drained
+/// the request and dropped it, so an op reached as an import could not fork or exec at all. That
+/// is invisible to a chibicc guest, whose `__px_*` calls arrive as `call.cap`/`call.sym`, and
+/// fatal to a no-C nim module, whose personality ops arrive as imports — `fork` answered
+/// `-ENOSYS`, nim read `pid < 0` as "fork failed", and `execShellCmd` reported failure having
+/// never called `execve` (#1621). One decision, three callers, so a fourth call form cannot
+/// quietly acquire a fourth answer (INVARIANTS #15).
+///
+/// Read parking is deliberately **not** here: it legitimately differs per arm (an import-routed
+/// blocking read keeps its historical 0-EOF rather than parking), and that posture is a separate
+/// question from whether a request is honored.
+#[allow(clippy::too_many_arguments)]
+fn service_caller_request(
+    request: Option<ParkEvent>,
+    cur: usize,
+    sched: &SchedRef,
+    host: &Arc<Mutex<Host>>,
+    mem: Option<&Mem>,
+    durable: bool,
+    clean_root: bool,
+) -> CallerRequest {
+    let Some(ev) = request else {
+        return CallerRequest::None;
+    };
+    if cur != ROOT_FIBER || !matches!(sched, SchedRef::Real(_)) {
+        return CallerRequest::None;
+    }
+    match ev {
+        ParkEvent::ForkSelf => CallerRequest::Fork,
+        // The op resolved the path against the command registry and packed argv/envp into the
+        // powerbox args region, so only the resolved command handle rides the request.
+        ParkEvent::ExecSelf { cmd } => {
+            match build_exec_req(host, mem, sched, cmd, 0, 0, 0, 0, durable, clean_root) {
+                Some(req) => CallerRequest::Exec(req),
+                None => CallerRequest::ExecRefused,
+            }
+        }
+        _ => CallerRequest::None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_exec_req(
     host: &Arc<Mutex<Host>>,
@@ -14008,14 +14075,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
                         _ => None,
                     };
-                    let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
-                    // #1609 — `execve` through the personality: the op resolved the path against
-                    // the command registry and packed argv/envp into the powerbox args region, so
-                    // only the resolved command handle rides the request.
-                    let exec_self = match request {
-                        Some(ParkEvent::ExecSelf { cmd }) => Some(cmd),
-                        _ => None,
-                    };
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park. (`fork`
@@ -14080,41 +14139,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
                     }
-                    // #799 — `fork` through the personality: hand this vCPU to the fork engine
-                    // (no rewind, no result push — both copies resume past the call via their
-                    // return-twice `Pending::CapResult`). A non-parkable context keeps the
-                    // placeholder (`-ENOSYS`: fork unavailable on this route/tier — an error a
-                    // shell surfaces, never an infinite `-EAGAIN` retry).
-                    if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                        return Ok(Inner::Park(Blocked::ForkSelf));
-                    }
-                    // #1609 — the `execve` twin of the `fork` request above, through the same door
-                    // and the same root/real gate. Success **never returns**: the image-replace
-                    // destroys this continuation, which is what makes a guest's `execve(...);
-                    // exitnow(127)` run `exitnow` only on failure. A refusal replaces the op's
-                    // `-ENOSYS` placeholder with `-EINVAL` — probeable, caller still running
-                    // (POSIX: `execve` returns only on failure). A non-parkable context (a fiber,
-                    // the explorer) keeps `-ENOSYS`: exec is unavailable on that route, an error a
-                    // guest surfaces rather than a hang.
+                    // #799/#1609 — the `fork`/`exec` caller requests, serviced by the one
+                    // decision every call form shares (#1621).
                     let mut exec_refused = false;
-                    if let Some(cmd) = exec_self {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            match build_exec_req(
-                                host,
-                                mem.as_ref(),
-                                sched,
-                                cmd,
-                                0,
-                                0,
-                                0,
-                                0,
-                                durable,
-                                serve_run.is_none(),
-                            ) {
-                                Some(req) => return Ok(Inner::Exec(req)),
-                                None => exec_refused = true,
-                            }
-                        }
+                    match service_caller_request(
+                        request,
+                        *cur,
+                        sched,
+                        host,
+                        mem.as_ref(),
+                        durable,
+                        serve_run.is_none(),
+                    ) {
+                        CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
+                        CallerRequest::ExecRefused => exec_refused = true,
+                        CallerRequest::None => {}
                     }
                     if !eintr_done {
                         if exec_refused {
@@ -14287,9 +14327,38 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // the §3.6 caller-parking slice); discard the flag so it can't leak into a
                     // later direct call's park decision — the read keeps its historical 0-EOF.
                     let _ = hg.take_stdin_parked();
-                    let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
-                    for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                        frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                    // #1621 — the **caller request** is not "likewise". Read parking is a posture
+                    // this arm may legitimately decline; `fork`/`exec` are requests the drive loop
+                    // acts on, and dropping one leaves the guest holding the op's `-ENOSYS`
+                    // placeholder with nothing to say why. This arm used to drop it, which is
+                    // invisible to a chibicc guest (its `__px_*` calls arrive as `call.cap`) and
+                    // fatal to a no-C nim module, whose personality ops arrive as imports: `fork`
+                    // answered `-ENOSYS` and `execShellCmd` failed without ever calling `execve`.
+                    let request = hg.take_park_request();
+                    drop(hg);
+                    let mut exec_refused = false;
+                    match service_caller_request(
+                        request,
+                        *cur,
+                        sched,
+                        host,
+                        mem.as_ref(),
+                        durable,
+                        serve_run.is_none(),
+                    ) {
+                        CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
+                        CallerRequest::ExecRefused => exec_refused = true,
+                        CallerRequest::None => {}
+                    }
+                    if exec_refused {
+                        if !call_sig(&cur_types, *sig).results.is_empty() {
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
+                        }
+                    } else {
+                        for (s, ty) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
+                            frames[top].vals.push(Reg::from_value(slot_to_val(*ty, *s)));
+                        }
                     }
                 }
                 // §7/§22 symbolic call: when the instance bound the name, dispatch exactly like
@@ -14430,14 +14499,6 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
                         _ => None,
                     };
-                    let fork_self = matches!(request, Some(ParkEvent::ForkSelf));
-                    // #1609 — `execve` through the personality: the op resolved the path against
-                    // the command registry and packed argv/envp into the powerbox args region, so
-                    // only the resolved command handle rides the request.
-                    let exec_self = match request {
-                        Some(ParkEvent::ExecSelf { cmd }) => Some(cmd),
-                        _ => None,
-                    };
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `call.cap` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some()
@@ -14486,37 +14547,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
                     }
-                    // #799 — `fork` through the personality (see the `call.cap` arm).
-                    if fork_self && *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                        return Ok(Inner::Park(Blocked::ForkSelf));
-                    }
-                    // #1609 — the `execve` twin of the `fork` request above, through the same door
-                    // and the same root/real gate. Success **never returns**: the image-replace
-                    // destroys this continuation, which is what makes a guest's `execve(...);
-                    // exitnow(127)` run `exitnow` only on failure. A refusal replaces the op's
-                    // `-ENOSYS` placeholder with `-EINVAL` — probeable, caller still running
-                    // (POSIX: `execve` returns only on failure). A non-parkable context (a fiber,
-                    // the explorer) keeps `-ENOSYS`: exec is unavailable on that route, an error a
-                    // guest surfaces rather than a hang.
+                    // #799/#1609 — the `fork`/`exec` caller requests (see the `call.cap` arm).
                     let mut exec_refused = false;
-                    if let Some(cmd) = exec_self {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            match build_exec_req(
-                                host,
-                                mem.as_ref(),
-                                sched,
-                                cmd,
-                                0,
-                                0,
-                                0,
-                                0,
-                                durable,
-                                serve_run.is_none(),
-                            ) {
-                                Some(req) => return Ok(Inner::Exec(req)),
-                                None => exec_refused = true,
-                            }
-                        }
+                    match service_caller_request(
+                        request,
+                        *cur,
+                        sched,
+                        host,
+                        mem.as_ref(),
+                        durable,
+                        serve_run.is_none(),
+                    ) {
+                        CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
+                        CallerRequest::ExecRefused => exec_refused = true,
+                        CallerRequest::None => {}
                     }
                     if let Some(pipe) = pipe_wake {
                         sched.wake_pipe_readers(pipe);
@@ -14574,11 +14619,37 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     let results =
                         hg.cap_dispatch_slots(temen_ir::CAP_DYN_TYPE_ID, packed, h, &argv, gm)?;
                     let _ = hg.take_stdin_parked(); // no dyn-parking this slice (see call.import)
-                    let _ = hg.take_park_request(); // #799: likewise — degrade to the poll answer
-                    for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
-                        frames[top]
-                            .vals
-                            .push(Reg::from_value(slot_to_val(*tyv, *s)));
+                                                    // #1621 — the caller request is honored here too. No consumer reaches a
+                                                    // personality op through `call.dyn` today, but leaving this arm the one that
+                                                    // silently drops the request would just re-create the asymmetry that cost
+                                                    // #1621 four rounds to find.
+                    let request = hg.take_park_request();
+                    drop(hg);
+                    let mut exec_refused = false;
+                    match service_caller_request(
+                        request,
+                        *cur,
+                        sched,
+                        host,
+                        mem.as_ref(),
+                        durable,
+                        serve_run.is_none(),
+                    ) {
+                        CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
+                        CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
+                        CallerRequest::ExecRefused => exec_refused = true,
+                        CallerRequest::None => {}
+                    }
+                    if exec_refused {
+                        if !call_sig(&cur_types, *sig).results.is_empty() {
+                            frames[top].vals.push(Reg::from_i64(EINVAL));
+                        }
+                    } else {
+                        for (s, tyv) in results.iter().zip(&call_sig(&cur_types, *sig).results) {
+                            frames[top]
+                                .vals
+                                .push(Reg::from_value(slot_to_val(*tyv, *s)));
+                        }
                     }
                 }
                 // §3.5 self-namespace extensions: reify own offer / intern own shape / probe
