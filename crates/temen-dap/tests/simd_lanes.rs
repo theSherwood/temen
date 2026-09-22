@@ -7,9 +7,8 @@
 //! Gated `#![cfg(unix)]` (needs the chibicc toolchain, like the frontend suites).
 #![cfg(unix)]
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
 
 use temen_dap::{DapServer, Json};
 
@@ -23,20 +22,9 @@ fn repo_root() -> PathBuf {
         .unwrap()
 }
 
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .expect("run `make` to build the chibicc fork");
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "../../temen/tests/support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// Compile C to `-g` text IR (attached `-I` — cc1 only accepts `-Ipath`).
 fn c_to_ir(src: &str) -> String {

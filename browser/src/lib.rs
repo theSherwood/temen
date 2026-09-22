@@ -6598,10 +6598,17 @@ pub struct JitOnrampRun {
     /// warm+JIT path leaves it `false` and keeps its pre-sized `run_over` bounce byte-for-byte, so this
     /// slice touches only the single-shot tier.
     grow: bool,
-    prots: Option<Vec<(u64, u8)>>,
-    /// The committed prefix `prots` is relative to (the previous bounce's `MemMapInfo.1`): a grown
-    /// tail the seed folded into the prefix lives here, not in `prots` (#1540).
-    prots_mapped: u64,
+    /// The page map carried forward between cross-tier bounces: the on-ramp's `protect`ed rodata and
+    /// any `vm_map`-grown tail, together with the committed prefix those entries are relative to (the
+    /// previous bounce's `MemMapInfo.1` — a grown tail the seed folded into the prefix lives there,
+    /// not in the entries, #1540).
+    ///
+    /// One `PageMap` rather than a `Vec<(u64, u8)>` plus a `prots_mapped` beside it (#1456): the two
+    /// had to be kept in step by hand across every bounce, and passing them out of step is precisely
+    /// the lossy shape `run_over_grown.rs::the_folded_prefix_carries_across_bounces_only_when_passed_back`
+    /// pins. It is a `PageMap` and not a `MemLayout` because there is no image to put in one — the
+    /// window is live in `back`.
+    prots: Option<temen_interp::PageMap>,
     mapped: u64,
     /// #1201 — the run emits **paged** (`module_uses_unmap_protect`, see `emit_for_run`): `pagestate`
     /// is the #750 page-state table rebuilt from each bounce's live map
@@ -7222,8 +7229,7 @@ impl JitOnrampRun {
             trapped: false,
             fs_readback,
             grow: true, // #1153 single-shot on-ramp: real `vm_map` growth (no pre-size)
-            prots: Some(Vec::new()),
-            prots_mapped: 0,
+            prots: Some(temen_interp::PageMap::empty()),
             mapped,
             paged,
             pagestate,
@@ -7319,8 +7325,7 @@ impl JitOnrampRun {
             // Warm+JIT keeps its pre-sized window and the prior `run_over` bounce (`grow: false`), so the
             // growth fields are inert here; initialized for struct parity (#1153 touches only single-shot).
             grow: false,
-            prots: Some(Vec::new()),
-            prots_mapped: 0,
+            prots: Some(temen_interp::PageMap::empty()),
             mapped: 1u64 << win_log2,
             paged: false,
             pagestate: Vec::new(),
@@ -7402,8 +7407,7 @@ impl JitOnrampRun {
                 &mut self.host,
                 false,
                 temen_ir::DEFAULT_RESERVED_LOG2,
-                self.prots.as_deref(),
-                self.prots_mapped,
+                self.prots.as_ref(),
                 Some(&self.table), // #1296: installs persist across this run's bounces
             );
             match info {
@@ -7419,8 +7423,16 @@ impl JitOnrampRun {
                     } else {
                         self.mapped = mapped;
                     }
-                    self.prots_mapped = info.1;
-                    self.prots = Some(info.3);
+                    // Rebuild the carry with the prefix its entries are now relative to — one value,
+                    // so the two cannot drift apart.
+                    self.prots = temen_interp::PageMap::from_entries(
+                        temen_interp::host_page_size(),
+                        info.1,
+                        &info.3,
+                    );
+                    if self.prots.is_none() {
+                        return Err(Trap::CapFault); // a §13 `Backed` entry — unrestorable, fail closed
+                    }
                 }
                 None => {
                     self.prots = None;
@@ -7873,11 +7885,7 @@ struct WarmSession {
     /// The module (memory patched to the mapped window) — re-granted onto a fresh host per eval so the
     /// deterministic powerbox handles match the snapshot's window-relative state.
     module: temen_ir::Module,
-    /// The warmup image's explicit page-state entries (#816, the `Mem::map_info` encoding): the
-    /// on-ramp's `protect`ed rodata inside the prefix and the `vm_map`-grown heap tail alike.
-    /// Re-established (without zeroing) before every eval, so the guest restores to the same
-    /// mapped geometry — and the same write protections — instead of faulting.
-    prots: Vec<(u64, u8)>,
+
     /// The powerbox data-stack base (`powerbox_entry_sp`), passed as each entry's `sp` arg.
     entry_sp: u64,
     eval_fn: temen_ir::FuncIdx,
@@ -7886,10 +7894,22 @@ struct WarmSession {
     /// it instead of `-EINVAL`ing, and extending it *reallocates*, so the base moves — read it through
     /// [`WarmSession::win_ptr`] / [`WarmSession::win`] at every use, never cached.
     back: std::sync::Arc<temen_interp::Region>,
-    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`.
-    image: Vec<u8>,
-    /// High-water of bytes any prior eval may have dirtied (≥ `image.len()`): the restore zeroes
-    /// `[image.len(), dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    /// The program-independent warm image — the live prefix `[0, brk)` captured after `warmup`,
+    /// together with the warmup's explicit page-state entries (#816): the on-ramp's `protect`ed rodata
+    /// inside the prefix and the `vm_map`-grown heap tail alike.
+    ///
+    /// **One window-image form** (#1456). These were a `Vec<u8>` and a `Vec<(u64, u8)>` side by side,
+    /// which is the private pair-of-fields `MemLayout` exists to replace — the checkpoint ladder, the
+    /// reactor moment and the §12 codec's window section all describe this same datum
+    /// (INVARIANTS #13/#15). Re-established (without zeroing) before every eval, so the guest restores
+    /// to the same mapped geometry — and the same write protections — instead of faulting.
+    warm: temen_interp::MemLayout,
+    /// High-water of bytes any prior eval may have dirtied (≥ the image length): the restore zeroes
+    /// `[image, dirty_end)` so a re-Run sees the same zero tail `warmup` left above the heap.
+    ///
+    /// Deliberately *not* folded into `warm`: it is a property of what previous runs did to this
+    /// session's window, not of the captured image, and a `MemLayout` that carried it would be
+    /// describing two different things.
     dirty_end: usize,
     /// #964: the module's NULL guard (`0` = legacy layout) — a marked module's powerbox low scratch
     /// (heap bump words included) sits one guard up, so every brk read/seed offsets by this.
@@ -7913,6 +7933,23 @@ struct WarmSession {
 }
 
 impl WarmSession {
+    /// Restore the warm image and zero the tail any prior eval grew the heap into, so this Run sees
+    /// byte-identical warm state (fresh-per-Run isolation).
+    ///
+    /// One body, three callers (batch eval, streaming eval, warm+JIT eval). It was three identical
+    /// copies, which is the second position INVARIANTS #15 is about — and the kind that bites quietly,
+    /// since a fourth entry point would have been written by copying a third.
+    fn restore_warm_window(&self) {
+        let image = self.warm.bytes();
+        // SAFETY: `win_ptr` owns `win >= dirty_end` bytes; no engine run is in flight (every caller
+        // is between runs, which is what makes the whole-window overwrite sound).
+        unsafe {
+            let w = core::slice::from_raw_parts_mut(self.win_ptr(), self.win() as usize);
+            w[..image.len()].copy_from_slice(image);
+            w[image.len()..self.dirty_end].fill(0);
+        }
+    }
+
     /// The window's base address **right now**. A `vm_map` grow inside an eval reallocates the
     /// backing, so this can differ from one call to the next (#1312) — never cache it across a run.
     fn win_ptr(&self) -> *mut u8 {
@@ -8058,16 +8095,29 @@ pub extern "C" fn temen_warm_open(mod_ptr: *const u8, mod_len: usize) -> i64 {
         let live = warm_read_brk(w, scratch).min(win as usize);
         (w[..live].to_vec(), live)
     };
+    // Bytes + page map as the one form. `from_parts` rejects a §13 `Backed` entry, which is the same
+    // fail-closed rule the `pages` match above applies — an alias cannot be reproduced from an image.
+    //
+    // The map's prefix is **0**, not `win`: it is the committed extent the entries are *relative to*,
+    // and these came from the warmup's own `map_info` with nothing carried in front of them. Both warm
+    // eval entries passed a hardcoded `0` for it before the two were folded into one value (#1456), so
+    // this is that behaviour written down rather than left implicit at the call sites.
+    let Some(warm) =
+        temen_interp::MemLayout::from_parts(image, temen_interp::host_page_size(), 0, &prots)
+    else {
+        drop(back);
+        set(STATUS_TRAP);
+        return -1;
+    };
     // SAFETY: single-threaded wasm; the session is read back only via the warm exports.
     unsafe {
         *core::ptr::addr_of_mut!(WARM_SESSION) = Some(WarmSession {
             prog,
             module: m,
-            prots,
             entry_sp,
             eval_fn,
             back,
-            image,
+            warm,
             dirty_end: live,
             scratch,
             jit: None,
@@ -8099,12 +8149,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
     };
     // Restore the warm image, and zero the tail any prior eval grew the heap into — so this Run sees
     // byte-identical warm state (fresh-per-Run isolation).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     // Live-stream stdout as the eval writes it (#1142). The tee fires the `stdout_chunk` host import,
@@ -8131,7 +8176,7 @@ pub extern "C" fn temen_warm_eval(stdin_ptr: *const u8, stdin_len: usize) -> i64
         // clamped to `WARM_MAPPED_LOG2` — it defines the image geometry, which is captured as a flat
         // byte prefix, so growth there would have nothing to restore into.
         temen_ir::DEFAULT_RESERVED_LOG2,
-        Some(&s.prots),
+        Some(s.warm.page_map()),
     );
     let (status, value, exit_code) = match ran {
         Err(Trap::Exit(code)) => (STATUS_EXIT, 0, code),
@@ -8303,12 +8348,7 @@ pub extern "C" fn temen_warm_jit_prepare(stdin_ptr: *const u8, stdin_len: usize)
     }
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into — byte-identical
     // warm state each Run (identical to [`temen_warm_eval`]'s restore).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let stdin: Vec<u8> = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
     } else {
@@ -8547,12 +8587,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
     };
     // Restore the program-independent warm image, zeroing any tail a prior eval grew into —
     // byte-identical warm state each Run (identical to [`temen_warm_eval`]'s restore).
-    // SAFETY: `win_ptr` owns `win ≥ dirty_end` bytes; no engine run is in flight (sole access here).
-    unsafe {
-        let w = core::slice::from_raw_parts_mut(s.win_ptr(), s.win() as usize);
-        w[..s.image.len()].copy_from_slice(&s.image);
-        w[s.image.len()..s.dirty_end].fill(0);
-    }
+    s.restore_warm_window();
     let mut host = Host::new();
     host.stdin = if stdin_ptr.is_null() || stdin_len == 0 {
         Vec::new()
@@ -8588,7 +8623,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
         Some(tierup),
         s.back.clone(),
         temen_ir::DEFAULT_RESERVED_LOG2,
-        &s.prots,
+        s.warm.page_map(),
     ) {
         Ok(r) => r,
         Err(_) => {
@@ -14066,7 +14101,7 @@ pub extern "C" fn temen_durable_thaw_resume(
         &mut host,
         false, // bytes already restored into the backing — do not re-init data segments
         rreserved,
-        Some(&entries),
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &entries).as_ref(),
     );
     match r {
         Ok(vals) => match vals.first() {

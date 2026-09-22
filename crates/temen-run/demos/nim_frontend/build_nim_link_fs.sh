@@ -58,5 +58,5 @@ TR="$REPO/crates/temen-llvm/target/release/temen-llvm-translate"
 # directly, exactly like the `nimsem_ce`/`hexer_ce` child-entry assets. The gate test
 # (`nim_link_fs_asset.rs`) decode+verify+op-13-runs it and diffs vs native `link_nim_powerbox`.
 echo "[4/4] gzip the committed child-entry asset (validation is the op-13 gate test) ..."
-gzip -9 -c "$CACHE/nl_raw.temen" > "$HERE/fixtures/nim-link-fs.temen.gz"
+gzip -9 -n -c "$CACHE/nl_raw.temen" > "$HERE/fixtures/nim-link-fs.temen.gz"
 echo "done: $HERE/fixtures/nim-link-fs.temen.gz ($(du -h "$HERE/fixtures/nim-link-fs.temen.gz" | cut -f1))"

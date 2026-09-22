@@ -2391,6 +2391,70 @@ byte_budget }` is applied once per op; it is deliberately static, and a later ad
 fixed values for computed ones at the same call sites without changing the shape. A compaction is
 never revisited.
 
-Open: wiring journal-backed `step_back` into the DAP backend, DURABILITY.md **R4** (§13 shared-region
-edges — a design call, since a `Backed`/`SharedRegion` page has writers the journal cannot see), and
-real-program cost measurements (the bail criteria on #1557).
+**Measured, and the measurement moved the design.** `cargo run --release -p temen-run --example
+journal_cost` runs real guests on the debug engine armed and unarmed and reports the #1556 bail
+criteria. The first run said the journal cost **124.9×** on chibicc and **13.4×** on forth — far past
+any defensible factor. Turning per-op state capture off and re-running attributed **94%** and **83%**
+of that to one thing: a `ScheduledContinuation` clone per op, whose cost scales with **frame depth**,
+not with the window. #1556 had said not to do that — *"the continuation is snapshotted at segment
+boundaries rather than inverted per-op"* — and the first implementation did it per op anyway.
+
+`JournalPolicy::state_stride` is that boundary, and `undo_to(t)` now restores the nearest boundary at
+or before `t` and re-executes the remainder (bounded by the stride, using `tick`, which honours no
+breakpoint or watch checks because this is re-execution of turns that already happened). Window
+pre-images stay per-op, so the window is exact at every turn and only the continuation needs the short
+replay. At the chosen stride of 256:
+
+**What the intra-segment replay rests on, and why it is not a new bet.** Re-executing to reach `t`
+needs those turns to run the same way twice — but that is the assumption reverse debugging has always
+made, not one the journal introduces. `seek` replays too, from turn 0 or the nearest ladder rung
+(stride 1024); undo replays at most `state_stride` (256). Same premise, strictly less of it, and
+`dap_checkpoints.rs`'s warm≡cold oracle is the standing test of it. It is in fact the *weaker* form:
+`seek` re-derives state by rebuilding a run from scratch, while undo restores a cloned continuation in
+the same process, so anything that could differ between a rebuilt run and the original is never
+re-derived at all.
+
+What holds it up:
+
+- **Pure compute, one op per turn, lowest-index-runnable** — `tick`'s contract, and the debug engine is
+  the interpreter: JIT tier-up is never enabled on it, so a replay never crosses tiers.
+- **Nondeterministic inputs are recorded, not re-derived.** `is_recorded_input` covers `CLOCK`, stream
+  reads and `HOST_PROC`; `undo_to` arms `replay_cap_tape` *before* restoring the host cursor, so
+  re-execution re-serves the taped answers instead of calling a live closure
+  (`undoing_across_cap_calls_re_serves_the_recorded_inputs`).
+- **What cannot be recorded fails closed** — `Host::journal_invertible`: the §3.6 serve queue (it
+  drains, so it is not append-only), a capability's opaque declared state, a mid-invoke task, an
+  event-parked fiber. Those journal no state entry, `can_undo_to` declines, and `seek` serves.
+
+**Floats are not a hazard here, and it is worth saying why rather than assuming it.** The IR's scalar
+float unops are `abs`/`neg`/`sqrt`, all IEEE-754 correctly rounded and therefore bit-exact; there are
+**no transcendentals** (`sin`/`cos`/`exp`/`pow`/`log`) anywhere in the interpreter, which is where
+implementation-defined results would otherwise come from. FMA is an explicit op lowered to `mul_add` —
+the correctly-rounded IEEE FMA — not a compiler contraction, so there is no "did it fuse this time"
+question. NaN payloads are *preserved* rather than canonicalized, and deterministically so:
+`temen-opt`'s constant folder is pinned bit-for-bit against the interpreter including payloads and the
+wasm min/max/nearest rules (DESIGN.md §20c, the peval const-folder's coverage list).
+
+Three things *would* break it, none of which this path does: replaying on a different binary or
+machine (an in-process undo is immune; a **serialized** moment is not, which is a constraint on the §12
+codec and #1459 rather than here), adding a libm-backed float op to the IR or enabling fast-math/FTZ
+(which would break `seek` identically — worth a note on the IR if transcendentals ever land), and the
+parallel driver's real races, which #1454 already records as capture-only.
+
+| guest | slowdown | level 2 held | vs window | undo vs replay |
+| --- | --- | --- | --- | --- |
+| gradient (bulk framebuffer) | 1.23× | 13.9 KiB | 5.43% | — |
+| mandelzoom | 1.00× | 0.1 KiB | 0.02% | 7× |
+| forth (real interpreter) | 1.23× | 3.1 KiB | 0.31% | **422×** |
+| chibicc (real compiler) | 1.62× | 13.4 KiB | 0.66% | **556×** |
+
+Both bail criteria pass: the level-2 bound holds everywhere (a compacted segment is never worse than
+the snapshot it replaces), and the slowdown is 1.0–1.6×. Journaling is armed by default in the DAP
+backend on that basis, and `backward_counts()` reports which path served each backward step so the
+wiring cannot silently stop being used.
+
+Open: DURABILITY.md **R4** (§13 shared-region edges — a design call, since a `Backed`/`SharedRegion`
+page has writers the journal cannot see); a byte budget below one `state_stride` of writes leaves every
+anchor under the floor and turns undo off quietly rather than shortening it (#1558); and the
+level-2 measured bound against #1459's per-moment page-scan cost, which #1556 asks for and which needs
+#1459 to exist first.

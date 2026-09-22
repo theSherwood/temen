@@ -379,6 +379,7 @@ fn the_policy_keeps_recent_history_fine_and_ages_the_rest() {
     r.set_journal_policy(temen_interp::journal::JournalPolicy {
         fine_turns: 8,
         byte_budget: 0,
+        ..Default::default()
     });
     let mut fuel = FUEL;
     while r.tick(&mut fuel) {}
@@ -409,6 +410,7 @@ fn the_byte_budget_bounds_the_journal_and_fails_closed() {
     r.set_journal_policy(temen_interp::journal::JournalPolicy {
         fine_turns: 16,
         byte_budget: budget,
+        ..Default::default()
     });
     let mut fuel = FUEL;
     while r.tick(&mut fuel) {}
@@ -427,4 +429,112 @@ fn the_byte_budget_bounds_the_journal_and_fails_closed() {
     );
     assert!(!r.undo_to(0));
     assert_eq!(observe(&r), before, "a declined undo changes nothing");
+}
+
+/// **#1558's retention rule: compaction never discards an input record.**
+///
+/// The two entry kinds have different retention rules, and the issue is explicit about it: undo
+/// payloads are discardable once an anchor covers them, but *input records* must survive from the
+/// earliest retained anchor forward, because any replay from that anchor re-consumes them. Get that
+/// wrong and a compacted history replays against a tape that has already been eaten — the guest sees
+/// different answers than it saw the first time, which is the one failure mode the tape exists to
+/// prevent.
+///
+/// It holds here by construction rather than by care: the tape lives on the `Host` and the journal's
+/// compaction paths (`coalesce`, and the byte budget's oldest-first drop) only ever touch the journal's
+/// own `entries` and `states`. The only thing that moves the tape cursor is an undo, via the host
+/// cursor's `cap_consumed` — and that is a rewind, not a discard. This pins it, so a future compaction
+/// that *did* reach for the tape would fail here rather than in a user's session.
+#[test]
+fn compaction_never_eats_the_input_records() {
+    let m = cap_module();
+    let (host, h) = counting_host();
+    let mut r = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h)], host)
+        .expect("in the debug subset");
+    r.set_journal_armed(true);
+    // A budget small enough to drop history, and no fine window, so both compaction paths run.
+    r.set_journal_policy(temen_interp::journal::JournalPolicy {
+        fine_turns: 4,
+        byte_budget: 16,
+        ..Default::default()
+    });
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+    assert_eq!(
+        r.result().cloned(),
+        Some(Ok(vec![temen_interp::Value::I64(1002)])),
+        "the live capability answers 1 then 2 on the first pass"
+    );
+
+    // Compaction has been applied throughout, and again over the whole history for good measure.
+    r.coalesce_journal(end);
+    assert!(
+        r.journal_stats().bytes <= 16,
+        "the policy should have compacted this history down to its budget"
+    );
+
+    // The fallback still reproduces the run exactly, which it can only do if the input records
+    // survived the compaction that dropped the undo payloads.
+    let (host2, h2) = counting_host();
+    let mut fresh = ScheduledDebugRun::new_with_host(&m, 0, &[temen_interp::Value::I32(h2)], host2)
+        .expect("in the debug subset");
+    let mut fuel = FUEL;
+    while fresh.op_turn() < end && fresh.tick(&mut fuel) {}
+    assert_eq!(
+        fresh.result().cloned(),
+        r.result().cloned(),
+        "a replay of a compacted run must reach the same result — the tape it re-consumes is intact"
+    );
+}
+
+/// **A budgeted journal still undoes exactly, within whatever reach it has left.** The budget shortens
+/// undo's reach; it must not corrupt what is still held.
+///
+/// That the reach *ends* — that a target past the floor declines rather than coming back wrong — is
+/// pinned by `the_byte_budget_bounds_the_journal_and_fails_closed` here and, on a real mixed walk, by
+/// `dap_undo_step_back.rs::a_bounded_journal_hands_the_far_targets_back_to_replay`. This one is about
+/// what happens *inside* the reach, so it asserts only that and stops where the journal stops.
+#[test]
+fn a_dropped_history_still_undoes_exactly_within_its_reach() {
+    // `run()`'s fixture, because `state_at` — the oracle — replays that one. (Using the larger
+    // measurement fixture here compared two different programs and failed for that reason, not for
+    // anything to do with the budget.)
+    let mut r = run();
+    r.set_journal_armed(true);
+    r.set_journal_policy(temen_interp::journal::JournalPolicy {
+        // No coalescing: this fixture rewrites one hot cell, which level 2 would collapse to a handful
+        // of bytes — leaving the byte budget, the thing under test, with nothing to drop.
+        fine_turns: u64::MAX,
+        // A short stride so this small fixture has several anchors, and a budget that bites between
+        // them rather than below the first. With the default 256-turn stride a 24-iteration run has
+        // exactly one anchor, at turn 0, and any budget that drops history at all drops it below that
+        // anchor — leaving nothing to undo into. That interaction is real, and documented on
+        // `JournalPolicy::byte_budget`; here it just has to be steered around.
+        state_stride: 4,
+        byte_budget: 96,
+    });
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let end = r.op_turn();
+
+    // Walk back as far as the journal reaches; every step it accepts must match the oracle, and it
+    // must stop accepting at some point (the budget bounds the reach — that is the whole point).
+    let mut served = 0;
+    for t in (0..end).rev() {
+        if !r.can_undo_to(t) {
+            break; // past the floor — `seek` serves from here, and that path is already pinned
+        }
+        assert!(r.undo_to(t), "undo_to({t}) accepted then failed");
+        assert_eq!(
+            observe(&r),
+            state_at(t),
+            "undo_to({t}) inside the retained tail must equal a fresh run ticked to {t}"
+        );
+        served += 1;
+    }
+    assert!(
+        served > 0,
+        "the budget should still leave a usable tail to undo into"
+    );
 }

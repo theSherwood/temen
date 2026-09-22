@@ -94,8 +94,11 @@ fn grow_then(seed: bool) -> ProbeOutcome {
             .any(|&(off, kind)| kind == 1 && off >= 1 << DECLARED_LOG2),
         "entries must cover the grown page (got {pages:?})"
     );
-    // Call 2: fresh Mem over the same backing — the seam under test.
-    let seed = seed.then_some(pages);
+    // Call 2: fresh Mem over the same backing — the seam under test. The map carries the prefix its
+    // entries are relative to, so there is no second argument to keep in step (#1456).
+    let seed = seed
+        .then_some(pages)
+        .and_then(|p| temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &p));
     let (ran, pages, _) = prog.run_over_grown(
         1,
         &[],
@@ -104,7 +107,7 @@ fn grow_then(seed: bool) -> ProbeOutcome {
         &mut host,
         false,
         BACKING_LOG2,
-        seed.as_deref(),
+        seed.as_ref(),
     );
     (ran, pages)
 }
@@ -156,7 +159,6 @@ fn the_folded_prefix_carries_across_bounces_only_when_passed_back() {
         true,
         BACKING_LOG2,
         None,
-        0,
         None,
     );
     assert_eq!(ran.expect("grow"), vec![Value::I64(0)]);
@@ -169,8 +171,7 @@ fn the_folded_prefix_carries_across_bounces_only_when_passed_back() {
         &mut host,
         false,
         BACKING_LOG2,
-        Some(&info1.3),
-        0,
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &info1.3).as_ref(),
         None,
     );
     assert_eq!(ran.expect("seeded probe"), vec![Value::I64(424242)]);
@@ -181,7 +182,13 @@ fn the_folded_prefix_carries_across_bounces_only_when_passed_back() {
         info2.1,
         info2.3
     );
+    // Two maps over the *same* entries, differing only in the prefix they declare themselves
+    // relative to. Before #1456 this was one entry slice plus a separate `mapped` argument, and the
+    // pair could be handed over out of step — which is what made the lossy shape reachable by
+    // accident rather than only on purpose, as here.
     for (carry, want_marker) in [(info2.1, true), (0, false)] {
+        let seed =
+            temen_interp::PageMap::from_entries(temen_interp::host_page_size(), carry, &info2.3);
         let (ran, _, _) = prog.run_over_grown_info(
             1,
             &[],
@@ -190,8 +197,7 @@ fn the_folded_prefix_carries_across_bounces_only_when_passed_back() {
             &mut host,
             false,
             BACKING_LOG2,
-            Some(&info2.3),
-            carry,
+            seed.as_ref(),
             None,
         );
         if want_marker {
@@ -220,7 +226,7 @@ fn a_gap_in_the_seeded_tail_is_not_folded_over() {
         &mut host,
         true,
         BACKING_LOG2,
-        Some(&beyond_hole),
+        temen_interp::PageMap::from_entries(page, 0, &beyond_hole).as_ref(),
     );
     assert!(
         matches!(ran, Err(Trap::MemoryFault)),
@@ -335,7 +341,7 @@ fn protected_rodata_round_trips_readable_and_write_protected() {
         &mut host,
         false,
         BACKING_LOG2,
-        Some(&pages),
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &pages).as_ref(),
     );
     assert_eq!(
         ran.expect("seeded Ro read"),
@@ -352,7 +358,7 @@ fn protected_rodata_round_trips_readable_and_write_protected() {
         &mut host,
         false,
         BACKING_LOG2,
-        Some(&pages),
+        temen_interp::PageMap::from_entries(temen_interp::host_page_size(), 0, &pages).as_ref(),
     );
     assert!(
         matches!(ran, Err(Trap::MemoryFault)),

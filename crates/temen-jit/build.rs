@@ -1,9 +1,10 @@
 fn main() {
     // `fiber_rt`: the JIT's fiber/thread/futex runtime (§12) is available wherever `temen-fiber`
     // provides a real stack switch. Keep this in lockstep with `temen_fiber::supported()` and the
-    // `temen-fiber` module gates: x86-64 unix + x86-64 Windows today (aarch64 macOS next). Derived from
-    // the *target* (not the host), so a cross-compile gates correctly. Registered unconditionally so
-    // `#[cfg(fiber_rt)]` never trips the unexpected-cfg lint.
+    // `temen-fiber` module gates: unix x86-64, unix aarch64 and Windows x86-64 — all three have a
+    // switch today, and `gc.roots` has a matching `temen_gc_roots_flush` trampoline arm for each.
+    // Derived from the *target* (not the host), so a cross-compile gates correctly. Registered
+    // unconditionally so `#[cfg(fiber_rt)]` never trips the unexpected-cfg lint.
     println!("cargo:rustc-check-cfg=cfg(fiber_rt)");
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let on_unix = std::env::var_os("CARGO_CFG_UNIX").is_some();

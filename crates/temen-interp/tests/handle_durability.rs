@@ -380,6 +380,7 @@ fn a_budget_round_trips_through_capture_restore_with_its_remaining_intact() {
         mem: (1 << 20) - 4096,
         spawn: 3,
         channel: -1,
+        lane: -1,
     };
 
     let captured = a

@@ -16,7 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::Arc;
 
-use temen_interp::{run_with_host, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value};
+use temen_interp::{
+    run_with_host_traced, ForkedProc, Host, HostProc, HostProcFork, StreamRole, Value,
+};
 use temen_run::exec::{domain_exec_with_fs, DomainProgram};
 use temen_run::{instantiate, HostCap, Limits};
 
@@ -159,7 +161,8 @@ fn main() {
     .expect("decode nimsem_ce.temen");
     temen_verify::verify_module(&nimsem).expect("nimsem verifies");
     let decl = nimsem.memory.as_ref().expect("nimsem window").size_log2 as u32;
-    let child_sl = (decl + 3).max(28); // >= declared; nimsem's no-GC system semcheck peaks in (128, 256] MiB
+    // The carve floor is measured, documented and shared — see `temen_run::nim_phase_carve_log2`.
+    let child_sl = temen_run::nim_phase_carve_log2(decl);
     let carve_off = 1u64 << child_sl;
     let parent_win = 1u64 << (child_sl + 1);
 
@@ -193,7 +196,11 @@ fn main() {
     let modh = host.grant_module(&nimsem);
 
     let mut fuel = 2_000_000_000_000u64;
-    let r = run_with_host(
+    // `_traced`, not the plain `run_with_host`: the trap this driver exists to report belongs to the
+    // op-13 **child**, whose window dies with its outcome, so `Err(t)` alone is a bare `MemoryFault`
+    // with nothing left to ask (#1591). The backtrace it returns is the first-wins trap-origin
+    // capture — the child's frames, not the parent's join site.
+    let (r, trap_bt, _fiber) = run_with_host_traced(
         &parent,
         0,
         &[
@@ -224,7 +231,19 @@ fn main() {
     match &r {
         Ok(v) => eprintln!("nimsem child joined: {v:?}"),
         Err(t) => {
-            eprintln!("nimsem child trapped: {t:?}");
+            // The child's module names the frames: they are its funcs, not the parent driver's. The
+            // faulting address is worth as much as the trace — a small one says the pointer was
+            // never initialized, a wild one says the arithmetic that produced it was wrong, and the
+            // backtrace alone does not separate them.
+            eprintln!(
+                "{}",
+                temen_run::with_backtrace(
+                    format!("nimsem child trapped: {t:?}"),
+                    &trap_bt,
+                    temen_interp::last_capture_fault_addr(),
+                    &nimsem,
+                )
+            );
             exit(1);
         }
     }

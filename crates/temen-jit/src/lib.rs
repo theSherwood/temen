@@ -152,6 +152,10 @@ mod fiber_registry;
 // §14 nesting runtime: the host side of the `Instantiator` capability for the JIT — `instantiate`
 // re-compiles a child confined to a sub-window (nesting cost paid at setup) and runs it over the
 // parent's live window; `join` returns its result. Available where children can run (`fiber_rt`).
+/// D66 — the child-domain executor: detached §14 children as migrating tasks over a lane-bounded
+/// worker pool (DESIGN.md §23).
+#[cfg(fiber_rt)]
+mod child_exec;
 #[cfg(fiber_rt)]
 mod instantiator_rt;
 
@@ -185,7 +189,25 @@ pub const fn fiber_supported() -> bool {
 /// (128, 256] MiB, needing a 256 MiB child carve and thus a 512 MiB parent window. `mmap` is
 /// lazy (RSS follows touched pages, not the reservation), so the VA bump is cheap and real fuzz
 /// seeds — far below even the old cap — are unaffected.
-const MAX_JIT_WINDOW_LOG2: u8 = 29; // 512 MiB (the backed `mapped` extent)
+///
+/// **Re-measured 2026-09-21 (#1591, #1603): 29 → 31.** The premise above was accurate when written,
+/// then two of our own defects inflated the workload past it. `nifler_shim.c`'s `mmap` was not
+/// page-aligned, so Nim's allocator — which recovers a chunk header with `pageAddr(p) = p & ~0xFFF`
+/// — crashed in `rawDealloc`; that was worked around with `-d:useMalloc`, which routes every object
+/// to the on-ramp's `synth_malloc`, whose `free` is a no-op. The guest's peak then tracked total
+/// allocation *churn* rather than its live set: 2007 MiB. With the alignment fixed and the flag
+/// dropped it is **666 MiB** for byte-identical output — still 2.6x the original (128, 256], so the
+/// chain needs a 1 GiB carve and hence a 2 GiB parent window.
+///
+/// Raising the cap is safe in the sense that matters: it is **not** a confinement boundary. Masking
+/// enforces that (DESIGN §4 / INVARIANTS #2); this is a guard rail so a fuzzed or malformed module
+/// cannot ask the reference JIT for an absurd allocation. The cost is address space, not RAM — the
+/// mapping is lazy, so RSS follows touched pages, and a guest that needs 666 MiB needs it on every
+/// engine. `MAX_JIT_RESERVED_LOG2` has allowed 1 TiB of reserved VA all along.
+///
+/// (Recorded honestly because the line above says "owner-approved": the *figure* went stale, the
+/// decision behind it did not, and what actually changed was on our side of the boundary.)
+pub const MAX_JIT_WINDOW_LOG2: u8 = 31; // 2 GiB (the backed `mapped` extent)
 
 /// Largest **reserved** virtual range (the mask domain) the reference JIT will `mmap` per
 /// window. The reservation is `PROT_NONE` + `MAP_NORESERVE`, so this is virtual address space,
@@ -689,6 +711,16 @@ pub struct GrantChild {
     /// capability installs units into padding slots of its **own** table, so the builder reports
     /// the reservation its grant carried and the child compiles with that many slots.
     pub jit_table_log2: u8,
+    /// D66 — the child's **lane chain** coordinates, read off the two powerboxes by the builder:
+    /// the child domain's id and lane cap (`-1` = unbounded), and its parent's. The child-domain
+    /// executor gates each task's dispatch on every bounded cap along this chain
+    /// (`temen_ir::lanes`), so a task runs only while its own lane *and* every enclosing one has
+    /// room — the oracle's `lane_chain`, arriving on this backend. Zero/`-1` from a builder that
+    /// does not carry lanes (every path but `build_detached`).
+    pub domain: u64,
+    pub lane_cap: i64,
+    pub parent_domain: u64,
+    pub parent_lane_cap: i64,
 }
 
 /// The host callback the §14 nesting runtime uses for **`instantiate_granted`** (Instantiator op 8):
@@ -782,6 +814,17 @@ pub struct BudgetTaken {
 pub type BudgetMemTaker =
     unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64) -> i32;
 
+/// D66 — return a detached child's **lane** to its parent's `granted_lanes` once the child is reaped
+/// (the JIT twin of the interpreter's `credit_child_lane`). Called by the child-domain executor at
+/// task finish with the lane the child was stamped with (`-1` = unbounded, a no-op).
+pub type LaneGiver = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, lane: i64);
+
+/// #1587 — the undo of a [`BudgetMemTaker`] whose spawn then failed *after* the take: return `bytes`
+/// to `budget` on the parent. The OS-thread spawn is the one refusal on the detached path that
+/// happens after the commit, so without this a guest that trips it leaks its allowance per attempt.
+pub type BudgetMemGiver =
+    unsafe extern "C" fn(ctx: *mut core::ffi::c_void, budget: i32, bytes: u64);
+
 /// Op-15 **pre-map admission** (the parent side of `instantiate_detached`'s optional `(region,
 /// child_off)`): may the parent's `SharedRegion` `region` be aliased whole into a child window of
 /// `child_size` bytes at `child_off`? `1` admitted, `0` refused (bad geometry — the spawn answers
@@ -836,6 +879,10 @@ pub struct GrantChildHooks {
     pub build_detached: GrantNamedChildBuilder,
     /// #1287 — the `Budget` quota take (see [`BudgetMemTaker`]).
     pub budget_mem_take: BudgetMemTaker,
+    /// #1587 — its undo for a spawn that fails after the take (see [`BudgetMemGiver`]).
+    pub budget_mem_give: BudgetMemGiver,
+    /// D66 — return a reaped detached child's lane (see [`LaneGiver`]).
+    pub lane_give: LaneGiver,
     /// Op-15 pre-mapped region — the three host sides of one child-side `map` (see [`PremapAdmit`],
     /// [`PremapStage`], [`PremapApply`]).
     pub premap_admit: PremapAdmit,
@@ -875,6 +922,13 @@ pub struct GrantChildHooks {
     ///
     /// Null is legal only when the hooks are never invoked.
     pub parent_ctx: *mut core::ffi::c_void,
+    /// D66 — the parent domain's `(id, lane cap)`, read off the parent host when this family is
+    /// built (the same call that chooses the pointer above). A **carve** child (ops 0/5/8/11/13)
+    /// runs in its parent's lane — it has no lane of its own to be granted — so the executor gates
+    /// it on this alone; a detached child's `GrantChild` carries the same pair plus its own lane.
+    /// `-1` = unbounded.
+    pub parent_domain: u64,
+    pub parent_lane_cap: i64,
 }
 
 /// Register / clear a granted child's serve context on its shared powerbox — see
@@ -1872,12 +1926,9 @@ fn run_inner(
     // PROCESS.md S2 (JIT parity): install the `instantiate_granted` (op 8) host callbacks into the
     // §14 nursery before the guest runs (the nursery only exists when the module holds an
     // `Instantiator`). `None` leaves op 8 an inert `CapFault`.
-    #[cfg(fiber_rt)]
-    if let Some(n) = &cm._nursery {
-        n.set_grant_hooks(grant_child);
-    }
-    #[cfg(not(fiber_rt))]
-    let _ = grant_child;
+    // Through the one setter, so the nursery hooks and the domain's lane are installed together
+    // (they come from the same host and must agree).
+    cm.set_grant_child_hooks(grant_child);
     cm.run(args, init_mem, snapshot_cap)
 }
 
@@ -2322,6 +2373,10 @@ pub struct CompiledModule {
     fn_table: Box<[FnEntry]>,
     /// The entry's buffer-ABI trampoline (finalized code, owned by `module`).
     tramp_code: *const u8,
+    /// D66 — the entry's **limit-taking** trampoline (`build_trampoline(.., with_limit = true)`), the
+    /// one a child-domain task's fiber body enters through with its own stack low bound. Only a
+    /// `compile_child_windowed` product has one; null on a root (`compile`) module.
+    tramp_code_limited: *const u8,
     /// I36 slice 3 (§3.6 JIT serve loop) — one buffer-ABI trampoline per **impl-export
     /// handler**: `(funcidx, code, n_params, n_results)`, invocable over the live window via
     /// [`Self::invoke_extra`] from the embedder's serve arm ([`Self::handler_tramp`]). Empty
@@ -3275,7 +3330,7 @@ impl CompiledModule {
         }
 
         // The buffer-ABI trampoline for the entry, exported so Rust can call it.
-        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry);
+        build_trampoline(&mut module, &mut ctx.func, ids[func as usize], entry, false);
         let tramp = module
             .declare_function("trampoline", Linkage::Export, &ctx.func.signature)
             .map_err(|e| JitError::Backend(e.to_string()))?;
@@ -3299,6 +3354,7 @@ impl CompiledModule {
                             &mut ctx.func,
                             ids[f as usize],
                             &m.funcs[f as usize],
+                            false,
                         );
                         let id = module
                             .declare_function(
@@ -3464,6 +3520,7 @@ impl CompiledModule {
         Ok(CompiledModule {
             fn_table,
             tramp_code,
+            tramp_code_limited: core::ptr::null(), // a root is never a child-domain task
             serve_tramps,
             n_params: entry.params.len(),
             n_results: entry.results.len(),
@@ -3653,6 +3710,15 @@ impl CompiledModule {
         #[cfg(fiber_rt)]
         if let Some(n) = &self._nursery {
             n.set_grant_hooks(hooks);
+        }
+        // D66 — the same call installs this run's own lane: the hooks already carry the host's
+        // `(domain_id, lane_cap)` (that is how a §14 child's chain gets its parent entry), and the
+        // domain needs the identical pair so its 1:1 vCPUs and its children's tasks draw on **one**
+        // lane rather than two copies of the cap. Done here rather than at the nursery so a module
+        // that only uses `thread.*` — and therefore has no nursery at all — is still bounded.
+        #[cfg(fiber_rt)]
+        if let (Some(d), Some(h)) = (&self.domain, hooks.as_ref()) {
+            d.set_lane_chain(h.parent_domain, h.parent_lane_cap);
         }
         #[cfg(not(fiber_rt))]
         let _ = hooks;
@@ -4045,7 +4111,37 @@ impl CompiledModule {
         if let Some(fc) = &(*this).freeze_ctl {
             fc.publish(mem_base as usize);
         }
-        let faulted = if seed_faulted {
+        // D66 — the root vCPU takes a lane like any other task before it runs guest code, and gives
+        // it back when its computation ends. Without this the root would be exempt from the cap its
+        // own children are held to, which is the whole of INVARIANTS #3 read backwards. A run with
+        // no cap has an empty chain and skips every line of this.
+        #[cfg(fiber_rt)]
+        let root_lane = (*this)
+            .domain
+            .as_ref()
+            .map(|d| d.lane_chain())
+            .unwrap_or_default();
+        #[cfg(fiber_rt)]
+        let root_has_lane = match &(*this).domain {
+            // The root is the first task of its domain, so this only ever waits when a cap of 0
+            // makes it unsatisfiable — which is a `ThreadFault`, matching the interpreter.
+            Some(d) => d.lane_acquire(&root_lane, || false),
+            None => true,
+        };
+        #[cfg(fiber_rt)]
+        if !root_has_lane {
+            (*(trap_cell.as_ptr() as *const AtomicI64))
+                .compare_exchange(
+                    0,
+                    TrapKind::ThreadFault as i64,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .ok();
+        }
+        #[cfg(not(fiber_rt))]
+        let root_has_lane = true;
+        let faulted = if seed_faulted || !root_has_lane {
             // A thaw re-seed already failed and wrote the trap; don't re-enter with missing fibers.
             false
         } else {
@@ -4059,6 +4155,14 @@ impl CompiledModule {
                 trap_cell.as_ptr(),
             )
         };
+        // The root's computation has ended: its lane goes back, so a still-running child task or a
+        // spawned vCPU queued behind it can take it (teardown below joins them).
+        #[cfg(fiber_rt)]
+        if root_has_lane {
+            if let Some(d) = &(*this).domain {
+                d.lane_give_back(&root_lane);
+            }
+        }
         if let Some(fc) = &(*this).freeze_ctl {
             fc.retire();
         }
@@ -4380,7 +4484,7 @@ impl CompiledModule {
             .iter()
             .zip(&ids)
             .map(|(f, id)| {
-                build_trampoline(&mut self.module, &mut ctx.func, *id, f);
+                build_trampoline(&mut self.module, &mut ctx.func, *id, f, false);
                 let name = format!("xt{}", self.next_extra);
                 self.next_extra += 1;
                 let t = self
@@ -5369,12 +5473,34 @@ fn compile_child_windowed(
         &mut ctx.func,
         ids[child_entry as usize],
         &entry,
+        false,
     );
     let tramp = module
         .declare_function("child_trampoline", Linkage::Export, &ctx.func.signature)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module
         .define_function(tramp, &mut ctx)
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    module.clear_context(&mut ctx);
+    // D66 — the same entry through the limit-taking variant, for a child-domain **task** (a detached
+    // child resumed on a platform fiber by the executor, `child_exec`): its body passes the fiber's
+    // stack low bound so the guest's prologue checks guard the fiber stack, not an inert `0`.
+    build_trampoline(
+        &mut module,
+        &mut ctx.func,
+        ids[child_entry as usize],
+        &entry,
+        true,
+    );
+    let tramp_limited = module
+        .declare_function(
+            "child_trampoline_limited",
+            Linkage::Export,
+            &ctx.func.signature,
+        )
+        .map_err(|e| JitError::Backend(e.to_string()))?;
+    module
+        .define_function(tramp_limited, &mut ctx)
         .map_err(|e| JitError::Backend(e.to_string()))?;
     module.clear_context(&mut ctx);
     // CALLS.md 5c.1a — a serve trampoline per impl-export handler (the `CompiledModule::compile`
@@ -5390,6 +5516,7 @@ fn compile_child_windowed(
                     &mut ctx.func,
                     ids[f as usize],
                     &funcs[f as usize],
+                    false,
                 );
                 let id = module
                     .declare_function(
@@ -5427,6 +5554,7 @@ fn compile_child_windowed(
         .collect();
 
     let code = module.get_finalized_function(tramp);
+    let code_limited = module.get_finalized_function(tramp_limited);
     let serve_tramps: Vec<(u32, *const u8, usize, usize)> = serve_ids
         .iter()
         .map(|&(f, id)| {
@@ -5445,6 +5573,7 @@ fn compile_child_windowed(
     Ok(CompiledModule {
         fn_table,
         tramp_code: code,
+        tramp_code_limited: code_limited,
         serve_tramps,
         n_params: entry.params.len(),
         n_results: entry.results.len(),
@@ -5562,166 +5691,6 @@ pub(crate) fn compile_nondurable_child(
         0,   // an empty powerbox holds no `Jit` — the natural table,
         shadow,
     )
-}
-
-/// PROCESS.md S1: run an already-compiled non-durable §14 child confined to the carve
-/// `[parent_mem_base + sub_base, … + 2^size_log2)`. Because [`compile_child`] bakes only the size
-/// mask and the window **base is a runtime arg** to `run_guarded`, one compiled child runs at *any*
-/// carve offset — the property the compile cache relies on. Allocates the child's own fresh guarded
-/// window, seeds it from the carve (the §14 data plane is shared memory), runs under the re-entrant
-/// detect-and-kill guard, and copies the result window back into the carve (the parent is the
-/// superset). Non-durable only: no ctx-0 / shadow seeding and no freeze-unwind export (a non-durable
-/// run never freezes), so this is the `compile_child_and_run` body minus all its durable branches.
-///
-/// # Safety
-/// `code` is a live compiled child (kept alive by the cache for the call), held by raw pointer —
-/// **no `&CompiledModule` may be live across the run**: a child holding a `Jit` grant re-enters its
-/// module (`define_extra`/`install`) through the pointer its powerbox registered while its guest is
-/// suspended in the `call.cap` (the root's `run_raw` discipline). `[parent_mem_base + sub_base, …
-/// + child_size)` is committed parent-window memory (the `Instantiator` bounded the carve to the
-/// holder's range). `args` matches the entry's arity.
-#[cfg(fiber_rt)]
-pub(crate) unsafe fn run_child_code(
-    code: *const CompiledModule,
-    sub_base: u64,
-    child_size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: &[i64],
-    n_results: usize,
-) -> (i64, i64) {
-    run_child_code_then(
-        code,
-        sub_base,
-        child_size_log2,
-        parent_mem_base,
-        args,
-        n_results,
-        || (),
-    )
-}
-
-/// [`run_child_code`] with a **teardown hook** that runs after the copy-back but **before the child
-/// window is freed**. A granted child (Instantiator op 8/11/13) releases its powerbox `Host` here:
-/// the host's region-canon purge guard forgets `[child_base, +size)` when it drops, and running that
-/// while the window's VA range is still reserved means the purge can never erase entries a *later*
-/// window at a reused address just recorded (S1b/S1c canonical futex keys). The plain non-durable
-/// child passes `|| ()` — its empty powerbox installs no hook.
-///
-/// # Safety
-/// As [`run_child_code`].
-#[cfg(fiber_rt)]
-pub(crate) unsafe fn run_child_code_then(
-    code: *const CompiledModule,
-    sub_base: u64,
-    child_size_log2: u8,
-    parent_mem_base: *mut u8,
-    args: &[i64],
-    n_results: usize,
-    teardown: impl FnOnce(),
-) -> (i64, i64) {
-    // Read the two raw pointers the guarded call needs up front; no reference into `*code` survives
-    // past here (see the safety contract).
-    let (entry_code, fn_table_ptr) = (
-        (*code).tramp_code,
-        (*code).fn_table.as_ptr() as *const core::ffi::c_void,
-    );
-    let child_size = 1u64 << child_size_log2;
-    let mut child_window = mem::GuestWindow::new(child_size as usize, child_size as usize);
-    let child_base = child_window.base();
-    {
-        // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = child_size.
-        let src =
-            std::slice::from_raw_parts(parent_mem_base.add(sub_base as usize), child_size as usize);
-        child_window.rw_mut().copy_from_slice(src);
-    }
-    let mut results = vec![0i64; n_results];
-    let mut trap_cell: i64 = 0;
-    // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (baked size mask; a
-    // width-overrun hits this window's guard page); the guard is re-entrant so a child fault is
-    // caught here, not propagated to the parent's frame.
-    let faulted = mem::run_guarded(
-        &child_window,
-        entry_code,
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        child_base,
-        fn_table_ptr,
-        &mut trap_cell,
-    );
-    if faulted {
-        trap_cell = mem::FAULT_TRAP;
-    }
-    child_window.restore_rw();
-    {
-        // The parent (superset) now sees the child's writes: copy the carve back.
-        let dst = std::slice::from_raw_parts_mut(
-            parent_mem_base.add(sub_base as usize),
-            child_size as usize,
-        );
-        dst.copy_from_slice(&child_window.rw_mut()[..child_size as usize]);
-    }
-    // Run the teardown (e.g. free a granted child's powerbox host) while `child_window` is alive —
-    // see the doc comment: the host's region-canon purge must precede the window VA becoming reusable.
-    teardown();
-    (results.first().copied().unwrap_or(0), trap_cell)
-}
-
-/// PROCESS.md §5 / #1287: run a compiled **detached** child in a window that is its own — `mapped_log2`
-/// committed bytes inside a `reserved_log2` lazy reservation (a root run's shape), seeded by `init`
-/// (the module's data segments + the argv payload) and never copied anywhere: no parent carve exists,
-/// so there is no copy-in and no copy-back. `vm_map` commits tail pages through the child's own
-/// `AddressSpace` (the thunks see `(mapped, reserved)`), an access past the committed extent faults on
-/// the inaccessible tail. `premap` runs after `init` with `(base, mapped, reserved)` — the op-15
-/// pre-mapped region's alias onto the fresh window; `false` means the backend could not honour a staged
-/// alias, and the child never runs (a `CapFault` outcome). `teardown` runs while the window is alive
-/// (as [`run_child_code_then`]).
-///
-/// # Safety
-/// `code` was compiled by [`compile_child_windowed`] for exactly `(mapped_log2, reserved_log2)`;
-/// `args` matches the entry's arity.
-#[cfg(fiber_rt)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn run_detached_child_then(
-    code: *const CompiledModule,
-    mapped_log2: u8,
-    reserved_log2: u8,
-    init: impl FnOnce(&mut [u8]),
-    premap: impl FnOnce(*mut u8, u64, u64) -> bool,
-    args: &[i64],
-    n_results: usize,
-    teardown: impl FnOnce(),
-) -> (i64, i64) {
-    let (entry_code, fn_table_ptr) = (
-        (*code).tramp_code,
-        (*code).fn_table.as_ptr() as *const core::ffi::c_void,
-    );
-    let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
-    let base = window.base();
-    init(window.rw_mut());
-    if !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
-        window.restore_rw();
-        teardown();
-        return (0, TrapKind::CapFault as i64);
-    }
-    let mut results = vec![0i64; n_results];
-    let mut trap_cell: i64 = 0;
-    // SAFETY: `code` honours the `Entry` ABI and accesses only its own window (the reservation is the
-    // baked mask; the tail + guard fault); the guard is re-entrant so a child fault is caught here.
-    let faulted = mem::run_guarded(
-        &window,
-        entry_code,
-        args.as_ptr(),
-        results.as_mut_ptr(),
-        base,
-        fn_table_ptr,
-        &mut trap_cell,
-    );
-    if faulted {
-        trap_cell = mem::FAULT_TRAP;
-    }
-    window.restore_rw();
-    teardown();
-    (results.first().copied().unwrap_or(0), trap_cell)
 }
 
 /// The natural CLIF signature for an IR function: `(mem_base, fn_table_base, params…)
@@ -6468,18 +6437,33 @@ fn build_clif(
 /// fn_table_base, trap_out)` that decodes the entry function's args from `args_ptr`,
 /// calls it (natural ABI), and stores its results to `results_ptr`. This is what Rust
 /// calls, so any arity works.
-fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncId, entry: &Func) {
+///
+/// `with_limit` (D66) appends a sixth `stack_limit` param and threads it into the entry's §2b
+/// stack-limit context slot instead of the root's constant `0`: the variant a **child-domain task**
+/// enters through, since its body runs on a platform fiber's control stack whose low bound only the
+/// executor knows at resume time (the fiber's own `stack_low`), exactly as a guest fiber's entry does
+/// via the fiber call-trampoline. One flag on the one builder, not a second trampoline family.
+fn build_trampoline(
+    module: &mut JITModule,
+    clif: &mut Function,
+    entry_id: FuncId,
+    entry: &Func,
+    with_limit: bool,
+) {
     clif.signature.params.push(AbiParam::new(I64)); // args_ptr
     clif.signature.params.push(AbiParam::new(I64)); // results_ptr
     clif.signature.params.push(AbiParam::new(I64)); // mem_base
     clif.signature.params.push(AbiParam::new(I64)); // fn_table_base
     clif.signature.params.push(AbiParam::new(I64)); // trap_out
+    if with_limit {
+        clif.signature.params.push(AbiParam::new(I64)); // stack_limit (D66 child-domain task)
+    }
     clif.name = UserFuncName::user(0, 1);
 
     let mut fbctx = FunctionBuilderContext::new();
     let mut b = FunctionBuilder::new(clif, &mut fbctx);
     let blk = b.create_block();
-    for _ in 0..5 {
+    for _ in 0..(if with_limit { 6 } else { 5 }) {
         b.append_block_param(blk, I64);
     }
     b.switch_to_block(blk);
@@ -6497,8 +6481,12 @@ fn build_trampoline(module: &mut JITModule, clif: &mut Function, entry_id: FuncI
     let mut call_args = vec![mem_base, fn_table_base, trap_out];
     // §2b path B: the root runs on the OS thread stack (OS-guarded), so its stack-limit is 0 ⇒ the
     // prologue check is inert for the root computation; fibers get a real limit at their own entry.
-    let zero = b.ins().iconst(I64, 0);
-    call_args.push(zero); // stack_limit = 0 (root)
+    let limit = if with_limit {
+        b.block_params(blk)[5]
+    } else {
+        b.ins().iconst(I64, 0) // stack_limit = 0 (root)
+    };
+    call_args.push(limit);
     if sret {
         call_args.push(results_ptr);
     }

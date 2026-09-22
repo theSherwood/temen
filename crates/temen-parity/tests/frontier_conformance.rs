@@ -17,14 +17,15 @@
 //! | nesting | `Host::can_regrant` (via `Host::regrant_into_child`, its only public route) |
 //! | durability | the `NonDurableKind` match in `Host::capture_durable_handles` |
 //!
-//! Three more axes — `debugger`, `concurrency`, `code origin` — have no single predicate to read, so
-//! they are driven by their own tests beside this one (`debugger_conformance.rs`,
-//! `concurrency_conformance.rs`, `code_origin_conformance.rs`). The remaining two state the
+//! Four more axes — `debugger`, `concurrency`, `backend`, `code origin` — have no single predicate
+//! to read, so they are driven by their own tests beside this one (`debugger_conformance.rs`,
+//! `concurrency_conformance.rs`, `backend_conformance.rs`, `code_origin_conformance.rs`). The
+//! remaining one states the
 //! manifest's belief and are rendered `Unaudited` until their predicate is locatable. That is
 //! deliberate: an unaudited cell is visible and countable, and this test asserts the count only
 //! moves in one direction.
 
-use temen_interp::{Host, NonDurableKind, StreamRole};
+use temen_interp::{DurableBinding, Host, NonDurableKind, StreamRole};
 use temen_parity::frontier::{capability_axes, Axis, Capability};
 use temen_parity::Status;
 
@@ -133,6 +134,11 @@ fn the_durability_column_matches_the_durable_capture_classifier() {
         let expected_durable = match claimed {
             Status::Full => true,
             Status::Declines => false,
+            // A conditional row's answer depends on *how the grant was minted*, which one handle
+            // cannot express. `mintable` supplies the non-durable form; both directions are pinned
+            // by the dedicated test below (`a_module_handle_is_durable_iff_the_grant_is_attested_
+            // freezable`), so skipping here loses no coverage.
+            Status::Conditional => continue,
             other => panic!(
                 "{}: durability cell is {other:?}, uncheckable here",
                 cap.name()
@@ -200,7 +206,8 @@ fn the_uncheckable_rows_are_exactly_the_ones_that_need_a_live_peer_or_a_host_clo
 /// Coverage may only improve. A cell that was audited must not silently revert to `Unaudited`, and
 /// the two axes whose predicate classifies *every* row must stay fully audited.
 ///
-/// The three driven axes — `debugger`, `concurrency`, `code origin` — are not in that loop on
+/// The four driven axes — `debugger`, `concurrency`, `backend`, `code origin` — are not in that
+/// loop on
 /// purpose: their predicates are reached by *running* the capability's ops, and four rows hold ops
 /// only a running guest or a live peer can reach. `tests/debugger_conformance.rs` pins which four,
 /// so those cells cannot quietly spread — the count floor below is what stops a column from
@@ -227,10 +234,11 @@ fn audited_coverage_does_not_regress() {
         .filter(|cell| cell.status != Status::Unaudited)
         .count();
     assert!(
-        audited >= 68,
+        audited >= 80,
         "audited cell count fell to {audited}; it was 32 when the matrix landed, 44 once the \
-         `debugger` column was driven, 56 once `concurrency` was, and 68 once `code origin` was. \
-         Filling axes in is the work (#1413) — emptying them is a regression."
+         `debugger` column was driven, 56 once `concurrency` was, 68 once `backend` was, and 80 \
+         once `code origin` was. Filling axes in is the work (#1413) — emptying them is a \
+         regression."
     );
 }
 
@@ -254,4 +262,52 @@ fn every_known_gap_names_its_issue() {
             );
         }
     }
+}
+
+/// **The `Module` durability row's conditional half (#1361).** The cell is `Conditional` because the
+/// answer depends on how the grant was minted, so the loop above cannot check it with one handle.
+/// Both directions, on one host, so the pin fails if either half drifts:
+///
+/// - an **attested-freezable** grant (`grant_durable_module`) survives a drain and is captured,
+///   named by its §4 content digest — the module bytes are D-scope and never ride the artifact;
+/// - a plain grant (`grant_module`) is still drained as `NonDurableKind::Module`.
+#[test]
+fn a_module_handle_is_durable_iff_the_grant_is_attested_freezable() {
+    let m = a_module();
+    let mut host = Host::new();
+    let plain = host.grant_module(&m);
+    let freezable = host.grant_durable_module(&m);
+
+    // Before the drain, the un-attested grant is what makes a capture refuse.
+    assert!(
+        matches!(host.capture_durable_handles(), Err(h) if h.kind == NonDurableKind::Module),
+        "an un-attested module grant must still make the capture refuse"
+    );
+
+    let drained: Vec<NonDurableKind> = host
+        .drain_non_durable()
+        .into_iter()
+        .map(|h| h.kind)
+        .collect();
+    assert_eq!(
+        drained,
+        vec![NonDurableKind::Module],
+        "the drain must take the un-attested grant and keep the attested one"
+    );
+
+    let captured = host
+        .capture_durable_handles()
+        .expect("with the un-attested grant drained, the attested one is capturable");
+    let slots: Vec<u32> = captured.iter().map(|h| h.slot).collect();
+    assert_eq!(
+        slots,
+        vec![(freezable as u32) & 0xff],
+        "exactly the attested grant's slot survives; the drained one's is closed"
+    );
+    assert!(
+        matches!(captured[0].binding, DurableBinding::Module { .. }),
+        "the attested grant is captured as a module binding, got {:?}",
+        captured[0].binding
+    );
+    assert_ne!(plain, freezable, "the two grants are distinct handles");
 }

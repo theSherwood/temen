@@ -4,7 +4,7 @@
 
 INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `OPS_PARITY.md` machine-checks one of them at op granularity; this matrix is the machine for the rest (#1413). Rows are powerbox capability kinds; columns are the seven axes.
 
-**68 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. 5 of the seven columns (nesting, durability, concurrency, code origin, debugger) are checked against live predicates by the conformance tests in `crates/temen-parity/tests/`; the rest state the manifest's belief and nothing more.
+**80 of 112 cells audited** (16 capabilities × 7 axes). An ❔ cell is not a passing cell — it means nobody has established what it is. 6 of the seven columns (nesting, durability, backend, concurrency, code origin, debugger) are checked against live predicates by the conformance tests in `crates/temen-parity/tests/`; the rest state the manifest's belief and nothing more.
 
 ## Legend
 
@@ -18,7 +18,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 - **nesting** — can a §14 child hold it? (`Host::can_regrant`) *(conformance-tested)*
 - **durability** — does it survive a freeze? (`capture_durable_handles`) *(conformance-tested)*
-- **backend** — same on every engine? (see OPS_PARITY.md for op-level detail)
+- **backend** — same on every engine? (see OPS_PARITY.md for op-level detail) *(conformance-tested)*
 - **target** — same on native / wasm32 / Windows?
 - **concurrency** — carried by both the coop and per-Worker drivers? *(conformance-tested)*
 - **code origin** — usable from a §22 guest-JIT unit as from the base module? *(conformance-tested)*
@@ -28,20 +28,20 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 | capability | nesting | durability | backend | target | concurrency | code origin | debugger |
 |----|:----:|:----:|:----:|:----:|:----:|:----:|:----:|
-| `Stream` | ✅ | ✅ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `Exit` | ✅ | ✅ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `Clock` | ✅ | ✅ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `PipeEnd` | ✅ | ⛔ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `SharedRegion` | ✅ | ⛔ | ❔ | ❔ | ✅ | ✅ | 🔶 |
-| `AddressSpace` | ⛔ | ✅ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `Instantiator` | ⛔ | ✅ | ❔ | ❔ | ✅ | 🚧 | 🔶 |
-| `Budget` | ⛔ | ✅ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `Module` | ✅ | ⛔ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `ModuleLoader` | ⛔ | ⛔ | ❔ | ❔ | ✅ | ✅ | ✅ |
+| `Stream` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `Exit` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `Clock` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `PipeEnd` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | 🔶 |
+| `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | 🚧 | 🔶 |
+| `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `Module` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `ModuleLoader` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Jit` | ✅ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `JitCode` | ⛔ | ✅ | ❔ | ❔ | ❔ | ❔ | ❔ |
-| `Blocking` | ⛔ | ⛔ | ❔ | ❔ | ✅ | ✅ | ✅ |
-| `HostProc` | 🔶 | ⛔ | ❔ | ❔ | ✅ | ✅ | ✅ |
+| `Blocking` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `HostProc` | 🔶 | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Offer` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 | `LiveImpl` | ✅ | ⛔ | ❔ | ❔ | ❔ | ❔ | ❔ |
 
@@ -59,6 +59,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
+- *backend* 🚧 — join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)
 - *code origin* 🚧 — the spawn family reaches `drive_nested`'s catch-all `CapFault` inside a `Jit.invoke`: instantiate/instantiate_module_named/child_offer each answer -EINVAL probeably from the base module, and join's forgery trap differs too (#1578)
 - *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
@@ -66,7 +67,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 - *nesting* ⛔ — index-carrying: the child is granted a sub-budget by split/transfer, not the handle
 
 **`Module`**
-- *durability* ⛔ — NonDurableKind::Module — re-granted by the embedder after restore
+- *durability* 🔶 — durable iff the grant is attested freezable (#1361): the artifact carries the §4 content digest and the restoring host re-grants the module. An un-attested grant is still NonDurableKind::Module
 
 **`ModuleLoader`**
 - *nesting* ⛔ — not in `can_regrant`: a child that may mint modules must be granted one explicitly
@@ -81,7 +82,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 
 **`HostProc`**
 - *nesting* 🔶 — only a forkable host proc (one carrying a fork factory) crosses; a factory-less one cannot
-- *durability* ⛔ — NonDurableKind::HostProc — the host closure cannot be serialized
+- *durability* 🔶 — durable iff the grant carries a registered **name** (#1455): the closure cannot be serialized, but the name is a reconstruction rule the thaw's registrar acts on. An unnamed one is still NonDurableKind::HostProc
 
 **`Offer`**
 - *durability* ⛔ — NonDurableKind::Offer — an out-of-line reference to the offering domain

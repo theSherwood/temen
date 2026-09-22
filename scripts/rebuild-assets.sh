@@ -36,11 +36,14 @@ declare -a RESULTS=()
 note() { RESULTS+=("$1"); echo "  >> $1"; }
 
 # --- toolchain env: the setup each nimony builder assumes (see the header) ---------------------------
-# Prefer a real Nim toolchain dir (adjacent ../lib/nimbase.h) over a bare `nim` shim.
+# Prefer a real Nim toolchain dir (adjacent ../lib/nimbase.h) over a bare `nim` shim. `.nimtool/` is
+# the repo-local toolchain dir the nim demos already key off (`demos/nim_e2e_chain`,
+# `demos/nifler_temen`); a checkout whose Nim lives only there had every nimony asset SKIP silently.
 pick_nim() {
   local c
   for c in \
     "$(command -v nim 2>/dev/null)" \
+    "$REPO"/.nimtool/*/bin/nim \
     /root/.choosenim/toolchains/*/bin/nim \
     "$HOME"/.choosenim/toolchains/*/bin/nim; do
     [ -x "$c" ] || continue
@@ -209,7 +212,7 @@ if want nim_phases; then
     ok=1
     for p in nimsem hexer; do
       if [ -f "$E2E_OUT/$p.temen" ] && validate "$E2E_OUT/$p.temen"; then
-        gzip -9 -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
+        gzip -9 -n -c "$E2E_OUT/$p.temen" > "browser/web/assets/$p.temen.gz"
       else
         ok=0
       fi
@@ -241,7 +244,7 @@ if want nim_driver_guest; then
      && validate /tmp/rebuild_nim_link.temen; then
     note "nim_link ✓ (nim-link.temen.gz)"
   else
-    note "nim_link SKIP/✗ (rustc +1.81.0 + rust-src + llvm-18 — see build_nim_link.sh)"
+    note "nim_link SKIP/✗ (rustc + rust-src + llvm-link/opt of rustc\'s LLVM major — see below)"
   fi
   # Its **memfs-I/O twin** (`nim-link-fs.temen.gz`): the same `link_nim_powerbox`, but reading its
   # inputs from and writing its output to the shared memfs instead of stdin/stdout. Same build-std
@@ -332,6 +335,33 @@ echo
 echo "=== rebuild-assets summary ==="
 for r in "${RESULTS[@]}"; do echo "  $r"; done
 echo
+# A SKIP here is easy to read as "not applicable" when it actually means "this asset is now STALE and
+# nothing regenerated it" — which is silent until CI fails on a byte-comparison gate. That happened
+# twice on the v0.6.2 bump: `nim_link`/`nim_link_fs` (the in-guest linker IS temen-leng, so it goes
+# stale whenever the linker changes, wire format or not) and `nim_prestdlib` (wire-coupled to the
+# `_ce` guests). Call the skipped steps out again, separately, with what unblocks each.
+SKIPPED=()
+for r in "${RESULTS[@]}"; do case "$r" in *SKIP*|*✗*) SKIPPED+=("$r");; esac; done
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  echo "!!! ${#SKIPPED[@]} step(s) did NOT regenerate — each may now be STALE:"
+  for r in "${SKIPPED[@]}"; do echo "    $r"; done
+  echo
+  echo "    These are not advisory. An asset that embeds compiled code (the nim-link guests embed"
+  echo "    temen-leng; the prestdlib pack embeds the _ce guests' output) goes stale on any change to"
+  echo "    what it embeds, and the gate that catches it is a byte-comparison in CI, not here."
+  echo "    The browser-engine steps need:  cd browser && cargo run --bin gencorpus && \\"
+  echo "      RUSTFLAGS=\"-Ctarget-feature=+atomics,+bulk-memory,+mutable-globals -Clink-arg=--shared-memory\" \\"
+  echo "      cargo +nightly build -Z build-std=std,panic_abort --release --lib --target wasm32-unknown-unknown"
+  echo "    (see .github/workflows/ci.yml for the full flag set); the LLVM steps need the LLVM whose"
+  echo "    major matches rustc's on PATH (scripts/ci/install-llvm.sh). CI puts it there via"
+  echo "    GITHUB_PATH; locally nothing does, so if the distro\'s unversioned llvm-link is older"
+  echo "    than rustc\'s LLVM (\`rustc -vV | grep LLVM\`) prefix the run with"
+  echo "      PATH=/usr/lib/llvm-\$(grep -oP \'LLVM_MAJOR=\\K[0-9]+\' scripts/ci/install-llvm.sh)/bin:\$PATH"
+  echo "    A mismatch reads as a *parse* error on rustc\'s own IR (\`expected \')\' at end of"
+  echo "    argument list\` on an attribute the older tool has never heard of), not as a version"
+  echo "    complaint \u2014 which is why the note above used to blame a missing toolchain."
+  echo
+fi
 echo "Also (non-CI, but tracked) browser/tests/fixtures/*.temen — the display/reactor/onramp Rust-test"
 echo "fixtures — are clang -O2 + temen-llvm-translate --host-page 65536 (+--null-guard for the #964"
 echo "guarded ones: hello_onramp/bounce/life/mandelzoom; plain for gradient/fsread). shell/stage_runner/"

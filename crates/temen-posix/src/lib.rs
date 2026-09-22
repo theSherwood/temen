@@ -216,6 +216,33 @@ pub const OP_TCGETWINSIZE: u32 = 56;
 /// to fake `/dev/tty` unconditionally, which is wrong for a non-terminal fd.
 pub const OP_TTYNAME: u32 = 57;
 
+/// `fstat(fd, buf) -> 0 | -errno`: the **by-fd** twin of [`OP_STAT`], filling a real Linux/amd64
+/// `struct stat` at `buf`.
+///
+/// Unlike [`OP_STAT`], whose 16-byte `{mode, size}` is a Temen-private convention its own callers
+/// agree on, this writes the **ABI layout the guest's own headers declare** — 144 bytes, `st_mode`
+/// (u32) at 24 and `st_size` (i64) at 48, per nimony's `std/posix/posix.nim` ("Linux/amd64 `struct
+/// stat`"). It has to: `memfiles.open` declares `Stat` itself and reads `stat.st_size` at *its*
+/// offset, so a convenient short struct would be read as a garbage size rather than rejected.
+///
+/// Added for #1595 — nim's `memfiles.open` is `open` + `fstat` + `mmap`, and with `fstat` stubbed
+/// fail-closed to `0` every mapped file looked **empty**.
+pub const OP_FSTAT: u32 = 58;
+
+/// `statp(path_ptr, path_len, buf) -> 0 | -errno`: the **by-path** twin of [`OP_FSTAT`], writing the
+/// same Linux/amd64 `struct stat` that the guest's own headers declare.
+///
+/// Distinct from [`OP_STAT`] only in its **result layout**, not its behaviour — both resolve a memfs
+/// path to the same `(st_mode, st_size)` through [`Posix::stat_of_path`], and this one writes it
+/// through the same [`write_linux_stat`] `fstat` uses. `OP_STAT`'s short `{mode, size}` is the
+/// convention the Rust-std port (`rust-temen/temen-pal.rs`) already reads, so it stays; a C caller
+/// that declares `Stat` itself needs the declared offsets or it reads garbage.
+///
+/// Added for #1595: nimony's `fileExists` is `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, so with
+/// the `stat` leaf answering fail-closed, **every** file the compiler looked for was missing —
+/// nimsem's first act on a real module is `cannot find <input>`.
+pub const OP_STATP: u32 = 59;
+
 /// #972 slice 1 — the **handle-carrying tag** returned by `read`/`write`/`close` on a
 /// [`FdEntry::CorePipe`] fd: `PX_TAG_BASE - handle`. A **personality ↔ shim private convention**,
 /// never interpreted by the core (INVARIANTS.md #5/#11 discipline): every tag is `<= PX_TAG_BASE`,
@@ -383,6 +410,62 @@ const F_DUPFD_CLOEXEC: i64 = 1030;
 /// that is a prefix of some file key (or `"/"`) is a directory.
 const S_IFREG: i64 = 0o100000; // regular file (| 0o644 perms)
 const S_IFDIR: i64 = 0o040000; // directory (| 0o755 perms)
+const S_IFIFO: i64 = 0o010000; // FIFO/pipe — what a non-file fd stats as
+
+/// An embedder-supplied path as a memfs key: absolute, since every key is. A leading `/` is
+/// optional for the caller's convenience — `"g"` and `"/g"` are the same file — which is what lets
+/// a seed and the guest's own `open` of the same name meet in one entry.
+fn rooted(path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
+}
+
+/// Linux/amd64 `struct stat` geometry, as the **guest's own** headers declare it (nimony
+/// `std/posix/posix.nim`): 144 bytes, `st_mode` (u32) at 24, `st_size` (i64) at 48. Used by
+/// [`OP_FSTAT`] and [`OP_STATP`], which must match the caller's layout exactly — [`OP_STAT`]'s short
+/// `{mode, size}` is a separate, Temen-private convention and is *not* this.
+const STAT_SIZE: usize = 144;
+const STAT_MODE_OFF: usize = 24;
+const STAT_SIZE_OFF: usize = 48;
+/// `st_mtim.tv_sec`; `tv_nsec` is the 8 bytes after it.
+const STAT_MTIME_OFF: usize = 88;
+
+/// Write `(mode, size, mtime)` into the guest's `buf` as a Linux/amd64 `struct stat`. Every other
+/// field is zero: that is what the callers on this route read, and a zero is honest for what a flat
+/// memfs has no answer for — an invented inode would be a plausible-looking lie.
+///
+/// `mtime` is **not** one of those. It is the memfs's own write-clock tick (see [`World::fs_clock`]),
+/// written to `st_mtim.tv_sec` with a zero `tv_nsec` — the order the files were written in, which the
+/// memfs genuinely knows, rather than a wall clock it is granted no access to.
+///
+/// The one place these offsets are applied, shared by the by-fd ([`OP_FSTAT`]) and by-path
+/// ([`OP_STATP`]) entries, so the two can never drift apart.
+fn write_linux_stat(
+    mem: &mut dyn GuestMem,
+    buf: u64,
+    mode: i64,
+    size: i64,
+    mtime: i64,
+) -> Result<(), Trap> {
+    let mut out = vec![0u8; STAT_SIZE];
+    out[STAT_MODE_OFF..STAT_MODE_OFF + 4].copy_from_slice(&(mode as u32).to_le_bytes());
+    out[STAT_SIZE_OFF..STAT_SIZE_OFF + 8].copy_from_slice(&size.to_le_bytes());
+    out[STAT_MTIME_OFF..STAT_MTIME_OFF + 8].copy_from_slice(&mtime.to_le_bytes());
+    mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+    Ok(())
+}
+
+/// One memfs file: its bytes and the write-clock tick they were last written at. The two live
+/// together so a write cannot update one and forget the other — every mutation goes through
+/// [`World::file_put`] or [`World::file_mut`], which stamp it.
+#[derive(Default)]
+struct MemFile {
+    bytes: Vec<u8>,
+    mtime: i64,
+}
 
 // The ABI is **explicit-length**, syscall-style: a string argument is `(ptr, len)`, not a
 // NUL-terminated `char*`. This avoids an unbounded window scan (safer) and matches `read`/`write`;
@@ -772,7 +855,15 @@ struct World {
     /// The **in-memory filesystem**: path → contents. A memfs keeps the personality self-contained and
     /// deterministic (the playground has no disk); a native embedder routing to a real `fs` cap is a
     /// follow-up. Shared file bytes; per-fd offsets live in each fd's [`OpenFile`] description.
-    files: HashMap<String, Vec<u8>>,
+    files: HashMap<String, MemFile>,
+    /// The memfs **write clock**: a monotone logical tick, bumped on every write and stamped into
+    /// the written file's `st_mtim`. Not a wall clock — the personality is granted no ambient time
+    /// (`clock_gettime` writes a zero timespec for exactly that reason, #1422) — but the memfs does
+    /// genuinely know the ORDER its files were written in, and that order is the whole of what a
+    /// build tool's freshness check asks: is the output newer than its input. Reporting zero for
+    /// every file answered "no" to that question for every pair of files, so nimony's `execNifler`
+    /// re-parsed a dependency whose `.p.nif` was already sitting next to it (#1609).
+    fs_clock: i64,
     /// Explicitly-created **empty** directories (`mkdir`). The memfs otherwise infers directories as
     /// prefixes of file keys, which can't represent a dir with no files under it; this set carries those.
     /// A path is a directory if it is the root, appears here, or is a proper prefix of some file key.
@@ -844,6 +935,31 @@ struct World {
     /// tag-redirects to `input_handle` (the #972 park/EINTR/EOF path). Output echo goes to the
     /// stdout sink. The discipline is pure personality policy (INVARIANTS 4/12).
     terminal: Option<Terminal>,
+}
+
+impl World {
+    /// Replace `path`'s contents, stamping it with the next tick of the write clock. Creating a
+    /// file and truncating one are both writes, so both come here.
+    fn file_put(&mut self, path: String, bytes: Vec<u8>) {
+        self.fs_clock += 1;
+        let mtime = self.fs_clock;
+        self.files.insert(path, MemFile { bytes, mtime });
+    }
+
+    /// `path`'s bytes for in-place mutation, stamped with the next tick. Creates the file if absent.
+    /// Only call it when the caller is about to write: it restamps unconditionally.
+    fn file_mut(&mut self, path: &str) -> &mut Vec<u8> {
+        self.fs_clock += 1;
+        let mtime = self.fs_clock;
+        let f = self.files.entry(path.to_string()).or_default();
+        f.mtime = mtime;
+        &mut f.bytes
+    }
+
+    /// `path`'s length, or 0 when it does not exist — the read half, which never stamps.
+    fn file_len(&self, path: &str) -> usize {
+        self.files.get(path).map_or(0, |f| f.bytes.len())
+    }
 }
 
 /// #863 slice 2 — a [`World::procs`] process-table entry.
@@ -1127,22 +1243,36 @@ impl Posix {
     }
 
     /// Seed (or overwrite) a memfs file — how an embedder/test stages the filesystem a guest `open`s.
+    /// The path is [`rooted`]: `"g"` and `"/g"` name the same file, as they do on a real filesystem.
     pub fn write_file(&self, path: &str, bytes: &[u8]) {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .files
-            .insert(path.to_string(), bytes.to_vec());
+            .file_put(rooted(path), bytes.to_vec());
     }
 
-    /// Read a memfs file back — how an embedder/test inspects what the guest wrote.
+    /// Read a memfs file back — how an embedder/test inspects what the guest wrote. [`rooted`], so
+    /// it finds the file whichever spelling the guest created it under.
     pub fn read_file(&self, path: &str) -> Option<Vec<u8>> {
         self.world
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .files
-            .get(path)
-            .cloned()
+            .get(&rooted(path))
+            .map(|f| f.bytes.clone())
+    }
+
+    /// Every memfs path that currently exists, sorted — how an embedder/test sees what the guest
+    /// **actually** produced, rather than only whether one guessed-at path is there.
+    ///
+    /// The difference matters when a guest writes nothing to stdout or stderr and the expected
+    /// output file is absent: "wrote no `X`" cannot distinguish "wrote nothing" from "wrote it
+    /// somewhere else", and those point at different bugs.
+    pub fn file_names(&self) -> Vec<String> {
+        let st = self.world.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = st.files.keys().cloned().collect();
+        names.sort();
+        names
     }
 
     /// Seed (or overwrite) an environment variable — how an embedder/test stages the environment a
@@ -1397,9 +1527,9 @@ impl Posix {
         self.register_command(path, module_handle, win_log2);
         let mut st = self.world.lock().unwrap_or_else(|e| e.into_inner());
         st.executables.insert(path.to_string());
-        st.files
-            .entry(path.to_string())
-            .or_insert_with(|| b"\x7fSVM".to_vec());
+        if !st.files.contains_key(path) {
+            st.file_put(path.to_string(), b"\x7fSVM".to_vec());
+        }
     }
 
     /// Set the `Stream` handle the shell re-grants to a spawned child as its `"stdout"` — what
@@ -1569,6 +1699,9 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "environ" => OP_ENVIRON,
         "clock_gettime" | "clock" => OP_CLOCK,
         "stat" | "lstat" => OP_STAT,
+        "fstat" => OP_FSTAT,
+        // The memfs has no symlinks, so `lstat == stat` on this route too.
+        "statp" | "lstatp" => OP_STATP,
         "opendir" => OP_OPENDIR,
         "readdir" => OP_READDIR,
         "closedir" => OP_CLOSEDIR,
@@ -1901,6 +2034,8 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
         ("tcsetattr", 2),    // 55
         ("tcgetwinsize", 2), // 56
         ("ttyname", 3),      // 57
+        ("fstat", 2),        // 58
+        ("statp", 3),        // 59
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -2201,6 +2336,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         stdin,
         stdin_pos: 0,
         files: HashMap::new(),
+        fs_clock: 0,
         explicit_dirs: HashSet::new(),
         net_listeners: HashMap::new(),
         net_next_port: 49152, // the IANA ephemeral range start
@@ -2324,6 +2460,8 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_RENAME => st.rename(args, mem),
                 OP_RMDIR => st.rmdir(args, mem),
                 OP_STAT => st.stat(args, mem),
+                OP_FSTAT => st.fstat(args, mem),
+                OP_STATP => st.statp(args, mem),
                 OP_OPENDIR => st.opendir(args, mem),
                 OP_READDIR => st.readdir(args, mem),
                 OP_CLOSEDIR => Ok(vec![st.closedir(args)]),
@@ -2930,6 +3068,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        let path = self.resolve(&path);
         // #802 language differential — `/dev/fd/N` and `/dev/std{in,out,err}` (bash builds with
         // `HAVE_DEV_FD`): process substitution `<(cmd)`/`>(cmd)` substitutes `/dev/fd/N` for the
         // pipe end it set up, and the consumer `open`s it. This is a path-driven `dup`: alias the
@@ -2946,11 +3085,17 @@ impl Ctx<'_> {
         if !exists && flags & O_CREAT == 0 {
             return Ok(vec![ENOENT]);
         }
-        let file = self.w.files.entry(path.clone()).or_default();
-        if flags & O_TRUNC != 0 {
-            file.clear();
+        // Creating a file and truncating one are both writes, and only those two: opening an
+        // existing file for reading must not restamp its mtime, or every `stat` would report the
+        // last *reader* instead of the last writer.
+        if !exists || flags & O_TRUNC != 0 {
+            self.w.file_put(path.clone(), Vec::new());
         }
-        let pos = if flags & O_APPEND != 0 { file.len() } else { 0 };
+        let pos = if flags & O_APPEND != 0 {
+            self.w.file_len(&path)
+        } else {
+            0
+        };
         let acc = flags & O_ACCMODE;
         let writable = acc == O_WRONLY || acc == O_RDWR;
         Ok(vec![self.alloc_fd(FdEntry::File(Arc::new(Mutex::new(
@@ -2999,6 +3144,48 @@ impl Ctx<'_> {
 
     /// `lseek(fd, offset, whence) -> new_offset | -errno`: reposition a `File` fd (`SEEK_SET`/`CUR`/`END`).
     /// A negative result or bad whence is `-EINVAL`; a pipe/stdio fd is `-ESPIPE`; an unopened fd `-EBADF`.
+    /// Join a relative guest path onto the process's `cwd`, folding `.` and `..`. An absolute path
+    /// is returned unchanged. `..` above the root clamps to the root rather than escaping, which is
+    /// the confinement-shaped answer as well as POSIX's for `/..`.
+    fn join_cwd(&self, path: &str) -> String {
+        if path.starts_with('/') {
+            return path.to_string();
+        }
+        let joined = format!("{}/{}", self.p.cwd.trim_end_matches('/'), path);
+        let mut out: Vec<&str> = Vec::new();
+        for seg in joined.split('/') {
+            match seg {
+                "" | "." => {}
+                ".." => {
+                    out.pop();
+                }
+                s => out.push(s),
+            }
+        }
+        format!("/{}", out.join("/"))
+    }
+
+    /// Resolve a guest path against the working directory (#1596) — the **only** way a path becomes
+    /// a memfs key.
+    ///
+    /// Every key is absolute, so this is just [`Self::join_cwd`]. It used to be a *fallback*: take
+    /// the path verbatim when it already named something, join against the cwd only when it did not.
+    /// That was written to preserve relative keys that seeds had already created, and it left `"g"`
+    /// and `"/g"` able to coexist as distinct entries — an anomaly its own doc named, with
+    /// "canonicalizing keys at creation is the real answer" as the deferred fix.
+    ///
+    /// It came due. A path that names **nothing yet** matches neither key, so a create always took
+    /// the verbatim branch: `lengc c nimcache/x.x.nif` from cwd `/` wrote `nimcache/x.c`, reported
+    /// success, and the 436 KB it had just generated was invisible to anything asking for
+    /// `/nimcache/x.c`. A pipeline where one tool writes relative and the next reads absolute — which
+    /// is every nimony phase — could not hand a file along.
+    ///
+    /// The seeds that motivated the fallback are canonical now too ([`Posix::write_file`] roots its
+    /// path), so both spellings still reach the same file and the special case is simply gone.
+    fn resolve(&self, path: &str) -> String {
+        self.join_cwd(path)
+    }
+
     fn lseek(&mut self, args: &[i64]) -> i64 {
         let fd = *args.first().unwrap_or(&-1);
         let offset = *args.get(1).unwrap_or(&0);
@@ -3009,7 +3196,7 @@ impl Ctx<'_> {
             None => return EBADF,
         };
         let mut of = desc.lock().unwrap_or_else(|e| e.into_inner());
-        let size = self.w.files.get(&of.path).map_or(0, |f| f.len()) as i64;
+        let size = self.w.file_len(&of.path) as i64;
         let newpos = match whence {
             SEEK_SET => offset,
             SEEK_CUR => of.pos as i64 + offset,
@@ -3223,11 +3410,7 @@ impl Ctx<'_> {
                 let n = match self.p.fds.get(fd as usize).and_then(|s| s.as_ref()) {
                     Some(FdEntry::File(of)) => {
                         let of = of.lock().unwrap_or_else(|e| e.into_inner());
-                        self.w
-                            .files
-                            .get(&of.path)
-                            .map_or(0, |f| f.len())
-                            .saturating_sub(of.pos)
+                        self.w.file_len(&of.path).saturating_sub(of.pos)
                     }
                     _ => 0,
                 };
@@ -4028,6 +4211,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        let path = self.resolve(&path);
         Ok(vec![if self.w.files.remove(&path).is_some() {
             0
         } else {
@@ -4047,6 +4231,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        let path = self.resolve(&path);
         let norm = path.trim_end_matches('/').to_string();
         if norm.is_empty() {
             return Ok(vec![EEXIST]); // the root always exists
@@ -4076,6 +4261,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        let path = self.resolve(&path);
         let norm = path.trim_end_matches('/').to_string();
         if norm.is_empty() {
             return Ok(vec![EINVAL]); // cannot remove the root
@@ -4108,8 +4294,8 @@ impl Ctx<'_> {
         else {
             return Ok(vec![EINVAL]);
         };
-        let old_n = old.trim_end_matches('/').to_string();
-        let new_n = new.trim_end_matches('/').to_string();
+        let old_n = self.resolve(old.trim_end_matches('/'));
+        let new_n = self.resolve(new.trim_end_matches('/'));
         // File fast path: move the bytes, shadowing any explicit dir marker at the destination.
         if let Some(v) = self.w.files.remove(&old_n) {
             self.w.files.insert(new_n.clone(), v);
@@ -4400,6 +4586,30 @@ impl Ctx<'_> {
             || !self.dir_children(path).is_empty()
     }
 
+    /// What a memfs path stats as: `(st_mode, st_size, st_mtim.tv_sec)`, or `None` for a path that
+    /// is neither a file key nor a directory (`-ENOENT` to every caller). A file key is `S_IFREG`
+    /// with its byte length and its write-clock tick; a directory (a prefix of some key, or `"/"`)
+    /// is `S_IFDIR` size 0 at tick 0 — the memfs has no directory entries of its own to date.
+    ///
+    /// The **one** place a path becomes a stat result, whatever layout the caller wants it in —
+    /// [`Self::stat`] writes it as the short Temen-private struct, [`Self::statp`] as the declared
+    /// Linux one. `path` must already be [`Self::resolve`]d.
+    fn stat_of_path(&self, path: &str) -> Option<(i64, i64, i64)> {
+        if let Some(f) = self.w.files.get(path) {
+            // #801 — a registered executable carries the exec bits; a plain file does not.
+            let perms = if self.w.executables.contains(path) {
+                0o755
+            } else {
+                0o644
+            };
+            Some((S_IFREG | perms, f.bytes.len() as i64, f.mtime))
+        } else if self.is_dir(path) {
+            Some((S_IFDIR | 0o755, 0, 0))
+        } else {
+            None
+        }
+    }
+
     /// `stat(path_ptr, path_len, statbuf_ptr) -> 0 | -errno`: fill the caller's `struct stat`
     /// (`{ i64 st_mode; i64 st_size; }`, 16 bytes) for a memfs path. A file key is `S_IFREG` with its
     /// byte length; a directory (a prefix of some key, or `"/"`) is `S_IFDIR` size 0; anything else is
@@ -4413,23 +4623,68 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        let (mode, size) = if let Some(f) = self.w.files.get(&path) {
-            // #801 — a registered executable carries the exec bits; a plain file does not.
-            let perms = if self.w.executables.contains(&path) {
-                0o755
-            } else {
-                0o644
-            };
-            (S_IFREG | perms, f.len() as i64)
-        } else if self.is_dir(&path) {
-            (S_IFDIR | 0o755, 0)
-        } else {
+        let path = self.resolve(&path);
+        let Some((mode, size, _mtime)) = self.stat_of_path(&path) else {
             return Ok(vec![ENOENT]);
         };
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&mode.to_le_bytes());
         out.extend_from_slice(&size.to_le_bytes());
         mem.write_bytes(buf, &out).ok_or(Trap::Malformed)?;
+        Ok(vec![0])
+    }
+
+    /// `fstat(fd, buf) -> 0 | -errno`: fill a Linux/amd64 `struct stat` for an open fd.
+    ///
+    /// Only `st_mode`, `st_size` and `st_mtim` are populated; the rest of the 144 bytes are zeroed.
+    /// That is what the callers on this route read, and a zero is honest for fields a flat memfs
+    /// has no answer for — an invented inode would be a plausible-looking lie of exactly the kind
+    /// #1595 was. `st_mtim` is not invented: it is the memfs's own write order ([`World::fs_clock`]).
+    ///
+    /// A non-file fd (a pipe, a socket, stdio) stats as a FIFO with size 0 rather than failing:
+    /// `fstat` on a pipe is legal POSIX. An unknown fd is `EBADF`.
+    fn fstat(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let fd = *args.first().ok_or(Trap::Malformed)?;
+        let buf = (*args.get(1).ok_or(Trap::Malformed)?) as u64;
+        let (mode, size, mtime) = match self.fd(fd) {
+            Some(FdEntry::File(of)) => {
+                let path = {
+                    let of = of.lock().unwrap_or_else(|e| e.into_inner());
+                    of.path.clone()
+                };
+                // Same answer as the by-path entry, from the same place: an fd names a memfs key.
+                match self.stat_of_path(&path) {
+                    Some(t) => t,
+                    None => (S_IFREG | 0o644, 0, 0),
+                }
+            }
+            Some(_) => (S_IFIFO | 0o600, 0, 0),
+            None => return Ok(vec![EBADF]),
+        };
+        write_linux_stat(mem, buf, mode, size, mtime)?;
+        Ok(vec![0])
+    }
+
+    /// `statp(path_ptr, path_len, buf) -> 0 | -errno`: [`Self::stat`]'s answer in [`Self::fstat`]'s
+    /// layout — the by-path stat a C caller that declares its own `Stat` needs (see [`OP_STATP`]).
+    ///
+    /// Same resolution, same layout writer, different entry: no second notion of what a path stats
+    /// as, and no second copy of the Linux offsets.
+    fn statp(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        let mem = mem.ok_or(Trap::Malformed)?;
+        let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
+        let plen = (*args.get(1).ok_or(Trap::Malformed)?).max(0) as u64;
+        let buf = (*args.get(2).ok_or(Trap::Malformed)?) as u64;
+        let bytes = mem.read_bytes(ptr, plen).ok_or(Trap::Malformed)?;
+        let Ok(path) = String::from_utf8(bytes) else {
+            return Ok(vec![EINVAL]);
+        };
+        let path = self.resolve(&path);
+        let Some((mode, size, mtime)) = self.stat_of_path(&path) else {
+            return Ok(vec![ENOENT]);
+        };
+        write_linux_stat(mem, buf, mode, size, mtime)?;
         Ok(vec![0])
     }
 
@@ -4444,6 +4699,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
+        let path = self.resolve(&path);
         if self.w.files.contains_key(&path) {
             return Ok(vec![ENOTDIR]);
         }
@@ -4662,7 +4918,7 @@ impl Ctx<'_> {
             return EBADF;
         }
         let pos = of.pos;
-        let file = self.w.files.entry(of.path.clone()).or_default();
+        let file = self.w.file_mut(&of.path);
         let end = pos + data.len();
         if file.len() < end {
             file.resize(end, 0);
@@ -4685,7 +4941,7 @@ impl Ctx<'_> {
             .w
             .files
             .get(&of.path)
-            .map(|v| v.as_slice())
+            .map(|f| f.bytes.as_slice())
             .unwrap_or(&[]);
         let n = len.min(file.len().saturating_sub(pos));
         let chunk = file[pos..pos + n].to_vec();
@@ -4766,7 +5022,7 @@ impl Ctx<'_> {
         let Ok(path) = String::from_utf8(bytes) else {
             return Ok(vec![EINVAL]);
         };
-        self.p.cwd = path;
+        self.p.cwd = self.join_cwd(&path);
         Ok(vec![0])
     }
 
@@ -6899,6 +7155,254 @@ block 0 (vph: i32) {\n\
             Some("v2"),
             "overwrite=0 kept the existing value"
         );
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_the_cwd() {
+        // #1596. The personality has always stored a cwd, returned it from `getcwd` and let `chdir`
+        // set it — while no path op consulted it. So `chdir` succeeded and changed nothing, and a
+        // relative path could never match an absolute memfs key. hexer hit it as soon as it could
+        // map files: it derives its sibling index relatively, asked for `m.s.idx.nif`, and the
+        // memfs held `/m.s.idx.nif`.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/m.s.idx.nif", b"index");
+        posix.write_file("/sub/deep.txt", b"deep");
+        posix.write_file("g", b"x"); // a *relative* key, as `write_file` allows
+
+        let mut win = vec![0u8; WIN];
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+
+        // Relative, from the default cwd `/` — the exact shape hexer asked for.
+        win_write(&mut mem, 0, b"m.s.idx.nif");
+        let fd = st.open(&[0, 11, 0], Some(&mut mem)).unwrap()[0];
+        assert!(fd >= 0, "a relative open resolves against `/`: {fd}");
+
+        // Absolute paths are passed through byte-identical, so everything that worked still does.
+        win_write(&mut mem, 100, b"/m.s.idx.nif");
+        assert!(st.open(&[100, 12, 0], Some(&mut mem)).unwrap()[0] >= 0);
+
+        // `chdir` now actually moves: the same relative name resolves somewhere else afterwards.
+        win_write(&mut mem, 200, b"/sub");
+        assert_eq!(st.chdir(&[200, 4], Some(&mut mem)).unwrap()[0], 0);
+        win_write(&mut mem, 300, b"deep.txt");
+        let fd2 = st.open(&[300, 8, 0], Some(&mut mem)).unwrap()[0];
+        assert!(fd2 >= 0, "relative open follows the new cwd: {fd2}");
+        // ...and the old relative name no longer resolves, which is the half that proves `chdir`
+        // is doing something rather than that both names happen to exist.
+        win_write(&mut mem, 400, b"m.s.idx.nif");
+        assert_eq!(
+            st.open(&[400, 11, 0], Some(&mut mem)).unwrap()[0],
+            ENOENT,
+            "`/sub/m.s.idx.nif` does not exist"
+        );
+
+        // `..` folds, and cannot climb above the root.
+        win_write(&mut mem, 500, b"../m.s.idx.nif");
+        assert!(
+            st.open(&[500, 14, 0], Some(&mut mem)).unwrap()[0] >= 0,
+            "`..` folds"
+        );
+        assert_eq!(
+            st.join_cwd("../../../etc/passwd"),
+            "/etc/passwd",
+            "`..` clamps at the root rather than escaping it"
+        );
+        // Resolution is now a **rewrite**, not a fallback: a name that matches nothing still becomes
+        // an absolute key, so a *create* lands where a later absolute open will find it. As a
+        // fallback it did the opposite — `lengc` wrote 436 KB to `nimcache/x.c` and the next reader
+        // asked for `/nimcache/x.c`.
+        assert_eq!(st.resolve("nothing-here.txt"), "/sub/nothing-here.txt");
+        // And the seed spelled without a leading slash is the same file as the one with it: the
+        // embedder's paths are rooted, so `"g"` and `"/g"` cannot become two entries. (`g` is seeded
+        // up top with the others: `ctx!` holds the personality lock, so seeding after it deadlocks.)
+        assert_eq!(st.resolve("/g"), "/g");
+        win_write(&mut mem, 600, b"/g");
+        assert!(
+            st.open(&[600, 2, 0], Some(&mut mem)).unwrap()[0] >= 0,
+            "the `\"g\"` seed is reachable as `/g` — one entry, not two"
+        );
+    }
+
+    #[test]
+    fn fstat_reports_the_size_at_the_abi_offset() {
+        // #1595. `memfiles.open` is `open` + `fstat` + `mmap`, and it reads `stat.st_size` at the
+        // offset **its own headers** declare — 48, per nimony's Linux/amd64 `struct stat`. Bound to
+        // the compute shim's stub this came back 0, so every mapped file looked empty and the
+        // program parsed a zero-length buffer instead of its input.
+        //
+        // Pins the geometry, not just the value: a short `{mode, size}` struct like `OP_STAT`'s
+        // would put the size at offset 8 and be read as garbage rather than rejected.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/tmp/a", b"hello");
+
+        let mut win = vec![0u8; WIN];
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+
+        let fd = st.open(&[0, 6, 0], Some(&mut mem)).unwrap()[0];
+        assert!(fd >= 0, "open succeeded: {fd}");
+        assert_eq!(st.fstat(&[fd, 500], Some(&mut mem)).unwrap()[0], 0);
+        let size = i64::from_le_bytes(
+            mem.read_bytes(500 + STAT_SIZE_OFF as u64, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(size, 5, "st_size at offset {STAT_SIZE_OFF}");
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            mode,
+            (S_IFREG | 0o644) as u32,
+            "st_mode at offset {STAT_MODE_OFF}"
+        );
+        // Everything the memfs has no answer for stays zero — an invented inode would be the same
+        // class of plausible-looking lie that made this bug take a day to find. `st_mtim` is not in
+        // that class: see `a_freshness_check_can_tell_which_file_was_written_last`.
+        assert_eq!(
+            mem.read_bytes(500, 8).unwrap(),
+            vec![0u8; 8],
+            "st_dev zeroed"
+        );
+
+        // A non-file fd is legal to fstat (POSIX): a FIFO, size 0. An unknown fd is EBADF.
+        assert_eq!(st.fstat(&[1, 500], Some(&mut mem)).unwrap()[0], 0);
+        assert_eq!(st.fstat(&[999, 500], Some(&mut mem)).unwrap()[0], EBADF);
+    }
+
+    /// #1609 — **`st_mtim` orders the memfs's writes**, which is the whole of what a build tool's
+    /// freshness check asks. nimony's `execNifler` skips re-parsing a dependency when
+    /// `getLastModTime(<out>.p.nif) > getLastModTime(<src>.nim)`, and `getLastModificationTime` is
+    /// `stat(path)` → `st_mtim.tv_sec * 1e9 + tv_nsec`. With every file reporting tick 0 that
+    /// comparison was `0 > 0` for every pair, so a seeded `.p.nif` sitting right next to its source
+    /// was *always* judged stale and nimsem shelled out to re-make it — the thing that stops a no-C
+    /// nimsem from finishing a semantic check.
+    ///
+    /// The clock is logical, not ambient: the personality is granted no wall clock (`clock_gettime`
+    /// writes a zero timespec for that reason), but it does know the order it was written in.
+    #[test]
+    fn a_freshness_check_can_tell_which_file_was_written_last() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut win = vec![0u8; WIN];
+        ctx!(posix, w_g, p_g, st);
+
+        // `st_mtim.tv_sec` of `$path`, read back through the declared Linux layout — the same
+        // bytes `getLastModificationTime` reads.
+        macro_rules! mtime {
+            ($path:expr) => {{
+                let p: &str = $path;
+                win[..p.len()].copy_from_slice(p.as_bytes());
+                let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+                let plen = p.len() as i64;
+                assert_eq!(st.statp(&[0, plen, 500], Some(&mut mem)).unwrap()[0], 0);
+                i64::from_le_bytes(
+                    mem.read_bytes(500 + STAT_MTIME_OFF as u64, 8)
+                        .unwrap()
+                        .try_into()
+                        .unwrap(),
+                )
+            }};
+        }
+
+        // Seed the source first and the derived artifact second — the order a build makes them in.
+        // `ctx!` holds the world lock, so seed through the same `World::file_put` that
+        // `Posix::write_file` delegates to rather than re-locking it.
+        st.w.file_put("/src.nim".into(), b"echo 1".to_vec());
+        st.w.file_put("/out.p.nif".into(), b"(stmts)".to_vec());
+        let src = mtime!("/src.nim");
+        let out = mtime!("/out.p.nif");
+        assert!(
+            out > src,
+            "the artifact written second is newer than its source ({out} > {src})"
+        );
+
+        // Reading does not make a file newer — otherwise `stat` would report the last *reader* and
+        // the comparison would flip the moment anything looked at the source.
+        {
+            win[..8].copy_from_slice(b"/src.nim");
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            let fd = st.open(&[0, 8, 0], Some(&mut mem)).unwrap()[0];
+            assert!(fd >= 0, "open /src.nim for reading: {fd}");
+        }
+        assert_eq!(mtime!("/src.nim"), src, "a read-only open is not a write");
+
+        // Rewriting the source, as an edit does, makes it outrun the artifact again — the freshness
+        // check must then say "rebuild", which is exactly the case that must keep working.
+        st.w.file_put("/src.nim".into(), b"echo 2".to_vec());
+        assert!(
+            mtime!("/src.nim") > out,
+            "an edited source outruns the artifact built from the old one"
+        );
+    }
+
+    #[test]
+    fn statp_answers_by_path_in_the_declared_layout() {
+        // #1595. nimony's `fileExists` is `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, reading
+        // `st_mode` at the offset **its own headers** declare (24). `OP_STAT` answers the same
+        // question in a 16-byte `{mode, size}`, which puts the mode at offset 0 — so a C caller
+        // reads `st_dev` as the mode, `S_ISREG` is false, and every file it looks for is missing.
+        // That is why nimsem could not start: `cannot find <input>` before any work.
+        //
+        // Asserts both layouts off the same path, so the split cannot silently collapse.
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.write_file("/tmp/a", b"hello");
+
+        let mut win = vec![0u8; WIN];
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        ctx!(posix, w_g, p_g, st);
+
+        assert_eq!(st.statp(&[0, 6, 500], Some(&mut mem)).unwrap()[0], 0);
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mode, (S_IFREG | 0o644) as u32, "S_ISREG must hold");
+        let size = i64::from_le_bytes(
+            mem.read_bytes(500 + STAT_SIZE_OFF as u64, 8)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(size, 5);
+
+        // A directory is `S_IFDIR`, so `dirExists` works too — the half that a compose of
+        // `open` + `fstat` + `close` could not have served.
+        win[..4].copy_from_slice(b"/tmp");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.statp(&[0, 4, 500], Some(&mut mem)).unwrap()[0], 0);
+        let mode = u32::from_le_bytes(
+            mem.read_bytes(500 + STAT_MODE_OFF as u64, 4)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(mode, (S_IFDIR | 0o755) as u32, "S_ISDIR must hold");
+
+        // And the short form still answers where it always did, at *its* offsets — the two are
+        // different layouts of one lookup, not two notions of what a path is.
+        win[..6].copy_from_slice(b"/tmp/a");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.stat(&[0, 6, 600], Some(&mut mem)).unwrap()[0], 0);
+        let short_size = i64::from_le_bytes(mem.read_bytes(608, 8).unwrap().try_into().unwrap());
+        assert_eq!(short_size, 5, "OP_STAT keeps its 16-byte convention");
+
+        // A path that is neither file nor directory is ENOENT, not a zeroed struct.
+        win[..3].copy_from_slice(b"/no");
+        let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+        assert_eq!(st.statp(&[0, 3, 500], Some(&mut mem)).unwrap()[0], ENOENT);
     }
 
     #[test]

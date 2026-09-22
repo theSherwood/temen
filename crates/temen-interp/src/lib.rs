@@ -1250,6 +1250,7 @@ impl Inspector {
             root.memop = true; // one visible op per turn — the granularity steps/breakpoints align to
             root.debug = Some(Box::new(DebugCtx::new(Arc::clone(&shared))));
             s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
+            root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
             s.runnable.push(Box::new(root));
             id
         };
@@ -2536,6 +2537,8 @@ fn drive_over_cell(
             Arc::clone(&dt),
         ));
         root.durable = durable;
+        // D66 — the root's lane chain is just its own domain at the embedder-set cap.
+        root.lane_chain = vec![(s.root_domain, host_shared.lock_unpoisoned().lane_cap())];
         // The root's own durable state word is the window's initial phase (NORMAL / UNWINDING freeze /
         // REWINDING thaw); the runtime swaps it per vCPU from here (slice 3.2.1). §12.8 concurrent-thaw
         // stage 1: combine the global freeze word with the root's per-context thaw word (a thaw seeds
@@ -2724,6 +2727,7 @@ fn drive_over_cell(
                             fuel: *fuel,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     if parent == id {
@@ -2803,7 +2807,7 @@ fn drive_over_cell(
                 // (A *detached* durable child — not reconstructible on this carve path yet — will carry
                 // its own captured attestation instead, since `window_exposed = false` cannot be
                 // re-derived from "nested"; that lands with the detached-durable freeze plumbing.)
-                ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true));
+                ch.set_attestation(host_shared.lock_unpoisoned().child_attestation(true, None));
                 // §13.4 slice 4c: a child with recorded host state restores it **verbatim** —
                 // the captured handle table (slots/generations preserved, so guest handle
                 // values reloaded from its spilled frames still resolve) and its serve trio —
@@ -2980,6 +2984,7 @@ fn drive_over_cell(
                             fuel: *fuel,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     if parent == id {
@@ -3019,6 +3024,42 @@ fn drive_over_cell(
         // #863 slice 3 — no signal-wake clear: the wake closure holds the scheduler *weakly*, so a
         // source kept alive past the run pins nothing and a post-run raise is a no-op.
     }
+    // #1361 step 3 — harvest each live detached child the freeze rang the doorbell for. By here
+    // `worker_loop` has run until every vCPU finished, so a child that took the bell has unwound and
+    // delivered its window through the ordinary result channel; claim it and pair it with the
+    // powerbox the parent kept. A record left undrained is a child that never reached its poll — it
+    // stays in `pending_detached` for the caller to refuse on (#1584), rather than being silently
+    // dropped into a partial artifact.
+    {
+        let pending = std::mem::take(&mut host_shared.lock_unpoisoned().pending_detached);
+        let mut s = sched.lock();
+        let mut captured = Vec::new();
+        let mut unreached = Vec::new();
+        for p in pending {
+            // `layout_snapshot` is root-window-only and excludes a §13-region-mapped window; a
+            // detached child's window *is* a root window, and an unsafe one stays unreached rather
+            // than producing a partial image (R4 cross-tree sharing is its own open question).
+            match s
+                .results
+                .remove(&p.child_task)
+                .and_then(|o| o.mem)
+                .filter(|m| m.layout_snapshot_safe())
+            {
+                Some(m) => captured.push(CapturedDetached {
+                    parent_task: p.parent_task,
+                    slot: p.slot,
+                    reserved_log2: m.reserved_size().trailing_zeros() as u8,
+                    window: m.layout_snapshot(),
+                    host: p.host,
+                }),
+                None => unreached.push(p),
+            }
+        }
+        drop(s);
+        let mut hg = host_shared.lock_unpoisoned();
+        hg.captured_detached = captured;
+        hg.pending_detached = unreached;
+    }
     let (out, trap_origin) = {
         let mut s = sched.lock();
         // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
@@ -3032,8 +3073,17 @@ fn drive_over_cell(
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
     // which for a join-propagated child trap names the join site, not the origin. `None` ⇒ clean run
     // (use the root's empty backtrace). This mirrors the JIT's `root_trap_cap.or(worker_trap_cap)`.
-    let (trap_bt, trap_fiber) = trap_origin.unwrap_or((out.trap_bt, out.trap_fiber));
-    (out.result, trap_bt, trap_fiber)
+    let origin = trap_origin.unwrap_or(TrapOrigin {
+        bt: out.trap_bt,
+        fiber: out.trap_fiber,
+        fault: out.trap_fault,
+    });
+    // Every run entry point funnels through here, so recording the diagnostic once at this point
+    // gives all of them the trace — `run_capture_reserved_with_host` used to do it for itself, which
+    // left `run_with_host` (the op-13 child drivers' entry) with no way to see either.
+    LAST_CAPTURE_BACKTRACE.with(|c| *c.borrow_mut() = origin.bt.clone());
+    LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = origin.fault);
+    (out.result, origin.bt, origin.fiber)
 }
 
 /// Like [`run`], but seed the window with `init_mem` (its low bytes) and return the final
@@ -3127,6 +3177,47 @@ pub fn run_capture_reserved_with_host(
         .map(|mm| mm.snapshot_window(SNAP_CAP))
         .unwrap_or_default();
     (r, snap)
+}
+
+thread_local! {
+    /// The trap-time backtrace of the most recent run on this thread, recorded by [`drive`] — so
+    /// every entry point has one, not just the handful that return a [`TracedRun`].
+    ///
+    /// `drive` has always produced one; `run_capture_reserved_with_host` threw it away
+    /// (`let (r, ..) = …`), so a guest run **with argv** — which is every real program, since args
+    /// force the seeded-memory path — reported a bare `MemoryFault` with no location. A thread-local
+    /// keeps the existing return types (and their callers) untouched while making the trace
+    /// reachable; a run overwrites it, and it is only meaningful immediately after one. Nested runs
+    /// resolve the way you want: the inner `drive` returns first, so the outermost writes last.
+    static LAST_CAPTURE_BACKTRACE: core::cell::RefCell<Vec<IrPc>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// The trap-time backtrace of the last run on this thread — innermost frame first, empty if that run
+/// finished cleanly or none has happened. This is the **trap-origin** capture (first vCPU to trap),
+/// so a child domain's trap names the child's frames, not the parent's join site.
+pub fn last_capture_backtrace() -> Vec<IrPc> {
+    LAST_CAPTURE_BACKTRACE.with(|c| c.borrow().clone())
+}
+
+thread_local! {
+    /// The window-relative faulting address of the last run, the companion to
+    /// [`LAST_CAPTURE_BACKTRACE`] and recorded with it. `Inspector::fault_addr` already reported this
+    /// to the DAP layer; a plain run had no way to see it. #1591 — it rides the trap-origin capture,
+    /// so it survives an op-13 **child**'s trap, whose `Mem` is dropped at the join.
+    static LAST_CAPTURE_FAULT: core::cell::RefCell<Option<u64>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// The window-relative address of the last run's `MemoryFault` (a NULL deref is `0`); `None` if that
+/// run did not fault on an address. For a nested (op-13) child it is relative to the child's own
+/// carve — the frame its backtrace is already in.
+///
+/// Worth more than it looks next to a backtrace: a **small** address says the pointer was never
+/// initialized, a **wild** one says the arithmetic that produced it was wrong. Those point at
+/// different bugs, and the backtrace alone does not separate them.
+pub fn last_capture_fault_addr() -> Option<u64> {
+    LAST_CAPTURE_FAULT.with(|c| *c.borrow())
 }
 
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
@@ -3256,7 +3347,7 @@ pub fn run_scheduled(
         s.next_task += 1;
         s.live += 1;
         let dt = Arc::new(DomainTable::new(&funcs, 0)); // DPOR: no Jit install, natural table
-        let root = Box::new(VCpu::new(
+        let mut root = Box::new(VCpu::new(
             funcs,
             types,
             func,
@@ -3271,6 +3362,7 @@ pub fn run_scheduled(
             dt,
         ));
         s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
+        root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
         s.runnable.push(root);
         id
     };
@@ -4055,6 +4147,7 @@ fn run_one_schedule(
         );
         root.memop = true;
         s.root_domain = domain_key_of(&root); // §12: the root domain's key (owner 2026-07-24)
+        root.lane_chain = vec![(s.root_domain, root.host.lock_unpoisoned().lane_cap())]; // D66
         s.runnable.push(Box::new(root));
         id
     };
@@ -4554,6 +4647,21 @@ struct Outcome {
     /// The handle uses the cross-backend `(generation << FIBER_GEN_SHIFT) | slot` encoding, so it
     /// compares equal to the JIT's for the same fiber.
     trap_fiber: Option<i64>,
+    /// The **window-relative address** this vCPU's `MemoryFault` named, when it trapped on one
+    /// (#1591). Read off the vCPU's own [`Mem`] before it is dropped, so a *child* domain's fault
+    /// address survives the join propagation that flattens its trap to a bare `Err(Trap)` — the
+    /// parent's window has no record of it. `None` on a clean finish or a non-address trap.
+    trap_fault: Option<u64>,
+}
+
+/// What the first vCPU to trap recorded about *its own* trap — the run-shared, first-wins capture
+/// [`Sched::trap_origin`] holds and [`drive`] reports, rather than the root's join-site residue.
+struct TrapOrigin {
+    bt: Vec<IrPc>,
+    fiber: Option<i64>,
+    /// The window-relative faulting address (#1591). For a nested (op-13) child this is relative to
+    /// the child's own carve, which is the frame its own backtrace is in.
+    fault: Option<u64>,
 }
 
 /// The trapping vCPU's running-fiber handle for [`Outcome::trap_fiber`]: `-1` when the root is running
@@ -4634,6 +4742,12 @@ enum Blocked {
         expected: u64,
         width: u32,
         timeout_ns: u64,
+        /// The guest asked to wait **forever** (a negative timeout), so `timeout_ns` is the
+        /// [`MAX_WAIT`] backstop rather than a deadline anyone asked for. The clamp is "a pure
+        /// anti-wedge backstop, never semantics", and that distinction is load-bearing for
+        /// freeze-on-quiesce (#1584): a park that will wake on its own is not a quiesced run, but
+        /// a park that only the backstop can end is — so the flag has to survive the clamp.
+        indefinite: bool,
     },
     /// Blocked inside a capability call **through `handle`** (§3.6 slice 1: a blocking stream
     /// read with no data). Parked in the scheduler's handle-keyed waiter index, so a
@@ -5189,6 +5303,16 @@ struct Sched {
     handles: Vec<std::thread::JoinHandle<()>>,
     /// vCPUs not yet finished (running + queued + parked). The run ends when this hits 0.
     live: usize,
+    /// D66 — tasks currently **on a worker**, per domain (every domain a running task's lane chain
+    /// names, so a child's task counts here under its own domain *and* each ancestor's). Checked
+    /// against each chain entry's cap at dispatch ([`lane_enter`]); never counts a parked task.
+    lane_running: BTreeMap<usize, usize>,
+    /// D66 — vCPUs that were runnable but found a lane in their chain full. Re-admitted wholesale on
+    /// any lane release (wake-all, the same obviously-correct form `svc_waiters` uses: each re-checks
+    /// at its next dispatch and re-parks if still blocked). Internally-wakeable only — a release needs
+    /// a running task — so it is deliberately **not** in [`run_deadlocked`]'s external-wake list: a
+    /// lane of `0`, or a cap a bug never releases, ends as a `ThreadFault` rather than a hang.
+    lane_waiters: VecDeque<Box<VCpu>>,
     /// Worker threads in existence (incl. the calling thread, counted as 1).
     workers: usize,
     /// #1228 — worker threads currently **blocked** in the scheduler condvar (idle, no runnable
@@ -5223,13 +5347,13 @@ struct Sched {
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
     /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
     freeze_on_quiesce: bool,
-    /// §5 W3 / §23-D57 — the **trap-origin capture**: the `(backtrace, fiber)` of the *first* vCPU to
-    /// trap on its own op, run-shared and **first-wins**. A child trap propagates to its `thread.join`er
-    /// as a bare `Err(Trap)` (the parent re-traps with *its* frames at the join), so the root's own
-    /// outcome would name the join site, not the origin. `drive` reads this instead, so the trap
-    /// diagnostic names *where the guest actually trapped* — the interpreter counterpart to the JIT's
-    /// `Domain` trap-capture handoff. `None` on a clean run.
-    trap_origin: Option<(Vec<IrPc>, Option<i64>)>,
+    /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
+    /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
+    /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
+    /// join), so the root's own outcome would name the join site, not the origin. `drive` reads this
+    /// instead, so the trap diagnostic names *where the guest actually trapped* — the interpreter
+    /// counterpart to the JIT's `Domain` trap-capture handoff. `None` on a clean run.
+    trap_origin: Option<TrapOrigin>,
 }
 
 impl Scheduler {
@@ -5283,17 +5407,20 @@ impl Scheduler {
         process_timers(&mut self.lock());
     }
 
-    /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
+    /// Wake up to `count` vCPUs parked on `key`, **oldest first**; return how many were woken.
+    ///
+    /// Arrival order, not `Vec::pop()` order (owner ruling 2026-09-22, #1617). It used to pop the
+    /// tail, which woke last-in-first-out — an artefact of `pop()` being the cheap `Vec` operation
+    /// rather than a decision, and one that can starve a waiter that parked early: under steady
+    /// notify traffic every later arrival goes in front of it. It also disagreed with
+    /// [`DetSched::notify`], which has always woken in insertion order, so the model checker
+    /// explored an order the real pool never produced.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
         let mut woken: Vec<Waiter> = Vec::new();
         if let Some(q) = s.wait_waiters.get_mut(&key) {
-            while (woken.len() as u32) < count {
-                match q.pop() {
-                    Some((_, v)) => woken.push(v),
-                    None => break,
-                }
-            }
+            let take = (count as usize).min(q.len());
+            woken.extend(q.drain(..take).map(|(_, v)| v));
             if q.is_empty() {
                 s.wait_waiters.remove(&key);
             }
@@ -6342,6 +6469,7 @@ fn reap(s: &mut Sched, mut v: Box<VCpu>, reason: Trap) -> Vec<u64> {
         fuel: v.fuel,
         trap_bt: Vec::new(), // the *origin's* backtrace is already in `trap_origin` (first-wins)
         trap_fiber: None,
+        trap_fault: None,
     };
     let id = v.id;
     // #1217 — a reaped client child releases its services' parked `svc.wait` too.
@@ -6403,7 +6531,8 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     s.orphan_tickets.retain(|(callee, _)| *callee != key);
     let mut victims: Vec<Box<VCpu>> = drain_members(&mut s.runnable, key);
     victims.extend(drain_members(&mut s.join_waiters, key));
-    // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
+    victims.extend(drain_members(&mut s.lane_waiters, key)); // D66
+                                                             // #798 — the dying domain's stopped parks die with it (a stopped job killed at run end).
     victims.extend(s.stopped.remove(&key).unwrap_or_default());
     // #799 — the dying domain's blocking-`waitpid` benches die with it; other domains' stay.
     for ws in s.posix_reap_waiters.values_mut() {
@@ -6491,7 +6620,8 @@ fn teardown_run(s: &mut Sched) {
     s.shutdown = true;
     let mut victims: Vec<Box<VCpu>> = s.runnable.drain(..).collect();
     victims.extend(std::mem::take(&mut s.join_waiters).into_values());
-    // #798 — stopped jobs die with the run like any parked daemon.
+    victims.extend(s.lane_waiters.drain(..)); // D66
+                                              // #798 — stopped jobs die with the run like any parked daemon.
     victims.extend(std::mem::take(&mut s.stopped).into_values().flatten());
     // parked `wait(-1)` any-child callers.
     victims.extend(std::mem::take(&mut s.reap_any_waiters));
@@ -6630,6 +6760,35 @@ fn run_deadlocked(s: &Sched) -> bool {
             .any(|v| matches!(v.pending, Some(Pending::ReapPid { .. })))
 }
 
+/// D66 — the lane arithmetic, shared with the JIT's child-domain executor through
+/// [`temen_ir::lanes`] so the 6/2/2 answer is one function (INVARIANTS #15). See there.
+use temen_ir::lanes::{bounded as lane_bounded, enter as lane_enter, leave as lane_leave};
+
+/// #1584 / §13.4 4c-bis — is the run **quiesced**: is there at least one park for a freeze to
+/// re-admit, and will nothing wake on its own?
+///
+/// "Wakes on its own" is the whole question, and the futex clamp is why it needs asking carefully.
+/// An *infinite* `atomic.wait` is clamped to [`MAX_WAIT`] and so carries a `timers` entry like any
+/// timed wait — but that deadline is "a pure anti-wedge backstop, never semantics", nobody asked
+/// for it, and treating it as a real deadline is exactly what let a futex-parked vCPU veto a
+/// freeze. So the answer comes from the waiters ([`VCpu::wait_indefinite`]), not from the timer
+/// heap, which also carries stale entries for already-notified waiters.
+///
+/// Conservative in two places, deliberately. A waiter the guest gave a **real** timeout will wake
+/// and make progress, so the run has not quiesced and the arm holds off — unchanged from before.
+/// And a futex-parked **fiber** blocks it: a fiber park is the freeze driver's own business
+/// (§13.4 step 2 purges it and the thaw re-issues), not something to re-admit from here. Both
+/// cases behaved this way before #1584 too, since either one put a timer in the heap.
+fn quiesced_parks_only(s: &Sched) -> bool {
+    if s.svc_waiters.is_empty() && s.wait_waiters.is_empty() {
+        return false; // nothing parked that a freeze could re-admit
+    }
+    s.wait_waiters.values().flatten().all(|(_, w)| match w {
+        Waiter::VCpu(v) => v.wait_indefinite,
+        Waiter::Fiber { .. } => false,
+    })
+}
+
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
 fn worker_loop(sched: &Arc<Scheduler>) {
@@ -6644,28 +6803,60 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 if s.shutdown {
                     break None;
                 }
-                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the only thing
-                // keeping the run alive is `svc.wait`-parked consumers (a server idle in its
-                // accept loop) and the run is armed to freeze on quiesce, trigger it now —
-                // promote each parked domain's window to `UNWINDING` and re-admit it. Its
-                // re-executed `svc.wait` takes the trailing-poll sentinel and unwinds, so the
-                // freeze completes with the serve trio captured instead of the run hanging. Gated
-                // on empty futex timers too: a futex-parked vCPU (or a *timed* svc.wait) will wake
-                // on its own, so it isn't a quiesced idle server. One-shot (cleared on fire).
-                if s.freeze_on_quiesce
-                    && !s.svc_waiters.is_empty()
-                    && s.timers.is_empty()
-                    && s.svc_timers.is_empty()
-                {
+                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the run is armed
+                // and every remaining vCPU is parked in a wait **the scheduler owns**, trigger the
+                // freeze now — promote each parked vCPU's durable phase to `UNWINDING` and
+                // re-admit it. Its re-executed suspend point takes the freeze arm and unwinds, so
+                // the freeze completes instead of the run hanging. One-shot (cleared on fire).
+                //
+                // #1584 — this covers **every** such park, not just `svc.wait`. A parked child
+                // must not veto its parent's freeze: INVARIANTS #3 has authority moving *down* the
+                // grant graph, and "the freeze succeeds unless the child cooperates" is a weaker
+                // contract than "a parent may freeze its children". A vCPU parked in `atomic.wait`
+                // runs no ops, so it reaches no safepoint, so it used to veto by construction —
+                // and not even cleanly: the run stalled on the [`MAX_WAIT`] backstop and then
+                // returned a *timed-out* wait as a normal result, with a snapshot that was not a
+                // freeze point and nothing in the `Ok` to say so.
+                //
+                // The transform already instruments `atomic.wait` as a re-issue suspend point
+                // (`SuspendKind::MemoryWait`), exactly as it does the serve op; only the scheduler
+                // never woke it. So this re-admits futex waiters with the same `WAIT_WOKEN` the
+                // JIT's own freeze arm delivers — the status is discarded by the safepoint that
+                // unwinds before the guest can observe it, and the thaw re-issues the wait.
+                if s.freeze_on_quiesce && s.svc_timers.is_empty() && quiesced_parks_only(&s) {
                     s.freeze_on_quiesce = false;
+                    // Set each vCPU's own durable phase: the `dispatch` prologue swaps it into the
+                    // window before the vCPU runs (a direct window write would be clobbered by that
+                    // swap). At root context this routes to the global freeze word, so the
+                    // re-executed suspend point observes `UNWINDING`.
                     let keys: Vec<usize> = s.svc_waiters.keys().copied().collect();
                     for k in keys {
                         for mut v in s.svc_waiters.remove(&k).into_iter().flatten() {
-                            // Set the vCPU's own durable phase: the `dispatch` prologue swaps it
-                            // into the window before the vCPU runs (a direct window write would be
-                            // clobbered by that swap). At root context this routes to the global
-                            // freeze word, so the re-executed `svc.wait` observes `UNWINDING`.
                             v.dstate = STATE_UNWINDING;
+                            s.runnable.push_back(v);
+                        }
+                    }
+                    // A vCPU parked in `thread.join` (or queued for a D66 lane) *will* be woken
+                    // by something else — the child completing, a lane coming free — so it needs
+                    // no re-admission. It does need the phase: without it the joiner wakes with
+                    // `dstate` still `NORMAL`, never observes the freeze at its own safepoint, and
+                    // runs to completion *through* the freeze its owner asked for. A freeze is
+                    // run-wide, so every parked vCPU takes the phase; only the ones nothing else
+                    // can wake are also re-admitted.
+                    for v in s.join_waiters.values_mut() {
+                        v.dstate = STATE_UNWINDING;
+                    }
+                    for v in s.lane_waiters.iter_mut() {
+                        v.dstate = STATE_UNWINDING;
+                    }
+                    for (_, q) in std::mem::take(&mut s.wait_waiters) {
+                        for (_, w) in q {
+                            let Waiter::VCpu(mut v) = w else {
+                                unreachable!("quiesced_parks_only rejects a fiber futex waiter")
+                            };
+                            v.wait_indefinite = false;
+                            v.dstate = STATE_UNWINDING;
+                            v.pending = Some(Pending::Wait(WAIT_WOKEN));
                             s.runnable.push_back(v);
                         }
                     }
@@ -6771,6 +6962,17 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
     // futex wake, no worker pickup. Every other arm `return`s or falls through to the final
     // `break` exactly as before the loop existed.
     loop {
+        // D66 — lane admission: a bounded chain must have room in every lane before this vCPU takes
+        // the worker; a blocked one waits in `lane_waiters` (re-admitted on any release) and the worker
+        // moves on. Unbounded chains — every run that sets no cap — skip the lock entirely.
+        let bounded = lane_bounded(&v.lane_chain);
+        if bounded {
+            let mut s = sched.lock();
+            if !lane_enter(&mut s.lane_running, &v.lane_chain) {
+                s.lane_waiters.push_back(v);
+                return;
+            }
+        }
         // Durable multi-vCPU (DURABILITY.md §12.8 slice 3.2.1): swap THIS vCPU's per-context durable words
         // into the **shared** window before it runs — the state word ([`STATE_OFF`]) and the active
         // shadow-SP ([`SHADOW_SP_OFF`]). The freeze/thaw runs single-worker, so the one shared pair is each
@@ -6792,6 +6994,19 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             }
         }
         let step = v.run(u64::MAX);
+        // D66 — the lanes are held exactly while the vCPU is on the worker: release them before any
+        // routing below (a parked or finished task holds none), and re-admit everything that was
+        // waiting on a lane — each re-checks at its own dispatch.
+        if bounded {
+            let mut s = sched.lock();
+            lane_leave(&mut s.lane_running, &v.lane_chain);
+            if !s.lane_waiters.is_empty() {
+                let woken: Vec<Box<VCpu>> = s.lane_waiters.drain(..).collect();
+                s.runnable.extend(woken);
+                drop(s);
+                sched.work.notify_all();
+            }
+        }
         // Save this vCPU's durable words whenever it parks (it resumes later on this single worker and must
         // restore the same context). Skipped on `Done` (it won't run again; its residue, if any, is read
         // from the live words below).
@@ -7013,8 +7228,37 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 }
                             }
                         } else {
-                            refuse = true; // still running: the O6 mid-flight case (step 3)
-                            break;
+                            // #1361 step 3 — **still running**: ring the freeze doorbell and record
+                            // the child for harvest. We do not wait for it: this vCPU is itself
+                            // mid-freeze, and the child needs to *run* (to unwind) and *finish* (to
+                            // deliver its window through the scheduler's ordinary result channel).
+                            // The run driver already runs until every vCPU has finished, so it is the
+                            // natural collector — the parent rings, records, and unwinds.
+                            //
+                            // A child that never reaches its poll (parked on a futex or a join) never
+                            // unwinds, and the run reaches quiescence with this record undrained. That
+                            // is the fail-closed case tracked as #1584: a child must not be able to
+                            // veto its parent's freeze, but until the parked kinds are reachable the
+                            // honest answer is to refuse loudly rather than emit a partial artifact.
+                            if let Some(bell) = v.child_freeze.get(&slot) {
+                                bell.store(true, Ordering::Relaxed);
+                                let host = Arc::clone(&v.child_hosts[&slot]);
+                                let sink =
+                                    v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                                sink.lock_unpoisoned()
+                                    .pending_detached
+                                    .push(PendingDetached {
+                                        parent_task: v.id as usize,
+                                        slot,
+                                        child_task: cid,
+                                        host,
+                                    });
+                            } else {
+                                // No doorbell: a child minted before this mechanism existed, or one
+                                // reached by a path that does not wire one. Nothing can reach it.
+                                refuse = true;
+                                break;
+                            }
                         }
                     }
                     refuse
@@ -7080,6 +7324,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     Vec::new()
                 };
                 let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                // #1591: and the address it faulted on, off this vCPU's own window. A nested (op-13)
+                // child's `Mem` dies with its outcome, so reading it here is the only chance — the
+                // join propagation that reaches `drive` carries a bare `Err(Trap)`.
+                let trap_fault = result
+                    .is_err()
+                    .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
+                    .flatten();
                 // §12 domain lifetime (owner 2026-07-24): capture what a teardown needs before the vCPU
                 // is dropped — its domain key, its powerbox (the dying domain's queue), and the tickets
                 // of dispatches it admitted but never replied (their cross-domain callers wake, D37).
@@ -7109,6 +7360,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     fuel: v.fuel,
                     trap_bt,
                     trap_fiber,
+                    trap_fault,
                 };
                 drop(v);
                 let mut s = sched.lock();
@@ -7128,8 +7380,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
                 // true origin. A clean finish leaves it untouched.
                 if outcome.result.is_err() {
-                    s.trap_origin
-                        .get_or_insert_with(|| (outcome.trap_bt.clone(), outcome.trap_fiber));
+                    s.trap_origin.get_or_insert_with(|| TrapOrigin {
+                        bt: outcome.trap_bt.clone(),
+                        fiber: outcome.trap_fiber,
+                        fault: outcome.trap_fault,
+                    });
                 }
                 // #863 hygiene — a **fork twin** finishing notifies its personalities: the exit
                 // hooks its fork factories rode in on ([`Host::exit_hooks`]) fire with the raw
@@ -7227,6 +7482,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 expected,
                 width,
                 timeout_ns,
+                indefinite,
             }) => {
                 let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
                 let mut s = sched.lock();
@@ -7245,6 +7501,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let wid = s.next_wid;
                     s.next_wid += 1;
                     s.timers.push(Reverse((deadline, wid, key)));
+                    // #1584 — remember whether that deadline is the guest's or only the backstop.
+                    v.wait_indefinite = indefinite;
                     s.wait_waiters
                         .entry(key)
                         .or_default()
@@ -7915,6 +8173,11 @@ struct DetState {
     /// vCPUs parked by spin-loop detection (memop explorer only), woken by a write to their read range.
     spin_waiters: Vec<SpinWaiter>,
     live: usize,
+    /// D66 — the executor's `lane_running` / `lane_waiters`, so the exploration driver gates lanes
+    /// identically (a lane-blocked pick is deferred, not run).
+    lane_running: BTreeMap<usize, usize>,
+    #[allow(clippy::vec_box)]
+    lane_waiters: Vec<Box<VCpu>>,
     next_task: TaskId,
     clock: u64, // logical nanoseconds, advanced only to fire a timeout
     rng: u64,
@@ -8003,6 +8266,7 @@ fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
         fuel: v.fuel,
         trap_bt: Vec::new(), // the origin's own Done recorded the true backtrace
         trap_fiber: None,
+        trap_fault: None,
     };
     let id = v.id;
     drop(v);
@@ -8053,6 +8317,14 @@ fn det_teardown_domain(s: &mut DetState, key: usize, reason: &Trap) {
             s.spin_waiters.push(w);
         }
     }
+    let lw = std::mem::take(&mut s.lane_waiters); // D66
+    for v in lw {
+        if domain_key_of(&v) == key {
+            victims.push(v);
+        } else {
+            s.lane_waiters.push(v);
+        }
+    }
     for v in victims {
         det_reap(s, v, reason);
     }
@@ -8076,6 +8348,7 @@ fn det_teardown_run(s: &mut DetState) {
             .into_iter()
             .map(|w| w.vcpu),
     );
+    victims.extend(std::mem::take(&mut s.lane_waiters)); // D66
     for v in victims {
         det_reap(s, v, &Trap::ThreadFault);
     }
@@ -8091,6 +8364,8 @@ impl DetSched {
                 wait_waiters: Vec::new(),
                 spin_waiters: Vec::new(),
                 live: 0,
+                lane_running: BTreeMap::new(),
+                lane_waiters: Vec::new(),
                 next_task: 0,
                 clock: 0,
                 rng: seed | 1,
@@ -8262,6 +8537,16 @@ impl SchedDriver {
                             }
                         };
                         let v = s.runnable.swap_remove(pick);
+                        // D66 — the same lane admission as the executor's `dispatch`: a pick whose
+                        // chain has a full lane is deferred (it waits in `lane_waiters` until a
+                        // release re-admits it) and the driver picks again. A deferred planned pick
+                        // is fine: the plan named a runnable tid, and the tid is still live.
+                        if lane_bounded(&v.lane_chain)
+                            && !lane_enter(&mut s.lane_running, &v.lane_chain)
+                        {
+                            s.lane_waiters.push(v);
+                            continue;
+                        }
                         (v, quantum)
                     };
                     // Spin-loop detection (memop explorer only): snapshot the vCPU's local
@@ -8279,6 +8564,14 @@ impl SchedDriver {
             };
 
             let step = v.run(quantum);
+            // D66 — release the lanes the turn held and re-admit any lane-deferred pick (see
+            // `dispatch`; the exploration driver must gate identically to stay the oracle's oracle).
+            if lane_bounded(&v.lane_chain) {
+                let mut s = det.lock();
+                lane_leave(&mut s.lane_running, &v.lane_chain);
+                let woken = std::mem::take(&mut s.lane_waiters);
+                s.runnable.extend(woken);
+            }
 
             // A debug stop interrupts the turn before the op runs: hold the vCPU (its continuation is
             // intact) and hand control back. The DPOR decision isn't finalized — `d.finish` waits for
@@ -8329,6 +8622,10 @@ impl SchedDriver {
                         Vec::new()
                     };
                     let trap_fiber = result.is_err().then(|| trap_fiber_of(&v));
+                    let trap_fault = result
+                        .is_err()
+                        .then(|| v.mem.as_ref().and_then(|m| m.peek_fault_rel()))
+                        .flatten();
                     let key = domain_key_of(&v); // §12 teardown: read before the vCPU is dropped
                     let outcome = Outcome {
                         result,
@@ -8336,6 +8633,7 @@ impl SchedDriver {
                         fuel: v.fuel,
                         trap_bt,
                         trap_fiber,
+                        trap_fault,
                     };
                     drop(v);
                     let mut s = det.lock();
@@ -8370,6 +8668,10 @@ impl SchedDriver {
                     expected,
                     width,
                     timeout_ns,
+                    // The explorer has no freeze-on-quiesce and no wall clock: it *advances* its
+                    // logical clock to the earliest deadline when nothing is runnable, so the
+                    // backstop is already how it ends an infinite wait. Nothing to carry.
+                    indefinite: _,
                 }) => {
                     let mut s = det.lock();
                     if v.atomic_value(addr, width) != expected {
@@ -8423,6 +8725,7 @@ impl SchedDriver {
                             fuel: 0,
                             trap_bt: Vec::new(),
                             trap_fiber: None,
+                            trap_fault: None,
                         },
                     );
                     s.live -= 1;
@@ -8921,6 +9224,48 @@ pub struct FrozenDetached {
     pub slot: usize,
     /// The child's clean `thread.join` result (an `i64`; an `i32` result is sign-extended at capture).
     pub completed_result: i64,
+}
+
+/// #1361 step 3 — a **live** detached §14 child the freeze rang the doorbell for, recorded while the
+/// parent unwinds and harvested by the run driver once the child has unwound and finished. The
+/// in-flight half of [`FrozenDetached`]: that one is the completed case, where only a join result
+/// crosses; this one names a child whose whole *separate window* has to come back.
+///
+/// It exists because the parent cannot wait for the child. The parent is itself a running vCPU
+/// mid-freeze, and the child must run (to unwind) and finish (to deliver its window through the
+/// scheduler's ordinary result channel, [`Outcome::mem`]). So the parent rings, records, and unwinds;
+/// the driver — which already runs until every vCPU has finished — collects. Never serialized: the
+/// codec sees the harvested [`CapturedDetached`], not this.
+#[derive(Clone)]
+pub struct PendingDetached {
+    /// The task that spawned this child (op 15) — `0` for a direct child of the root.
+    pub parent_task: usize,
+    /// The spawner's `threads`/join slot the child was minted at.
+    pub slot: usize,
+    /// The child's scheduler task, so the driver can claim its outcome.
+    pub child_task: u64,
+    /// The child's own powerbox. An `Arc`, so it outlives the child's vCPU and is still readable when
+    /// the driver captures its handle table — the linkage that survives detachment is the powerbox,
+    /// never the window (PROCESS.md §5).
+    pub host: Arc<Mutex<Host>>,
+}
+
+/// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
+/// ready for the codec to freeze as its own root-shaped artifact (the form slice 3 established) and
+/// embed in the parent's. The parent's join edge is named the same way a completed child's is, so a
+/// thaw rebuilds it identically.
+pub struct CapturedDetached {
+    /// The task that spawned this child — `0` for a direct child of the root.
+    pub parent_task: usize,
+    /// The spawner's `threads`/join slot the child was minted at.
+    pub slot: usize,
+    /// The child's window at the instant it finished unwinding — its whole separate image, in the one
+    /// image form ([`MemLayout`], #1456), which is what [`temen_snapshot::freeze_layout`] consumes.
+    pub window: MemLayout,
+    /// `log2` of the child's reservation, the other half `freeze_layout` needs.
+    pub reserved_log2: u8,
+    /// The child's powerbox, for its handle table / JIT / named-cap residue.
+    pub host: Arc<Mutex<Host>>,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -9534,6 +9879,13 @@ struct VCpu {
     /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
     /// run leaves it `NORMAL` and never touches the word.
     dstate: i32,
+    /// #1584 — set while this vCPU sits in `wait_waiters` for a futex wait the guest asked to last
+    /// **forever**. Its `timers` entry is then the [`MAX_WAIT`] anti-wedge backstop, not a deadline
+    /// anyone asked for, so it must not read as "this park will wake on its own" when
+    /// freeze-on-quiesce decides whether the run has quiesced. Carried on the vCPU rather than
+    /// beside the waiter store so it travels with the park through every queue that can hold it
+    /// (INVARIANTS #15: no second structure to keep in step). Meaningless while runnable.
+    wait_indefinite: bool,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -9658,6 +10010,18 @@ struct VCpu {
     /// set the vCPU traps (`ThreadFault`, which `poll` reports as `2`), so the child's whole subtree
     /// self-terminates. `None` on the root and top-level threads (nothing above them to kill them).
     kill: Option<Arc<AtomicBool>>,
+    /// #1361 step 3 — the **freeze doorbell**: `Some` on a *detached* §14 child, whose window its
+    /// parent cannot reach. A nested child is told to unwind by one word written into the parent's
+    /// own image (`carve_off + STATE_OFF`); a detached child owns its window elsewhere and the
+    /// parent deliberately holds no pointer into it (`window_exposed = false` is structural), so the
+    /// broadcast is rung out-of-band instead — the same shape as [`kill`](Self::kill), which already
+    /// crosses this boundary.
+    ///
+    /// It is a **doorbell, not a second unwinding path** (INVARIANTS #15): all it does is write
+    /// `UNWINDING` into this domain's *own* global freeze word, which is the one thing that makes any
+    /// durable domain unwind. The instrumented code takes it from there exactly as it would for a
+    /// root freeze. `None` on every other vCPU — the common case, one predicted branch.
+    freeze_bell: Option<Arc<AtomicBool>>,
     /// #796 L2 async signals — one entry (`frames.len()` just after the push) per **live injected
     /// signal-handler frame**, innermost last. Empty = not in a handler. Delivery may **nest**
     /// (a different unmasked signal can interrupt a running handler — the source blocks the
@@ -9670,6 +10034,22 @@ struct VCpu {
     /// kill flag ([`VCpu::kill`]), so `Instantiator.kill(child)` sets it. Sparse (only §14 children,
     /// not `thread.spawn` threads, which share their §14 ancestor's flag); empty on a leaf vCPU.
     child_kill: BTreeMap<usize, Arc<AtomicBool>>,
+    /// #1361 step 3 — a parent's map from a **detached** child's join slot to that child's freeze
+    /// doorbell ([`VCpu::freeze_bell`]), so a subtree freeze can ring it. The detached twin of
+    /// [`child_kill`](Self::child_kill), and sparse for the same reason: only op-15 children have one
+    /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
+    child_freeze: BTreeMap<usize, Arc<AtomicBool>>,
+    /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
+    /// innermost first. A worker may run it only while every bounded cap in the chain has room
+    /// ([`lane_enter`]); it holds those lanes exactly while it is on a worker and releases them the
+    /// moment it parks, yields or finishes ([`lane_leave`]). Copied from the spawner at spawn (a
+    /// `thread.spawn` sibling shares its domain's chain; a §14 child prepends its own domain), so it
+    /// never changes for the vCPU's life and needs no lock to read. Empty ⇒ nothing bounded: the hot
+    /// path skips both scheduler locks entirely, which is every run that sets no lane cap.
+    lane_chain: Vec<(usize, i64)>,
+    /// D66 — a parent's map from a **detached** child's join slot to the lane it was granted, so the
+    /// reap ([`credit_child_lane`]) returns it to `granted_lanes`. Only op-15 children have one.
+    child_lane: BTreeMap<usize, i64>,
     /// §3.6 slice 5b — the serve loop's **running handler fiber**, set when the
     /// `svc.poll`/`svc.wait` arm switches into one and consumed when the serve frame re-executes
     /// (the handler returned, fiber-parked, or suspended). See [`ServeRun`].
@@ -9780,6 +10160,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
+            wait_indefinite: false,
             mem,
             host,
             freeze_sink: None,
@@ -9808,8 +10189,12 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
+            lane_chain: Vec::new(),
+            child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -9850,6 +10235,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
+            wait_indefinite: false,
             mem: twin_mem,
             host: twin_host,
             freeze_sink: None,
@@ -9878,8 +10264,12 @@ impl VCpu {
             invoked_ref_slots: None,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: self.sig_handler_stack.clone(), // forked mid-handler: the twin returns from the inherited frame too
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
+            lane_chain: Vec::new(),
+            child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -9944,6 +10334,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
+            wait_indefinite: false,
             mem,
             host,
             freeze_sink: None,
@@ -9972,8 +10363,12 @@ impl VCpu {
             invoked_ref_slots,
             debug: None,
             kill: None,
+            freeze_bell: None,
             sig_handler_stack: Vec::new(),
             child_kill: BTreeMap::new(),
+            child_freeze: BTreeMap::new(),
+            lane_chain: Vec::new(),
+            child_lane: BTreeMap::new(),
             serve_run: None,
             handler_parks: BTreeMap::new(),
             serve_count: 0,
@@ -10328,6 +10723,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                 .and_then(|x| *x)
                 .ok_or(Trap::ThreadFault)?;
             v.threads[slot] = None; // a handle is joined once
+            credit_child_lane(&mut v.child_lane, &v.host, slot); // D66 — before the `?`: a trapped child returns its lane too
             let out = v.sched.take_result(child).ok_or(Trap::Malformed)?;
             let vals = out.result?; // a child trap propagates as this vCPU's trap
             let top = v.frames.len() - 1;
@@ -10400,6 +10796,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         spawn_residue: _,
         vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
+        wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
         mem,
         host,
         freeze_sink, // §4: the effective sink a §14 child inherits so its residue reaches the root host
@@ -10426,8 +10823,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         invoked_ref_slots,
         debug,
         kill,
+        freeze_bell,
         sig_handler_stack,
         child_kill,
+        child_freeze,
+        lane_chain,
+        child_lane,
         serve_run,
         handler_parks,
         serve_count,
@@ -11071,6 +11472,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // fuel, and a §14 child must self-terminate even in a loop that exits on its first
             // iteration (no back-edge), so it can't wait for a safepoint.
             poll_kill(kill.as_deref())?;
+            // #1361 step 3 — the freeze doorbell. A **detached** child owns a window its parent
+            // cannot write, so a subtree freeze rings this instead of broadcasting into a carve. All
+            // it does is set our OWN global freeze word: from here the instrumented code unwinds
+            // exactly as it would for a root freeze, so there is still one unwinding path and this is
+            // a doorbell for it (#15). Idempotent, and placed here rather than at a safepoint for the
+            // same reason `kill` is — a child must be reachable even in a loop with no back-edge.
+            // Free when unarmed (`None`); when armed, one relaxed load per op.
+            if freeze_bell
+                .as_deref()
+                .is_some_and(|b| b.load(Ordering::Relaxed))
+            {
+                if let Some(m) = mem.as_mut() {
+                    if m.durable_state() == STATE_NORMAL {
+                        m.durable_set_state(STATE_UNWINDING);
+                    }
+                }
+            }
             // #796 default actions — a `SIG_DFL` terminate delivered to this domain: die at the
             // next op, exactly like the parent-set kill flag (the exit hook reports term-by-signal
             // from the personality's bookkeeping). Checked before stop — death beats stop, so a
@@ -11850,9 +12268,29 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 ch.set_durable(durable);
                                 // §6: stamp the child's attestation — nested (its carve is a superset
                                 // the parent reads), freezable iff durable, tier inherited from us.
+                                let carve = (ibase.saturating_add(off), child_size);
                                 let catt = {
-                                    let hg = host.lock_unpoisoned();
-                                    hg.child_attestation(durable)
+                                    let mut hg = host.lock_unpoisoned();
+                                    // #1440: R1's "for a nested carve child the grant is implied by
+                                    // the aliasing" written as an actual grant. Minted over the whole
+                                    // **instantiator** range, not this one carve: authority is
+                                    // containment-based, so one grant covers every child carved from
+                                    // it — which also keeps a guest that spawns hundreds of children
+                                    // from spending a handle-table slot per spawn. `holds_` makes it
+                                    // idempotent, and the fallible grant means a full table costs the
+                                    // exposure bit's precision, never the run.
+                                    if durable
+                                        && !hg.holds_freeze_authority(FreezeScope::Carve {
+                                            base: carve.0,
+                                            size: carve.1,
+                                        })
+                                    {
+                                        let _ = hg.try_grant_freeze_authority(FreezeScope::Carve {
+                                            base: ibase,
+                                            size: isize,
+                                        });
+                                    }
+                                    hg.child_attestation(durable, Some(carve))
                                 };
                                 ch.set_attestation(catt);
                                 let cinst = ch.grant_instantiator(0, child_size);
@@ -12098,6 +12536,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // parent sets it via `Instantiator.kill`.
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
+                                    // D66 — the child's lane chain: its own domain (a nested child's
+                                    // own cap is unbounded; it counts against ours) then ours.
+                                    let chain_child = {
+                                        let mut c = vec![(
+                                            child_host.lock_unpoisoned().domain_id() as usize,
+                                            -1i64,
+                                        )];
+                                        c.extend(lane_chain.iter().copied());
+                                        c
+                                    };
                                     // §13.4 slice 4c: the join slot `threads.push` below will
                                     // assign — threaded into the child so its self-unwind can
                                     // key its host-state residue.
@@ -12164,6 +12612,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // so a mid-freeze instantiate composes recursively.
                                         child.dstate = child_dstate;
                                         child.kill = Some(kflag_child); // S3: parent-settable kill flag
+                                        child.lane_chain = chain_child; // D66: own domain, then ours
                                         Box::new(child)
                                     });
                                     match made {
@@ -12236,6 +12685,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let child = threads[slot].ok_or(Trap::ThreadFault)?;
                             threads[slot] = None; // no longer joinable
                             let _ = sched.take_result(child); // reap if already finished
+                            credit_child_lane(child_lane, host, slot); // D66
                             frames[top].vals.push(Reg::from_i32(0));
                         }
                         // kill(child) -> 0 | -ESRCH (PROCESS.md S3): set the child's subtree kill flag;
@@ -12435,17 +12885,24 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // keeps a durable parent's detached child capturable at all. Inert
                             // behind the `!durable` gate today; load-bearing the moment it comes out.
                             let mod_durable_ok = !durable || cm.durable;
-                            let admitted = ok_entry
+                            // D66 — admission is one call, shared by every engine: the funding
+                            // budget's lane is reserved against our Σ and its `mem` spent, or neither.
+                            let admitted = (ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && mod_durable_ok
                                 && payload_ok
                                 && premap_ok
-                                && !durable
-                                && host.lock_unpoisoned().budget_mem_take(budget, child_size);
-                            if !admitted {
+                                && !durable)
+                                .then(|| {
+                                    host.lock_unpoisoned()
+                                        .admit_detached_spawn(budget, child_size)
+                                })
+                                .flatten();
+                            if admitted.is_none() {
                                 frames[top].vals.push(Reg::from_i32(EINVAL as i32));
                             } else {
+                                let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
                                 let mut fm = Mem::with_reservation(
@@ -12605,6 +13062,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     if let Some(b) = rec_b.as_ref() {
                                         child_host.lock_unpoisoned().set_channel_cap(b.channel);
                                     }
+                                    // D66 — the child's own lane cap, from the funding budget (the
+                                    // admission already reserved it against ours).
+                                    child_host.lock_unpoisoned().set_lane_cap(child_lane_val);
                                     let child_fuel = match rec_b.as_ref() {
                                         Some(b) if b.fuel >= 0 => (b.fuel as u64).min(*fuel),
                                         Some(_) => *fuel,
@@ -12629,6 +13089,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     let csched = sched.clone();
                                     let kflag = Arc::new(AtomicBool::new(false));
                                     let kflag_child = Arc::clone(&kflag);
+                                    // #1361 step 3 — the freeze doorbell, minted beside the kill flag
+                                    // because it crosses the same boundary for the same reason: the
+                                    // parent keeps lifecycle authority over a child whose window it
+                                    // cannot reach (PROCESS.md §5, "detachment severs *read*, not
+                                    // lifecycle"). A freeze is a lifecycle action.
+                                    let bell = Arc::new(AtomicBool::new(false));
+                                    let bell_child = Arc::clone(&bell);
+                                    // D66 — the child's lane chain: its own domain at its own cap, then
+                                    // ours, so its tasks count against both (INVARIANTS #3 ruling).
+                                    let chain_child = {
+                                        let mut c = vec![(
+                                            child_host.lock_unpoisoned().domain_id() as usize,
+                                            child_lane_val,
+                                        )];
+                                        c.extend(lane_chain.iter().copied());
+                                        c
+                                    };
                                     let made = sched.spawn(move |id| {
                                         // A detached child is its own domain: own dispatch
                                         // table, own window; NOT `nested_child` (no carve to
@@ -12661,15 +13138,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         // host's.
                                         child.durable = durable;
                                         child.kill = Some(kflag_child); // lifecycle stays the spawner's
+                                        child.freeze_bell = Some(bell_child); // and so does the freeze
+                                        child.lane_chain = chain_child; // D66: own domain (its lane), then ours
                                         Box::new(child)
                                     });
                                     match made {
                                         Some(child_id) => {
                                             threads.push(Some(child_id));
                                             child_kill.insert(threads.len() - 1, kflag);
-                                            // Live offers over a detached child work exactly as
-                                            // nested (`child_offer` + caller parking): the
-                                            // linkage is the powerbox Arc, not the window.
+                                            child_freeze.insert(threads.len() - 1, bell);
+                                            child_lane.insert(threads.len() - 1, child_lane_val); // D66
+                                                                                                  // Live offers over a detached child work exactly as
+                                                                                                  // nested (`child_offer` + caller parking): the
+                                                                                                  // linkage is the powerbox Arc, not the window.
                                             child_hosts.insert(threads.len() - 1, child_host_keep);
                                             frames[top]
                                                 .vals
@@ -14606,6 +15087,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                               // **Share** the fiber registry (D57 3b-i): one handle namespace per domain, so
                                               // the child can resume fibers the parent (or a sibling) created and suspended.
                     let creg = Arc::clone(registry);
+                    let chain_sib = lane_chain.clone(); // D66
                     let parent_id = *id; // the spawning vCPU's task — the child's `parent_task`
                     let csched = sched.clone();
                     // A debugged run shares one breakpoint/watchpoint set across all threads
@@ -14647,6 +15129,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         child.spawn_residue = Some((entry, vec![spv, av]));
                         child.debug = cdebug.map(|sh| Box::new(DebugCtx::new(sh)));
                         child.kill = kill_inherit; // S3: inherit the §14 subtree kill flag (or None)
+                        child.lane_chain = chain_sib; // D66: a sibling shares its domain's chain
                         Box::new(child)
                     });
                     match made {
@@ -14727,6 +15210,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         expected: exp,
                         width,
                         timeout_ns: wait.as_nanos() as u64,
+                        indefinite: to_ns < 0,
                     }));
                 }
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
@@ -16898,6 +17382,41 @@ pub enum StreamRole {
 /// The host-side object a handle-table entry dispatches to — the mock equivalent of
 /// §3c's `(methods, object)`. The guest never names or writes this (it lives in host
 /// memory); it is selected only by a *granted* handle index.
+/// What a [`Binding::FreezeAuthority`] covers.
+///
+/// Two scopes because the two kinds of child are named differently, and that difference is the whole
+/// of #1440's hard half. A §14 **nested carve** child *is* a sub-range of its parent's window, so an
+/// address range names it. A **detached** child owns a separate window and has no address in its
+/// parent's frame at all — there is nothing to point at.
+///
+/// One binding parameterized by scope rather than two bindings: "may this holder snapshot that
+/// domain?" is one question, and two variants would be two places to keep the answer (INVARIANTS #15).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FreezeScope {
+    /// The window sub-range `[base, base+size)` — a §14 nested carve, where the range *is* the child.
+    /// Covers by **containment**: authority over a range covers anything inside it, the same rule
+    /// [`Binding::AddressSpace`]/[`Binding::Instantiator`] sub-ranges use. One grant over an
+    /// instantiator's range therefore covers every carve from it, instead of costing a handle-table
+    /// slot per spawn.
+    Carve { base: u64, size: u64 },
+    /// Every **detached** child the holder spawns — all of them or none.
+    ///
+    /// Deliberately not per-child (owner decision): a detached child has no sub-range to be named by,
+    /// and the per-child alternatives both have costs worth deferring — a domain id would have to be
+    /// recorded in the artifact and re-linked on thaw first, and naming a child by its spawn edge
+    /// rebinds silently when a join slot is recycled. All-or-nothing needs none of that and is the
+    /// granularity the blocking question actually wants.
+    ///
+    /// **This one must never be self-minted.** A nested parent already reads its child's carve, so
+    /// granting itself authority there documents a fact. A detached child's window is *not* readable
+    /// by its parent — that is what detached means — so authority over one is a real new power, and a
+    /// parent that could mint it for itself would dissolve the isolation it just asked for. It comes
+    /// from above (the embedder, or an ancestor re-granting downward) or not at all, which holds by
+    /// construction: no guest-reachable op mints a capability, and the §14 spawn path mints only the
+    /// [`Carve`](FreezeScope::Carve) form.
+    DetachedProgeny,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Binding {
     Stream {
@@ -16958,6 +17477,9 @@ enum Binding {
         base: u64,
         size: u64,
     },
+    /// **Freeze authority** — the authority to snapshot a domain (#1440, INVARIANTS #14 R1,
+    /// PROCESS.md O14). What it covers is the [`FreezeScope`].
+    FreezeAuthority(FreezeScope),
     /// A §14 `ModuleLoader` handle (iface 7) — pure authority (no per-instance state), so a unit
     /// variant like [`Binding::Exit`]. op 0 `from_bytes(ptr, len)` has the host decode+verify a
     /// wire-encoded module from the holder's window and mints a [`Binding::Module`] for it. The
@@ -17022,6 +17544,13 @@ pub struct BudgetState {
     /// #989 — remaining host-served **channel memory** (bytes), the 4th splittable dimension. `-1` =
     /// unbounded. Stamped onto a §14 child's [`Host::channel_cap`] at spawn.
     pub channel: i64,
+    /// D66 / #1586 — the **lane** a child spawned with this budget receives: how many tasks of its
+    /// subtree may be *running at once* (INVARIANTS #3 ruling 2026-09-21). `-1` = unbounded. Unlike
+    /// the four stocks above this is a **ceiling, not a transfer**: `split` hands a child a lane
+    /// bounded by the holder's own [`Host::lane_cap`] and the holder keeps its cap; the grantor's
+    /// Σ-of-granted-lanes ≤ its cap is enforced at spawn ([`Host::admit_detached_spawn`]), and a
+    /// reaped child returns its lane. Stamped onto the child's [`Host::lane_cap`] at spawn.
+    pub lane: i64,
 }
 
 /// §6 (PROCESS.md) — a domain's platform-vouched **attestation**, reported by `self.attest`. The
@@ -17072,8 +17601,9 @@ impl Attestation {
 /// into a fresh `Host` reconstructs the exact authority. The `JitTable`/`JitCode` variants
 /// (Slice 2) are re-grantable *because* the domain's out-of-line unit state is captured
 /// alongside ([`Host::capture_durable_jit`]) and rebuilt positionally on thaw, so the binding's
-/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Module`,
-/// `Blocking`, `HostProc`) are **not** durable: a live one makes the domain non-snapshottable.
+/// index stays valid. The remaining non-value bindings (`SharedRegion`, `Blocking`, an unnamed
+/// `HostProc`, a non-freezable `Module`) are **not** durable: a live one makes the domain
+/// non-snapshottable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DurableBinding {
     Stream(StreamRole),
@@ -17088,6 +17618,10 @@ pub enum DurableBinding {
         base: u64,
         size: u64,
     },
+    /// Freeze authority, and what it covers (#1440). Value-typed, so a thawed parent holds the same
+    /// authority over its thawed child that it held before the freeze — without this, a round trip
+    /// would launder a domain's exposure away and `attest` would start lying.
+    FreezeAuthority(FreezeScope),
     /// §13.4 slice 4d — a live-callee offer (`child_offer`) over a §14 child, named
     /// **structurally** by the callee's join `slot` in the holder's own table + the offer
     /// `export` (a `DomainId`/`Arc` is process-local and never rides the artifact). The thaw
@@ -17112,6 +17646,24 @@ pub enum DurableBinding {
     JitCode {
         domain: u32,
         unit: u32,
+    },
+    /// #1361 — a §14 [`Binding::Module`] grant the granting host attested **freezable**
+    /// (`grant_durable_module` ran `temen_durable::transform_module` on it), named by its §4
+    /// content digest. The module *bytes* never ride an artifact (D-scope): the restoring host
+    /// re-grants the same module and this digest re-resolves the handle against it — exactly the
+    /// rule a separate-module [`FrozenNested`] child already re-attaches by
+    /// ([`Host::module_by_digest`]), reused rather than duplicated.
+    ///
+    /// A grant *without* the attestation stays non-durable ([`NonDurableKind::Module`]): a durable
+    /// domain may not instantiate one anyway (DURABILITY.md §4), so there is nothing a thaw could
+    /// usefully hand back. This is the same conditional shape [`Named`](Self::Named) has — durable
+    /// iff the grant carries a reconstruction rule the restoring host can act on.
+    ///
+    /// Authority is unchanged: a digest is not authority. The thaw resolves it only against modules
+    /// the **restoring** host chose to grant, so a moment cannot carry in code a host would not have
+    /// granted fresh (INVARIANTS #3).
+    Module {
+        digest: [u8; 32],
     },
     /// #1455 — an embedder host capability ([`Binding::HostProc`]) that carries a registered
     /// **name**, so a thaw can re-grant it. A host-proc is a closure: its code address is
@@ -17874,6 +18426,16 @@ pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Se
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NamedCapRestoreError {
     pub name: String,
+}
+
+/// Why a thaw could not re-resolve a durable [`DurableBinding::Module`] handle (#1361): the
+/// restoring host holds no **durable** module grant whose §4 content digest matches. Fail-closed,
+/// and carrying the digest, so an embedder can tell "I forgot to re-grant it" from "I re-granted a
+/// different build". The bytes never ride the artifact (D-scope), so re-granting the same module is
+/// the embedder's half of the contract, exactly as for a separate-module nested child.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ModuleRestoreError {
+    pub digest: [u8; 32],
 }
 
 /// #1502 — the thaw-side **budget hook**: given a carried `Budget`'s remaining quotas, what the
@@ -18668,6 +19230,26 @@ pub struct Host {
     /// `Budget`'s `channel` field, so a parent's `Budget` split bounds a child's channel memory the
     /// same way it bounds fuel/mem/spawn.
     channel_cap: i64,
+    /// D66 — this domain's **lane cap**: how many tasks of its subtree may be *running at once*
+    /// (INVARIANTS #3 ruling 2026-09-21). `-1` = unbounded (the default — every existing run). A §14
+    /// spawn stamps the child's from the funding budget's `lane`; the embedder sets the root's
+    /// ([`Host::set_lane_cap`]). Enforced at **dispatch** by the scheduler, against this cap and every
+    /// enclosing one (a task counts against its own lane and each ancestor's).
+    lane_cap: i64,
+    /// D66 — Σ of the lanes this domain has granted to its **live** detached children. A spawn admits
+    /// only if `granted_lanes + lane ≤ lane_cap` ([`Host::admit_detached_spawn`]); a reaped child
+    /// returns its lane ([`Host::give_lane`]). Ceiling semantics: this domain's own tasks may still fill
+    /// any lane it holds, including a child's.
+    granted_lanes: i64,
+    /// D66 — the domain that spawned this one (its [`Host::domain_id`]), `None` for a root. Set by
+    /// [`Host::spawn_child_powerbox`] on every §14 builder path, so a child's lane chain can be walked.
+    parent_domain: Option<u64>,
+    /// D66 — the lane [`Host::admit_detached_spawn`] just reserved, waiting for the builder that
+    /// follows it to stamp on the child ([`Host::spawn_detached_child`] consumes it). The JIT's op-15
+    /// thunk admits and builds through two hooks with no channel between them; this is that channel,
+    /// on the one object both hooks hold. The interpreter's arm sets the child's cap directly and
+    /// never reads it (its `take` and `build` are one arm), so it is inert there.
+    pending_child_lane: Option<i64>,
     /// §6 (PROCESS.md) — this domain's platform-vouched provenance, reported verbatim by
     /// `self.attest`. Defaults to a **root** report ([`Attestation::default`]); the embedder sets it
     /// for the top-level domain and the §14 spawn path stamps a nested child's (exposed) one.
@@ -18983,6 +19565,14 @@ pub struct Host {
     /// refused) and **in** to a thaw (the seeding posts each result and rebuilds the join edge).
     /// See [`FrozenDetached`]. Empty for every run that froze no completed detached child.
     frozen_detached: Vec<FrozenDetached>,
+    /// #1361 step 3 — **live** detached children a freeze rang the doorbell for, awaiting harvest by
+    /// the run driver (see [`PendingDetached`]). Transient: the driver drains this into
+    /// [`captured_detached`](Self::captured_detached) once each child has unwound and finished, so a
+    /// non-empty one at the end of a run is a child that never got there (#1584).
+    pending_detached: Vec<PendingDetached>,
+    /// #1361 step 3 — the harvested form (see [`CapturedDetached`]): each live detached child's
+    /// unwound window + powerbox, for the codec to embed as a sub-artifact.
+    captured_detached: Vec<CapturedDetached>,
     /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
     /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
     /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
@@ -19335,6 +19925,10 @@ impl Host {
             pipes: Vec::new(),
             channel_used: Arc::new(std::sync::atomic::AtomicI64::new(0)), // #989
             channel_cap: -1, // #989 — unbounded by default
+            lane_cap: -1,    // D66 — unbounded by default
+            granted_lanes: 0,
+            parent_domain: None,
+            pending_child_lane: None,
             attestation: Attestation::default(),
             modules: Vec::new(),
             region_factory: None,
@@ -19394,6 +19988,8 @@ impl Host {
             frozen_vcpus: Vec::new(),
             frozen_nested: Vec::new(),
             frozen_detached: Vec::new(),
+            pending_detached: Vec::new(),
+            captured_detached: Vec::new(),
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
@@ -20402,6 +20998,22 @@ impl Host {
 
     /// Seed the completed detached children a **thaw** must deliver, alongside the restored window
     /// (the in-memory counterpart of [`Host::set_frozen_nested`]).
+    /// #1361 step 3 — the **live** detached children this run's freeze captured, each with its own
+    /// unwound window and powerbox (see [`CapturedDetached`]). The codec freezes each as its own
+    /// root-shaped artifact and embeds it in the parent's.
+    pub fn captured_detached(&self) -> &[CapturedDetached] {
+        &self.captured_detached
+    }
+
+    /// #1361 step 3 — detached children the freeze rang the doorbell for that **never reached their
+    /// poll** (parked on a futex or a join, so they never unwound). Non-empty means the artifact
+    /// would be incomplete: a caller must refuse rather than emit it. Tracked as #1584 — a child
+    /// should not be able to veto its parent's freeze, so this is the fail-closed resting state, not
+    /// the end state.
+    pub fn unreached_detached(&self) -> &[PendingDetached] {
+        &self.pending_detached
+    }
+
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
     }
@@ -21074,10 +21686,19 @@ impl Host {
                 Binding::Clock => DurableBinding::Clock,
                 Binding::AddressSpace { base, size } => DurableBinding::AddressSpace { base, size },
                 Binding::Instantiator { base, size } => DurableBinding::Instantiator { base, size },
+                Binding::FreezeAuthority(scope) => DurableBinding::FreezeAuthority(scope),
                 Binding::SharedRegion(_) => {
                     return Err(self.non_durable(slot, NonDurableKind::SharedRegion))
                 }
-                Binding::Module(_) => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                // #1361: a module grant the granting host attested **freezable** (§4) is durable —
+                // named by its content digest, which the thaw resolves against the restoring host's
+                // re-granted modules (the same rule a separate-module nested child re-attaches by).
+                // An un-attested grant is still refused: a durable domain cannot instantiate one,
+                // so there is no authority for a thaw to reconstruct.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => DurableBinding::Module { digest: g.digest },
+                    _ => return Err(self.non_durable(slot, NonDurableKind::Module)),
+                },
                 Binding::ModuleLoader => {
                     return Err(self.non_durable(slot, NonDurableKind::ModuleLoader))
                 }
@@ -21160,6 +21781,7 @@ impl Host {
                 | Binding::Clock
                 | Binding::AddressSpace { .. }
                 | Binding::Instantiator { .. }
+                | Binding::FreezeAuthority(_)
                 // Slice 2: guest-JIT handles are durable (their unit state rides the artifact via
                 // `capture_durable_jit`), so a drain keeps them — the complement of `capture` above.
                 | Binding::JitTable(_)
@@ -21168,7 +21790,12 @@ impl Host {
                 // complement of `capture` above.
                 | Binding::Budget(_) => continue,
                 Binding::SharedRegion(_) => NonDurableKind::SharedRegion,
-                Binding::Module(_) => NonDurableKind::Module,
+                // #1361: the complement of `capture` above — an attested-freezable grant is
+                // durable and a drain keeps it; an un-attested one is still relinquished.
+                Binding::Module(id) => match self.modules.get(id as usize) {
+                    Some(g) if g.durable => continue,
+                    _ => NonDurableKind::Module,
+                },
                 Binding::ModuleLoader => NonDurableKind::ModuleLoader,
                 Binding::Blocking(_) => NonDurableKind::Blocking,
                 Binding::HostProc(_) => NonDurableKind::HostProc,
@@ -21214,6 +21841,7 @@ impl Host {
                 DurableBinding::Clock => Binding::Clock,
                 DurableBinding::AddressSpace { base, size } => Binding::AddressSpace { base, size },
                 DurableBinding::Instantiator { base, size } => Binding::Instantiator { base, size },
+                DurableBinding::FreezeAuthority(scope) => Binding::FreezeAuthority(scope),
                 DurableBinding::LiveImpl { slot, export } => {
                     // §13.4 slice 4d: install a placeholder entry (its `callee`/`sigs` are
                     // patched once the §14 child at `slot` is re-created — see
@@ -21235,6 +21863,15 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1361: re-resolve the module the artifact *names* against what this host has been
+                // granted. `check_modules_for_thaw` validated every carried digest before any slot
+                // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
+                // anyway, leaving the slot closed drops the authority rather than forging one, and
+                // the guest's handle value becomes a dead generation (D37).
+                DurableBinding::Module { digest } => match self.module_id_by_digest(&digest) {
+                    Some(id) => Binding::Module(id),
+                    None => continue,
+                },
                 // #1455: re-pin the named capability at its captured index. The handler behind it was
                 // re-granted by `restore_durable_named` (positionally, before this), so the index
                 // resolves — and a name the registrar declined never reaches here, because that
@@ -21252,6 +21889,27 @@ impl Host {
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
+    /// modules, **before** [`Self::restore_durable_handles`] pins anything. The module twin of
+    /// [`Self::restore_durable_named`]'s registrar step, and fail-closed for the same reason: an
+    /// artifact *names* a module, it never carries one, so a restore that cannot find it must fail
+    /// rather than thaw a domain holding a handle to nothing.
+    ///
+    /// Reports the **first** unresolved digest, so the restore is all-or-nothing like the capture.
+    pub fn check_modules_for_thaw(
+        &self,
+        handles: &[DurableHandle],
+    ) -> Result<(), ModuleRestoreError> {
+        for h in handles {
+            if let DurableBinding::Module { digest } = h.binding {
+                if self.module_id_by_digest(&digest).is_none() {
+                    return Err(ModuleRestoreError { digest });
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The name registered for the grant living at `slot`, if any — the reverse of
@@ -21405,6 +22063,7 @@ impl Host {
                     && attenuates(carried.mem, o.mem)
                     && attenuates(carried.spawn, o.spawn)
                     && attenuates(carried.channel, o.channel)
+                    && attenuates(carried.lane, o.lane)
             });
             match (ok, offered) {
                 (true, Some(o)) => h.binding = DurableBinding::Budget(o),
@@ -21541,6 +22200,83 @@ impl Host {
     /// split bounds a child's host-served pipe memory. Embedders leave it `-1` (unchanged behaviour).
     pub fn set_channel_cap(&mut self, cap: i64) {
         self.channel_cap = cap;
+    }
+
+    /// D66 — set this domain's lane cap (see [`Host::lane_cap`]); `-1` = unbounded. The embedder sets
+    /// the root's before the run; a §14 spawn sets a child's from its funding budget.
+    pub fn set_lane_cap(&mut self, cap: i64) {
+        self.lane_cap = cap;
+    }
+
+    /// D66 — this domain's lane cap (`-1` = unbounded).
+    pub fn lane_cap(&self) -> i64 {
+        self.lane_cap
+    }
+
+    /// D66 — the domain that spawned this one, or `None` for a root.
+    pub fn parent_domain(&self) -> Option<u64> {
+        self.parent_domain
+    }
+
+    /// D66 — the Σ of lanes granted to live detached children (a monitoring readout).
+    pub fn granted_lanes(&self) -> i64 {
+        self.granted_lanes
+    }
+
+    /// D66 — reserve `lane` for a child about to be spawned: the grant-time Σ check. `true` (and
+    /// `granted_lanes` raised) if `lane` is unbounded, this cap is unbounded, or the sum fits;
+    /// `false` (nothing changed) otherwise. Paired with [`Host::give_lane`] at reap.
+    pub fn try_grant_lane(&mut self, lane: i64) -> bool {
+        if lane < 0 {
+            return true; // an unbounded child lane draws nothing from the Σ
+        }
+        if self.lane_cap >= 0 && self.granted_lanes.saturating_add(lane) > self.lane_cap {
+            return false;
+        }
+        self.granted_lanes = self.granted_lanes.saturating_add(lane);
+        true
+    }
+
+    /// D66 — return a lane reserved by [`Host::try_grant_lane`] once its child is reaped. A no-op for
+    /// an unbounded lane (nothing was drawn).
+    pub fn give_lane(&mut self, lane: i64) {
+        if lane >= 0 {
+            self.granted_lanes = (self.granted_lanes - lane).max(0);
+        }
+    }
+
+    /// D66 / #1289 R2 — **the one detached-spawn admission** every engine calls (INVARIANTS #15): the
+    /// funding budget's lane is reserved against this domain's Σ ([`Host::try_grant_lane`]) and its
+    /// `mem` is spent for the window ([`Host::budget_mem_take`]), as one step — if the second refuses
+    /// the first is undone, so a refused spawn charges nothing on either axis. `Some(lane)` = admitted
+    /// (the lane to stamp on the child and to return at its reap); `None` = refused, probeably.
+    pub fn admit_detached_spawn(&mut self, budget: i32, child_size: u64) -> Option<i64> {
+        let lane = self.peek_budget(budget).map_or(-1, |b| b.lane);
+        if !self.try_grant_lane(lane) {
+            return None;
+        }
+        if !self.budget_mem_take(budget, child_size) {
+            self.give_lane(lane);
+            return None;
+        }
+        self.pending_child_lane = Some(lane);
+        Some(lane)
+    }
+
+    /// #1587 — return `bytes` to the `mem` field of the `Budget` behind `handle`: the undo of a
+    /// [`Host::budget_mem_take`] whose spawn then failed *after* the take (the JIT's OS-thread spawn is
+    /// the one refusal on that path that happens after the commit). Inert on an unbounded budget and on
+    /// a forged handle; never raises a bounded field past what a take drew, because it is only ever
+    /// called once per failed take.
+    pub fn budget_mem_give(&mut self, handle: i32, bytes: u64) {
+        let Ok(Binding::Budget(idx)) = self.resolve(handle, cap_id::BUDGET) else {
+            return;
+        };
+        if let Some(b) = self.budgets.get_mut(idx as usize) {
+            if b.mem >= 0 {
+                b.mem = b.mem.saturating_add(bytes as i64);
+            }
+        }
     }
 
     /// #989 — the domain's live channel-memory total (bytes), for the §15 monitoring readout and tests.
@@ -22734,6 +23470,49 @@ impl Host {
         self.grant(cap_id::INSTANTIATOR, Binding::Instantiator { base, size })
     }
 
+    /// Grant **freeze authority** over the window sub-range `[base, base+size)` — the authority to
+    /// snapshot the domain living there (#1440).
+    ///
+    /// For a §14 nested carve the range is the child's carve, which is what makes the R1 rule
+    /// ("for a nested carve child the grant is implied by the aliasing") expressible as a real grant
+    /// rather than an inference from placement: the spawn path mints this, and
+    /// [`holds_freeze_authority`](Host::holds_freeze_authority) is how a later freeze asks.
+    pub fn grant_freeze_authority(&mut self, scope: FreezeScope) -> i32 {
+        self.grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
+    }
+
+    /// [`grant_freeze_authority`](Host::grant_freeze_authority), fallible — `None` when the handle
+    /// table is full. The spawn path uses this rather than the panicking form: a guest chooses how
+    /// many children it spawns, so a per-spawn grant that could exhaust the 256-slot table would hand
+    /// it a way to abort the host (INVARIANTS #5 — a trap is for forgery, not for a benign guest doing
+    /// a lot of legitimate work).
+    pub fn try_grant_freeze_authority(&mut self, scope: FreezeScope) -> Option<i32> {
+        self.try_grant(cap_id::FREEZE_AUTHORITY, Binding::FreezeAuthority(scope))
+    }
+
+    /// Whether this host holds freeze authority covering `scope` — i.e. may snapshot what it names.
+    ///
+    /// A [`Carve`](FreezeScope::Carve) matches by **containment**: authority over a range covers
+    /// anything inside it. [`DetachedProgeny`](FreezeScope::DetachedProgeny) matches exactly — it is
+    /// all-or-nothing by construction, so there is nothing to contain.
+    ///
+    /// A domain nobody holds authority over is **confidential**; that is the whole of the
+    /// confidential/ancestor-freezable distinction (INVARIANTS #14 R1 §6), derived from the absence of
+    /// a grant rather than tracked as a state of its own.
+    pub fn holds_freeze_authority(&self, scope: FreezeScope) -> bool {
+        self.table.iter().any(|slot| match (slot.entry, scope) {
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::Carve { base: b, size: n })),
+                FreezeScope::Carve { base, size },
+            ) => b <= base && base.saturating_add(size) <= b.saturating_add(n),
+            (
+                Some(Binding::FreezeAuthority(FreezeScope::DetachedProgeny)),
+                FreezeScope::DetachedProgeny,
+            ) => true,
+            _ => false,
+        })
+    }
+
     /// Resolve a handle as an `Instantiator` (§14) and return its `(base, size)` sub-range, or a
     /// `CapFault` for a forged / closed / wrong-type handle. Used by the eval loop, which services
     /// `instantiate`/`join` itself (the generic dispatch can't reach the executor).
@@ -22853,33 +23632,46 @@ impl Host {
 
     /// Find a granted **durable** module by its content digest (§4 separate-module thaw): the restore
     /// host re-grants the child's module, and its re-attach residue names it by [`module_digest`].
-    /// Returns the grant's function table, or `None` (a missing / mismatched re-grant ⇒
-    /// the thaw fails closed, the per-child R5 identity gate).
-    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+    /// `None` on a missing / mismatched re-grant, so the thaw fails closed — the per-child R5
+    /// identity gate. The single lookup behind every `*_by_digest` accessor and behind a durable
+    /// [`DurableBinding::Module`] handle's re-resolution: one rule for "which grant is this digest",
+    /// not one per consumer (INVARIANTS #15).
+    ///
+    /// Matching is by *content*, so two grants of the same module are interchangeable by
+    /// construction — which is the point of naming a module by what it is rather than by an index.
+    fn grant_by_digest(&self, digest: &[u8; 32]) -> Option<(u32, &ModuleGrant)> {
         self.modules
             .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.funcs))
+            .position(|g| g.durable && &g.digest == digest)
+            .map(|i| (i as u32, &self.modules[i]))
+    }
+
+    /// The `modules` index a durable digest names — what a captured [`DurableBinding::Module`]
+    /// re-binds to on thaw.
+    fn module_id_by_digest(&self, digest: &[u8; 32]) -> Option<u32> {
+        self.grant_by_digest(digest).map(|(i, _)| i)
+    }
+
+    /// The function table of the grant [`Self::grant_by_digest`] names.
+    fn module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[Func]>> {
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.funcs))
     }
 
     /// The type section of the granted module matching `digest` (FuncType interning, #922) — the
     /// sibling of [`Self::module_by_digest`] so a re-granted separate-module thread child resolves
     /// its call variants' interned signatures.
     fn module_types_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<[temen_ir::TypeEntry]>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.types))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.types))
     }
 
     /// §13.4 slice 4c — the whole granted `Module` matching a nested record's digest, for the
     /// thaw to register as the re-created serving child's **self module** (serve admission +
     /// handler resolution need the module, not just its functions).
     fn module_arc_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
-        self.modules
-            .iter()
-            .find(|g| g.durable && &g.digest == digest)
-            .map(|g| Arc::clone(&g.module))
+        self.grant_by_digest(digest)
+            .map(|(_, g)| Arc::clone(&g.module))
     }
 
     /// Resolve a handle as a §14 `Module` grant — the eval loop's lookup for the Instantiator's
@@ -23096,6 +23888,7 @@ impl Host {
                     mem: 0,
                     spawn: 0,
                     channel: 0,
+                    lane: 0,
                 };
                 Some(t)
             }
@@ -23140,6 +23933,7 @@ impl Host {
             mem,
             spawn,
             channel,
+            lane: -1, // D66: unbounded unless a `split` narrows it
         });
         self.grant(cap_id::BUDGET, Binding::Budget(id))
     }
@@ -23170,15 +23964,39 @@ impl Host {
         Attestation {
             tier: self.attestation.tier,
             window_exposed: false,
-            freeze_exposed: false,
+            // Derived, like the nested case (#1440): an ancestor may snapshot this child iff the
+            // spawner holds `DetachedProgeny` *and* the subtree is durable. Both conjuncts matter —
+            // authority is *who may*, durability is *whether a snapshot is possible at all*.
+            //
+            // In practice this is still `false` today, because op 15's `!durable` gate refuses a
+            // durable parent a detached child at all (#1412, restored on all three engines until
+            // #1361's capture lands). Written as the derivation anyway so the gate lift is a change to
+            // the gate and nothing else — and so this stops being a hardcoded `false` that would have
+            // to be remembered.
+            freeze_exposed: self.durable
+                && self.holds_freeze_authority(FreezeScope::DetachedProgeny),
         }
     }
 
-    fn child_attestation(&self, durable: bool) -> Attestation {
+    /// `freeze_exposed` is **derived** when the caller can name the child's carve: an ancestor may
+    /// snapshot it iff someone holds freeze authority covering that range *and* the subtree is
+    /// durable. The two are different questions the single bit had been conflating — authority is
+    /// *who may*, durability is *whether a snapshot is possible at all* — and separating them is what
+    /// lets a detached child be platform-durable and ancestor-confidential at once (PROCESS.md §6).
+    ///
+    /// `carve = None` keeps the old placement reading (durable ⇒ exposed) for the two callers with no
+    /// range in hand: a non-durable child, where the answer is `false` either way, and the thaw
+    /// re-stamp, whose parent's authority rode the freeze but whose carve the restore path does not
+    /// thread through yet. A parameter rather than a second function, so there is one answer to what a
+    /// child's report says (INVARIANTS #15); threading the carve through the thaw closes the `None`.
+    fn child_attestation(&self, durable: bool, carve: Option<(u64, u64)>) -> Attestation {
         Attestation {
             tier: self.attestation.tier,
             window_exposed: true,
-            freeze_exposed: durable,
+            freeze_exposed: durable
+                && carve.is_none_or(|(base, size)| {
+                    self.holds_freeze_authority(FreezeScope::Carve { base, size })
+                }),
         }
     }
 
@@ -23895,7 +24713,7 @@ impl Host {
         // §3.6/5c.0: same-program child — seed the holder's self module (see spawn_named_child).
         ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        ch.set_attestation(self.child_attestation(false));
+        ch.set_attestation(self.child_attestation(false, None));
         let cinst = ch.grant_instantiator(0, child_size);
         let cas = ch.grant_address_space(0, child_size);
         let cg = self.regrant_into_child(grant_handle, &mut ch)?;
@@ -24109,7 +24927,7 @@ impl Host {
         child_size: u64,
     ) -> Option<(Host, i32, i32)> {
         // §6: a named-grant child is nested (window-exposed) and non-durable (not ancestor-freezable).
-        let attestation = self.child_attestation(false);
+        let attestation = self.child_attestation(false, None);
         self.spawn_child_powerbox(grants, child_size, attestation)
     }
 
@@ -24131,8 +24949,12 @@ impl Host {
         // the vCPU; the nesting × durability cell on the resumable engine is #1413's to audit, not
         // this builder's to decide.
         let durable = self.durable;
+        // D66 — the lane the admission that preceded this build reserved (the JIT path's two-hook
+        // sequence); `None` ⇒ unbounded, which is also what an un-admitted build gets.
+        let lane = self.pending_child_lane.take().unwrap_or(-1);
         let (mut ch, cinst, cas) = self.spawn_child_powerbox(grants, reservation, attestation)?;
         ch.set_durable(durable);
+        ch.set_lane_cap(lane);
         Some((ch, cinst, cas))
     }
 
@@ -24148,10 +24970,11 @@ impl Host {
             return None;
         }
         let mut ch = Host::new();
-        // §3.6/5c.0: a named-grant child runs the holder's own program, so its **self module** —
-        // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's
-        // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
-        // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
+        ch.parent_domain = Some(self.domain_id); // D66 — the lane chain's next link
+                                                 // §3.6/5c.0: a named-grant child runs the holder's own program, so its **self module** —
+                                                 // what `offer_shape` and its serve loop resolve against — is the holder's. The interp's
+                                                 // spawn arm re-assigns the same Arc for the same-module case; seeding here makes the JIT
+                                                 // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
         ch.self_module = self.self_module.clone();
         ch.set_attestation(attestation);
         let cinst = ch.grant_instantiator(0, child_size);
@@ -24831,6 +25654,10 @@ impl Host {
             // host-side dispatch cannot park). Reaching it here means a backend tier without
             // the servicing arm: answer probeable, never trap.
             Binding::LiveImpl(_) => Ok(vec![EINVAL]),
+            // #1440: freeze authority is pure authority, like `Module` — the freeze path consults it,
+            // nothing calls it. An `EINVAL` rather than a trap keeps it probeable (INVARIANTS #5:
+            // traps are for forgery, and the handle here is genuine).
+            Binding::FreezeAuthority(_) => Ok(vec![EINVAL]),
             // PROCESS.md §5: a window minter is spawn *evidence* (an `instantiate_detached`
             // argument), not a dispatch target — inert probeable refusal.
             // §3.6 slice 1: `Stream.close` is **real** — the guest-side revocation act (D37
@@ -25208,6 +26035,7 @@ impl Host {
                     mem,
                     spawn,
                     channel,
+                    lane,
                 }) = self.budgets.get(idx)
                 else {
                     return Ok(vec![EINVAL]);
@@ -25233,12 +26061,35 @@ impl Host {
                                 None // over-attenuation of a bounded field
                             }
                         };
-                        let (Some((cf, pf)), Some((cm, pm)), Some((cs, ps)), Some((cc, pc))) = (
+                        // D66 — the lane is a **ceiling** (INVARIANTS #3, 2026-09-21): the child's
+                        // lane is bounded by the holder's own cap, and the holder keeps its cap (no
+                        // draw-down). Omitted ⇒ inherit the holder's cap. Σ-of-lanes ≤ cap is checked
+                        // at *spawn*, where the lane is actually taken up, not here.
+                        let my_cap = self.lane_cap;
+                        let split_lane = |arg: i64| -> Option<i64> {
+                            if arg < 0 {
+                                Some(my_cap)
+                            } else if my_cap < 0 || arg <= my_cap {
+                                Some(arg)
+                            } else {
+                                None // a lane wider than the holder's own cap
+                            }
+                        };
+                        let _ = lane; // the sub-budget's lane derives from the cap, not the field
+                        let (
+                            Some((cf, pf)),
+                            Some((cm, pm)),
+                            Some((cs, ps)),
+                            Some((cc, pc)),
+                            Some(cl),
+                        ) = (
                             split_field(*args.first().unwrap_or(&0), fuel),
                             split_field(*args.get(1).unwrap_or(&0), mem),
                             split_field(*args.get(2).unwrap_or(&0), spawn),
                             split_field(*args.get(3).unwrap_or(&-1), channel), // #989 — omitted ⇒ inherit (unbounded)
-                        ) else {
+                            split_lane(*args.get(4).unwrap_or(&-1)), // D66 — omitted ⇒ inherit the cap
+                        )
+                        else {
                             return Ok(vec![EINVAL]);
                         };
                         // Mint the child budget first; draw down the parent only once the grant
@@ -25249,6 +26100,7 @@ impl Host {
                             mem: cm,
                             spawn: cs,
                             channel: cc,
+                            lane: cl,
                         });
                         Ok(vec![
                             match self.try_grant(cap_id::BUDGET, Binding::Budget(child)) {
@@ -25268,12 +26120,13 @@ impl Host {
                         ])
                     }
                     // read(field) -> remaining | -EINVAL: `0` fuel, `1` mem, `2` spawn (the §15
-                    // monitoring readout). Window-independent — one field per call.
+                    // monitoring readout), `3` channel, `4` lane. Window-independent — one field per call.
                     1 => Ok(vec![match *args.first().unwrap_or(&-1) {
                         0 => fuel,
                         1 => mem,
                         2 => spawn,
                         3 => channel, // #989
+                        4 => lane,    // D66
                         _ => EINVAL,
                     }]),
                     2 => {
@@ -25330,6 +26183,7 @@ impl Host {
                             mem: credit(d.mem, mm),
                             spawn: credit(d.spawn, ms),
                             channel: d.channel, // #989 — transfer (op 2) moves only fuel/mem/spawn; channel passes through
+                            lane: d.lane,       // D66 — a lane is a ceiling, never moved
                         };
                         let h = &mut self.budgets[idx];
                         h.fuel = hf;
@@ -25877,21 +26731,132 @@ pub fn host_region_granularity() -> u64 {
 /// frames, whose window is a bare `Region`; a run driver carrying the page list a previous run handed
 /// back) builds one with [`MemLayout::from_parts`], which speaks the [`Mem::map_info`] page encoding
 /// every FFI and run entry already uses.
+/// A window's **page map**: which pages deviate from the region default, in what page unit, over what
+/// committed prefix. The half of a [`MemLayout`] that is not bytes.
+///
+/// It is its own type because three things carry a page map with **no image** and had been carrying it
+/// as loose parts: a §14 child window's map (its bytes ride the parent's capture), the on-ramp run
+/// driver's carry-forward between cross-tier bounces, and `MemLayout` itself. Loose parts means the
+/// decode, the encode and the page-unit conversion live wherever each holder happens to need them, and
+/// means a holder keeps `prots` and `prots_mapped` as two fields that must agree — the pair-of-fields
+/// shape `MemLayout` was introduced to remove (#1456, INVARIANTS #13/#15).
+///
+/// A `MemLayout` is then exactly `bytes + PageMap`, which is also the honest answer to why the on-ramp
+/// driver could not simply hold a `MemLayout`: it has no image to put in one.
 #[derive(Clone)]
-pub struct MemLayout {
-    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
-    /// uncommitted pages read zero).
-    bytes: Vec<u8>,
+pub struct PageMap {
     /// The guest-visible page-protection entries (window-relative page index ⇒ state), in `page`-byte
     /// pages: every `Rw`/`Ro`/`Unmapped` deviation from the region default. A page absent here is
     /// read-write below `mapped` and unmapped above it — [`Mem`]'s own convention.
     prot: BTreeMap<u64, PageProt>,
     /// The page size those indices are in — the capturing window's protection granularity, which is
     /// not always the reader's (the §12 codec's page is a fixed 4 KiB; a native host's can be 16 KiB).
-    /// [`Mem::restore_layout`] converts against it rather than assuming its own.
+    /// [`rebased_to`](PageMap::rebased_to) converts against it rather than assuming its own.
     page: u64,
     /// The committed prefix `[0, mapped)` — the boundary that gives an *absent* entry its meaning.
     mapped: u64,
+}
+
+impl PageMap {
+    /// A map with no deviations from the region default and no carried prefix — what a driver starts a
+    /// session with, and what a flat window hands back.
+    ///
+    /// The page unit is `1` rather than a real page size because there are no entries for it to scale:
+    /// it is deliberately not `Default`, so a caller states that it means *empty* instead of picking up
+    /// a zero page size that would be silently wrong the moment an entry existed.
+    pub fn empty() -> PageMap {
+        PageMap {
+            prot: BTreeMap::new(),
+            page: 1,
+            mapped: 0,
+        }
+    }
+
+    /// Decode a page list in the [`Mem::map_info`] encoding: `(page_base_byte_offset, kind)` with kind
+    /// `0 = Ro`, `1 = Rw`, `2 = Unmapped`. A `3` (§13 `Backed`) entry is **rejected** — its bytes live
+    /// in a shared region, so an image cannot reproduce it ([`Mem::layout_snapshot_safe`]) — and so is
+    /// an unknown kind, both as `None` rather than a silently dropped protection.
+    pub fn from_entries(page: u64, mapped: u64, entries: &[(u64, u8)]) -> Option<PageMap> {
+        if page == 0 {
+            return None;
+        }
+        let prot = entries
+            .iter()
+            .map(|&(off, kind)| {
+                let p = match kind {
+                    0 => PageProt::Ro,
+                    1 => PageProt::Rw,
+                    2 => PageProt::Unmapped,
+                    _ => return None, // 3 = Backed, or a kind this encoding never had
+                };
+                Some((off / page, p))
+            })
+            .collect::<Option<BTreeMap<_, _>>>()?;
+        Some(PageMap { prot, page, mapped })
+    }
+
+    /// The entries back in the [`Mem::map_info`] encoding — the inverse of
+    /// [`from_entries`](Self::from_entries), for handing the map to a run entry that speaks it.
+    pub fn entries(&self) -> Vec<(u64, u8)> {
+        self.prot
+            .iter()
+            .map(|(&page, prot)| {
+                let kind = match prot {
+                    PageProt::Ro => 0,
+                    PageProt::Rw => 1,
+                    PageProt::Unmapped => 2,
+                    // `from_entries` rejects `Backed` and `layout_snapshot_safe` excludes it, so a map
+                    // built either way never holds one; encode it faithfully rather than invent a kind.
+                    PageProt::Backed { .. } => 3,
+                };
+                (page * self.page, kind)
+            })
+            .collect()
+    }
+
+    /// The page unit the indices are in.
+    pub fn page(&self) -> u64 {
+        self.page
+    }
+
+    /// The committed prefix — what an absent entry means.
+    pub fn mapped(&self) -> u64 {
+        self.mapped
+    }
+
+    /// Whether the map carries no deviation from the region default.
+    pub fn is_empty(&self) -> bool {
+        self.prot.is_empty()
+    }
+
+    /// This map re-expressed in `page`-byte pages. Identity when the units already agree; otherwise
+    /// every page of the target unit an entry covers takes that entry, last one winning — a finer
+    /// entry into a coarser page marks the whole page, the same rounding [`Mem::apply_prots`] does.
+    ///
+    /// The conversion lives here rather than at the restore site because it is a property of the map,
+    /// not of who is installing it — and because the §12 codec's fixed 4 KiB, a 16 KiB native capture
+    /// and a wasm host's 4 KiB all meet at this one function.
+    pub(crate) fn rebased_to(&self, page: u64) -> BTreeMap<u64, PageProt> {
+        if page == self.page {
+            return self.prot.clone();
+        }
+        self.prot
+            .iter()
+            .flat_map(|(&pg, &p)| {
+                let (lo, hi) = (pg * self.page, (pg + 1) * self.page - 1);
+                (lo / page..=hi / page).map(move |hp| (hp, p))
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+pub struct MemLayout {
+    /// Window bytes `[0, high_water)` — the mapped prefix plus any grown reserved-tail page (page-wise;
+    /// uncommitted pages read zero).
+    bytes: Vec<u8>,
+    /// Which pages deviate, in what unit, over what committed prefix.
+    map: PageMap,
 }
 
 impl MemLayout {
@@ -25909,27 +26874,25 @@ impl MemLayout {
         mapped: u64,
         prot: &[(u64, u8)],
     ) -> Option<MemLayout> {
-        if page == 0 {
-            return None;
-        }
-        let prot = prot
-            .iter()
-            .map(|&(off, kind)| {
-                let p = match kind {
-                    0 => PageProt::Ro,
-                    1 => PageProt::Rw,
-                    2 => PageProt::Unmapped,
-                    _ => return None, // 3 = Backed, or a kind this encoding never had
-                };
-                Some((off / page, p))
-            })
-            .collect::<Option<BTreeMap<_, _>>>()?;
         Some(MemLayout {
             bytes,
-            prot,
-            page,
-            mapped,
+            map: PageMap::from_entries(page, mapped, prot)?,
         })
+    }
+
+    /// The page map's entries in the [`Mem::map_info`] encoding — see [`PageMap::entries`].
+    pub fn page_entries(&self) -> Vec<(u64, u8)> {
+        self.map.entries()
+    }
+
+    /// The committed prefix this layout was captured over.
+    pub fn mapped(&self) -> u64 {
+        self.map.mapped()
+    }
+
+    /// The page map half, for a holder that wants the map without the image.
+    pub fn page_map(&self) -> &PageMap {
+        &self.map
     }
 
     /// Build a layout from the §12 codec's **dense** form — one [`CapturedProt`] per
@@ -25940,9 +26903,11 @@ impl MemLayout {
     pub fn from_dense(bytes: Vec<u8>, prots: &[CapturedProt], mapped: u64) -> MemLayout {
         MemLayout {
             bytes,
-            prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped).collect(),
-            page: DURABLE_SNAPSHOT_PAGE,
-            mapped,
+            map: PageMap {
+                prot: sparse_prots(prots, DURABLE_SNAPSHOT_PAGE, mapped).collect(),
+                page: DURABLE_SNAPSHOT_PAGE,
+                mapped,
+            },
         }
     }
 
@@ -25952,7 +26917,12 @@ impl MemLayout {
     /// under a grown high-water stays a hole), and an entry in a coarser page unit covers every codec
     /// page it spans.
     pub fn dense_prots(&self) -> Vec<CapturedProt> {
-        dense_prots(&self.prot, self.page, self.mapped, self.bytes.len() as u64)
+        dense_prots(
+            &self.map.prot,
+            self.map.page,
+            self.map.mapped,
+            self.bytes.len() as u64,
+        )
     }
 
     /// The captured window bytes `[0, len)`.
@@ -26610,8 +27580,10 @@ impl Mem {
     /// (set by the NULL-guard arm of [`check_prot`]) first, then falls back to [`last_fault`] — which
     /// a top-level unmapped/read-only fault leaves set at the offending address (a satisfied §14
     /// recoverable fault clears it via `take_fault`, so no stale value survives). Non-clearing, so it
-    /// does not disturb the §14 pager. `None` when no address was recorded — e.g. a pure out-of-window
-    /// fault (address unknown, honest).
+    /// does not disturb the §14 pager. An **out-of-window** refusal records the address it was asked
+    /// for here too ([`Self::report_out_of_window`], #1591) — it used to record nothing, which left
+    /// the confinement boundary as the one fault that could not say what it refused. `None` now means
+    /// no fatal memory fault happened at all.
     pub(crate) fn peek_fault_rel(&self) -> Option<u64> {
         let raw = match self.fault_report.load(Ordering::Relaxed) {
             NO_FAULT => self.last_fault.load(Ordering::Relaxed),
@@ -26702,7 +27674,33 @@ impl Mem {
                                                             // cleared and `take_fault` returns `None` for the coroutine path to propagate the trap.
         self.window
             .checked_reserved(addr, offset, width)
-            .ok_or(Trap::MemoryFault)
+            .ok_or_else(|| self.report_out_of_window(addr, offset))
+    }
+
+    /// Record the address an **out-of-window** access asked for, and return the trap (#1591).
+    ///
+    /// It goes in [`Self::fault_report`], not `last_fault`: the latter is the recoverable-page-fault
+    /// channel, and a `take_fault` that answered `Some` here would let the §14 coroutine path treat a
+    /// confinement refusal as something its pager could satisfy. The NULL-guard arm of
+    /// [`Self::check_prot`] already splits them for that reason; this is the same split.
+    ///
+    /// Until now this case recorded nothing, so [`Self::peek_fault_rel`] answered `None` and the
+    /// diagnostic read "MemoryFault" with no location — which is the *least* affordable place to
+    /// have none. An out-of-window access is the confinement boundary doing its job (DESIGN §4), and
+    /// the address it refused is the whole content of the report: `0x8000_0000` past a 32 MiB carve
+    /// is a wild pointer, one byte past the end is an off-by-one, and the trap alone cannot tell
+    /// them apart. #1591's op-13 nimsem child is exactly this case — it faults out of its carve, and
+    /// the child's window dies with it.
+    ///
+    /// Stored absolute (`base + (addr+offset)`) so `peek_fault_rel`'s subtraction hands back the
+    /// window-relative address the guest actually named. Wrapping, because the arithmetic that
+    /// produced a rejected address is allowed to have overflowed — reporting the wrapped value is
+    /// honest about what was asked for, where saturating would invent a different question.
+    fn report_out_of_window(&self, addr: u64, offset: u64) -> Trap {
+        let rel = addr.wrapping_add(offset);
+        self.fault_report
+            .store(self.window.base().wrapping_add(rel), Ordering::Relaxed);
+        Trap::MemoryFault
     }
 
     /// Read `len` raw bytes from confined window address `addr` (DEBUGGING.md W2 inspection). Bounds
@@ -26744,7 +27742,9 @@ impl Mem {
         self.last_fault.store(NO_FAULT, Ordering::Relaxed);
         // The span-OOB arithmetic is temen-mask's `span_checked` — the one fuzzed reference the JIT's
         // `confine_span` must emit (INVARIANTS #2's "one masking regime").
-        self.window.span_checked(addr, len).ok_or(Trap::MemoryFault)
+        self.window
+            .span_checked(addr, len)
+            .ok_or_else(|| self.report_out_of_window(addr, 0))
     }
 
     /// Per-page committed-ness / RO enforcement over a whole span — the `len: u64` analogue of
@@ -27473,7 +28473,10 @@ impl Mem {
 
     /// Seed the low bytes of the window from `init` (escape-oracle, §18). Bytes past the
     /// window size are ignored — confinement only concerns `[0, size)`.
-    fn seed(&mut self, init: &[u8]) {
+    ///
+    /// `pub(crate)` so the debug engine can seed an argv blob the same way the production entries do
+    /// (`ScheduledDebugRun::seed_mem`) rather than growing a second seeding path.
+    pub(crate) fn seed(&mut self, init: &[u8]) {
         let n = (init.len() as u64).min(self.window.mapped()) as usize;
         // Bulk fast path: with no §13 region mapped, no page is `Backed`, so the whole prefix writes
         // straight through to `back` — one `memcpy` (flat) or a single-lock page-wise copy (`Paged`),
@@ -27654,9 +28657,11 @@ impl Mem {
         };
         MemLayout {
             bytes,
-            prot: space.prot.clone(),
-            page: self.page,
-            mapped: self.window.mapped(),
+            map: PageMap {
+                prot: space.prot.clone(),
+                page: self.page,
+                mapped: self.window.mapped(),
+            },
         }
     }
 
@@ -27682,24 +28687,11 @@ impl Mem {
         // moment) must drop the pages the guest has `map`-grown since, or they would survive as
         // addressable memory the moment never had. A fresh window (the checkpoint ladder's target) has
         // an empty map, so this is unchanged there.
-        if !layout.prot.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
+        if !layout.map.is_empty() || self.prot_dirty.load(Ordering::Acquire) {
             let mut space = self.space_write(); // marks prot_dirty, matching the captured window
-            space.prot = if layout.page == self.page {
-                layout.prot.clone()
-            } else {
-                // The layout is in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB
-                // native capture): re-express each entry over every page of *this* window it
-                // covers. A finer entry into a coarser page marks the whole page, last one winning —
-                // the same rounding `apply_prots` performs.
-                layout
-                    .prot
-                    .iter()
-                    .flat_map(|(&pg, &p)| {
-                        let (lo, hi) = (pg * layout.page, (pg + 1) * layout.page - 1);
-                        (lo / self.page..=hi / self.page).map(move |hp| (hp, p))
-                    })
-                    .collect()
-            };
+                                                // The layout may be in another page unit (a §12 artifact's fixed 4 KiB, or a 16 KiB native
+                                                // capture); `rebased_to` is identity when they already agree.
+            space.prot = layout.map.rebased_to(self.page);
         }
     }
 
@@ -28297,6 +29289,15 @@ fn step(fuel: &mut u64, kill: Option<&AtomicBool>) -> Result<(), Trap> {
 /// `Instantiator.kill`), orthogonal to the fuel budget: a §14 child must self-terminate promptly even
 /// inside a loop that exits on its *first* iteration (no back-edge to poll at), so kill cannot wait
 /// for a safepoint. Free when unarmed (`None` — the common case, a predicted branch, no atomic load).
+/// D66 — return a reaped detached child's lane to its parent's `granted_lanes`. Idempotent by
+/// construction: the entry is *removed*, and every reap path clears the join slot as it goes, so a
+/// second reap finds nothing to credit. A no-op for a nested or `thread.spawn` child (no entry).
+fn credit_child_lane(child_lane: &mut BTreeMap<usize, i64>, host: &Arc<Mutex<Host>>, slot: usize) {
+    if let Some(lane) = child_lane.remove(&slot) {
+        host.lock_unpoisoned().give_lane(lane);
+    }
+}
+
 #[inline]
 fn poll_kill(kill: Option<&AtomicBool>) -> Result<(), Trap> {
     if let Some(k) = kill {
@@ -29614,6 +30615,90 @@ mod prot_tests {
 }
 
 #[cfg(test)]
+mod lane_tests {
+    //! D66 — the lane arithmetic every driver's dispatch calls ([`lane_enter`] / [`lane_leave`]),
+    //! pinned on the owner's 6/2/2 case under the **ceiling with per-child lanes** ruling
+    //! (INVARIANTS #3, 2026-09-21): A up to 6; B ≤ 2 of those, contended with A only; C ≤ 2,
+    //! contended with A only; B and C never contend with each other; and A *may* absorb a child's
+    //! lane. Driver-agnostic: the executor and the exploration driver call these same functions.
+    use super::*;
+
+    const ROOT: usize = 1;
+    const B: usize = 2;
+    const C: usize = 3;
+
+    /// A task's chain: its own domain at its own cap, then the root at 6.
+    fn chain(own: usize, cap: i64) -> Vec<(usize, i64)> {
+        if own == ROOT {
+            vec![(ROOT, 6)]
+        } else {
+            vec![(own, cap), (ROOT, 6)]
+        }
+    }
+
+    #[test]
+    fn six_two_two_reads_as_a_up_to_six_b_and_c_two_each_contended_with_a_only() {
+        let mut r = BTreeMap::new();
+        let (a, b, c) = (chain(ROOT, 6), chain(B, 2), chain(C, 2));
+        assert!(lane_enter(&mut r, &b));
+        assert!(lane_enter(&mut r, &b));
+        assert!(
+            !lane_enter(&mut r, &b),
+            "B's third task is over B's lane of 2"
+        );
+        assert!(lane_enter(&mut r, &c));
+        assert!(lane_enter(&mut r, &c), "C's lane is independent of B's");
+        assert!(!lane_enter(&mut r, &c));
+        // A's own tasks fill the rest of A's 6 — B's two and C's two count against A.
+        assert!(lane_enter(&mut r, &a));
+        assert!(lane_enter(&mut r, &a));
+        assert!(
+            !lane_enter(&mut r, &a),
+            "A is at 6: 2 (B) + 2 (C) + 2 (its own)"
+        );
+        assert_eq!(r.get(&ROOT), Some(&6));
+        assert_eq!(r.get(&B), Some(&2));
+        // Ceiling semantics: a B task leaving frees room A may take — and B then cannot re-enter
+        // until A gives it back. This is the trade the ruling chose over a hard partition.
+        lane_leave(&mut r, &b);
+        assert!(
+            lane_enter(&mut r, &a),
+            "A absorbs the lane a B task released"
+        );
+        assert!(
+            !lane_enter(&mut r, &b),
+            "…so B is held out by A's total, not by its own lane"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_chain_is_free_and_a_zero_lane_never_admits() {
+        assert!(!lane_bounded(&[(ROOT, -1), (B, -1)]));
+        assert!(lane_bounded(&[(B, 0), (ROOT, -1)]));
+        let mut r = BTreeMap::new();
+        assert!(
+            !lane_enter(&mut r, &[(B, 0)]),
+            "a lane of 0 is 'may exist, never run'"
+        );
+        assert!(r.is_empty(), "a refused enter counts nothing");
+    }
+
+    #[test]
+    fn leave_is_the_exact_inverse_of_enter() {
+        let mut r = BTreeMap::new();
+        let b = chain(B, 2);
+        assert!(lane_enter(&mut r, &b));
+        lane_leave(&mut r, &b);
+        assert!(
+            r.is_empty(),
+            "every count returns to zero and the entry is dropped"
+        );
+        lane_leave(&mut r, &b); // a spurious leave saturates rather than underflowing
+        assert!(r.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod domain_table_tests {
     //! The shared, live [`DomainTable`] (DESIGN.md §22): an `install` on one vCPU's view is visible to
     //! every vCPU sharing the `Arc` — the threaded-install / install-during-own-invocation
@@ -29877,6 +30962,94 @@ block 0 (vsp: i64, v0: i64) {
             "trap origin names the trapping sibling, not the torn-down root: {bt:?}"
         );
     }
+
+    /// #1591 — a **sibling's** faulting address survives the propagation that flattens its trap.
+    ///
+    /// A child domain's window dies with its `Outcome`, so by the time the run's result reaches a
+    /// caller there is nothing left to ask. The driver for the op-13 nimsem child reported a bare
+    /// `MemoryFault` for exactly this reason. The address now rides the first-wins `trap_origin`
+    /// capture alongside the backtrace, so it names the faulting frame's window, not the root's.
+    ///
+    /// `0x800` is the address the real bug landed on (#1595): inside the NULL guard, which is what
+    /// says "this pointer was never initialized" rather than "the arithmetic was wrong". Asserting
+    /// the *value* is the point — a diagnostic that reports some address is not a diagnostic.
+    #[test]
+    fn a_siblings_fault_address_outlives_its_window() {
+        let m = parse_module(SIBLING_FAULTS_IN_THE_NULL_GUARD).unwrap();
+        let mut fuel = 10_000_000u64;
+        let (r, bt, _fiber) = run_traced(&m, 0, &[], &mut fuel);
+        assert_eq!(r, Err(Trap::MemoryFault));
+        assert_eq!(
+            bt.first().map(|pc| pc.func),
+            Some(1),
+            "the trapping sibling, not the torn-down root: {bt:?}"
+        );
+        assert_eq!(
+            last_capture_fault_addr(),
+            Some(0x800),
+            "the address the sibling faulted on"
+        );
+    }
+
+    /// #1591 — an **out-of-window** access names the address it was refused.
+    ///
+    /// The confinement boundary (DESIGN §4) was the one fault that recorded nothing: `peek_fault_rel`
+    /// answered `None`, so the report read `MemoryFault` with no location. That is the least
+    /// affordable place to have none — a wildly out-of-range address and a one-byte overrun are
+    /// different bugs and the trap alone cannot separate them.
+    ///
+    /// Asserts the *value*, and that a NULL-guard fault still reports its own address, so the two
+    /// arms cannot be conflated.
+    #[test]
+    fn an_out_of_window_access_names_the_address_it_asked_for() {
+        // `memory 16` — a 64 KiB window. `0x7fff_0000` is far outside it, and outside the reserved
+        // domain, so it is refused by `confine_checked` before any page check.
+        let m = parse_module(
+            r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 2147418112
+  v1 = i64.load v0
+  return v1
+  }
+}
+"#,
+        )
+        .unwrap();
+        let mut fuel = 10_000u64;
+        let (r, ..) = run_traced(&m, 0, &[], &mut fuel);
+        assert_eq!(r, Err(Trap::MemoryFault));
+        assert_eq!(
+            last_capture_fault_addr(),
+            Some(0x7fff_0000),
+            "the address the guest asked for, window-relative"
+        );
+    }
+
+    /// The sibling dereferences a small constant inside the unconditional NULL guard (#964), so it
+    /// The sibling dereferences a small constant inside the unconditional NULL guard (#964), so it
+    /// takes a `MemoryFault` at a **known** address while the root sits in a long timed wait.
+    const SIBLING_FAULTS_IN_THE_NULL_GUARD: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = i64.const 0
+  v1 = thread.spawn 1 v0 v0
+  v2 = i64.const 16392
+  v3 = i32.const 0
+  v4 = i64.const 8000000000
+  v5 = i32.atomic.wait v2 v3 v4
+  v6 = i64.const 42
+  return v6
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, v0: i64) {
+  v1 = i64.const 2048
+  v2 = i64.load v1
+  return v2
+  }
+}
+"#;
 
     /// (d) explorer: root return with a parked daemon — every seed yields the root's `Ok`,
     /// with the daemon reaped, not scheduled to its (logical) timeout.

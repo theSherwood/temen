@@ -6,6 +6,19 @@
 //! Like them it is an untrusted producer (DESIGN.md §2a): the verifier re-checks every module it
 //! emits, so a bug here is a clean error, never an escape.
 //!
+//! ## This crate ships **inside a sandbox guest**
+//!
+//! `temen-leng` is compiled into the nim-link guest (`demos/nim_frontend/nim_link_guest`, the
+//! committed `nim-link.temen.gz` asset): the linker running *on Temen*, over the LLVM on-ramp. That
+//! on-ramp provides a deliberately tiny C bottom edge — `read`/`write`/`mem*`/`malloc`/`free` and the
+//! `__vm_*` ops — and `build_nim_link.sh`'s stub audit **fails the build** on any other extern in the
+//! link closure. So this crate must not reach for anything that pulls in libc: no `std::env` (a
+//! `getenv`), no `eprintln!`/`println!` (thread-local stdio drags in `pthread_key_*`, `abort`,
+//! `__errno_location`). A `TEMEN_LENG_DUMP_LAYOUT` diagnostic knob added here during #1593 tripped
+//! exactly that audit — the guest is not a place where an environment exists to read.
+//!
+//! Diagnostics belong in the **callers** (`temen-run`, the tests), which are ordinary host binaries.
+//!
 //! ## Scope — a walking skeleton
 //!
 //! The frontend now lowers integers/floats, arithmetic, locals and direct/indirect calls, control
@@ -215,21 +228,26 @@ fn translate_object_module(
     src: &str,
     sel: Select,
     ext_types: &[(String, translate::Layout)],
-    ext_funcrefs: &[(String, translate::FnPtrSig)],
+    ext_globals: &[(String, translate::TyDesc)],
     ext_frame_procs: &[String],
     ext_sret: &[(String, translate::TyDesc)],
     ext_proc_params: &[translate::ProcParamSig],
     ext_consts: &[(String, i64)],
+    c_global_defs: &[String],
+    c_global_aliases: &[(String, String)],
     tls_layout: Option<&crate::dethash::HashMap<String, u64>>,
+    pooled_funcrefs: &crate::dethash::HashSet<String>,
 ) -> Result<Module, LengError> {
     let root = nif::parse(src).map_err(LengError::Parse)?;
     let mut t = translate::Translator::new_for_link();
     t.import_types(ext_types);
-    t.import_funcrefs(ext_funcrefs);
+    t.import_globals(ext_globals);
     t.import_proc_frames(ext_frame_procs);
     t.import_sret_procs(ext_sret);
     t.import_proc_params(ext_proc_params);
     t.import_consts(ext_consts);
+    t.import_c_global_defs(c_global_defs);
+    t.import_c_global_aliases(c_global_aliases);
     // Tier-2 TLS link (NIM.md §3d): inject the whole-program shared TLS layout so this unit's
     // `tvar` accesses — its own and any cross-module references — bake the agreed block offsets.
     if let Some(layout) = tls_layout {
@@ -237,6 +255,11 @@ fn translate_object_module(
     }
     // Whole module → translate every proc, exporting the exact local names the translator emitted
     // in func order; a named subset → exactly those, in list order.
+    // The whole-program funcref pool, adopted before any body is emitted: a proc *this* unit
+    // defines must carry the funcref ABI's leading `$sp` when **any** unit funcrefs it, and only the
+    // pool can say so. `module_with_names` runs `compute_funcref_targets` (the locally-visible uses)
+    // first, so this widens that set rather than replacing it.
+    t.import_funcref_targets(&root, stem, pooled_funcrefs);
     let (text, export_names) = match sel {
         Select::Whole => t.module_with_names(&root)?,
         Select::Names(names) => {
@@ -292,7 +315,11 @@ pub fn compile_object(unit: &LengModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
+        &[],
         None,
+        // A standalone object has no siblings, so no cross-unit funcref can exist to pool.
+        &crate::dethash::HashSet::default(),
     )?))
 }
 
@@ -311,7 +338,11 @@ pub fn compile_whole_object(unit: &WholeModule) -> Result<Vec<u8>, LengError> {
         &[],
         &[],
         &[],
+        &[],
+        &[],
         None,
+        // A standalone object has no siblings, so no cross-unit funcref can exist to pool.
+        &crate::dethash::HashSet::default(),
     )?))
 }
 
@@ -334,43 +365,141 @@ fn link_selected(units: &[(&str, &str, Select)]) -> Result<Module, LengError> {
 
 /// Build the **powerbox `_start` link unit** (function 0): a paramless entry that reads the
 /// post-link data-stack base (`data.top`, which the linker resolves to `powerbox_entry_sp` and
-/// reserves stack above) and tail-calls the C-shaped `main($sp, argc, argv, envp)` with
-/// `argc/argv/envp = 0`, returning its `cint`. `main` is a cross-unit symbol resolved at link
-/// (`call.import "main"` → a direct `call` once merged). Injecting the entry **as a unit** (linked
-/// first, so it is function 0) — rather than [`temen_ir::synth_manifest_start`]-prepending it after
-/// the link — is what keeps the program's `data.funcref` initializers valid: the linker numbers
-/// `_start` first and bakes every funcref at its final merged index in one pass, so nothing needs a
-/// post-hoc +1 shift (which the discarded relocation metadata could no longer drive).
+/// reserves stack above), marshals the §3e args buffer into C `argv[]`/`envp[]` arrays, and
+/// tail-calls the C-shaped `main($sp, argc, argv, envp)`, returning its `cint`. `main` is a
+/// cross-unit symbol resolved at link (`call.import "main"` → a direct `call` once merged).
+/// Injecting the entry **as a unit** (linked first, so it is function 0) — rather than
+/// [`temen_ir::synth_manifest_start`]-prepending it after the link — is what keeps the program's
+/// `data.funcref` initializers valid: the linker numbers `_start` first and bakes every funcref at
+/// its final merged index in one pass, so nothing needs a post-hoc +1 shift (which the discarded
+/// relocation metadata could no longer drive).
+///
+/// **argv (#763).** The entry used to pass `argc = 0` and point `argv`/`envp` at the fixed empty
+/// vectors, so *no* nim program on this route could read its own command line: nimony's
+/// `std/cmdline` reads the `cmdCount`/`cmdLine` globals that the generated `main` parks its
+/// parameters in, so `paramCount()` came back `-1` and `paramStr(i)` came back `""` however the host
+/// was invoked. Real tools are argv-driven — `nifler2 parse in.nim out.nif` does nothing without
+/// one — so the entry now parses the buffer the host seeds at [`temen_ir::module_args_base`]
+/// (`{argc:u32, envc:u32}` then the packed NUL-terminated strings, [`temen_ir::write_args_blob`]):
+/// it walks the strings, writes a `char*` per entry (pointing *into* the buffer — no copy) plus the
+/// required NULL terminator at the data-stack base, parks `envp[]` just above `argv[]`, and gives
+/// `main` a frame 16-byte-aligned above both. This mirrors `temen-llvm`'s `synth_start_argv` and
+/// chibicc's `needs_argv` entry — the C `char**` convention lives only in a frontend's `_start`; the
+/// powerbox ABI itself delivers the neutral byte blob.
+///
+/// There is no second, no-args entry: a run that seeds nothing leaves the buffer zeroed, which reads
+/// back as `argc = envc = 0` and produces one-entry NULL-terminated vectors — exactly the old
+/// [`temen_ir::POWERBOX_EMPTY_ARGV`] behaviour, and the reason a null `argv`/`envp` must never be
+/// passed (#1422: nim's `getEnvVarsC` dereferences `envp` before it can discover it is empty).
 ///
 /// The guest heap bump-pointer words ([`temen_ir::POWERBOX_HEAP_BRK`]/[`POWERBOX_HEAP_TOP`]) are
 /// **not** seeded here — this unit is built before the merged window size is known, and the heap
 /// ceiling *is* that window top. [`seed_powerbox_heap`] bakes both words into the linked module's
 /// data image (post-link, where the window is known); see it for the #1051/#1054/#1060 rationale.
 fn synth_start_unit(entry: &str) -> Result<temen_ir::LinkUnit, LengError> {
-    // `argc = 0`, and `argv`/`envp` point at **one-entry NULL-terminated vectors** rather than being
-    // NULL themselves (#1422): `_start` writes the terminator into the reserved page-0 scratch at
-    // [`temen_ir::POWERBOX_EMPTY_ARGV`]/[`POWERBOX_EMPTY_ENVP`] and hands `main` their addresses.
-    // Passing 0 is what a C `main` is never given, and nim's `getEnvVarsC` walks `nimEnviron` until
-    // it reads NULL — so a null `envp` faulted on the very first load against the #1094 guard,
-    // taking every module that reaches `std/envvars` (`os`, `paths`, `strtabs`, `appdirs`, …) down
-    // with it. One store each, paid once per run.
-    let argv = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ARGV;
-    let envp = temen_ir::POWERBOX_NULL_GUARD + temen_ir::POWERBOX_EMPTY_ENVP;
+    let args = temen_ir::module_args_base();
+    let strs = args + 8; // past `{argc:u32, envc:u32}`: the first packed string
+                         // `argv[]` is built at the data-stack base (`data.top`) and `envp[]` directly above it; `main`'s
+                         // frame starts 16-byte-aligned above *both*, so its upward-growing frame never overwrites them.
+                         // The arrays cost `(argc + envc + 2) * 8` bytes out of the [`temen_ir::POWERBOX_STACK_RESERVE`]
+                         // the linker reserves above the entry SP — the same place chibicc's entry puts them.
     let text = format!(
         "import 0 \"{entry}\" (i64, i32, i64, i64) -> (i32)\n\
          func () -> (i32) {{\n\
          block 0 () {{\n\
-         \x20 v0 = data.top\n\
-         \x20 v1 = i32.const 0\n\
-         \x20 vz = i64.const 0\n\
-         \x20 v2 = i64.const {argv}\n\
-         \x20 i64.store v2 vz\n\
-         \x20 v3 = i64.const {envp}\n\
-         \x20 i64.store v3 vz\n\
-         \x20 v4 = call.import 0 (v0, v1, v2, v3)\n\
-         \x20 return v4\n\
+         \x20 v0 = i64.const {args}\n\
+         \x20 v1 = i32.load v0\n\
+         \x20 v2 = i64.extend_i32_u v1\n\
+         \x20 v3 = i64.const {envc_off}\n\
+         \x20 v4 = i32.load v3\n\
+         \x20 v5 = i64.extend_i32_u v4\n\
+         \x20 v6 = i64.const 0\n\
+         \x20 v7 = i64.const {strs}\n\
+         \x20 br 1(v2, v5, v6, v7)\n\
          \x20 }}\n\
-         }}\n"
+         block 1 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.lt_u v2 v0\n\
+         \x20 br_if v4 2(v0, v1, v2, v3) 5(v0, v1, v3)\n\
+         \x20 }}\n\
+         block 2 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = data.top\n\
+         \x20 v5 = i64.const 8\n\
+         \x20 v6 = i64.mul v2 v5\n\
+         \x20 v7 = i64.add v4 v6\n\
+         \x20 i64.store v7 v3\n\
+         \x20 br 3(v0, v1, v2, v3)\n\
+         \x20 }}\n\
+         block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i32.load8_u v3\n\
+         \x20 v5 = i64.const 1\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 v7 = i32.eqz v4\n\
+         \x20 br_if v7 4(v0, v1, v2, v6) 3(v0, v1, v2, v6)\n\
+         \x20 }}\n\
+         block 4 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 1\n\
+         \x20 v5 = i64.add v2 v4\n\
+         \x20 br 1(v0, v1, v5, v3)\n\
+         \x20 }}\n\
+         block 5 (v0: i64, v1: i64, v2: i64) {{\n\
+         \x20 v3 = data.top\n\
+         \x20 v4 = i64.const 8\n\
+         \x20 v5 = i64.mul v0 v4\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 v7 = i64.const 0\n\
+         \x20 i64.store v6 v7\n\
+         \x20 v8 = i64.const 1\n\
+         \x20 v9 = i64.add v0 v8\n\
+         \x20 v10 = i64.mul v9 v4\n\
+         \x20 v11 = i64.add v3 v10\n\
+         \x20 v12 = i64.const 0\n\
+         \x20 br 6(v1, v12, v2, v11)\n\
+         \x20 }}\n\
+         block 6 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.lt_u v1 v0\n\
+         \x20 br_if v4 7(v0, v1, v2, v3) 10(v0, v3)\n\
+         \x20 }}\n\
+         block 7 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 8\n\
+         \x20 v5 = i64.mul v1 v4\n\
+         \x20 v6 = i64.add v3 v5\n\
+         \x20 i64.store v6 v2\n\
+         \x20 br 8(v0, v1, v2, v3)\n\
+         \x20 }}\n\
+         block 8 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i32.load8_u v2\n\
+         \x20 v5 = i64.const 1\n\
+         \x20 v6 = i64.add v2 v5\n\
+         \x20 v7 = i32.eqz v4\n\
+         \x20 br_if v7 9(v0, v1, v6, v3) 8(v0, v1, v6, v3)\n\
+         \x20 }}\n\
+         block 9 (v0: i64, v1: i64, v2: i64, v3: i64) {{\n\
+         \x20 v4 = i64.const 1\n\
+         \x20 v5 = i64.add v1 v4\n\
+         \x20 br 6(v0, v5, v2, v3)\n\
+         \x20 }}\n\
+         block 10 (v0: i64, v1: i64) {{\n\
+         \x20 v2 = i64.const 8\n\
+         \x20 v3 = i64.mul v0 v2\n\
+         \x20 v4 = i64.add v1 v3\n\
+         \x20 v5 = i64.const 0\n\
+         \x20 i64.store v4 v5\n\
+         \x20 v6 = i64.const 1\n\
+         \x20 v7 = i64.add v0 v6\n\
+         \x20 v8 = i64.mul v7 v2\n\
+         \x20 v9 = i64.add v1 v8\n\
+         \x20 v10 = i64.const 15\n\
+         \x20 v11 = i64.add v9 v10\n\
+         \x20 v12 = i64.const -16\n\
+         \x20 v13 = i64.and v11 v12\n\
+         \x20 v14 = i64.const {args}\n\
+         \x20 v15 = i32.load v14\n\
+         \x20 v16 = data.top\n\
+         \x20 v17 = call.import 0 (v13, v15, v16, v1)\n\
+         \x20 return v17\n\
+         \x20 }}\n\
+         }}\n",
+        envc_off = args + 4,
     );
     let module = temen_text::parse_module(&text)
         .map_err(|e| LengError::Malformed(format!("synth `_start` unit: {e:?}")))?;
@@ -402,32 +531,53 @@ fn link_selected_with_extra(
 ) -> Result<Module, LengError> {
     // Cross-module aggregate type layouts. Unlike the other pools, an object type can *inherit* a
     // base defined in another unit (`JsonParser = object of BaseLexer`, `BaseLexer` in a sibling
-    // module), and the base is inlined into the derived layout at translate time — so a single
-    // per-module pass exports a lossy layout (missing every inherited field) whenever the base is
-    // cross-module. Pool to a **fixpoint** instead: each round re-exports with the prior round's
-    // pool visible, so a chain of any depth is fully inlined. Inlining only *adds* fields, so the
-    // summed field count is monotonic and converges; the unit count bounds the max chain depth.
+    // module), and a field can *be* an object another unit defines — and both are resolved at
+    // translate time, so a single per-module pass exports a lossy layout: missing every inherited
+    // field when the base is cross-module, and sizing every cross-module aggregate *field* as the
+    // scalar placeholder `scan_lenient` falls back to. Pool to a **fixpoint** instead: each round
+    // re-exports with the prior round's pool visible, so a chain of any depth resolves.
+    //
+    // **The signal is the whole table, not the field count** (#1593). Inlining a base adds fields, so
+    // a field-count comparison sees it; a round that only corrects a *size* does not change the count
+    // at all. `Parser { lex: Lexer; tok: Token; dest: TokenBuf }` stopped one round early with its
+    // three aggregate fields still sized as 8-byte placeholders: `lex` at +0 and `tok` at +60 when
+    // `Lexer` is 76 bytes, so the fields **overlapped** and writing one clobbered the next. Every unit
+    // agreed on that layout — it is not a cross-unit disagreement — which is why nothing downstream
+    // could see it, and why nifler2 parsed into a `Parser` whose fields scribbled over each other.
+    // Comparing the tables directly costs one extra round and cannot miss a change of either kind.
     let roots: Vec<_> = units
         .iter()
         .map(|(_, src, _)| nif::parse(src).map_err(LengError::Parse))
         .collect::<Result<_, _>>()?;
     let mut pooled: Vec<(String, translate::Layout)> = Vec::new();
-    let mut prev_fields = usize::MAX;
-    for _ in 0..=units.len() {
+    let mut converged = false;
+    // Each round resolves one more level of nesting/inheritance, so the bound is the depth of the
+    // deepest chain — at most one link per unit, plus a round to observe the fixed point.
+    for _ in 0..=units.len() + 1 {
         let mut next: Vec<(String, translate::Layout)> = Vec::new();
         for ((stem, _, _), root) in units.iter().zip(&roots) {
             next.extend(translate::Translator::export_types_pooled(
                 root, stem, &pooled,
             )?);
         }
-        let fields: usize = next.iter().map(|(_, l)| l.field_count()).sum();
-        pooled = next;
-        if fields == prev_fields {
+        if next == pooled {
+            converged = true;
             break;
         }
-        prev_fields = fields;
+        pooled = next;
     }
-    let mut pooled_funcrefs = Vec::new();
+    // Fail closed rather than compile against a layout table still in motion: every offset in the
+    // program is read off this, and a stale one is silent memory corruption, not a link error.
+    if !converged {
+        return Err(LengError::Unsupported(format!(
+            "cross-module type layouts did not converge in {} rounds — a layout that is still \
+             changing would place fields at offsets the defining unit disagrees with",
+            units.len() + 2
+        )));
+    }
+    // Pooled **non-scalar globals** across all units (stem-suffixed name → descriptor): the type of
+    // every foreign symbol a unit might call through or index into. See `Translator::ext_globals`.
+    let mut pooled_globals: Vec<(String, translate::TyDesc)> = Vec::new();
     // Frame-graph nodes across all units: (global_name, own_needs_frame, global_callees).
     let mut frame_nodes: Vec<(String, bool, Vec<String>)> = Vec::new();
     // Tier-2 TLS (NIM.md §3d): pooled `(stem-suffixed tvar name, size)` across all units, in unit
@@ -450,15 +600,49 @@ fn link_selected_with_extra(
     // which `fastRuneAt`'s template expansion plants in every consumer) has no data symbol to bind.
     // Pooling lets the referencing unit inline the same value the defining unit does.
     let mut pooled_consts: Vec<(String, i64)> = Vec::new();
+    // Pooled **C names of `exportc` globals** across all units: an `importc` gvar declaring one of
+    // these is the *same object* the exporting unit defines (`cmdCount`/`cmdLine`/`nimEnviron`, which
+    // the program's generated `main` writes and `std/cmdline`/`std/envvars` read), so the declaring
+    // unit binds it by C name instead of giving it private, never-written storage (#763). A C name no
+    // unit defines is absent here and keeps the local-global lowering — this can only link objects
+    // that were already meant to be one, never fail a link that worked.
+    let mut pooled_c_global_defs: Vec<String> = Vec::new();
     for (stem, src, _) in units {
         let root = nif::parse(src).map_err(LengError::Parse)?;
-        pooled_funcrefs.extend(translate::Translator::export_funcrefs(&root, stem)?);
+        pooled_globals.extend(translate::Translator::export_globals(&root, stem, &pooled)?);
         pooled_sret.extend(translate::Translator::export_sret_procs(&root, stem)?);
         pooled_proc_params.extend(translate::Translator::export_proc_params(&root, stem)?);
         pooled_consts.extend(translate::Translator::export_consts(&root, stem)?);
+        pooled_c_global_defs.extend(translate::Translator::export_c_global_names(&root));
         if tls {
             pooled_tls.extend(translate::Translator::export_tls_vars(&root, stem)?);
         }
+    }
+    // The C-name alias pool, built **after** `pooled_c_global_defs` is complete: a unit that diverts
+    // an `importc` declaration to its C name stops exporting that declaration's nim name, so every
+    // other unit needs the same redirection for its own references. Second pass for the same reason
+    // the frame fixpoint has one — the input must be whole before it is consumed.
+    let mut pooled_c_global_aliases: Vec<(String, String)> = Vec::new();
+    for ((stem, _, _), root) in units.iter().zip(&roots) {
+        pooled_c_global_aliases.extend(translate::Translator::export_c_global_aliases(
+            root,
+            stem,
+            &pooled_c_global_defs,
+        ));
+    }
+    // **Funcref-target pool**, built after `pooled_proc_params` because that table is what tells a
+    // unit whether an atom in value position names a sibling's proc. Whole-program by necessity: the
+    // funcref ABI gives a target a leading `$sp`, and the unit that *defines* a proc cannot see that
+    // a *sibling* takes its address — `funcref_targets`' own doc has said "pooled across the link"
+    // since it was written, but nothing pooled it. Feeds both the frame pre-scan below and the real
+    // translation, which must agree on every proc's arity.
+    let mut pooled_funcrefs: crate::dethash::HashSet<String> = crate::dethash::HashSet::default();
+    for ((stem, _, _), root) in units.iter().zip(&roots) {
+        pooled_funcrefs.extend(translate::Translator::export_funcref_uses(
+            root,
+            stem,
+            &pooled_proc_params,
+        )?);
     }
     // Frame fixpoint input — computed now that every unit's sret-ness is pooled, so a proc that calls
     // an sret proc is correctly seen as frame-needing (its result temp lives in its own frame).
@@ -469,6 +653,8 @@ fn link_selected_with_extra(
             stem,
             &pooled,
             &pooled_sret,
+            &pooled_proc_params,
+            &pooled_funcrefs,
         )?);
     }
     // The shared TLS layout: each thread-var gets a disjoint offset in the per-vCPU block. Every
@@ -529,12 +715,15 @@ fn link_selected_with_extra(
                 src,
                 *sel,
                 &pooled,
-                &pooled_funcrefs,
+                &pooled_globals,
                 &pooled_frame_procs,
                 &pooled_sret,
                 &pooled_proc_params,
                 &pooled_consts,
+                &pooled_c_global_defs,
+                &pooled_c_global_aliases,
                 tls_layout.as_ref(),
+                &pooled_funcrefs,
             )?))
         })
         .collect::<Result<_, LengError>>()?;
@@ -800,7 +989,12 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     ("setpgid", ANY, 45),
     ("kill", ANY, 46),
     ("nanosleep", ANY, 47),
-    ("sysconf", ANY, 48),
+    // **Pinned, not `ANY`** (#1499): nim declares `sysconf(a1: cint): int`, so the shim must take
+    // `i32` — row 48 took `i64`, and an `ANY` row binds by name whatever the shape, so the call
+    // linked and the module then failed to verify with `TypeMismatch { expected: I64, found: I32 }`
+    // deep inside `std/cpuinfo` (`sysconf(_SC_NPROCESSORS_ONLN)`, which is what `std/threadpool`
+    // sizes itself from). Pinning makes the next such drift an unbound leaf named at link instead.
+    ("sysconf", sig(&[I32], &[I64]), 48),
     ("nativeIoctl", ANY, 49),
     ("pthread_attr_init", ANY, 50),
     ("pthread_attr_setstacksize", ANY, 51),
@@ -903,6 +1097,31 @@ const COMPUTE_LEAVES: &[ComputeLeaf] = &[
     // 0) would be exactly the silent-wrong-answer this table is careful about everywhere else: the
     // call would succeed and quietly produce a wrong port number. Row 84 does the swap.
     ("htons", ANY, 84),
+    // **`errnoLocation` returns a real, writable word** (row 85, the shim's own 8-byte data
+    // segment), not 0. `std/posix` reaches libc's `errno` through the address-returning accessor
+    // (`__errno_location`, `__error` on Darwin) and both *reads and writes* through it —
+    // `readdir` must zero errno at end-of-directory or a consumer misreads a stale value as a
+    // failure. A 0 here would not be a stub, it would be a store to the #1094 NULL guard: a trap,
+    // from a program that merely cleared errno. One word for the whole guest is the right shape —
+    // §3d is a single vCPU, which is exactly the condition under which a process-wide errno is
+    // well-defined.
+    ("errnoLocation", ANY, 85),
+    // `posix_fallocate`'s bottom half (row 86), stubbed to `-1` like the adapter's other file-op
+    // syscalls: this powerbox has no filesystem to preallocate on. Reached by *linking* `std/posix`
+    // (`std/times`, `std/strtabs` and `std/paths` all pull it in transitively), not by calling it.
+    ("fallocateImpl", ANY, 86),
+    // **`cpuRelax`'s intrinsic form** (row 87, a bare `() -> ()` no-op). v0.4.0 spelled this as an
+    // `{.emit.}` of raw C, which `EMIT_NOPS` already swallowed; v0.6.2 makes it a real intrinsic
+    // declaration with a name to bind. Same single-vCPU posture as its `builtinThreadFence`
+    // neighbours (§3d): a spin-wait hint has nothing to yield to when there is one vCPU.
+    ("builtinCpuRelax", ANY, 87),
+    // `nimony/src/lib/vfs.nim`'s `proc osProcessId(): int32 {.importc: "getpid".}` — the pid that
+    // names a temp file (`target & ".tmp." & $osProcessId() & …`). Same shim as `cGetpid` (row 1) and
+    // the same posture: one process in the sandbox, so a constant pid is the honest answer, and the
+    // only thing that reads it is a filename's uniqueness against *other processes*. **Pinned**, not
+    // `ANY` (#1499) — the row and the shim are both `() -> i32`, and `sysconf` is the standing
+    // reminder of what an `ANY` row does when those drift apart.
+    ("osProcessId", sig(&[], &[I32]), 1),
 ];
 
 /// The C symbols the **prebuilt guest libc** ([`nim_libc_units`]) serves for a nim program — the
@@ -1125,6 +1344,199 @@ func (i32) -> (i32) { block 0 (v0: i32) { v1 = i32.const 0 return v1 } }
 func (i64, i32, i64) -> (i32) { block 0 (v0: i64, v1: i32, v2: i64) { v3 = i32.const -1 return v3 } }
 func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.const -1 return v3 } }";
 
+/// The **POSIX-personality open adapter**: the one place nimony's C bottom edge and `temen_posix`'s
+/// op ABI disagree.
+///
+/// Over a full POSIX personality the nim syscall leaves bind **directly** to the personality's ops —
+/// `sysWrite(fd, buf, len)`, `sysRead(fd, buf, len)`, `sysClose(fd)` and `sysLseek(fd, off, whence)`
+/// are argument-for-argument what `temen_posix`'s `write`/`read`/`close`/`lseek` take, so no shim
+/// stands between them. `open` is the exception: C passes a **NUL-terminated `char*`**, while every
+/// `temen_posix` path op takes an explicit `(ptr, len)` pair (the sandbox never scans guest memory for
+/// a terminator on the host side). Binding `sysOpen` straight to `OP_OPEN` therefore read the *flags*
+/// word as the path length — `O_RDONLY` is 0, so every open saw the empty path and returned `ENOENT`.
+///
+/// This unit exports `sysOpen`'s nim signature, walks the string to its NUL in the guest, and forwards
+/// `(ptr, len, flags)`. `open` itself stays a manifest import the host binds to the personality.
+///
+/// **Two entry points, same walk** (#1595). `syncio` reaches the bottom edge as `sysOpen`
+/// — `(ptr, i32 flags, i64 mode) -> i32` — but `std/posix`'s own `open`, which `memfiles.open`
+/// calls, is `(ptr, i32 flags, i32 mode) -> i32`. Only `sysOpen` was routed here; plain `open` stayed
+/// on the compute shim's fail-closed stub (func 20, "report failure"), so `readFile` worked while
+/// **memory-mapping the same file failed** — the second half of #1595, and invisible until something
+/// mapped a file. Func 0 serves the `sysOpen` shape, func 1 the `open` shape; the differing `mode`
+/// width is why one func cannot serve both (the link checks import shape, #1524).
+///
+/// Funcs 2–4 are `unlink`, `rename` and `stat`, here for the same reason and doing the same walk.
+/// `stat` is the one that decides whether a compiler can *start*: nimony's `fileExists` is
+/// `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, so on the shim's fail-closed stub no file it
+/// looked for existed, and nimsem's first act on a real module was `cannot find <input>`. It
+/// forwards to `statp`, the by-path op that writes the **declared** `struct stat` — not `stat`,
+/// whose short `{mode, size}` a caller with its own `Stat` reads as a garbage mode.
+const POSIX_OPEN_ADAPTER: &str = "\
+import 0 \"open\" (i64, i64, i64) -> (i64)
+import 1 \"unlink\" (i64, i64) -> (i64)
+import 2 \"rename\" (i64, i64, i64, i64) -> (i64)
+import 3 \"statp\" (i64, i64, i64) -> (i64)
+
+func (i64, i32, i64) -> (i32) {
+block 0 (v0: i64, v1: i32, v2: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i32, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i32, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = i64.extend_i32_s v1
+  v5 = call.import 0 (v0, v3, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}
+
+func (i64, i32, i32) -> (i32) {
+block 0 (v0: i64, v1: i32, v2: i32) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i32, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i32, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = i64.extend_i32_s v1
+  v5 = call.import 0 (v0, v3, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}
+
+func (i64) -> (i32) {
+block 0 (v0: i64) { br 1(v0, v0) }
+block 1 (v0: i64, v1: i64) {
+  v2 = i32.load8_u v1
+  v3 = i32.eqz v2
+  v4 = i64.const 1
+  v5 = i64.add v1 v4
+  br_if v3 2(v0, v1) 1(v0, v5)
+  }
+block 2 (v0: i64, v1: i64) {
+  v2 = i64.sub v1 v0
+  v3 = call.import 1 (v0, v2)
+  v4 = i32.wrap_i64 v3
+  return v4
+  }
+}
+
+func (i64, i64) -> (i32) {
+block 0 (v0: i64, v1: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.sub v2 v0
+  br 3(v0, v3, v1, v1)
+  }
+block 3 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i32.load8_u v3
+  v5 = i32.eqz v4
+  v6 = i64.const 1
+  v7 = i64.add v3 v6
+  br_if v5 4(v0, v1, v2, v3) 3(v0, v1, v2, v7)
+  }
+block 4 (v0: i64, v1: i64, v2: i64, v3: i64) {
+  v4 = i64.sub v3 v2
+  v5 = call.import 2 (v0, v1, v2, v4)
+  v6 = i32.wrap_i64 v5
+  return v6
+  }
+}
+
+func (i64, i64) -> (i32) {
+block 0 (v0: i64, v1: i64) { br 1(v0, v1, v0) }
+block 1 (v0: i64, v1: i64, v2: i64) {
+  v3 = i32.load8_u v2
+  v4 = i32.eqz v3
+  v5 = i64.const 1
+  v6 = i64.add v2 v5
+  br_if v4 2(v0, v1, v2) 1(v0, v1, v6)
+  }
+block 2 (v0: i64, v1: i64, v2: i64) {
+  v3 = i64.sub v2 v0
+  v4 = call.import 3 (v0, v3, v1)
+  v5 = i32.wrap_i64 v4
+  return v5
+  }
+}";
+
+/// The private alias under which [`nim_posix_runtime`] re-exports the compute shim's **anonymous**
+/// `mmap` so [`POSIX_MMAP_ADAPTER`] can call it. The shim IR is unchanged — only the export list
+/// gains a second name for the same func, so there is still one allocator.
+const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
+
+/// The **POSIX-personality mmap adapter** — the second place nimony's C bottom edge and this
+/// sandbox disagree, after [`POSIX_OPEN_ADAPTER`].
+///
+/// nim reads a file by **mapping** it: `nifreader.open` → `vfsOpenMmap` → `memfiles.open`, which is
+/// `open` + `fstat` + `mmap(fd)`. The compute shim's `mmap` is the guest **heap bump allocator**
+/// (hands out `[brk, brk+len)`, advancing `POWERBOX_HEAP_BRK`) and ignores `fd` entirely, so a
+/// file-backed mapping came back as uninitialized heap. With `fstat` also stubbed to 0 the result
+/// was an empty buffer, and hexer asserted in `jumpTo` on a zero-length file (#1595).
+///
+/// This unit owns the `mmap` name on the POSIX route and **composes what already works**: it calls
+/// the shim's allocator through [`MMAP_ANON_ALIAS`] for the pages, then — when `fd` is a real
+/// descriptor — seeks and reads the file into them. An anonymous request (`fd == -1`, every
+/// allocator call) returns the pages untouched, so the hot path is one extra forwarding call.
+///
+/// **It stays in the guest, like the shim.** A nested child links these same units and needs
+/// nothing granted at any depth; no new capability crosses a sandbox boundary, and the heap
+/// ceiling check (#1060) stays where it is. A §13 `SharedRegion` premap is the zero-copy upgrade
+/// behind this same symbol when a copy stops being cheap enough.
+///
+/// **Fails closed on a short read.** A partial fill is indistinguishable downstream from a truncated
+/// file, so anything other than exactly `len` bytes returns `MAP_FAILED` (-1) and nim's
+/// `memfiles.open` raises — the caller sees "cannot open", never a half-filled buffer.
+const POSIX_MMAP_ADAPTER: &str = "\
+import 0 \"__temen_mmap_anon\" (i64, i64, i32, i32, i32, i64) -> (i64)
+import 1 \"read\" (i64, i64, i64) -> (i64)
+import 2 \"lseek\" (i64, i64, i64) -> (i64)
+
+func (i64, i64, i32, i32, i32, i64) -> (i64) {
+block 0 (v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i64) {
+  v6 = call.import 0 (v0, v1, v2, v3, v4, v5)
+  v7 = i32.const 0
+  v8 = i32.lt_s v4 v7
+  br_if v8 1(v6) 2(v6, v1, v4, v5)
+  }
+block 1 (v0: i64) {
+  return v0
+  }
+block 2 (v0: i64, v1: i64, v2: i32, v3: i64) {
+  v4 = i64.extend_i32_s v2
+  v5 = i64.const 0
+  v6 = call.import 2 (v4, v3, v5)
+  v7 = i64.const 0
+  v8 = i64.lt_s v6 v7
+  br_if v8 4() 3(v0, v1, v4)
+  }
+block 3 (v0: i64, v1: i64, v2: i64) {
+  v3 = call.import 1 (v2, v0, v1)
+  v4 = i64.eq v3 v1
+  br_if v4 1(v0) 4()
+  }
+block 4 () {
+  v0 = i64.const -1
+  return v0
+  }
+}";
+
 /// The compute-shim func index for a bottom-edge leaf import `name`, or `None` for a name the shim
 /// doesn't serve (the true syscalls — those go to the adapter / powerbox).
 /// The shim func serving a leaf, or `None` to leave it unbound.
@@ -1219,47 +1631,7 @@ pub fn link_nim_powerbox(units: &[WholeModule], libc: Option<&[u8]>) -> Result<M
 /// depends only on which bottom-edge leaves and raw syscalls the program references), so one build
 /// serves every permutation.
 pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
-    // The compute shim must know which leaf names to export; discover them from the `system` unit's
-    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
-    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
-    let sys = units
-        .iter()
-        .find(|u| u.stem.starts_with("sysv"))
-        .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
-    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
-        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
-    let mut compute_exports: Vec<(String, u32)> = Vec::new();
-    for imp in &sys_obj.imports {
-        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&sys_obj, imp)) {
-            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
-                compute_exports.push((imp.name.clone(), i));
-            }
-        }
-    }
-    let compute_unit = |exports: Vec<(String, u32)>| -> Result<temen_ir::LinkUnit, LengError> {
-        let module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
-            .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
-        Ok(temen_ir::LinkUnit {
-            module,
-            exports,
-            ..Default::default()
-        })
-    };
-
-    // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
-    let m1 = link_whole_powerbox_manifest(units, vec![compute_unit(compute_exports.clone())?])?;
-
-    // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
-    // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
-    // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
-    // program is linked. Both passes feed one export list, so the final compute unit serves both.
-    for imp in &m1.imports {
-        if let Some(i) = compute_leaf_index(&imp.name, import_sig(&m1, imp)) {
-            if compute_exports.iter().all(|(n, _)| n != &imp.name) {
-                compute_exports.push((imp.name.clone(), i));
-            }
-        }
-    }
+    let (compute_exports, m1) = nim_compute_exports(units)?;
 
     // Map each retained syscall onto the adapter's fixed func order.
     let mut adapter_exports: Vec<(String, u32)> = Vec::new();
@@ -1287,7 +1659,193 @@ pub fn nim_powerbox_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkU
         ..Default::default()
     };
 
-    Ok(vec![compute_unit(compute_exports)?, adapter])
+    Ok(vec![compute_shim_unit(compute_exports)?, adapter])
+}
+
+/// The **compute-shim link unit alone** — the half of [`nim_powerbox_runtime`] that carries no
+/// syscalls, exporting exactly the pure-compute leaves `units` reference.
+///
+/// Link against this (rather than the full runtime) when the true syscalls must stay **retained
+/// imports**, so a host personality can bind them by name — the POSIX route, where `sysWrite`/
+/// `sysOpen`/… go to `temen_posix`'s memfs ops instead of [`SYSCALL_ADAPTER`]'s stdout-only stubs.
+/// Same discovery, same table: one route through the compute bottom edge, two bindings above it.
+pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit, LengError> {
+    compute_shim_unit(nim_compute_exports(units)?.0)
+}
+
+/// Bottom-edge leaves the **host** serves for real, so [`nim_posix_runtime`] leaves them to it
+/// instead of binding [`POWERBOX_COMPUTE_SHIM`]'s stub. Each is passed through with its C ABI
+/// unchanged — a leaf that needs reconciling (a NUL-terminated path where the op wants `(ptr, len)`)
+/// belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
+///
+/// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
+///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
+///   exists.
+/// - `fstat` → the matching `temen_posix` op. Bound to the shim it reports **size 0**, so
+///   `memfiles.open` (`open` + `fstat` + `mmap`) maps every file as empty and the program reads a
+///   zero-length buffer rather than its input — #1595.
+/// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
+///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
+///   and the program runs on past the error path that called it. nimsem printed `command expected`
+///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
+///   error path is built on `quit`, so on this route none of them ended the program.
+const POSIX_SERVED_LEAVES: &[&str] = &["getcwd", "cExitSys", "fstat"];
+
+/// The nim runtime for the **POSIX-personality bottom edge** — the second configuration of the split
+/// [`nim_powerbox_runtime`] makes, over the same compute half.
+///
+/// Both are `[compute shim, syscall edge]`. They differ only in what stands behind the syscalls:
+/// `nim_powerbox_runtime` uses [`SYSCALL_ADAPTER`], which folds them onto the single §3e STREAM
+/// `write` cap and fails every file operation closed (a stdout-only program). This leaves them as
+/// **retained manifest imports** the host binds to a real `temen_posix` personality — so a program
+/// that opens and reads files (`nifler2 parse in.nim out.nif`) works — and adds only
+/// [`POSIX_OPEN_ADAPTER`], the one ABI reconciliation that edge needs.
+pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+    let (mut compute_exports, m1) = nim_compute_exports(units)?;
+    // Withhold the leaves the **personality serves for real** from the compute shim, whose versions
+    // of them are deliberate fail-closed stubs ("a playground guest is granted no ambient
+    // filesystem"). Bound to the stub, `getcwd` returns NULL and nim's `getCurrentDir()` raises —
+    // which is right for the stdout-only powerbox and wrong here, where a real cwd exists. Dropped
+    // from the shim's export set they survive as retained imports the host binds to the matching
+    // `temen_posix` op, whose `getcwd(buf, size) -> buf` is the C ABI unchanged.
+    compute_exports.retain(|(n, _)| !POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)));
+    // `sysOpen`'s nim name is only known once the program is linked (pass 1's retained imports).
+    let mut opens: Vec<(String, u32)> = m1
+        .imports
+        .iter()
+        .filter(|i| i.name.starts_with("sysOpen"))
+        .map(|i| (i.name.clone(), 0))
+        .collect();
+    // `std/posix`'s plain `open` (what `memfiles.open` calls) is a *compute leaf* bound to the
+    // shim's fail-closed stub, not a retained import — so it never reached the adapter and every
+    // memory-mapped read failed while `readFile` worked (#1595). Take the name off the shim and
+    // give it the adapter's second entry point, whose `mode` is `i32` rather than `sysOpen`'s `i64`.
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("open"))
+            .map(|(n, _)| (n.clone(), 1)),
+    );
+    compute_exports.retain(|(n, _)| !n.starts_with("open"));
+    // `unlink` and `c_rename`, for the same reason and by the same route. nim writes a file
+    // **atomically** — `vfs.writeBytes` writes a temp then renames it into place, and removes the
+    // temp if anything fails — so a stubbed `rename` means every file write fails at the last step,
+    // after the work is done. Both need the NUL walk: C passes terminated strings where the ops take
+    // `(ptr, len)`, exactly as `open` does.
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("unlink"))
+            .map(|(n, _)| (n.clone(), 2)),
+    );
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("c_rename"))
+            .map(|(n, _)| (n.clone(), 3)),
+    );
+    // `stat`/`lstat` (the memfs has no symlinks, so they are the same answer). This is the leaf that
+    // decides whether the *compiler* can run at all: every `fileExists` on the shim's stub said no,
+    // so nimsem quit with `cannot find <input>` before doing any work. `fstat` is deliberately not
+    // matched — it takes an fd, needs no walk, and the host serves it directly
+    // (`POSIX_SERVED_LEAVES`).
+    opens.extend(
+        compute_exports
+            .iter()
+            .filter(|(n, _)| n.starts_with("stat") || n.starts_with("lstat"))
+            .map(|(n, _)| (n.clone(), 4)),
+    );
+    compute_exports.retain(|(n, _)| {
+        !n.starts_with("unlink")
+            && !n.starts_with("c_rename")
+            && !n.starts_with("stat")
+            && !n.starts_with("lstat")
+    });
+    let open_adapter = temen_ir::LinkUnit {
+        module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
+            .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,
+        exports: opens,
+        ..Default::default()
+    };
+    // **`mmap` changes hands** (#1595). nim maps files to read them, and the shim's `mmap` is the
+    // heap bump allocator — it ignores `fd`, so a file-backed mapping is uninitialized heap. Hand
+    // the name to `POSIX_MMAP_ADAPTER` and re-export the shim's func to it under a private alias,
+    // so the allocator itself is still the one the shim owns.
+    let mmaps: Vec<(String, u32)> = compute_exports
+        .iter()
+        .filter(|(n, _)| n.starts_with("mmap"))
+        .map(|(n, _)| (n.clone(), 0))
+        .collect();
+    let mmap_adapter = if mmaps.is_empty() {
+        // A program that never maps anything (it links no `mmap` leaf) needs no adapter, and
+        // adding one would leave `read`/`lseek` imports nothing binds.
+        None
+    } else {
+        let anon_idx = compute_exports
+            .iter()
+            .find(|(n, _)| n.starts_with("mmap"))
+            .map(|(_, i)| *i)
+            .expect("mmaps is non-empty");
+        compute_exports.retain(|(n, _)| !n.starts_with("mmap"));
+        compute_exports.push((MMAP_ANON_ALIAS.to_string(), anon_idx));
+        Some(temen_ir::LinkUnit {
+            module: temen_text::parse_module(POSIX_MMAP_ADAPTER)
+                .map_err(|e| LengError::Malformed(format!("posix mmap adapter parse: {e:?}")))?,
+            exports: mmaps,
+            ..Default::default()
+        })
+    };
+    let mut out = vec![compute_shim_unit(compute_exports)?, open_adapter];
+    out.extend(mmap_adapter);
+    Ok(out)
+}
+
+/// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).
+fn compute_shim_unit(exports: Vec<(String, u32)>) -> Result<temen_ir::LinkUnit, LengError> {
+    let module = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
+        .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+    Ok(temen_ir::LinkUnit {
+        module,
+        exports,
+        ..Default::default()
+    })
+}
+
+/// Which [`COMPUTE_LEAVES`] rows `units` actually reference, plus the **pass-1 link** they were
+/// discovered against (whose surviving imports are the true syscalls — what the caller binds next).
+fn nim_compute_exports(units: &[WholeModule]) -> Result<(Vec<(String, u32)>, Module), LengError> {
+    // The compute shim must know which leaf names to export; discover them from the `system` unit's
+    // own compiled imports (every pure-compute leaf originates there — a self-contained module that
+    // compiles standalone, unlike a program unit that references a sibling's aggregate type).
+    let sys = units
+        .iter()
+        .find(|u| u.stem.starts_with("sysv"))
+        .ok_or_else(|| LengError::Malformed("no `system` unit (stem `sysv…`) to link".into()))?;
+    let sys_obj = temen_encode::decode_unit(&compile_whole_object(sys)?)
+        .map_err(|e| LengError::Malformed(format!("decode system object: {e:?}")))?;
+    let mut compute_exports: Vec<(String, u32)> = Vec::new();
+    let widen = |m: &Module, exports: &mut Vec<(String, u32)>| {
+        for imp in &m.imports {
+            if let Some(i) = compute_leaf_index(&imp.name, import_sig(m, imp)) {
+                if exports.iter().all(|(n, _)| n != &imp.name) {
+                    exports.push((imp.name.clone(), i));
+                }
+            }
+        }
+    };
+    widen(&sys_obj, &mut compute_exports);
+
+    // Pass 1: link with only the compute shim, so the true syscalls survive as retained imports.
+    let m1 =
+        link_whole_powerbox_manifest(units, vec![compute_shim_unit(compute_exports.clone())?])?;
+
+    // Widen the compute set with any leaf the shim serves that survived pass 1. The `system` scan
+    // above finds every leaf that module declares, but a leaf declared by *another* stdlib module
+    // (`std/posix`'s `clock_gettime`, reached through `std/times`) only shows up once the whole
+    // program is linked. Both passes feed one export list, so the final compute unit serves both.
+    widen(&m1, &mut compute_exports);
+
+    Ok((compute_exports, m1))
 }
 
 /// **Link several nimony modules in Tier-2 TLS mode** (NIM.md §3d) together with a runtime that

@@ -32,6 +32,24 @@ NIM_BIN="$(dirname "$(command -v nim)")"
 # it via `../nativenif`); both are repo-root submodules, so that sibling layout holds.
 git submodule update --init nimony nativenif
 
+# `nativenif` is pinned TWICE and both pins must agree. Ours is the submodule gitlink; nimony's own
+# is `src/nativenif.commit`, which `hastur build all` checks out into `../nativenif` before building
+# arkham/nifasm from it. The submodule update above runs first and resets the checkout to OUR pin, so
+# when the two disagree the build silently proceeds against whichever one ran last — and a nimony
+# bump that moves its pin without moving the submodule fails deep inside the build with no hint that
+# a pin is the reason. Say so here instead, before anything is built.
+NATIVENIF_PIN_FILE=nimony/src/nativenif.commit
+if [ -f "$NATIVENIF_PIN_FILE" ]; then
+  want="$(awk '{print $1; exit}' "$NATIVENIF_PIN_FILE")"
+  have="$(git -C nativenif rev-parse HEAD)"
+  if [ "$want" != "$have" ]; then
+    echo "error: nativenif pin mismatch — the nimony submodule wants $want" >&2
+    echo "       ($NATIVENIF_PIN_FILE) but our submodule gitlink is $have." >&2
+    echo "       Move both together: git -C nativenif checkout $want && git add nativenif" >&2
+    exit 1
+  fi
+fi
+
 # setup-nim installs the *prebuilt* devel nightly, cut daily and lagging devel's head by hours to
 # a day (or months when nightlies stall). nifler compiles Nim's own parser, so it needs current
 # compiler sources; nimony's CI overlays devel HEAD's `compiler/` onto the nightly for that. An
@@ -41,6 +59,17 @@ git submodule update --init nimony nativenif
 # both `compiler/` and `lib/` from it — one coherent source tree, the nightly only the bootstrap
 # binary (Nim's own bootstrap compiles devel sources with an older binary the same way).
 NIM_SRC_REV=973065b279d2ae5b3954c25348c7dc4a02335f2b # nim-lang/Nim devel, 2026-09-03
+# There is a THIRD Nim revision in play, and it used to be invisible: nifler vendors a copy of Nim's
+# parser and records the revision it was taken from in `src/nifler/nimparser/upstream.commit`. That
+# is the revision upstream's own CI overlays. Ours is deliberately separate (we bump it when a
+# nightly/devel split breaks the build — see #1220 above), but a large drift between the two is the
+# first thing to suspect when nifler stops compiling, so print both rather than leave the reader to
+# discover the second one by hitting it.
+NIFLER_UPSTREAM_FILE=nimony/src/nifler/nimparser/upstream.commit
+if [ -f "$NIFLER_UPSTREAM_FILE" ]; then
+  echo "provision-nimony: overlaying Nim $NIM_SRC_REV; nifler's vendored parser is from \
+$(cat "$NIFLER_UPSTREAM_FILE")" >&2
+fi
 if [ ! -d nim-src/.git ]; then
   git init -q nim-src
   git -C nim-src remote add origin https://github.com/nim-lang/Nim
@@ -95,7 +124,11 @@ toolchain_works() {
 if toolchain_works; then
   echo "provision-nimony: restored nimony/bin compiles a probe — skipping the hastur build." >&2
 else
-  ( cd nimony && nim c -r src/hastur --release build all )
+  # `src/hastur/hastur.nim`, not `src/hastur`: hastur became a directory of modules, so the bare
+  # directory no longer resolves to a compilable file. `--release` sits AFTER the filename on
+  # purpose — everything before it is nim's, everything after is hastur's, and `nim c -r x --release`
+  # would hand the flag to nim and leave hastur with `build all` alone.
+  ( cd nimony && nim c -r src/hastur/hastur.nim --release build all )
 fi
 
 echo "NIMONY_BIN=$WORK/nimony/bin" >&3

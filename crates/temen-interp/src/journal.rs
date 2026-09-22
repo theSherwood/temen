@@ -120,6 +120,21 @@ pub struct JournalPolicy {
     /// no state entry, so [`Journal::can_undo_to`] declines it and the checkpoint-plus-replay path
     /// serves. `0` means unbounded.
     pub byte_budget: usize,
+    /// Turns between **continuation snapshots** — the segment boundaries `undo_to` lands on before
+    /// replaying the remainder forward. `1` journals one per op.
+    ///
+    /// This is the dial the #1556 measurements turned out to be about. Window pre-images are cheap
+    /// (they are sized by what an op writes); a continuation is a clone of every task's `Vm`, the
+    /// fiber chain and the task states, and its cost scales with **frame depth**, not with the window.
+    /// #1556 said so in the design — *"the continuation is snapshotted at segment boundaries rather
+    /// than inverted per-op"* — and measuring a per-op implementation on real guests is what made the
+    /// point concrete: on `chibicc` (deep recursive descent) the per-op continuation was **94%** of
+    /// the journal's total cost, 139× slowdown against 9× with it off; on `forth`, 83%.
+    ///
+    /// So `undo_to(t)` restores the nearest boundary at or before `t` and re-executes the remainder,
+    /// which is bounded by this stride. `cargo run --release -p temen-run --example journal_cost`
+    /// reports the trade at several strides.
+    pub state_stride: u64,
 }
 
 impl Default for JournalPolicy {
@@ -130,9 +145,26 @@ impl Default for JournalPolicy {
         JournalPolicy {
             fine_turns: 4096,
             byte_budget: 0,
+            state_stride: DEFAULT_STATE_STRIDE,
         }
     }
 }
+
+/// The default [`state_stride`](JournalPolicy::state_stride), chosen from the `journal_cost` sweep.
+///
+/// | stride | chibicc slowdown | forth slowdown | undo (chibicc) |
+/// | --- | --- | --- | --- |
+/// | 1 (per op) | 124.9× | 13.4× | 149 µs |
+/// | 16 | 8.4× | 2.0× | 102 µs |
+/// | 64 | 3.6× | 1.4× | 221 µs |
+/// | **256** | **1.6×** | **1.3×** | **77 µs** |
+///
+/// The replay inside an undo is bounded by the stride, so its cost grows linearly with this while the
+/// per-op capture cost falls with it. 256 turns of re-execution is well under a millisecond on every
+/// guest measured — imperceptible against an interactive step — and it is where the capture cost has
+/// flattened, so paying more stride buys nothing. An embedder that wants tighter undo latency at a
+/// higher steady-state cost sets its own.
+pub const DEFAULT_STATE_STRIDE: u64 = 256;
 
 /// An ordered journal of window pre-images and per-op engine state (see the module docs).
 ///
@@ -146,6 +178,14 @@ pub struct Journal {
     armed: bool,
     appended: usize,
     appended_bytes: usize,
+    /// The earliest coordinate this journal can still restore faithfully.
+    ///
+    /// Not derivable from `entries`: they exist only for turns that *wrote*, so the oldest entry's
+    /// coord says nothing about whether history is complete before it. What does move this is the
+    /// byte budget dropping the oldest pre-images — after that, undoing to an anchor below the floor
+    /// would re-apply a partial set and hand back a window that never existed. Raised only by
+    /// dropping, so it is monotone, like every other thing the policy does.
+    floor: u64,
 }
 
 impl Journal {
@@ -216,6 +256,12 @@ impl Journal {
         if !self.armed {
             return;
         }
+        // One per *segment*, not one per op — see `JournalPolicy::state_stride`. A duplicate coord can
+        // arrive when a run is undone into a segment and re-executes over it; keep the one already
+        // held, which is the one every earlier position was restored against.
+        if self.states.last().is_some_and(|s| s.coord >= coord) {
+            return;
+        }
         self.states.push(StateEntry {
             coord,
             cont,
@@ -223,18 +269,26 @@ impl Journal {
         });
     }
 
-    /// The state entry recorded exactly at `coord`, or `None` if that turn has none — which is how a
-    /// run outside the invertible subset, or one whose history has been compacted past `coord`,
-    /// declines to be undone there.
+    /// The nearest state entry **at or before** `coord`, or `None` when the journal holds none that
+    /// early — which is how a run outside the invertible subset, or one whose history has been
+    /// compacted or dropped past `coord`, declines to be undone there.
+    ///
+    /// At or before, rather than exactly at, because continuations ride segment boundaries
+    /// ([`JournalPolicy::state_stride`]). `undo_to` restores this entry and re-executes forward to
+    /// `coord`; the window pre-images in between stay per-op, so the *window* is exact at every turn
+    /// and only the continuation needs the short replay.
     pub(crate) fn state_at(&self, coord: u64) -> Option<&StateEntry> {
-        let i = self.states.partition_point(|s| s.coord < coord);
-        self.states.get(i).filter(|s| s.coord == coord)
+        let i = self.states.partition_point(|s| s.coord <= coord);
+        self.states.get(i.checked_sub(1)?)
     }
 
     /// Whether [`state_at`](Self::state_at) can serve `coord` — the engine's precondition for undoing
-    /// there at all.
+    /// there at all. Also requires the anchor to sit at or above the [`floor`](Self::floor): undoing
+    /// re-applies every pre-image from the anchor forward, so an anchor whose pre-images the byte
+    /// budget has partly dropped would restore a window that never existed.
     pub(crate) fn can_undo_to(&self, coord: u64) -> bool {
-        self.state_at(coord).is_some()
+        self.state_at(coord)
+            .is_some_and(|st| st.coord >= self.floor)
     }
 
     /// Undo every entry at a coordinate `>= coord`, restoring the window to the state it held *before*
@@ -264,6 +318,7 @@ impl Journal {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.states.clear();
+        self.floor = u64::MAX; // nothing is restorable until something is recorded again
     }
 
     /// Apply `policy` at live position `now`: coalesce history that has aged out of the fine window,
@@ -287,13 +342,25 @@ impl Journal {
         }
         // Drop oldest-first. Undo reaching a given turn needs only the entries from that turn forward,
         // so shedding the tail of history shortens the reach without corrupting what remains.
+        //
+        // **A budget below one `state_stride` of writes turns undo off entirely**, and does so quietly:
+        // `state_at` resolves a target to the nearest boundary at or before it, so once the floor
+        // passes the last boundary every target resolves below it and `can_undo_to` declines
+        // universally. That is *safe* — declining is the fail-closed answer and `seek` serves — but it
+        // is a trap for an embedder who sets a tight budget and wonders why `step_back` never uses the
+        // journal it is paying for. Keeping the live segment regardless of the budget looks like the
+        // fix and is not a one-liner: it has to keep the floor honest about which pre-images survive,
+        // and a first attempt at it restored windows that never existed. Left as a documented
+        // constraint rather than a hasty fix; #1558 carries it.
         let mut held: usize = self.entries.iter().map(|e| e.pre.len()).sum();
         while held > policy.byte_budget && !self.entries.is_empty() {
             let dropped = self.entries.remove(0);
             held -= dropped.pre.len();
-            // Any state entry no longer backed by a full pre-image history is unusable.
-            let keep_from = self.entries.first().map_or(u64::MAX, |e| e.coord);
-            self.states.retain(|s| s.coord >= keep_from);
+            // History before the *next* remaining entry is now incomplete: that is the new floor, and
+            // `can_undo_to` declines every anchor below it. Fail-closed by construction — a dropped
+            // turn becomes unreachable, never wrong.
+            self.floor = self.entries.first().map_or(dropped.coord + 1, |e| e.coord);
+            self.states.retain(|s| s.coord >= self.floor);
         }
     }
 

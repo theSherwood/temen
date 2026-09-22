@@ -26,15 +26,9 @@
 
 #[path = "support/grant_hooks.rs"]
 mod grant_hooks_mod;
-#[path = "support/repo_root.rs"]
-mod repo_root_mod;
 use grant_hooks_mod::grant_hooks;
 
-use repo_root_mod::repo_root;
-
-use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
 
 use core::ffi::c_void;
 use temen_interp::{run_capture_reserved_with_host, GuestMem, Host, StreamRole, Trap};
@@ -43,20 +37,9 @@ use temen_jit::{compile_and_run_capture_reserved_with_host_ex, JitOutcome};
 use temen_text::parse_module as parse_module_raw;
 use temen_verify::verify_module;
 
-fn chibicc() -> &'static Path {
-    static CC: OnceLock<PathBuf> = OnceLock::new();
-    CC.get_or_init(|| {
-        let dir = repo_root().join("frontend/chibicc");
-        let status = Command::new("make")
-            .arg("-s")
-            .current_dir(&dir)
-            .status()
-            .unwrap();
-        assert!(status.success(), "chibicc build failed");
-        dir.join("chibicc")
-    })
-    .as_path()
-}
+#[path = "support/chibicc.rs"]
+mod chibicc_mod;
+use chibicc_mod::chibicc;
 
 /// Compile `src` to text IR; `child_entry` selects the §14 spawnable entry ABI.
 fn c_to_ir(src: &str, child_entry: bool) -> String {

@@ -68,6 +68,22 @@ note missed). The thaw may **attenuate** a carried budget through an embedder ho
 (`Host::set_budget_thaw_hook` — a re-hosted domain under a tighter ceiling), never raise it; no hook
 ⇒ verbatim. Minting authority therefore survives a freeze exactly as it was left.
 
+**Ruling — parallelism is a granted resource, bounded at dispatch, ceiling with per-child lanes
+(2026-09-21, D66 / #1586):** how many of a domain's subtree may be *running at once* is authority,
+and it moves down the graph like every other. Until D66 no runtime represented it per domain —
+`max_vcpus` bounds task *count* (parked tasks included), host parallelism was a global worker count,
+and on the JIT a §14 detached child was one OS thread, so a parent held whatever the OS allowed. Now a
+domain holds a **lane cap**, checked when a worker picks one of its tasks and released on
+park/yield/finish. A parent grants a child a lane ≤ its own cap, with Σ granted lanes ≤ the parent's
+cap enforced at grant time, and a running task counts against its own lane and every enclosing one.
+The model is a **ceiling**, not a transfer: the parent's own tasks may fill any lane it holds,
+including a child's — so 6 / 2 / 2 is *A up to 6, B ≤ 2 contended with A, C ≤ 2 contended with A, B
+and C never contending with each other*. This was chosen over the `split`-style hard partition the
+other three budget dimensions use, accepting that a parent can absorb a child's lane in exchange for
+not stranding idle capacity; revisit if a workload needs the guarantee. *Violated by:* a §14 spawn
+path that takes a worker without a lane, or a grant that exceeds the grantor's cap. (DESIGN.md §23
+"Child-domain scheduling".)
+
 ## 4. Host = mechanism, guest = policy
 
 The host's inter-domain layer is a waiter table, wake plumbing, and lifecycle cleanup —
@@ -304,8 +320,15 @@ safety it moved to the freeze, `detached_live_refused`, ends the run with `Trap:
 platform lifecycle action the guest cannot see coming, killing the domain, which invariant 5 forbids in
 terms ("a lifecycle event is never a domain-killing surprise"). Refusing the spawn probeably on all
 three engines is therefore the resting state until (a) freeze authority is **represented in code** —
-today it is implicit in nesting and `freeze_authority` is doc-only (PROCESS.md O14) — and (b) the
-per-child-artifact capture lands (#1361). Then the gate comes out everywhere at once and the rule is
+`Binding::FreezeAuthority { base, size }` now is that representation for a §14 **nested carve**, whose
+carve names it: granted at spawn, containment-covering so one grant serves every child of an
+instantiator range, durable so a thawed parent holds what it held, and askable through
+`Host::holds_freeze_authority` (#1440). A **detached** child, which owns its own window and has no
+sub-range to be named by, is covered by `FreezeScope::DetachedProgeny` — all-or-nothing, and never
+self-minted: a nested parent already reads its child's carve, so self-granting there documents a fact,
+whereas a detached child's window is *not* parent-readable, so a self-mint would dissolve the very
+isolation the spawn asked for. Authority over detached children therefore arrives from above or not at
+all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
 
