@@ -1214,6 +1214,26 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
 
 /// §3.6 slice 5a: the fiber currently running on this OS thread (the innermost live resume),
 /// if any — the futex thunk's fiber-context probe. `None` for the root computation.
+/// #1631 — is the fiber behind `handle` event-parked on a wait that carries its **own** deadline?
+///
+/// Read by the blocking-resume thunk to decide whether the vCPU idling on that fiber counts toward
+/// `Domain::parked`. It does not when the answer is `true`: the fiber's own deadline will end the
+/// wait, the vCPU re-polls it and runs on, so that vCPU is a potential notifier — the same question
+/// the OS futex park (#1625) and the D66 task park (#1631) each ask of their own parks.
+///
+/// `false` for a handle that no longer resolves, which is the conservative answer: a vCPU that
+/// cannot make progress should count as blocked.
+///
+/// # Safety
+/// Called on a vCPU thread whose [`CURRENT_RT`] is the run's fiber runtime — the same contract
+/// [`fiber_resume`] has, and the blocking-resume thunk calls it on that thread.
+pub(crate) unsafe fn park_is_self_resolving(handle: i64) -> bool {
+    let rt = &*current();
+    rt.table
+        .resolve(handle)
+        .is_some_and(|(_, slot)| slot.took_self_resolving_park())
+}
+
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
     let rt = current();
     if rt.is_null() {
