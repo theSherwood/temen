@@ -226,8 +226,8 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 | `i64.atomic.rmw.xchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
 | `i64.atomic.cmpxchg` | ✅ | ✅ | ✅ | ✅ | single-threaded lowering (concurrency-free module) |
 | `atomic.fence` | ✅ | ✅ | ✅ | ✅ |  |
-| `i32.atomic.wait` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `atomic.notify` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `i32.atomic.wait` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `atomic.notify` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## simd v128
 
@@ -505,15 +505,15 @@ Backends (DESIGN.md §3): the tree-walk interpreter is the **oracle** (defines o
 
 | op | temen-tree-walk | temen-bytecode | temen-jit | temen-wasm-jit | notes |
 |----|:----:|:----:|:----:|:----:|-------|
-| `cont.new` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `cont.resume` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `cont.resume.block` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `gc.roots` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (fiber_rt); Declines to the interp elsewhere; module-granular: a module that can reach it emits nothing (#1546), since an emitted frame's roots are invisible to the scan; serviced on the debug engine too (#1563) |
-| `setjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
-| `longjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on x86-64-unix (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `cont.new` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `cont.resume` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `cont.resume.block` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `suspend` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `thread.spawn` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `thread.join` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `gc.roots` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 / Windows x86-64 (fiber_rt); Declines to the interp elsewhere; module-granular: a module that can reach it emits nothing (#1546), since an emitted frame's roots are invisible to the scan; serviced on the debug engine too (#1563) |
+| `setjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
+| `longjmp` | ✅ | ✅ | 🔶 | ⛔ | Full on unix x86-64 / unix aarch64 (setjmp_rt); Declines to the interp elsewhere; leaf accelerator: folds to the bytecode interp underneath (DESIGN §3) |
 
 ## terminators
 

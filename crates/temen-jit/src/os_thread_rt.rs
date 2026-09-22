@@ -269,35 +269,65 @@ struct Threads {
 
 #[derive(Default)]
 struct FutexEntry {
-    /// Bumped by `notify` so parked waiters re-check and observe a wake (vs a spurious one).
-    generation: u64,
-    waiters: u32,
-    /// §3.6 slice 5a — **event-parked FIBER waiters** on this key (FIFO). A fiber's
-    /// `memory.wait` parks the fiber, not its OS thread, so it can't sit on the condvar like a
-    /// vCPU waiter; instead it queues a status cell here. `notify` drains up to its remaining
-    /// budget (counting them as woken); the timeout consumes the cell at a `cont.resume` poll
-    /// ([`fiber_futex_wait`]). Invariant: a cell is queued here iff its status is still
-    /// [`PENDING_WAIT`] — every transition happens under the futex lock. Always empty in the
-    /// loom model (fiber parks are not modeled; the futex core paths are untouched when so).
-    fibers: Vec<std::sync::Arc<FiberWaitCell>>,
+    /// **Every** waiter parked on this key, in arrival order — an OS-thread vCPU and an event-parked
+    /// fiber alike, one [`WaitCell`] each. `notify` drains exactly its `count` from the **front**
+    /// (oldest first, as both interpreter drivers do) and marks those cells woken; a timeout /
+    /// teardown exit consumes its own cell
+    /// ([`wait_deregister`]). Invariant: a cell is queued here iff its status is still
+    /// [`PENDING_WAIT`] — every transition happens under the futex lock.
+    ///
+    /// The two waiter kinds shared this key but not this queue until #1600's follow-on: a fiber
+    /// had a cell, an OS vCPU had a shared *generation* counter that one `notify` bumped once, so
+    /// **every** OS waiter on the key woke while `futex_notify` reported `min(waiters, count)`.
+    /// The count a guest was told was not the count it got, and the answer depended on which
+    /// engine ran the program (the oracle drains by count — invariant 15's "one path per
+    /// behaviour", and §5's "an error, or a fact, is a value"). One queue, one wake rule.
+    waiters: Vec<std::sync::Arc<WaitCell>>,
 }
 
-/// §3.6 slice 5a — one event-parked fiber waiter's completion cell (see [`FutexEntry::fibers`]).
-/// Written once, under the futex lock; read by the parked fiber at each `cont.resume` poll.
-struct FiberWaitCell {
+/// One parked waiter's completion cell (see [`FutexEntry::waiters`]). Written once, under the futex
+/// lock; read by its waiter — at each `cont.resume` poll for a fiber, at each condvar wakeup for an
+/// OS-thread vCPU. The cell owns the wake decision on both paths; the condvar is only how an OS
+/// waiter sleeps between re-checks.
+struct WaitCell {
     /// [`PENDING_WAIT`] while queued; a `WAIT_*` status once the event fired.
     status: AtomicI32,
+    /// `true` while this waiter is counted in [`Domain::parked`] — an **indefinite** OS-vCPU futex
+    /// park, the only kind the deadlock predicate cares about. Cleared exactly once, by whichever of
+    /// the two ends the park first: the waiter leaving, or a `notify` claiming the cell
+    /// ([`cell_unpark`]). A fiber's cell and a timed wait's cell are never counted, so their flag
+    /// starts `false` and every `cell_unpark` on them is a no-op.
+    parked: AtomicBool,
 }
 
-/// [`FiberWaitCell::status`] sentinel: no event yet. Distinct from every `WAIT_*` status; 0 is
-/// `WAIT_WOKEN`, so the cell is constructed at this explicit sentinel (via [`fiber_cell_new`]).
+/// [`WaitCell::status`] sentinel: no event yet. Distinct from every `WAIT_*` status; 0 is
+/// `WAIT_WOKEN`, so the cell is constructed at this explicit sentinel (via [`wait_cell_new`]).
 const PENDING_WAIT: i32 = i32::MIN;
 
-/// A fresh [`FiberWaitCell`] at the [`PENDING_WAIT`] sentinel.
-fn fiber_cell_new() -> std::sync::Arc<FiberWaitCell> {
-    std::sync::Arc::new(FiberWaitCell {
+/// A fresh [`WaitCell`] at the [`PENDING_WAIT`] sentinel. `parked` says whether its waiter counts
+/// toward [`Domain::parked`] (see [`WaitCell::parked`]); the caller has already incremented the
+/// counter when it passes `true`.
+fn wait_cell_new(parked: bool) -> std::sync::Arc<WaitCell> {
+    std::sync::Arc::new(WaitCell {
         status: AtomicI32::new(PENDING_WAIT),
+        parked: AtomicBool::new(parked),
     })
+}
+
+/// End this cell's contribution to [`Domain::parked`], if it still has one. Idempotent and racy-safe:
+/// the `swap` makes exactly one of the waiter's exit and a `notify`'s claim do the decrement.
+///
+/// **Why a `notify` settles it (#1625).** The waiter alone used to own the decrement, so a waiter a
+/// `notify` had already claimed still counted as parked until the OS scheduled it again. A barrier's
+/// last arriver notifies its peers and parks for the next phase at once; with the peers it had just
+/// made runnable still counted, `live > parked` read false and the arriver declared `WAIT_DEADLOCK`
+/// against threads that were already on their way back to it. A claimed waiter is runnable, so the
+/// claim is what ends its park — settled under the same futex lock that stores the status, so no
+/// observer sees a claimed cell still counted.
+fn cell_unpark(cell: &WaitCell, parked: &AtomicUsize) {
+    if cell.parked.swap(false, Ordering::AcqRel) {
+        parked.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// PROCESS.md S1b/S1c — **canonical futex key**. A §13 `SharedRegion` mapped at several window offsets
@@ -319,22 +349,58 @@ pub(crate) enum FutexKey {
 /// itself is process-global (real OS threads); keyed **absolutely** so a thunk needs only `phys`, never
 /// the window base.
 ///
-/// **Address reuse is a known hazard here** (#1608, open). Two runs never hold the same virtual
-/// address at the same time, but they reuse it over time — a freed reservation is handed straight
-/// back out, and in a process running several domains that happens constantly — while the purge runs
-/// from the host's teardown, i.e. *after* the reservation is released. A dying run can therefore
-/// forget pages a live one already recorded. Moving the purge into `GuestWindow::drop` (the one
-/// moment the range is provably still ours) is the fix and it is written up on #1608; it is not
-/// applied here because it aborts the windows nextest lane in the manner #1575 documents, which
-/// cannot be debugged without a Windows box. Real-runtime only — regions are not part of the loom
-/// futex model.
+/// **Entries are owner-scoped, because window addresses are recycled** (#1608). Two runs never hold
+/// the same virtual address at once, but they reuse it constantly — a freed reservation is handed
+/// straight back out — while the purge runs from the host's teardown, i.e. *after* the reservation is
+/// released. A dying run could therefore forget pages a live one had already recorded, and since a
+/// window purge spans the whole 1 TiB reservation it did not have to be anywhere near the same base
+/// to do it.
+///
+/// That is not hypothetical. `child_exec_jit`'s ping-pong test hangs about 1 run in 10 at
+/// `--test-threads=6`, and instrumenting the registry catches it exactly: one page was recorded by
+/// four different runs at the same recycled base (backings 3, 6, 5, 7), and a dead run's purge then
+/// erased the live run's entry between the waiter parking and the notifier waking it —
+///
+/// ```text
+/// forget base=7340c3ffa000 size=1099511627776   <- a dead run's purge, 1 TiB span
+/// keyof phys=7340c400a000 -> Region(7, 0)       <- the waiter parks on this key
+/// keyof phys=7340c400a000 -> Anon (MISS)        <- the notifier computes a different one
+/// ```
+///
+/// A `notify` on `Anon(..)` cannot reach a waiter parked on `Region(7, 0)`, so the handoff is lost and
+/// the run wedges with no error anywhere. Each entry therefore records **which run wrote it**, and a
+/// purge forgets only its own; a record may still replace another owner's entry for a page, which is
+/// correct because a live run's reservation proves the previous owner is gone.
+///
+/// Still keyed **absolutely** so a thunk needs only `phys`, never the window base, and still
+/// process-global because the JIT futex itself is (real OS threads). Scoping the whole map to the
+/// `Domain` would make even a stale *read* impossible and is the end state #1608 describes; it needs
+/// the recorder's install path to carry the `Domain`, which `cap_thunk`'s ABI does not. Real-runtime
+/// only — regions are not part of the loom futex model.
 #[cfg(not(loom))]
-static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, (u64, u64)>>> =
+static REGION_MAP: std::sync::OnceLock<std::sync::Mutex<HashMap<u64, RegionRecord>>> =
     std::sync::OnceLock::new();
 
+/// One page's canonical region identity, plus the run that recorded it (see [`REGION_MAP`]).
 #[cfg(not(loom))]
-fn region_map() -> &'static std::sync::Mutex<HashMap<u64, (u64, u64)>> {
+#[derive(Clone, Copy)]
+struct RegionRecord {
+    backing: u64,
+    region_off: u64,
+    owner: u64,
+}
+
+#[cfg(not(loom))]
+fn region_map() -> &'static std::sync::Mutex<HashMap<u64, RegionRecord>> {
     REGION_MAP.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// A fresh registry owner id for one run's window, taken once when its recorder is installed. Plain
+/// monotonic counter: ids are never reused, so a dead run's late purge can never match a live one.
+#[cfg(not(loom))]
+pub fn region_canon_new_owner() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Record that the absolute window range `[abs_base, abs_base + len)` aliases region-`backing` starting
@@ -343,7 +409,7 @@ fn region_map() -> &'static std::sync::Mutex<HashMap<u64, (u64, u64)>> {
 /// the granule); `abs_base`/`region_off` are page-aligned (`map` requires it), so page `i` of the span
 /// aliases region byte `region_off + i·page`.
 #[cfg(not(loom))]
-pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u64) {
+pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u64, owner: u64) {
     if len == 0 {
         return;
     }
@@ -352,39 +418,64 @@ pub fn region_canon_record(abs_base: u64, len: u64, backing: u64, region_off: u6
     let last = (abs_base + len - 1) / page;
     let mut g = region_map().lock().unwrap_or_else(|e| e.into_inner());
     for p in first..=last {
-        g.insert(p, (backing, region_off + (p - first) * page));
+        g.insert(
+            p,
+            RegionRecord {
+                backing,
+                region_off: region_off + (p - first) * page,
+                owner,
+            },
+        );
     }
 }
 
-/// Forget every canonical mapping in the absolute window `[base, base + size)` — called at `unmap` and
-/// at run teardown so a reused virtual address never inherits a stale region identity. The teardown
-/// caller no longer holds the address by then; see [`REGION_MAP`] and #1608.
+/// Forget `owner`'s canonical mappings in the absolute window `[base, base + size)` — called at `unmap`
+/// and at run teardown so a reused virtual address never inherits a stale region identity.
+///
+/// **`owner` is what makes this safe.** The teardown caller no longer holds the address range by the
+/// time it runs, and the range is the whole reservation, so without the owner test a dying run wiped
+/// live entries belonging to whichever runs had since been handed those addresses — the wedge written
+/// up on [`REGION_MAP`] and #1608.
 #[cfg(not(loom))]
-pub fn region_canon_forget_window(base: u64, size: u64) {
+pub fn region_canon_forget_window(base: u64, size: u64, owner: u64) {
     let page = mem::page_size() as u64;
     let lo = base / page;
     let hi = base.saturating_add(size).div_ceil(page);
     region_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|&p, _| p < lo || p >= hi);
+        .retain(|&p, r| p < lo || p >= hi || r.owner != owner);
 }
 
 /// The canonical futex key for absolute guest address `phys`: `Region(backing, off)` when its page was
 /// region-`map`ped, else `Anon(phys)`.
 fn futex_key_of(phys: u64) -> FutexKey {
     #[cfg(not(loom))]
-    {
-        let page = mem::page_size() as u64;
-        if let Some(&(backing, region_off)) = region_map()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(phys / page))
-        {
-            return FutexKey::Region(backing, region_off + phys % page);
-        }
+    if let Some((backing, off)) = region_canon_lookup(phys) {
+        return FutexKey::Region(backing, off);
     }
     FutexKey::Anon(phys)
+}
+
+/// The canonical `(backing, region byte offset)` recorded for the byte at absolute address `phys`, or
+/// `None` if its page is not region-`map`ped — the lookup [`futex_key_of`] is built on, and the one
+/// place the registry is read (#15).
+///
+/// Public because it is the only way to ask the registry what it believes, which is what a lost
+/// wakeup comes down to: two vCPUs of one run disagreeing about a key. #1608's owner scoping is
+/// tested through it, and an embedder debugging a stuck rendezvous wants the same question answered.
+#[cfg(not(loom))]
+pub fn region_canon_lookup(phys: u64) -> Option<(u64, u64)> {
+    let page = mem::page_size() as u64;
+    let &RegionRecord {
+        backing,
+        region_off,
+        ..
+    } = region_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(phys / page))?;
+    Some((backing, region_off + phys % page))
 }
 
 impl Domain {
@@ -1983,7 +2074,7 @@ unsafe fn fiber_futex_wait(
 ) -> i32 {
     let mask = width_mask(width);
     let key = futex_key_of(phys);
-    let cell = fiber_cell_new();
+    let cell = wait_cell_new(false);
     {
         let mut g = lock(&dom.futex);
         if read_phys(phys, width) & mask != expected & mask {
@@ -1992,7 +2083,7 @@ unsafe fn fiber_futex_wait(
             // `FIBER_PARKED` the oracle's register-then-recheck shows (fiber_parks.rs).
             cell.status.store(WAIT_NOT_EQUAL, Ordering::Release);
         } else {
-            g.entry(key).or_default().fibers.push(cell.clone());
+            g.entry(key).or_default().waiters.push(cell.clone());
         }
     }
     fiber_futex_wait_loop(dom, slot, key, &cell, deadline, unwind_base, trap_out)
@@ -2004,7 +2095,7 @@ unsafe fn fiber_futex_wait_loop(
     dom: &Domain,
     slot: &std::sync::Arc<fiber_rt::FiberSlot>,
     key: FutexKey,
-    cell: &std::sync::Arc<FiberWaitCell>,
+    cell: &std::sync::Arc<WaitCell>,
     deadline: Option<Instant>,
     unwind_base: u64,
     trap_out: u64,
@@ -2032,14 +2123,14 @@ unsafe fn fiber_futex_wait_loop(
             || load_trap(trap_out as *mut i64) != 0
             || (unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base))
         {
-            fiber_wait_deregister(dom, key, cell);
+            wait_deregister(&mut lock(&dom.futex), key, cell);
             return WAIT_WOKEN;
         }
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
                 // The deadline passed: fire the timeout at this poll. A notify that raced us
                 // and already consumed the cell wins with its own status.
-                if fiber_wait_deregister(dom, key, cell) {
+                if wait_deregister(&mut lock(&dom.futex), key, cell) {
                     return WAIT_TIMED_OUT;
                 }
                 return cell.status.load(Ordering::Acquire);
@@ -2048,27 +2139,27 @@ unsafe fn fiber_futex_wait_loop(
     }
 }
 
-/// Consume `cell`'s waiter entry under the futex lock: `true` if it was still queued (the
-/// caller owns the wake and delivers its own status), `false` if a `notify` already drained it
-/// (its stored status stands). See the [`FutexEntry::fibers`] invariant.
-fn fiber_wait_deregister(
-    dom: &Domain,
+/// Consume `cell`'s waiter entry: `true` if it was still queued (the caller owns the wake and
+/// delivers its own status), `false` if a `notify` already drained it (its stored status stands).
+/// Both park paths exit through here — the OS park holds the futex lock across its whole loop, so
+/// this takes the map rather than the mutex. See the [`FutexEntry::waiters`] invariant.
+fn wait_deregister(
+    g: &mut HashMap<FutexKey, FutexEntry>,
     key: FutexKey,
-    cell: &std::sync::Arc<FiberWaitCell>,
+    cell: &std::sync::Arc<WaitCell>,
 ) -> bool {
-    let mut g = lock(&dom.futex);
     let Some(e) = g.get_mut(&key) else {
         return false;
     };
     let Some(pos) = e
-        .fibers
+        .waiters
         .iter()
         .position(|c| std::sync::Arc::ptr_eq(c, cell))
     else {
         return false;
     };
-    e.fibers.remove(pos);
-    if e.waiters == 0 && e.fibers.is_empty() {
+    e.waiters.remove(pos);
+    if e.waiters.is_empty() {
         g.remove(&key);
     }
     true
@@ -2160,7 +2251,13 @@ pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, c
     let dom = &*sched;
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
-    let woken = futex_notify(&dom.futex, &dom.futex_cv, futex_key_of(phys), count as u32);
+    let woken = futex_notify(
+        &dom.futex,
+        &dom.futex_cv,
+        futex_key_of(phys),
+        count as u32,
+        &dom.parked,
+    );
     if woken > 0 {
         // D66 — a parked **child-domain task** has no resumer polling it: re-offer the parked set
         // so the one whose cell this notify just filled runs again promptly, instead of waiting
@@ -2185,6 +2282,20 @@ impl<'a> ParkGuard<'a> {
 impl Drop for ParkGuard<'_> {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// The waiter's half of [`cell_unpark`]: drops this waiter's [`Domain::parked`] contribution on every
+/// exit from the park loop — woken, timed out, freeze, kill, teardown, deadlock — and on an unwind.
+/// A `notify` that claimed the cell first has already settled it; the `swap` inside makes the loser a
+/// no-op.
+struct CellParkGuard<'a> {
+    cell: &'a WaitCell,
+    parked: &'a AtomicUsize,
+}
+impl Drop for CellParkGuard<'_> {
+    fn drop(&mut self) {
+        cell_unpark(self.cell, self.parked);
     }
 }
 
@@ -2217,18 +2328,35 @@ fn futex_wait(
     if !still_eq() {
         return WAIT_NOT_EQUAL;
     }
-    let start_gen = {
-        let e = g.entry(key).or_default();
-        e.waiters += 1;
-        e.generation
+    // One cell, queued in arrival order alongside every other waiter on this key — fibers included.
+    // A `notify` that claims this waiter stores its status here, so the wake is *latched*: it cannot
+    // be missed, and it cannot be observed by a waiter the notify did not claim.
+    // Count this vCPU as blocked for the duration of the park, so a peer's `peers_live` — and the
+    // deadlock check below — see it. Settled on every exit path by the guard, or earlier by a
+    // `notify` that claims the cell ([`cell_unpark`]).
+    //
+    // **Only an indefinite park counts (#1625).** `parked` feeds exactly one reader, the deadlock
+    // predicate `live > parked`, which asks "could any live vCPU still reach a `notify`?". A *timed*
+    // wait answers yes: it wakes at its own deadline with no help and runs on. Counting it said no,
+    // so a sibling's infinite wait declared `WAIT_DEADLOCK` against a peer that was merely sleeping —
+    // a parked daemon self-trapped while the root sat in a timed wait on its way out of the run. A
+    // waiter that self-resolves is a potential notifier, not a deadlock participant.
+    let counts = deadline.is_none();
+    if counts {
+        parked.fetch_add(1, Ordering::AcqRel);
+    }
+    let cell = wait_cell_new(counts);
+    g.entry(key).or_default().waiters.push(cell.clone());
+    let _pg = CellParkGuard {
+        cell: &cell,
+        parked,
     };
-    // Count this vCPU as blocked for the duration of the park (dropped on every loop exit below), so a
-    // peer's `peers_live` — and the deadlock check below — see it.
-    let _pg = ParkGuard::new(parked);
     let status = loop {
-        let cur = g.get(&key).map(|e| e.generation).unwrap_or(start_gen);
-        if cur != start_gen {
-            break WAIT_WOKEN;
+        // Every other exit below is decided under this same lock acquisition, so a claimed cell
+        // always wins over a deadline or a teardown that fell in the same iteration.
+        let st = cell.status.load(Ordering::Acquire);
+        if st != PENDING_WAIT {
+            break st;
         }
         // §5 kill-path: a parked waiter unwinds when the host kills the domain (it returns as if
         // woken; the guest code after the wait traps `OutOfFuel` at its next epoch poll).
@@ -2254,34 +2382,41 @@ fn futex_wait(
         }
         match deadline {
             None => {
-                // Armed (real build): bounded re-check so an *infinite* wait still observes a kill or a
-                // freeze even when no `notify` arrives.
+                // §12.8 concurrent-thaw stage 2/3: deadlock detection. If no other vCPU is live *and
+                // not itself parked*, no `notify` can ever arrive — a parked waiter can't notify
+                // itself, and a wasm wait returns only on notify/timeout, not on a plain value
+                // change — so this infinite wait can never be satisfied. Fail closed (#5: an error is
+                // a value, never a hang) rather than re-check forever.
+                //
+                // **Unconditional (#1623).** This check and the bounded re-check below used to sit
+                // inside an `epoch_addr != 0 || unwind_base != 0` guard, with a `#[cfg(loom)]` copy of
+                // the check for the model. So on an ordinary run with no kill path and no durable
+                // window — neither armed — control fell through to an *untimed* `cv.wait` that
+                // re-evaluated nothing, and the detector did not exist: a lone infinite wait hung the
+                // host forever, with the `ThreadFault` its own caller promises two lines away
+                // unreachable. The JIT does not clamp an infinite wait the way the interpreter does,
+                // so `None` is an ordinary production path, not just the model's. One check now, for
+                // every run shape and for loom (#15).
+                if !peers_live() {
+                    break WAIT_DEADLOCK;
+                }
+                // Real build: a bounded re-check, so an infinite wait still observes a kill, a freeze,
+                // or the last peer exiting even when no `notify` arrives. Under loom there are no
+                // timeouts and none is needed — every state change that could satisfy or refute this
+                // wait notifies this `cv` under this lock — a `notify`, or a peer going non-live
+                // (`child_finished` / `run_child` drop `live` and wake) — so the model re-evaluates
+                // on each wakeup.
                 #[cfg(not(loom))]
-                if epoch_addr != 0 || unwind_base != 0 {
-                    // §12.8 concurrent-thaw stage 2: deadlock detection. If no other vCPU is live, no
-                    // `notify` can ever arrive (a parked waiter can't notify itself, and a wasm wait
-                    // returns only on notify/timeout — not on a plain value change), so this infinite wait
-                    // can never be satisfied. Fail closed rather than re-check forever. Detected within
-                    // `KILL_RECHECK` of the last peer exiting (run_child drops `live` as each finishes).
-                    if !peers_live() {
-                        break WAIT_DEADLOCK;
-                    }
+                {
                     g = cv
                         .wait_timeout(g, KILL_RECHECK)
                         .unwrap_or_else(|e| e.into_inner())
                         .0;
-                    continue;
                 }
-                // §12.8 concurrent-thaw stage 3: the same deadlock check, modeled under loom. loom has no
-                // timeouts (so the real-build `wait_timeout` re-check above is compiled out), but it *does*
-                // explore the peer-exit↔consumer-wait interleavings: a peer that goes non-live notifies
-                // this `cv`, and we re-evaluate `peers_live` on each wakeup, so an infinite wait with no
-                // possible notifier resolves to `WAIT_DEADLOCK` instead of blocking the model forever.
                 #[cfg(loom)]
-                if !peers_live() {
-                    break WAIT_DEADLOCK;
+                {
+                    g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
                 }
-                g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
             // loom's `Condvar` models no timeouts; the loom test only exercises the infinite-wait path
             // (`deadline = None`), so the timed branch is real-build-only.
@@ -2296,9 +2431,10 @@ fn futex_wait(
                     .unwrap_or_else(|e| e.into_inner());
                 g = ng;
                 if to.timed_out() {
-                    let cur = g.get(&key).map(|e| e.generation).unwrap_or(start_gen);
-                    break if cur != start_gen {
-                        WAIT_WOKEN
+                    // A `notify` that claimed this cell while we slept wins with its own status.
+                    let st = cell.status.load(Ordering::Acquire);
+                    break if st != PENDING_WAIT {
+                        st
                     } else {
                         WAIT_TIMED_OUT
                     };
@@ -2308,51 +2444,50 @@ fn futex_wait(
             Some(_dl) => unreachable!("loom futex model uses no timeout"),
         }
     };
-    if let Some(e) = g.get_mut(&key) {
-        e.waiters = e.waiters.saturating_sub(1);
-        // Audit #8: drop a fully-drained entry so the futex map can't accumulate stale keys. Safe
-        // under the held lock — `waiters == 0` means no one is parked, so the per-key generation
-        // has no live observer to preserve; a later waiter on this key starts a fresh entry.
-        // (§3.6 slice 5a: unless event-parked fiber waiters still queue here — keep their cells.)
-        if e.waiters == 0 && e.fibers.is_empty() {
-            g.remove(&key);
-        }
-    }
+    // Audit #8: `wait_deregister` drops a fully-drained entry, so the futex map can't accumulate stale keys.
+    // A cell a `notify` already drained is simply not there (its status is the `status` above).
+    wait_deregister(&mut g, key, &cell);
     status
 }
 
-/// Futex wake core: bump `key`'s generation (so up to `count` parked waiters observe a real wake) and
-/// `notify_all`; return how many waiters were parked (capped at `count`).
+/// Futex wake core: claim **exactly** `count` of `key`'s parked waiters — oldest first, OS-thread
+/// vCPUs and event-parked fibers in one arrival order — and return how many there were to claim.
+///
+/// The `notify_all` that follows is only how the OS waiters are roused to re-check; a waiter this
+/// call did not claim finds its cell still [`PENDING_WAIT`] and parks again. So the returned count is
+/// the number of waiters that will report `WAIT_WOKEN`, which is what the oracle promises and what a
+/// guest handing work out one wake at a time depends on.
 fn futex_notify(
     futex: &Mutex<HashMap<FutexKey, FutexEntry>>,
     cv: &Condvar,
     key: FutexKey,
     count: u32,
+    // #1625: a claimed waiter is runnable, so the claim ends its park — see [`cell_unpark`].
+    parked: &AtomicUsize,
 ) -> u32 {
     let woken = {
         let mut g = lock(futex);
         match g.get_mut(&key) {
             Some(e) if count > 0 => {
-                let os = if e.waiters > 0 {
-                    e.generation = e.generation.wrapping_add(1);
-                    e.waiters.min(count)
-                } else {
-                    0
-                };
-                // §3.6 slice 5a: spend the remaining budget on event-parked FIBER waiters
-                // (FIFO). Statuses are delivered under this same lock, so a racing poll either
-                // finds the cell queued or finds its status — never neither. OS waiters count
-                // first; the oracle wakes in strict arrival order across both kinds, a
-                // difference only racy multi-waiter kernels could see (not differentially
-                // pinnable).
-                let take = ((count - os) as usize).min(e.fibers.len());
-                for c in e.fibers.drain(..take) {
+                // Statuses are delivered under this same lock, so a racing poll (fiber) or condvar
+                // wakeup (vCPU) either finds the cell queued or finds its status — never neither.
+                //
+                // **Oldest first** — arrival order, matching both interpreter drivers (owner ruling
+                // 2026-09-22, #1617). `futex_notify_count_jit.rs` makes a fiber register strictly
+                // before a vCPU (a `cont.resume` returns `FIBER_PARKED` only once the fiber is
+                // queued, and the spawn follows), so *which* of the two a `notify(key, 1)` claims
+                // is a deterministic, race-free differential rather than a matter of taste.
+                let take = (count as usize).min(e.waiters.len());
+                for c in e.waiters.drain(..take) {
                     c.status.store(WAIT_WOKEN, Ordering::Release);
+                    // Runnable as of this store, so it stops counting as parked *now* — under this
+                    // same lock, before any deadlock check can observe the pair (#1625).
+                    cell_unpark(&c, parked);
                 }
-                if e.waiters == 0 && e.fibers.is_empty() {
+                if e.waiters.is_empty() {
                     g.remove(&key);
                 }
-                os + take as u32
+                take as u32
             }
             _ => 0,
         }
@@ -2381,17 +2516,25 @@ mod loom_tests {
             let word = Arc::new(AtomicU64::new(0)); // the guest futex word
             const KEY: u64 = 0x1000;
 
-            let (f2, cv2, w2) = (Arc::clone(&futex), Arc::clone(&cv), Arc::clone(&word));
+            // #1625: one counter, shared with the notifier — a claim settles the waiter's park, so
+            // both sides move it and the assertion after the join checks they did so exactly once.
+            let parked = Arc::new(AtomicUsize::new(0));
+
+            let (f2, cv2, w2, p2) = (
+                Arc::clone(&futex),
+                Arc::clone(&cv),
+                Arc::clone(&word),
+                Arc::clone(&parked),
+            );
             let producer = loom::thread::spawn(move || {
                 // store then notify (the release/wake pair)
                 w2.store(1, Ordering::SeqCst);
-                futex_notify(&f2, &cv2, FutexKey::Anon(KEY), 1);
+                futex_notify(&f2, &cv2, FutexKey::Anon(KEY), 1, &p2);
             });
 
             // consumer: wait while the word is still 0. Must not hang: either it sees 1 (NOT_EQUAL) or
             // it parks and the notify wakes it (WOKEN). A finite deadline keeps the model bounded, but
             // the invariant is "doesn't time out".
-            let parked = AtomicUsize::new(0); // unread here: the model's `peers_live` is always true
             let status = futex_wait(
                 &futex,
                 &cv,
@@ -2406,6 +2549,87 @@ mod loom_tests {
             );
             producer.join().unwrap();
             assert!(status == WAIT_WOKEN || status == WAIT_NOT_EQUAL);
+            // #1625: settled exactly once, by the waiter or by the notify that claimed it.
+            assert_eq!(
+                parked.load(Ordering::SeqCst),
+                0,
+                "the park settled exactly once",
+            );
+        });
+    }
+
+    /// **A notify's count is a promise.** Two waiters park on one key; the notifier stores the word
+    /// and delivers `notify(key, 1)`, then a second `notify(key, MAX)` releases whoever is left (so
+    /// the model always terminates — loom has no timeouts). Under *every* interleaving the number of
+    /// waiters that report `WAIT_WOKEN` equals the total the two notifies claimed: a waiter reports
+    /// woken **iff** a notify claimed it, never because a peer's wake splashed onto it.
+    ///
+    /// This is the property the shared *generation* counter could not hold — one bump woke every OS
+    /// waiter on the key while the call reported `min(waiters, count)` — and the reason both waiter
+    /// kinds now queue one [`WaitCell`] each in one arrival order. A waiter that races past the store
+    /// instead reports `WAIT_NOT_EQUAL` and is claimed by nobody, which the equality accounts for.
+    #[test]
+    fn loom_notify_wakes_exactly_the_waiters_it_claims() {
+        loom::model(|| {
+            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
+            let cv = Arc::new(Condvar::new());
+            let word = Arc::new(AtomicU64::new(0));
+            const KEY: u64 = 0x2000;
+
+            // #1625: one counter for every waiter and the notifier (see the assertion below).
+            let parked = Arc::new(AtomicUsize::new(0));
+
+            let waiters: Vec<_> = (0..2)
+                .map(|_| {
+                    let (f, c, w, pk) = (
+                        Arc::clone(&futex),
+                        Arc::clone(&cv),
+                        Arc::clone(&word),
+                        Arc::clone(&parked),
+                    );
+                    loom::thread::spawn(move || {
+                        futex_wait(
+                            &f,
+                            &c,
+                            FutexKey::Anon(KEY),
+                            || w.load(Ordering::SeqCst) == 0,
+                            None,
+                            0,
+                            0,
+                            &pk,
+                            || true,  // a notifier is always live in this model
+                            || false, // no domain teardown
+                        )
+                    })
+                })
+                .collect();
+
+            word.store(1, Ordering::SeqCst);
+            let claimed = futex_notify(&futex, &cv, FutexKey::Anon(KEY), 1, &parked)
+                + futex_notify(&futex, &cv, FutexKey::Anon(KEY), u32::MAX, &parked);
+            let woken = waiters
+                .into_iter()
+                .map(|w| w.join().unwrap())
+                .inspect(|st| {
+                    assert!(
+                        *st == WAIT_WOKEN || *st == WAIT_NOT_EQUAL,
+                        "an infinite wait resolves as woken or not-equal, got {st}",
+                    )
+                })
+                .filter(|st| *st == WAIT_WOKEN)
+                .count() as u32;
+            assert_eq!(
+                woken, claimed,
+                "exactly the waiters the notifies claimed reported woken",
+            );
+            // #1625: each park is settled exactly once — by the waiter leaving or by the notify that
+            // claimed its cell, never both and never neither. A double decrement wraps this far past
+            // zero; a missed one leaves it positive. Both are visible here under every interleaving.
+            assert_eq!(
+                parked.load(Ordering::SeqCst),
+                0,
+                "every park settled exactly once",
+            );
         });
     }
 
@@ -2451,6 +2675,97 @@ mod loom_tests {
             assert_eq!(
                 status, WAIT_DEADLOCK,
                 "no possible notifier left ⇒ deadlock detected, not an infinite block",
+            );
+        });
+    }
+
+    /// #1600 slice 7(c) — the deadlock predicate itself, over the **real** shape rather than a
+    /// modeled flag: a `live` count behind its mutex and the `parked` counter [`ParkGuard`] moves,
+    /// composed exactly as `thread_wait` composes them (`lock(&dom.threads).live > dom.parked`).
+    ///
+    /// The case that matters, and the one the lone-waiter model above cannot reach: a **mutual**
+    /// deadlock. Two vCPUs park on different keys, each waiting for a store only the other would
+    /// make. Neither can be satisfied, and both must come back `WAIT_DEADLOCK` under every
+    /// interleaving — not just whichever parked last.
+    ///
+    /// What carries it is the **exit** wake, and the model pins that rather than assuming it. The
+    /// waiter that parks second checks `peers_live` *after* its own `ParkGuard` increment, so it
+    /// sees `live == parked` and breaks without needing to be woken at all. The first is already
+    /// asleep, and loom has no timeouts — what frees it is the second one finishing: dropping `live`
+    /// and notifying the futex condvar, the pairing `Domain::child_finished` and `run_child` do.
+    /// Without that wake the survivor sits at `live(2) > parked(1)` forever.
+    ///
+    /// Worth recording because the first attempt got it backwards: I added a notify to `ParkGuard`
+    /// on the theory that the sleeping waiter had to learn its peer had blocked, and this model is
+    /// what showed it was never needed — the tests pass identically without it, so it came back out.
+    #[test]
+    fn loom_a_mutual_deadlock_resolves_for_both_waiters() {
+        loom::model(|| {
+            let futex = Arc::new(Mutex::new(HashMap::<FutexKey, FutexEntry>::new()));
+            let cv = Arc::new(Condvar::new());
+            // The real predicate's two halves: `live` counts vCPUs that have not finished, `parked`
+            // is the shared counter each `ParkGuard` bumps. (`parked` stays the std type
+            // `futex_wait` takes, as in the lone-waiter model above.)
+            let live = Arc::new(Mutex::new(2usize));
+            let parked = Arc::new(AtomicUsize::new(0));
+            const KEY_A: u64 = 0x3000;
+            const KEY_B: u64 = 0x3008;
+
+            let spawn_waiter = |key: u64,
+                                futex: Arc<Mutex<HashMap<FutexKey, FutexEntry>>>,
+                                cv: Arc<Condvar>,
+                                live: Arc<Mutex<usize>>,
+                                parked: Arc<AtomicUsize>| {
+                loom::thread::spawn(move || {
+                    let status = {
+                        let (lv, pk) = (Arc::clone(&live), Arc::clone(&parked));
+                        futex_wait(
+                            &futex,
+                            &cv,
+                            FutexKey::Anon(key),
+                            || true, // the word only the *other* waiter would store never changes
+                            None,
+                            0,
+                            0,
+                            &parked,
+                            // The production predicate, verbatim: a notifier must be a live vCPU
+                            // that is not itself parked.
+                            move || {
+                                *lv.lock().unwrap_or_else(|e| e.into_inner())
+                                    > pk.load(Ordering::Acquire)
+                            },
+                            || false, // no domain teardown in this model
+                        )
+                    };
+                    // This vCPU is done. Drop it from `live` and wake the futex waiters, exactly as
+                    // `Domain::child_finished` / `run_child` do — without this the surviving waiter
+                    // never sees the count fall and the model hangs.
+                    *live.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+                    let _g = futex.lock().unwrap_or_else(|e| e.into_inner());
+                    cv.notify_all();
+                    status
+                })
+            };
+
+            let a = spawn_waiter(
+                KEY_A,
+                Arc::clone(&futex),
+                Arc::clone(&cv),
+                Arc::clone(&live),
+                Arc::clone(&parked),
+            );
+            let b = spawn_waiter(
+                KEY_B,
+                Arc::clone(&futex),
+                Arc::clone(&cv),
+                Arc::clone(&live),
+                Arc::clone(&parked),
+            );
+            let (sa, sb) = (a.join().unwrap(), b.join().unwrap());
+            assert_eq!(
+                (sa, sb),
+                (WAIT_DEADLOCK, WAIT_DEADLOCK),
+                "both halves of a mutual deadlock must resolve, not just the one that parked last",
             );
         });
     }

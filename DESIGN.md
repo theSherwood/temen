@@ -1952,6 +1952,18 @@ primitive still wants a second consumer.
   Intra-domain mostly userspace; a host futex is needed only when a vCPU has no
   runnable fiber and must actually sleep. Cross-domain notify signals the other
   domain (slow path).
+- **`notify`'s count is a promise, and it is differentially pinned.** `notify(addr, n)`
+  wakes **at most `n`** waiters on that key — **oldest first**, in arrival order (owner ruling
+  2026-09-22) — and returns exactly how many it woke; the rest stay parked. FIFO because LIFO
+  starves: under steady notify traffic a waiter that parked early sits behind every later arrival
+  forever, and a guest work queue whose oldest waiter never runs is a hard failure to attribute. A guest lock or semaphore handing out one unit of
+  work per wake depends on that, so "woke more than it claimed" is a bug, not slack: it
+  is a thundering herd on one engine and the intended `n` on the other. One key therefore
+  holds **one** arrival-ordered waiter queue, whatever each waiter is parked as — a
+  1:1 vCPU's OS thread and an event-parked fiber queue the same kind of cell, and the
+  wake is latched in that cell rather than inferred from shared state, so a waiter reports
+  woken iff a `notify` claimed it. Two representations behind one key is how the JIT once
+  woke three OS waiters while reporting one (#1615, invariant #15).
 
 ### Memory model
 - **C/C++11 model** (relaxed / acquire / release / acq_rel / seq_cst; RMWs; thread
