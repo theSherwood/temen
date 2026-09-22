@@ -154,30 +154,28 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
         Ok(vec![Value::I64(0)]),
         "both vCPUs unwind: the root must not run through the freeze on its child's coat-tails"
     );
+    let (frozen, root_sp) = (h.frozen_vcpus().to_vec(), h.frozen_root_sp());
+    assert_eq!(frozen.len(), 1, "the child recorded its re-attach residue");
 
-    // **The thaw of this shape does not work yet (#1620), and that boundary is deliberate.**
-    // A *spawned* vCPU frozen at an `atomic.wait` suspend point does not re-attach: the thaw
-    // returns `ThreadFault`. Every existing multi-vCPU durable test freezes its child at a
-    // `call.cap` instead (`temen-durable/tests/multivcpu.rs`), so the `MemoryWait` suspend kind
-    // has never been exercised on a child — the veto fixed here is what kept this shape from ever
-    // being frozen in the first place.
-    //
-    // Pinned as-is rather than left untested: this is strictly better than what it replaces. The
-    // freeze above now takes a correct, consistent cut in ~0.1 s where it used to stall 10 s and
-    // return `2000` as an ordinary result; and the thaw fails **closed and loudly**, which is a
-    // value (#5), not a wrong answer. When #1620 lands, this flips to the `2100` round trip.
+    // The round trip: hand the child's re-attach residue to the thaw host, change the word, thaw.
+    // The child re-issues its wait and gets NOT_EQUAL (1 · 100), the root re-issues its join and
+    // reaps it — 2000 + 100.
     let mut h2 = Host::new();
     h2.set_durable(true);
     h2.set_self_module(&inst);
+    h2.set_frozen_vcpus(frozen);
+    if let Some(sp) = root_sp {
+        h2.set_frozen_root_sp(sp);
+    }
     let mut win2 = snap.clone();
     win2[66000..66004].copy_from_slice(&1i32.to_le_bytes());
     begin_thaw(&mut win2, TEST_ARENA, 0);
     let mut fuel2 = 1_000_000u64;
     let (r2, _) =
         run_capture_reserved_with_host(&inst, 0, &[], &mut fuel2, &win2, SIZE_LOG2, &mut h2);
-    assert!(
-        r2.is_err(),
-        "#1620: a spawned vCPU frozen at `atomic.wait` does not re-attach yet — but it must fail \
-         closed rather than resume wrong. Flip this to `Ok([I64(2100)])` when #1620 lands: {r2:?}"
+    assert_eq!(
+        r2,
+        Ok(vec![Value::I64(2100)]),
+        "the thawed subtree re-issues both suspend points and completes"
     );
 }

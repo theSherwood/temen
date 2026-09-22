@@ -158,10 +158,14 @@ const CLI_JIT_TABLE_LOG2: u8 = 10;
 struct WindowRegionPurge {
     base: u64,
     reserved: u64,
+    /// This run's registry owner id (#1608). Without it the purge — which runs after the reservation
+    /// is released, over the whole 1 TiB range — erased entries belonging to whichever runs had since
+    /// been handed those addresses, losing their futex wakeups.
+    owner: u64,
 }
 impl Drop for WindowRegionPurge {
     fn drop(&mut self) {
-        temen_jit::region_canon_forget_window(self.base, self.reserved);
+        temen_jit::region_canon_forget_window(self.base, self.reserved, self.owner);
     }
 }
 
@@ -2922,21 +2926,26 @@ fn install_region_hook(host: &mut Host, mem_base: *mut u8, mem_reserved: u64) {
         return;
     }
     let base = mem_base as u64;
-    // Purge every entry in this window at teardown (when the hook `Arc` — held for the run — drops),
-    // so a later run reusing the virtual address never inherits a stale region identity. NOTE this
-    // runs *after* the window's reservation is released, which is the race #1608 is open on.
+    // #1608 — one registry owner id per window, taken here and shared by every record this hook makes
+    // and by the teardown purge. Window virtual addresses are recycled between runs, so an absolute
+    // page is not on its own enough to say whose entry it is.
+    let owner = temen_jit::region_canon_new_owner();
+    // Purge this owner's entries in this window at teardown (when the hook `Arc` — held for the run —
+    // drops), so a later run reusing the virtual address never inherits a stale region identity. This
+    // still runs *after* the reservation is released; `owner` is what keeps that harmless.
     let purge = WindowRegionPurge {
         base,
         reserved: mem_reserved,
+        owner,
     };
     host.set_region_hook(Some(std::sync::Arc::new(
         move |win_off: u64, len: u64, mapped: Option<(u64, u64)>| {
             let _keep = &purge; // the closure owns the teardown guard
             match mapped {
                 Some((region_off, backing)) => {
-                    temen_jit::region_canon_record(base + win_off, len, backing, region_off)
+                    temen_jit::region_canon_record(base + win_off, len, backing, region_off, owner)
                 }
-                None => temen_jit::region_canon_forget_window(base + win_off, len),
+                None => temen_jit::region_canon_forget_window(base + win_off, len, owner),
             }
         },
     )));
