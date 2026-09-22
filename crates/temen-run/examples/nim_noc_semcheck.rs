@@ -23,8 +23,20 @@
 //!
 //! Be precise about what this shows and what it does not. Every phase that runs is a Temen module
 //! compiled with no C compiler, doing the real work — that is the point. But the *driver* sequences
-//! the phases; nimsem is not spawning nifler itself. Serving `fork`/`execve` so it can is the
-//! remaining piece of #1609, and it is a process-model decision, not a missing line of code.
+//! the phases; nimsem is not spawning nifler itself.
+//!
+//! **`--sh <sh.ir>` is the real path, and it is one blocker short** (#1609). Passing a
+//! chibicc-built shell registers it at `/bin/sh`, registers nifler2 at the spellings nimsem uses,
+//! and drops the hand-crank — nimsem then takes its own fork/exec/wait sequence. Four of the five
+//! things that needed were built and work: `OP_EXECVE` and `OP_WAIT4` exist, `execShellCmd`'s
+//! whole leaf set is retained as real imports rather than fail-closed stubs, those imports are
+//! bound to the personality, and this run installs the signal/caller-request door `fork` rides.
+//!
+//! What is left is **#1621**: a nim module reaches its personality through `call.import`, and that
+//! dispatch arm *drains and discards* the caller request ("degrade to the poll answer"), so `fork`
+//! answers `-ENOSYS` and `execShellCmd` reports failure having never called `execve`. The
+//! `call.cap`/`call.sym` arms act on the request; the import arm does not. Until that is closed,
+//! `--sh` fails with the message above and the hand-crank remains the working path.
 //!
 //! **A live cross-check on the cache-stem port.** `temen_run::nim_module_suffix` reimplements
 //! nimony's `moduleSuffix`. Every request the guest makes is a chance to check it against the real
@@ -113,17 +125,65 @@ fn dump_cache(posix: &temen_posix::Posix, out_p: &str) {
     eprintln!("dumped {n} nimcache files to {dir}");
 }
 
+/// Load a chibicc-emitted **command module** (IR text, `--child-entry`) — the `/bin/sh` that turns
+/// nimsem's shell-out into a real `execve`. Kept out of the asset pipeline deliberately: the shell
+/// is host environment, the way a kernel is, and passing it in keeps #763's "no C compiler"
+/// claim about *nimony's* toolchain honest and visible rather than quietly bundled.
+fn command_module(path: &str, what: &str) -> temen_ir::Module {
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    let m = temen_text::parse_module(&text).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {path}: {e:?}"));
+    eprintln!(
+        "{what}: {} funcs, window 2^{}",
+        m.funcs.len(),
+        m.memory.as_ref().map(|x| x.size_log2).unwrap_or(0),
+    );
+    m
+}
+
 fn main() {
-    let a: Vec<String> = std::env::args().skip(1).collect();
+    let mut a: Vec<String> = std::env::args().skip(1).collect();
+    // `--sh <sh.ir>`: register it at `/bin/sh` and let nimsem spawn nifler itself. Without it the
+    // driver falls back to cranking the shell-out from outside (the pre-#1609 behaviour), which is
+    // kept as the oracle the real path is checked against.
+    let sh_ir = a.iter().position(|t| t == "--sh").map(|i| {
+        let v = a.get(i + 1).cloned().expect("--sh needs a path");
+        a.drain(i..=i + 1);
+        v
+    });
     let [nimsem_p, nifler_p, libdir, sys_pnif, sys_stem, out_p] = &a[..] else {
         panic!(
-            "usage: nim_noc_semcheck <nimsem.temen> <nifler2.temen> <libdir> <sys.p.nif> \
-             <sys-stem> <out.s.nif>"
+            "usage: nim_noc_semcheck [--sh <sh.ir>] <nimsem.temen> <nifler2.temen> <libdir> \
+             <sys.p.nif> <sys-stem> <out.s.nif>"
         );
     };
 
     let nimsem = phase(nimsem_p, "nimsem");
     let nifler = phase(nifler_p, "nifler2");
+    // The command registry this run grants: the shell nimsem execs, and nifler for the shell to
+    // exec in turn.
+    //
+    // nimsem spells nifler **`bin/nifler`** — relative to its cwd, from its own
+    // `findTool`/`getAppDir` logic — which is the spelling that actually has to resolve. The other
+    // three are registered because the registry is a flat name table and the cost of a spelling is
+    // one row: a PATH walk for a bare `nifler`, and the absolute form, so a future nimsem that
+    // resolves differently does not fail as a mystery. The guest names what it wants; we do not
+    // guess which name that will be.
+    let commands: Vec<(String, temen_ir::Module)> = match &sh_ir {
+        Some(p) => {
+            let sh = command_module(p, "/bin/sh");
+            ["/bin/sh"]
+                .iter()
+                .map(|n| (n.to_string(), sh.clone()))
+                .chain(
+                    ["bin/nifler", "/bin/nifler", "nifler"]
+                        .iter()
+                        .map(|n| (n.to_string(), nifler.clone())),
+                )
+                .collect()
+        }
+        None => Vec::new(),
+    };
 
     // One personality for both phases: one memfs, one fd table, one stdout.
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
@@ -153,6 +213,11 @@ fn main() {
     );
     eprintln!("seeded {} stdlib files + the system .p.nif", seed.len());
 
+    if !commands.is_empty() {
+        // The PATH the shell walks for a bare `nifler`.
+        posix.set_env("PATH", "/bin");
+    }
+
     let nimsem_argv: Vec<String> = [
         "nimsem",
         "--define:nimNativeAlloc",
@@ -171,11 +236,28 @@ fn main() {
     let mut served: Vec<String> = Vec::new();
     loop {
         let before = posix.stdout().len();
-        let outcome =
-            temen_run::nim_noc_run(nimsem.clone(), &posix, Arc::clone(&make), &nimsem_argv);
+        let outcome = temen_run::nim_noc_run_with_commands(
+            nimsem.clone(),
+            &posix,
+            Arc::clone(&make),
+            &nimsem_argv,
+            &commands,
+        );
         let said = String::from_utf8_lossy(&posix.stdout()[before..]).into_owned();
         if posix.read_file(&produced).is_some() {
             break;
+        }
+        if !commands.is_empty() {
+            // With `/bin/sh` registered nimsem spawns nifler itself, so reaching here means the
+            // real exec path did not work — serving it from outside would hide exactly the thing
+            // this mode exists to prove. See the module docs for the one blocker that remains.
+            eprint!("--- nimsem said ---\n{said}");
+            dump_cache(&posix, out_p);
+            panic!(
+                "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
+                 failed: {outcome:?}\nIf this is the `call.import` drain (#1621), the guest saw \
+                 `fork` answer -ENOSYS and never reached `execve`."
+            );
         }
         let Some(argv) = failed_nifler_command(&said) else {
             eprint!("--- nimsem said ---\n{said}");

@@ -223,6 +223,18 @@ pub const OP_EXEC_RESOLVE: u32 = 53;
 /// holds.
 pub const OP_EXECVE: u32 = 60;
 
+/// #1609 — **`wait4(pid, status, options, rusage)`**: [`OP_WAITPID`] with the Linux syscall's
+/// fourth argument. nimony binds `wait4` rather than `waitpid` deliberately — "there is no
+/// `waitpid` Linux syscall — it is libc sugar for `wait4` with a NULL `rusage`", so its
+/// `std/posix` provides `waitpid` as an inline wrapper and `wait4` is the only symbol that
+/// reaches a host. Binding `wait4` to the 3-arg `OP_WAITPID` would be an arity mismatch and a
+/// bind-time refusal (#1524), so it gets its own row.
+///
+/// `rusage` must be NULL: this personality keeps no resource accounting, and quietly leaving a
+/// caller's `struct rusage` untouched would report zeros as though they were measured. A non-NULL
+/// pointer is `-EINVAL` — fail closed (invariant 9), and nothing nimony does passes one.
+pub const OP_WAIT4: u32 = 61;
+
 /// [`OP_EXECVE`] — the most argv/envp entries the pointer-array walk will follow, and the longest
 /// single string it will read. Bounds, not policy: the args region (16 KiB) refuses anything near
 /// these with `-E2BIG` long before they bite. They exist so a forged `char**` cannot walk the
@@ -1832,6 +1844,7 @@ pub fn resolve(name: &str) -> Option<ResolvedCap> {
         "getppid" => OP_GETPPID,
         "fork" => OP_FORK,
         "waitpid" => OP_WAITPID,
+        "wait4" => OP_WAIT4,
         "wait" => OP_WAIT,
         "signal" => OP_SIGNAL,
         "kill" => OP_KILL,
@@ -2133,6 +2146,7 @@ fn px_vtable() -> (Vec<String>, Vec<temen_ir::FuncType>) {
         ("fstat", 2),        // 58
         ("statp", 3),        // 59
         ("execve", 3),       // 60
+        ("wait4", 4),        // 61
     ];
     let mut names = Vec::with_capacity(OPS.len());
     let mut sigs = Vec::with_capacity(OPS.len());
@@ -2572,6 +2586,7 @@ fn handler(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProc {
                 OP_PIPE_ADOPT => st.pipe_adopt(args, mem),
                 OP_EXEC_RESOLVE => st.exec_resolve(args, mem),
                 OP_EXECVE => st.execve(args, mem),
+                OP_WAIT4 => st.wait4(args, mem),
                 OP_TCGETATTR => st.tcgetattr(args, mem),
                 OP_TCSETATTR => st.tcsetattr(args, mem),
                 OP_TCGETWINSIZE => st.tcgetwinsize(args, mem),
@@ -4955,6 +4970,16 @@ impl Ctx<'_> {
             return Err(EACCES);
         }
         Err(ENOENT)
+    }
+
+    /// [`OP_WAIT4`] — `wait4(pid, status, options, rusage)`: [`Self::waitpid`] with the syscall's
+    /// fourth argument, which must be NULL (see [`OP_WAIT4`] for why a non-NULL one is refused
+    /// rather than ignored).
+    fn wait4(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
+        if *args.get(3).unwrap_or(&0) != 0 {
+            return Ok(vec![EINVAL]);
+        }
+        self.waitpid(&args[..3.min(args.len())], mem)
     }
 
     /// [`OP_EXECVE`] — `execve(path, argv, envp)`: become the registered command at `path`.
