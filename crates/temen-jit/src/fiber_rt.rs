@@ -332,6 +332,16 @@ pub(crate) struct FiberSlot {
     /// that same OS thread; cross-vCPU polls order it through the `own` claim/publish pairing,
     /// so `Relaxed` suffices.
     event_park: AtomicBool,
+    /// #1631 — **does this park resolve itself?** `true` while the fiber is event-parked on a wait
+    /// that carries its own deadline, so it will come back and run on with no help from anyone.
+    /// Written and cleared beside [`Self::event_park`] by [`fiber_event_park`], read by the
+    /// executor on the same seam.
+    ///
+    /// The executor counts a parked task in `Domain::parked`, whose one reader is the futex
+    /// deadlock predicate `live > parked` — "could any live vCPU still reach a `notify`?". A task
+    /// sleeping on its own deadline answers yes, exactly as a *timed* 1:1 `futex_wait` does
+    /// (#1625), so it must not be counted.
+    park_self_resolving: AtomicBool,
 }
 
 /// The **domain-shared fiber table** (D57 3b-ii): one per compiled module, shared by the root vCPU
@@ -455,6 +465,7 @@ impl SharedFiberTable {
             func,
             sp,
             event_park: AtomicBool::new(false),
+            park_self_resolving: AtomicBool::new(false),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         });
@@ -490,6 +501,7 @@ impl FiberSlot {
             func: -1,
             sp: 0,
             event_park: AtomicBool::new(false),
+            park_self_resolving: AtomicBool::new(false),
             consumed: AtomicBool::new(false),
             pending: Mutex::new(None),
         })
@@ -499,6 +511,12 @@ impl FiberSlot {
     /// resume seam reads it. The executor classifies a `State::Yielded` with this.
     pub(crate) fn took_event_park(&self) -> bool {
         self.event_park.load(Ordering::Relaxed)
+    }
+
+    /// #1631 — whether that event park carries its own deadline (see [`Self::park_self_resolving`]).
+    /// Read on the same seam as [`Self::took_event_park`], while the fiber is still suspended.
+    pub(crate) fn took_self_resolving_park(&self) -> bool {
+        self.park_self_resolving.load(Ordering::Relaxed)
     }
 
     /// D66 — the single-owner claim for a platform slot's resume (generation 0, never recycled).
@@ -563,6 +581,7 @@ impl SharedFiberTable {
             func,
             sp,
             event_park: AtomicBool::new(false),
+            park_self_resolving: AtomicBool::new(false),
             consumed: AtomicBool::new(consumed), // #1538: delivers at its rewound suspend
             pending: Mutex::new(None),
         }));
@@ -1214,7 +1233,7 @@ pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
 /// # Safety
 /// Must be called from inside a running fiber, with `slot` = that fiber's own slot (the futex
 /// thunk resolves it via [`current_fiber_slot`]).
-pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>) {
+pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>, self_resolving: bool) {
     let y = {
         let rt = &mut *current();
         rt.yielders
@@ -1222,8 +1241,13 @@ pub(crate) unsafe fn fiber_event_park(slot: &Arc<FiberSlot>) {
             .expect("event park only inside a running fiber")
     };
     slot.event_park.store(true, Ordering::Relaxed);
+    // #1631 — published with the park marker and cleared with it, so the executor reading the seam
+    // sees the two together and never a stale answer from the previous park.
+    slot.park_self_resolving
+        .store(self_resolving, Ordering::Relaxed);
     let _ = (*y).suspend(0); // the poll's resume arg is deliberately not delivered
     slot.event_park.store(false, Ordering::Relaxed);
+    slot.park_self_resolving.store(false, Ordering::Relaxed);
     // Back from the poll — possibly on a different OS thread (a sibling vCPU's `cont.resume`):
     // push the yielder onto the *resuming* thread's runtime, exactly as `fiber_suspend` does.
     {

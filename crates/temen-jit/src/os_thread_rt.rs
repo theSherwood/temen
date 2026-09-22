@@ -2110,7 +2110,10 @@ unsafe fn fiber_futex_wait_loop(
                 return st;
             }
         }
-        fiber_rt::fiber_event_park(slot);
+        // #1631 — a park with its own deadline comes back by itself, so it is a potential
+        // notifier and must not count toward `Domain::parked`. Same rule the OS park applies to a
+        // timed `futex_wait` (#1625); this is the task half of it.
+        fiber_rt::fiber_event_park(slot, deadline.is_some());
         // Re-entered: a `cont.resume` polled this fiber. Completed?
         let st = cell.status.load(Ordering::Acquire);
         if st != PENDING_WAIT {
