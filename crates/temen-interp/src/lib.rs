@@ -4742,6 +4742,12 @@ enum Blocked {
         expected: u64,
         width: u32,
         timeout_ns: u64,
+        /// The guest asked to wait **forever** (a negative timeout), so `timeout_ns` is the
+        /// [`MAX_WAIT`] backstop rather than a deadline anyone asked for. The clamp is "a pure
+        /// anti-wedge backstop, never semantics", and that distinction is load-bearing for
+        /// freeze-on-quiesce (#1584): a park that will wake on its own is not a quiesced run, but
+        /// a park that only the backstop can end is — so the flag has to survive the clamp.
+        indefinite: bool,
     },
     /// Blocked inside a capability call **through `handle`** (§3.6 slice 1: a blocking stream
     /// read with no data). Parked in the scheduler's handle-keyed waiter index, so a
@@ -5401,17 +5407,20 @@ impl Scheduler {
         process_timers(&mut self.lock());
     }
 
-    /// Wake up to `count` vCPUs parked on `key`; return how many were woken.
+    /// Wake up to `count` vCPUs parked on `key`, **oldest first**; return how many were woken.
+    ///
+    /// Arrival order, not `Vec::pop()` order (owner ruling 2026-09-22, #1617). It used to pop the
+    /// tail, which woke last-in-first-out — an artefact of `pop()` being the cheap `Vec` operation
+    /// rather than a decision, and one that can starve a waiter that parked early: under steady
+    /// notify traffic every later arrival goes in front of it. It also disagreed with
+    /// [`DetSched::notify`], which has always woken in insertion order, so the model checker
+    /// explored an order the real pool never produced.
     fn notify(&self, key: FutexKey, count: u32) -> u32 {
         let mut s = self.lock();
         let mut woken: Vec<Waiter> = Vec::new();
         if let Some(q) = s.wait_waiters.get_mut(&key) {
-            while (woken.len() as u32) < count {
-                match q.pop() {
-                    Some((_, v)) => woken.push(v),
-                    None => break,
-                }
-            }
+            let take = (count as usize).min(q.len());
+            woken.extend(q.drain(..take).map(|(_, v)| v));
             if q.is_empty() {
                 s.wait_waiters.remove(&key);
             }
@@ -6755,6 +6764,31 @@ fn run_deadlocked(s: &Sched) -> bool {
 /// [`temen_ir::lanes`] so the 6/2/2 answer is one function (INVARIANTS #15). See there.
 use temen_ir::lanes::{bounded as lane_bounded, enter as lane_enter, leave as lane_leave};
 
+/// #1584 / §13.4 4c-bis — is the run **quiesced**: is there at least one park for a freeze to
+/// re-admit, and will nothing wake on its own?
+///
+/// "Wakes on its own" is the whole question, and the futex clamp is why it needs asking carefully.
+/// An *infinite* `atomic.wait` is clamped to [`MAX_WAIT`] and so carries a `timers` entry like any
+/// timed wait — but that deadline is "a pure anti-wedge backstop, never semantics", nobody asked
+/// for it, and treating it as a real deadline is exactly what let a futex-parked vCPU veto a
+/// freeze. So the answer comes from the waiters ([`VCpu::wait_indefinite`]), not from the timer
+/// heap, which also carries stale entries for already-notified waiters.
+///
+/// Conservative in two places, deliberately. A waiter the guest gave a **real** timeout will wake
+/// and make progress, so the run has not quiesced and the arm holds off — unchanged from before.
+/// And a futex-parked **fiber** blocks it: a fiber park is the freeze driver's own business
+/// (§13.4 step 2 purges it and the thaw re-issues), not something to re-admit from here. Both
+/// cases behaved this way before #1584 too, since either one put a timer in the heap.
+fn quiesced_parks_only(s: &Sched) -> bool {
+    if s.svc_waiters.is_empty() && s.wait_waiters.is_empty() {
+        return false; // nothing parked that a freeze could re-admit
+    }
+    s.wait_waiters.values().flatten().all(|(_, w)| match w {
+        Waiter::VCpu(v) => v.wait_indefinite,
+        Waiter::Fiber { .. } => false,
+    })
+}
+
 /// A worker: pull a runnable vCPU and dispatch it, sleeping (until work, a timer, or shutdown) when
 /// idle. Returns when the run is shutting down and nothing is left to do.
 fn worker_loop(sched: &Arc<Scheduler>) {
@@ -6769,28 +6803,60 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 if s.shutdown {
                     break None;
                 }
-                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the only thing
-                // keeping the run alive is `svc.wait`-parked consumers (a server idle in its
-                // accept loop) and the run is armed to freeze on quiesce, trigger it now —
-                // promote each parked domain's window to `UNWINDING` and re-admit it. Its
-                // re-executed `svc.wait` takes the trailing-poll sentinel and unwinds, so the
-                // freeze completes with the serve trio captured instead of the run hanging. Gated
-                // on empty futex timers too: a futex-parked vCPU (or a *timed* svc.wait) will wake
-                // on its own, so it isn't a quiesced idle server. One-shot (cleared on fire).
-                if s.freeze_on_quiesce
-                    && !s.svc_waiters.is_empty()
-                    && s.timers.is_empty()
-                    && s.svc_timers.is_empty()
-                {
+                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the run is armed
+                // and every remaining vCPU is parked in a wait **the scheduler owns**, trigger the
+                // freeze now — promote each parked vCPU's durable phase to `UNWINDING` and
+                // re-admit it. Its re-executed suspend point takes the freeze arm and unwinds, so
+                // the freeze completes instead of the run hanging. One-shot (cleared on fire).
+                //
+                // #1584 — this covers **every** such park, not just `svc.wait`. A parked child
+                // must not veto its parent's freeze: INVARIANTS #3 has authority moving *down* the
+                // grant graph, and "the freeze succeeds unless the child cooperates" is a weaker
+                // contract than "a parent may freeze its children". A vCPU parked in `atomic.wait`
+                // runs no ops, so it reaches no safepoint, so it used to veto by construction —
+                // and not even cleanly: the run stalled on the [`MAX_WAIT`] backstop and then
+                // returned a *timed-out* wait as a normal result, with a snapshot that was not a
+                // freeze point and nothing in the `Ok` to say so.
+                //
+                // The transform already instruments `atomic.wait` as a re-issue suspend point
+                // (`SuspendKind::MemoryWait`), exactly as it does the serve op; only the scheduler
+                // never woke it. So this re-admits futex waiters with the same `WAIT_WOKEN` the
+                // JIT's own freeze arm delivers — the status is discarded by the safepoint that
+                // unwinds before the guest can observe it, and the thaw re-issues the wait.
+                if s.freeze_on_quiesce && s.svc_timers.is_empty() && quiesced_parks_only(&s) {
                     s.freeze_on_quiesce = false;
+                    // Set each vCPU's own durable phase: the `dispatch` prologue swaps it into the
+                    // window before the vCPU runs (a direct window write would be clobbered by that
+                    // swap). At root context this routes to the global freeze word, so the
+                    // re-executed suspend point observes `UNWINDING`.
                     let keys: Vec<usize> = s.svc_waiters.keys().copied().collect();
                     for k in keys {
                         for mut v in s.svc_waiters.remove(&k).into_iter().flatten() {
-                            // Set the vCPU's own durable phase: the `dispatch` prologue swaps it
-                            // into the window before the vCPU runs (a direct window write would be
-                            // clobbered by that swap). At root context this routes to the global
-                            // freeze word, so the re-executed `svc.wait` observes `UNWINDING`.
                             v.dstate = STATE_UNWINDING;
+                            s.runnable.push_back(v);
+                        }
+                    }
+                    // A vCPU parked in `thread.join` (or queued for a D66 lane) *will* be woken
+                    // by something else — the child completing, a lane coming free — so it needs
+                    // no re-admission. It does need the phase: without it the joiner wakes with
+                    // `dstate` still `NORMAL`, never observes the freeze at its own safepoint, and
+                    // runs to completion *through* the freeze its owner asked for. A freeze is
+                    // run-wide, so every parked vCPU takes the phase; only the ones nothing else
+                    // can wake are also re-admitted.
+                    for v in s.join_waiters.values_mut() {
+                        v.dstate = STATE_UNWINDING;
+                    }
+                    for v in s.lane_waiters.iter_mut() {
+                        v.dstate = STATE_UNWINDING;
+                    }
+                    for (_, q) in std::mem::take(&mut s.wait_waiters) {
+                        for (_, w) in q {
+                            let Waiter::VCpu(mut v) = w else {
+                                unreachable!("quiesced_parks_only rejects a fiber futex waiter")
+                            };
+                            v.wait_indefinite = false;
+                            v.dstate = STATE_UNWINDING;
+                            v.pending = Some(Pending::Wait(WAIT_WOKEN));
                             s.runnable.push_back(v);
                         }
                     }
@@ -7416,6 +7482,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 expected,
                 width,
                 timeout_ns,
+                indefinite,
             }) => {
                 let deadline = Instant::now() + Duration::from_nanos(timeout_ns);
                 let mut s = sched.lock();
@@ -7434,6 +7501,8 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let wid = s.next_wid;
                     s.next_wid += 1;
                     s.timers.push(Reverse((deadline, wid, key)));
+                    // #1584 — remember whether that deadline is the guest's or only the backstop.
+                    v.wait_indefinite = indefinite;
                     s.wait_waiters
                         .entry(key)
                         .or_default()
@@ -8599,6 +8668,10 @@ impl SchedDriver {
                     expected,
                     width,
                     timeout_ns,
+                    // The explorer has no freeze-on-quiesce and no wall clock: it *advances* its
+                    // logical clock to the earliest deadline when nothing is runnable, so the
+                    // backstop is already how it ends an infinite wait. Nothing to carry.
+                    indefinite: _,
                 }) => {
                     let mut s = det.lock();
                     if v.atomic_value(addr, width) != expected {
@@ -9806,6 +9879,13 @@ struct VCpu {
     /// word to `NORMAL` after reloading, which must not disturb siblings still rewinding. A non-durable
     /// run leaves it `NORMAL` and never touches the word.
     dstate: i32,
+    /// #1584 — set while this vCPU sits in `wait_waiters` for a futex wait the guest asked to last
+    /// **forever**. Its `timers` entry is then the [`MAX_WAIT`] anti-wedge backstop, not a deadline
+    /// anyone asked for, so it must not read as "this park will wake on its own" when
+    /// freeze-on-quiesce decides whether the run has quiesced. Carried on the vCPU rather than
+    /// beside the waiter store so it travels with the park through every queue that can hold it
+    /// (INVARIANTS #15: no second structure to keep in step). Meaningless while runnable.
+    wait_indefinite: bool,
     /// This vCPU's linear-memory view (shared `Region` + address space; see [`Mem`]).
     mem: Option<Mem>,
     /// The domain's powerbox, **shared** by every vCPU of the run (`Arc<Mutex<Host>>`): a spawned
@@ -10080,6 +10160,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
+            wait_indefinite: false,
             mem,
             host,
             freeze_sink: None,
@@ -10154,6 +10235,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: self.vcpu_ctx,
             dstate: self.dstate,
+            wait_indefinite: false,
             mem: twin_mem,
             host: twin_host,
             freeze_sink: None,
@@ -10252,6 +10334,7 @@ impl VCpu {
             spawn_residue: None,
             vcpu_ctx: 0,
             dstate: STATE_NORMAL,
+            wait_indefinite: false,
             mem,
             host,
             freeze_sink: None,
@@ -10713,6 +10796,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         spawn_residue: _,
         vcpu_ctx,  // §12.8 4A.5: this vCPU's root shadow context, for `durable.shadow_base`
         dstate: _, // swapped at the dispatch boundary, not inside `run_inner`
+        wait_indefinite: _, // #1584 — set at the futex park site, read by the quiesce gate
         mem,
         host,
         freeze_sink, // §4: the effective sink a §14 child inherits so its residue reaches the root host
@@ -15126,6 +15210,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         expected: exp,
                         width,
                         timeout_ns: wait.as_nanos() as u64,
+                        indefinite: to_ns < 0,
                     }));
                 }
                 // §12 futex notify: wake up to `count` vCPUs parked on the confined address.
