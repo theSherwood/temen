@@ -2234,6 +2234,18 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 let self_resolving = fiber_rt::park_is_self_resolving(handle);
                 let g = lock(&dom.futex);
                 let _pg = (!self_resolving).then(|| ParkGuard::new(&dom.parked));
+                // #1639 — an indefinite fiber wait that no live vCPU can ever notify is
+                // unsatisfiable, and idling on it is a hang with no error anywhere (INVARIANTS #5).
+                // Same predicate `futex_wait` breaks `WAIT_DEADLOCK` on, asked here because this
+                // vCPU — not the fiber — is the one holding the run open. Evaluated with this
+                // waiter already counted by the guard above, so a lone driver sees `live == parked`
+                // and fails itself closed rather than sleeping forever.
+                if !self_resolving && lock(&dom.threads).live <= dom.parked.load(Ordering::Acquire)
+                {
+                    drop(g);
+                    store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                    return value;
+                }
                 let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
             }
             if !dom.lane_acquire(&lane, || {

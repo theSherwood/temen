@@ -4963,7 +4963,26 @@ enum Waiter {
         /// **handler** fiber gets resumed rather than waiting for the next unrelated enqueue
         /// (a non-handler fiber's spurious serve wake finds nothing runnable and re-parks).
         svc: usize,
+        /// #1639 — the fiber's half of [`VCpu::wait_indefinite`]: `true` when the guest asked this
+        /// `atomic.wait` to last **forever**, so the deadline in `timers` is only the [`MAX_WAIT`]
+        /// backstop. Read solely for a `wait_waiters` entry, by [`futex_parks_unsatisfiable`];
+        /// [`Waiter::fiber`] builds the other waiter kinds, which are not futex parks at all.
+        wait_indefinite: bool,
     },
+}
+
+impl Waiter {
+    /// A fiber parked somewhere that is **not** a futex wait — a capability call, a ticket, a
+    /// reply. `wait_indefinite` is meaningless for those and never read; `false` is the
+    /// conservative value if that ever changes (it blocks a deadlock verdict, never causes one).
+    fn fiber(reg: Arc<FiberRegistry>, slot: usize, svc: usize) -> Waiter {
+        Waiter::Fiber {
+            reg,
+            slot,
+            svc,
+            wait_indefinite: false,
+        }
+    }
 }
 
 /// A parked entry that belongs to a domain and, when that domain dies, either yields its vCPU to be
@@ -5131,7 +5150,7 @@ fn wake_pipe_batch_locked(s: &mut Sched, woken: Vec<Waiter>) -> u32 {
     for w in woken {
         match w {
             Waiter::VCpu(v) => s.runnable.push_back(v),
-            Waiter::Fiber { reg, slot, svc } => {
+            Waiter::Fiber { reg, slot, svc, .. } => {
                 reg.wake_blocked(slot, Reg::from_i64(0));
                 svc_wake_locked(s, svc);
             }
@@ -5428,7 +5447,7 @@ impl Scheduler {
                 // §3.6 5a: a fiber-level waiter — deliver the status into its set-aside
                 // frames and make it claimable; its resumer re-admits it cooperatively
                 // (for a handler fiber, that resumer is the domain's serve loop — 5b).
-                Waiter::Fiber { reg, slot, svc } => {
+                Waiter::Fiber { reg, slot, svc, .. } => {
                     reg.wake_blocked(slot, Reg::from_i32(WAIT_WOKEN));
                     svc_wake_locked(&mut s, svc);
                 }
@@ -5455,7 +5474,7 @@ impl Scheduler {
                     v.pending = Some(Pending::CapResult(status));
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc } => {
+                Waiter::Fiber { reg, slot, svc, .. } => {
                     reg.wake_blocked(slot, Reg::from_i64(status));
                     svc_wake_locked(&mut s, svc);
                 }
@@ -5583,7 +5602,7 @@ impl Scheduler {
                     v.host.lock_unpoisoned().set_sig_interrupt();
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc } => {
+                Waiter::Fiber { reg, slot, svc, .. } => {
                     reg.wake_blocked(slot, Reg::from_i64(EINTR));
                     svc_wake_locked(&mut s, svc);
                 }
@@ -5663,7 +5682,7 @@ impl Scheduler {
                     v.pending = Some(Pending::CapResult(EINTR));
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc } => {
+                Waiter::Fiber { reg, slot, svc, .. } => {
                     reg.wake_blocked(slot, Reg::from_i64(EINTR));
                     svc_wake_locked(&mut s, svc);
                 }
@@ -5772,7 +5791,7 @@ impl Scheduler {
                 s.runnable.push_back(v);
                 self.work.notify_all();
             }
-            Some(Waiter::Fiber { reg, slot, svc }) => {
+            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
                 reg.wake_blocked(slot, Reg::from_i64(result));
                 if svc_wake_locked(&mut s, svc) {
                     self.work.notify_all();
@@ -5817,7 +5836,7 @@ impl Scheduler {
                 // rides the same ordered drain. The wake pair is the established one: the
                 // result lands on the parked frame, and the domain's `svc.wait` consumers are
                 // re-admitted so a woken handler fiber gets re-claimed (slice 5b).
-                Some(Waiter::Fiber { reg, slot, svc }) => {
+                Some(Waiter::Fiber { reg, slot, svc, .. }) => {
                     reg.wake_blocked(slot, Reg::from_i64(r));
                     svc_wake_locked(&mut s, svc);
                     woke = true;
@@ -6396,7 +6415,7 @@ fn process_timers(s: &mut Sched) {
                     v.pending = Some(Pending::Wait(WAIT_TIMED_OUT));
                     s.runnable.push_back(v);
                 }
-                Waiter::Fiber { reg, slot, svc } => {
+                Waiter::Fiber { reg, slot, svc, .. } => {
                     reg.wake_blocked(slot, Reg::from_i32(WAIT_TIMED_OUT));
                     svc_wake_locked(s, svc);
                 }
@@ -6488,7 +6507,7 @@ fn wake_dead_tickets(s: &mut Sched, callee: usize, tickets: impl IntoIterator<It
                 w.pending = Some(Pending::CapResult(CAP_REVOKED));
                 s.runnable.push_back(w);
             }
-            Some(Waiter::Fiber { reg, slot, svc }) => {
+            Some(Waiter::Fiber { reg, slot, svc, .. }) => {
                 reg.wake_blocked(slot, Reg::from_i64(CAP_REVOKED));
                 svc_wake_locked(s, svc);
             }
@@ -6786,17 +6805,28 @@ fn quiesced_parks_only(s: &Sched) -> bool {
 /// nobody asked for, decided by a constant whose own doc calls it "a pure anti-wedge backstop, never
 /// semantics". That made the backstop into semantics, which is the #1584 shape all over again.
 ///
-/// Conservative in exactly the two places [`quiesced_parks_only`] is, and for the same reasons. A
-/// waiter the guest gave a **real** timeout will wake and run on, so it is a potential notifier, not a
-/// deadlock participant — one of those and the run is not deadlocked. And a futex-parked **fiber** is
-/// the freeze driver's business, so it blocks the verdict too. `svc_timers` must be empty for the same
-/// reason a real deadline disqualifies: a service deadline is a wake that will arrive.
+/// Conservative in one place: a waiter the guest gave a **real** timeout will wake and run on, so it
+/// is a potential notifier, not a deadlock participant — one of those and the run is not deadlocked.
+/// `svc_timers` must be empty for the same reason: a service deadline is a wake that will arrive.
+///
+/// **A futex-parked fiber is asked the same question as a vCPU (#1639).** It used to be excluded
+/// here, and the stated reason was borrowed from [`quiesced_parks_only`] — "a fiber park is the
+/// freeze driver's business". That reason is about whether a *freeze* should re-admit the park, and
+/// says nothing about whether the wait can ever be satisfied, which is what this asks. The two are
+/// unrelated, and transplanting one to the other was a mistake in #1624; it was fail-safe (it only
+/// ever suppressed a verdict) but it is why an unsatisfiable fiber wait was still being ended by the
+/// `MAX_WAIT` backstop — the very thing #1624 set out to stop doing. A fiber futex waiter is woken by
+/// a `notify`, a kill, teardown or a freeze, exactly as a vCPU waiter is, so it belongs in the same
+/// `all()`. [`quiesced_parks_only`] keeps its exclusion, which is correct **there** for its own
+/// reason.
 fn futex_parks_unsatisfiable(s: &Sched) -> bool {
     !s.wait_waiters.is_empty()
         && s.svc_timers.is_empty()
         && s.wait_waiters.values().flatten().all(|(_, w)| match w {
             Waiter::VCpu(v) => v.wait_indefinite,
-            Waiter::Fiber { .. } => false,
+            Waiter::Fiber {
+                wait_indefinite, ..
+            } => *wait_indefinite,
         })
 }
 
@@ -13991,11 +14021,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             } else {
                                                 sg.ticket_waiters.insert(
                                                     (callee_id as usize, t),
-                                                    Waiter::Fiber {
-                                                        reg: Arc::clone(&regc),
-                                                        slot,
-                                                        svc: svck,
-                                                    },
+                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
                                                 );
                                                 drop(sg);
                                                 let early = calleec
@@ -14095,14 +14121,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let regc = Arc::clone(registry);
                                 fiber_park!(|slot: usize| {
                                     let mut sg = sr.lock();
-                                    sg.completion_waiters.insert(
-                                        id,
-                                        Waiter::Fiber {
-                                            reg: Arc::clone(&regc),
-                                            slot,
-                                            svc: svck,
-                                        },
-                                    );
+                                    sg.completion_waiters
+                                        .insert(id, Waiter::fiber(Arc::clone(&regc), slot, svck));
                                     drop(sg);
                                     sr.completion_drain(&comps);
                                 });
@@ -14156,11 +14176,11 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let svck = hostc.lock_unpoisoned().domain_id() as usize;
                                 fiber_park!(|slot: usize| {
                                     let mut sg = sr.lock();
-                                    sg.cap_waiters.entry(h).or_default().push(Waiter::Fiber {
-                                        reg: Arc::clone(&regc),
+                                    sg.cap_waiters.entry(h).or_default().push(Waiter::fiber(
+                                        Arc::clone(&regc),
                                         slot,
-                                        svc: svck,
-                                    });
+                                        svck,
+                                    ));
                                     drop(sg);
                                     let live = hostc.lock_unpoisoned().handle_live(h);
                                     if !live {
@@ -14392,11 +14412,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             } else {
                                                 sg.ticket_waiters.insert(
                                                     (callee_id as usize, t),
-                                                    Waiter::Fiber {
-                                                        reg: Arc::clone(&regc),
-                                                        slot,
-                                                        svc: svck,
-                                                    },
+                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
                                                 );
                                                 drop(sg);
                                                 let early = calleec
@@ -14548,11 +14564,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                             } else {
                                                 sg.ticket_waiters.insert(
                                                     (callee_id as usize, t),
-                                                    Waiter::Fiber {
-                                                        reg: Arc::clone(&regc),
-                                                        slot,
-                                                        svc: svck,
-                                                    },
+                                                    Waiter::fiber(Arc::clone(&regc), slot, svck),
                                                 );
                                                 drop(sg);
                                                 let early = calleec
@@ -15394,6 +15406,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         reg: Arc::clone(&regc),
                                         slot,
                                         svc: svck,
+                                        // #1639 — the guest asked for a wait with no end, so the
+                                        // deadline just pushed is only the `MAX_WAIT` backstop.
+                                        wait_indefinite: to_ns < 0,
                                     },
                                 ));
                                 // Compare-under-lock: a value that already changed wakes the
@@ -30354,11 +30369,7 @@ mod orphan_reply_tests {
             let mut s = sched.lock();
             s.ticket_waiters.insert(
                 (surviving_callee, 5),
-                Waiter::Fiber {
-                    reg: Arc::new(FiberRegistry::new()),
-                    slot: 0,
-                    svc: dying_key, // this parked caller belongs to the dying domain
-                },
+                Waiter::fiber(Arc::new(FiberRegistry::new()), 0, dying_key), // dying domain's parked caller,
             );
             s.orphan_tickets.insert((dying_key, 9)); // an orphan *for* the dying domain as callee
 
