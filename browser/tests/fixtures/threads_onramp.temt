@@ -1,0 +1,94 @@
+; #152 — a threaded on-ramp guest (the manifest `_start` shape) for the parallel Worker driver's
+; on-ramp recipe (`temen_par_powerbox_onramp`). `_start` spawns 4 threads, parks on a futex until
+; every one has checked in, joins them, writes the 8-byte total through its `write` import and
+; `exit`s 7. Each thread bumps a shared counter 2000 times, writes its own letter ('a' + arg)
+; through the same `write` import and returns arg * 10. Total = 4 * 2000 + 10 * (0+1+2+3) = 8060.
+; stdout = the four letters in schedule order, then the total. Shared by `tests/par_onramp.rs`
+; (native, real OS threads) and `gencorpus` (the `capio` item, real Web Workers).
+memory 16
+import 0 "write" (i64, i64) -> (i64)
+import 1 "exit" (i32) -> ()
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  v1 = i64.const 1
+  v2 = i64.const 2
+  v3 = i64.const 3
+  vt0 = thread.spawn 1 vz vz
+  vt1 = thread.spawn 1 vz v1
+  vt2 = thread.spawn 1 vz v2
+  vt3 = thread.spawn 1 vz v3
+  br 1(vt0, vt1, vt2, vt3)
+}
+block 1 (vt0: i32, vt1: i32, vt2: i32, vt3: i32) {
+  vflag = i64.const 32776
+  vseen = i32.atomic.load vflag
+  vall = i32.const 4
+  vdone = i32.eq vseen vall
+  br_if vdone 3(vt0, vt1, vt2, vt3) 2(vt0, vt1, vt2, vt3, vseen)
+}
+block 2 (vt0: i32, vt1: i32, vt2: i32, vt3: i32, vcur: i32) {
+  vflag2 = i64.const 32776
+  vinf = i64.const -1
+  vw = i32.atomic.wait vflag2 vcur vinf
+  br 1(vt0, vt1, vt2, vt3)
+}
+block 3 (vt0: i32, vt1: i32, vt2: i32, vt3: i32) {
+  vj0 = thread.join vt0
+  vj1 = thread.join vt1
+  vj2 = thread.join vt2
+  vj3 = thread.join vt3
+  vs1 = i64.add vj0 vj1
+  vs2 = i64.add vs1 vj2
+  vs3 = i64.add vs2 vj3
+  vctr = i64.const 32768
+  vcount = i64.atomic.load vctr
+  vtotal = i64.add vs3 vcount
+  vslot = i64.const 36864
+  i64.store vslot vtotal
+  vlen = i64.const 8
+  vwr = call.import 0 (vslot, vlen)
+  vcode = i32.const 7
+  call.import 1 (vcode)
+  return vtotal
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vn = i64.const 2000
+  br 1(vn, varg)
+}
+block 1 (vi: i64, varg: i64) {
+  vz = i64.const 0
+  vfin = i64.eq vi vz
+  br_if vfin 3(varg) 2(vi, varg)
+}
+block 2 (vk: i64, varg: i64) {
+  vctr = i64.const 32768
+  vone = i64.const 1
+  vold = i64.atomic.rmw.add vctr vone
+  vm1 = i64.const -1
+  vnext = i64.add vk vm1
+  br 1(vnext, varg)
+}
+block 3 (varg: i64) {
+  v8 = i64.const 8
+  voff = i64.mul varg v8
+  vbase = i64.const 40960
+  vaddr = i64.add vbase voff
+  va = i64.const 97
+  vch = i64.add va varg
+  i64.store vaddr vch
+  vone1 = i64.const 1
+  vw = call.import 0 (vaddr, vone1)
+  vflag = i64.const 32776
+  vin = i32.const 1
+  vold2 = i32.atomic.rmw.add vflag vin
+  vall = i32.const 4
+  vwoken = atomic.notify vflag vall
+  vten = i64.const 10
+  vret = i64.mul varg vten
+  return vret
+  }
+}
+export 0 func "_start" 0
