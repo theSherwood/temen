@@ -4114,13 +4114,18 @@ impl<'p> Vcpu<'p> {
                 false, // #1157: not preemptible (run-to-completion; budget is u64::MAX anyway)
             );
             match stop {
-                // §3.6 (I36 slice 2): live calls / svc.wait / child_offer need the cooperative
-                // scheduler's waker topology (`drive`); on this single-vCPU driver nothing could
-                // ever wake or mint them — fail closed rather than hang. Unreachable through the
-                // compile (op-14 implies the drive path); requires a hand-wired live cap.
+                // #1732 — `child_offer` mints over a live child's powerbox, which only the
+                // cooperative scheduler keeps; this driver has none. "Unavailable" is the `-EINVAL`
+                // the oracle gives a child it has nothing to offer over, as on the parallel driver
+                // and the Cranelift nursery: a value, not a trap (INVARIANTS #5, #9).
+                Ok(VcpuStop::ChildOffer { dst, .. }) => {
+                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                }
+                // §3.6 (I36 slice 2): live calls / svc.wait need the cooperative scheduler's waker
+                // topology (`drive`); on this single-vCPU driver nothing could ever wake them —
+                // fail closed rather than hang. They need a hand-wired live cap to arrive here.
                 Ok(VcpuStop::LiveCall { .. })
                 | Ok(VcpuStop::SvcWait)
-                | Ok(VcpuStop::ChildOffer { .. })
                 | Ok(VcpuStop::CloneCaller { .. })
                 | Ok(VcpuStop::Reap { .. })
                 // `exec_module` image-replace needs the cooperative driver's task/env set; this
