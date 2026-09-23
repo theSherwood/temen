@@ -86,7 +86,7 @@ use temen_ir::errno::*; // the one shared negative-errno table (#905)
 /// A deterministic **in-memory** filesystem capability (fresh, empty state per host). The hermetic
 /// default for tests and differential runs.
 pub fn mem_fs() -> HostCap {
-    HostCap::host_proc(0, temen_fs::mem_fs_handler(false))
+    mem_fs_cap(|| temen_fs::MemFsHandle::new(false))
 }
 
 /// Like [`mem_fs`] but with the **test-only crash-injection** controller enabled (the [`FS_CRASH_ARM`]
@@ -94,7 +94,7 @@ pub fn mem_fs() -> HostCap {
 /// Never grant this to a real guest: a tripped crash freezes the store (a self-inflicted DoS on the
 /// holder's own fs, no host effect, but pointless outside a test).
 pub fn mem_fs_crashy() -> HostCap {
-    HostCap::host_proc(0, temen_fs::mem_fs_handler(true))
+    mem_fs_cap(|| temen_fs::MemFsHandle::new(true))
 }
 
 /// A **pre-seeded** in-memory filesystem: `files` maps a normalized relative path to its contents, and
@@ -102,7 +102,32 @@ pub fn mem_fs_crashy() -> HostCap {
 /// clone of the seed, so a run's writes never leak back into it — re-runs are deterministic. This is how
 /// a demo with no real filesystem (e.g. the browser) mounts a data-dir image on the `fs` cap.
 pub fn mem_fs_seeded(files: Vec<(String, Vec<u8>)>, dirs: Vec<String>) -> HostCap {
-    HostCap::host_proc(0, temen_fs::mem_fs_seeded_handler(files, dirs))
+    mem_fs_cap(move || temen_fs::MemFsHandle::seeded(&files, &dirs))
+}
+
+/// A memfs [`HostCap`] whose every grant mints a fresh store from `store` **and declares its state**
+/// (#1491), so a checkpoint, a debugger rebuild and a §12 freeze carry the files, directories and
+/// open descriptors the guest has — not just the continuation that expects them. A `fork()` twin
+/// gets a fresh store, as [`HostCap::host_proc`] gives any `make`-built capability.
+fn mem_fs_cap(store: impl Fn() -> temen_fs::MemFsHandle + Send + Sync + 'static) -> HostCap {
+    let store = std::sync::Arc::new(store);
+    let fork: temen_interp::HostProcFork = std::sync::Arc::new({
+        let store = std::sync::Arc::clone(&store);
+        move |_pid| temen_interp::ForkedProc::shared(store().handler())
+    });
+    HostCap {
+        type_id: temen_interp::cap_id::HOST_PROC,
+        op: 0,
+        grant: std::sync::Arc::new(move |h, _| {
+            let fs = store();
+            let handle = h.grant_host_proc_forkable(fs.handler(), std::sync::Arc::clone(&fork));
+            fs.declare_state(h, handle);
+            handle
+        }),
+        unbound: false,
+        offer: None,
+        iface: None,
+    }
 }
 
 /// Walk a host directory into a [`mem_fs_seeded`] capability — every regular file's bytes keyed by its

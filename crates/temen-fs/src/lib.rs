@@ -8,8 +8,10 @@
 //! backend (which pulls in the unix-only JIT/mmap machinery) and wraps these handlers in its
 //! `HostCap`; it re-exports this crate's protocol + `mem_fs*` so `temen_run::fs::*` is unchanged.
 //!
-//! A handler builder returns a `make: impl Fn() -> HostProc` closure — `temen-run` passes it to
-//! `HostCap::host_proc`, and the browser cdylib grants the `HostProc` directly on its `temen-interp` Host.
+//! A store is a [`MemFsHandle`]: it mints the `HostProc` handlers granted over it and declares its
+//! own state ([`MemFsHandle::declare_state`], #1491), so every checkpoint, debugger rebuild and §12
+//! freeze carries the files a guest wrote. `temen-run` wraps it in its `HostCap`; the browser cdylib
+//! and the debug on-ramp grant it through [`grant_vm_fs`].
 
 use std::collections::HashMap;
 use std::path::{Component, Path};
@@ -274,7 +276,7 @@ impl MemFsState {
 
 impl MemFsState {
     /// Current contents as a `(files, dirs)` seed — the exact shape [`encode_image`] serializes and
-    /// [`mem_fs_seeded_handler`]/[`mem_fs_seeded_shared`] mount. A file's bytes are its live committed
+    /// [`MemFsHandle::seeded`]/[`mem_fs_seeded_shared`] mount. A file's bytes are its live committed
     /// buffer (an open `fd` shares the same `Arc`, so bytes already `write`n are included); purely
     /// transient state that is not part of a filesystem *image* — open-fd cursors, `opendir` handles,
     /// live mmaps — is dropped. Entries are sorted for a byte-deterministic image (so re-snapshotting an
@@ -305,7 +307,224 @@ impl MemFsState {
     }
 }
 
+/// The [`MemFsHandle::capture_state`] layout version; any other refuses to decode.
+const STATE_VERSION: u8 = 1;
+
 impl MemFsState {
+    /// Serialize the whole store (#1491). Little-endian: the version byte; files (path, buffer id)
+    /// sorted by path; dirs; the open table (per slot: absent, or buffer id + cursor + mode bits);
+    /// the `opendir` table (per slot: absent, or the names still to yield); the live mappings
+    /// (base, len, file offset, buffer id); the crash controller; then the buffers, each once. A
+    /// buffer id names a shared `Arc`, so aliasing survives the round trip.
+    fn encode(&self) -> Vec<u8> {
+        let mut bufs: Vec<Vec<u8>> = Vec::new();
+        let mut ids: HashMap<usize, u32> = HashMap::new();
+        let mut id = |a: &Arc<Mutex<Vec<u8>>>| -> u32 {
+            *ids.entry(Arc::as_ptr(a) as usize).or_insert_with(|| {
+                bufs.push(a.lock().unwrap_or_else(|e| e.into_inner()).clone());
+                (bufs.len() - 1) as u32
+            })
+        };
+        let mut out = vec![STATE_VERSION];
+        let put_u32 = |o: &mut Vec<u8>, v: usize| o.extend_from_slice(&(v as u32).to_le_bytes());
+        let put_u64 = |o: &mut Vec<u8>, v: u64| o.extend_from_slice(&v.to_le_bytes());
+        let put_str = |o: &mut Vec<u8>, s: &str| {
+            o.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            o.extend_from_slice(s.as_bytes());
+        };
+
+        let mut files: Vec<(&String, &Arc<Mutex<Vec<u8>>>)> = self.files.iter().collect();
+        files.sort_by(|a, b| a.0.cmp(b.0));
+        put_u32(&mut out, files.len());
+        for (path, data) in files {
+            put_str(&mut out, path);
+            put_u32(&mut out, id(data) as usize);
+        }
+        put_u32(&mut out, self.dirs.len());
+        for d in &self.dirs {
+            put_str(&mut out, d);
+        }
+        put_u32(&mut out, self.open.len());
+        for o in &self.open {
+            match o {
+                None => out.push(0),
+                Some(o) => {
+                    out.push(1);
+                    put_u32(&mut out, id(&o.data) as usize);
+                    put_u64(&mut out, o.pos as u64);
+                    out.push(o.readable as u8 | (o.writable as u8) << 1 | (o.append as u8) << 2);
+                }
+            }
+        }
+        put_u32(&mut out, self.opendirs.len());
+        for d in &self.opendirs {
+            match d {
+                None => out.push(0),
+                Some(names) => {
+                    out.push(1);
+                    put_u32(&mut out, names.len());
+                    for n in names {
+                        put_str(&mut out, n);
+                    }
+                }
+            }
+        }
+        put_u32(&mut out, self.maps.len());
+        for m in &self.maps {
+            put_u64(&mut out, m.base);
+            put_u64(&mut out, m.len);
+            put_u64(&mut out, m.file_off);
+            put_u32(&mut out, id(&m.data) as usize);
+        }
+        match &self.crash {
+            None => out.push(0),
+            Some(c) => {
+                out.push(1);
+                out.push(c.countdown.is_some() as u8);
+                put_u64(&mut out, c.countdown.unwrap_or(0));
+                out.push(c.crashed as u8);
+            }
+        }
+        put_u32(&mut out, bufs.len());
+        for b in &bufs {
+            put_u64(&mut out, b.len() as u64);
+            out.extend_from_slice(b);
+        }
+        out
+    }
+
+    /// The inverse of [`encode`](Self::encode). Fail-closed: a wrong version, a truncated field, a
+    /// buffer id past the table or trailing bytes refuse the whole store rather than yield part of it.
+    fn decode(bytes: &[u8]) -> Result<MemFsState, String> {
+        struct Rd<'a>(&'a [u8]);
+        impl<'a> Rd<'a> {
+            fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+                if n > self.0.len() {
+                    return Err("memfs state: truncated".into());
+                }
+                let (h, t) = self.0.split_at(n);
+                self.0 = t;
+                Ok(h)
+            }
+            fn u8(&mut self) -> Result<u8, String> {
+                Ok(self.take(1)?[0])
+            }
+            fn u32(&mut self) -> Result<usize, String> {
+                Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as usize)
+            }
+            fn u64(&mut self) -> Result<u64, String> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+            }
+            fn len(&mut self) -> Result<usize, String> {
+                usize::try_from(self.u64()?).map_err(|_| "memfs state: too large".to_string())
+            }
+            fn str(&mut self) -> Result<String, String> {
+                let n = self.u32()?;
+                String::from_utf8(self.take(n)?.to_vec())
+                    .map_err(|_| "memfs state: path is not UTF-8".to_string())
+            }
+        }
+        let mut r = Rd(bytes);
+        if r.u8()? != STATE_VERSION {
+            return Err("memfs state: unsupported version".into());
+        }
+        let mut files = Vec::new();
+        for _ in 0..r.u32()? {
+            files.push((r.str()?, r.u32()?));
+        }
+        let mut dirs = std::collections::BTreeSet::new();
+        for _ in 0..r.u32()? {
+            dirs.insert(r.str()?);
+        }
+        let mut open = Vec::new();
+        for _ in 0..r.u32()? {
+            open.push(match r.u8()? {
+                0 => None,
+                1 => Some((r.u32()?, r.len()?, r.u8()?)),
+                _ => return Err("memfs state: bad open-slot tag".into()),
+            });
+        }
+        let mut opendirs = Vec::new();
+        for _ in 0..r.u32()? {
+            opendirs.push(match r.u8()? {
+                0 => None,
+                1 => {
+                    let mut names = Vec::new();
+                    for _ in 0..r.u32()? {
+                        names.push(r.str()?);
+                    }
+                    Some(names)
+                }
+                _ => return Err("memfs state: bad opendir-slot tag".into()),
+            });
+        }
+        let mut maps = Vec::new();
+        for _ in 0..r.u32()? {
+            maps.push((r.u64()?, r.u64()?, r.u64()?, r.u32()?));
+        }
+        let crash = match r.u8()? {
+            0 => None,
+            1 => {
+                let armed = r.u8()? != 0;
+                let countdown = r.u64()?;
+                let crashed = r.u8()? != 0;
+                Some(CrashCtl {
+                    countdown: armed.then_some(countdown),
+                    crashed,
+                })
+            }
+            _ => return Err("memfs state: bad crash tag".into()),
+        };
+        let mut bufs = Vec::new();
+        for _ in 0..r.u32()? {
+            let n = r.len()?;
+            bufs.push(Arc::new(Mutex::new(r.take(n)?.to_vec())));
+        }
+        if !r.0.is_empty() {
+            return Err("memfs state: trailing bytes".into());
+        }
+        let buf = |i: usize| {
+            bufs.get(i)
+                .cloned()
+                .ok_or_else(|| "memfs state: buffer id out of range".to_string())
+        };
+        Ok(MemFsState {
+            files: files
+                .into_iter()
+                .map(|(p, i)| Ok((p, buf(i)?)))
+                .collect::<Result<_, String>>()?,
+            dirs,
+            open: open
+                .into_iter()
+                .map(|o| {
+                    o.map(|(i, pos, mode)| {
+                        Ok(MemOpen {
+                            data: buf(i)?,
+                            pos,
+                            readable: mode & 1 != 0,
+                            writable: mode & 2 != 0,
+                            append: mode & 4 != 0,
+                        })
+                    })
+                    .transpose()
+                })
+                .collect::<Result<_, String>>()?,
+            opendirs,
+            maps: maps
+                .into_iter()
+                .map(|(base, len, file_off, i)| {
+                    Ok(MemMapping {
+                        base,
+                        len,
+                        data: buf(i)?,
+                        file_off,
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+            crash,
+        })
+    }
+
     fn handle(&mut self, op: u32, args: &[i64], mem: Option<&mut dyn GuestMem>) -> i64 {
         let mut mem = mem;
         let a = |i: usize| args.get(i).copied().unwrap_or(0);
@@ -732,54 +951,6 @@ pub fn arm_crash(ctl: Option<&mut CrashCtl>, n: i64) -> i64 {
     0
 }
 
-/// A `make` builder for the in-memory backend (`temen-run` wraps it in a `HostCap`; the browser grants
-/// the `HostProc` directly). `crashy` enables the **test-only** crash-injection op ([`FS_CRASH_ARM`]).
-pub fn mem_fs_handler(crashy: bool) -> impl Fn() -> HostProc + Send + Sync + 'static {
-    move || {
-        let mut st = MemFsState {
-            crash: crashy.then(CrashCtl::default),
-            ..MemFsState::default()
-        };
-        Box::new(
-            move |op: u32,
-                  args: &[i64],
-                  mem: Option<&mut dyn GuestMem>,
-                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![st.handle(op, args, mem)])
-            },
-        ) as HostProc
-    }
-}
-
-/// A `make` builder for a **pre-seeded** in-memory backend (a mounted data image): `files` maps a
-/// path to its bytes, `dirs` names directories that must exist even when empty. Each grant clones the
-/// seed fresh, so a run's writes never leak back into it (deterministic re-runs).
-pub fn mem_fs_seeded_handler(
-    files: Vec<(String, Vec<u8>)>,
-    dirs: Vec<String>,
-) -> impl Fn() -> HostProc + Send + Sync + 'static {
-    let files = Arc::new(files);
-    let dirs = Arc::new(dirs);
-    move || {
-        let (files, dirs) = (files.clone(), dirs.clone());
-        let mut st = MemFsState::default();
-        for (p, data) in files.iter() {
-            st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
-        }
-        for d in dirs.iter() {
-            st.dirs.insert(norm(d));
-        }
-        Box::new(
-            move |op: u32,
-                  args: &[i64],
-                  mem: Option<&mut dyn GuestMem>,
-                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![st.handle(op, args, mem)])
-            },
-        ) as HostProc
-    }
-}
-
 /// A live handle onto a store mounted by [`mem_fs_seeded_shared`], letting the caller serialize the
 /// **current** filesystem back out — e.g. to persist a browser Postgres session across page reloads
 /// (snapshot the data dir, stash the image, reboot from it next visit). Cloneable; every clone observes
@@ -790,6 +961,84 @@ pub fn mem_fs_seeded_handler(
 pub struct MemFsHandle(Arc<Mutex<MemFsState>>);
 
 impl MemFsHandle {
+    /// A fresh, empty store. `crashy` enables the **test-only** crash-injection op ([`FS_CRASH_ARM`]).
+    pub fn new(crashy: bool) -> MemFsHandle {
+        MemFsHandle(Arc::new(Mutex::new(MemFsState {
+            crash: crashy.then(CrashCtl::default),
+            ..MemFsState::default()
+        })))
+    }
+
+    /// A store holding `files` (path → bytes) and the `dirs` that must exist even when empty.
+    pub fn seeded(files: &[(String, Vec<u8>)], dirs: &[String]) -> MemFsHandle {
+        let mut st = MemFsState::default();
+        for (p, data) in files {
+            st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
+        }
+        for d in dirs {
+            st.dirs.insert(norm(d));
+        }
+        MemFsHandle(Arc::new(Mutex::new(st)))
+    }
+
+    /// A store rebuilt from a [`capture_state`](Self::capture_state) — what a thaw's registrar mints
+    /// for a `vm_fs`/`fs` the artifact names. `Err` on bytes this version cannot fully read.
+    pub fn from_state(bytes: &[u8]) -> Result<MemFsHandle, String> {
+        Ok(MemFsHandle(Arc::new(Mutex::new(MemFsState::decode(
+            bytes,
+        )?))))
+    }
+
+    /// #1491 — the **whole** store as bytes: every file, directory, open descriptor (with its
+    /// cursor and mode), `opendir` handle and live mapping. Files that share a buffer — an open
+    /// descriptor and its path, two descriptors on one file, a removed file still held open — still
+    /// share one after a round trip. There is no partial form: a store that came back with its files
+    /// but not its cursors would look restored and read from the wrong offset (INVARIANTS #9c).
+    pub fn capture_state(&self) -> Vec<u8> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).encode()
+    }
+
+    /// Replace this live store's contents with a [`capture_state`](Self::capture_state), in place,
+    /// so every handler already granted over it sees the restored store. `Err` (and the store left
+    /// as it was) on bytes this version cannot fully read.
+    pub fn restore_state(&self, bytes: &[u8]) -> Result<(), String> {
+        let restored = MemFsState::decode(bytes)?;
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = restored;
+        Ok(())
+    }
+
+    /// A handler over this live store (the grant half: every handler minted here shares it).
+    pub fn handler(&self) -> HostProc {
+        let st = self.0.clone();
+        Box::new(
+            move |op: u32,
+                  args: &[i64],
+                  mem: Option<&mut dyn GuestMem>,
+                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
+                Ok(vec![st
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .handle(op, args, mem)])
+            },
+        ) as HostProc
+    }
+
+    /// Declare this store as the state of the capability granted at `handle` (#1455's pair), so a
+    /// checkpoint, a moment, a cap tape and a §12 artifact all carry it, and an in-session rewind
+    /// puts it back. One definition of the store's state, read every way.
+    pub fn declare_state(&self, host: &mut temen_interp::Host, handle: i32) {
+        let (c, r) = (self.clone(), self.clone());
+        host.set_cap_state_capture(handle, Box::new(move || c.capture_state()));
+        host.set_cap_state_restore(
+            handle,
+            Box::new(move |b| {
+                // The bytes are this store's own capture, so a decode failure is a bug, not input.
+                let restored = r.restore_state(b);
+                debug_assert!(restored.is_ok(), "memfs state restore: {restored:?}");
+            }),
+        );
+    }
+
     /// The current filesystem as a `(files, dirs)` seed (see [`MemFsState::snapshot`]).
     pub fn seed(&self) -> FsSeed {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).snapshot()
@@ -803,12 +1052,9 @@ impl MemFsHandle {
     }
 }
 
-/// Like [`mem_fs_seeded_handler`] but returns the `HostProc` **and** a [`MemFsHandle`] onto its state, so
-/// the mount can be snapshotted back out later (the persistent-session persistence path). Unlike the
-/// `make: impl Fn() -> HostProc` builders — which re-seed a fresh store on every grant — this grants
-/// **one** live store shared between the handler and the handle through an `Arc<Mutex<..>>`, locked per
-/// op (uncontended in the single-threaded browser). The deterministic, snapshot-free one-shot path keeps
-/// [`mem_fs_seeded_handler`].
+/// A seeded store's `HostProc` **and** its [`MemFsHandle`], so the mount can be snapshotted back out
+/// later (the persistent-session persistence path): one live store shared between the handler and the
+/// handle through an `Arc<Mutex<..>>`, locked per op (uncontended in the single-threaded browser).
 pub fn mem_fs_seeded_shared(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
@@ -819,8 +1065,8 @@ pub fn mem_fs_seeded_shared(
 
 /// Like [`mem_fs_seeded_shared`] but returns a **reusable factory** granting the *same* live store to
 /// every domain it's called for, instead of a single `HostProc`. This is the **cross-domain shared
-/// memfs**: unlike [`mem_fs_seeded_handler`] (a factory that re-seeds a *fresh* store per grant, so
-/// two domains get isolated filesystems), every `HostProc` this yields closes over one shared
+/// memfs**: unlike a fresh [`MemFsHandle::seeded`] per grant (so two domains get isolated
+/// filesystems), every `HostProc` this yields closes over one shared
 /// `Arc<Mutex<MemFsState>>`, so a file one domain writes another domain reads — the file hand-off a
 /// multi-phase pipeline needs (NIM.md §3c, W4: phase N writes `x.nif`, phase N+1 reads it). The
 /// returned [`MemFsHandle`] observes the same store (snapshot/seed it host-side). Granting this to a
@@ -830,30 +1076,47 @@ pub fn mem_fs_shared_factory(
     files: Vec<(String, Vec<u8>)>,
     dirs: Vec<String>,
 ) -> (impl Fn() -> HostProc + Send + Sync + 'static, MemFsHandle) {
-    let mut st = MemFsState::default();
-    for (p, data) in &files {
-        st.files.insert(norm(p), Arc::new(Mutex::new(data.clone())));
-    }
-    for d in &dirs {
-        st.dirs.insert(norm(d));
-    }
-    let shared = Arc::new(Mutex::new(st));
-    let handle = MemFsHandle(shared.clone());
-    let factory = move || {
-        let shared = shared.clone();
-        Box::new(
-            move |op: u32,
-                  args: &[i64],
-                  mem: Option<&mut dyn GuestMem>,
-                  _minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                Ok(vec![shared
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .handle(op, args, mem)])
-            },
-        ) as HostProc
+    let handle = MemFsHandle::seeded(&files, &dirs);
+    let factory = {
+        let handle = handle.clone();
+        move || handle.handler()
     };
     (factory, handle)
+}
+
+/// #1491 — grant a guest-private, read-write in-memory filesystem on the **`vm_fs`** seam: the
+/// chibicc `__vm_fs` builtin's `call.sym "vm_fs"`, one flat call with the fs op in `args[0]` and its
+/// arguments after. Seeded from `seed` when given (a launch's fs-image), else empty. Registers the
+/// name and declares the store's state, so every rebuild, rewind and freeze carries the files the
+/// guest wrote. The one definition the browser Run path and the debug on-ramp both grant.
+pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 {
+    let fs = match seed {
+        Some((files, dirs)) => MemFsHandle::seeded(files, dirs),
+        None => MemFsHandle::new(false),
+    };
+    let h = host.grant_host_proc(vm_fs_handler(&fs));
+    host.register_cap_name("vm_fs", h);
+    fs.declare_state(host, h);
+    h
+}
+
+/// The `vm_fs` seam's handler over `fs`: the fs op in `args[0]`, its arguments after. What
+/// [`grant_vm_fs`] grants, and what a thaw's registrar hands back for a `vm_fs` the artifact names
+/// (over [`MemFsHandle::from_state`] of the state it carries).
+pub fn vm_fs_handler(fs: &MemFsHandle) -> HostProc {
+    let mut inner = fs.handler();
+    Box::new(
+        move |_slot_op: u32,
+              args: &[i64],
+              mem: Option<&mut dyn GuestMem>,
+              minter: Option<&mut dyn temen_interp::RegionMinter>| {
+            let (op, rest) = args
+                .split_first()
+                .map(|(o, r)| (*o as u32, r))
+                .unwrap_or((0, &[][..]));
+            inner(op, rest, mem, minter)
+        },
+    )
 }
 
 /// A filesystem seed: `(files as (relative-path, bytes), directory relative-paths)`. The material both
@@ -992,6 +1255,109 @@ mod tests {
         }
     }
 
+    /// #1491 — a captured store comes back **whole**: run one op sequence against the original and
+    /// against a store rebuilt from its capture, and every answer, every byte read and the final
+    /// capture agree. The sequence leans on what an image-only snapshot would lose: a cursor mid-file,
+    /// two descriptors sharing one file, a removed file still held open, a half-read `opendir`.
+    #[test]
+    fn a_captured_store_restores_its_descriptors_and_their_sharing() {
+        let call = |fs: &mut HostProc, op: u32, args: &[i64], mem: &mut VecMem| -> i64 {
+            fs(op, args, Some(mem), None).expect("host fn")[0]
+        };
+        let a = MemFsHandle::seeded(&[("keep".into(), b"k".to_vec())], &["empty".into()]);
+        let mut fs = a.handler();
+        // Paths "a" at 0, "b" at 1 and "." at 2; payload "hello" at 16; reads land at 32.
+        let mut mem = VecMem(vec![0u8; 64]);
+        mem.0[..3].copy_from_slice(b"ab.");
+        mem.0[16..21].copy_from_slice(b"hello");
+        let rw = call(
+            &mut fs,
+            FS_OPEN,
+            &[0, 1, O_CREATE | O_READ | O_WRITE],
+            &mut mem,
+        );
+        assert_eq!(call(&mut fs, FS_WRITE, &[rw, 16, 5], &mut mem), 5);
+        assert_eq!(call(&mut fs, FS_SEEK, &[rw, 0, 1], &mut mem), 1);
+        let ro = call(&mut fs, FS_OPEN, &[0, 1, O_READ], &mut mem);
+        let wb = call(&mut fs, FS_OPEN, &[1, 1, O_CREATE | O_WRITE], &mut mem);
+        assert_eq!(call(&mut fs, FS_REMOVE, &[1, 1], &mut mem), 0);
+        let dh = call(&mut fs, FS_OPENDIR, &[2, 1], &mut mem);
+        assert!(call(&mut fs, FS_READDIR, &[dh, 40, 16], &mut mem) > 0);
+
+        let bytes = a.capture_state();
+        let b = MemFsHandle::from_state(&bytes).expect("a capture decodes");
+        assert_eq!(
+            b.capture_state(),
+            bytes,
+            "recapturing a restored store is byte-identical"
+        );
+
+        let after = |fs: &mut HostProc| {
+            let mut mem = VecMem(vec![0u8; 64]);
+            mem.0[16..17].copy_from_slice(b"!");
+            let mut out = vec![
+                call(fs, FS_READ, &[rw, 32, 8], &mut mem), // the cursor: "ello", not "hello"
+                call(fs, FS_WRITE, &[rw, 16, 1], &mut mem), // at the end: "hello!"
+                call(fs, FS_READ, &[ro, 48, 8], &mut mem), // the sharing: sees the "!"
+                call(fs, FS_WRITE, &[wb, 16, 1], &mut mem), // the removed file is still writable
+                call(fs, FS_READDIR, &[dh, 40, 16], &mut mem), // the rest of the listing
+                call(fs, FS_READDIR, &[dh, 40, 16], &mut mem),
+            ];
+            out.extend(mem.0.iter().map(|&x| x as i64));
+            out
+        };
+        let (mut fa, mut fb) = (a.handler(), b.handler());
+        let want = after(&mut fa);
+        assert_eq!(
+            &want[..3],
+            &[4, 1, 6],
+            "cursor at 1, then append, then the sharer reads all six"
+        );
+        assert_eq!(
+            after(&mut fb),
+            want,
+            "the restored store answers exactly as the original"
+        );
+        assert_eq!(
+            b.capture_state(),
+            a.capture_state(),
+            "and ends in the same state"
+        );
+    }
+
+    /// A capture is all or nothing: bytes this version cannot fully read refuse the whole store.
+    #[test]
+    fn a_damaged_capture_refuses_rather_than_restoring_part_of_a_store() {
+        let bytes = MemFsHandle::seeded(&[("f".into(), b"data".to_vec())], &[]).capture_state();
+        assert!(MemFsHandle::from_state(&bytes).is_ok());
+        assert!(
+            MemFsHandle::from_state(&bytes[..bytes.len() - 1]).is_err(),
+            "truncated"
+        );
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(MemFsHandle::from_state(&extra).is_err(), "trailing bytes");
+        let mut version = bytes.clone();
+        version[0] = STATE_VERSION + 1;
+        assert!(
+            MemFsHandle::from_state(&version).is_err(),
+            "another version"
+        );
+        // The file's buffer id sits after the version, the file count and the path ("f").
+        let mut dangling = bytes;
+        dangling[1 + 4 + 4 + 1] = 7;
+        assert!(
+            MemFsHandle::from_state(&dangling).is_err(),
+            "a buffer id past the table"
+        );
+
+        // A live store keeps its contents when handed bad bytes.
+        let live = MemFsHandle::seeded(&[("f".into(), b"data".to_vec())], &[]);
+        let before = live.capture_state();
+        assert!(live.restore_state(&[0xff]).is_err());
+        assert_eq!(live.capture_state(), before);
+    }
+
     /// `mem_fs_seeded_shared` snapshots the **live** store — writes and removes made through the granted
     /// `HostProc` after the mount show up in `MemFsHandle::image`, and the image round-trips through
     /// `decode_image` back to a mountable seed. This is the persistence hinge: a Postgres session's data
@@ -1043,7 +1409,7 @@ mod tests {
     /// The cross-domain file hand-off (NIM.md §3c, W4): two **independent** grants from one
     /// `mem_fs_shared_factory` — as two pipeline phases would each receive — see each other's writes.
     /// Phase A creates and writes "x"; phase B, a separate `HostProc`, opens and reads it back. Had
-    /// the grants owned isolated stores (the `mem_fs_seeded_handler` behavior), B's read-only open
+    /// the grants owned isolated stores (a fresh `MemFsHandle::seeded` per grant), B's read-only open
     /// would miss and this would fail — so the read-back witnesses one shared store across the two.
     #[test]
     fn two_grants_from_the_factory_share_one_store() {

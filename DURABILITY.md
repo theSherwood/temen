@@ -1611,6 +1611,15 @@ publishes its result to its `Done` cell; the last child leaves the active shadow
 matching the interp's dispatch-last convention. `NORMAL` durable runs keep concurrent OS threads (matching
 the interp's multi-worker `NORMAL`).
 
+The root is not the only vCPU that yields (#1655). `ARMED` is ≠ `NORMAL` too, so an armed run defers
+every spawn before any freeze has begun, and a vCPU that joins a deferred child before the trigger
+fires is the only thing that can start it. `thread_join` therefore drives the deferred children inline,
+in spawn order, when its target has no result yet — the interp's single worker running its queue when
+the joiner parks. If the trigger fires inside one of them, the join takes the freeze return rather than
+the result the child unwound past. The oracle half of the same shape: a freeze phase is **one-way and
+run-global**, so the interp's `dispatch` never restores a vCPU's pre-freeze `ARMED`/`NORMAL` over a
+global `UNWINDING` — it did, and a root woken from a join by a child that unwound ran on past the freeze.
+
 **Decomposition:**
 - **PR-1 (freeze side) — DONE:** the deferred single-worker path (`defer_spawn` /
   `Domain::drive_frozen_spawns`) + `FrozenVCpu` residue + vCPU-context allocator, exported through

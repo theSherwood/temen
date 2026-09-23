@@ -4213,7 +4213,7 @@ impl CompiledModule {
             // `FrozenVCpu`. This reproduces the interp's dispatch order (root → root's fibers →
             // children), so the side-effect interleaving — and the frozen window — is byte-identical.
             if let Some(d) = &(*this).domain {
-                d.drive_frozen_spawns();
+                d.drive_frozen_spawns(0, (*this).shadow.region_base(0));
                 // §12.8 4A.5 stage (ii): drains the **deferred** (single-worker) children now;
                 // **concurrent** children record their residue on their own OS threads, drained again
                 // after `join_all` below. `extend` (vs. assign) so both contribute. Canonical sort at

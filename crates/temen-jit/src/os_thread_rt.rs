@@ -1565,18 +1565,24 @@ impl Domain {
         (result, trap, faulted)
     }
 
-    /// Run every child *deferred* during a durable freeze (slice 3.3), inline and in spawn order, once
-    /// the root has unwound — the JIT's single-worker equivalent of the interpreter dispatching the
-    /// enqueued children after the root yields. Each child runs in its own top-down shadow context
-    /// (the active shadow-SP word points there for the run); one that unwound under the freeze records a
-    /// [`crate::FrozenVCpu`] residue and keeps its context for thaw, while a genuine finish frees the
-    /// context for reuse. The last child leaves the active shadow-SP at its own extent, matching the
-    /// interp's dispatch-last convention so the window is byte-identical.
+    /// Run every child *deferred* on a durable run (slice 3.3), inline and in spawn order — the JIT's
+    /// single-worker equivalent of the interpreter dispatching its enqueued children once the vCPU
+    /// ahead of them yields. Two callers: `run_inner` once the root has unwound for a freeze, and
+    /// [`thread_join`] when a vCPU joins a child that has not run yet (#1655 — the interpreter's
+    /// worker runs the queue when the joiner parks; without this an armed run whose trigger has not
+    /// fired would wait on a child nothing will start). Each child runs in its own top-down shadow
+    /// context (the active shadow-SP word points there for the run); one that unwound under the freeze
+    /// records a [`crate::FrozenVCpu`] residue and keeps its context for thaw, while a genuine finish
+    /// frees the context for reuse. Between children, and at the end, the caller's task and shadow
+    /// region (`resume_task`, `resume_region`) are restored. From `run_inner` that is the root's, so
+    /// the last child's extent stays in its own word, matching the interp's dispatch-last convention
+    /// and keeping the window byte-identical.
     ///
     /// # Safety
-    /// Called from `run_inner` after the root's guarded call returned (no guest code is on this thread)
-    /// on a durable freeze run; the env's window / fault range / call-trampoline are the live run's.
-    pub(crate) unsafe fn drive_frozen_spawns(&self) {
+    /// The env's window / fault range / call-trampoline are the live run's, on a durable run. From
+    /// `run_inner`: the root's guarded call has returned. From `thread_join`: the joiner's own frame is
+    /// below, and no lock the children publish through is held.
+    pub(crate) unsafe fn drive_frozen_spawns(&self, resume_task: u64, resume_region: u64) {
         let env = self.env();
         // Arm this thread's detect-and-kill recovery for the inline runs (idempotent; the root's run
         // already installed the process-wide handler, but a child's `run_guarded_range` needs the
@@ -1608,8 +1614,8 @@ impl Domain {
                 // §12: seed the child's per-vCPU TLS register to its (global) task id, matching the interp.
                 let (result, trap, faulted) =
                     self.run_child_inline(env, p.code, p.sp, p.arg, p.task as i64);
-                *lock(&self.cur_task) = 0; // back to the root between children
-                crate::durable_shadow::seed(self.shadow().region_base(0)); // back to the root's region
+                *lock(&self.cur_task) = resume_task; // back to the caller between children
+                crate::durable_shadow::seed(resume_region); // and to the caller's region
 
                 // The child's flattened extent and whether it unwound under the freeze.
                 let child_sp = fiber_rt::read_shadow_sp(env.mem_base, child_region);
@@ -1860,6 +1866,18 @@ pub(crate) unsafe extern "C" fn thread_join(
     } else {
         0
     };
+    // #1655 — a durable run defers every spawn while its window is not `NORMAL`, and `ARMED` counts:
+    // the child has not started, and only this vCPU can start it. So when the joined child has no
+    // result yet, run the deferred children inline now, in spawn order — what the interpreter's single
+    // worker does when the joiner parks. If the freeze trigger fires inside one of them, the joined
+    // child may have published a result it unwound past, so take the freeze return instead of it.
+    // SAFETY: a durable run's committed window; `done.state` is not held (the children publish there).
+    if unwind_base != 0 && lock(&done.state).is_none() && !lock(&dom.pending_spawns).is_empty() {
+        unsafe { dom.drive_frozen_spawns(cur, crate::durable_shadow::get()) };
+        if unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
+            return 0; // freeze in progress — the join's trailing safepoint unwinds
+        }
+    }
     // D66 — a joiner holds no lane while it waits. Under a cap of 1 this is load-bearing: the child
     // being joined cannot run at all until the joiner steps aside. Released before the completion
     // cell's lock is taken and re-taken after it is dropped — blocking for a lane while holding that

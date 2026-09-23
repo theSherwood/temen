@@ -820,7 +820,14 @@ falls back to the (correct) replay-from-0. **A guest holding a host capability i
 does file I/O or drives a device; one carrying a registered **name** is now admitted (an unnamed one
 still vetoes, fail-closed), because every `HOST_PROC` crossing is taped — a replay serves it rather than
 re-entering the closure — and the checkpoint carries both the capability's own declared state and the
-count of crossings consumed so far. *Oracles:*
+count of crossings consumed so far. **Under a replaying tape the declared state is the tape's end's, not
+the checkpoint's (#1491):** a replay never enters the handler, so the state a live continuation past the
+tape reads is the one the handler held when the tape was cut. The DAP carries it from the run it
+rebuilds, a checkpoint restore leaves it alone while a tape is armed, and an undo (which replays the
+run's own tape) never rewinds it — which is also why a recorded stateful capability no longer blocks the
+undo journal. The `vm_fs` memfs declares its whole store (files, directories, open table, `opendir`
+handles, mappings), so a debugged C guest that seeks back and runs on past the tape reads its own
+writes. *Oracles:* `file_io.rs::a_reverse_seek_keeps_the_files_the_guest_wrote`,
 `dap_checkpoints.rs::bytecode_checkpoint_warm_seek_matches_cold_with_a_host_capability` (a `vm_fs`
 write loop under the real DAP powerbox) and `bytecode_debug_cap_checkpoint.rs` (the named/unnamed
 split, and a stateful capability restored against a live host). *Tests (`debug_checkpoints.rs`):* a **warm** Inspector
