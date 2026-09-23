@@ -21,7 +21,16 @@
 //! asks for one twin once per op — and every op must still land on one process with one working
 //! door (the #1644 net).
 //!
-//! **Not covered here:** `call.cap` and `call.import.dyn`, whose handle operand is real rather than
+//! **Not covered here (1): the interrupt row.** #1647 made `-EINTR` on an interrupted park one
+//! decision for all four forms, but exercising it needs a signal delivered *while* the caller is
+//! parked. The deterministic idiom for that is `c_posix.rs`'s
+//! `c_a_caught_signal_interrupts_a_blocked_capability_read_with_eintr`: a spawned guest thread
+//! raises in a loop until the parked caller takes the interrupt, so it retries rather than races.
+//! Reproducing it here means a hand-written IR guest with `thread.spawn`, atomics and the signal
+//! setup; #1647 tracks it. A timing-based approximation would be a `kind:flaky-ci` issue waiting
+//! to happen, so there isn't one.
+//!
+//! **Not covered here (2):** `call.cap` and `call.import.dyn`, whose handle operand is real rather than
 //! vestigial — a `_start`-shaped powerbox run has no way to hand a guest a live `HOST_PROC` handle,
 //! and building one by hand would bypass the scheduler these requests need. `call.cap` is covered
 //! end-to-end instead by `crates/temen/tests/c_posix.rs`, where chibicc's real shell forks, execs
