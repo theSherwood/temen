@@ -2537,6 +2537,22 @@ is a bounded, behavior-neutral refactor and the first implementation slice.
      serving). **Remaining:** 4d `LiveImpl` capture — a parent holding a live cap onto a
      serving child still refuses; the cross-domain *call* path (op-14 offer + parked caller)
      is the last fixture.
+     **Every park, and every trigger (#1584, 2026-09-23):** #1619 widened the drain from
+     `svc.wait` to every park the scheduler owns (futex, join, lane), but still only on the
+     quiesce arm. The *other* triggers this section names — the `ARMED → UNWINDING` promotion
+     and an externally-set `UNWINDING` — never got the "freeze unparks everything" step, so a
+     vCPU parked when such a freeze arrived was reaped by the deadlock check: the freeze
+     returned `Ok` with that vCPU missing from the cut (the thaw then faulted), and a child that
+     parked *under* the phase faulted the run outright where the JIT, whose futex park
+     observes a freeze on its own, froze it. Now one body (`admit_parks_for_freeze`) serves
+     both triggers — freeze-on-quiesce, and **a freeze already in flight** (a vCPU has
+     unwound for one, or a parked vCPU carries the phase) — run at the worker loop's idle
+     point, ahead of the deadlock predicate. A futex-parked **fiber** now counts as quiesced
+     (it is left for its owner's `freeze_drive` to purge, as step 2 specifies), and a durable
+     `cont.resume.block` idles instead of spinning, so an idle durable fiber scheduler reaches
+     quiescence at all. Pinned in `temen-durable/tests/quiesce_parks.rs` (each shape's full
+     freeze→thaw round trip) and `temen/tests/durable_multivcpu_jit.rs` (the parked-child
+     cut, byte-identical on both engines).
    * **4d — live-cap re-link: BUILT 2026-07-24.** `Binding::LiveImpl` is now durably
      capturable when it names a §14 child: `child_offer` (op 14) records the callee's **join
      slot** on the `LiveImplEntry` (`wire_live_impl_child`), and `capture_durable_handles`

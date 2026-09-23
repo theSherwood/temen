@@ -761,3 +761,149 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
         other => panic!("nested thaw did not return cleanly: {other:?}"),
     }
 }
+
+// #1584 — a child **parked** in an infinite `atomic.wait` when the freeze reaches it. The run starts
+// `UNWINDING`; the root spawns the child and joins it; the child's first act is the wait. The two
+// engines used to disagree, and the oracle was the one that was wrong: the JIT's futex park observes a
+// freeze on its own recheck cadence and unwinds, while the interpreter let the wait park under
+// `UNWINDING`, nothing re-admitted it, and the deadlock check faulted the whole run `ThreadFault`. The
+// in-flight freeze now re-admits it, and both engines capture it at its wait's re-issue point.
+const SRC_FUTEX_PARKED_CHILD: &str = r#"
+memory 17
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vr = thread.join vt
+  vk = i64.const 2000
+  vs = i64.add vk vr
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  vk = i64.const 100
+  vr = i64.mul vst64 vk
+  return vr
+  }
+}
+"#;
+
+#[test]
+fn jit_and_interp_freeze_a_futex_parked_child_identically() {
+    let mut m = temen_text::parse_module(SRC_FUTEX_PARKED_CHILD).expect("parse");
+    m.memory = Some(Memory {
+        size_log2: SIZE_LOG2,
+        shadow: Some(TEST_ARENA),
+    });
+    let inst = transform_module_assume_confined(&m).expect("transform");
+    temen_verify::verify_module(&inst).expect("instrumented IR verifies");
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+
+    let mut h = Host::new();
+    h.set_durable(true);
+    let mut fuel = 1_000_000u64;
+    let (r, isnap) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(0)]),
+        "the oracle freezes it (it used to fault)"
+    );
+    let (ivcpus, iroot_sp) = (
+        h.frozen_vcpus().to_vec(),
+        h.frozen_root_sp().expect("root extent recorded"),
+    );
+    assert_eq!(ivcpus.len(), 1, "the parked child is in the oracle's cut");
+
+    let mut jhost = Host::new();
+    jhost.set_durable(true);
+    let (jout, jsnap, jfibers, jvcpus, _) =
+        match compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[],
+            &win,
+            &[],
+            &[],
+            &[],
+            TEST_ARENA.region_base(0),
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut jhost as *mut Host as *mut c_void,
+        ) {
+            Ok(t) => t,
+            Err(JitError::Unsupported(_)) => return,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+            Err(e) => panic!("JIT failed on a verified module: {e:?}"),
+        };
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT freeze returns a placeholder, got {jout:?}"
+    );
+    assert!(jfibers.is_empty(), "no fibers in this module");
+
+    // The same cut, byte for byte: the reserve, and the child's re-attach residue field for field.
+    let reserve = TEST_ARENA.end as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "interp/JIT freeze the parked child into a byte-identical durable reserve"
+    );
+    assert_eq!(jvcpus.len(), 1, "the JIT exported the parked child");
+    assert_eq!(
+        (
+            jvcpus[0].task,
+            jvcpus[0].func,
+            &jvcpus[0].args,
+            jvcpus[0].shadow_sp
+        ),
+        (
+            ivcpus[0].task,
+            ivcpus[0].func,
+            &ivcpus[0].args,
+            ivcpus[0].shadow_sp
+        ),
+        "same re-attach residue"
+    );
+
+    // And the oracle's cut thaws on the JIT: with the waited-on word changed, the child re-issues
+    // its wait (NOT_EQUAL, 1·100) and the root reaps it — 2000 + 100.
+    let seed: Vec<JitVCpu> = ivcpus
+        .iter()
+        .map(|v| JitVCpu {
+            task: v.task,
+            parent_task: v.parent_task,
+            func: v.func,
+            args: v.args.clone(),
+            shadow_sp: v.shadow_sp,
+            completed_result: None,
+        })
+        .collect();
+    let mut twin = isnap.clone();
+    twin[66000..66004].copy_from_slice(&1i32.to_le_bytes());
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let (tout, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+        &inst,
+        0,
+        &[],
+        &twin,
+        &[],
+        &[],
+        &seed,
+        iroot_sp,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut thost as *mut Host as *mut c_void,
+    )
+    .expect("JIT thaw of the oracle's cut");
+    assert_eq!(tout, JitOutcome::Returned(vec![2100]));
+}

@@ -1792,9 +1792,13 @@ its own threading model (1:1, M:N, async/await, goroutines, actors) on top.
   (`fiber_resume_block`) and re-resumes, woken by any `notify`/teardown broadcast and
   bounded by the `KILL_RECHECK` re-poll (so a timed wait's deadline, a kill, or a freeze
   is observed with no timer thread). The deterministic explorer keeps the `FIBER_PARKED`
-  downgrade (the guest loop absorbs it — determinism untouched), as do durable runs
-  (freeze-on-quiesce untouched) and the bytecode/JIT **OS-thread-parallel** driver
-  variants (their idle is a small remaining follow-up). It never "blocks the domain"
+  downgrade (the guest loop absorbs it — determinism untouched), as do the bytecode/JIT
+  **OS-thread-parallel** driver variants (their idle is a small remaining follow-up). A
+  **durable** run idles like any other and takes the downgrade only while its freeze is
+  unwinding, where the resumer must reach its trailing poll rather than re-park (#1584). The
+  oracle used to downgrade durable runs unconditionally — the other two tiers never did — and
+  that made an idle durable fiber scheduler spin: a spinning run never quiesces, so
+  freeze-on-quiesce could not fire, and the run burned its fuel instead of freezing. It never "blocks the domain"
   (§12 below) — the guest issues it only when it has nothing else to run (mechanism,
   not policy), and other vCPUs keep running; teardown/exit/trap free an idle resumer
   (the `svc_waiters` sweep on the oracle; the `KILL_RECHECK`/broadcast re-poll on the

@@ -5368,6 +5368,10 @@ struct Sched {
     /// and quiesces instead of the run hanging. One-shot (cleared on fire). Set at run setup from
     /// the window's arm-quiesce flag ([`ARM_QUIESCE_OFF`]).
     freeze_on_quiesce: bool,
+    /// #1584 — some vCPU of this run has finished by **unwinding for a freeze**. From then on the
+    /// freeze is in flight, and the worker loop brings every park the scheduler owns through it
+    /// ([`admit_parks_for_freeze`]) instead of reaping them as deadlocked.
+    froze: bool,
     /// §5 W3 / §23-D57 — the **trap-origin capture**: the backtrace, fiber and faulting address of
     /// the *first* vCPU to trap on its own op, run-shared and **first-wins**. A child trap propagates
     /// to its `thread.join`er as a bare `Err(Trap)` (the parent re-traps with *its* frames at the
@@ -6788,19 +6792,104 @@ use temen_ir::lanes::{bounded as lane_bounded, enter as lane_enter, leave as lan
 /// freeze. So the answer comes from the waiters ([`VCpu::wait_indefinite`]), not from the timer
 /// heap, which also carries stale entries for already-notified waiters.
 ///
-/// Conservative in two places, deliberately. A waiter the guest gave a **real** timeout will wake
-/// and make progress, so the run has not quiesced and the arm holds off — unchanged from before.
-/// And a futex-parked **fiber** blocks it: a fiber park is the freeze driver's own business
-/// (§13.4 step 2 purges it and the thaw re-issues), not something to re-admit from here. Both
-/// cases behaved this way before #1584 too, since either one put a timer in the heap.
+/// Conservative in one place, deliberately: a waiter the guest gave a **real** timeout will wake
+/// and make progress, so the run has not quiesced and the arm holds off.
+///
+/// A futex-parked **fiber** is asked the same question as a vCPU. It used to hold the arm off, on
+/// the grounds that a fiber park is the freeze driver's own business (§13.4 step 2 purges it and
+/// the thaw re-issues). That is true, and it is a statement about *re-admission* — which
+/// [`admit_parks_for_freeze`] honours by leaving fiber waiters where they are — not about whether
+/// the run has quiesced. An indefinite fiber park wakes on its own no more than a vCPU's does; the
+/// same transplanted reason was #1639's mistake in the deadlock predicate.
 fn quiesced_parks_only(s: &Sched) -> bool {
     if s.svc_waiters.is_empty() && s.wait_waiters.is_empty() {
         return false; // nothing parked that a freeze could re-admit
     }
     s.wait_waiters.values().flatten().all(|(_, w)| match w {
         Waiter::VCpu(v) => v.wait_indefinite,
-        Waiter::Fiber { .. } => false,
+        Waiter::Fiber {
+            wait_indefinite, ..
+        } => *wait_indefinite,
     })
+}
+
+/// #1584 — is a freeze already under way in this run? Either some vCPU has unwound for one
+/// ([`Sched::froze`]), or a parked vCPU carries the `UNWINDING` phase: under a freeze a futex wait
+/// still parks, so a child spawned into an in-flight freeze parks with the phase and nothing else
+/// would ever wake it.
+fn freeze_in_flight(s: &Sched) -> bool {
+    let unwinding = |v: &VCpu| v.dstate == STATE_UNWINDING;
+    s.froze
+        || s.svc_waiters.values().flatten().any(|v| unwinding(v))
+        || s.join_waiters.values().any(|v| unwinding(v))
+        || s.lane_waiters.iter().any(|v| unwinding(v))
+        || s.wait_waiters
+            .values()
+            .flatten()
+            .any(|(_, w)| matches!(w, Waiter::VCpu(v) if unwinding(v)))
+}
+
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait` and futex **vCPU**
+/// parks are re-admitted; a joiner or lane waiter is woken by something else, and a fiber park is
+/// its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left would spin
+/// the worker loop instead of falling through to the deadlock check.
+fn freeze_can_admit(s: &Sched) -> bool {
+    !s.svc_waiters.is_empty()
+        || s.wait_waiters
+            .values()
+            .flatten()
+            .any(|(_, w)| matches!(w, Waiter::VCpu(_)))
+}
+
+/// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
+/// in the worker loop (freeze-on-quiesce, or a freeze already in flight). A parked child must not
+/// veto its parent's freeze: INVARIANTS #3 has authority moving *down* the grant graph, and "the
+/// freeze succeeds unless the child cooperates" is a weaker contract than "a parent may freeze its
+/// children". A parked vCPU runs no ops and reaches no safepoint, so the scheduler must bring the
+/// freeze to it.
+///
+/// Every parked vCPU takes the phase. It is set in each vCPU's own durable phase, which the
+/// `dispatch` prologue swaps into the window before the vCPU runs (a direct window write would be
+/// clobbered by that swap); at root context it routes to the global freeze word. The ones nothing
+/// else can wake — `svc.wait` consumers and futex waiters — are also re-admitted, so their
+/// re-executed suspend point observes `UNWINDING` and unwinds. The transform instruments both as
+/// re-issue suspend points (`SuspendKind::MemoryWait` for `atomic.wait`), so a futex waiter gets the
+/// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
+/// before the guest can observe it, and the thaw re-issues the wait.
+///
+/// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
+/// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
+/// it would wake `NORMAL`, never observe the freeze at its own safepoint, and run to completion
+/// *through* the freeze its owner asked for. A futex-parked **fiber** stays where it is: its
+/// owner's `freeze_drive` purges and flattens it (§13.4 step 2), and the thaw re-issues its wait.
+fn admit_parks_for_freeze(s: &mut Sched) {
+    for (_, q) in std::mem::take(&mut s.svc_waiters) {
+        for mut v in q {
+            v.dstate = STATE_UNWINDING;
+            s.runnable.push_back(v);
+        }
+    }
+    for v in s.join_waiters.values_mut() {
+        v.dstate = STATE_UNWINDING;
+    }
+    for v in s.lane_waiters.iter_mut() {
+        v.dstate = STATE_UNWINDING;
+    }
+    for (key, q) in std::mem::take(&mut s.wait_waiters) {
+        for (tag, w) in q {
+            match w {
+                Waiter::VCpu(mut v) => {
+                    v.wait_indefinite = false;
+                    v.dstate = STATE_UNWINDING;
+                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                    s.runnable.push_back(v);
+                }
+                fiber @ Waiter::Fiber { .. } => {
+                    s.wait_waiters.entry(key).or_default().push((tag, fiber));
+                }
+            }
+        }
+    }
 }
 
 /// #1624 — is every remaining futex park **unsatisfiable**, so that the only thing still keeping the
@@ -6853,63 +6942,27 @@ fn worker_loop(sched: &Arc<Scheduler>) {
                 if s.shutdown {
                     break None;
                 }
-                // §13.4 slice 4c-bis: freeze-on-quiesce. Nothing is runnable; if the run is armed
-                // and every remaining vCPU is parked in a wait **the scheduler owns**, trigger the
-                // freeze now — promote each parked vCPU's durable phase to `UNWINDING` and
-                // re-admit it. Its re-executed suspend point takes the freeze arm and unwinds, so
-                // the freeze completes instead of the run hanging. One-shot (cleared on fire).
+                // §13.4 slice 4c-bis / #1584 — a freeze drains every park the scheduler owns.
+                // Nothing is runnable, and two triggers reach the same body because they are the
+                // same event seen from two sides:
                 //
-                // #1584 — this covers **every** such park, not just `svc.wait`. A parked child
-                // must not veto its parent's freeze: INVARIANTS #3 has authority moving *down* the
-                // grant graph, and "the freeze succeeds unless the child cooperates" is a weaker
-                // contract than "a parent may freeze its children". A vCPU parked in `atomic.wait`
-                // runs no ops, so it reaches no safepoint, so it used to veto by construction —
-                // and not even cleanly: the run stalled on the [`MAX_WAIT`] backstop and then
-                // returned a *timed-out* wait as a normal result, with a snapshot that was not a
-                // freeze point and nothing in the `Ok` to say so.
+                // - **freeze-on-quiesce** (armed, one-shot): every remaining vCPU is parked in a wait
+                //   the scheduler owns and nothing will wake on its own, so trigger the freeze now.
+                // - **a freeze already in flight**: some vCPU unwound for one — a countdown fired, or
+                //   the run started `UNWINDING` — while others sit parked. A parked vCPU runs no ops,
+                //   so it reaches no safepoint and never observes the freeze. Left alone it vetoed
+                //   the freeze from below: the deadlock check reaped it, so a freeze with a sibling
+                //   parked since before the trigger returned `Ok` with that sibling missing from the
+                //   cut (the thaw then faulted), and one whose child parked under `UNWINDING` faulted
+                //   outright. The JIT's futex park observes a freeze on its own recheck cadence; this
+                //   is the oracle's form of the same rule, reached through the one body.
                 //
-                // The transform already instruments `atomic.wait` as a re-issue suspend point
-                // (`SuspendKind::MemoryWait`), exactly as it does the serve op; only the scheduler
-                // never woke it. So this re-admits futex waiters with the same `WAIT_WOKEN` the
-                // JIT's own freeze arm delivers — the status is discarded by the safepoint that
-                // unwinds before the guest can observe it, and the thaw re-issues the wait.
-                if s.freeze_on_quiesce && s.svc_timers.is_empty() && quiesced_parks_only(&s) {
-                    s.freeze_on_quiesce = false;
-                    // Set each vCPU's own durable phase: the `dispatch` prologue swaps it into the
-                    // window before the vCPU runs (a direct window write would be clobbered by that
-                    // swap). At root context this routes to the global freeze word, so the
-                    // re-executed suspend point observes `UNWINDING`.
-                    let keys: Vec<usize> = s.svc_waiters.keys().copied().collect();
-                    for k in keys {
-                        for mut v in s.svc_waiters.remove(&k).into_iter().flatten() {
-                            v.dstate = STATE_UNWINDING;
-                            s.runnable.push_back(v);
-                        }
-                    }
-                    // A vCPU parked in `thread.join` (or queued for a D66 lane) *will* be woken
-                    // by something else — the child completing, a lane coming free — so it needs
-                    // no re-admission. It does need the phase: without it the joiner wakes with
-                    // `dstate` still `NORMAL`, never observes the freeze at its own safepoint, and
-                    // runs to completion *through* the freeze its owner asked for. A freeze is
-                    // run-wide, so every parked vCPU takes the phase; only the ones nothing else
-                    // can wake are also re-admitted.
-                    for v in s.join_waiters.values_mut() {
-                        v.dstate = STATE_UNWINDING;
-                    }
-                    for v in s.lane_waiters.iter_mut() {
-                        v.dstate = STATE_UNWINDING;
-                    }
-                    for (_, q) in std::mem::take(&mut s.wait_waiters) {
-                        for (_, w) in q {
-                            let Waiter::VCpu(mut v) = w else {
-                                unreachable!("quiesced_parks_only rejects a fiber futex waiter")
-                            };
-                            v.wait_indefinite = false;
-                            v.dstate = STATE_UNWINDING;
-                            v.pending = Some(Pending::Wait(WAIT_WOKEN));
-                            s.runnable.push_back(v);
-                        }
-                    }
+                // Checked ahead of the deadlock predicate below: a freeze is not a deadlock.
+                let quiesce_fires =
+                    s.freeze_on_quiesce && s.svc_timers.is_empty() && quiesced_parks_only(&s);
+                if quiesce_fires || (freeze_in_flight(&s) && freeze_can_admit(&s)) {
+                    s.freeze_on_quiesce = false; // one-shot, and this run is freezing either way
+                    admit_parks_for_freeze(&mut s);
                     continue;
                 }
                 // #1624: every futex park is indefinite and nothing else can wake the run, so the
@@ -7439,6 +7492,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 };
                 drop(v);
                 let mut s = sched.lock();
+                // #1584 — a freeze is now in flight: the worker loop drains the parks that will not
+                // otherwise observe it (see `freeze_in_flight`).
+                s.froze |= froze;
                 // (Never during a freeze unwind: servers are quiesced by freeze-on-quiesce, not run.)
                 if !froze {
                     for service in gone {
@@ -12029,10 +12085,13 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // FIBER_PARKED to the resumer. Rewind the resumer's `cont.resume.block` so
                     // the wake re-executes it (re-claims the now-woken fiber and switches in);
                     // park keyed on the fiber's domain (== the resumer's), the `OfferPark` shape.
-                    // Gated on the real M:N scheduler and a non-durable run (the explorer and
-                    // durable freeze take the advisory FIBER_PARKED downgrade below — the guest
-                    // loops). `slot: leaving` is the parked fiber, for the lost-wakeup recheck.
-                    if cont_block.contains(&leaving) && !durable {
+                    // Gated on the real M:N scheduler; the explorer, and a durable run whose
+                    // freeze is unwinding, take the advisory FIBER_PARKED downgrade below (the
+                    // guest loops) — see the resume site for why a durable run otherwise idles
+                    // (#1584). `slot: leaving` is the parked fiber, for the lost-wakeup recheck.
+                    let unwinding =
+                        mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                    if cont_block.contains(&leaving) && !(durable && unwinding) {
                         if let SchedRef::Real(_) = sched {
                             let key = host
                                 .lock_unpoisoned()
@@ -15073,19 +15132,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         // §3.6 slice 5a: still blocked — the cooperative poll. Report
                         // `(FIBER_PARKED, 0)` to the resumer without switching.
                         Claimed::StillParked => {
-                            // I48 blocking variant: on the REAL M:N scheduler and a non-durable
-                            // run, idle this vCPU on the fiber's own registered waiter instead of
-                            // returning FIBER_PARKED. Rewind the op so the wake re-executes it —
-                            // re-claiming the now-woken fiber and switching in (the `svc.wait`
-                            // rewind shape). Park keyed on this fiber's domain (== the resumer's
-                            // own domain): every fiber-wake `svc_wake`s that key, so the resumer
-                            // is re-admitted for free, teardown sweeps `svc_waiters` by identity,
-                            // and the idle deadline already includes the fiber's own timer. A
-                            // durable run or the deterministic explorer takes the advisory
-                            // downgrade below (return FIBER_PARKED) — a conforming result the
-                            // guest's loop absorbs, so freeze-on-quiesce and the §18 explorer need
-                            // no new machinery (ISSUES.md I48).
-                            if blocking && !durable {
+                            // I48 blocking variant: on the REAL M:N scheduler, idle this vCPU on
+                            // the fiber's own registered waiter instead of returning FIBER_PARKED.
+                            // Rewind the op so the wake re-executes it — re-claiming the now-woken
+                            // fiber and switching in (the `svc.wait` rewind shape). Park keyed on
+                            // this fiber's domain (== the resumer's own domain): every fiber-wake
+                            // `svc_wake`s that key, so the resumer is re-admitted for free,
+                            // teardown sweeps `svc_waiters` by identity, and the idle deadline
+                            // already includes the fiber's own timer. The deterministic explorer
+                            // takes the advisory downgrade below (return FIBER_PARKED, a conforming
+                            // result the guest's loop absorbs), and so does a durable run whose
+                            // freeze is unwinding: that resumer must reach its trailing poll, not
+                            // re-park.
+                            //
+                            // #1584 — a durable run used to take the downgrade unconditionally, so
+                            // an idle durable fiber scheduler **spun** on its parked fiber: it burned
+                            // a core, and it never quiesced, so freeze-on-quiesce could not fire and
+                            // the run ran out of fuel instead of freezing. Idling is what quiesces
+                            // it; `admit_parks_for_freeze` re-admits the parked resumer.
+                            let unwinding =
+                                mem.as_ref().map(|m| m.durable_state()) == Some(STATE_UNWINDING);
+                            if blocking && !(durable && unwinding) {
                                 if let SchedRef::Real(_) = sched {
                                     let key = host.lock_unpoisoned().domain_id() as usize;
                                     frames[top].inst -= 1; // rewind: the wake re-executes this op
