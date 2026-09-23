@@ -112,32 +112,35 @@ fn single_step_advances_exactly_one_op_and_ticks_the_clock() {
     let m = parse_module(LOOP_SUM).expect("parse");
     let mut insp = Inspector::attach(&m, 0, &[Value::I32(2)], 1_000_000);
 
-    // block0 has a single instruction (`v1 = i32.const 0`); the `br` is the block *terminator*,
-    // not an `insts` op, so it isn't a hookable step point. Stepping one op therefore runs the
-    // const and the branch, landing before block1's first op. The clock counts non-terminator ops.
+    // block0 has a single instruction (`v1 = i32.const 0`) and then its `br` terminator. A terminator
+    // is a step point too (#1713): the first step runs the const and stops *on* the branch, at
+    // `inst == insts.len()`; the second takes the branch and stops before block1's first op. The clock
+    // counts every stop position, one per step.
     let before = insp.clock();
-    match insp.step() {
-        Stop::Break {
-            reason: StopReason::Step,
-            pc,
-        } => {
-            assert_eq!(
+    for (i, want) in [(0, 1), (1, 0)].into_iter().enumerate() {
+        match insp.step() {
+            Stop::Break {
+                reason: StopReason::Step,
                 pc,
-                IrPc {
-                    module: 0,
-                    func: 0,
-                    block: 1,
-                    inst: 0
-                }
-            );
+            } => {
+                assert_eq!(
+                    pc,
+                    IrPc {
+                        module: 0,
+                        func: 0,
+                        block: want.0,
+                        inst: want.1
+                    }
+                );
+            }
+            other => panic!("expected step stop, got {other:?}"),
         }
-        other => panic!("expected step stop, got {other:?}"),
+        assert_eq!(
+            insp.clock(),
+            before + i as u64 + 1,
+            "exactly one op executed per step"
+        );
     }
-    assert_eq!(
-        insp.clock(),
-        before + 1,
-        "exactly one (non-terminator) op executed"
-    );
     // In block1 the frame's values are its params v2 (counter) and v3 (accumulator) = N, 0.
     assert_eq!(insp.read_ir_value(0, 1), Some(Value::I32(0)));
 

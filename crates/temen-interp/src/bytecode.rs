@@ -678,10 +678,11 @@ enum Op {
 }
 
 /// Marks a [`Program::src`] entry as a **terminator** op's location (OR-ed into the `inst` field).
-/// Two readers need terminators distinguished from instructions: [`Vm::cur_ir_pc`] (debug stepping)
-/// skips them, while [`vm_trap_bt`] (trap backtrace) *reports* them — a trap at a terminator
-/// (`unreachable`, `return_call.dyn`) is real and the tree-walker names it. The flag is the high
-/// bit, never set by a real block/inst count, so masking it off recovers the stored index.
+/// [`vm_trap_bt`] needs terminators distinguished from instructions: a trap at an instruction is
+/// reported one past it (the tree-walker's cursor advance), a trap at a terminator (`unreachable`,
+/// `return_call.dyn`) at the terminator itself. [`Vm::cur_ir_pc`] just masks the flag off — a
+/// terminator is a stop position like any instruction (#1713). The flag is the high bit, never set
+/// by a real block/inst count, so masking it off recovers the stored index.
 pub const SRC_TERM: u32 = 1 << 31;
 
 struct Program {
@@ -691,10 +692,9 @@ struct Program {
     /// to its `(block, inst)`; a **terminator** op maps to `(block, insts.len() | `[`SRC_TERM`]`)` —
     /// the `insts.len()` is the `inst` the tree-walker's `Vec<Frame>` carries for a terminator (it sits
     /// one past the block's last instruction). The tree-walker's debug seam (`run_inner`'s `before_op`)
-    /// stops only at **instructions**, never terminators, so [`Vm::cur_ir_pc`] reports `None` for a
-    /// [`SRC_TERM`] entry — keeping the engine's step/breakpoint location trace identical to the
-    /// tree-walker's [`crate::IrPc`] sequence op-for-op — while [`vm_trap_bt`] still resolves it for a
-    /// trap-time backtrace.
+    /// fires before every instruction **and** before the terminator (#1713), and [`Vm::cur_ir_pc`]
+    /// reports both, keeping the engine's step/breakpoint location trace identical to the
+    /// tree-walker's [`crate::IrPc`] sequence op-for-op.
     src: Box<[Option<(u32, u32)>]>,
 }
 
@@ -1587,8 +1587,8 @@ fn compile_func(
     // Debug reverse map (Slice 1c-3), built **incrementally** alongside `ops` (was a positional
     // post-pass) so fusion — which drops an op — keeps `src` and `ops` in lockstep: each op push is
     // paired with exactly one `src` push. Instruction ops map to their `(block, inst)`; the
-    // terminator op maps to `(block, insts.len() | SRC_TERM)` (flagged so `cur_ir_pc` skips it while
-    // `vm_trap_bt` can name a terminator-trap site). A fused `BrIfCmp` takes the terminator location
+    // terminator op maps to `(block, insts.len() | SRC_TERM)` (flagged so `vm_trap_bt` can tell a
+    // terminator-trap site from an instruction's). A fused `BrIfCmp` takes the terminator location
     // (it can never trap), and the fused-away `IntCmp`'s entry is dropped — the fused program is
     // never single-stepped (debug/trace compile unfused), so no source location is lost there.
     let mut src: Vec<Option<(u32, u32)>> = Vec::new();
@@ -2454,8 +2454,7 @@ pub fn compile_and_run_with_host_traced(
 /// the trapping op for *both*, so to report identical `IrPc`s we add `1` to the innermost frame's
 /// `inst` unless the trap is `OutOfFuel`. Every suspended caller in `stack` already resumes at
 /// `call_pc + 1` (the tree-walker likewise advances a caller's `inst` past the call before
-/// descending), so its call op sits at `resume_pc - 1` and we report `inst + 1` for it. `None`-`src`
-/// ops (terminators) are skipped, matching [`Program::src`] / [`Vm::cur_ir_pc`].
+/// descending), so its call op sits at `resume_pc - 1` and we report `inst + 1` for it.
 fn vm_trap_bt(vm: &Vm, source: &ModuleSource, trap: &Trap) -> Vec<super::IrPc> {
     let mut bt = Vec::new();
     let Some(c) = source.get(vm.module) else {
@@ -5301,8 +5300,8 @@ pub type WindowTrace = (Vec<(super::IrPc, Vec<u8>)>, Result<Vec<Value>, Trap>);
 pub type ValueTrace = (Vec<(super::IrPc, Vec<Value>)>, Result<Vec<Value>, Trap>);
 
 /// Debug seam (Slice 1c-3): single-step `m`'s `func(args)` and record the [`crate::IrPc`] of each
-/// **instruction** executed (terminators are skipped, matching the tree-walker's `before_op`, which
-/// only stops at instructions), returning the location trace plus the result. `None` if the module is
+/// op executed — instructions and terminators alike (#1713), matching the tree-walker's `before_op` —
+/// returning the location trace plus the result. `None` if the module is
 /// outside the engine's subset, or if a step hits a concurrency/coroutine seam (debug is single-vCPU,
 /// seam-free — DEBUGGING.md S4). Stepping uses `budget = 1` so each `resume` runs exactly one op.
 ///
@@ -5967,7 +5966,7 @@ enum FiberStep {
     Other(Outcome),
     /// #1366 — the op punted to a host-completed cap: the debug run parks on completion `id`
     /// (result slot `dst`); `at` is the call's own pc (captured before the op advanced), the stop
-    /// location the backend reports — the post-call position may be a terminator with no pc.
+    /// location the backend reports — the call, not whatever op follows it.
     CapParked {
         id: u64,
         dst: u32,
@@ -5991,7 +5990,7 @@ fn debug_advance_fiber(
     host: &mut Host,
 ) -> FiberStep {
     // #1366: the op's own pc, before it advances — a host-completed park reports it as the stop
-    // location (the position after a call may be a terminator, which has no pc).
+    // location (the call, not whatever op follows it).
     let at = vt.debug_active().cur_ir_pc(source);
     // Step-into a §14 coroutine body: while a coroutine child is the
     // its **own** confined `mem`/`host`/`table`, the op-by-op counterpart of `resume_coro`. Surfacing
@@ -6199,6 +6198,10 @@ struct FrameReader<'a> {
     /// the active continuation is module 0 (the parent or a same-module coroutine), where the module-0
     /// fields above apply. See [`FrameReader::md_for`].
     coro_debug: Option<&'a ModuleDebug>,
+    /// The thread has returned. Its `Vm` still rests on the final `return` op — a stop position
+    /// since #1713 — so without this a finished run would report that `return` as a live frame. (A
+    /// thread that *trapped* keeps its frames: they are where it crashed.)
+    finished: bool,
 }
 
 /// A resolved write destination (slice 8): a typed absolute regs slot (a promoted SSA scalar) or
@@ -6299,6 +6302,7 @@ fn apply_due_writes(
                             fn_block_base,
                             fn_block_types,
                             coro_debug: None,
+                            finished: matches!(t.state, DbgTaskState::Done(Ok(_))),
                         }
                         .write_target(*frame, name);
                         apply_target(target, *value, *width, &mut t.vt.active.regs, mem);
@@ -6341,6 +6345,9 @@ impl<'a> FrameReader<'a> {
     /// stack or when the top is paused on a non-instruction.
     fn frame_at(&self, depth: usize) -> Option<(usize, usize, usize, usize, usize)> {
         if depth == 0 {
+            if self.finished {
+                return None;
+            }
             let pc = self.vm.cur_ir_pc(self.source)?;
             return Some((self.vm.module, self.vm.cur, pc.block, pc.inst, self.vm.base));
         }
@@ -8366,8 +8373,7 @@ impl ScheduledDebugRun {
                                     _ => None,
                                 })
                             {
-                                // The stop location is the call itself (the position after it may
-                                // be a terminator), falling back to the live pc.
+                                // The stop location is the call itself, falling back to the live pc.
                                 let pc =
                                     at.or_else(|| tasks[p].vt.debug_active().cur_ir_pc(source));
                                 if let Some(pc) = pc {
@@ -9001,6 +9007,7 @@ impl ScheduledDebugRun {
             // spawn); a same-module one leaves it `None` (its frames are module 0, read against the fields
             // above).
             coro_debug: None,
+            finished: matches!(self.tasks[self.focus].state, DbgTaskState::Done(Ok(_))),
         }
     }
 
@@ -16035,14 +16042,12 @@ impl Vm {
     fn cur_ir_pc(&self, source: &ModuleSource) -> Option<super::IrPc> {
         let cm = source.get(self.module)?;
         let (block, inst) = cm.progs[self.cur].src.get(self.pc).copied().flatten()?;
-        if inst & SRC_TERM != 0 {
-            return None; // terminator — non-steppable (see `Program::src`)
-        }
+        // A terminator is a stop position too (#1713), at `inst == insts.len()` — see `Program::src`.
         Some(super::IrPc {
             module: self.module as u32,
             func: self.cur as FuncIdx,
             block: block as usize,
-            inst: inst as usize,
+            inst: (inst & !SRC_TERM) as usize,
         })
     }
 

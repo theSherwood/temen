@@ -642,7 +642,7 @@ impl DebugCtx {
     fn before_op(
         &mut self,
         pc: IrPc,
-        inst: &Inst,
+        inst: Option<&Inst>,
         accesses: [MemAccess; 2],
         frame_vals: &[Reg],
         depth: usize,
@@ -679,7 +679,7 @@ impl DebugCtx {
                     addr: 0,
                     write: true,
                 })
-            } else if let Some(r) = sh.cap_stop(inst) {
+            } else if let Some(r) = inst.and_then(|i| sh.cap_stop(i)) {
                 Some(r)
             } else if self.step_target == Some(self.clock) {
                 Some(StopReason::Step)
@@ -12591,7 +12591,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     [MemAccess::None; 2]
                 };
                 if let Some(reason) =
-                    dbg.before_op(pc, inst, accesses, &frames[top].vals, frames.len())
+                    dbg.before_op(pc, Some(inst), accesses, &frames[top].vals, frames.len())
                 {
                     return Ok(Inner::Pause(reason, pc));
                 }
@@ -16382,6 +16382,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
         }
 
+        // The debug seam for the terminator (#1713): it is a stop position at `inst == insts.len()`,
+        // so a line whose only code is a `return x;` or a loop condition's branch can hold a
+        // breakpoint and a step lands on it. It touches no memory, so there are no accesses to watch.
+        if let Some(dbg) = debug.as_mut() {
+            let pc = IrPc {
+                module: frames[top].module,
+                func: frames[top].func,
+                block: frames[top].block,
+                inst: frames[top].inst,
+            };
+            let accesses = [MemAccess::None; 2];
+            if let Some(reason) = dbg.before_op(pc, None, accesses, &frames[top].vals, frames.len())
+            {
+                return Ok(Inner::Pause(reason, pc));
+            }
+        }
         // Fuel unification: the terminator no longer charges fuel unconditionally. A *back-edge* branch
         // (target block <= current) charges in its arm below; tail calls charge as function entries;
         // forward branches and `return` are free (bounded straight-line control flow). `kill` stays

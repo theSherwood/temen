@@ -2143,9 +2143,9 @@ iteration variable) and on each write. The emitter records every `set_curval` (b
 entry block's param/zero-init bindings, and writes) as a `(func, slot, block, inst, value)` and
 emits the list; memory locals still emit `win`. So you debug the **actually-optimized** code — the
 value-location-list tier of the W6/§19 trade — and the interpreter resolves a var to the right SSA
-value at each pc. (Honest optimized-debug consequence: a variable assigned by a block's *last* op
-is only live at the following step point, since the interpreter breaks before an op, not at the
-terminator.) Tests (`c_frontend.rs`): named locals read by C name at a breakpoint (now via
+value at each pc. (A variable assigned by a block's *last* op is live at the following step point,
+which since #1713 is that block's terminator: both engines stop before a terminator as they do
+before an instruction, so a `return x;` or loop-condition line is a stop position.) Tests (`c_frontend.rs`): named locals read by C name at a breakpoint (now via
 `ssalist`), source-line mapping, structured types, and a **loop accumulator** whose `(i, acc)` read
 correctly across iterations — chibicc debugging promoted code end-to-end.
 

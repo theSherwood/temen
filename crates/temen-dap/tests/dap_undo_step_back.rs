@@ -160,7 +160,9 @@ fn a_bounded_journal_hands_the_far_targets_back_to_replay() {
     for _ in 0..3000 {
         b.step();
     }
-    const BACK: usize = 900; // far enough to walk off the end of what a 512-byte budget retains
+    // Far enough to walk off the end of what a 512-byte budget retains: an iteration is 9 steps
+    // (seven instructions and two branches, #1713), so 1500 steps reach ~166 stores back, past ~128.
+    const BACK: usize = 1500;
     let mut seen = Vec::new();
     for _ in 0..BACK {
         b.step_back();
