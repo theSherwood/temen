@@ -6102,10 +6102,17 @@ impl Scheduler {
             },
             None => None,
         };
-        // The twin's TaskId — read (not yet committed) so the fork factories learn the pid the
-        // parent's `fork()` will return (#863 slice 2: a personality registers the new process in
-        // its table at birth). Stable under `s` (the scheduler lock is held throughout); committed
-        // below only once the fork succeeds, so a failed fork burns no id.
+        // The twin's TaskId — read before the powerbox duplicate so the fork factories learn the
+        // pid the parent's `fork()` will return (#863 slice 2: a personality registers the new
+        // process in its table at birth). Stable under `s` (the scheduler lock is held throughout).
+        //
+        // #1648 — a `fork_powerbox` refusal **burns** the id, because by then a factory may have
+        // registered a process under it. Reusing it would hand the next attempt that ghost: the
+        // #1644 memo answers a repeat ask for a pid with the process it just minted, which on a
+        // retry would suppress the very door claim the refusal exists to detect — the check would
+        // pass on the second try and the twin would silently share its parent's door, which is
+        // #1635 again. Refusals *before* the duplicate (a non-bare shape, an unforkable window)
+        // registered nothing, so burning there only skips a number.
         // #799 — a twin's TaskId IS its personality pid (#863's one pid space), so the mint skips
         // the personality's reserved band: `0` (the `kill(0)` self-raise convention) and `1` (the
         // root process — a ROOT-domain fork's first twin would otherwise overwrite the root's own
@@ -6124,6 +6131,7 @@ impl Scheduler {
                 Some(h) => Arc::new(Mutex::new(h)),
                 None => {
                     drop(hg);
+                    s.next_task = twin_id + 1; // #1648 — burn it; a factory may have used it
                     put_back_none!();
                 }
             }
@@ -18574,6 +18582,15 @@ pub struct ForkedProc {
     /// A signal door over the **new process's own** signal state, installed on the new domain's
     /// `Host` ([`Host::set_signal_source`]). `None` = the twin shares its parent's source (the
     /// pre-split behavior, right for providers whose state is fully shared).
+    ///
+    /// #1648 — **at most one provider per powerbox may claim it.** This is a *domain*-scoped
+    /// resource offered by an *entry*-scoped factory: a `Host` has one `sig_source`, and it is what
+    /// [`Scheduler::wire_signal_doors`] installs the domain's wake / stop / kill / park-request
+    /// closures on. Two claimants used to mean the loop's winner took the door and the loser's
+    /// handlers fired one that wrote into nobody's cell — #1635 one level up. A second claim now
+    /// fails the fork closed (`-EAGAIN`, like every other unforkable powerbox) and latches, so a
+    /// powerbox in that state refuses without running the factories again. Two personalities in one
+    /// powerbox is a construction error to fix, not a runtime condition to survive.
     pub signal: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)>,
     /// The **replacement fork factory** for the new domain: a self-replicating personality forks
     /// the *new* process's state next time, not the original's (fork-of-fork clones the twin's fd
@@ -19781,6 +19798,20 @@ pub struct Host {
     /// handler when `sig_armed` fires. `None` ⇒ no async signals (poll-only, the default). Installed via
     /// [`Host::set_signal_source`]; the source holds the *same* `sig_armed` `Arc`, so its arming is visible.
     sig_source: Option<Arc<dyn SignalSource + Send + Sync>>,
+    /// #1648 — **two providers claimed this domain's signal door**, latched at the fork that found
+    /// out. A domain has ONE [`Self::sig_source`], but [`Self::fork_powerbox`] learns which
+    /// provider supplies the twin's door only by *calling* each entry's fork factory — so the
+    /// first fork of an ambiguous powerbox mints before it can refuse. The latch makes every later
+    /// fork refuse **before** the factories run, so exactly one attempt ever reaches them.
+    ///
+    /// Interior-mutable because `fork_powerbox` takes `&self` (it runs under the caller's host
+    /// guard). Never cleared: the ambiguity is a host-construction error, not a transient.
+    ///
+    /// This catches **two personalities**. One personality spread over several entries is the
+    /// other half, and it is the provider's to answer — temen-posix re-offers the twin it just
+    /// minted and declines the extras (#1644), so only one door ever reaches here and such a
+    /// powerbox forks normally.
+    multi_door: AtomicBool,
     /// #863 hygiene — exit hooks the fork factories supplied ([`ForkedProc::exit`]): fired with the
     /// task's raw exit status when this host's **fork-twin** task completes, so each personality
     /// retires the process from its own table. Empty for every non-forked host.
@@ -20349,6 +20380,7 @@ impl Host {
             completions: Arc::new(Completions::new()),
             completion_notify: None,
             sig_armed: Arc::new(AtomicBool::new(false)),
+            multi_door: AtomicBool::new(false),
             sig_source: None,
             exit_hooks: Vec::new(),
             exec_remap_hooks: Vec::new(),
@@ -20451,7 +20483,10 @@ impl Host {
             && self.frozen_nested.is_empty()
             && self.frozen_detached.is_empty()
             && self.frozen_child_state.is_empty();
-        if !simple {
+        // #1648 — a powerbox whose providers disagree about who owns the domain's signal door was
+        // refused once already; refuse now, before any factory runs, so exactly one attempt ever
+        // reaches them (see [`Host::multi_door`]).
+        if !simple || self.multi_door.load(Ordering::SeqCst) {
             return None;
         }
         let mut twin = Host::new(); // fresh `domain_id`
@@ -20522,41 +20557,53 @@ impl Host {
         // resolve. #863: the minted [`ForkedProc`] may carry a per-process signal door (installed on
         // the twin below, overriding the shared-source fallback) and a replacement factory (so
         // fork-of-fork forks the *twin's* state); either absent keeps the pre-split shared behavior.
+        //
+        // #1648 — **at most one provider may claim the door.** A domain has one `sig_source`, and
+        // it is what `Scheduler::wire_signal_doors` installs the wake/stop/kill/park-request
+        // closures on; a second claimant used to just overwrite the first, leaving that
+        // personality's handlers firing a door that writes into nobody's cell. That is #1635 one
+        // level up — the failure that took a long chase to find from the symptom — so it fails
+        // closed (invariant 9) rather than picking a winner by iteration order. A `for` loop, not
+        // `map`/`collect`, so the second claim can bail before minting the rest.
         let mut twin_sig: Option<(Arc<dyn SignalSource + Send + Sync>, Arc<AtomicBool>)> = None;
         let mut twin_exit: Vec<Arc<dyn Fn(i64) + Send + Sync>> = Vec::new();
         let mut twin_exec_remap: Vec<ExecRemapHook> = Vec::new();
-        twin.host_procs = self
-            .host_procs
-            .iter()
-            .map(|e| {
-                let factory = e.fork.as_ref().unwrap();
-                let forked = factory(twin_pid);
-                if forked.signal.is_some() {
-                    twin_sig = forked.signal;
+        twin.host_procs = Vec::with_capacity(self.host_procs.len());
+        for e in self.host_procs.iter() {
+            let factory = e.fork.as_ref().unwrap();
+            let forked = factory(twin_pid);
+            if let Some(door) = forked.signal {
+                if twin_sig.is_some() {
+                    // Latch it: this powerbox cannot be forked faithfully, and every later attempt
+                    // now refuses before any factory runs (see [`Host::multi_door`]). The caller
+                    // sees the same probeable `-EAGAIN` every other unforkable powerbox gives.
+                    self.multi_door.store(true, Ordering::SeqCst);
+                    return None;
                 }
-                if let Some(x) = forked.exit {
-                    twin_exit.push(x);
-                }
-                if let Some(x) = forked.exec_remap {
-                    twin_exec_remap.push(x);
-                }
-                HostProcEntry {
-                    handler: ProcHandler::Sync(forked.handler),
-                    fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
-                    mints: e.mints,
-                    // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
-                    // command and have its manifest bind against the twin's own personality.
-                    vtable: e.vtable.clone(),
-                    // #1455 — the state serializer does NOT ride the fork: the twin's handler is a
-                    // fresh closure the provider's factory minted over whatever state it chose to
-                    // give the twin, so the parent's serializer (closed over the *parent's* state)
-                    // would capture the wrong domain's. A forked twin that wants to be freezable
-                    // re-registers one.
-                    state: None,
-                    restore: None,
-                }
-            })
-            .collect();
+                twin_sig = Some(door);
+            }
+            if let Some(x) = forked.exit {
+                twin_exit.push(x);
+            }
+            if let Some(x) = forked.exec_remap {
+                twin_exec_remap.push(x);
+            }
+            twin.host_procs.push(HostProcEntry {
+                handler: ProcHandler::Sync(forked.handler),
+                fork: Some(forked.refork.unwrap_or_else(|| Arc::clone(factory))),
+                mints: e.mints,
+                // #801 — the vtable rides the fork: a twin can exec a `__px_`-linked
+                // command and have its manifest bind against the twin's own personality.
+                vtable: e.vtable.clone(),
+                // #1455 — the state serializer does NOT ride the fork: the twin's handler is a
+                // fresh closure the provider's factory minted over whatever state it chose to
+                // give the twin, so the parent's serializer (closed over the *parent's* state)
+                // would capture the wrong domain's. A forked twin that wants to be freezable
+                // re-registers one.
+                state: None,
+                restore: None,
+            });
+        }
         // FORK.md §8.6 — module grants ride along (their `funcs`/`data`/`module` are `Arc`s, so the
         // copy is cheap): a shell that holds command modules must be able to fork *and* have each twin
         // still resolve/`execve` them (the twin's copied handle table carries the `Binding::Module`
@@ -31711,5 +31758,103 @@ mod park_event_encoding_tests {
             ParkEvent::decode(EXEC_SELF_TAG | 0x8000_0000),
             Some(ParkEvent::TaskExit(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod signal_door_claim_tests {
+    //! #1648 — a domain has ONE signal source, and [`Scheduler::wire_signal_doors`] installs its
+    //! wake / stop / kill / park-request closures on it. [`Host::fork_powerbox`] learns which
+    //! provider supplies the twin's door only by calling each entry's fork factory, and it used to
+    //! keep whichever came last — so a second personality in one powerbox silently left the first
+    //! one's handlers firing a door that wrote into nobody's cell. That is #1635 one level up.
+    use super::*;
+
+    /// A fork factory that counts its calls and optionally claims the domain's signal door.
+    fn factory(claims_door: bool, calls: &Arc<AtomicUsize>) -> HostProcFork {
+        let calls = Arc::clone(calls);
+        Arc::new(move |_pid| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ForkedProc {
+                handler: Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
+                signal: claims_door.then(|| {
+                    let door: Arc<dyn SignalSource + Send + Sync> = Arc::new(NoSignals);
+                    (door, Arc::new(AtomicBool::new(false)))
+                }),
+                refork: None,
+                exit: None,
+                exec_remap: None,
+            }
+        })
+    }
+
+    /// A door that answers nothing — the claim is what matters here, not the policy.
+    struct NoSignals;
+    impl SignalSource for NoSignals {
+        fn take_deliverable(&self) -> Option<(i32, i32, u64)> {
+            None
+        }
+    }
+
+    fn host_with(doors: &[bool], calls: &Arc<AtomicUsize>) -> Host {
+        let mut h = Host::new();
+        for &d in doors {
+            h.grant_host_proc_forkable(
+                Box::new(|_op, _args, _mem, _reg| Ok(vec![0])),
+                factory(d, calls),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn one_claimant_forks_and_the_twin_gets_that_door() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Three entries, one personality: the shape #1645 leaves behind plus two plain host caps.
+        let h = host_with(&[false, true, false], &calls);
+        let twin = h.fork_powerbox(7).expect("one claimant forks");
+        assert!(
+            twin.sig_source.is_some(),
+            "the twin takes the single claimed door"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "every entry was minted");
+    }
+
+    #[test]
+    fn no_claimant_forks_and_the_twin_shares_its_parents_source() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = host_with(&[false, false], &calls);
+        let twin = h.fork_powerbox(7).expect("no claimant forks");
+        assert!(
+            twin.sig_source.is_none(),
+            "no door claimed: the twin falls back to sharing the parent's (none installed here)"
+        );
+    }
+
+    /// The fix. Two claimants must refuse rather than pick a winner by iteration order, and the
+    /// refusal must **latch** — the first attempt has already minted, so every later one has to
+    /// refuse before the factories run or it would keep making processes nobody reaps.
+    #[test]
+    fn two_claimants_refuse_the_fork_and_latch() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let h = host_with(&[true, true, false], &calls);
+        assert!(
+            h.fork_powerbox(7).is_none(),
+            "two providers claiming the domain's door must fail the fork closed"
+        );
+        let first = calls.load(Ordering::SeqCst);
+        assert_eq!(
+            first, 2,
+            "it bails on the second claim — the third entry is never minted"
+        );
+        assert!(
+            h.fork_powerbox(8).is_none(),
+            "the refusal is permanent: the powerbox cannot be forked faithfully"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            first,
+            "and it is latched: no factory runs again, so no further processes are minted"
+        );
     }
 }
