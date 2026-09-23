@@ -461,8 +461,15 @@ self.onmessage = async (e) => {
       continue;
     }
     if (evc === JOIN) {
-      const cslot = handles[Number(ex.temen_par_ev_a(v))];
+      // The oracle's `resolve_thread` rule (#773, #1728): a negative handle traps; any other is masked
+      // to the table's power-of-two span; a spent or never-issued slot traps.
+      const a = Number(ex.temen_par_ev_a(v));
+      let span = 1;
+      while (span < handles.length) span <<= 1;
+      const h = a < 0 ? -1 : a & (span - 1);
+      const cslot = handles[h];
       if (cslot === undefined) { ex.temen_par_deliver_join(v, 0n, 1); continue; } // bad handle → trap, never wait(0)
+      handles[h] = undefined; // the join spends the handle
       Atomics.wait(i32(), cslot >> 2, 0); // block until the child sets its done flag
       const trapped = Atomics.load(i32(), cslot >> 2) === 2;
       ex.temen_par_deliver_join(v, i64()[(cslot + 8) >> 3], trapped ? 1 : 0);

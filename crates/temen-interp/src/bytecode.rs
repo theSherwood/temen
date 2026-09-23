@@ -15033,12 +15033,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 vt.active.set(dst, Reg::from_i32(handle));
             }
             Ok(VcpuStop::Join { handle, dst }) => {
-                let slot = match super::resolve_thread(&threads, handle) {
-                    Ok(s) => s,
+                // Single join: the handle is now spent.
+                let id = match super::take_child(&mut threads, handle) {
+                    Ok(id) => id,
                     Err(t) => return (Err(t), mem),
                 };
-                let id = threads[slot].expect("resolve_thread checked liveness");
-                threads[slot] = None; // single join — the handle is now spent
                 match reg.join(id) {
                     // A joined child's first result value lands in the joiner's `dst`.
                     Ok(vals) => {
