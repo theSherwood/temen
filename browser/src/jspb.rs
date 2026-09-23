@@ -146,13 +146,18 @@ pub extern "C" fn temen_jspb_run(mod_ptr: *const u8, mod_len: usize) -> i64 {
     let mut host = Host::new();
     // One handle per registered name: the closure carries its slot, so the guest reaches the right
     // JS function purely by which handle it dispatches through (object-capability, not by name).
+    // Forkable (#1718): the JS function's state lives on the page, so a §14 child or `fork()` twin
+    // the capability is re-granted to calls the same function through a fresh closure over the slot.
     let handles: Vec<i32> = caps
         .iter()
         .enumerate()
         .map(|(slot, name)| {
-            let handle = host.grant_host_proc(Box::new(move |op, args, mem, _| {
-                Ok(vec![dispatch(slot as u32, op, args, mem)])
-            }));
+            let mint = move || -> temen_interp::HostProc {
+                Box::new(move |op, args, mem, _| Ok(vec![dispatch(slot as u32, op, args, mem)]))
+            };
+            let fork: temen_interp::HostProcFork =
+                std::sync::Arc::new(move |_pid| temen_interp::ForkedProc::shared(mint()));
+            let handle = host.grant_host_proc_forkable(mint(), fork);
             // §7 F7/F9: the name is also the label, so a guest can `self.resolve` / `self.label` it.
             host.register_cap_name(name, handle);
             handle

@@ -1513,7 +1513,7 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     let mut thost = Host::new();
     thost.set_named_cap_registrar(Box::new(move |name, state| {
         log.lock().unwrap().push((name.to_string(), state.to_vec()));
-        Some(Box::new(|_op, _args, _mem, _| Ok(vec![99])))
+        Some((Box::new(|_op, _args, _mem, _| Ok(vec![99])), None))
     }));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `fs`");
 
@@ -1580,7 +1580,12 @@ fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
         (name == "vm_fs")
             .then(|| temen_fs::MemFsHandle::from_state(state).ok())
             .flatten()
-            .map(|fs| temen_fs::vm_fs_handler(&fs))
+            .map(|fs| {
+                (
+                    temen_fs::vm_fs_handler(&fs),
+                    Some(temen_fs::vm_fs_fork(&fs)),
+                )
+            })
     }));
     restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `vm_fs`");
 

@@ -3271,6 +3271,36 @@ impl OnrampCaps {
         }
     }
 
+    /// `name`'s **fork factory** (#1718): a §14 child the capability is re-granted to, or a `fork()`
+    /// twin, gets a fresh [`handler`](Self::handler) over **these** cells — one framebuffer, one pair
+    /// of input queues, one served file, whichever domain draws on or reads from them. Shared, not
+    /// copied: a reactor has one screen and one keyboard. `Host::can_regrant` admits a host proc only
+    /// if it carries one, so without it no card could hand a child the screen.
+    fn fork(&self, name: &str) -> temen_interp::HostProcFork {
+        let (caps, name) = (self.clone(), name.to_string());
+        std::sync::Arc::new(move |_pid| {
+            // `grant` and `registrar` build a factory only for a name `handler` served, over cells
+            // that never change which names they serve — so the fallback is never reached. It traps
+            // rather than answers if it ever is.
+            temen_interp::ForkedProc::shared(
+                caps.handler(&name)
+                    .unwrap_or_else(|| Box::new(|_op, _args, _mem, _| Err(Trap::CapFault))),
+            )
+        })
+    }
+
+    /// The thaw's **registrar** over these cells: re-grant a named capability the artifact carries —
+    /// its handler, re-seeded from the captured state, and its fork factory, so a thawed capability is
+    /// exactly as re-grantable as a fresh one — or refuse a name this powerbox does not serve.
+    fn registrar(&self) -> temen_interp::NamedCapRegistrar {
+        let caps = self.clone();
+        Box::new(move |name, state| {
+            let handler = caps.handler(name)?;
+            caps.set_state(name, state); // re-seed before the guest can call it
+            Some((handler, Some(caps.fork(name))))
+        })
+    }
+
     /// `name`'s guest-observable state, as the provider that owns it chooses to serialize it — see
     /// the note above [`encode_events`] for what each capability declares and why `display` declares
     /// nothing. The one definition; [`declare_state`](Self::declare_state) registers it with the host
@@ -3351,7 +3381,7 @@ impl OnrampCaps {
     /// Grant `name` onto `host` — handler, canonical name, and state hooks — returning its handle.
     /// `None` for a name this powerbox does not serve (an `fs` with no file, say).
     fn grant(&self, host: &mut Host, name: &str) -> Option<i32> {
-        let handle = host.grant_host_proc(self.handler(name)?);
+        let handle = host.grant_host_proc_forkable(self.handler(name)?, self.fork(name));
         host.register_cap_name(name, handle);
         self.declare_state(host, name, handle);
         Some(handle)
@@ -5902,12 +5932,7 @@ impl OnrampReactor {
         // had dropped before the freeze is absent from the artifact and stays dropped.
         let mut host = Host::new();
         let caps = grant_onramp_caps(&mut host, m, fs);
-        let registrar = caps.clone();
-        host.set_named_cap_registrar(Box::new(move |name, state| {
-            let handler = registrar.handler(name)?;
-            registrar.set_state(name, state); // re-seed before the guest can call it
-            Some(handler)
-        }));
+        host.set_named_cap_registrar(caps.registrar());
 
         let (layout, _reserved) = temen_snapshot::restore_layout(artifact, m, &mut host)
             .map_err(|_| STATUS_UNSUPPORTED)?;
@@ -6332,12 +6357,7 @@ impl JitOnrampReactor {
             // A save-state instead of a boot (#1458): the artifact's image is already post-`_start`, so
             // the entry is **not** run — which is most of the point, Doom's WAD parse being seconds.
             JitStart::Thaw(artifact) => {
-                let registrar = caps.clone();
-                host.set_named_cap_registrar(Box::new(move |name, state| {
-                    let handler = registrar.handler(name)?;
-                    registrar.set_state(name, state); // re-seed before the guest can call it
-                    Some(handler)
-                }));
+                host.set_named_cap_registrar(caps.registrar());
                 // Bound to `m` — the module the guest was *frozen* over — not the outlined copy this
                 // tier runs. Outlining rewrites the module, so binding the digest to it would make an
                 // artifact un-thawable for a reason that has nothing to do with the guest.

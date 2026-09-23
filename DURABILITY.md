@@ -1145,6 +1145,10 @@ Two halves make it honest:
   fresh run (INVARIANTS #3). No registrar, or a name it does not serve, fails the restore closed with
   `RestoreError::NamedCapRefused(name)` — before any handle is pinned. A forged `Named { idx }` naming
   an absent entry is rejected at the same boundary as a forged JIT index.
+  *"What it would have granted a fresh run" includes forkability (#1718):* the registrar returns the
+  capability's fork factory beside its handler, and the rebuilt entry keeps it, so a thawed
+  capability can be re-granted into a §14 child exactly when a fresh one can. Before, the rebuild
+  dropped every factory, and a thawed domain lost the ability to hand a child what it held.
 
 *The **checkpoint ladder** now admits them too (2026-09-15, the #1455 ladder half).*
 `Host::checkpoint_safe` required `host_procs.is_empty()`, so debug-tier time travel self-disabled for

@@ -278,9 +278,10 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
         // Re-seed the fresh handler from the captured state — this is the provider reading back
         // exactly the bytes it wrote at freeze.
         let answer = state.first().copied().unwrap_or(0) as i64;
-        Some(Box::new(move |_op: u32, _args: &[i64], _mem, _| {
-            Ok(vec![answer])
-        }))
+        Some((
+            Box::new(move |_op: u32, _args: &[i64], _mem, _| Ok(vec![answer])),
+            None,
+        ))
     }));
     b.restore_durable_named(&named)
         .expect("the registrar serves `fs`");
@@ -297,6 +298,48 @@ fn a_registrar_re_grants_named_caps_and_the_handles_still_dispatch() {
         Ok(vec![42]),
         "the re-granted capability answers on the pinned handle"
     );
+}
+
+/// #1718 — a thaw never narrows a capability to un-forkable. A registrar that hands back a fork
+/// factory with the handler restores a capability a §14 child can be granted, exactly as a fresh
+/// forkable grant is; one that hands back none restores one the child grant refuses, exactly as a
+/// fresh factory-less grant is. (`restore_durable_named` used to drop the factory unconditionally.)
+#[test]
+fn a_restored_named_cap_is_as_forkable_as_its_registrar_says() {
+    fn answer() -> temen_interp::HostProc {
+        Box::new(|_op, _args, _mem, _| Ok(vec![7]))
+    }
+    fn factory() -> temen_interp::HostProcFork {
+        std::sync::Arc::new(|_pid| temen_interp::ForkedProc::shared(answer()))
+    }
+    let mut a = Host::new();
+    let h = a.grant_host_proc_forkable(answer(), factory());
+    a.register_cap_name("display", h);
+    let handles = a.capture_durable_handles().expect("named ⇒ durable");
+    let named = a.capture_durable_named();
+
+    for forkable in [true, false] {
+        let mut b = Host::new();
+        b.set_named_cap_registrar(Box::new(move |_name, _state| {
+            Some((answer(), forkable.then(factory)))
+        }));
+        b.restore_durable_named(&named)
+            .expect("the registrar serves it");
+        b.restore_durable_handles(&handles);
+        let child = b.spawn_granted_child(h, 1 << 16);
+        assert_eq!(
+            child.is_some(),
+            forkable,
+            "a restored capability re-grants into a child iff the registrar returned a factory"
+        );
+        if let Some((mut ch, _inst, _as, granted)) = child {
+            assert_eq!(
+                ch.cap_dispatch_slots(cap_id::HOST_PROC, 0, granted, &[], None),
+                Ok(vec![7]),
+                "the child's copy reaches a handler the factory minted"
+            );
+        }
+    }
 }
 
 /// **The authority seam.** An artifact names a capability; it never carries one. A restoring host
@@ -320,8 +363,10 @@ fn a_restore_refuses_a_name_the_embedder_does_not_serve() {
     // A registrar that serves a *different* name refuses this one rather than substituting.
     let mut picky = Host::new();
     picky.set_named_cap_registrar(Box::new(|name, _state| {
-        (name == "display")
-            .then(|| -> temen_interp::HostProc { Box::new(|_op, _args, _mem, _| Ok(vec![0])) })
+        (name == "display").then(|| {
+            let h: temen_interp::HostProc = Box::new(|_op, _args, _mem, _| Ok(vec![0]));
+            (h, None)
+        })
     }));
     assert_eq!(picky.restore_durable_named(&named).unwrap_err().name, "fs");
 }

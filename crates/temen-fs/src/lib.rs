@@ -1088,16 +1088,27 @@ pub fn mem_fs_shared_factory(
 /// chibicc `__vm_fs` builtin's `call.sym "vm_fs"`, one flat call with the fs op in `args[0]` and its
 /// arguments after. Seeded from `seed` when given (a launch's fs-image), else empty. Registers the
 /// name and declares the store's state, so every rebuild, rewind and freeze carries the files the
-/// guest wrote. The one definition the browser Run path and the debug on-ramp both grant.
+/// guest wrote. Granted forkable ([`vm_fs_fork`]), so the guest can re-grant it to a §14 child. The
+/// one definition the browser Run path and the debug on-ramp both grant.
 pub fn grant_vm_fs(host: &mut temen_interp::Host, seed: Option<&FsSeed>) -> i32 {
     let fs = match seed {
         Some((files, dirs)) => MemFsHandle::seeded(files, dirs),
         None => MemFsHandle::new(false),
     };
-    let h = host.grant_host_proc(vm_fs_handler(&fs));
+    let h = host.grant_host_proc_forkable(vm_fs_handler(&fs), vm_fs_fork(&fs));
     host.register_cap_name("vm_fs", h);
     fs.declare_state(host, h);
     h
+}
+
+/// #1718 — the `vm_fs` seam's **fork factory** over `fs`: a §14 child the capability is re-granted
+/// to, or a `fork()` twin, gets a handler over the **same** store — the shared-store posture
+/// [`mem_fs_shared_factory`] gives a phase and the children it spawns. What [`grant_vm_fs`] grants
+/// the handle with, and what a thaw's registrar hands back beside [`vm_fs_handler`], so a thawed
+/// `vm_fs` is exactly as re-grantable as a fresh one.
+pub fn vm_fs_fork(fs: &MemFsHandle) -> temen_interp::HostProcFork {
+    let fs = fs.clone();
+    Arc::new(move |_pid| temen_interp::ForkedProc::shared(vm_fs_handler(&fs)))
 }
 
 /// The `vm_fs` seam's handler over `fs`: the fs op in `args[0]`, its arguments after. What
