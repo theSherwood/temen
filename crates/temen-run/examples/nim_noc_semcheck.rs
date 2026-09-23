@@ -8,39 +8,35 @@
 //! nim_noc_semcheck <nimsem.temen> <nifler2.temen> <libdir> <sys.p.nif> <sys-stem> <out.s.nif>
 //! ```
 //!
-//! **The shell-out, cranked from outside.** `nimsem m` resolves its import graph by shelling out to
-//! nifler for every dependency without a current `.p.nif` (`deps.nim`'s `execNifler` →
-//! `os.execShellCmd` → `fork` + `execve("/bin/sh", ["-c", cmd])` + `waitpid`). The LLVM route serves
-//! that from inside the guest: `nifler_shim.c` defines `system()` and drives the `exec` capability. A
-//! no-C phase has no C shim, so it takes the real fork/exec path — and `temen-posix` exposes no
-//! `execve` op and has no `/bin/sh` in its command registry (#1609 has the table of what exists).
+//! **The shell-out.** `nimsem m` resolves its import graph by shelling out to nifler for every
+//! dependency without a current `.p.nif` (`deps.nim`'s `execNifler` → `os.execShellCmd` → `fork` +
+//! `execve("/bin/sh", ["-c", cmd])` + `waitpid`). There are two ways to serve it:
 //!
-//! So this driver does what the shell would, one level out: run nimsem; when it quits with
-//! `FAILURE: nifler … parse <src> <out>`, run nifler2 over the same memfs with exactly those
-//! arguments; run nimsem again. The guest names the file it wants, so nothing here guesses a path or
-//! a cache stem. It converges because each round makes one more dependency current, and it refuses
-//! to spin: a command it has already served, served again, is a hang, not progress.
+//! * **`--sh <sh.ir>`, the real path.** Registers a shell at `/bin/sh` and nifler2 at the spellings
+//!   nimsem uses, and nimsem runs its own fork/exec/wait sequence. The shell must be the **POSIX
+//!   build** of `demos/shell` — the one that runs a command as a process of the same personality,
+//!   inheriting its fds, rather than as a §14 child with a grant list (#1662):
 //!
-//! Be precise about what this shows and what it does not. Every phase that runs is a Temen module
-//! compiled with no C compiler, doing the real work — that is the point. But the *driver* sequences
-//! the phases; nimsem is not spawning nifler itself.
+//!   ```text
+//!   cat demos/shell/{shim,ring,shell_main}.c > sh.c
+//!   chibicc -cc1 --emit-ir --child-entry -DTEMEN_SHELL_POSIX -cc1-input sh.c -cc1-output sh.ir sh.c
+//!   ```
 //!
-//! **`--sh <sh.ir>` is the real path, and it is one blocker short** (#1609). Passing a
-//! chibicc-built shell registers it at `/bin/sh`, registers nifler2 at the spellings nimsem uses,
-//! and drops the hand-crank — nimsem then takes its own fork/exec/wait sequence. Four of the five
-//! things that needed were built and work: `OP_EXECVE` and `OP_WAIT4` exist, `execShellCmd`'s
-//! whole leaf set is retained as real imports rather than fail-closed stubs, those imports are
-//! bound to the personality, and this run installs the signal/caller-request door `fork` rides.
+//!   `sh -c "bin/nifler …"` is one simple command, so the shell execs nifler in place: nimsem's
+//!   shell-out is one fork and two image-replaces, and nimsem reaps nifler's own status.
 //!
-//! The exec path itself now works: #1621 (the `call.import` arm dropped the caller request, so
-//! `fork` answered `-ENOSYS`) is fixed, and so is the argv replacement behind it. Run this with a
-//! three-line probe registered in place of the shell and nimsem forks, `execve`s, the image is
-//! replaced, and the probe runs on the shared personality reading its `argc`/`argv`.
+//!   **One blocker short: #1668.** Everything up to the last step runs — nimsem forks, the twin
+//!   execs `/bin/sh`, the shell parses `-c` and execs `bin/nifler` — and that exec is refused
+//!   (`bin/nifler: cannot execute (errno 22)`): exec admits only the chibicc child-entry shape, and
+//!   nimony's decorated import names bind only through temen-run's root linker. Until then, `--sh`
+//!   fails at that line and the hand-crank below is the working path.
 //!
-//! What is left is **#1628**: `demos/shell` has only ever been compiled as a *root* module
-//! (`c_to_ir`, never `--child-entry`), and does not start as a command — it never reaches `main`.
-//! That is about the demo, not the VM. Until it is sorted `--sh` fails and the hand-crank below
-//! remains the working path.
+//! * **Without `--sh`, a hand-crank.** Run nimsem; when it quits with `FAILURE: nifler … parse <src>
+//!   <out>`, run nifler2 over the same memfs with exactly those arguments; run nimsem again. The
+//!   guest names the file it wants, so nothing here guesses a path or a cache stem. It converges
+//!   because each round makes one more dependency current, and it refuses to spin: a command it has
+//!   already served, served again, is a hang, not progress. Every phase is still a no-C Temen
+//!   module doing the real work — but the driver sequences them; nimsem is not spawning nifler.
 //!
 //! **A live cross-check on the cache-stem port.** `temen_run::nim_module_suffix` reimplements
 //! nimony's `moduleSuffix`. Every request the guest makes is a chance to check it against the real
@@ -146,14 +142,6 @@ fn dump_cache(posix: &temen_posix::Posix, out_p: &str) {
 fn command_module(path: &str, what: &str) -> temen_ir::Module {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let m = temen_text::parse_module(&text).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
-    // #1609 — **link the shim's own names** before registering the shell as a command. chibicc
-    // emits `call.sym "__spawn"` / `"__as_region"` / … for the §14 surface, and nothing binds those
-    // at run time: `default_cap_resolver` does not know them (by design — they are this demo's
-    // spellings, bound through §7 late binding), so an unlinked slot stays empty and an empty slot
-    // is a `CapFault` at first use, not a fall-through to the handle operand. A shell without this
-    // starts, reads its argv, and dies silently the moment it spawns something non-builtin — which
-    // is exactly how `sh -c "bin/nifler …"` reaped as a bare 128.
-    let m = temen_run::link_shell_demo(&m).unwrap_or_else(|e| panic!("link {path}: {e:?}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {path}: {e:?}"));
     eprintln!(
         "{what}: {} funcs, window 2^{}",
@@ -210,8 +198,11 @@ fn semcheck(
             dump_cache(posix, out_p);
             panic!(
                 "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
-                 failed: {outcome:?}\nA shell that never reaches `main` is #1628; try a \
-                 three-line probe command in its place to tell that apart from an exec fault."
+                 failed: {outcome:?}\nThe shell reports a failed exec on stdout (`<cmd>: not \
+                 found` / `cannot execute (errno N)`), shown above; `bin/nifler: cannot execute \
+                 (errno 22)` is #1668. Nothing there usually means /bin/sh is not the \
+                 -DTEMEN_SHELL_POSIX build: the default build's manifest does not bind under a \
+                 POSIX personality, so its own exec is refused."
             );
         }
         // A dependency that is parsed but not yet **semchecked**: `vfs: open failed:

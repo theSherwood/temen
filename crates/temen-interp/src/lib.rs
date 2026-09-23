@@ -20399,25 +20399,6 @@ impl Default for Host {
 /// through the same call as a separate-module child's (#1234).
 pub const SELF_MODULE: i32 = -1;
 
-/// How far [`Host::bind_manifest`]'s step-3 withhold bends for a given kind of child (§3.3).
-///
-/// The three callers differ in *whose* manifest they are reading, and that is the whole reason the
-/// answers differ — see each `bind_*_manifest` for the argument.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lenience {
-    /// A separate-module child spawn: an unmet `required` slot fails the spawn closed.
-    Strict,
-    /// An `execve` image-replace: a name **no provider has** is left empty (it may not be a
-    /// capability request at all), but a name a provider *does* have and cannot satisfy — a
-    /// coverage or signature mismatch — still refuses. Shape drift stays a bind-time error
-    /// (#1524), which is what keeps `execve` returning `-EINVAL` instead of becoming a command it
-    /// cannot run and trapping inside it.
-    UnknownOnly,
-    /// A same-module child: its manifest is the *parent's* whole import surface, which it never
-    /// declared, so any unmet slot is left empty.
-    All,
-}
-
 impl Host {
     pub fn new() -> Host {
         Host {
@@ -20823,15 +20804,15 @@ impl Host {
     ///    import index; callers surface `-EINVAL` before any child code runs).
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
-    /// lockstep). [`Host::bind_same_module_manifest`] and [`Host::bind_exec_manifest`] are the
-    /// same walk with step 3 softened — see each for why a child running the parent's own program,
-    /// and an image replacing its caller, may not refuse over an unmet `required` slot.
+    /// lockstep), and by `execve`'s image-replace ([`Host::exec_carry`]) — see there for why an exec
+    /// binds this strictly. [`Host::bind_same_module_manifest`] is the same walk with step 3
+    /// softened, for a child running the parent's own program.
     pub fn bind_child_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, Lenience::Strict)
+        self.bind_manifest(imports, tsec, false)
     }
 
     /// #1234 — [`Host::bind_child_manifest`] for a §14 **same-module** child: the identical walk,
@@ -20850,46 +20831,14 @@ impl Host {
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, Lenience::All)
-    }
-
-    /// #1628 — [`Host::bind_child_manifest`] for an **`execve` image-replace**, which takes the
-    /// softened step 3 for a different reason than a same-module child does.
-    ///
-    /// An exec'd image is not spawned into confinement — it **becomes its caller**, in the same
-    /// process: same window, same fds, same pid, same personality ([`Host::exec_carry`] moves all
-    /// of it across). §3.3's "a separate module's manifest is that child's own honest declaration
-    /// of need, so withhold" describes a *spawn*, and reading it onto exec had a concrete cost:
-    /// **a program that runs fine at top level could not be exec'd.**
-    ///
-    /// `demos/shell` is the case. Its pipeline runner calls `__spawn`/`__join`/`__as_region`/
-    /// `__rg_*` — which are **not** name-resolved capabilities. They are `call.sym`s carrying the
-    /// handle the shell discovered by reflection, and an unbound name falls through to dispatching
-    /// on that operand. The shell runs as a root program with its whole name registry empty and
-    /// every one of those calls working. The strict walk refused the exec at `__as_region` before
-    /// a single instruction ran, over names that were never asking the runtime for anything.
-    ///
-    /// **Authority is unchanged**, which is what makes this safe rather than a loosening:
-    ///
-    /// - An empty slot `CapFault`s on use, exactly as for a same-module child.
-    /// - The handle fallback cannot invent authority — the guest dispatches on a handle it already
-    ///   holds, and it holds only what it was granted.
-    ///
-    /// So an exec'd shell that was given no `Instantiator` faults the moment it tries to run a
-    /// pipeline, and runs `sh -c "<one command>"` fine. That is the right answer to both.
-    pub fn bind_exec_manifest(
-        &mut self,
-        imports: &[temen_ir::Import],
-        tsec: &[temen_ir::TypeEntry],
-    ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, Lenience::UnknownOnly)
+        self.bind_manifest(imports, tsec, true)
     }
 
     fn bind_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
-        lenient: Lenience,
+        lenient: bool,
     ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
@@ -20977,24 +20926,11 @@ impl Host {
         let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
-            // Whether an unmet slot may be left empty rather than refusing the spawn. A
-            // `rebindable` one always may (it is declared empty-able). Beyond that the two
-            // questions are different, and #1628 is why they are now asked separately:
-            //
-            // `soft_shape` — a provider **has this name** and still could not satisfy it, i.e. a
-            // coverage or signature mismatch. Only a same-module child forgives that; for an
-            // `execve` it stays a refusal, so shape drift is a bind-time `-EINVAL` (#1524) rather
-            // than an image that replaces its caller and then traps on its first call.
-            //
-            // `soft_absent` — **nothing anywhere** has the name. For an exec that is not
-            // necessarily a capability request: a `call.sym` carries its own handle operand, and
-            // an unbound name falls through to dispatching on it (which is how `demos/shell`'s
-            // `__spawn`/`__as_region` work as a root program, with the name registry empty).
-            //
-            // The *entry* still records the declared mode either way, so a lenient-empty
-            // `required` slot stays un-attachable.
-            let soft_shape = rebindable || lenient == Lenience::All;
-            let soft_absent = rebindable || lenient != Lenience::Strict;
+            // Whether an unmet slot may be left empty rather than refusing the spawn: a
+            // `rebindable` one always may (it is declared empty-able), and every one may for a
+            // same-module child (see `bind_same_module_manifest`). The *entry* still records the
+            // declared mode, so a lenient-empty `required` slot stays un-attachable.
+            let soft = rebindable || lenient;
             let unmet = || {
                 if rebindable {
                     BoundImport::rebindable(0, 0, None)
@@ -21023,7 +20959,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft_shape => {
+                        None if soft => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -21054,7 +20990,7 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
-                        None if soft_shape => {
+                        None if soft => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -21079,7 +21015,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft_shape => {
+                        None if soft => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -21124,7 +21060,7 @@ impl Host {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
                 }
-                None if soft_absent => {
+                None if soft => {
                     bindings.push(unmet());
                     remaps.push(None);
                 }
@@ -25668,6 +25604,29 @@ impl Host {
     ) -> Result<Vec<(i32, i32)>, ()> {
         // The command serves its OWN offers / resolves `cap.self` against its module.
         child.self_module = Some(Arc::clone(cmodule));
+        // #1662 — the process's **module grants** survive exec at the SAME handle numbers, exactly
+        // as they survive fork (`fork_powerbox` clones the table and `modules`). A personality
+        // records what a process may `execve` by handle number, in state every process shares
+        // (`temen_posix`'s executable registry); re-granting under fresh numbers would leave each of
+        // those entries dangling, so an exec'd image — a shell — could never exec anything, and did
+        // not: `sh -c "bin/nifler …"` resolved `bin/nifler` to a number that named nothing and was
+        // refused `-EINVAL`. Done first, before this carry's own grants take free slots.
+        //
+        // No widening: the new image is the same process, holding the modules it held an instant
+        // ago. A slot the fresh powerbox already filled (its own Instantiator/AddressSpace) cannot
+        // keep its number; that grant stays behind, and an exec of it later fails closed.
+        let base = child.modules.len() as u32;
+        child.modules.extend(self.modules.iter().cloned());
+        for (i, st) in self.table.iter().enumerate() {
+            if let Some(Binding::Module(m)) = st.entry {
+                if child.table[i].entry.is_none() {
+                    child.table[i] = Slot {
+                        entry: Some(Binding::Module(m + base)),
+                        ..*st
+                    };
+                }
+            }
+        }
         // The task-lifecycle wiring: exit hooks (a personality fork twin's retire-to-Zombie — without
         // it an exec'd twin's exit never retires and a blocking `waitpid` hangs) and the signal
         // source + armed flag (the twin stays kill/stop-addressable after exec — the doors reach the
@@ -25716,7 +25675,15 @@ impl Host {
                 remap.push((old_h, nh));
             }
         }
-        match child.bind_exec_manifest(imports, types) {
+        // The new image's manifest binds **strictly** — the same walk as a §14 child, so an import
+        // nothing can satisfy refuses the exec and the caller gets `-EINVAL` back while it still
+        // exists to report it (#1662). #1628 bound it leniently instead, reasoning that an
+        // unbindable `call.sym` "falls through to dispatching on its handle operand". It does not:
+        // an unbound slot `CapFault`s on first use, and the `call.sym` arm ignores the operand. So
+        // leniency only moved the failure past the point of no return — the caller was already
+        // gone, and a trapping twin reaps as a bare 128. The case it was written for, the demo
+        // shell, needed the POSIX build, not a softer bind.
+        match child.bind_child_manifest(imports, types) {
             Ok(()) => {
                 for hook in self.exec_remap_hooks.iter() {
                     hook(&remap);
