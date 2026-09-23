@@ -7397,10 +7397,14 @@ fn dbg_instantiate_module(
     quota: i64,
     dst: u32,
 ) -> Result<(), Trap> {
-    // Resolve + clone the granted module from the powerbox (mirrors production: the module handle is
-    // resolved against the shared host). A forged/closed/wrong-type handle is an inert CapFault.
+    // Resolve + clone the granted module from the spawning task's own powerbox (#1727). A
+    // forged/closed/wrong-type handle is an inert CapFault.
+    let owner = match tasks[ti].env {
+        None => host,
+        Some(k) => &extra_envs[k].host,
+    };
     let (cfuncs, cmem_log2, cdata, ctypes, cshadow) = {
-        let g = host.resolve_module(mh)?;
+        let g = owner.resolve_module(mh)?;
         (
             g.funcs.clone(),
             g.memory_log2,
@@ -7541,16 +7545,16 @@ fn dbg_instantiate_detached(
     premap: Option<(i32, u64)>,
     dst: u32,
 ) -> Result<(), Trap> {
-    let pm: Option<&Mem> = match tasks[ti].env {
-        None => shared_mem.as_ref(),
-        Some(k) => extra_envs[k].mem.as_ref(),
-    };
-    let pfuel = match tasks[ti].env {
-        None => shared_fuel,
-        Some(k) => extra_envs[k].fuel,
+    // The parent's window and fuel, and the powerbox its handles resolve in: its own (#1727).
+    let (pm, owner, pfuel) = match tasks[ti].env {
+        None => (shared_mem.as_ref(), host, shared_fuel),
+        Some(k) => {
+            let e = &mut extra_envs[k];
+            (e.mem.as_ref(), &mut e.host, e.fuel)
+        }
     };
     let Some(child) = admit_detached_child(
-        host, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
+        owner, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
     )?
     else {
         tasks[ti]
@@ -11323,6 +11327,17 @@ struct ChildEnv {
     fuel: u64,
 }
 
+/// #1727 — the powerbox a task's own handles live in: its §14 [`ChildEnv`]'s, or the domain's for the
+/// root and its `thread.spawn` siblings. Every handle a spawn names (the module, the by-name grants,
+/// the `Budget`) resolves here. Resolving them in the root's table instead let a nested child spawn
+/// with authority only the root held.
+fn task_host<'a>(host: &'a mut Host, envs: &'a [ChildEnv], env: Option<usize>) -> HostCell<'a> {
+    match env {
+        None => HostCell::Excl(host),
+        Some(k) => HostCell::Shared(&envs[k].host),
+    }
+}
+
 /// A scheduled vCPU and its blocking state.
 struct TaskSlot {
     vt: VTask,
@@ -13093,8 +13108,9 @@ impl CoopSched {
                     // those two; op 11 (`grants` is `Some((ptr, n))`) additionally re-grants a by-name cap
                     // list read from the parent window, so a spawned stage resolves an inherited region
                     // (a ring end) by name — the concurrent-pipeline spawn. The named build fails closed
-                    // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm; grants resolve
-                    // against the root `host`, so a confined child's forged handle fails `can_regrant`).
+                    // via the shared, fuzzed `spawn_named_child` (mirrors the op-13 arm). Grants and the
+                    // budget resolve in the spawning task's own powerbox (#1727).
+                    let mut owner = task_host(host, extra_envs, tasks[ti].env);
                     let (mut child_host, cinst, cas) = if let Some((grants_ptr, grants_n)) = grants
                     {
                         // Parse `grants_n × 16-byte {name_off:u32, name_len:u32, handle:i32, flags:u32}`
@@ -13127,7 +13143,7 @@ impl CoopSched {
                                 continue;
                             }
                         };
-                        match host.spawn_named_child(&list, child_size) {
+                        match owner.with(|h| h.spawn_named_child(&list, child_size)) {
                             Some(triple) => triple,
                             None => {
                                 complete(tasks, ti, Err(Trap::CapFault));
@@ -13143,10 +13159,7 @@ impl CoopSched {
                     // §3.6: a same-module child serves over the shared program — its serve machinery
                     // (enqueue admission, handler resolution) and any `child_offer` shape read the
                     // domain's registered module, exactly the tree-walker's `self_module` handoff.
-                    child_host.self_module = match tasks[ti].env {
-                        None => host.self_module.clone(),
-                        Some(k) => extra_envs[k].host.lock_unpoisoned().self_module.clone(),
-                    };
+                    child_host.self_module = owner.with(|h| h.self_module.clone());
                     // #1234: and its import manifest is ours too — bind the *parent's* manifest
                     // against the child's attenuated powerbox, the same binder + `CHILD_BINDABLE`
                     // policy the op-13 separate-module arm uses below (and the tree-walker's op-0
@@ -13177,10 +13190,10 @@ impl CoopSched {
                     // #989 slice 1b — peek the budget's `channel` cap BEFORE `take_spawn_budget`
                     // drains it, so a funded spawn can stamp the child's host-served channel ceiling.
                     let chan_cap = (budget != 0)
-                        .then(|| host.peek_budget(budget).map(|b| b.channel))
+                        .then(|| owner.with(|h| h.peek_budget(budget).map(|b| b.channel)))
                         .flatten();
                     let child_fuel = if budget != 0 {
-                        match take_spawn_budget(host, budget, child_size, pfuel) {
+                        match owner.with(|h| take_spawn_budget(h, budget, child_size, pfuel)) {
                             Err(t) => {
                                 complete(tasks, ti, Err(t));
                                 continue;
@@ -13272,9 +13285,12 @@ impl CoopSched {
                         None => *fuel,
                         Some(k) => extra_envs[k].fuel,
                     };
-                    let child = match admit_detached_child(
-                        host, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
-                    ) {
+                    let admitted = task_host(host, extra_envs, tasks[ti].env).with(|h| {
+                        admit_detached_child(
+                            h, pm, pfuel, budget, mh, entry, size_log2, quota, grants, args, premap,
+                        )
+                    });
+                    let child = match admitted {
                         Ok(Some(c)) => c,
                         Ok(None) => {
                             tasks[ti]
@@ -13341,14 +13357,22 @@ impl CoopSched {
                     grants,
                     budget,
                 }) => {
-                    // Resolve the granted Module (a forged/closed/wrong-type handle is an inert CapFault).
-                    let (cfuncs, cmem_log2, cdata, cmodule) = match host.resolve_module(mh) {
-                        Ok(g) => (
-                            g.funcs.clone(),
-                            g.memory_log2,
-                            g.data.clone(),
-                            std::sync::Arc::clone(&g.module),
-                        ),
+                    // Resolve the granted Module in the spawning task's own powerbox (#1727; a
+                    // forged/closed/wrong-type handle is an inert CapFault). Its grants and budget below
+                    // resolve there too.
+                    let mut owner = task_host(host, extra_envs, tasks[ti].env);
+                    let resolved = owner.with(|h| {
+                        h.resolve_module(mh).map(|g| {
+                            (
+                                g.funcs.clone(),
+                                g.memory_log2,
+                                g.data.clone(),
+                                std::sync::Arc::clone(&g.module),
+                            )
+                        })
+                    });
+                    let (cfuncs, cmem_log2, cdata, cmodule) = match resolved {
+                        Ok(r) => r,
                         Err(t) => {
                             complete(tasks, ti, Err(t));
                             continue;
@@ -13448,23 +13472,24 @@ impl CoopSched {
                         None => mem.as_ref(),
                         Some(k) => extra_envs[k].mem.as_ref(),
                     };
-                    let (mut child_host, cinst, cas) =
-                        match named_child_host(host, pm, grants, child_size, &cmodule) {
-                            Ok(Some(triple)) => triple,
-                            // A `required` import slot with nothing to bind: probeable `-EINVAL`, as
-                            // the tree-walker answers, never a trap.
-                            Ok(None) => {
-                                tasks[ti]
-                                    .vt
-                                    .active
-                                    .set(dst, Reg::from_i32(super::EINVAL as i32));
-                                continue;
-                            }
-                            Err(t) => {
-                                complete(tasks, ti, Err(t));
-                                continue;
-                            }
-                        };
+                    let (mut child_host, cinst, cas) = match owner
+                        .with(|h| named_child_host(h, pm, grants, child_size, &cmodule))
+                    {
+                        Ok(Some(triple)) => triple,
+                        // A `required` import slot with nothing to bind: probeable `-EINVAL`, as
+                        // the tree-walker answers, never a trap.
+                        Ok(None) => {
+                            tasks[ti]
+                                .vt
+                                .active
+                                .set(dst, Reg::from_i32(super::EINVAL as i32));
+                            continue;
+                        }
+                        Err(t) => {
+                            complete(tasks, ti, Err(t));
+                            continue;
+                        }
+                    };
                     let child_args = if want_as {
                         vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
                     } else {
@@ -13474,10 +13499,10 @@ impl CoopSched {
                     // other refusal (module resolve, geometry, grants, manifest binding).
                     // #989 slice 1b — peek the channel cap before `take_spawn_budget` drains it.
                     let chan_cap = (budget != 0)
-                        .then(|| host.peek_budget(budget).map(|b| b.channel))
+                        .then(|| owner.with(|h| h.peek_budget(budget).map(|b| b.channel)))
                         .flatten();
                     let child_fuel = if budget != 0 {
-                        match take_spawn_budget(host, budget, child_size, pfuel) {
+                        match owner.with(|h| take_spawn_budget(h, budget, child_size, pfuel)) {
                             Err(t) => {
                                 complete(tasks, ti, Err(t));
                                 continue;
