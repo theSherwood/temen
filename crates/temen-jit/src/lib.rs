@@ -1243,13 +1243,14 @@ pub fn compile_and_run_with_host_interruptible_fast(
 }
 
 /// Like [`compile_and_run_with_host`], but **arm safepoint-anchored counted fuel** (INTERP_PERF.md
-/// "Fuel unification"): the lowering decrements `*fuel` by one at every function entry and taken
-/// back-edge, and traps [`TrapKind::OutOfFuel`] when the budget would go below zero. Unlike the §5
-/// kill-path ([`compile_and_run_with_host_interruptible`], a host-written cell polled asynchronously),
-/// this is a deterministic **guest budget**: `fuel` counts exactly (function entries + taken
-/// back-edges), the same unit the tree-walker and bytecode engines now charge, so a run either
-/// completes or traps `OutOfFuel` at the same safepoint on all three backends. The caller owns the
-/// `u64` cell, seeds it with the budget, and reads the remainder back after the call.
+/// "Fuel unification"): the lowering decrements `*fuel` by one at every function entry, taken
+/// back-edge and `cont.resume`, and traps [`TrapKind::OutOfFuel`] when the budget would go below zero.
+/// Unlike the §5 kill-path ([`compile_and_run_with_host_interruptible`], a host-written cell polled
+/// asynchronously), this is a deterministic **guest budget**: `fuel` counts exactly the function
+/// entries, taken back-edges and resumes executed — the unit the tree-walker and bytecode engines
+/// charge — so a run either completes or traps `OutOfFuel` at the same safepoint on all three
+/// backends. The caller owns the `u64` cell, seeds it with the budget, and reads the remainder back
+/// after the call.
 ///
 /// # Safety
 /// `fuel` must point at a live, writable `u64` that outlives the call (its address is baked into the compiled
@@ -1426,7 +1427,8 @@ pub fn compile_and_run_capture_reserved_with_host_ex(
 /// [`compile_and_run_capture_reserved_with_host`] with a **counted-fuel budget armed** (INTERP_PERF.md
 /// "Fuel unification"): the caller owns the `u64` cell, seeds it with the budget, and reads the
 /// remainder back after the call; the run traps [`TrapKind::OutOfFuel`] when the budget would
-/// underflow, at the same IR safepoints (function entries + taken back-edges) the interpreters charge.
+/// underflow, at the same IR safepoints (function entries + taken back-edges + `cont.resume`) the
+/// interpreters charge.
 /// This lets the differential fuzzer **assert** cross-engine `OutOfFuel` parity rather than exclude it.
 ///
 /// # Safety
@@ -2849,10 +2851,10 @@ impl CompiledModule {
         // owns it (e.g. an `Arc<AtomicU64>` a watchdog thread sets), so the baked address stays valid.
         let epoch_addr = interrupt.map_or(0, |p| p as i64);
         // Fuel unification: the address of the host-owned counted-fuel cell the lowering decrements at
-        // safepoints (function entries + taken back-edges). `0` ⇒ no fuel armed (no fuel checks
-        // emitted — guest code byte-identical). The caller owns the `u64` cell (it must outlive the
-        // module, since its address is baked into the code) and reads the remaining budget back after
-        // the run.
+        // safepoints (function entries + taken back-edges + `cont.resume`). `0` ⇒ no fuel armed (no
+        // fuel checks emitted — guest code byte-identical). The caller owns the `u64` cell (it must
+        // outlive the module, since its address is baked into the code) and reads the remaining budget
+        // back after the run.
         let fuel_addr = fuel.map_or(0, |p| p as i64);
         // #932 — the async-signal delivery arm baked into `emit_signal_check` at safepoints. `null`
         // (no checks emitted) unless the caller supplied a `SignalArm`. Its three addresses (the
@@ -6215,11 +6217,12 @@ struct Lower<'a> {
     /// Address of the host-owned **counted-fuel cell** (`u64`) for safepoint-anchored fuel metering
     /// (INTERP_PERF.md "Fuel unification"). `0` ⇒ no fuel budget is armed for this compile (no fuel
     /// checks are emitted — guest code is byte-identical to the un-armed build). When non-zero, the
-    /// lowering decrements `*fuel_addr` by one at every function entry and taken back-edge (the same IR
-    /// safepoints the interpreters charge at) and traps [`TrapKind::OutOfFuel`] when it would go below
-    /// zero — so `fuel` = (function entries + taken back-edges) executed, identical to the interpreters
-    /// by construction. Unlike [`Self::epoch_addr`] this is the **guest's own budget**, not written by
-    /// the host mid-run, so the load/decrement/store is plain (non-atomic); the store⇒load dependency
+    /// lowering decrements `*fuel_addr` by one at every function entry, taken back-edge and
+    /// `cont.resume` (the same IR safepoints the interpreters charge at; a fiber's entry is refunded,
+    /// since the resume that started it paid — #1642) and traps [`TrapKind::OutOfFuel`] when it would
+    /// go below zero — so `fuel` = (function entries + taken back-edges + resumes) executed, identical
+    /// to the interpreters. Unlike [`Self::epoch_addr`] this is the **guest's own budget**, not written
+    /// by the host mid-run, so the load/decrement/store is plain (non-atomic); the store⇒load dependency
     /// on the same address keeps Cranelift from hoisting the check out of a loop.
     fuel_addr: i64,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
@@ -6882,23 +6885,26 @@ fn lower_block(
         // `lower.fiber`), threading `mem_base`/`fn_table_base`/`trap_out` like `call.cap`. A thunk that
         // sets the trap cell (forged handle, bad funcref, fiber-bomb, root suspend) propagates here.
         if let Inst::ContNew { func, sp } = inst {
-            // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64) -> i32 handle. The
-            // running vCPU's fiber runtime is read from a thread-local, so threads + fibers compose.
+            // fiber_new(mem_base, fn_table_base, trap_out, funcref:i32, sp:i64, fuel_addr:i64) -> i32
+            // handle. The running vCPU's fiber runtime is read from a thread-local, so threads +
+            // fibers compose. `fuel_addr` (`0` ⇒ un-armed) lets the fiber's first entry refund the
+            // prologue charge its starting `cont.resume` already paid (#1642).
             let mem_base = b.use_var(lower.mem_var);
             let fnt = b.use_var(lower.fn_table_var);
             let trap_out = b.use_var(lower.trap_var);
             let funcref = get(&vals, *func)?;
             let spv = get(&vals, *sp)?;
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64] {
+            for t in [I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64)); // i64 fiber handle (16-bit slot + 48-bit generation)
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.fiber.new_thunk);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv]);
+            let fuel = b.ins().iconst(I64, lower.fuel_addr);
+            let call =
+                b.ins()
+                    .call_indirect(tref, thunk, &[mem_base, fnt, trap_out, funcref, spv, fuel]);
             emit_trap_propagate(b, lower);
             vals.push(b.inst_results(call)[0]);
             continue;
@@ -6909,6 +6915,13 @@ fn lower_block(
         // so the JIT idles like the oracle and the cooperative bytecode driver (INVARIANTS.md #9).
         // Both append the two results (status:i32, value:i64) to match the IR's shape.
         if let Inst::ContResume { k, arg, block } = inst {
+            // Fuel unification (#1642): one fuel per `cont.resume`, charged here, before the claim —
+            // where the interpreters take theirs, and one per op whether the resume starts the fiber,
+            // switches back into a suspended one, or finds it still parked. This site used to charge
+            // nothing: the fiber's entry prologue paid for its *start*, so a fiber resumed once cost
+            // the same as on the interpreters and every re-resume after that went unmetered. A start
+            // now pays here, and `fiber_rt::make_fiber` refunds the entry prologue's second charge.
+            emit_fuel_check(b, lower);
             let blocking = *block;
             let ss =
                 b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
@@ -8492,9 +8505,11 @@ fn emit_signal_check(module: &mut JITModule, b: &mut FunctionBuilder, lower: &Lo
 /// one fuel — trap [`TrapKind::OutOfFuel`] if the budget is already exhausted, else store the
 /// decremented budget back. A no-op when no fuel is armed (`fuel_addr == 0`) — then guest code is
 /// byte-identical to the un-armed build, so an ordinary (non-fuel) run pays nothing. Placed at the
-/// same sites as [`emit_epoch_check`] (function entry + every taken back-edge) so `fuel` counts
-/// exactly (function entries + back-edges) executed — identical to what the tree-walker and bytecode
-/// engines now charge, so `OutOfFuel` becomes a checked cross-engine parity.
+/// [`emit_epoch_check`] sites (function entry + every taken back-edge) **and at every `cont.resume`**
+/// (#1642), so `fuel` counts exactly (function entries + back-edges + resumes) executed — what the
+/// tree-walker and bytecode engines charge, so `OutOfFuel` is a checked cross-engine parity. A fiber's
+/// entry is the one function entry the interpreters do not charge (its starting resume is the whole
+/// cost), so `fiber_rt::make_fiber` refunds that prologue's charge.
 ///
 /// Distinct from [`emit_epoch_check`] in two ways: (1) it is the **guest's own** budget, not written
 /// by the host from another thread, so a plain (non-atomic) load/store is correct — and cheaper; (2)

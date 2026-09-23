@@ -447,6 +447,16 @@ not by shaving predicted branches. The JIT stays the answer for near-native.
 > charges. *(History: the #448 stopgap note above records how this gap was found — earlier revisions
 > wrongly called the corpus fuel-insensitive, measured branch-vs-branch; the CI regression was the real
 > signal that led here.)*
+>
+> **The JIT half (#1642).** That slice charged `cont.resume` in the two interpreters only. The Cranelift
+> JIT went on charging function-entry prologues alone, which pays for a fiber's *start* and for none of
+> its re-resumes. The two models agree exactly when every fiber is resumed once, and no JIT fuel test
+> used fibers at all (`jit_fuel`, `fuel_remaining`, `jit_instantiate_fuel`; `jit_fuzz` generates no
+> `cont.*`), so the gap was invisible until a busy resume-poll loop measured 2002 fuel on both
+> interpreters and 1002 on the JIT. The JIT now charges at `cont.resume` too (`emit_fuel_check`, before
+> the claim, where the interpreters charge) and refunds the fiber entry prologue's charge at the start
+> (`fiber_rt::make_fiber`), so a start costs one on every engine, not two. Pinned three-engine in
+> `jit_fuel.rs`.
 
 *Cross-backend execution contract; owner-approved 2026-07-25. The model and the migration:*
 
