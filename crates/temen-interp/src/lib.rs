@@ -9906,6 +9906,15 @@ struct ChildMod {
     module: Arc<Module>,
 }
 
+/// A computation paused under a `Jit.invoke` while the invoked unit runs inline ([`VCpu::below`]):
+/// its live frames, its parked root computation's frames if a fiber was running, and its fiber
+/// registry — everything its own `gc.roots` would have scanned.
+struct Paused {
+    frames: Vec<Frame>,
+    root_parked: Option<Vec<Frame>>,
+    registry: Arc<FiberRegistry>,
+}
+
 /// between worker threads and (next) parking its continuation on a blocking op.
 struct VCpu {
     /// The owned function table; `Frame::func` resolves against it.
@@ -9931,6 +9940,12 @@ struct VCpu {
     /// The root computation's parked frames while it is resuming a fiber (the root lives
     /// off-table — see [`ROOT_FIBER`] — so its parked state can't go in the registry).
     root_parked: Option<Vec<Frame>>,
+    /// #1660 — the computations paused **beneath** this one while it runs inline over the same window
+    /// and heap: a `Jit.invoke`'s invoker and, under a nested invoke, every invoker below that,
+    /// outermost first. They hold live roots, so `gc.roots` scans them too (GC.md §3.1 — the caller's
+    /// whole live stack). Moved in for the invoke and back out after, like the window itself; empty
+    /// for every other vCPU.
+    below: Vec<Paused>,
     /// Total frames across this vCPU's parked resume-chain ancestors (incl. a parked root) —
     /// maintained at fiber switches so the recursion depth bound (`MAX_CALL_DEPTH`) spans all
     /// active fibers without walking the shared registry on every call.
@@ -10243,6 +10258,7 @@ impl VCpu {
                 vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
+            below: Vec::new(),
             parked_frames: 0,
             durable: false,
             root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
@@ -10318,6 +10334,7 @@ impl VCpu {
             cur: ROOT_FIBER,
             frames: self.frames.clone(), // the continuation inside the pending fork `call.cap`
             root_parked: None,
+            below: Vec::new(),
             parked_frames: 0,
             durable: self.durable,
             root_shadow_sp: self.root_shadow_sp,
@@ -10417,6 +10434,7 @@ impl VCpu {
                 vals: args.iter().map(|&x| Reg::from_value(x)).collect(),
             }],
             root_parked: None,
+            below: Vec::new(),
             parked_frames: 0,
             durable: false,
             root_shadow_sp: ShadowArena::EMPTY.frame_base(0), // re-seeded from the window at run setup
@@ -11233,6 +11251,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         page_fault: _,
         frames,
         root_parked,
+        below,
         parked_frames,
         durable,
         root_shadow_sp,
@@ -12277,7 +12296,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         spawn_quota,
                     );
                     child.memop = memop;
+                    // #1660: the unit runs over this window's heap, so a collection inside it must
+                    // see everything paused beneath it — this computation, and whatever was already
+                    // beneath *it*. Moved (not copied) and moved back whatever the outcome.
+                    let mut beneath = std::mem::take(below);
+                    beneath.push(Paused {
+                        frames: std::mem::take(frames),
+                        root_parked: root_parked.take(),
+                        registry: Arc::clone(registry),
+                    });
+                    child.below = beneath;
                     let out = run_inner(&mut child, u64::MAX);
+                    let mut beneath = std::mem::take(&mut child.below);
+                    let me = beneath.pop().ok_or(Trap::Malformed)?;
+                    *frames = me.frames;
+                    *root_parked = me.root_parked;
+                    *below = beneath;
                     *mem = child.mem.take();
                     *fuel = child.fuel;
                     match out {
@@ -15327,13 +15361,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     if let Some(rp) = root_parked.as_ref() {
                         gc_scan_frames(rp, lo, hi, mask, &mut roots);
                     }
-                    for fib in registry.lock().fibers.iter() {
-                        if let RegFiber::Parked(f)
-                        | RegFiber::Running(Some(f))
-                        | RegFiber::ParkedOn { frames: f, .. } = fib
-                        {
-                            gc_scan_frames(f, lo, hi, mask, &mut roots);
+                    gc_scan_registry(registry, lo, hi, mask, &mut roots);
+                    // #1660: and every computation paused beneath this one (a `Jit.invoke`'s
+                    // invokers) — the same three parts, scanned the same way.
+                    for p in below.iter() {
+                        gc_scan_frames(&p.frames, lo, hi, mask, &mut roots);
+                        if let Some(rp) = p.root_parked.as_ref() {
+                            gc_scan_frames(rp, lo, hi, mask, &mut roots);
                         }
+                        gc_scan_registry(&p.registry, lo, hi, mask, &mut roots);
                     }
                     let total = roots.len();
                     let mut bytes = Vec::with_capacity(total.min(cap) * 8);
@@ -29446,6 +29482,26 @@ fn decode_loaded(rty: ValType, width: u32, signed: bool, raw: u64) -> Value {
                 ValType::Ref => Value::Ref(ext), // opaque, stored/loaded as an i64-width word
                 _ => Value::I64(ext as i64),
             }
+        }
+    }
+}
+
+/// `gc.roots` over a fiber registry: every fiber that holds frames — `Parked` (suspended),
+/// `ParkedOn` (event-parked) and `Running(Some)` (a resume-chain ancestor). The running fiber's own
+/// slot is `Running(None)`; its frames are scanned by the caller, so nothing double-counts.
+fn gc_scan_registry(
+    registry: &FiberRegistry,
+    lo: u64,
+    hi: u64,
+    mask: u64,
+    roots: &mut std::collections::BTreeSet<u64>,
+) {
+    for fib in registry.lock().fibers.iter() {
+        if let RegFiber::Parked(f)
+        | RegFiber::Running(Some(f))
+        | RegFiber::ParkedOn { frames: f, .. } = fib
+        {
+            gc_scan_frames(f, lo, hi, mask, roots);
         }
     }
 }
