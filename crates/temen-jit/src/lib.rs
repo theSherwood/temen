@@ -1564,126 +1564,61 @@ impl FreezeController {
     }
 }
 
-/// [`compile_and_run_capture_reserved_with_host_prots`] for a **durable** run (DURABILITY.md §12.8):
-/// arms the per-fiber shadow-SP swap so a freeze that lands while a fiber runs spills into that
-/// fiber's own shadow region (D-fiber-cont option A), drives the freeze (flattening parked fibers),
-/// and round-trips the fiber residue.
-///
-/// - **Freeze:** pass empty `init_prots` + empty `seed`; returns the [`FrozenFiber`] residue of every
-///   fiber the driver flattened (for the snapshot's Section 2).
-/// - **Thaw:** pass the captured page-protection map as `init_prots` and the frozen fibers as `seed`;
-///   they are re-created in the fiber table before the `REWINDING` re-entry. Returns an empty residue.
-///
-/// # Safety
-/// As [`compile_and_run_capture_reserved_with_host`].
-#[allow(clippy::too_many_arguments)]
-pub fn compile_and_run_capture_reserved_with_host_durable(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    init_mem: &[u8],
-    init_prots: &[WindowProt],
-    seed: &[FrozenFiber],
-    reserved_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
-    let mut cm = CompiledModule::compile(
-        m,
-        func,
-        cap_thunk,
-        cap_ctx,
-        reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
-        Quota::default(),
-        0,
-    )?;
-    cm.restore_prots = init_prots.to_vec();
-    cm.frozen_seed = seed.to_vec();
-    cm.durable = true;
-    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
+/// A durable JIT run's **whole** freeze/thaw residue (DURABILITY.md §12.4, §12.8, §4): what a thaw
+/// re-creates before the root re-enters under `REWINDING`, and what a freeze hands back — the same
+/// pieces the interpreter's `ThawResidue` carries, so one embedder hand-off serves both engines
+/// (#1690: each durable entry used to carry a different subset, silently dropping the rest).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DurableResidue {
+    /// Fibers the freeze flattened (§12.4).
+    pub fibers: Vec<FrozenFiber>,
+    /// `thread.spawn`ed vCPUs that unwound under the freeze (slice 3.3).
+    pub vcpus: Vec<FrozenVCpu>,
+    /// §14 nested children that unwound into their carves (§4).
+    pub nested: Vec<FrozenNested>,
+    /// The root vCPU's flattened shadow-SP extent (slice 3.3): reported beside the vCPUs because the
+    /// shared active-SP word ends at the last child's. `None` ⇒ the root's extent is the window's own
+    /// active-SP word (a single-vCPU run).
+    pub root_sp: Option<u64>,
 }
 
-/// The durable-nested freeze/thaw entry's return: outcome, window, flattened fibers, and the §14
-/// **nested-child** freeze residue (each a [`FrozenNested`]).
-pub type DurableNestedOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenNested>);
-
-/// [`compile_and_run_capture_reserved_with_host_durable`] that ALSO returns the §14 **nested-child**
-/// freeze residue (DURABILITY.md §4 "JIT parity") — one [`FrozenNested`] per child that unwound into
-/// its carve under the freeze. Use for a durable domain that nests §14 children; the extra residue is
-/// what a thaw re-attaches. A separate entry so the existing `_durable` callers are unaffected.
-///
-/// # Safety
-/// As [`compile_and_run_capture_reserved_with_host_durable`].
-#[allow(clippy::too_many_arguments)]
-pub fn compile_and_run_capture_reserved_with_host_durable_nested(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    init_mem: &[u8],
-    init_prots: &[WindowProt],
-    seed: &[FrozenFiber],
-    nested_seed: &[FrozenNested],
-    reserved_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-) -> Result<DurableNestedOutcome, JitError> {
-    let mut cm = CompiledModule::compile(
-        m,
-        func,
-        cap_thunk,
-        cap_ctx,
-        reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
-        Quota::default(),
-        0,
-    )?;
-    cm.restore_prots = init_prots.to_vec();
-    cm.frozen_seed = seed.to_vec();
-    cm.frozen_nested_seed = nested_seed.to_vec();
-    cm.durable = true;
-    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((
-        outcome,
-        win,
-        std::mem::take(&mut cm.frozen_out),
-        std::mem::take(&mut cm.frozen_nested_out),
-    ))
+/// How a durable JIT run is driven beyond its residue.
+#[derive(Clone, Default)]
+pub struct DurableRun {
+    /// Per-page protections to re-establish on a thawed window (§12.3); empty on a freeze.
+    pub init_prots: Vec<WindowProt>,
+    /// The thaw seed (empty on a freeze or an ordinary durable run).
+    pub seed: DurableResidue,
+    /// An async freeze controller (Phase-4 Slice A): a controller thread's
+    /// [`FreezeController::request_freeze`] lands mid-run. Its presence also engages the **concurrent**
+    /// durable path (§12.8 4A.5): a child spawned while `NORMAL` runs on its own OS thread with its own
+    /// reserved shadow context, so an async freeze reaches it in its own region — never the root's
+    /// (#1691: an async freeze without it unwound children into the root's region).
+    pub freeze: Option<Arc<FreezeController>>,
 }
 
-/// [`compile_and_run_capture_reserved_with_host_durable`] wired for an **async freeze** (Phase-4
-/// Slice A, 4A.3): publishes the live window base into `freeze` so a controller thread can
-/// [`FreezeController::request_freeze`] mid-run — the real bounded-latency stop-the-world trigger for
-/// a poll-free compute loop (vs. the deterministic `arm_freeze_after_backedges` test oracle). The
-/// guest observes the controller's `UNWINDING` write at its next loop-header back-edge poll and
-/// unwinds, exactly as a freeze-from-start or armed freeze does — so the artifact round-trips
-/// identically; only the *trigger* differs.
+/// The one **durable** JIT entry (DURABILITY.md §12.8): [`compile_and_run_capture_reserved_with_host_prots`]
+/// with the per-fiber shadow-SP swap armed, the freeze driven (fibers flattened, spawned vCPUs and §14
+/// children unwound), and the whole residue round-tripped.
+///
+/// - **Freeze:** an empty [`DurableRun::seed`]; returns every piece of residue the freeze produced.
+/// - **Thaw:** the artifact's page map as `init_prots` and its residue as `seed`; returns an empty
+///   residue.
 ///
 /// # Safety
-/// As [`compile_and_run_capture_reserved_with_host_durable`]; additionally `freeze`'s lifetime
-/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
+/// As [`compile_and_run_capture_reserved_with_host`]; with a controller, its lifetime contract (call
+/// `request_freeze` at most once, concurrently with this run) must hold.
 #[allow(clippy::too_many_arguments)]
-pub fn compile_and_run_capture_reserved_with_host_durable_interruptible(
+pub fn compile_and_run_durable(
     m: &IrModule,
     func: FuncIdx,
     args: &[i64],
     init_mem: &[u8],
-    init_prots: &[WindowProt],
-    seed: &[FrozenFiber],
     reserved_log2: u8,
     cap_thunk: CapThunk,
     cap_ctx: *mut core::ffi::c_void,
-    freeze: Arc<FreezeController>,
-) -> Result<(JitOutcome, Vec<u8>, Vec<FrozenFiber>), JitError> {
+    run: DurableRun,
+) -> Result<(JitOutcome, Vec<u8>, DurableResidue), JitError> {
     let mut cm = CompiledModule::compile(
         m,
         func,
@@ -1698,132 +1633,12 @@ pub fn compile_and_run_capture_reserved_with_host_durable_interruptible(
         Quota::default(),
         0,
     )?;
-    cm.restore_prots = init_prots.to_vec();
-    cm.frozen_seed = seed.to_vec();
-    cm.durable = true;
-    cm.freeze_ctl = Some(freeze);
+    cm.restore_prots = run.init_prots;
+    cm.set_durable(run.seed);
+    cm.concurrent_durable = run.freeze.is_some();
+    cm.freeze_ctl = run.freeze;
     let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((outcome, win, std::mem::take(&mut cm.frozen_out)))
-}
-
-/// The result of a **multi-vCPU** durable freeze/thaw run (slice 3.3): `(outcome, window image,
-/// flattened-fiber residue, spawned-vCPU residue, root vCPU's flattened shadow-SP extent)`. On a thaw
-/// the two residue vectors are empty and the extent is inert.
-pub type DurableMvOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
-
-/// [`compile_and_run_capture_reserved_with_host_durable`] for a **multi-vCPU** durable domain
-/// (DURABILITY.md §12.8 slice 3.3) — the full freeze + thaw of a domain whose root has `thread.spawn`ed
-/// children. A durable run is single-worker, so children run **inline** (deferred during a freeze until
-/// the root unwinds; re-attached + run before the root re-enters on a thaw).
-///
-/// - **Freeze** (`vcpu_seed` empty): returns the flattened fibers, the spawned-vCPU residue (each
-///   [`FrozenVCpu`]: entry func, `(sp, arg)` operands, flattened shadow-SP), **and the root vCPU's
-///   flattened extent** (`root_sp`, reported separately because the shared active-SP word ends at the
-///   last child's extent) — everything a snapshot needs to record the whole multi-vCPU domain.
-/// - **Thaw** (`vcpu_seed` = the frozen children, `root_sp` = the root's restored extent): re-attaches
-///   and runs the children, then re-enters the root under `REWINDING`. Returns empty residue.
-///
-/// # Safety
-/// As [`compile_and_run_capture_reserved_with_host_durable`].
-#[allow(clippy::too_many_arguments)]
-pub fn compile_and_run_capture_reserved_with_host_durable_mv(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    init_mem: &[u8],
-    init_prots: &[WindowProt],
-    seed: &[FrozenFiber],
-    vcpu_seed: &[FrozenVCpu],
-    root_sp: u64,
-    reserved_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-) -> Result<DurableMvOutcome, JitError> {
-    let mut cm = CompiledModule::compile(
-        m,
-        func,
-        cap_thunk,
-        cap_ctx,
-        reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
-        Quota::default(),
-        0,
-    )?;
-    cm.restore_prots = init_prots.to_vec();
-    cm.frozen_seed = seed.to_vec();
-    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
-    cm.thaw_root_sp = root_sp;
-    cm.durable = true;
-    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((
-        outcome,
-        win,
-        std::mem::take(&mut cm.frozen_out),
-        std::mem::take(&mut cm.frozen_vcpus_out),
-        cm.frozen_root_sp_out,
-    ))
-}
-
-/// [`compile_and_run_capture_reserved_with_host_durable_mv`] for a **genuinely-concurrent** freeze
-/// (DURABILITY.md §12.8 Phase 4 Slice A.5 stage ii): the root's `thread.spawn`ed children run as real
-/// OS threads (not the single-worker deferred model), and a [`FreezeController::request_freeze`] makes
-/// every context — root and children — self-unwind into its **own** per-context shadow-SP region
-/// concurrently (lock-free, since the stage-i relocation gave each its own SP word). The coordinator
-/// (root) joins the children via the existing `join_all` and then runs the unchanged freeze-drive +
-/// snapshot. Residue is canonically sorted at serialize, so the (racy) quiesce order can't change the
-/// artifact (§12.6). `request_freeze` may be called at most once, concurrently with this run.
-///
-/// # Safety
-/// As [`compile_and_run_capture_reserved_with_host_durable_mv`]; additionally `freeze`'s lifetime
-/// contract (call `request_freeze` at most once, concurrently with this run) must hold.
-#[allow(clippy::too_many_arguments)]
-pub fn compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
-    m: &IrModule,
-    func: FuncIdx,
-    args: &[i64],
-    init_mem: &[u8],
-    init_prots: &[WindowProt],
-    seed: &[FrozenFiber],
-    vcpu_seed: &[FrozenVCpu],
-    root_sp: u64,
-    reserved_log2: u8,
-    cap_thunk: CapThunk,
-    cap_ctx: *mut core::ffi::c_void,
-    freeze: Arc<FreezeController>,
-) -> Result<DurableMvOutcome, JitError> {
-    let mut cm = CompiledModule::compile(
-        m,
-        func,
-        cap_thunk,
-        cap_ctx,
-        reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
-        Quota::default(),
-        0,
-    )?;
-    cm.restore_prots = init_prots.to_vec();
-    cm.frozen_seed = seed.to_vec();
-    cm.frozen_vcpu_seed = vcpu_seed.to_vec();
-    cm.thaw_root_sp = root_sp;
-    cm.durable = true;
-    cm.concurrent_durable = true;
-    cm.freeze_ctl = Some(freeze);
-    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((
-        outcome,
-        win,
-        std::mem::take(&mut cm.frozen_out),
-        std::mem::take(&mut cm.frozen_vcpus_out),
-        cm.frozen_root_sp_out,
-    ))
+    Ok((outcome, win, cm.take_durable_residue()))
 }
 
 /// A §14 **nested sub-window**: run the guest confined to `[base, base+child_size)` of a
@@ -3670,18 +3485,28 @@ impl CompiledModule {
     /// Make the next run **durable** (DURABILITY.md §12.8) on a caller-built module — the
     /// fiber-hosting / `Jit`-domain setup (`enable_fiber_hosting`, reconstructed units) stays the
     /// caller's, so an embedder like `temen_run::jit_cap_run` needs no second durable entry point.
-    /// `seed` is the thaw seed: the frozen fibers to re-create before a `REWINDING` run (empty for a
-    /// freeze or an ordinary durable run). The freeze residue comes back via
-    /// [`Self::take_frozen_fibers`].
-    pub fn set_durable(&mut self, seed: Vec<FrozenFiber>) {
-        self.frozen_seed = seed;
+    /// `seed` is the thaw seed: the residue to re-create before a `REWINDING` run (empty for a freeze
+    /// or an ordinary durable run). The freeze residue comes back via [`Self::take_durable_residue`].
+    pub fn set_durable(&mut self, seed: DurableResidue) {
+        self.frozen_seed = seed.fibers;
+        self.frozen_vcpu_seed = seed.vcpus;
+        self.frozen_nested_seed = seed.nested;
+        if let Some(sp) = seed.root_sp {
+            self.thaw_root_sp = sp;
+        }
         self.durable = true;
     }
 
-    /// The fibers the freeze driver flattened in the last durable run (empty unless a freeze
-    /// flattened fibers); taken, so a later run starts clean.
-    pub fn take_frozen_fibers(&mut self) -> Vec<FrozenFiber> {
-        std::mem::take(&mut self.frozen_out)
+    /// The residue the last durable run's freeze produced (empty unless a freeze caught something);
+    /// taken, so a later run starts clean.
+    pub fn take_durable_residue(&mut self) -> DurableResidue {
+        let root_sp = std::mem::take(&mut self.frozen_root_sp_out);
+        DurableResidue {
+            fibers: std::mem::take(&mut self.frozen_out),
+            vcpus: std::mem::take(&mut self.frozen_vcpus_out),
+            nested: std::mem::take(&mut self.frozen_nested_out),
+            root_sp: (root_sp != 0).then_some(root_sp),
+        }
     }
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by

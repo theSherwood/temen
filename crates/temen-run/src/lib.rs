@@ -1530,8 +1530,14 @@ pub fn jit_cap_run(
         // below: re-compile any restore-rebuilt units into this fresh module. A no-op for a fresh run.
         {
             let mut hg = host_mutex.lock().unwrap_or_else(|e| e.into_inner());
-            reconstruct_jit_units(&mut cm, &mut hg)?;
-            jit_durable_enter(&mut cm, &mut hg);
+            // Either failing hands the embedder its powerbox back (it moved into the mutex above).
+            let prepared = reconstruct_jit_units(&mut cm, &mut hg)
+                .and_then(|()| jit_durable_enter(&mut cm, &mut hg));
+            drop(hg);
+            if let Err(e) = prepared {
+                hg_restore(host, host_mutex);
+                return Err(e);
+            }
         }
         // SAFETY: `&mut cm` is the only pointer the thunk's handlers re-enter through (registered
         // above); all of the run's vCPU threads serialize their `call.cap`s through `host_mutex`.
@@ -1541,7 +1547,7 @@ pub fn jit_cap_run(
             hg.set_jit_native_ctx(0);
             jit_durable_leave(&mut cm, &mut hg);
         }
-        *host = host_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
+        hg_restore(host, host_mutex);
         return r;
     }
     let mut cm = CompiledModule::compile(
@@ -1569,7 +1575,11 @@ pub fn jit_cap_run(
     // this fresh module so a native `invoke` of them runs their own code. A no-op for a fresh run (no
     // restored units); the guest is not yet running, so `define_extra` is at a quiescent point.
     reconstruct_jit_units(&mut cm, host)?;
-    jit_durable_enter(&mut cm, host);
+    if let Err(e) = jit_durable_enter(&mut cm, host) {
+        host.set_jit_native_ctx(0);
+        host.set_serve_native_ctx(0);
+        return Err(e);
+    }
     // Snapshot span: the low 256 KiB, matching the interp/JIT `SNAP_CAP` capture pairing.
     // SAFETY: `cm_ptr` is the only pointer used for this run (the same one the thunk's handlers
     // re-enter through, registered above); the run is single-threaded on this thread.
@@ -1581,36 +1591,39 @@ pub fn jit_cap_run(
     r
 }
 
-/// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
-/// durable, seeded with the fibers a restore re-created (`Host::frozen_fibers`, taken — the
-/// interp's thaw consumes them the same way). A plain host leaves the run byte-identical.
-fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) {
-    if host.is_durable() {
-        let seed = host
-            .frozen_fibers()
-            .iter()
-            .map(|f| temen_jit::FrozenFiber {
-                slot: f.slot,
-                func: f.func,
-                sp: f.sp,
-                shadow_sp: f.shadow_sp,
-                generation: f.generation,
-                consumed: f.consumed,
-            })
-            .collect();
-        host.set_frozen_fibers(Vec::new());
-        cm.set_durable(seed);
-    }
+/// Hand the embedder back the powerbox [`jit_cap_run`]'s serialized path moved into its mutex.
+fn hg_restore(host: &mut Host, host_mutex: Mutex<Host>) {
+    *host = host_mutex.into_inner().unwrap_or_else(|e| e.into_inner());
 }
 
-/// The freeze residue of a durable [`jit_cap_run`]: the fibers the freeze flattened, handed to the
-/// embedder on the `Host` exactly where the interp's freeze driver leaves them, so one
-/// `temen_snapshot::freeze(module, window, host)` serves both engines.
-fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
-    let frozen: Vec<temen_interp::FrozenFiber> = cm
-        .take_frozen_fibers()
-        .into_iter()
-        .map(|f| temen_interp::FrozenFiber {
+/// Durable [`jit_cap_run`] (DURABILITY.md §12.8, #1236): a `Host` marked durable makes the run
+/// durable, seeded with the **whole** residue a restore re-created on it — fibers, spawned vCPUs and
+/// the root's extent, §14 nested children — taken, as the interp's thaw consumes them. A plain host
+/// leaves the run byte-identical.
+///
+/// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): a
+/// separate-module or completed nested child, a nested child's host state, a detached child (#1692,
+/// #1361). The embedder then thaws on the interpreter, which carries all of it.
+fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
+    if !host.is_durable() {
+        return Ok(());
+    }
+    let jit_unrepresentable = host
+        .frozen_nested()
+        .iter()
+        .any(|n| n.module_digest.is_some() || n.completed_result.is_some())
+        || !host.frozen_child_state().is_empty()
+        || !host.frozen_detached().is_empty()
+        || !host.thawed_detached().is_empty();
+    if jit_unrepresentable {
+        return Err(temen_jit::JitError::Unsupported(
+            "durable JIT thaw: residue the JIT cannot re-create (#1692)",
+        ));
+    }
+    let fibers = host
+        .frozen_fibers()
+        .iter()
+        .map(|f| temen_jit::FrozenFiber {
             slot: f.slot,
             func: f.func,
             sp: f.sp,
@@ -1619,8 +1632,95 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
             consumed: f.consumed,
         })
         .collect();
-    if !frozen.is_empty() {
-        host.set_frozen_fibers(frozen);
+    let vcpus = host
+        .frozen_vcpus()
+        .iter()
+        .map(|v| temen_jit::FrozenVCpu {
+            task: v.task,
+            parent_task: v.parent_task,
+            func: v.func,
+            args: v.args.clone(),
+            shadow_sp: v.shadow_sp,
+            completed_result: v.completed_result,
+        })
+        .collect();
+    let nested = host
+        .frozen_nested()
+        .iter()
+        .map(|n| temen_jit::FrozenNested {
+            parent_task: n.parent_task,
+            slot: n.slot,
+            carve_off: n.carve_off,
+            size_log2: n.size_log2,
+            entry: n.entry,
+        })
+        .collect();
+    host.set_frozen_fibers(Vec::new());
+    host.set_frozen_vcpus(Vec::new());
+    host.set_frozen_nested(Vec::new());
+    let root_sp = host.take_frozen_root_sp();
+    cm.set_durable(temen_jit::DurableResidue {
+        fibers,
+        vcpus,
+        nested,
+        root_sp,
+    });
+    Ok(())
+}
+
+/// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
+/// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
+/// both engines. The whole residue, not just the fibers (#1690).
+fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
+    let r = cm.take_durable_residue();
+    if !r.fibers.is_empty() {
+        host.set_frozen_fibers(
+            r.fibers
+                .into_iter()
+                .map(|f| temen_interp::FrozenFiber {
+                    slot: f.slot,
+                    func: f.func,
+                    sp: f.sp,
+                    shadow_sp: f.shadow_sp,
+                    generation: f.generation,
+                    consumed: f.consumed,
+                })
+                .collect(),
+        );
+    }
+    if !r.vcpus.is_empty() {
+        host.set_frozen_vcpus(
+            r.vcpus
+                .into_iter()
+                .map(|v| temen_interp::FrozenVCpu {
+                    task: v.task,
+                    parent_task: v.parent_task,
+                    func: v.func,
+                    args: v.args,
+                    shadow_sp: v.shadow_sp,
+                    completed_result: v.completed_result,
+                })
+                .collect(),
+        );
+    }
+    if let Some(sp) = r.root_sp {
+        host.set_frozen_root_sp(sp);
+    }
+    if !r.nested.is_empty() {
+        host.set_frozen_nested(
+            r.nested
+                .into_iter()
+                .map(|n| temen_interp::FrozenNested {
+                    parent_task: n.parent_task,
+                    slot: n.slot,
+                    carve_off: n.carve_off,
+                    size_log2: n.size_log2,
+                    entry: n.entry,
+                    module_digest: None,
+                    completed_result: None,
+                })
+                .collect(),
+        );
     }
 }
 

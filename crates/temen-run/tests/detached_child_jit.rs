@@ -12,8 +12,8 @@
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable,
-    compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome,
+    compile_and_run_capture_reserved_with_host_ex, compile_and_run_durable, DurableResidue,
+    DurableRun, GrantChildHooks, JitOutcome,
 };
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
@@ -220,16 +220,15 @@ fn a_durable_detached_spawn_declines_the_same_way_on_the_interpreter_and_the_nat
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
         let args = [h[0] as i64, h[1] as i64, h[2] as i64];
-        let (jo, _, _) = compile_and_run_capture_reserved_with_host_durable(
+        let (jo, _, DurableResidue { .. }) = compile_and_run_durable(
             &p,
             0,
             &args,
             &[],
-            &[],
-            &[],
             temen_ir::DEFAULT_RESERVED_LOG2,
             temen_run::cap_thunk,
             &mut host as *mut Host as *mut c_void,
+            DurableRun::default(),
         )
         .expect("jit run");
         let r = match jo {

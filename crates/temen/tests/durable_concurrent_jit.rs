@@ -20,9 +20,8 @@ use temen_durable::{
 use temen_interp::Host;
 use temen_ir::{Memory, Module};
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable_mv,
-    compile_and_run_capture_reserved_with_host_durable_mv_interruptible, FreezeController,
-    FrozenFiber, FrozenVCpu, JitError, JitOutcome, TrapKind,
+    compile_and_run_durable, DurableResidue, DurableRun, FreezeController, FrozenFiber, FrozenVCpu,
+    JitError, JitOutcome, TrapKind,
 };
 use temen_snapshot::{freeze as codec_freeze, restore as codec_restore};
 
@@ -98,23 +97,26 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
         fc.request_freeze();
     });
 
-    let res = compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
+    let res = compile_and_run_durable(
         inst,
         0,
         &[clk as i64, hf as i64],
         &init_durable_window(WINDOW, TEST_ARENA),
-        &[],
-        &[],
-        &[],
-        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
-        freeze,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.frame_base(0)),
+                ..Default::default()
+            },
+            freeze: Some(freeze),
+            ..Default::default()
+        },
     );
     controller.join().unwrap();
     match res {
-        Ok((o, s, f, v, r)) => Some((o, s, f, v, r)),
+        Ok((o, s, r)) => Some((o, s, r.fibers, r.vcpus, r.root_sp.unwrap_or(0))),
         Err(JitError::Unsupported(_)) => None,
         Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
         Err(e) => panic!("concurrent freeze failed: {e:?}"),
@@ -135,18 +137,23 @@ fn thaw(
     let tclk = thost.grant_clock();
     // The host fn is granted (handle order preserved) but never called on the thaw path.
     let _ = thost.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
-    let (tout, tfinal, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, tfinal, ..) = compile_and_run_durable(
         inst,
         0,
         &[tclk as i64, 0],
         &twin,
-        &[], // init_prots
-        fibers,
-        vcpus,
-        root_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: fibers.to_vec(),
+                vcpus: vcpus.to_vec(),
+                root_sp: Some(root_sp),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("concurrent thaw");
     (tout, tfinal)
@@ -658,19 +665,22 @@ fn nested_concurrent_spawn_returns_grandchild_value() {
     let _clk = host.grant_clock();
     // A controller is required by the entry but never triggered — this is a pure NORMAL nested spawn.
     let freeze = FreezeController::new();
-    let res = compile_and_run_capture_reserved_with_host_durable_mv_interruptible(
+    let res = compile_and_run_durable(
         &inst,
         0,
         &[0],
         &init_durable_window(WINDOW, TEST_ARENA),
-        &[],
-        &[],
-        &[],
-        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
-        freeze,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.frame_base(0)),
+                ..Default::default()
+            },
+            freeze: Some(freeze),
+            ..Default::default()
+        },
     );
     match res {
         Ok((out, ..)) => assert!(
@@ -1107,18 +1117,21 @@ fn run_mv_fresh(inst: &Module) -> (JitOutcome, Vec<u8>) {
     host.clock_ns = 42;
     let clk = host.grant_clock();
     let _ = host.grant_host_proc(Box::new(|_op: u32, _a: &[i64], _m, _| Ok(vec![0])));
-    let (out, win, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+    let (out, win, ..) = compile_and_run_durable(
         inst,
         0,
         &[clk as i64, 0],
         &init_durable_window(WINDOW, TEST_ARENA),
-        &[],
-        &[],
-        &[],
-        TEST_ARENA.frame_base(0),
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.frame_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("fresh concurrent mv run");
     (out, win)

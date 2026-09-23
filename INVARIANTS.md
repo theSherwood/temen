@@ -355,7 +355,9 @@ directive (invariant 1) is actually about.
 
 A suffix is a parameter that escaped into the name space. `compile_and_run_capture_reserved_with_host_durable_mv_interruptible`
 is the smell in its pure form: the suffix set *is* the axis set, enumerated as names that nothing can
-iterate, rather than as a struct that everything can.
+iterate, rather than as a struct that everything can. (It and its four siblings are now one
+`compile_and_run_durable` taking a `DurableRun` — #1690, where each copy carrying a different subset of
+the residue had silently dropped the rest.)
 
 **The deliberate second implementation is exempt, and it is exempt by naming its differential.** A
 second implementation whose *whole purpose* is to disagree — `temen-spec` restating the semantics

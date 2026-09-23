@@ -24,7 +24,7 @@ use temen_durable::{
 };
 use temen_interp::{run_capture_reserved_with_host, FrozenFiber as InterpFrozen, Host, Value};
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable, FrozenFiber as JitFrozen, JitOutcome,
+    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFrozen, JitOutcome,
 };
 use temen_snapshot::{freeze, restore};
 use temen_text::parse_module;
@@ -132,16 +132,15 @@ fn jit_durable_fiber_switch_routes_shadow_sp_per_context() {
     // not the window, so no seed is needed.
     let init = vec![0u8; WINDOW];
 
-    let (outcome, _win, _residue) = compile_and_run_capture_reserved_with_host_durable(
+    let (outcome, _win, DurableResidue { .. }) = compile_and_run_durable(
         &m,
         0,
         &[hf as i64],
         &init,
-        &[], // freeze-style: no page protections to re-establish
-        &[], // no fibers to re-seed (a probe run, not a thaw)
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut host as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("JIT compiles + runs the durable fiber module");
     assert!(
@@ -224,16 +223,15 @@ fn jit_freeze_driver_flattens_a_fiber_matching_interp() {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap, _residue) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, jsnap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &jwin,
-        &[],
-        &[], // freeze: no seed
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("JIT freeze compiles + runs");
     assert!(
@@ -275,16 +273,21 @@ fn jit_and_interp_freeze_a_fiber_to_an_identical_artifact() {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (_jout, jsnap, residue) = compile_and_run_capture_reserved_with_host_durable(
+    let (
+        _jout,
+        jsnap,
+        DurableResidue {
+            fibers: residue, ..
+        },
+    ) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &jwin,
-        &[],
-        &[],
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("JIT freeze");
     assert_eq!(
@@ -359,16 +362,21 @@ fn interp_frozen_fiber_artifact_thaws_on_the_jit() {
 
     // Thaw on the JIT: re-seed the fiber, re-enter under REWINDING, run to completion.
     let mut jhost = Host::new();
-    let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &thaw_win,
-        &[],
-        &seed,
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: seed.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("JIT thaw");
     match jout {
@@ -454,16 +462,21 @@ fn interp_frozen_active_chain_fiber_thaws_on_the_jit() {
     let mut jhost = Host::new();
     jhost.clock_ns = 99;
     let jclk = jhost.grant_clock();
-    let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[jclk as i64],
         &thaw_win,
-        &[],
-        &seed,
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: seed.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("JIT thaw");
     match jout {
@@ -561,16 +574,15 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut jwin, 3);
-    let (jout, jsnap, jr) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, jsnap, DurableResidue { fibers: jr, .. }) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &jwin,
-        &[],
-        &[], // freeze: no seed
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("JIT armed freeze compiles + runs");
     assert!(
@@ -604,16 +616,21 @@ fn jit_and_interp_freeze_a_recycled_fiber_identically_and_thaw_on_the_jit() {
     assert_eq!(seed[0].generation, 1, "re-seeded at generation 1");
 
     let mut jhost2 = Host::new();
-    let (jout2, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout2, _win, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &thaw_win,
-        &[],
-        &seed,
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost2 as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: seed.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("JIT thaw");
     match jout2 {
@@ -662,16 +679,21 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
 
     let jit_thaw = |thaw_win: &[u8], seed: &[JitFrozen], what: &str| {
         let mut jhost = Host::new();
-        let (jout, _win, _res) = compile_and_run_capture_reserved_with_host_durable(
+        let (jout, _win, DurableResidue { .. }) = compile_and_run_durable(
             &inst,
             0,
             &[],
             thaw_win,
-            &[],
-            seed,
             WINDOW_LOG2,
             temen_run::cap_thunk,
             &mut jhost as *mut Host as *mut c_void,
+            DurableRun {
+                seed: DurableResidue {
+                    fibers: seed.to_vec(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         )
         .expect("JIT thaw");
         match jout {
@@ -712,16 +734,15 @@ fn a_consumed_park_frozen_mid_delivery_redelivers_on_the_jit() {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut jwin, 3);
-    let (jout, mut jsnap, jr) = compile_and_run_capture_reserved_with_host_durable(
+    let (jout, mut jsnap, DurableResidue { fibers: jr, .. }) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &jwin,
-        &[],
-        &[],
         WINDOW_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("JIT armed freeze");
     assert!(

@@ -22135,6 +22135,11 @@ impl Host {
         self.freeze_declined.take()
     }
 
+    /// The live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
+    pub fn thawed_detached(&self) -> &[ThawedDetached] {
+        &self.thawed_detached
+    }
+
     /// Take the live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
     pub fn take_thawed_detached(&mut self) -> Vec<ThawedDetached> {
         std::mem::take(&mut self.thawed_detached)
@@ -22163,6 +22168,12 @@ impl Host {
     /// for a multi-vCPU thaw, alongside [`Host::set_frozen_vcpus`].
     pub fn set_frozen_root_sp(&mut self, sp: u64) {
         self.frozen_root_sp = Some(sp);
+    }
+
+    /// Take the root extent [`Host::set_frozen_root_sp`] seeded (cleared here) — for an engine that
+    /// consumes a restored residue itself, as the JIT's durable hand-off does.
+    pub fn take_frozen_root_sp(&mut self) -> Option<u64> {
+        self.frozen_root_sp.take()
     }
 
     /// Begin recording the nondeterministic capability **inputs** crossing into the guest, so a

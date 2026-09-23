@@ -40,7 +40,7 @@ const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::Sh
     end: 65536,
 };
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable_mv, FrozenFiber as JitFiber,
+    compile_and_run_durable, DurableResidue, DurableRun, FrozenFiber as JitFiber,
     FrozenVCpu as JitVCpu, JitError, JitOutcome,
 };
 
@@ -130,27 +130,37 @@ fn jit_freezes_a_spawned_vcpu_matching_interp() {
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap, jfibers, jvcpus, _jroot_sp) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[clk as i64],
-            &jwin,
-            &[],
-            &[],                       // freeze: no fiber seed
-            &[],                       // freeze: no vcpu seed
-            TEST_ARENA.region_base(0), // freeze: root_sp unused
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut jhost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => {
-                panic!("JIT failed to compile a verified multi-vCPU module: {e:?}\n{inst:#?}")
-            }
-        };
+    let (
+        jout,
+        jsnap,
+        DurableResidue {
+            fibers: jfibers,
+            vcpus: jvcpus,
+            ..
+        },
+    ) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[clk as i64],
+        &jwin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.region_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => {
+            panic!("JIT failed to compile a verified multi-vCPU module: {e:?}\n{inst:#?}")
+        }
+    };
     assert!(
         matches!(jout, JitOutcome::Returned(_)),
         "JIT freeze returns a placeholder, got {jout:?}"
@@ -215,25 +225,35 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     let fclk = fhost.grant_clock();
     let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
-    let (fout, fsnap, _ff, fvcpus, froot_sp) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[fclk as i64],
-            &fwin,
-            &[],
-            &[],
-            &[],
-            TEST_ARENA.region_base(0), // freeze: root_sp unused
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut fhost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => panic!("JIT freeze failed: {e:?}\n{inst:#?}"),
-        };
+    let (
+        fout,
+        fsnap,
+        DurableResidue {
+            vcpus: fvcpus,
+            root_sp: froot_sp,
+            ..
+        },
+    ) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[fclk as i64],
+        &fwin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut fhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.region_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT freeze failed: {e:?}\n{inst:#?}"),
+    };
     assert!(
         matches!(fout, JitOutcome::Returned(_)),
         "freeze placeholder"
@@ -253,25 +273,28 @@ fn jit_thaws_its_own_multivcpu_freeze() {
     thost.clock_ns = 44;
     let tclk = thost.grant_clock();
     assert_eq!(tclk, fclk, "fresh host re-grants the same clock handle");
-    let (tout, _tsnap, _tf, tvcpus, _troot) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[tclk as i64],
-            &twin,
-            &[],
-            &[],      // no fibers
-            &fvcpus,  // re-attach the frozen child
-            froot_sp, // restore the root's extent
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut thost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => panic!("JIT thaw failed: {e:?}\n{inst:#?}"),
-        };
+    let (tout, _tsnap, DurableResidue { vcpus: tvcpus, .. }) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[tclk as i64],
+        &twin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                vcpus: fvcpus.to_vec(),
+                root_sp: froot_sp,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT thaw failed: {e:?}\n{inst:#?}"),
+    };
     assert!(tvcpus.is_empty(), "a thaw re-freezes nothing");
     match tout {
         JitOutcome::Returned(rs) => assert_eq!(
@@ -336,18 +359,22 @@ fn interp_frozen_multivcpu_thaws_on_the_jit() {
     thost.set_durable(true);
     thost.clock_ns = 44;
     let tclk = thost.grant_clock();
-    let (tout, ..) = match compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, ..) = match compile_and_run_durable(
         &inst,
         0,
         &[tclk as i64],
         &twin,
-        &[],
-        &[],
-        &seed,
-        iroot_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                vcpus: seed.to_vec(),
+                root_sp: Some(iroot_sp),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     ) {
         Ok(t) => t,
         Err(JitError::Unsupported(_)) => return,
@@ -479,25 +506,36 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap, jfibers, jvcpus, jroot_sp) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[clk as i64],
-            &jwin,
-            &[],
-            &[],
-            &[],
-            TEST_ARENA.region_base(0), // freeze: root_sp unused
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut jhost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => panic!("JIT freeze of child-owned fiber failed: {e:?}\n{inst:#?}"),
-        };
+    let (
+        jout,
+        jsnap,
+        DurableResidue {
+            fibers: jfibers,
+            vcpus: jvcpus,
+            root_sp: jroot_sp,
+            ..
+        },
+    ) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[clk as i64],
+        &jwin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.region_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT freeze of child-owned fiber failed: {e:?}\n{inst:#?}"),
+    };
     assert!(
         matches!(jout, JitOutcome::Returned(_)),
         "freeze placeholder"
@@ -536,18 +574,23 @@ fn jit_freezes_and_thaws_a_child_owned_fiber_matching_interp() {
     thost.set_durable(true);
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
-    let (tout, ..) = match compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, ..) = match compile_and_run_durable(
         &inst,
         0,
         &[tclk as i64],
         &twin,
-        &[],
-        &seed_fibers,
-        &seed_vcpus,
-        jroot_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: seed_fibers.to_vec(),
+                vcpus: seed_vcpus.to_vec(),
+                root_sp: jroot_sp,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     ) {
         Ok(t) => t,
         Err(JitError::Unsupported(_)) => return,
@@ -681,25 +724,35 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     let clk = jhost.grant_clock();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jout, jsnap, _jf, jvcpus, jroot_sp) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[clk as i64],
-            &jwin,
-            &[],
-            &[],
-            &[],
-            TEST_ARENA.region_base(0), // freeze: root_sp unused
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut jhost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => panic!("JIT freeze of nested tree failed: {e:?}\n{inst:#?}"),
-        };
+    let (
+        jout,
+        jsnap,
+        DurableResidue {
+            vcpus: jvcpus,
+            root_sp: jroot_sp,
+            ..
+        },
+    ) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[clk as i64],
+        &jwin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.region_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT freeze of nested tree failed: {e:?}\n{inst:#?}"),
+    };
     assert!(
         matches!(jout, JitOutcome::Returned(_)),
         "freeze placeholder"
@@ -725,7 +778,7 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
         assert_eq!(j.func, i.func, "same func");
         assert_eq!(j.shadow_sp, i.shadow_sp, "same extent");
     }
-    assert_eq!(jroot_sp, iroot_sp, "same root extent");
+    assert_eq!(jroot_sp, Some(iroot_sp), "same root extent");
 
     // (3) Thaw on the JIT with an advanced clock: rebuild the per-parent join tables, run children
     // before parents, reload all three clock reads → 129 (a re-issue would be 99+100+101 = 300).
@@ -735,18 +788,22 @@ fn jit_freezes_and_thaws_a_nested_tree_matching_interp() {
     thost.set_durable(true);
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
-    let (tout, ..) = match compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, ..) = match compile_and_run_durable(
         &inst,
         0,
         &[tclk as i64],
         &twin,
-        &[],
-        &[],
-        &jvcpus,
-        jroot_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                vcpus: jvcpus.to_vec(),
+                root_sp: jroot_sp,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     ) {
         Ok(t) => t,
         Err(JitError::Unsupported(_)) => return,
@@ -825,25 +882,35 @@ fn jit_and_interp_freeze_a_futex_parked_child_identically() {
 
     let mut jhost = Host::new();
     jhost.set_durable(true);
-    let (jout, jsnap, jfibers, jvcpus, _) =
-        match compile_and_run_capture_reserved_with_host_durable_mv(
-            &inst,
-            0,
-            &[],
-            &win,
-            &[],
-            &[],
-            &[],
-            TEST_ARENA.region_base(0),
-            SIZE_LOG2,
-            temen_run::cap_thunk,
-            &mut jhost as *mut Host as *mut c_void,
-        ) {
-            Ok(t) => t,
-            Err(JitError::Unsupported(_)) => return,
-            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
-            Err(e) => panic!("JIT failed on a verified module: {e:?}"),
-        };
+    let (
+        jout,
+        jsnap,
+        DurableResidue {
+            fibers: jfibers,
+            vcpus: jvcpus,
+            ..
+        },
+    ) = match compile_and_run_durable(
+        &inst,
+        0,
+        &[],
+        &win,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                root_sp: Some(TEST_ARENA.region_base(0)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ) {
+        Ok(t) => t,
+        Err(JitError::Unsupported(_)) => return,
+        Err(JitError::Backend(msg)) if msg.contains("Allocation error") => return,
+        Err(e) => panic!("JIT failed on a verified module: {e:?}"),
+    };
     assert!(
         matches!(jout, JitOutcome::Returned(_)),
         "JIT freeze returns a placeholder, got {jout:?}"
@@ -892,18 +959,22 @@ fn jit_and_interp_freeze_a_futex_parked_child_identically() {
     begin_thaw(&mut twin, TEST_ARENA, 0);
     let mut thost = Host::new();
     thost.set_durable(true);
-    let (tout, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, ..) = compile_and_run_durable(
         &inst,
         0,
         &[],
         &twin,
-        &[],
-        &[],
-        &seed,
-        iroot_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                vcpus: seed.to_vec(),
+                root_sp: Some(iroot_sp),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("JIT thaw of the oracle's cut");
     assert_eq!(tout, JitOutcome::Returned(vec![2100]));
@@ -930,21 +1001,24 @@ fn jit_durable_run_bounded(
         h.set_durable(true);
         h.clock_ns = 42;
         let clk = h.grant_clock();
-        let r = compile_and_run_capture_reserved_with_host_durable_mv(
+        let r = compile_and_run_durable(
             &inst,
             0,
             &[clk as i64],
             &win,
-            &[],
-            &[],
-            &[],
-            TEST_ARENA.region_base(0),
             SIZE_LOG2,
             temen_run::cap_thunk,
             &mut h as *mut Host as *mut c_void,
+            DurableRun {
+                seed: DurableResidue {
+                    root_sp: Some(TEST_ARENA.region_base(0)),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
         );
         let _ = tx.send(match r {
-            Ok(t) => Some(t),
+            Ok((o, w, r)) => Some((o, w, r.fibers, r.vcpus, r.root_sp.unwrap_or(0))),
             Err(JitError::Unsupported(_)) => None,
             Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
             Err(e) => panic!("JIT failed on a verified durable module: {e:?}"),
@@ -1087,22 +1161,139 @@ fn a_trigger_that_fires_in_a_joined_child_freezes_identically_on_both_engines() 
     thost.set_durable(true);
     thost.clock_ns = 99;
     let tclk = thost.grant_clock();
-    let (tout, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+    let (tout, ..) = compile_and_run_durable(
         &inst,
         0,
         &[tclk as i64],
         &twin,
-        &[],
-        &jfibers,
-        &jvcpus,
-        jroot_sp,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut thost as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: jfibers.to_vec(),
+                vcpus: jvcpus.to_vec(),
+                root_sp: Some(jroot_sp),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("JIT thaw");
     assert!(
         matches!(tout, JitOutcome::Returned(ref v) if v == &[147]),
         "the thawed cut finishes the uninterrupted run: {tout:?}"
+    );
+}
+
+/// #1690 — the **embedder's** durable JIT path (`temen_run::jit_cap_run`, what an embedder that
+/// snapshots through `temen_snapshot` runs) carries the spawned-vCPU residue and the root's extent
+/// through the `Host` both ways. It used to hand back fibers only, so a frozen thread was silently
+/// missing from the artifact and the thaw's `thread.join` found nothing. The interpreter is the
+/// oracle for both the residue and the thawed result.
+#[test]
+fn the_embedder_jit_path_carries_the_vcpu_residue_both_ways() {
+    let inst = instrument();
+    let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut fwin, STATE_UNWINDING);
+    let (_, isnap, _, ivcpus, iroot) = interp_durable_run(&inst, &fwin, 42, None);
+
+    // Freeze on the JIT through the embedder path: the residue lands on the Host.
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.clock_ns = 42;
+    let clk = h.grant_clock();
+    let jsnap = match temen_run::jit_cap_run(&inst, 0, &[clk as i64], &fwin, SIZE_LOG2, 0, &mut h) {
+        Ok((_, snap)) => snap,
+        Err(JitError::Unsupported(_)) => return, // a target without the threads runtime
+        Err(e) => panic!("JIT freeze failed: {e:?}"),
+    };
+    let jvcpus = h.frozen_vcpus().to_vec();
+    assert_eq!(
+        jvcpus.len(),
+        ivcpus.len(),
+        "the spawned child's residue reached the Host"
+    );
+    for (j, i) in jvcpus.iter().zip(&ivcpus) {
+        assert_eq!(
+            (j.task, j.parent_task, j.func),
+            (i.task, i.parent_task, i.func)
+        );
+        assert_eq!(j.shadow_sp, i.shadow_sp, "same extent");
+    }
+    assert_eq!(
+        h.frozen_root_sp(),
+        iroot,
+        "the root's extent reached the Host too"
+    );
+
+    // Thaw on the JIT through the same path, from the Host, under an advanced clock: the result is
+    // the interpreter's thaw of the interpreter's own cut.
+    let (iresult, ..) = {
+        let mut twin = isnap.clone();
+        begin_thaw(&mut twin, TEST_ARENA, 0);
+        interp_durable_run(&inst, &twin, 99, Some((Vec::new(), ivcpus, iroot.unwrap())))
+    };
+    let mut twin = jsnap;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut th = Host::new();
+    th.set_durable(true);
+    th.clock_ns = 99;
+    let tclk = th.grant_clock();
+    th.set_frozen_vcpus(jvcpus);
+    th.set_frozen_root_sp(h.frozen_root_sp().expect("root extent"));
+    let (tout, _) = temen_run::jit_cap_run(&inst, 0, &[tclk as i64], &twin, SIZE_LOG2, 0, &mut th)
+        .expect("JIT thaw");
+    let want = match iresult {
+        Ok(v) => v,
+        Err(t) => panic!("interp thaw trapped: {t:?}"),
+    };
+    let JitOutcome::Returned(got) = tout else {
+        panic!("JIT thaw did not return: {tout:?}");
+    };
+    assert_eq!(
+        got,
+        want.iter()
+            .map(|v| match v {
+                Value::I64(x) => *x,
+                other => panic!("unexpected result {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        "the JIT's thaw from the Host matches the interpreter's"
+    );
+    assert!(
+        th.frozen_vcpus().is_empty(),
+        "the thaw consumed the residue"
+    );
+}
+
+/// #1690 — residue the JIT cannot re-create yet is refused whole, and left on the `Host` so the
+/// embedder can thaw on the interpreter instead: never silently dropped.
+#[test]
+fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
+    let inst = instrument();
+    let mut h = Host::new();
+    h.set_durable(true);
+    let clk = h.grant_clock();
+    let detached = temen_interp::FrozenDetached {
+        parent_task: 0,
+        slot: 0,
+        completed_result: 7,
+    };
+    h.set_frozen_detached(vec![detached]);
+    let r = temen_run::jit_cap_run(
+        &inst,
+        0,
+        &[clk as i64],
+        &init_durable_window(WINDOW, TEST_ARENA),
+        SIZE_LOG2,
+        0,
+        &mut h,
+    );
+    assert!(matches!(r, Err(JitError::Unsupported(_))), "refused: {r:?}");
+    assert_eq!(
+        h.frozen_detached(),
+        &[detached],
+        "and the residue is still there"
     );
 }

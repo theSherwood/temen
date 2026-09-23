@@ -1444,7 +1444,7 @@ resume/suspend — through the freeze→thaw round-trip (R11).
 **3.3.1 landed**: the JIT maintains the per-fiber **shadow-SP swap** in `fiber_resume` (which
 brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_suspend` needs no change),
 keyed off a `durable` flag + window base armed on the root `FiberRuntime` at entry and a per-`FiberSlot`
-saved-SP. Gated by `compile_and_run_capture_reserved_with_host_durable`; tested by
+saved-SP. Gated by the durable JIT entry (now `compile_and_run_durable`); tested by
 `crates/temen/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
 against `temen_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze driver**
 (`fiber_rt::freeze_drive`, hooked into `run_code_raw` after the root unwinds, gated on the
@@ -1459,7 +1459,7 @@ residue per flattened fiber (entry funcref + data-SP retained in the `FiberSlot`
 flattened shadow-SP read after), and a thaw **re-seeds** those fibers into the run-shared table
 before re-entering under `REWINDING` (`fiber_rt::seed_frozen_fibers` builds each via the shared
 `make_fiber`, so a thaw `cont.resume` re-enters its entry → rewinds → re-parks). The durable entry
-(`compile_and_run_capture_reserved_with_host_durable`) takes a `seed` and returns the residue.
+(now `compile_and_run_durable`, #1690) takes a `seed` and returns the residue.
 `durable_fibers_jit.rs` proves both cross-backend directions: interp and JIT freeze a fiber'd domain
 to a **byte-identical §12 artifact** (window image + Section-2 residue), and an **interpreter-frozen
 fiber artifact** restored through the codec **thaws on the JIT** to the uninterrupted result (107).
@@ -1583,6 +1583,19 @@ the codec rightly refuses). *Interp note:* recycling is done interp-side, but th
 STW (single-worker; `arm_freeze_after` flips only the running vCPU's word), so the recycled-context-at-freeze
 stays a **JIT** slice; the interp path is unaffected. *Still optional:* fuzzing the spawn/join/freeze interleaving.
 
+**One durable JIT entry, one residue (#1690, #1691).** The JIT's five durable entries
+(`…_durable`, `_nested`, `_interruptible`, `_mv`, `_mv_interruptible`) each carried a different subset
+of the residue and silently dropped the rest; the embedder's path (`temen_run::jit_cap_run`) carried
+fibers only, so a frozen thread or nested child never reached the artifact. They are now one
+`compile_and_run_durable(…, DurableRun { init_prots, seed, freeze })` over one `DurableResidue { fibers,
+vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and `jit_durable_enter`/`_leave`
+carry all of it through the `Host` both ways. An async freeze controller now always engages the
+concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
+the root's (#1691). Residue the JIT cannot re-create yet (a separate-module or completed nested child,
+a nested child's host state, a detached child — #1692, #1361) is refused whole as `Unsupported` and
+left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
+(`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
+
 **Declined freezes (#1671, owner decision 2026-09-23).** A freeze that cannot complete is **declined at its
 trigger, before anything unwinds** — never a domain-killing trap (INVARIANTS #5). The instant a countdown
 trigger fires (`durable_tick_countdown` promotes `ARMED` → `UNWINDING`, at a fiber safepoint or a back-edge),
@@ -1672,7 +1685,7 @@ global `UNWINDING` — it did, and a root woken from a join by a child that unwo
 **Decomposition:**
 - **PR-1 (freeze side) — DONE:** the deferred single-worker path (`defer_spawn` /
   `Domain::drive_frozen_spawns`) + `FrozenVCpu` residue + vCPU-context allocator, exported through
-  `compile_and_run_capture_reserved_with_host_durable_mv`. Pinned by `durable_multivcpu_jit`'s
+  the durable JIT entry (now `compile_and_run_durable`, #1690). Pinned by `durable_multivcpu_jit`'s
   `jit_freezes_a_spawned_vcpu_matching_interp`: a root+child domain freezes to a **byte-identical durable
   reserve** and a **field-identical `FrozenVCpu` residue** vs the interpreter (the multi-vCPU analog of
   `jit_freeze_driver_flattens_a_fiber_matching_interp`).
