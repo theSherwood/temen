@@ -7984,6 +7984,8 @@ struct WarmCoop {
     jit_importer: bool,
     shared: bool,
     prog: bytecode::SharedProgram,
+    /// #1627: the emit is spill-instrumented (see [`CoopEmit::spill`]).
+    spill: bool,
 }
 
 /// The one live warm session (single-threaded wasm ⇒ a plain static). `None` until [`temen_warm_open`].
@@ -8564,6 +8566,7 @@ pub extern "C" fn temen_warm_coop_open(shared: i32) -> i32 {
         jit_importer: emit.jit_importer,
         shared: shared != 0,
         prog,
+        spill: emit.spill,
         m: emit.m,
     }));
     set(STATUS_OK);
@@ -8667,6 +8670,7 @@ pub extern "C" fn temen_warm_coop_prepare(stdin_ptr: *const u8, stdin_len: usize
             pagestate_version: u64::MAX,
             pagestate_env: i64::MIN,
             pagestate_cover: 0,
+            spill: spill_region(wc.spill),
         });
     }
     set(STATUS_OK);
@@ -13377,6 +13381,12 @@ pub extern "C" fn temen_wasmjit_env_bytes() -> usize {
     temen_wasm_jit::ENV_CELL_BYTES
 }
 
+/// #1627: byte offset of the env cell's spill cursor (`i32`); the region's end follows at `+ 4`.
+#[no_mangle]
+pub extern "C" fn temen_wasmjit_spill_sp_off() -> usize {
+    temen_wasm_jit::ENV_SPILL_SP_OFF
+}
+
 /// Materialize the most recent [`temen_wasmjit_compile`] module's **data segments** into the window at
 /// `[win_ptr, win_ptr + win_size)` — the emitted code only loads/stores, so the host must lay the
 /// module's initialized data into the window before running `f{entry}` (exactly what the
@@ -14845,6 +14855,10 @@ struct CoopTierupRun {
     /// counters, so the cache key is (env, version), never version alone.
     pagestate_env: i64,
     pagestate_cover: u64,
+    /// #1627: the spill stack a spilling emit ([`CoopEmit::spill`]) pushes to — [`COOP_SPILL_BYTES`]
+    /// of `u64`s, so it is 8-aligned (a `temen_alloc`ation is not); empty for a run that doesn't
+    /// spill. Emitted code writes it through the env cell's cursor; Rust only reads the live prefix.
+    spill: Vec<u64>,
 }
 
 impl CoopTierupRun {
@@ -14906,6 +14920,10 @@ struct CoopEmit {
     all_shimmable: bool,
     table_log2: u8,
     jit_importer: bool,
+    /// #1627: the guest reaches `gc.roots` and emitted over the shared table, so the wasm was
+    /// compiled with `gc_spill` — its frames push their live words, and the driver must hand them to
+    /// each bounce ([`temen_coop_call_interp`]'s `spill_*`).
+    spill: bool,
 }
 
 fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<CoopEmit, i32> {
@@ -14966,6 +14984,9 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
     // per-event/-bounce refresh carries the runtime remaps).
     let paged = all_shimmable
         && (m.data.iter().any(|d| d.readonly) || temen_wasm_jit::module_uses_unmap_protect(&m));
+    // #1627: a collecting guest emits over the shared table in spill mode instead of not at all.
+    // The local-table fallback has no spill path, so it keeps #1546's veto.
+    let spill = all_shimmable && m.funcs.iter().any(temen_ir::Func::uses_gc_roots);
     let page_log2 = temen_interp::host_page_size().trailing_zeros() as u8;
     let emitted_res = if paged {
         temen_wasm_jit::compile_module_tierup_b2_paged(
@@ -14973,10 +14994,10 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
             shared,
             table_log2 as u32,
             page_log2,
-            false, // #1627 slice C wires the spill region
+            spill,
         )
     } else if all_shimmable {
-        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, false)
+        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, spill)
     } else {
         temen_wasm_jit::compile_module_tierup(&emit_m, shared)
     };
@@ -15024,6 +15045,7 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
         all_shimmable,
         table_log2,
         jit_importer,
+        spill,
     })
 }
 
@@ -15063,6 +15085,7 @@ pub extern "C" fn temen_coop_open(
         all_shimmable,
         table_log2,
         jit_importer,
+        spill,
     } = match coop_emit_for(&m0, shared != 0, win_log2) {
         Ok(e) => e,
         Err(status) => {
@@ -15172,6 +15195,7 @@ pub extern "C" fn temen_coop_open(
             pagestate_version: u64::MAX,
             pagestate_env: i64::MIN,
             pagestate_cover: 0,
+            spill: spill_region(spill),
         });
     }
     set(STATUS_OK);
@@ -15513,8 +15537,13 @@ pub extern "C" fn temen_coop_deliver_jit_trap() {
 /// interp-resident leaf `target` over the **tiering-up task's** window/powerbox (routed by
 /// [`CoopRun::bounce`]). `args_ptr` is the env scratch (i64 slots, args→results in place). Returns
 /// `0` on success, `1` on a callback trap (staged for [`temen_coop_deliver_trap`]).
+///
+/// #1627: `spill_len` is how many words the emitted frames beneath this bounce have pushed — the
+/// driver reads the env cell's cursor and passes `(cursor - base) / 8` of [`temen_coop_spill_ptr`]'s
+/// region — and a `gc.roots` in the bounce scans them. Ignored for a run that does not spill, whose
+/// bounces keep refusing `gc.roots`.
 #[no_mangle]
-pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 {
+pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8, spill_len: usize) -> i32 {
     let Some(s) = (unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }) else {
         return 1;
     };
@@ -15523,8 +15552,12 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 
     let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
-    // #1627 slice C wires the spill stack; until then a `gc.roots` in a bounce fails closed.
-    match s.run.bounce(target, io, None) {
+    // A length past the region is no cursor this run's code produced: refuse `gc.roots` (fail
+    // closed) rather than scan a truncated view.
+    let spill = (!s.spill.is_empty())
+        .then(|| s.spill.get(..spill_len))
+        .flatten();
+    match s.run.bounce(target, io, spill) {
         Ok(_) => {
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth
@@ -15539,6 +15572,41 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 
             1
         }
     }
+}
+
+/// #1627: a spilling run's spill stack, in bytes. 1 MiB is 128 Ki live words across every emitted
+/// frame at once; a deeper stack traps `TRAP_SPILL_OVERFLOW` and the run declines to the interpreter
+/// like any other emitted trap.
+const COOP_SPILL_BYTES: usize = 1 << 20;
+
+fn spill_region(spill: bool) -> Vec<u64> {
+    if spill {
+        vec![0; COOP_SPILL_BYTES / 8]
+    } else {
+        Vec::new()
+    }
+}
+
+/// #1627: the size of this run's spill stack in bytes — `0` unless its emit spills. Before each
+/// emitted entry (TIERUP or JIT_INVOKE) the driver points the env cell's cursor pair
+/// ([`temen_wasmjit_spill_sp_off`]) at `[base, base + bytes)` of [`temen_coop_spill_ptr`]. Every such
+/// entry is outermost: a bounce drives the interpreter and never surfaces an event.
+#[no_mangle]
+pub extern "C" fn temen_coop_spill_bytes() -> usize {
+    unsafe { (*core::ptr::addr_of!(COOP_RUN)).as_ref() }.map_or(0, |s| s.spill.len() * 8)
+}
+
+/// #1627: the base of this run's spill stack (null unless it spills). Owned by the run; freed at
+/// [`temen_coop_close`].
+#[no_mangle]
+pub extern "C" fn temen_coop_spill_ptr() -> *mut u64 {
+    unsafe { (*core::ptr::addr_of_mut!(COOP_RUN)).as_mut() }.map_or(core::ptr::null_mut(), |s| {
+        if s.spill.is_empty() {
+            core::ptr::null_mut()
+        } else {
+            s.spill.as_mut_ptr()
+        }
+    })
 }
 
 /// The run window's committed scalar extent right now — the #717 value the host re-syncs to every

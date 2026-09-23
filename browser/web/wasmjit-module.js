@@ -392,7 +392,11 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
     __indirect_function_table: table,
     trap: () => {},
     call_interp: (target, argsPtr) => {
-      const rc = ex.temen_coop_call_interp(target, argsPtr);
+      // #1627: a spilling run hands the bounce the words its emitted frames pushed, `[base, cursor)`.
+      const spillLen = spillBase
+        ? (new DataView(memory.buffer).getUint32(envCell + spillOff, true) - spillBase) / 8
+        : 0;
+      const rc = ex.temen_coop_call_interp(target, argsPtr, spillLen);
       // #1233: the bounce may have been a `Jit.install`/`uninstall` issued from the emitted frame
       // itself (Forth's outer interpreter defining a word, then `call.dyn`ing it) — the slot mirror
       // moved mid-event, and the frame's next `call_indirect` must find the new occupant, not a stale
@@ -435,6 +439,19 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
   const instance = await WebAssembly.instantiate(module, unitImports());
   const emitted = instance.exports;
   const envCell = Number(ex.temen_alloc(ex.temen_wasmjit_env_bytes()));
+  // #1627: a collecting guest's emitted frames push their live words to a spill stack named by the
+  // env cell's cursor pair; every event is an outermost entry, so each one re-arms it at the base.
+  const spillBytes = ex.temen_coop_spill_bytes();
+  const spillBase = spillBytes ? Number(ex.temen_coop_spill_ptr()) : 0;
+  const spillOff = ex.temen_wasmjit_spill_sp_off();
+  const armEnv = () => {
+    const dv = new DataView(memory.buffer);
+    dv.setBigInt64(envCell, 1n << 61n, true);
+    if (spillBase) {
+      dv.setUint32(envCell + spillOff, spillBase, true);
+      dv.setUint32(envCell + spillOff + 4, spillBase + spillBytes, true);
+    }
+  };
   registerGlobals(emitted);
   // Per-code-handle unit instances (a runtime-compiled §22 unit runs emitted on JIT_INVOKE — the
   // JACL macro-staging shape). Async instantiation: a macro unit can exceed the sync compile budget.
@@ -609,7 +626,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
           const ps = Number(ex.temen_coop_pagestate_ptr());
           for (const g of pagestateGlobals) g.value = ps;
         }
-        new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+        armEnv();
         try {
           const ret = unit['f0'](eventWin(), envCell, ...args);
           const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
@@ -645,7 +662,7 @@ async function driveCoopTierupRun(ex, memory, cacheKey) {
         const ps = Number(ex.temen_coop_pagestate_ptr());
         for (const g of pagestateGlobals) g.value = ps;
       }
-      new DataView(memory.buffer).setBigInt64(envCell, 1n << 61n, true);
+      armEnv();
       try {
         const ret = emitted['f' + func](eventWin(), envCell, ...args);
         const rets = ret === undefined ? [] : Array.isArray(ret) ? ret : [ret];
