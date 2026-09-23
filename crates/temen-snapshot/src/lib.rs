@@ -57,10 +57,10 @@
 
 use temen_encode::{digest256, encode_module, wire};
 use temen_interp::{
-    Attestation, BudgetState, BudgetThawRefused, CapturedProt, DurableBinding, DurableHandle,
-    DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope, FrozenChildState,
-    FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout, NonDurableHandle,
-    ShadowArena, StreamRole, SvcDispatch,
+    Attestation, BudgetState, BudgetThawRefused, CapturedDetached, CapturedProt, DetachedLaunch,
+    DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope,
+    FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
+    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached,
 };
 use temen_ir::Module;
 
@@ -211,7 +211,11 @@ use temen_ir::Module;
 /// v25 (#1440): `B_FREEZE_AUTHORITY` — freeze authority is a durable binding, so a thawed parent
 /// still holds it over its thawed child. An artifact whose domain holds none is byte-identical to
 /// v24 but for the version field.
-const FORMAT_VERSION: u16 = 28;
+/// v29 (#1361 step 4): Section 8 (`TAG_DETACHED`) — each **live** detached child a freeze captured,
+/// as its own root-shaped artifact (this same format, recursively) behind its spawner-held launch
+/// record. Elided when the domain captured none, so such an artifact is byte-identical to v28 but for
+/// the version field.
+const FORMAT_VERSION: u16 = 29;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -239,6 +243,12 @@ const TAG_ATTEST: u64 = 6;
 /// and the state its provider captured. The handle table (Section 3) carries the `B_NAMED` *bindings*
 /// (indices); this carries what those indices name. Emitted only when the domain holds one.
 const TAG_NAMED: u64 = 7;
+/// Section 8 (v29, #1361 step 4): live detached children, each a nested artifact. See [`write_detached`].
+const TAG_DETACHED: u64 = 8;
+/// How deep detached children may nest inside one artifact. Restore recurses once per level, so an
+/// untrusted artifact must not choose the depth; freeze refuses past the same bound, so it never emits
+/// an artifact restore would reject.
+pub const MAX_DETACHED_DEPTH: usize = 64;
 
 // ---- Binding descriptors (§12.5). One tag byte + value-typed payload. ----
 const B_STREAM: u8 = 0;
@@ -307,6 +317,12 @@ pub enum FreezeError {
     /// restore would reject the artifact (`RestoreError::BindingOutOfWindow`), so freeze fails
     /// closed at the same line rather than producing an unrestorable snapshot.
     BindingOutOfWindow { slot: u32 },
+    /// #1361 step 4 — a live detached child the freeze rang never reached its poll, so its window was
+    /// never captured ([`Host::unreached_detached`]). The artifact would be missing a domain, so freeze
+    /// refuses it whole rather than emitting part of the tree.
+    DetachedUnreached { parent_task: usize, slot: usize },
+    /// Detached children nest deeper than [`MAX_DETACHED_DEPTH`].
+    DetachedTooDeep,
 }
 
 /// Why restoring an artifact failed. All are fail-closed: restore never yields partial state.
@@ -425,7 +441,18 @@ pub fn freeze_layout(
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
-    let prots: Vec<PageProt> = layout
+    freeze_with_prots(
+        module,
+        layout.bytes(),
+        &layout_prots(layout),
+        reserved_log2,
+        host,
+    )
+}
+
+/// A [`MemLayout`]'s dense page map as the codec's [`PageProt`]s.
+fn layout_prots(layout: &MemLayout) -> Vec<PageProt> {
+    layout
         .dense_prots()
         .into_iter()
         .map(|p| match p {
@@ -436,8 +463,7 @@ pub fn freeze_layout(
             // `MemLayout::from_parts`), so this arm is unreachable rather than a silent `Rw`.
             CapturedProt::Backed => unreachable!("a MemLayout never carries a Backed page"),
         })
-        .collect();
-    freeze_with_prots(module, layout.bytes(), &prots, reserved_log2, host)
+        .collect()
 }
 
 /// [`freeze`] with an explicit per-page protection map (§12.3): `prots[i]` is the protection of
@@ -458,6 +484,24 @@ pub fn freeze_with_prots(
     reserved_log2: u8,
     host: &Host,
 ) -> Result<Vec<u8>, FreezeError> {
+    freeze_at(module, window, prots, reserved_log2, host, 0)
+}
+
+/// [`freeze_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder asked for).
+fn freeze_at(
+    module: &Module,
+    window: &[u8],
+    prots: &[PageProt],
+    reserved_log2: u8,
+    host: &Host,
+    depth: usize,
+) -> Result<Vec<u8>, FreezeError> {
+    if let Some(p) = host.unreached_detached().first() {
+        return Err(FreezeError::DetachedUnreached {
+            parent_task: p.parent_task,
+            slot: p.slot,
+        });
+    }
     // The committed extent is page-granular (a `vm_map` grows whole pages) and must fit the mask
     // domain it grew within. Unlike v17 it need not be a power of two — a grown high-water rarely is.
     //
@@ -730,7 +774,65 @@ pub fn freeze_with_prots(
         section(&mut out, TAG_NAMED, |b| write_named(b, &named));
     }
 
+    // Section 8 — live detached children (#1361 step 4, v29). Each child's artifact is frozen first,
+    // so a child that can't be frozen fails this freeze whole (all-or-nothing, INVARIANTS #9c).
+    // Elided when none was captured, so such an artifact keeps the v28 layout.
+    let detached_live = host.captured_detached();
+    if !detached_live.is_empty() {
+        if depth >= MAX_DETACHED_DEPTH {
+            return Err(FreezeError::DetachedTooDeep);
+        }
+        let body = write_detached(detached_live, depth)?;
+        section(&mut out, TAG_DETACHED, |b| b.extend_from_slice(&body));
+    }
+
     Ok(out)
+}
+
+/// Serialize Section 8 (v29): the live detached children, canonical ascending `(parent_task, slot)`.
+/// Each record is the spawner-held [`DetachedLaunch`] — the edge, the program, and the bounds the child
+/// was granted — then the child's own artifact, length-prefixed. The child is a root of its own window,
+/// so its artifact is exactly this format, frozen from its own powerbox (with its own detached children
+/// in *its* Section 8).
+fn write_detached(children: &[CapturedDetached], depth: usize) -> Result<Vec<u8>, FreezeError> {
+    let mut order: Vec<&CapturedDetached> = children.iter().collect();
+    order.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+    let mut b = Vec::new();
+    write_uleb(&mut b, order.len() as u64);
+    for c in order {
+        let art = {
+            let h = c.host.lock().unwrap_or_else(|e| e.into_inner());
+            let prots = layout_prots(&c.window);
+            freeze_at(
+                &c.module,
+                c.window.bytes(),
+                &prots,
+                c.reserved_log2,
+                &h,
+                depth + 1,
+            )?
+        };
+        let l = &c.launch;
+        write_uleb(&mut b, c.parent_task as u64);
+        write_uleb(&mut b, c.slot as u64);
+        write_uleb(&mut b, l.task);
+        write_uleb(&mut b, l.entry as u64);
+        b.extend_from_slice(&l.digest);
+        write_uleb(&mut b, l.fuel);
+        write_uleb(&mut b, l.lane as u64);
+        write_uleb(&mut b, l.channel as u64);
+        write_uleb(&mut b, l.max_vcpus);
+        b.push(l.same_module as u8);
+        write_uleb(&mut b, l.names.len() as u64);
+        for (name, h) in &l.names {
+            write_uleb(&mut b, name.len() as u64);
+            b.extend_from_slice(name.as_bytes());
+            write_uleb(&mut b, *h as u32 as u64);
+        }
+        write_uleb(&mut b, art.len() as u64);
+        b.extend_from_slice(&art);
+    }
+    Ok(b)
 }
 
 /// Serialize the named host capabilities (Section 7, v21). Canonical: the entry count, then one
@@ -833,7 +935,17 @@ pub fn restore_layout(
     module: &Module,
     host: &mut Host,
 ) -> Result<(MemLayout, u8), RestoreError> {
-    let (bytes, prots, reserved_log2) = restore_with_prots(artifact, module, host)?;
+    restore_layout_at(artifact, module, host, 0)
+}
+
+/// [`restore_layout`] at detached-nesting `depth`.
+fn restore_layout_at(
+    artifact: &[u8],
+    module: &Module,
+    host: &mut Host,
+    depth: usize,
+) -> Result<(MemLayout, u8), RestoreError> {
+    let (bytes, prots, reserved_log2) = restore_at(artifact, module, host, depth)?;
     let mapped = module.memory.map_or(0, |mc| 1u64 << mc.size_log2);
     let prots: Vec<CapturedProt> = prots
         .iter()
@@ -858,6 +970,16 @@ pub fn restore_with_prots(
     module: &Module,
     host: &mut Host,
 ) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
+    restore_at(artifact, module, host, 0)
+}
+
+/// [`restore_with_prots`] at detached-nesting `depth` (0 for the artifact an embedder handed in).
+fn restore_at(
+    artifact: &[u8],
+    module: &Module,
+    host: &mut Host,
+    depth: usize,
+) -> Result<(Vec<u8>, Vec<PageProt>, u8), RestoreError> {
     // The unified TEMEN wire header (WIRE.md): magic, then this codec's own kind/version/flags,
     // each fail-closed at the header before any section is read.
     let (hdr, payload) = wire::read_header(artifact).map_err(|e| match e {
@@ -880,6 +1002,7 @@ pub fn restore_with_prots(
     let mut jit_body = None;
     let mut attest_body = None;
     let mut named_body = None;
+    let mut detached_body = None;
     while !r.at_end() {
         let tag = r.uleb()?;
         let len = r.uleb()? as usize;
@@ -893,6 +1016,7 @@ pub fn restore_with_prots(
             TAG_JIT => jit_body = Some(body),
             TAG_ATTEST => attest_body = Some(body),
             TAG_NAMED => named_body = Some(body),
+            TAG_DETACHED => detached_body = Some(body),
             // Fail closed on an unknown tag (#915/§8). The version gate above already pins
             // `version == FORMAT_VERSION`, so no artifact this build emits can carry one — silently
             // skipping it was dead "forward-compat" that only opened a canonicality hole (a
@@ -1128,7 +1252,101 @@ pub fn restore_with_prots(
         host.set_attestation(attest);
     }
 
+    // ---- Live detached children (#1361 step 4, v29): each restored from its own nested artifact into
+    // its own powerbox, against the module grant its launch record names. Last, so the parent's own
+    // handle table (and so the registrar's answers for it) is settled first; all-or-nothing — any
+    // child failing fails this restore. ----
+    if let Some(body) = detached_body {
+        let children = decode_detached(body, host, depth)?;
+        host.set_thawed_detached(children);
+    }
+
     Ok((window, prots, reserved_log2))
+}
+
+/// Decode Section 8 ([`write_detached`]) and restore each child's artifact into a fresh powerbox that
+/// holds the restoring host's thaw seams ([`Host::detached_thaw_host`]). A child whose module the
+/// restoring host no longer grants is `ModuleUnresolved`, the same answer as for a handle.
+fn decode_detached(
+    body: &[u8],
+    host: &mut Host,
+    depth: usize,
+) -> Result<Vec<ThawedDetached>, RestoreError> {
+    if depth >= MAX_DETACHED_DEPTH {
+        return Err(RestoreError::Malformed);
+    }
+    let mut r = Reader::new(body);
+    let n = r.uleb()? as usize;
+    if n == 0 {
+        return Err(RestoreError::Malformed); // canonical: an empty list elides the section
+    }
+    let mut out: Vec<ThawedDetached> = Vec::with_capacity(n.min(64));
+    for _ in 0..n {
+        let parent_task = r.uleb()? as usize;
+        let slot = r.uleb()? as usize;
+        if out
+            .last()
+            .is_some_and(|p| (p.parent_task, p.slot) >= (parent_task, slot))
+        {
+            return Err(RestoreError::Malformed); // canonical: strictly ascending `(parent_task, slot)`
+        }
+        let task = r.uleb()?;
+        let entry = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)?;
+        let digest: [u8; 32] = r
+            .take(32)?
+            .try_into()
+            .expect("take(32) yields exactly 32 bytes");
+        let fuel = r.uleb()?;
+        let lane = r.uleb()? as i64;
+        let channel = r.uleb()? as i64;
+        let max_vcpus = r.uleb()?;
+        let same_module = match r.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(RestoreError::Malformed),
+        };
+        let n_names = r.uleb()? as usize;
+        let mut names = Vec::with_capacity(n_names.min(64));
+        for _ in 0..n_names {
+            let len = r.uleb()? as usize;
+            let name = core::str::from_utf8(r.take(len)?)
+                .map_err(|_| RestoreError::Malformed)?
+                .to_string();
+            let h = u32::try_from(r.uleb()?).map_err(|_| RestoreError::Malformed)? as i32;
+            names.push((name, h));
+        }
+        let art_len = r.uleb()? as usize;
+        let art = r.take(art_len)?;
+        let module = host
+            .durable_module_by_digest(&digest)
+            .ok_or(RestoreError::ModuleUnresolved(digest))?;
+        let mut child = host.detached_thaw_host();
+        let restored = restore_layout_at(art, &module, &mut child, depth + 1);
+        host.reclaim_thaw_seams(&mut child);
+        let (window, reserved_log2) = restored?;
+        out.push(ThawedDetached {
+            parent_task,
+            slot,
+            window,
+            reserved_log2,
+            host: child,
+            launch: DetachedLaunch {
+                task,
+                entry,
+                digest,
+                fuel,
+                lane,
+                channel,
+                max_vcpus,
+                same_module,
+                names,
+            },
+        });
+    }
+    if !r.at_end() {
+        return Err(RestoreError::Malformed);
+    }
+    Ok(out)
 }
 
 /// Decode Section 2: the frozen-fiber residue (canonical ascending slot), then — appended only when
