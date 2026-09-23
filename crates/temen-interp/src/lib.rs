@@ -19349,12 +19349,19 @@ pub type HostProcStateRestore = Box<dyn Fn(&[u8]) + Send>;
 
 /// #1455 — the embedder's thaw-side re-granter for named host capabilities
 /// ([`Host::set_named_cap_registrar`]): given the name a capability was registered under and the
-/// state its provider captured at freeze, return the handler to install, or `None` to refuse.
+/// state its provider captured at freeze, return the handler to install — with its fork factory
+/// when the capability is forkable — or `None` to refuse.
 ///
 /// Refusing is a real answer, not an error path to route around: this is the seam that keeps an
 /// artifact from conferring authority. The restoring embedder grants what it would have granted a
 /// fresh run, and an artifact naming something it does not serve simply fails to thaw.
-pub type NamedCapRegistrar = Box<dyn FnMut(&str, &[u8]) -> Option<HostProc> + Send>;
+///
+/// #1718 — the factory rides back *with* the handler because "what it would have granted a fresh
+/// run" includes forkability. A capability granted forkable (so it can be re-granted into a §14
+/// child — `Host::can_regrant` — or carried into a `fork()` twin) must come back forkable, or a
+/// thawed domain could no longer hand a child what the same domain could before its freeze.
+pub type NamedCapRegistrar =
+    Box<dyn FnMut(&str, &[u8]) -> Option<(HostProc, Option<HostProcFork>)> + Send>;
 
 /// Why a thaw could not re-grant a named host capability (#1455): the restoring embedder's registrar
 /// does not serve `name` — or there was no registrar at all. Fail-closed, and named, so an embedder
@@ -23140,9 +23147,10 @@ impl Host {
     ///
     /// Each captured entry is handed to the embedder's registrar
     /// ([`Self::set_named_cap_registrar`]) as `(name, state)`; the registrar returns the handler to
-    /// install — a fresh closure of the embedder's own making, re-seeded from `state` if it cares.
-    /// Entries are rebuilt **positionally** (a `None`, or a name the registrar declines, leaves a
-    /// placeholder that traps if ever dispatched), so indices re-resolve exactly.
+    /// install — a fresh closure of the embedder's own making, re-seeded from `state` if it cares —
+    /// and its fork factory, which the rebuilt entry keeps (#1718: a thaw never narrows a capability
+    /// to un-forkable). Entries are rebuilt **positionally** (a `None`, or a name the registrar
+    /// declines, leaves a placeholder that traps if ever dispatched), so indices re-resolve exactly.
     ///
     /// Fail-closed, and this is the security-relevant part: with no registrar set, or for a name the
     /// registrar does not know, nothing is granted and the restore reports the offending name. An
@@ -23156,15 +23164,15 @@ impl Host {
         let mut out = Vec::with_capacity(caps.len());
         let mut refused = None;
         for cap in caps {
-            let handler = match cap {
+            let (handler, fork) = match cap {
                 // An index no live handle named: keep the slot so later indices line up, but install
                 // a handler that traps rather than one that silently answers.
-                None => None,
+                None => (None, None),
                 Some(c) => match registrar.as_mut().and_then(|r| r(&c.name, &c.state)) {
-                    Some(h) => Some(h),
+                    Some((h, fork)) => (Some(h), fork),
                     None => {
                         refused.get_or_insert_with(|| c.name.clone());
-                        None
+                        (None, None)
                     }
                 },
             };
@@ -23174,7 +23182,7 @@ impl Host {
                         Box::new(|_op, _args, _mem, _minter| Err(Trap::CapFault))
                     }),
                 ),
-                fork: None,
+                fork,
                 mints: false,
                 vtable: None,
                 state: None,

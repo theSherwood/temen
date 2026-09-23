@@ -426,6 +426,245 @@ fn a_thawed_reactor_can_be_frozen_again() {
     assert!(!expected.is_empty());
 }
 
+// ---- #1718: the powerbox re-grants into a §14 child — fresh, and after a thaw -----------------
+//
+// Every on-ramp capability is granted **forkable**, so a guest can hand one to a §14 child by name (the
+// op-17 grant record, the attenuation cards' mechanism) and the child reaches the *same* cells the page
+// does: its `present` is the frame the page reads, it drains the queue the page pushes to, it reads the
+// file the page served. A thaw must keep that. Its registrar hands the fork factory back with the
+// handler, or a restored reactor could not re-grant what it could before its freeze.
+
+/// How a case's reactor is brought up before the `tick` that spawns the child: opened, or opened then
+/// frozen and thawed into a fresh reactor (the registrar path).
+#[derive(Clone, Copy, Debug)]
+enum Start {
+    Fresh,
+    Thawed,
+}
+
+/// `s` (at most 8 bytes) packed little-endian, as a guest stores it with one `i64.store`.
+fn packed(s: &str) -> i64 {
+    let mut b = [0u8; 8];
+    b[..s.len()].copy_from_slice(s.as_bytes());
+    i64::from_le_bytes(b)
+}
+
+/// A reactor whose `tick` spawns a §14 child (func 2, a 64 KiB carve) with exactly one capability,
+/// `cap`, re-granted by name, joins it, and writes the low byte of the child's result to stdout (`?` if
+/// the child could not resolve `cap`). A grant the parent may not re-grant fails the spawn closed —
+/// op 17 traps `CapFault` on every engine. `child_body` runs in the child with the resolved handle in
+/// `vh2: i32` and returns an `i64`.
+fn regrant_reactor(cap: &str, child_body: &str) -> temen_ir::Module {
+    let (len, name) = (cap.len(), packed(cap));
+    let src = format!(
+        r#"memory 20
+data 16384 "instantiator"
+data 16400 "{cap}"
+data 16416 "stdout"
+export 0 func "_start" 0
+export 1 func "tick" 1
+
+func () -> (i64) {{
+block 0 () {{
+  vz = i64.const 0
+  return vz
+  }}
+}}
+
+func (i64) -> (i64) {{
+block 0 (vsp: i64) {{
+  vnp = i64.const 16384
+  vnl = i64.const 12
+  vinst = self.resolve vnp vnl
+  vcp = i64.const 16400
+  vcl = i64.const {len}
+  vcap = self.resolve vcp vcl
+  ; the grant record at 17472: {{name_off, name_len, handle, flags}}
+  vg0 = i64.const 17472
+  vgn = i32.const 16400
+  i32.store vg0 vgn
+  vg1 = i64.const 17476
+  vgl = i32.const {len}
+  i32.store vg1 vgl
+  vg2 = i64.const 17480
+  i32.store vg2 vcap
+  vg3 = i64.const 17484
+  vgz = i32.const 0
+  i32.store vg3 vgz
+  ; the spawn record at 17408 (temen_ir::SpawnRec): entry 2, carve [64K, 128K), self module, one grant
+  vr0 = i64.const 17408
+  vf0 = i64.const 8589934592
+  i64.store vr0 vf0
+  vr1 = i64.const 17416
+  voff = i64.const 65536
+  i64.store vr1 voff
+  vr2 = i64.const 17424
+  vf2 = i64.const -4294967280
+  i64.store vr2 vf2
+  vr3 = i64.const 17432
+  vf3 = i64.const 4294967295
+  i64.store vr3 vf3
+  vr4 = i64.const 17440
+  vq = i64.const 0
+  i64.store vr4 vq
+  vr5 = i64.const 17448
+  i64.store vr5 vg0
+  vr6 = i64.const 17456
+  vn = i64.const 1
+  i64.store vr6 vn
+  vh = call.cap 6 17 (i64) -> (i32) vinst (vr0)
+  vgot = call.cap 6 1 (i32) -> (i64) vinst (vh)
+  vbp = i64.const 16432
+  i64.store vbp vgot
+  vop = i64.const 16416
+  vol = i64.const 6
+  vout = self.resolve vop vol
+  vone = i64.const 1
+  vw = call.cap 0 1 (i64, i64) -> (i64) vout (vbp, vone)
+  vret = i64.const 0
+  return vret
+  }}
+}}
+
+; the child: its carve starts zeroed, so it writes the capability's name itself before resolving it
+func (i64) -> (i64) {{
+block 0 (va: i64) {{
+  vcp = i64.const 16400
+  vname = i64.const {name}
+  i64.store vcp vname
+  vcl = i64.const {len}
+  vh = self.resolve vcp vcl
+  vz = i32.const 0
+  vmiss = i32.lt_s vh vz
+  br_if vmiss 1() 2(vh)
+}}
+block 1 () {{
+  vq = i64.const 63
+  return vq
+}}
+block 2 (vh2: i32) {{
+{child_body}
+  }}
+}}
+"#
+    );
+    temen_text::parse_module(&src)
+        .unwrap_or_else(|e| panic!("parse the {cap} re-grant reactor: {e:?}"))
+}
+
+/// The `display` child: presents a 1×1 frame (RGBA 11 22 33 44), answering `D` if `present` took it.
+const PRESENT_CHILD: &str = "  vpx = i64.const 16448
+  vrgba = i32.const 1144201745
+  i32.store vpx vrgba
+  vwh = i64.const 1
+  vr = call.cap 13 0 (i64, i64, i64) -> (i64) vh2 (vpx, vwh, vwh)
+  vd = i64.const 68
+  vres = i64.add vr vd
+  return vres";
+
+/// The `keyboard` / `mouse` child: polls one event and answers its low 16 bits (`-1`, empty, reads as
+/// `0xffff`), so the byte it answers is the one the page pushed.
+const POLL_CHILD: &str = "  vm = i64.const 65535
+  ve = call.cap 13 0 (i64) -> (i64) vh2 (vm)
+  vk = i64.and ve vm
+  return vk";
+
+/// The `fs` child: opens `data.bin`, reads its first byte into a zeroed slot, and answers it.
+fn read_child() -> String {
+    format!(
+        "  vnp = i64.const 16448
+  vname2 = i64.const {}
+  i64.store vnp vname2
+  vnl = i64.const 8
+  vfl = i64.const 0
+  vfd = call.cap 13 0 (i64, i64, i64) -> (i64) vh2 (vnp, vnl, vfl)
+  vbuf = i64.const 16464
+  vone = i64.const 1
+  vn = call.cap 13 1 (i64, i64, i64) -> (i64) vh2 (vfd, vbuf, vone)
+  vb = i64.load vbuf
+  return vb",
+        packed("data.bin")
+    )
+}
+
+/// Bring up `m` (serving `file` through `fs` if given) the `start` way, feed `input`, run one `tick`,
+/// and return what it wrote to stdout and the frame it presented.
+fn regrant_tick(
+    m: &temen_ir::Module,
+    file: Option<(String, Vec<u8>)>,
+    input: fn(&OnrampReactor),
+    start: Start,
+) -> (Vec<u8>, Option<Frame>) {
+    let mut r = match &file {
+        Some((name, bytes)) => OnrampReactor::open_with_fs(m, name.clone(), bytes.clone()),
+        None => OnrampReactor::open(m),
+    }
+    .expect("open");
+    if let Start::Thawed = start {
+        let artifact = r.freeze(m).expect("freeze");
+        r = OnrampReactor::thaw(&artifact, m, file).expect("thaw");
+    }
+    input(&r);
+    let (status, stdout) = r.frame();
+    assert_eq!(
+        status,
+        STATUS_OK,
+        "{start:?}: tick trapped: {}",
+        r.last_trap()
+    );
+    (stdout, r.take_frame())
+}
+
+/// The gate: each capability the page serves natively crosses into a §14 child and reaches the page's
+/// own cells, on a fresh reactor and on a thawed one. (`webgpu` is granted only in the wasm build.)
+/// Before #1718 every spawn here trapped `CapFault`: the handlers carried no fork factory, and a thaw
+/// dropped any factory they had.
+#[test]
+fn every_powerbox_capability_re_grants_into_a_child_fresh_and_thawed() {
+    let file = || Some(("data.bin".to_string(), b"F".to_vec()));
+    type Case = (
+        &'static str,
+        String,
+        Option<(String, Vec<u8>)>,
+        fn(&OnrampReactor),
+        &'static [u8],
+    );
+    let cases: [Case; 4] = [
+        ("display", PRESENT_CHILD.to_string(), None, |_| {}, b"D"),
+        (
+            "keyboard",
+            POLL_CHILD.to_string(),
+            None,
+            |r| r.push_key(75, 1),
+            b"K",
+        ),
+        (
+            "mouse",
+            POLL_CHILD.to_string(),
+            None,
+            |r| r.push_mouse(0, 77),
+            b"M",
+        ),
+        ("fs", read_child(), file(), |_| {}, b"F"),
+    ];
+    for start in [Start::Fresh, Start::Thawed] {
+        for (cap, body, served, input, answer) in &cases {
+            let m = regrant_reactor(cap, body);
+            let (stdout, frame) = regrant_tick(&m, served.clone(), *input, start);
+            assert_eq!(
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(answer),
+                "{cap} ({start:?}): `?` = the child could not resolve it"
+            );
+            if *cap == "display" {
+                let f = frame.expect("the child's present is the frame the page reads");
+                assert_eq!((f.width, f.height), (1, 1));
+                assert_eq!(f.rgba, [0x11, 0x22, 0x33, 0x44], "{start:?}");
+            }
+        }
+    }
+}
+
 // ---- #1457 items 3–4: the input tape and the keyframe ladder ---------------------------------
 //
 // A moment alone only goes *back* to a point you thought to save. A `ReactorTimeline` adds the two
