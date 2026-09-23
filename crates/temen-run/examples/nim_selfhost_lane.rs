@@ -9,7 +9,7 @@
 //! ```text
 //! nim_selfhost_lane [--sh <sh.ir>] [--check <prog.nim | lib/std/x.nim>] [--hexer <hexer.temen>]
 //!                   [--expect <native-nimcache>]
-//!                   <nimsem.temen> <nifler2.temen> <libdir> <sys.p.nif> <sys-stem> <out.s.nif>
+//!                   <nimsem.temen> <nifler2.temen> <libdir> <out.s.nif>
 //! ```
 //!
 //! What runs, in the order `nimony c --isMain prog.nim` runs it (its `.build.nif` plan):
@@ -28,8 +28,8 @@
 //! backend, where native nimony runs `dce` → lengc → a C compiler. `lengc` is nimony's *C* emitter
 //! and has no place on a Temen target. Running nimony's driver and nifmake in-guest is the next step.
 //!
-//! `--expect` makes the run a **test**: every `.s.nif` (and, with `--hexer`, every `.x.nif`) native
-//! nimony wrote must exist here and match (byte for byte; see [`expect_native`]).
+//! `--expect` makes the run a **test**: every artifact of every phase must be native nimony's, byte
+//! for byte, when native runs the same phases built by the same compiler (see [`expect_native`]).
 //!
 //! **The shell-out.** `nimsem m` shells out to nifler for a file it needs parsed and finds no
 //! current `.p.nif` for — in practice the files a module includes (`deps.nim`'s `execNifler` →
@@ -164,40 +164,6 @@ fn dump_cache(posix: &temen_posix::Posix, out_p: &str) {
     eprintln!("dumped {n} nimcache files to {dir}");
 }
 
-/// `.x.nif` declarations in a canonical order: the top-level items sorted, and the trailing index's
-/// entries with their byte offsets masked (an offset is where an item landed, so order moves it).
-///
-/// For the one known divergence only (#1753): hexer compiled to Temen emits some of a
-/// module's declarations in a different order than native hexer over the same input. Same items,
-/// same bytes each. An `.x.nif` is compared exactly first; this is the fallback, and it is reported.
-fn declarations(text: &str) -> Vec<String> {
-    // `(.index@` — not `(.index`, which also matches the `(.indexat …)` header on line 2.
-    let (body, index) = text.split_at(text.find("(.index@").unwrap_or(text.len()));
-    let mut items: Vec<String> = Vec::new();
-    for l in body.lines() {
-        // A top-level item opens at one space of indent; everything deeper continues the last one.
-        match items.last_mut() {
-            Some(last) if !l.starts_with(" (") => {
-                last.push('\n');
-                last.push_str(l);
-            }
-            _ => items.push(l.to_string()),
-        }
-    }
-    items.extend(index.lines().map(|l| {
-        // ` (h <sym> 130)` → ` (h <sym> N)`, keeping however many parens close the line.
-        let t = l.trim_end_matches(')');
-        match t.rsplit_once(' ') {
-            Some((head, n)) if !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) => {
-                format!("{head} N{}", &l[t.len()..])
-            }
-            _ => l.to_string(),
-        }
-    }));
-    items.sort();
-    items
-}
-
 /// Load a chibicc-emitted **command module** (IR text, `--child-entry`) — the `/bin/sh` that turns
 /// nimsem's shell-out into a real `execve`. Kept out of the asset pipeline deliberately: the shell
 /// is host environment, the way a kernel is, and passing it in keeps #763's "no C compiler"
@@ -212,6 +178,30 @@ fn command_module(path: &str, what: &str) -> temen_ir::Module {
         m.memory.as_ref().map(|x| x.size_log2).unwrap_or(0),
     );
     m
+}
+
+/// **nifler** over one module, as native nimony's plan runs its parse step (`nifler --portablePaths
+/// --deps parse <src> <out>`). The one host-run parse, for every module nimsem does not parse
+/// itself: `system`, the program, and each import. Returns the module's cache stem.
+fn parse(
+    nifler: &temen_ir::Module,
+    posix: &temen_posix::Posix,
+    make: &Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    src: &str,
+) -> String {
+    let stem = temen_run::nim_module_suffix(src, &["lib"]);
+    let out = format!("nimcache/{stem}.p.nif");
+    let argv: Vec<String> = ["nifler", "--portablePaths", "--deps", "parse", src, &out]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    temen_run::nim_noc_run(nifler.clone(), posix, Arc::clone(make), &argv)
+        .unwrap_or_else(|e| panic!("nifler2 on {src}: {e}"));
+    assert!(
+        posix.read_file(&out).is_some(),
+        "nifler2 wrote no {out} for {src}"
+    );
+    stem
 }
 
 /// Run nimsem until it produces `produced`: parse and semcheck the dependencies it names as missing
@@ -281,13 +271,7 @@ fn semcheck(
             // module its own `nifler` step, and nimsem only spawns nifler for what a module
             // *includes*. So its parse is served here too, as that plan's step.
             if posix.read_file(&pnif).is_none() {
-                let argv: Vec<String> =
-                    ["nifler", "--portablePaths", "--deps", "parse", src, &pnif]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                temen_run::nim_noc_run(nifler.clone(), posix, Arc::clone(make), &argv)
-                    .unwrap_or_else(|e| panic!("nifler2 on {src}: {e}"));
+                parse(nifler, posix, make, src);
             }
             let argv: Vec<String> = [
                 "nimsem",
@@ -464,58 +448,73 @@ fn link_and_run(posix: &temen_posix::Posix) -> Vec<u8> {
     run.stdout()
 }
 
-/// `--expect`: every artifact native nimony wrote for a phase this run performed (`.s.nif` from
-/// nimsem, and `.x.nif` from hexer when it ran) must be here, **byte for byte**. Nothing is
-/// normalized: the lane script runs native nimony from a tree laid out as this memfs is (`lib/` at
-/// its cwd), so both record the same paths. The one tolerance is [`declarations`]' — named, and
-/// reported when used.
+/// `--expect`: the run's artifacts must be native nimony's, **byte for byte** — nothing is
+/// normalized and nothing is tolerated.
+///
+/// * every `.s.nif` native wrote (and, when hexer ran, every `.x.nif`) must be here and the same;
+/// * every `.p.nif` *this run* wrote must be native's. Native's driver also parses files nothing
+///   ends up including, so its set is the larger one.
+///
+/// Two conditions make exactness the right bar. The lane script runs native nimony from a tree laid
+/// out as this memfs is (`lib/` at its cwd), so both record the same paths. And its phases are the
+/// ones **nimony** built natively from the same sources as these Temen builds
+/// (`build_nim_hello_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
+/// own phases are built by classic Nim, a different compiler whose hash tables iterate in a
+/// different order, and hexer's output shows it (#1753).
 fn expect_native(posix: &temen_posix::Posix, native: &str, lowered: bool) {
-    let mut want: Vec<(String, Vec<u8>)> = Vec::new();
-    collect(Path::new(native), "", &mut want);
-    want.retain(|(rel, _)| rel.ends_with(".s.nif") || (lowered && rel.ends_with(".x.nif")));
-    want.sort();
+    let mut theirs: Vec<(String, Vec<u8>)> = Vec::new();
+    collect(Path::new(native), "", &mut theirs);
+    let theirs: std::collections::HashMap<String, Vec<u8>> = theirs.into_iter().collect();
+    let mut compared: Vec<String> = theirs
+        .keys()
+        .filter(|rel| rel.ends_with(".s.nif") || (lowered && rel.ends_with(".x.nif")))
+        .cloned()
+        .collect();
+    compared.extend(
+        posix
+            .file_names()
+            .iter()
+            .filter_map(|n| n.strip_prefix("/nimcache/"))
+            .filter(|rel| rel.ends_with(".p.nif"))
+            .map(|rel| rel.to_string()),
+    );
+    compared.sort();
     assert!(
-        !want.is_empty(),
+        compared.iter().any(|rel| rel.ends_with(".s.nif")),
         "{native} holds no .s.nif — not a nimcache?"
     );
-    let (mut exact, mut reordered) = (0, Vec::new());
-    for (rel, w) in &want {
+    for rel in &compared {
+        let want = theirs
+            .get(rel)
+            .unwrap_or_else(|| panic!("this run wrote {rel}; native nimony did not"));
         let got = posix
             .read_file(&format!("nimcache/{rel}"))
             .unwrap_or_else(|| panic!("native nimony wrote {rel}; this run did not"));
-        if got == *w {
-            exact += 1;
+        if got == *want {
             continue;
         }
-        let (g, n) = (String::from_utf8_lossy(&got), String::from_utf8_lossy(w));
-        if rel.ends_with(".x.nif") && declarations(&g) == declarations(&n) {
-            reordered.push(rel.as_str());
-            continue;
-        }
-        let (gl, nl): (Vec<_>, Vec<_>) = (g.lines().collect(), n.lines().collect());
+        let (g, w) = (String::from_utf8_lossy(&got), String::from_utf8_lossy(want));
+        let (gl, wl): (Vec<_>, Vec<_>) = (g.lines().collect(), w.lines().collect());
         let at = gl
             .iter()
-            .zip(&nl)
+            .zip(&wl)
             .position(|(a, b)| a != b)
-            .unwrap_or(gl.len().min(nl.len()));
+            .unwrap_or(gl.len().min(wl.len()));
         let show = |v: &[&str]| v[at.saturating_sub(2)..(at + 3).min(v.len())].join("\n");
         panic!(
             "{rel} differs from native nimony's at line {}\n--- temen ---\n{}\n--- native ---\n{}",
             at + 1,
             show(&gl),
-            show(&nl)
+            show(&wl)
         );
     }
+    let count = |ext: &str| compared.iter().filter(|r| r.ends_with(ext)).count();
     eprintln!(
-        "✅ matches native nimony: {exact} of {} artifacts byte for byte",
-        want.len()
+        "✅ matches native nimony byte for byte: {} .p.nif, {} .s.nif, {} .x.nif",
+        count(".p.nif"),
+        count(".s.nif"),
+        count(".x.nif")
     );
-    if !reordered.is_empty() {
-        eprintln!(
-            "   the rest hold native's declarations in another order (#1753): {}",
-            reordered.join(", ")
-        );
-    }
 }
 
 fn main() {
@@ -531,10 +530,9 @@ fn main() {
     // `--check prog.nim` / `--check lib/std/math.nim`: semcheck **that** module after `system`.
     // A host file is a **program**: it is seeded at the memfs root and checked as the main module
     // (`--isMain`), exactly as `nimony c --isMain prog.nim` run beside it treats it. A lib-relative
-    // path names a stdlib module that is already seeded. The system module
-    // is the special case (`--isSystem`, and its `.p.nif` arrives ready-made); every other module
-    // is reached the ordinary way — nifler parses it, then nimsem is pointed at the result — and
-    // the shell-out loop below resolves its imports exactly as it does for `system`'s.
+    // path names a stdlib module that is already seeded. Either way it is reached as `system` is —
+    // nifler parses it, then nimsem is pointed at the result — and its imports are served by the
+    // same loop as `system`'s.
     //
     // Needed because the divergence #1630 found lives in a module `system`'s closure never
     // reaches, and the only way to see it was a 10-minute nimsem build plus a Playwright run per
@@ -561,11 +559,11 @@ fn main() {
         a.drain(i..=i + 1);
         v
     });
-    let [nimsem_p, nifler_p, libdir, sys_pnif, sys_stem, out_p] = &a[..] else {
+    let [nimsem_p, nifler_p, libdir, out_p] = &a[..] else {
         panic!(
             "usage: nim_selfhost_lane [--sh <sh.ir>] [--check <prog.nim | lib/std/x.nim>] \
              [--hexer <hexer.temen>] [--expect <native-nimcache>] <nimsem.temen> <nifler2.temen> \
-             <libdir> <sys.p.nif> <sys-stem> <out.s.nif>"
+             <libdir> <out.s.nif>"
         );
     };
 
@@ -600,21 +598,12 @@ fn main() {
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
     let make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> = Arc::new(make);
 
-    // Seed the stdlib under `lib/`, both preserving `std/` and flattened (nimony resolves `std/x` as
-    // `lib/x` as well as `lib/std/x`), then the system module's parsed nif. Sources go in first so
-    // every artifact a phase derives from them is genuinely newer — the memfs stamps write order
-    // into `st_mtim`, and that ordering is what the freshness checks in `deps.nim` and nifler's own
-    // `parse` read.
+    // Seed the stdlib under `lib/`, where native nimony has it beside its cwd, and nothing else: every
+    // artifact is derived in-guest. Sources go in first so every artifact a phase derives from them
+    // is genuinely newer — the memfs stamps write order into `st_mtim`, and that ordering is what
+    // the freshness checks in `deps.nim` and nifler's own `parse` read.
     let mut seed: Vec<(String, Vec<u8>)> = Vec::new();
     collect(Path::new(libdir), "lib/", &mut seed);
-    let flat: Vec<(String, Vec<u8>)> = seed
-        .iter()
-        .filter_map(|(k, v)| {
-            k.strip_prefix("lib/std/")
-                .map(|r| (format!("lib/{r}"), v.clone()))
-        })
-        .collect();
-    seed.extend(flat);
     for (k, v) in &seed {
         posix.write_file(k, v);
     }
@@ -634,11 +623,7 @@ fn main() {
         }
         other => (other, false),
     };
-    posix.write_file(
-        &format!("nimcache/{sys_stem}.p.nif"),
-        &std::fs::read(sys_pnif).unwrap_or_else(|e| panic!("read {sys_pnif}: {e}")),
-    );
-    eprintln!("seeded {} stdlib files + the system .p.nif", seed.len());
+    eprintln!("seeded {} stdlib files", seed.len());
 
     // `stem -> lib-relative source`, the inverse of `nim_module_suffix` over everything seeded.
     // The guest names a missing artifact by stem only, so serving it needs the way back; building
@@ -656,19 +641,13 @@ fn main() {
         posix.set_env("PATH", "/bin");
     }
 
-    // `--check`: parse the target with nifler first, so nimsem has a `.p.nif` to be pointed at.
-    // Its own imports still resolve through the shell-out loop below.
+    // Parse `system`, and the `--check` target, so nimsem has a `.p.nif` to be pointed at. Their
+    // imports are parsed as nimsem names them, below.
+    let sys_stem = parse(&nifler, &posix, &make, "lib/std/system.nim");
     let target_stem = match &check_mod {
         Some(m) => {
-            let stem = temen_run::nim_module_suffix(m, &["lib"]);
-            let out = format!("nimcache/{stem}.p.nif");
-            eprintln!("--check {m} -> {out}");
-            let argv: Vec<String> = ["nifler", "--portablePaths", "--deps", "parse", m, &out]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            temen_run::nim_noc_run(nifler.clone(), &posix, Arc::clone(&make), &argv)
-                .unwrap_or_else(|e| panic!("nifler2 on {m}: {e}"));
+            let stem = parse(&nifler, &posix, &make, m);
+            eprintln!("--check {m} -> nimcache/{stem}.p.nif");
             stem
         }
         None => sys_stem.clone(),

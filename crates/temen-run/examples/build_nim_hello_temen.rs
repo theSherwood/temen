@@ -22,7 +22,13 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // `[--posix] [--root <tree>] <src> <out.temen>`.
+    // `[--posix] [--root <tree>] [--native <out-exe>] <src> <out.temen>`.
+    //
+    // `--native` also keeps the **native** binary nimony built from the same source on the way (it
+    // runs the whole chain, gcc included): the same compiler, only the target differs. That is the
+    // reference a Temen build of a program is differentialled against — a phase built by some other
+    // compiler (hastur builds `nimony/bin` with classic Nim) is a different program, whose hash
+    // tables iterate in a different order.
     //
     // `--root` compiles **in tree**, the way nimony is normally invoked: `<src>` is then relative to
     // `<tree>`, which is also the string nimony records in each module's line info and therefore the
@@ -35,6 +41,10 @@ fn main() {
         .iter()
         .position(|a| a == "--root")
         .and_then(|i| argv.get(i + 1).cloned());
+    let native = argv
+        .iter()
+        .position(|a| a == "--native")
+        .and_then(|i| argv.get(i + 1).cloned());
     let positional: Vec<&String> = {
         let mut skip_next = false;
         argv.iter()
@@ -43,7 +53,7 @@ fn main() {
                     skip_next = false;
                     return false;
                 }
-                if *a == "--root" {
+                if *a == "--root" || *a == "--native" {
                     skip_next = true;
                     return false;
                 }
@@ -52,7 +62,10 @@ fn main() {
             .collect()
     };
     let [nim, out] = positional.as_slice() else {
-        panic!("usage: build_nim_hello_temen [--posix] [--root <tree>] <prog.nim> <out.temen>");
+        panic!(
+            "usage: build_nim_hello_temen [--posix] [--root <tree>] [--native <out-exe>] \
+             <prog.nim> <out.temen>"
+        );
     };
     let (nim, out) = (nim.to_string(), out.to_string());
 
@@ -108,6 +121,19 @@ fn main() {
         "no `system` module in {:?}",
         mods.iter().map(|(s, _)| s).collect::<Vec<_>>()
     );
+    if let Some(native) = &native {
+        // nimony links the program as `nimcache/<program stem>/<name>`; the program module is the
+        // one closure member carrying `main`.
+        let stem = mods
+            .iter()
+            .find(|(_, src)| src.contains("(exportc \"main\")"))
+            .map(|(s, _)| s.as_str())
+            .expect("no program module in the closure");
+        let name = file.file_stem().expect("nim file stem");
+        let exe = dir.join("nimcache").join(stem).join(name);
+        std::fs::copy(&exe, native).unwrap_or_else(|e| panic!("copy {exe:?} to {native}: {e}"));
+        eprintln!("wrote {native} — the same source, as nimony built it natively");
+    }
 
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
