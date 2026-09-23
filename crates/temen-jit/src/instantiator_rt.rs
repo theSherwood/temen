@@ -1210,6 +1210,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         if unwound {
             rt.push_frozen_nested(crate::FrozenNested {
                 parent_task: rt.my_task(),
+                task: child_task,
                 slot,
                 carve_off: base + off,
                 size_log2: size_log2 as u8,

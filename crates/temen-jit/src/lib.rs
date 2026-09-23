@@ -491,6 +491,9 @@ pub struct FrozenNested {
     /// carries its parent-child's task (depth-2, a follow-up). Mirror of [`FrozenVCpu::parent_task`];
     /// a thaw groups by it to re-attach parents before children.
     pub parent_task: usize,
+    /// The child's own task id in the frozen run — what its children's `parent_task` names, so a thaw
+    /// re-attaches each grandchild to the parent it recorded (#1687).
+    pub task: usize,
     /// The parent's join-table slot for this child (the guest-held handle value).
     pub slot: usize,
     /// The carve's window-relative base (`sub_base`), inside the frozen window image.
@@ -3918,9 +3921,9 @@ impl CompiledModule {
         // carve in thaw mode (rewind from the carve's frozen continuation, not a fresh start); the
         // result is published at the child's join slot for the parent's `join`. Depth-2: re-attach only
         // the **root's direct children** (`parent_task == 0`) here — each re-runs in thaw mode, and
-        // `compile_child_and_run` recursively re-attaches *its* grandchildren before it runs. A **shared**
-        // counter assigns task ids in DFS re-attach order, reproducing the freeze-time ids so a
-        // grandchild's `parent_task` resolves to its re-attached parent-child.
+        // `compile_child_and_run` recursively re-attaches *its* grandchildren before it runs. Each
+        // re-attached child runs as its recorded `task`, so a grandchild's `parent_task` names it
+        // (#1687); the shared counter starts above every recorded task, for children minted afresh.
         #[cfg(fiber_rt)]
         if (*this).durable && !(*this).frozen_nested_seed.is_empty() {
             let seed = std::mem::take(&mut (*this).frozen_nested_seed);
@@ -3928,13 +3931,14 @@ impl CompiledModule {
                 let funcs = n.funcs();
                 let types = n.types();
                 let epoch = n.epoch_addr();
-                let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
+                let first_free = seed.iter().map(|s| s.task + 1).max().unwrap_or(1);
+                let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(first_free));
                 let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new())); // thaw captures none
                 let mut roots: Vec<&FrozenNested> =
                     seed.iter().filter(|s| s.parent_task == 0).collect();
                 roots.sort_by_key(|s| s.slot);
                 for rec in roots {
-                    let my_task = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let my_task = rec.task;
                     let entry = rec.entry as FuncIdx;
                     let nargs = funcs
                         .get(entry as usize)
@@ -4959,8 +4963,7 @@ pub(crate) unsafe fn compile_child_and_run(
     // its slot in the child's nursery — so when the rewinding child re-executes its `join(grandchild)`
     // it resolves without re-running the grandchild (parents-before-children, one level down). The
     // grandchild's `carve_off` is child-window-relative (its `instantiate` resolved the child's own
-    // window to `base 0`), so it re-runs over `child_base`. DFS via the shared `task_counter` reproduces
-    // the freeze-time task ids, so a grandchild's `parent_task` resolves to this re-attached child.
+    // window to `base 0`), so it re-runs over `child_base`, as its recorded `task` (#1687).
     if thaw && durable {
         if let Some(cn) = &child_nursery {
             let mut gkids: Vec<&FrozenNested> = nested_seeds
@@ -4969,7 +4972,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 .collect();
             gkids.sort_by_key(|s| s.slot);
             for rec in gkids {
-                let gc_task = task_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let gc_task = rec.task;
                 let gc_entry = rec.entry as FuncIdx;
                 let gc_nargs = funcs
                     .get(gc_entry as usize)

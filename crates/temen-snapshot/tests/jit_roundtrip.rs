@@ -229,6 +229,7 @@ fn a_frozen_childs_jit_tables_round_trip_through_the_codec() {
     let module = gate_module();
     let mut host = Host::new();
     host.set_frozen_nested(vec![FrozenNested {
+        task: 1,
         parent_task: 0,
         slot: 0,
         carve_off: 0,
@@ -280,6 +281,7 @@ fn a_frozen_childs_jit_tables_round_trip_through_the_codec() {
     // A child with NO Jit cap writes the presence byte 0 (elided): its state still round-trips.
     let mut host2 = Host::new();
     host2.set_frozen_nested(vec![FrozenNested {
+        task: 1,
         parent_task: 0,
         slot: 0,
         carve_off: 0,

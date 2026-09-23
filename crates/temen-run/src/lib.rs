@@ -1656,6 +1656,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
         .iter()
         .map(|n| temen_jit::FrozenNested {
             parent_task: n.parent_task,
+            task: n.task,
             slot: n.slot,
             carve_off: n.carve_off,
             size_log2: n.size_log2,
@@ -1877,6 +1878,7 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                 .into_iter()
                 .map(|n| temen_interp::FrozenNested {
                     parent_task: n.parent_task,
+                    task: n.task,
                     slot: n.slot,
                     carve_off: n.carve_off,
                     size_log2: n.size_log2,
