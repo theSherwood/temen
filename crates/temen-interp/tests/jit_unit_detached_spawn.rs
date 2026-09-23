@@ -18,7 +18,7 @@
 //! temen-interp suite with no Cranelift dependency.
 
 use std::sync::Arc;
-use temen_interp::{bytecode, Host, Value};
+use temen_interp::{bytecode, Host, Trap, Value};
 use temen_text::parse_module;
 
 /// What the detached child returns — read back through the unit's `join`.
@@ -55,8 +55,7 @@ fn resolve_by_name(dst: &str, addr: u64, name: &str) -> String {
 /// the spawn's own result. A name it cannot resolve is `-1`, and op 15 through a `-1` handle is a
 /// `CapFault` — so reaching a non-negative child handle at all is the proof the set was granted.
 ///
-/// It does **not** `join`: a `join` parks its caller, and a synchronous `Jit.invoke` cannot park
-/// (DESIGN.md §22) — see `joining_from_inside_a_unit_is_refused`.
+/// It does **not** `join` — [`joining_unit_src`] does.
 fn unit_src() -> String {
     format!(
         r#"memory {WIN_LOG2}
@@ -79,7 +78,7 @@ block 0 (v0: i64) {{
     )
 }
 
-/// The spawning unit plus a `join` of the child it just spawned — the §22 boundary.
+/// The spawning unit plus a `join` of the child it just spawned: returns the child's result.
 fn joining_unit_src() -> String {
     unit_src().replace(
         "  vr = i64.extend_i32_s vh\n  return vr",
@@ -96,18 +95,29 @@ block 0 (v0: i64) {
 }
 "#;
 
-/// The guest **program**: func 0 `(jit, code) -> Jit.invoke(code, 0)`; func 1 is the detached child
-/// entry the unit names. Crucially func 0 carries **no** `call.cap 6 15`, so the root-module scan
-/// grants nothing — the whole point.
-fn guest() -> temen_ir::Module {
+/// How the guest reaches its unit — DESIGN §22's two routes, which carry different contracts: an
+/// **installed** unit runs in the caller's frames and spawns like the base module; an **invoked**
+/// one is a seam-free leaf with no `Instantiator` at all (#1578).
+const INSTALL: &str = r#"  vc = i64.extend_i32_u v1
+  vslot = call.cap 11 3 (i64) -> (i64) v0 (vc)
+  vs32 = i32.wrap_i64 vslot
+  vz = i64.const 0
+  vr = call.dyn (i64) -> (i64) vs32 (vz)
+  return vr"#;
+const INVOKE: &str = r#"  vc = i64.extend_i32_u v1
+  vz = i64.const 0
+  vr = call.cap 11 1 (i64, i64) -> (i64) v0 (vc, vz)
+  return vr"#;
+
+/// The guest **program**: func 0 `(jit, code)` reaches the unit by `route`; func 1 is the detached
+/// child entry the unit names. Crucially func 0 carries **no** `call.cap 6 15`, so the root-module
+/// scan grants nothing — the whole point.
+fn guest_by(route: &str) -> temen_ir::Module {
     let src = format!(
         r#"memory {WIN_LOG2}
 func (i32, i32) -> (i64) {{
 block 0 (v0: i32, v1: i32) {{
-  vc = i64.extend_i32_u v1
-  vz = i64.const 0
-  vr = call.cap 11 1 (i64, i64) -> (i64) v0 (vc, vz)
-  return vr
+{route}
   }}
 }}
 func (i64) -> (i64) {{
@@ -124,6 +134,11 @@ block 0 (v0: i64) {{
     let m = parse_module(&src).expect("parse guest");
     temen_verify::verify_module(&m).expect("verify guest");
     m
+}
+
+/// The guest that installs its unit — the route the grant tests use.
+fn guest() -> temen_ir::Module {
+    guest_by(INSTALL)
 }
 
 /// The submitted blob: a real wire-encoded module. The host reads the unit's **type section** by
@@ -157,10 +172,10 @@ fn powerbox(m: &temen_ir::Module) -> Host {
     host
 }
 
-/// Grant a `Jit` domain with the validator, compile `src`'s unit, hand back the entry args
-/// `(jit, code)`.
+/// Grant a `Jit` domain (with install slots) and the validator, compile `src`'s unit, hand back the
+/// entry args `(jit, code)`.
 fn install(host: &mut Host, src: &str) -> Vec<Value> {
-    let jit = host.grant_jit(Some(WIN_LOG2));
+    let jit = host.grant_jit_with_table(Some(WIN_LOG2), 4);
     host.set_jit_validator(validator);
     let code = match host.jit_compile(jit, &unit_blob(src)) {
         Ok(Ok(c)) => c.handle,
@@ -212,65 +227,47 @@ fn without_a_granted_instantiator_the_install_grants_nothing() {
     );
 }
 
-/// End to end on the oracle: the unit resolves the set the install granted it and spawns the
-/// guest's own func 1 as a detached child over a fresh window — handle `0`, the first child. Before
-/// this, `instantiator` resolved and `module` / `budget` did not, so the spawn `CapFault`ed on a
-/// `-1` handle without ever reaching admission.
+/// End to end, on the route §22 supports for spawning: the installed unit resolves the set the
+/// install granted it, spawns the guest's own func 1 as a detached child over a fresh window, and
+/// joins it — on both interpreters. Before #1529, `instantiator` resolved and `module` / `budget`
+/// did not, so the spawn `CapFault`ed on a `-1` handle without ever reaching admission.
 #[test]
-fn a_unit_spawns_a_detached_child_on_the_oracle() {
-    let m = guest();
-    let mut host = powerbox(&m);
-    let args = install(&mut host, &unit_src());
-    let mut fuel = u64::MAX;
-    let tw = temen_interp::run_with_host(&m, 0, &args, &mut fuel, &mut host)
-        .expect("the tree-walker services the unit's spawn");
-    assert_eq!(tw, vec![Value::I64(0)], "the first child's handle");
-}
-
-/// The engine gap the grant makes reachable, pinned rather than papered over: the bytecode engine's
-/// **invoke** seam (`drive_nested`) carries arms for fibers, cap parks and nested `Jit` ops, and
-/// none for the §14/§5 instantiate family — every one of them lands on its catch-all and traps
-/// `CapFault`. That is not about this grant (no unit could reach an instantiate seam there before
-/// either) and not about op 15 (op 0 / op 5 fare the same), so it is left as the pre-existing
-/// divergence from the oracle above rather than redesigned here: the invoke runs to completion
-/// inside the parent's `call.cap`, so hosting a child's lifetime under it is a design call, not a
-/// missing arm. Fail-closed meanwhile, never a wrong value.
-#[test]
-fn the_bytecode_invoke_seam_services_no_spawn() {
-    let m = guest();
-    let mut host = powerbox(&m);
-    let args = install(&mut host, &unit_src());
-    let mut fuel = u64::MAX;
-    let bc = bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
-        .expect("bytecode supports the module");
-    assert!(
-        bc.is_err(),
-        "the invoke seam must fail closed on a spawn it cannot host — got {bc:?}"
-    );
-}
-
-/// The boundary the grant does **not** move, on either engine: a `join` inside the unit parks its
-/// caller, and a synchronous `Jit.invoke` has no one to park for (DESIGN.md §22 — the unit runs to
-/// completion inside the parent's `call.cap`). The child handle also lives in the invoke's own
-/// thread table, so the program cannot join it after the invoke returns either. Pinned so a future
-/// "a unit spawns a worker" story has to decide this deliberately — a probeable `-EINVAL` at the
-/// op, or banking the child for the program — instead of inheriting a trap by accident.
-#[test]
-fn joining_from_inside_a_unit_is_refused_by_the_no_park_seam() {
+fn an_installed_unit_spawns_and_joins_a_detached_child() {
     let m = guest();
 
     let mut host = powerbox(&m);
     let args = install(&mut host, &joining_unit_src());
     let mut fuel = u64::MAX;
-    assert!(
-        temen_interp::run_with_host(&m, 0, &args, &mut fuel, &mut host).is_err(),
-        "tree-walker: a parking join inside an invoke must fail closed, never return a value"
-    );
+    let tw = temen_interp::run_with_host(&m, 0, &args, &mut fuel, &mut host);
+    assert_eq!(tw, Ok(vec![Value::I64(CHILD)]), "tree-walker");
 
     let mut host = powerbox(&m);
     let args = install(&mut host, &joining_unit_src());
     let mut fuel = u64::MAX;
     let bc = bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
         .expect("bytecode supports the module");
-    assert!(bc.is_err(), "bytecode: the same refusal — got {bc:?}");
+    assert_eq!(bc, Ok(vec![Value::I64(CHILD)]), "bytecode");
+}
+
+/// The same unit **invoked** reaches no `Instantiator` (DESIGN §22, #1578): the spawn itself
+/// `CapFault`s, on both engines, before any child exists. An invoked unit is never installed, so a
+/// child would outlive the synchronous call over code nothing keeps, under a handle naming the
+/// transient invoke vCPU's child — which nobody could join. The grant still happened (it is made at
+/// install of the *compiled* unit, whatever route later runs it); the route is what refuses.
+#[test]
+fn an_invoked_unit_has_no_instantiator() {
+    let m = guest_by(INVOKE);
+
+    let mut host = powerbox(&m);
+    let args = install(&mut host, &unit_src());
+    let mut fuel = u64::MAX;
+    let tw = temen_interp::run_with_host(&m, 0, &args, &mut fuel, &mut host);
+    assert_eq!(tw, Err(Trap::CapFault), "tree-walker");
+
+    let mut host = powerbox(&m);
+    let args = install(&mut host, &unit_src());
+    let mut fuel = u64::MAX;
+    let bc = bytecode::compile_and_run_with_host(&m, 0, &args, &mut fuel, &mut host)
+        .expect("bytecode supports the module");
+    assert_eq!(bc, Err(Trap::CapFault), "bytecode");
 }

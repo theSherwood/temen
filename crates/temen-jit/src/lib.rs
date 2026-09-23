@@ -2385,6 +2385,14 @@ pub struct CompiledModule {
     /// Kept alive because its address is baked into the module's `Instantiator` call.cap sites.
     #[cfg(fiber_rt)]
     _nursery: Option<Box<instantiator_rt::Nursery>>,
+    /// #1726 — the programs of installed §22 units that spawn same-module children: each one's
+    /// address is baked into that unit's `Instantiator` sites as `self_prog`, so it lives as long as
+    /// the code does. Declared after `_nursery`, so it outlives the nursery that resolves it.
+    // The `Box` is the point: each program's address is baked into code, so it must not move when
+    // this `Vec` reallocates.
+    #[cfg(fiber_rt)]
+    #[allow(clippy::vec_box)]
+    _unit_progs: Vec<Box<instantiator_rt::UnitProg>>,
     /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
     /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
     #[cfg(setjmp_rt)]
@@ -2946,37 +2954,41 @@ impl CompiledModule {
         // supplied post-finalize via `set_env`, like the thread `Domain`). A child runs synchronously
         // today, so the nursery is touched only on the calling thread.
         #[cfg(fiber_rt)]
-        let nursery: Option<Box<instantiator_rt::Nursery>> = if module_uses_instantiator(m) {
-            Some(Box::new(instantiator_rt::Nursery::new(
-                m.funcs.clone().into(),
-                m.types.clone().into(),
-                cap_thunk,
-                cap_ctx,
-                resolve_module,
-                epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
-                fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
-                // The run's thread `Domain` (always stood up for a nesting module, above): children
-                // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
-                // the parent rendezvous in one table.
-                domain
-                    .as_ref()
-                    .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
-                    .unwrap_or(0),
-                0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
-                std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
-                std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
-                // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
-                // (same module) compiles with serve trampolines and can be a child_offer target.
-                m.impl_exports
-                    .iter()
-                    .flat_map(|e| e.ops.iter().copied())
-                    .collect::<Vec<u32>>()
-                    .into_boxed_slice(),
-                shadow,
-            )))
-        } else {
-            None
-        };
+        // #1726: also for a module that can **install** §22 units (a reserved `call.dyn` table): an
+        // installed unit that instantiates runs in this module's frames, so it needs this nursery
+        // even when the module itself names no `Instantiator` (it may only pass the handle on).
+        let nursery: Option<Box<instantiator_rt::Nursery>> =
+            if module_uses_instantiator(m) || table_reserve_log2 > 0 {
+                Some(Box::new(instantiator_rt::Nursery::new(
+                    m.funcs.clone().into(),
+                    m.types.clone().into(),
+                    cap_thunk,
+                    cap_ctx,
+                    resolve_module,
+                    epoch_addr as usize, // §5: nested JIT children poll the parent's kill-path cell too
+                    fuel_addr as usize, // §5 fuel: children clamp their budget against the parent's remaining
+                    // The run's thread `Domain` (always stood up for a nesting module, above): children
+                    // compile their `atomic.wait`/`notify` against its futex, so concurrent children and
+                    // the parent rendezvous in one table.
+                    domain
+                        .as_ref()
+                        .map(|d| (&**d as *const os_thread_rt::Domain) as usize)
+                        .unwrap_or(0),
+                    0, // §4 depth-2: the **root** nursery's task id; its direct children get `parent_task = 0`
+                    std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1)), // next child task = 1
+                    std::sync::Arc::new(std::sync::Mutex::new(Vec::new())), // the subtree's shared residue sink
+                    // CALLS.md 5c.1a — the module's impl-export handler funcidxs, so a granted child
+                    // (same module) compiles with serve trampolines and can be a child_offer target.
+                    m.impl_exports
+                        .iter()
+                        .flat_map(|e| e.ops.iter().copied())
+                        .collect::<Vec<u32>>()
+                        .into_boxed_slice(),
+                    shadow,
+                )))
+            } else {
+                None
+            };
         // #964: a marked module's carves may not dip into the reserved NULL region (the host
         // seeds/copies carves outside the guarded call).
         #[cfg(fiber_rt)]
@@ -2998,6 +3010,7 @@ impl CompiledModule {
                 child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
                 instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const ()
                     as i64,
+                self_prog: 0, // the module's own program (#1726)
             }
         } else {
             InstEnv::null()
@@ -3443,6 +3456,8 @@ impl CompiledModule {
             domain,
             #[cfg(fiber_rt)]
             _nursery: nursery,
+            #[cfg(fiber_rt)]
+            _unit_progs: Vec::new(),
             #[cfg(setjmp_rt)]
             _setjmp_rt: setjmp_runtime,
             #[cfg(fiber_rt)]
@@ -4359,6 +4374,27 @@ impl CompiledModule {
             None
         };
 
+        // #1726: a unit's same-module (self) child runs the unit's OWN program — the spawning frame's
+        // module, as on both interpreters — so its `Instantiator` sites carry the address of a copy
+        // of that program, kept alive by `_unit_progs`, as `self_prog`. Without this a self child
+        // spawned from unit code ran module 0's function of the same index.
+        #[cfg(fiber_rt)]
+        let inst = if self.inst.is_active() && funcs_use_instantiator(funcs) {
+            let prog = Box::new(instantiator_rt::UnitProg {
+                funcs: funcs.into(),
+                types: types.into(),
+            });
+            let self_prog = &*prog as *const instantiator_rt::UnitProg as i64;
+            self._unit_progs.push(prog);
+            InstEnv {
+                self_prog,
+                ..self.inst
+            }
+        } else {
+            self.inst
+        };
+        #[cfg(not(fiber_rt))]
+        let inst = self.inst;
         let mut ctx = self.module.make_context();
         for (f, id) in funcs.iter().zip(&ids) {
             build_clif(
@@ -4370,7 +4406,7 @@ impl CompiledModule {
                 self.cap,
                 self.fiber,
                 self.thread,
-                self.inst,
+                inst,
                 self.setjmp,
                 SigEnv::null(), // #932 — define_extra units are not signal-delivery armed (slice 1b)
                 &mut ctx.func,
@@ -4881,6 +4917,7 @@ pub(crate) unsafe fn compile_child_and_run(
             instantiate_rec_thunk: instantiator_rt::instantiate_rec as *const () as i64,
             child_offer_thunk: instantiator_rt::child_offer as *const () as i64,
             instantiate_detached_thunk: instantiator_rt::instantiate_detached as *const () as i64,
+            self_prog: 0, // the module's own program (#1726)
         },
         None => InstEnv::null(),
     };
@@ -5535,6 +5572,7 @@ fn compile_child_windowed(
         fiber_rt: None,
         domain: None,
         _nursery: None,
+        _unit_progs: Vec::new(),
         #[cfg(setjmp_rt)]
         _setjmp_rt: None,
         call_tramp: None,
@@ -6003,6 +6041,10 @@ struct InstEnv {
     // root-shaped window (a fresh lazy reservation, no carve, no alias), minted through a
     // `Budget`; argv rides as the optional spawn-time payload.
     instantiate_detached_thunk: i64,
+    /// #1726 — the program a **self** child of this code runs: `0` for the module's own program
+    /// (module 0), or the address of an installed §22 unit's `instantiator_rt::UnitProg` when this
+    /// env lowers that unit (`define_extra`). Passed to every spawn thunk as `self_prog`.
+    self_prog: i64,
 }
 
 impl InstEnv {
@@ -6018,6 +6060,7 @@ impl InstEnv {
             instantiate_rec_thunk: 0,
             child_offer_thunk: 0,
             instantiate_detached_thunk: 0,
+            self_prog: 0,
         }
     }
     /// True when this compilation may lower `Instantiator` call.cap calls to the nesting runtime (the
@@ -6465,7 +6508,13 @@ fn module_uses_setjmp(m: &IrModule) -> bool {
 /// — so `run_inner` knows to stand up the nesting [`instantiator_rt::Nursery`].
 #[cfg(fiber_rt)]
 fn module_uses_instantiator(m: &IrModule) -> bool {
-    m.funcs.iter().any(|f| {
+    funcs_use_instantiator(&m.funcs)
+}
+
+/// [`module_uses_instantiator`] over a bare function list — a §22 unit's, in `define_extra`.
+#[cfg(fiber_rt)]
+fn funcs_use_instantiator(funcs: &[Func]) -> bool {
+    funcs.iter().any(|f| {
         f.blocks.iter().any(|blk| {
             blk.insts.iter().any(|i| {
                 matches!(
@@ -8843,6 +8892,8 @@ fn lower_instantiator(
         return Ok(());
     }
     let nursery = b.ins().iconst(I64, lower.inst.nursery_addr);
+    // #1726: which program a self child of this code runs (0 = module 0; else this unit's).
+    let self_prog = b.ins().iconst(I64, lower.inst.self_prog);
     let mem_base = b.use_var(lower.mem_var);
     let trap_out = b.use_var(lower.trap_var);
     match op {
@@ -8866,7 +8917,7 @@ fn lower_instantiator(
             let size_log2 = slot_i64(b, get(vals, *args.get(a0 + 2).ok_or(JitError::Malformed)?)?);
             let fuel = slot_i64(b, get(vals, *args.get(a0 + 3).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I32, I64, I64, I64, I64, I64, I64] {
+            for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -8876,7 +8927,7 @@ fn lower_instantiator(
                 tref,
                 thunk,
                 &[
-                    nursery, mem_base, h, modh, entry, off, size_log2, fuel, trap_out,
+                    nursery, self_prog, mem_base, h, modh, entry, off, size_log2, fuel, trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);
@@ -8945,7 +8996,7 @@ fn lower_instantiator(
             let mem_size = b.ins().iconst(I64, win_reserved as i64);
             let record_ptr = slot_i64(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64] {
+            for t in [I64, I64, I64, I64, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -8954,7 +9005,9 @@ fn lower_instantiator(
             let call = b.ins().call_indirect(
                 tref,
                 thunk,
-                &[nursery, mem_base, mem_size, h, record_ptr, trap_out],
+                &[
+                    nursery, self_prog, mem_base, mem_size, h, record_ptr, trap_out,
+                ],
             );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
@@ -9000,7 +9053,9 @@ fn lower_instantiator(
             let size_log2 = slot_i64(b, get(vals, *args.get(5).ok_or(JitError::Malformed)?)?);
             let fuel = slot_i64(b, get(vals, *args.get(6).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64] {
+            for t in [
+                I64, I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64,
+            ] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -9012,8 +9067,8 @@ fn lower_instantiator(
                 tref,
                 thunk,
                 &[
-                    nursery, mem_base, mem_size, h, modh, grants_ptr, grants_n, entry, off,
-                    size_log2, fuel, trap_out,
+                    nursery, self_prog, mem_base, mem_size, h, modh, grants_ptr, grants_n, entry,
+                    off, size_log2, fuel, trap_out,
                 ],
             );
             emit_trap_propagate(b, lower);
@@ -9058,7 +9113,7 @@ fn lower_instantiator(
             };
             let mut tsig = module.make_signature();
             for t in [
-                I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
+                I64, I64, I64, I64, I32, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64, I64,
             ] {
                 tsig.params.push(AbiParam::new(t));
             }
@@ -9070,6 +9125,7 @@ fn lower_instantiator(
                 thunk,
                 &[
                     nursery,
+                    self_prog,
                     mem_base,
                     mem_size,
                     h,
