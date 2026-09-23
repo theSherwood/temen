@@ -443,9 +443,11 @@ impl Debuggee for Inspector {
 struct RevTrace {
     /// The furthest clock/turn the scan covered; the cache is valid for any position `<= high_water`.
     high_water: u64,
-    /// `(clock, depth)` of each stoppable op in `[0, high_water)`, ascending — a `step_back` target is
-    /// the last entry strictly before the current position at call depth `<=` the current frame count.
-    stoppable: Vec<(u64, usize)>,
+    /// `(clock, depth, sourced)` of each stoppable op in `[0, high_water)`, ascending — a `step_back`
+    /// target is the last entry strictly before the current position at call depth `<=` the current
+    /// frame count. `sourced` is whether the op has a source location; it picks the target from a
+    /// finished run, which has no frame count to compare against (see `step_back`).
+    stoppable: Vec<(u64, usize, bool)>,
 }
 
 /// The **bytecode backend** — the resumable bytecode debug session ([`ScheduledDebugRun`]) plus the
@@ -885,8 +887,9 @@ impl BytecodeBackend {
                 break;
             }
             probe.locate();
-            if probe.frame_pc(0).is_some() {
-                stoppable.push((c, probe.depth()));
+            if let Some(pc) = probe.frame_pc(0) {
+                let sourced = temen_interp::source_loc(&self.module, pc).is_some();
+                stoppable.push((c, probe.depth(), sourced));
             }
             if !probe.tick(&mut fuel) {
                 break;
@@ -1019,10 +1022,19 @@ impl Debuggee for BytecodeBackend {
         // The candidate positions come from the cached [`RevTrace`] (the run's fixed stoppable-op
         // timeline), so the target search is a lookup rather than a second full replay — only the `seek`
         // below re-executes. The first `step_back` past a new high-water builds the trace with one scan.
+        //
+        // **From a finished run** (the root is done — exited or trapped) the frame count is not a place
+        // in the program any more, and comparing against it picked the startup function's first op:
+        // the entry, where every later step-back stayed. Dropping the filter is not enough either: the last stoppable op is then
+        // the sourceless startup code *after* `main` returned, and a depth-aware step from there jumps
+        // back over the whole call to `main`. The forward step that ended the run went from the last
+        // source line to termination (a step passes sourceless code by), so its reverse lands on the
+        // last op that has a source location.
         let (now, now_depth) = (self.run.op_turn(), self.run.depth());
         if !self.ensure_rev_trace(now) {
             return Stop::Blocked;
         }
+        let finished = self.run.result().is_some();
         let target = self
             .rev_trace
             .as_ref()
@@ -1030,8 +1042,8 @@ impl Debuggee for BytecodeBackend {
             .stoppable
             .iter()
             .rev()
-            .find(|(c, d)| *c < now && *d <= now_depth)
-            .map_or(0, |(c, _)| *c);
+            .find(|&&(c, d, sourced)| c < now && if finished { sourced } else { d <= now_depth })
+            .map_or(0, |&(c, _, _)| c);
         self.rewind_to(target)
     }
 

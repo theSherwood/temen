@@ -2292,3 +2292,149 @@ fn dap_over_bytecode_threaded_value_watchpoint_fires_during_step() {
         "exactly one step stops for the value watch on the scheduled engine: {reasons:?}"
     );
 }
+
+/// A C program's shape after a link: a **sourceless** startup function (`func 0`, no `debug.loc` — the
+/// libc's `_start`) calls a sourced `main` (`func 1`), then runs a few more sourceless ops before the
+/// run ends. `main` writes 1 then 2 to a window word, so where a reverse step lands is observable.
+const SOURCELESS_START: &str = r#"memory 16
+func () -> (i32) {
+block 0 () {
+  v0 = call 1 ()
+  v1 = i32.const 1
+  v2 = i32.add v0 v1
+  return v2
+  }
+}
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 16384
+  v1 = i32.const 1
+  i32.store v0 v1
+  v2 = i32.const 2
+  i32.store v0 v2
+  v3 = i32.const 0
+  return v3
+  }
+}
+
+debug.file 0 "main.c"
+debug.fname 1 "main"
+debug.loc 1 0 0 0 3 5
+debug.loc 1 0 3 0 4 5
+debug.loc 1 0 5 0 5 5
+"#;
+
+/// The top frame's `(name, line)` at the current stop.
+fn top_frame(s: &mut DapServer, seq: i64) -> (String, i64) {
+    let f = frames(s, seq, 1);
+    let top = f.first().expect("a live frame");
+    (
+        top.get("name")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string(),
+        top.get("line").and_then(Json::as_i64).unwrap_or(0),
+    )
+}
+
+/// **`stepBack` from a finished run lands on the last source line, not the program's entry.**
+///
+/// The bytecode `step_back` is depth-aware — only ops at call depth `<=` the current one are
+/// candidates, so stepping back over a call does not descend into it (the reverse of `next`). A
+/// finished run has no frames, so no op qualified and the target fell through to position 0: the
+/// entry. From there nothing is earlier, so every further `stepBack` stayed put. c_interpret hit it as
+/// "step back from Halted never reverts the canvas" — the learner lands before `main` ran, and stays.
+///
+/// Without the depth filter it would still be wrong: the last stoppable op is in the sourceless
+/// startup code *after* `main` returned, and a depth-aware step from there jumps straight back over
+/// the whole call to `main`. The step that ended the run went from `main`'s last line to termination
+/// (a forward step passes sourceless code by), so its reverse is the last op that has a source line.
+#[test]
+fn dap_over_bytecode_step_back_from_a_finished_run_lands_on_the_last_source_line() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(SOURCELESS_START)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "launch ok"
+    );
+
+    // Step in until the run finishes.
+    let mut seq = 10;
+    let mut finished = false;
+    for _ in 0..50 {
+        seq += 1;
+        let out = s.handle(&req(
+            seq,
+            "stepIn",
+            Json::obj(vec![("threadId", Json::i(1))]),
+        ));
+        if event(&out, "terminated").is_some() || event(&out, "exited").is_some() {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the program runs to completion under stepIn");
+
+    // The window word as `readMemory` returns it: base64 of the 4 bytes (`AgAAAA==` is 2, `AQAAAA==` 1).
+    let word = |s: &mut DapServer, seq: i64| -> String {
+        let out = s.handle(&req(
+            seq,
+            "readMemory",
+            Json::obj(vec![
+                ("memoryReference", Json::s("16384")),
+                ("count", Json::i(4)),
+            ]),
+        ));
+        response(&out)
+            .get("body")
+            .and_then(|b| b.get("data"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+
+    seq += 1;
+    let back = s.handle(&req(seq, "stepBack", Json::obj(vec![])));
+    assert_eq!(response(&back).get("success"), Some(&Json::Bool(true)));
+    seq += 1;
+    assert_eq!(
+        top_frame(&mut s, seq),
+        ("#0 main".to_string(), 5),
+        "the first stepBack from a finished run lands on main's last line (`return 0`)",
+    );
+    seq += 1;
+    assert_eq!(
+        word(&mut s, seq),
+        "AgAAAA==",
+        "with main's second store (2) still in memory"
+    );
+
+    // And the walk continues backward through main from there, until the first store is undone.
+    let mut saw_one = false;
+    for _ in 0..20 {
+        seq += 1;
+        s.handle(&req(seq, "stepBack", Json::obj(vec![])));
+        seq += 1;
+        if word(&mut s, seq) == "AQAAAA==" {
+            saw_one = true;
+            seq += 1;
+            assert_eq!(
+                top_frame(&mut s, seq).0,
+                "#0 main",
+                "the store of 2 is undone inside main"
+            );
+            break;
+        }
+    }
+    assert!(saw_one, "further stepBacks keep walking back through main");
+}
