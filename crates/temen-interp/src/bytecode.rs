@@ -4677,26 +4677,17 @@ impl<'p> Vcpu<'p> {
             },
             None => true,
         };
-        // A **durable** domain refuses op 15 outright (PROCESS.md §5): a detached window is outside
-        // the subtree snapshot, and a child no freeze can see is worse than a probeable `-EINVAL`.
-        // The tree-walker and the native thunk gate the same way; this arm must too (#1299) — and
-        // before the quota take below, so the refusal charges nothing.
+        // #1361 step 4 — a durable domain spawns detached on the terms every engine applies: an
+        // attested-freezable module (#1501) and, inside the shared admission below, freeze authority
+        // over its detached progeny (#1440). This engine hands the child to its embedder's driver, so
+        // capturing it at a freeze is that driver's; the browser's grants neither the authority nor an
+        // attested module, so its durable reactors are refused here as on every engine.
         let durable = match self.shared_host {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
         };
-        // #1501 — §4's other half, as the tree-walker's op-15 arm and the nested arms enforce it: a
-        // durable domain admits only a module the grant attests as instrumented. Inert behind the
-        // `durable` gate; what keeps a re-lift from surfacing an uncapturable child to the host.
         let mod_durable_ok = !durable || cdurable;
-        if !ok_entry
-            || child_size == 0
-            || !mod_ok
-            || !mod_durable_ok
-            || !payload_ok
-            || !premap_ok
-            || durable
-        {
+        if !ok_entry || child_size == 0 || !mod_ok || !mod_durable_ok || !payload_ok || !premap_ok {
             self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
             return Ok(None);
         }

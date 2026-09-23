@@ -2341,13 +2341,6 @@ fn drive_arc_shared(
     )
 }
 
-/// #1361 step 4 — whether a durable parent's detached spawn (op 15) is admitted, given freeze
-/// authority over its detached progeny. The capture and the re-launch exist on this engine; the gate
-/// lifts on all three engines together (INVARIANTS #9), so until the JIT and the resumable engine
-/// capture too, only this crate's own tests run with it — which is what lets the capture be tested
-/// end to end before it ships.
-const DURABLE_DETACHED_CAPTURE: bool = cfg!(test);
-
 /// A domain's §12 thaw residue: everything its root re-enters with besides the window image, as the
 /// codec's control section carries it. Empty for a freeze or an ordinary run.
 #[derive(Default)]
@@ -2916,40 +2909,30 @@ fn relaunch_detached(
         launch,
         ..
     } = td;
-    let g = grants
+    let residue = ThawResidue::take(&mut host, launch.task as TaskId);
+    let DetachedRelaunch {
+        funcs,
+        types,
+        shadow,
+        memory_log2,
+        module,
+        host,
+    } = grants
         .lock_unpoisoned()
-        .grant_by_digest(&launch.digest)
-        .map(|(_, g)| g.clone())?;
+        .prepare_detached_relaunch(&launch, host)?;
     // The window: a fresh reservation (a root's shape, as op 15 mints it) holding the child's image,
     // its freeze word cleared and its context-0 thaw word set — `begin_thaw`, on the child's own window.
-    let mut mem = Mem::with_reservation(reserved_log2, g.memory_log2?, g.shadow);
+    let mut mem = Mem::with_reservation(reserved_log2, memory_log2, shadow);
     mem.restore_layout(&window);
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
     mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())?;
-    // The powerbox: restored from the child's own artifact (handles, serve state, attestation, JIT,
-    // named caps); what its *spawner* decided rides the launch record and is re-applied here.
-    let residue = ThawResidue::take(&mut host, launch.task as TaskId);
-    host.set_durable(true);
-    host.set_lane_cap(launch.lane);
-    host.set_channel_cap(launch.channel);
-    host.self_module = Some(Arc::clone(&g.module));
-    for (name, h) in &launch.names {
-        host.register_cap_name(name, *h);
-    }
-    let bound = if launch.same_module {
-        host.bind_same_module_manifest(&g.imports, &g.types)
-    } else {
-        host.bind_child_manifest(&g.imports, &g.types)
-    };
-    bound.ok()?;
     let dom = host.domain_id() as usize;
     let child_host = Arc::new(Mutex::new(host));
     sched.wire_signal_doors(&child_host);
     // Entry args are inert under a rewind (the prologue reloads spilled values), so pass zero
     // placeholders of the entry's shape, as the nested re-attach does.
-    let want_as = g
-        .funcs
+    let want_as = funcs
         .get(launch.entry as usize)
         .is_some_and(|f| f.params.len() >= 2);
     let args = if want_as {
@@ -2961,7 +2944,7 @@ fn relaunch_detached(
     s.next_task += 1;
     s.live += 1;
     let cdt = Arc::new(DomainTable::new(
-        &g.funcs,
+        &funcs,
         child_host.lock_unpoisoned().jit_table_log2(),
     ));
     let child_quota = Quota {
@@ -2972,8 +2955,8 @@ fn relaunch_detached(
     let kflag = Arc::new(AtomicBool::new(false));
     let bell = Arc::new(AtomicBool::new(false));
     let mut child = Box::new(VCpu::new(
-        Arc::clone(&g.funcs),
-        Arc::clone(&g.types),
+        Arc::clone(&funcs),
+        Arc::clone(&types),
         launch.entry,
         &args,
         Some(mem),
@@ -2996,8 +2979,8 @@ fn relaunch_detached(
         s,
         sched,
         &mut child,
-        &g.funcs,
-        &g.types,
+        &funcs,
+        &types,
         &cdt,
         &child_host,
         child_fuel,
@@ -3016,7 +2999,7 @@ fn relaunch_detached(
             bell,
             DetachedSpawn {
                 entry: launch.entry,
-                module: Arc::clone(&g.module),
+                module: Arc::clone(&module),
                 digest: launch.digest,
                 max_vcpus: child_quota.max_vcpus,
                 same_module: launch.same_module,
@@ -7733,11 +7716,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // sibling, which is in neither map). A **completed-but-unjoined** one rides via
                 // `completed_result` — its result is taken from the scheduler and its separate window
                 // need not ride (reload-not-reissue on thaw, exactly like a completed nested child).
-                // A **still-running** one stays fail-closed: the STW never reaches its separate
-                // window, so it could not self-unwind — the O6 mid-flight capture is step 3. A
-                // completed-**trapped** one is not representable yet either. Inert behind op 15's
-                // `!durable` admission gate (a durable parent cannot yet spawn a detached child);
-                // load-bearing when step 4 lifts it.
+                // A **still-running** one is rung (step 3) and captured by the harvest (step 4). A
+                // completed-**trapped** one is not representable yet (#1674; the freeze census
+                // declines it at the trigger, #1671).
                 let detached_live_refused = froze && {
                     let detached: Vec<usize> = v
                         .child_hosts
@@ -9779,9 +9760,7 @@ pub struct FrozenNested {
 /// (reload-not-reissue). On thaw the runtime posts the result into the scheduler and maps it to the
 /// recording parent's join `slot`, so the parent's re-executed `thread.join` delivers it without
 /// re-spawning the child: op 15 is a `call.cap` checkpoint, so the rewind reloads its spilled slot
-/// handle (the transform instruments every `call.cap`) rather than re-running the spawn. Inert behind
-/// op 15's `!durable` admission gate today (a durable parent cannot yet spawn a detached child);
-/// load-bearing when the gate lifts (#1361 step 4).
+/// handle (the transform instruments every `call.cap`) rather than re-running the spawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrozenDetached {
     /// The task that spawned this child (op 15): `0` for a direct child of the root; a deeper
@@ -9886,6 +9865,18 @@ pub struct CapturedDetached {
     pub module: Arc<Module>,
     /// How a thaw launches it again (#1361 step 4).
     pub launch: DetachedLaunch,
+}
+
+/// #1361 step 4 — a thawed detached child ready to re-launch, on either engine: its own program
+/// (resolved by digest against the restoring host's durable grants) and its powerbox with the
+/// spawner-held launch record re-applied. See [`Host::prepare_detached_relaunch`].
+pub struct DetachedRelaunch {
+    pub funcs: Arc<[Func]>,
+    pub types: Arc<[temen_ir::TypeEntry]>,
+    pub shadow: Option<ShadowArena>,
+    pub memory_log2: u8,
+    pub module: Arc<Module>,
+    pub host: Host,
 }
 
 /// #1361 step 4 — a captured detached child as a **thaw** receives it: its restored window and
@@ -13910,58 +13901,27 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                                 None => true,
                             };
-                            // #1412 — a **durable** domain refuses op 15, matching the resumable
-                            // engine (`bytecode.rs` `event_instantiate_detached`) and the native thunk
-                            // (`instantiator_rt.rs`). This is an **interim** gate, and it reverses.
-                            //
-                            // #1289 R1 lifted this gate here, and only here, on 2026-09-08 — one day
-                            // after #1299 added it to the resumable engine "like the other two
-                            // engines". R1 is right about the end state (freeze authority is a
-                            // per-grant capability, not a placement rule), but the compensating
-                            // safety it moved to — `detached_live_refused` at the freeze — exists
-                            // only on this path, and it fails with `Trap::ThreadFault`. So the tree
-                            // had the oracle admitting what two engines refused (INVARIANTS #9), and
-                            // its one coherent path ended a durable run in a **trap** on a platform
-                            // lifecycle action the guest cannot see coming (INVARIANTS #5: "a
-                            // lifecycle event is never a domain-killing surprise").
-                            //
-                            // Owner decision 2026-09-14: the end state is to **admit the spawn and
-                            // capture the child**, gated on the parent actually holding freeze
-                            // authority over it — R1's endpoint, and what PROCESS.md O14 already
-                            // names ("refuse unless a freeze-authority holder is registered"). That
-                            // needs two things that do not exist yet: freeze authority represented
-                            // in code at all (today it is implicit in nesting; `freeze_authority` is
-                            // doc-only), and the per-child-artifact capture (#1361). Until both land,
-                            // agreeing with the other two engines is the honest resting state: it is
-                            // fail-closed, it restores #9, and it makes `detached_live_refused`
-                            // unreachable so no durable run can be killed by a freeze.
-                            //
-                            // Re-lift this together with that capture, not before.
+                            // #1361 step 4 (#1412, #1289 R1, owner decision 2026-09-14) — a
+                            // **durable** domain spawns detached children, and its freeze captures
+                            // them: each child's window and powerbox ride the parent's artifact as its
+                            // own (`CapturedDetached`), and a thaw re-launches it (`relaunch_detached`).
+                            // Admission holds the parent to R1's rule — it must hold freeze authority
+                            // over its detached progeny (#1440) — inside the one shared admission
+                            // (`Host::admit_detached_spawn`), so all three engines ask it identically.
                             let durable = host.lock_unpoisoned().is_durable();
                             // #1501 — §4's other half, mirrored from the nested arm: *a durable
                             // domain admits only freezable modules*. An un-instrumented child could
-                            // never drain-then-unwind, so once the gate above lifts this is what
-                            // keeps a durable parent's detached child capturable at all. Inert
-                            // behind the `!durable` gate today; load-bearing the moment it comes out.
+                            // never drain-then-unwind, so this is what keeps a durable parent's
+                            // detached child capturable at all.
                             let mod_durable_ok = !durable || cm.durable;
                             // D66 — admission is one call, shared by every engine: the funding
                             // budget's lane is reserved against our Σ and its `mem` spent, or neither.
-                            // #1361 step 4 — the lifted form of the gate, R1's endpoint: a durable
-                            // parent may spawn detached iff it holds freeze authority over its
-                            // detached progeny (#1440). Live only where the capture exists end to
-                            // end — this engine's own tests — until slice 4 lands it on all three.
-                            let durable_ok = !durable
-                                || (DURABLE_DETACHED_CAPTURE
-                                    && host
-                                        .lock_unpoisoned()
-                                        .holds_freeze_authority(FreezeScope::DetachedProgeny));
                             let admitted = (ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && mod_durable_ok
                                 && payload_ok
-                                && premap_ok
-                                && durable_ok)
+                                && premap_ok)
                                 .then(|| {
                                     host.lock_unpoisoned()
                                         .admit_detached_spawn(budget, child_size)
@@ -13988,9 +13948,8 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // detached child inherits the bit exactly as a nested one does (the
                                 // nested arm above), so its own spawns/fibers reserve shadow state
                                 // and its own instantiates re-apply the admission rule. #1501: this
-                                // was the half the detached arm never had. Inert behind the
-                                // `!durable` gate; without it a re-lift spawns a child no freeze
-                                // could ever capture.
+                                // was the half the detached arm never had; without it a durable
+                                // parent spawns a child no freeze could ever capture.
                                 ch.set_durable(durable);
                                 ch.set_attestation({
                                     let hg = host.lock_unpoisoned();
@@ -22071,6 +22030,12 @@ impl Host {
         &self.pending_detached
     }
 
+    /// Record detached children a freeze rang that never reached their poll — an engine whose
+    /// harvest runs outside this crate (the JIT's) reports them here, where the codec refuses on them.
+    pub fn set_unreached_detached(&mut self, unreached: Vec<PendingDetached>) {
+        self.pending_detached = unreached;
+    }
+
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
     }
@@ -22115,6 +22080,61 @@ impl Host {
     pub fn reclaim_thaw_seams(&mut self, child: &mut Host) {
         self.named_cap_registrar = child.named_cap_registrar.take();
         self.budget_thaw_hook = child.budget_thaw_hook.take();
+    }
+
+    /// #1361 step 4 — prepare a thawed detached child's re-launch, the one preparation both engines use:
+    /// resolve its program by digest among this (spawner's) powerbox's durable grants, and re-apply to
+    /// its restored powerbox what the spawner decided — durability, lane and channel caps, its program
+    /// as self module, its grant names, and its import bindings (leniently for a same-module child,
+    /// #1234). `None` if the grant is gone, it declares no memory, or its imports no longer bind.
+    pub fn prepare_detached_relaunch(
+        &self,
+        launch: &DetachedLaunch,
+        mut host: Host,
+    ) -> Option<DetachedRelaunch> {
+        let (_, g) = self.grant_by_digest(&launch.digest)?;
+        let memory_log2 = g.memory_log2?;
+        host.set_durable(true);
+        host.set_lane_cap(launch.lane);
+        host.set_channel_cap(launch.channel);
+        host.self_module = Some(Arc::clone(&g.module));
+        for (name, h) in &launch.names {
+            host.register_cap_name(name, *h);
+        }
+        let bound = if launch.same_module {
+            host.bind_same_module_manifest(&g.imports, &g.types)
+        } else {
+            host.bind_child_manifest(&g.imports, &g.types)
+        };
+        bound.ok()?;
+        Some(DetachedRelaunch {
+            funcs: Arc::clone(&g.funcs),
+            types: Arc::clone(&g.types),
+            shadow: g.shadow,
+            memory_log2,
+            module: Arc::clone(&g.module),
+            host,
+        })
+    }
+
+    /// The `Module` a grant handle names — `SELF_MODULE` for this domain's own program — if live.
+    pub fn module_arc(&self, handle: i32) -> Option<Arc<Module>> {
+        if handle == SELF_MODULE {
+            return self.self_module.clone();
+        }
+        self.resolve_module(handle)
+            .ok()
+            .map(|g| Arc::clone(&g.module))
+    }
+
+    /// This domain's own program, as registered ([`Host::set_self_module`]).
+    pub fn self_module(&self) -> Option<Arc<Module>> {
+        self.self_module.clone()
+    }
+
+    /// The names this powerbox's caps were registered under, `(name, handle)`.
+    pub fn cap_names(&self) -> &[(String, i32)] {
+        &self.cap_names
     }
 
     /// The durable module grant with §4 content digest `digest`, if this host holds one — what a
@@ -23402,6 +23422,12 @@ impl Host {
     /// the first is undone, so a refused spawn charges nothing on either axis. `Some(lane)` = admitted
     /// (the lane to stamp on the child and to return at its reap); `None` = refused, probeably.
     pub fn admit_detached_spawn(&mut self, budget: i32, child_size: u64) -> Option<i64> {
+        // #1361 step 4 — R1's endpoint (#1440): a **durable** domain spawns detached only over children
+        // a freeze of it may capture, i.e. while it holds freeze authority over its detached progeny.
+        // Checked first, so a refusal charges nothing.
+        if self.durable && !self.holds_freeze_authority(FreezeScope::DetachedProgeny) {
+            return None;
+        }
         let lane = self.peek_budget(budget).map_or(-1, |b| b.lane);
         if !self.try_grant_lane(lane) {
             return None;
@@ -24856,6 +24882,7 @@ impl Host {
         *const temen_ir::TypeEntry,
         usize,
         ShadowArena,
+        bool,
     )> {
         let g = self.resolve_module(handle).ok()?;
         Some((
@@ -24869,6 +24896,7 @@ impl Host {
             g.types.as_ptr(),
             g.types.len(),
             g.shadow.unwrap_or(ShadowArena::EMPTY),
+            g.durable,
         ))
     }
 
@@ -25118,12 +25146,6 @@ impl Host {
             // Derived, like the nested case (#1440): an ancestor may snapshot this child iff the
             // spawner holds `DetachedProgeny` *and* the subtree is durable. Both conjuncts matter —
             // authority is *who may*, durability is *whether a snapshot is possible at all*.
-            //
-            // In practice this is still `false` today, because op 15's `!durable` gate refuses a
-            // durable parent a detached child at all (#1412, restored on all three engines until
-            // #1361's capture lands). Written as the derivation anyway so the gate lift is a change to
-            // the gate and nothing else — and so this stops being a hardcoded `false` that would have
-            // to be remembered.
             freeze_exposed: self.durable
                 && self.holds_freeze_authority(FreezeScope::DetachedProgeny),
         }
@@ -25543,7 +25565,8 @@ impl Host {
         //   code, and `grant_detached_spawn_caps` no-ops with none registered.
         // - **not durable**: a `Module` grant is non-durable (a freeze fails `NonDurableKind::Module`),
         //   so granting it mid-run would silently make a snapshot-taking domain unfreezable. A durable
-        //   domain refuses op 15 at admission anyway, so this forgoes nothing.
+        //   domain spawns detached only from an attested-freezable grant (#1501), which this is not,
+        //   so this forgoes nothing.
         //
         // The decision lives here, not in the powerbox tier, because this is the only point that sees
         // both the validated unit and the host — the injected [`JitValidator`] is a bare `fn`.

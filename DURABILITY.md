@@ -462,10 +462,9 @@ edge — the parent's re-executed `thread.join` reloads it **without re-spawning
 spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
 refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
 completed-result path above; the codec round-trip is pinned by
-`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. The capture and thaw-delivery are
-**inert behind one remaining prerequisite**, so they ship correct-but-unexercised (the #1501/#1502
-pattern): op 15's `!durable` **admission gate** — a durable parent cannot yet spawn a detached child
-(step 4). The second prerequisite is **cleared**: op 15 takes a *module handle*, which
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The op-15 `!durable` admission
+gate that kept this inert came out with step 4, below.) The module-handle prerequisite was cleared
+first: op 15 takes a *module handle*, which
 `capture_durable_handles` used to refuse outright, so a durable parent that spawned a detached child
 could not be frozen at all; an attested-freezable grant is durable as of #1361 (§12.5 above), and no
 post-spawn cap-close op is needed. Under a scratch
@@ -491,14 +490,36 @@ decides what the whole tree gets back; a child whose module it no longer grants 
 under `REWINDING`, seeds its residue through the same `seed_domain` as the run's root (resolving its
 residue's `parent_task`s through its frozen id), and re-links the spawner's join slot, doorbell, kill
 flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut. Nesting
-depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). The op-15 durable gate
-lifts on all three engines together (step 4, slice 4): until the JIT and the resumable engine capture
-too, only `temen-interp`'s own tests admit a durable detached spawn (`DURABLE_DETACHED_CAPTURE`, and
-only for a parent holding `FreezeScope::DetachedProgeny`). Pinned by
-`temen-interp/src/detached_freeze_tests.rs` (freeze a live child → harvest → re-launch → the join
-delivers the uninterrupted total) and `temen-snapshot/tests/detached_roundtrip.rs` (every field
+depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A binding in an artifact
+is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
+span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
+contained by the reservation, whose uncommitted tail faults inside the window.
+
+**The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
+its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,
+its image once it unwinds). A root freeze **rings** each live child — a store of `UNWINDING` into the
+child's *own* freeze word, which is all `FreezeController::request_freeze` does for the root — and the
+child unwinds at its next poll; its task deposits the image at finish, and the nursery keeps its
+powerbox. `temen_run::jit_cap_run` turns that harvest into the interpreter's `CapturedDetached`
+(`Arc::from_raw` on the kept powerbox), so **one artifact serves both engines**. A thaw prepares each
+child through the same `Host::prepare_detached_relaunch` the interpreter uses, builds its powerbox as a
+spawn does, and re-files its task **at its recorded join slot** on a window holding its image, freeze
+word `NORMAL` and thaw word `REWINDING`. The child records its program on its own powerbox at spawn
+(the import-binding hook sets `self_module`), which is how the harvest names it by digest.
+
+**The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
+holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
+authority half inside the one shared admission, `Host::admit_detached_spawn`, which the oracle, the
+JIT's budget-take hook and the resumable engine all call. The resumable engine hands its child to its
+embedder's driver, so capturing that child is the driver's; the browser's grants neither the authority
+nor an attested module, so its durable reactors refuse op 15 on the same rule. Pinned by
+`temen-interp/src/detached_freeze_tests.rs` (oracle: freeze a live child → harvest → re-launch → the
+join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip.rs` (every field
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
-missing grant refuses).
+missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT → codec → thaw on the
+JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
+is captured, without the re-launch the thaw's join traps), and `durable_detached_parity.rs` (the oracle
+and the resumable engine admit with the authority and refuse without it, alike).
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared

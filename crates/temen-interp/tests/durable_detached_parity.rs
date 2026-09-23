@@ -15,9 +15,10 @@
 //! exactly what INVARIANTS #9 requires ("the bytecode interpreter is held bit-exact" against the
 //! oracle) and what the frontier matrix (#1413) generalises.
 //!
-//! The current agreed answer is **refuse** (see `detached_windows.rs` for why this is interim, and
-//! #1361 for the capture that reverses it). This test asserts *agreement*, and separately asserts
-//! what they agree on — so when the capture lands, only the second assertion changes.
+//! Since #1361 step 4 the agreed answer is R1's rule: a durable domain **admits** a detached spawn of an
+//! attested-freezable module iff it holds freeze authority over its detached progeny (#1440), and its
+//! freeze captures the child; without that authority it refuses. This test asserts *agreement*, and
+//! separately asserts what they agree on.
 
 use std::sync::Arc;
 use temen_interp::{bytecode, Host, Region, Trap, Value};
@@ -81,7 +82,16 @@ fn classify(r: Result<Vec<Value>, Trap>) -> Answer {
 
 /// Grant the three caps op 15 needs. The quota is generous on purpose: a quota miss also refuses with
 /// `-EINVAL`, which would make a refusal assertion pass for the wrong reason.
-fn powerbox(host: &mut Host, child: &temen_ir::Module, marked: bool) -> Vec<Value> {
+/// …and, when `authority`, freeze authority over detached progeny (#1440).
+fn powerbox_with(
+    host: &mut Host,
+    child: &temen_ir::Module,
+    marked: bool,
+    authority: bool,
+) -> Vec<Value> {
+    if authority {
+        host.grant_freeze_authority(temen_interp::FreezeScope::DetachedProgeny);
+    }
     let inst = host.grant_instantiator(0, 1 << 16);
     // `marked`: the host attests the grant as freeze-instrumented (`grant_durable_module`) — the
     // DURABILITY.md §4 bit a durable domain's admission checks. Unmarked is the default everywhere
@@ -101,11 +111,15 @@ fn oracle(durable: bool) -> Answer {
 }
 
 fn oracle_with(durable: bool, marked: bool) -> Answer {
+    oracle_full(durable, marked, false)
+}
+
+fn oracle_full(durable: bool, marked: bool, authority: bool) -> Answer {
     let parent = module(SPAWN);
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_durable(durable);
-    let args = powerbox(&mut host, &child, marked);
+    let args = powerbox_with(&mut host, &child, marked, authority);
     let mut fuel = u64::MAX;
     classify(temen_interp::run_with_host(
         &parent, 0, &args, &mut fuel, &mut host,
@@ -120,11 +134,15 @@ fn resumable(durable: bool) -> Answer {
 }
 
 fn resumable_with(durable: bool, marked: bool) -> Answer {
+    resumable_full(durable, marked, false)
+}
+
+fn resumable_full(durable: bool, marked: bool, authority: bool) -> Answer {
     let parent = module(SPAWN);
     let child = module(CHILD);
     let mut host = Host::new();
     host.set_durable(durable);
-    let args = powerbox(&mut host, &child, marked);
+    let args = powerbox_with(&mut host, &child, marked, authority);
     let prog = bytecode::VcpuProgram::compile(&parent).expect("compile");
     let back = Arc::new(Region::new(1u64 << 16, 4096));
     let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &args, back, &[], host)
@@ -156,18 +174,34 @@ fn the_oracle_and_the_resumable_engine_agree_about_a_detached_spawn() {
     }
 }
 
-/// What they agree *on*, asserted separately so the capture landing (#1361) changes this test and not
-/// the agreement test above.
+/// What they agree *on*: R1's rule (#1361 step 4). A durable domain spawns detached exactly when it
+/// holds freeze authority over its detached progeny (and the module is attested freezable, #1501) —
+/// on both engines alike; without the authority it refuses, probeably.
 #[test]
-fn a_durable_domain_is_refused_and_a_non_durable_one_is_admitted() {
+fn a_durable_domain_spawns_detached_iff_it_holds_detached_freeze_authority() {
     assert_eq!(
         oracle(false),
         Answer::Admitted,
-        "a non-durable domain spawns detached children — the gate is about durability, not op 15"
+        "a non-durable domain spawns detached children — the rule is about durability, not op 15"
     );
-    assert!(
-        matches!(oracle(true), Answer::Declined(_)),
-        "a durable domain's detached spawn refuses, until the per-child capture lands (#1361)"
+    for (name, run) in [
+        ("oracle", oracle_full as fn(bool, bool, bool) -> Answer),
+        ("resumable", resumable_full),
+    ] {
+        assert!(
+            matches!(run(true, true, false), Answer::Declined(_)),
+            "{name}: without freeze authority over its detached progeny, a durable domain refuses"
+        );
+        assert_eq!(
+            run(true, true, true),
+            Answer::Admitted,
+            "{name}: with it, and an attested-freezable module, a durable domain spawns detached"
+        );
+    }
+    assert_eq!(
+        oracle_full(true, true, true),
+        resumable_full(true, true, true),
+        "and the two engines agree (INVARIANTS #9)"
     );
 }
 
@@ -191,16 +225,14 @@ fn the_durable_refusal_is_a_value_on_both_engines() {
 // gate without adding either half, which is one more reason it would have failed even with #1361's
 // capture built.
 //
-// Both halves now land **behind** the interim gate, so today they are inert and the refusal arm is
-// what fires. These tests are written as **tripwires**: each asserts the one outcome that is wrong
-// in every era — admission of what §4 forbids — so they pass now, keep passing when the gate lifts
-// with the halves in place, and go red if the gate lifts without them. The live control in each
-// proves the probe itself works, so the tripwire half is not vacuous.
+// These tests are **tripwires**: each asserts the one outcome that is wrong in every era — admission
+// of what §4 forbids. The live control in each proves the probe itself works, so the tripwire half is
+// not vacuous.
 // ---------------------------------------------------------------------------------------------
 
 /// **§4, second half:** a durable domain never admits an **un-instrumented** module detached — on
-/// both engines. Today the interim `!durable` gate refuses first; when it lifts, `mod_durable_ok`
-/// must refuse in its place. Either way, admission is the wrong answer.
+/// both engines — `mod_durable_ok` refuses it, whatever authority the domain holds. Admission is the
+/// wrong answer.
 /// One engine's answer to the spawn, parametrised on `(durable, marked)`.
 type Engine = fn(bool, bool) -> Answer;
 

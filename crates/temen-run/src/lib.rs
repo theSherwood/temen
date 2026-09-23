@@ -1501,21 +1501,25 @@ pub fn jit_cap_run(
     // unit's spawned vCPUs are the concurrent callers, even when the top-level module is sequential).
     if hosts_threads || m.funcs.iter().any(|f| f.uses_concurrency()) {
         let host_mutex = Mutex::new(std::mem::take(host));
-        let ctx = &host_mutex as *const Mutex<Host> as *mut c_void;
+        let cc = CapCtx::Locked(&host_mutex as *const Mutex<Host>);
         let mut cm = CompiledModule::compile(
             m,
             entry,
-            cap_thunk_locked,
-            ctx,
+            cc.thunk(),
+            cc.ptr(),
             reserved_log2,
-            None, // sub
-            None, // resolve_module
-            None, // interrupt
-            None, // fuel
-            None, // fast_resolver
+            None,                         // sub
+            Some(module_resolver_locked), // §14 module children resolve their `Module` grant
+            None,                         // interrupt
+            None,                         // fuel
+            None,                         // fast_resolver
             temen_jit::Quota::default(),
             table_reserve_log2,
         )?;
+        // The granted §14 spawns (named, separate-module, detached) — the hooks the CLI path installs
+        // (`powerbox_compile_run`); without them a granted spawn here was an inert `CapFault`.
+        cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+        cm.set_budget_taker(Some(production_budget_taker(cc)));
         if hosts_fibers {
             cm.enable_fiber_hosting(temen_jit::Quota::default())?;
         }
@@ -1550,20 +1554,24 @@ pub fn jit_cap_run(
         hg_restore(host, host_mutex);
         return r;
     }
+    let cc = CapCtx::Raw(host as *mut Host);
     let mut cm = CompiledModule::compile(
         m,
         entry,
-        cap_thunk,
-        host as *mut Host as *mut c_void,
+        cc.thunk(),
+        cc.ptr(),
         reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
+        None,                  // sub
+        Some(module_resolver), // §14 module children resolve their `Module` grant
+        None,                  // interrupt
+        None,                  // fuel
+        None,                  // fast_resolver
         temen_jit::Quota::default(),
         table_reserve_log2,
     )?;
+    // The granted §14 spawns, as in the locked branch above.
+    cm.set_grant_child_hooks(Some(production_grant_hooks(cc)));
+    cm.set_budget_taker(Some(production_budget_taker(cc)));
     if hosts_fibers {
         cm.enable_fiber_hosting(temen_jit::Quota::default())?;
     }
@@ -1613,8 +1621,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
         .iter()
         .any(|n| n.module_digest.is_some() || n.completed_result.is_some())
         || !host.frozen_child_state().is_empty()
-        || !host.frozen_detached().is_empty()
-        || !host.thawed_detached().is_empty();
+        || !host.frozen_detached().is_empty();
     if jit_unrepresentable {
         return Err(temen_jit::JitError::Unsupported(
             "durable JIT thaw: residue the JIT cannot re-create (#1692)",
@@ -1655,10 +1662,12 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             entry: n.entry,
         })
         .collect();
+    let detached = detached_seeds(host)?;
     host.set_frozen_fibers(Vec::new());
     host.set_frozen_vcpus(Vec::new());
     host.set_frozen_nested(Vec::new());
     let root_sp = host.take_frozen_root_sp();
+    cm.set_detached_seed(detached);
     cm.set_durable(temen_jit::DurableResidue {
         fibers,
         vcpus,
@@ -1668,10 +1677,154 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
     Ok(())
 }
 
+/// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
+/// program resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
+/// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
+/// ([`finish_child_build`]). A child whose program the host no longer grants refuses the thaw whole.
+fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen_jit::JitError> {
+    let mut out = Vec::new();
+    for td in host.take_thawed_detached() {
+        let temen_interp::ThawedDetached {
+            slot,
+            window,
+            reserved_log2,
+            host: child,
+            launch,
+            ..
+        } = td;
+        let Some(r) = host.prepare_detached_relaunch(&launch, child) else {
+            return Err(temen_jit::JitError::Unsupported(
+                "durable JIT thaw: a detached child's program is not granted",
+            ));
+        };
+        if !host.try_grant_lane(launch.lane) {
+            // As the interpreter's re-launch: a lane the thawing parent's cap no longer fits is not
+            // re-drawn; the child keeps its own cap either way.
+        }
+        let mut gc = core::mem::MaybeUninit::<temen_jit::GrantChild>::zeroed();
+        let mut trap = 0i64;
+        // SAFETY: `gc`/`trap` are live out-cells for the call.
+        if unsafe { finish_child_build(host, Some((r.host, 0, 0)), gc.as_mut_ptr(), &mut trap) }
+            == 0
+        {
+            return Err(temen_jit::JitError::Unsupported(
+                "durable JIT thaw: child powerbox",
+            ));
+        }
+        out.push(temen_jit::DetachedSeed {
+            slot,
+            entry: launch.entry,
+            mapped_log2: r.memory_log2,
+            reserved_log2,
+            funcs: r.funcs,
+            types: r.types,
+            shadow: r
+                .shadow
+                .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
+            image: window.bytes().to_vec(),
+            // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
+            child: unsafe { gc.assume_init() },
+        });
+    }
+    Ok(out)
+}
+
+/// #1361 step 4 — the durable detached children a JIT freeze reached, onto the `Host` where the
+/// interpreter's harvest leaves them: an unwound child as a [`temen_interp::CapturedDetached`] (its
+/// window, its powerbox, its launch record), one that completed before the cut as a
+/// [`temen_interp::FrozenDetached`] result, and one that never reached its poll (or trapped) as
+/// unreached — which the codec refuses whole rather than emit part of the tree.
+fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
+    let mut captured = Vec::new();
+    let mut completed = Vec::new();
+    let mut unreached = Vec::new();
+    for h in cm.take_detached_harvest() {
+        if h.powerbox.is_null() {
+            continue; // a builder that shared no powerbox: nothing to carry (never the detached one)
+        }
+        // SAFETY: the harvest hands over the nursery's retained ref — one counted `Arc` to the
+        // child's `Mutex<Host>`, built by `finish_child_build` — now ours.
+        let child = unsafe { std::sync::Arc::from_raw(h.powerbox as *const Mutex<Host>) };
+        let (module, lane, channel, names) = {
+            let c = child.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                c.self_module(),
+                c.lane_cap(),
+                c.channel_cap(),
+                c.cap_names().to_vec(),
+            )
+        };
+        let Some(module) = module else {
+            continue;
+        };
+        let same_module = host
+            .self_module()
+            .is_some_and(|m| std::sync::Arc::ptr_eq(&m, &module));
+        let spawn = temen_interp::DetachedSpawn {
+            entry: h.entry,
+            digest: temen_interp::module_digest(&module),
+            module: std::sync::Arc::clone(&module),
+            max_vcpus: usize::MAX,
+            same_module,
+        };
+        match (h.image, h.outcome) {
+            (Some(image), _) => {
+                let pages = image.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
+                let window = temen_interp::MemLayout::from_dense(
+                    image,
+                    &vec![temen_interp::CapturedProt::Rw; pages],
+                    1u64 << h.mapped_log2,
+                );
+                captured.push(temen_interp::CapturedDetached {
+                    parent_task: 0,
+                    slot: h.slot,
+                    window,
+                    reserved_log2: h.reserved_log2,
+                    host: child,
+                    module,
+                    launch: temen_interp::DetachedLaunch {
+                        task: 0,
+                        entry: h.entry,
+                        digest: spawn.digest,
+                        fuel: u64::MAX,
+                        lane,
+                        channel,
+                        max_vcpus: u64::MAX,
+                        same_module,
+                        names,
+                    },
+                });
+            }
+            (None, Some((result, 0))) => completed.push(temen_interp::FrozenDetached {
+                parent_task: 0,
+                slot: h.slot,
+                completed_result: result,
+            }),
+            _ => unreached.push(temen_interp::PendingDetached {
+                parent_task: 0,
+                slot: h.slot,
+                child_task: 0,
+                host: child,
+                spawn,
+            }),
+        }
+    }
+    if !captured.is_empty() {
+        host.set_captured_detached(captured);
+    }
+    if !completed.is_empty() {
+        host.set_frozen_detached(completed);
+    }
+    if !unreached.is_empty() {
+        host.set_unreached_detached(unreached);
+    }
+}
+
 /// The freeze residue of a durable [`jit_cap_run`], handed to the embedder on the `Host` exactly where
 /// the interp's freeze driver leaves it, so one `temen_snapshot::freeze(module, window, host)` serves
 /// both engines. The whole residue, not just the fibers (#1690).
 fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
+    jit_detached_leave(cm, host);
     let r = cm.take_durable_residue();
     if !r.fibers.is_empty() {
         host.set_frozen_fibers(
@@ -2214,7 +2367,7 @@ pub unsafe extern "C" fn module_resolver(
 ) -> i32 {
     let host = &*(ctx as *const Host);
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -2224,6 +2377,7 @@ pub unsafe extern "C" fn module_resolver(
                 types,
                 n_types,
                 shadow,
+                durable,
             };
             1
         }
@@ -2245,7 +2399,7 @@ pub unsafe extern "C" fn module_resolver_locked(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     match host.resolve_module_parts(handle) {
-        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow)) => {
+        Some((funcs, n_funcs, memory_log2, data, n_data, types, n_types, shadow, durable)) => {
             *out = temen_jit::ResolvedModule {
                 funcs,
                 n_funcs,
@@ -2255,6 +2409,7 @@ pub unsafe extern "C" fn module_resolver_locked(
                 types,
                 n_types,
                 shadow,
+                durable,
             };
             1
         }
@@ -2921,6 +3076,11 @@ pub unsafe extern "C" fn child_bind_imports(
         };
         if bound.is_err() {
             return -22;
+        }
+        // The child runs this program: its own self module, as the interpreter's spawn arms stamp it
+        // (serve/offer resolution; and what a freeze of a detached child names it by, #1361).
+        if let Some(m) = parent.module_arc(module as i32) {
+            child.set_self_module(&m);
         }
     }
     0

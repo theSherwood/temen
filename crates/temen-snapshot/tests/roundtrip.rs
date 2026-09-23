@@ -1778,10 +1778,9 @@ fn the_thaw_hook_may_not_raise_or_decline_without_refusing_the_restore() {
 // #1361 step 2 — a completed-but-unjoined **detached** §14 child rides the control section. A
 // detached child owns a separate window; a completed one has nothing to unwind, so only its
 // `thread.join` result crosses the freeze boundary (reload-not-reissue), the same shape a completed
-// nested child uses. This exercises the codec half end to end. The freeze-**capture** and
-// thaw-**delivery** halves are inert behind op 15's `!durable` admission gate (a durable parent
-// cannot yet spawn a detached child, #1361 step 4), so they are validated by a scratch gate-lift
-// rather than shipped here — see the PR description.
+// nested child uses. This exercises the codec half end to end; the live capture and re-launch of a
+// running detached child (#1361 step 4) are pinned by `detached_roundtrip.rs` and `temen`'s
+// `durable_detached_jit.rs`.
 // ---------------------------------------------------------------------------------------------
 
 /// A detached residue — `(parent_task, slot, join-result)` per child — round-trips through the codec

@@ -675,6 +675,9 @@ pub struct ResolvedModule {
     /// The module's declared durable shadow arena (INVARIANTS.md #16) — `ShadowArena::EMPTY` when
     /// it declared none (then a durable child of it is refused, never placed by default).
     pub shadow: temen_ir::durable_abi::ShadowArena,
+    /// The granting host attested the module **freezable** (DURABILITY.md §4: it was instrumented). A
+    /// durable domain admits only such a child (#1501).
+    pub durable: bool,
 }
 
 /// The host callback the §14 nesting runtime uses to resolve a guest's **`Module` handle** to the
@@ -1582,6 +1585,43 @@ pub struct DurableResidue {
     pub root_sp: Option<u64>,
 }
 
+/// #1361 step 4 — a **detached** child a durable JIT freeze reached: what the embedder needs to put
+/// it in the parent's artifact (as the interpreter's `CapturedDetached`) or to tell why it cannot.
+pub struct DetachedHarvest {
+    /// The parent's join slot for it.
+    pub slot: usize,
+    /// Its entry function in its own module.
+    pub entry: u32,
+    /// Its window geometry.
+    pub mapped_log2: u8,
+    pub reserved_log2: u8,
+    /// Its powerbox: the nursery's retained ref ([`GrantChild::retained_ctx`]) — one counted ref to
+    /// the child `Host`, which the embedder now owns and must release.
+    pub powerbox: *mut core::ffi::c_void,
+    /// Its window image, **iff** it unwound for the freeze.
+    pub image: Option<Vec<u8>>,
+    /// `(result, trap)` once its task finished: it completed before the cut (`trap == 0` and no
+    /// image), or was torn down unreached (it never polled — parked, #1584).
+    pub outcome: Option<(i64, i64)>,
+}
+
+/// #1361 step 4 — a captured detached child a JIT **thaw** re-launches (see
+/// [`CompiledModule::set_detached_seed`]).
+pub struct DetachedSeed {
+    pub slot: usize,
+    pub entry: u32,
+    pub mapped_log2: u8,
+    pub reserved_log2: u8,
+    /// Its own program, resolved by the embedder from the module digest the artifact names.
+    pub funcs: Arc<[Func]>,
+    pub types: Arc<[temen_ir::TypeEntry]>,
+    pub shadow: temen_ir::durable_abi::ShadowArena,
+    /// Its restored window image.
+    pub image: Vec<u8>,
+    /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
+    pub child: GrantChild,
+}
+
 /// How a durable JIT run is driven beyond its residue.
 #[derive(Clone, Default)]
 pub struct DurableRun {
@@ -2321,6 +2361,11 @@ pub struct CompiledModule {
     /// Durable **thaw** seed (§4 "JIT parity"): the §14 **nested children** to re-attach + rewind before
     /// the parent re-enters under `REWINDING`, so its re-executed `join` resolves. Empty otherwise.
     frozen_nested_seed: Vec<FrozenNested>,
+    /// #1361 step 4 — the durable **detached** children a freeze reached, after teardown (see
+    /// [`DetachedHarvest`]); taken by the embedder. Empty unless a freeze caught one.
+    detached_out: Vec<DetachedHarvest>,
+    /// #1361 step 4 — the captured detached children a **thaw** re-launches before the root re-enters.
+    detached_seed: Vec<DetachedSeed>,
     /// Durable **thaw** input (slice 3.3): the root vCPU's restored shadow-SP extent (from the
     /// artifact), set as the active word before the root rewinds. The empty root extent (`ShadowArena::frame_base(0)`) otherwise.
     thaw_root_sp: u64,
@@ -3385,6 +3430,8 @@ impl CompiledModule {
             frozen_root_sp_out: 0,
             frozen_vcpu_seed: Vec::new(),
             frozen_nested_seed: Vec::new(),
+            detached_out: Vec::new(),
+            detached_seed: Vec::new(),
             thaw_root_sp: shadow.frame_base(0), // §12.8 4A.5: empty root extent
             freeze_ctl: None,
             #[cfg(fiber_rt)]
@@ -3507,6 +3554,18 @@ impl CompiledModule {
             nested: std::mem::take(&mut self.frozen_nested_out),
             root_sp: (root_sp != 0).then_some(root_sp),
         }
+    }
+
+    /// #1361 step 4 — the durable detached children the last run's freeze reached (see
+    /// [`DetachedHarvest`]); taken. Each carries a powerbox ref the caller now owns.
+    pub fn take_detached_harvest(&mut self) -> Vec<DetachedHarvest> {
+        std::mem::take(&mut self.detached_out)
+    }
+
+    /// #1361 step 4 — the captured detached children the next (thaw) run re-launches, each at its
+    /// recorded join slot, before the root re-enters under `REWINDING`.
+    pub fn set_detached_seed(&mut self, seed: Vec<DetachedSeed>) {
+        self.detached_seed = seed;
     }
 
     /// Run an **incrementally defined** function (a trampoline pointer returned by
@@ -3910,6 +3969,19 @@ impl CompiledModule {
             }
         }
 
+        // #1361 step 4 — re-launch the captured detached children at their recorded slots, each on its
+        // own restored window under `REWINDING`, before the root re-enters: its rewound `join` then
+        // parks on them exactly as before the cut.
+        #[cfg(fiber_rt)]
+        if (*this).durable && !(*this).detached_seed.is_empty() {
+            let seed = std::mem::take(&mut (*this).detached_seed);
+            if let Some(n) = &(*this)._nursery {
+                for d in seed {
+                    n.relaunch_detached(d);
+                }
+            }
+        }
+
         // Publish the live window's fault range so a mid-run `invoke_extra` (from a call.cap
         // handler) can arm its nested recovery against this run's window.
         (*this).live_fault_range = Some(window.fault_range());
@@ -4055,6 +4127,9 @@ impl CompiledModule {
             // read back by the durable-nested entry point.
             if let Some(n) = &(*this)._nursery {
                 (*this).frozen_nested_out = n.take_frozen_nested();
+                // #1361 step 4 — and reach its detached children, which own windows the freeze word
+                // above is not in: ring each one's own; they unwind and are harvested at teardown.
+                n.ring_detached();
             }
         }
 
@@ -4068,7 +4143,12 @@ impl CompiledModule {
         // the parent window, so none may outlive it (mirrors the vCPU `join_all` just below).
         #[cfg(fiber_rt)]
         if let Some(n) = &(*this)._nursery {
-            n.join_children();
+            let froze =
+                (*this).durable && !faulted && fiber_rt::window_is_unwinding(mem_base as u64);
+            n.join_children(froze);
+            if froze {
+                (*this).detached_out = n.take_detached_harvest();
+            }
         }
         // Join every spawned vCPU OS thread before freeing the window — no vCPU may outlive it.
         #[cfg(fiber_rt)]
@@ -5444,6 +5524,8 @@ fn compile_child_windowed(
         frozen_root_sp_out: 0,
         frozen_vcpu_seed: Vec::new(),
         frozen_nested_seed: Vec::new(),
+        detached_out: Vec::new(),
+        detached_seed: Vec::new(),
         thaw_root_sp: shadow.frame_base(0),
         shadow,
         freeze_ctl: None,

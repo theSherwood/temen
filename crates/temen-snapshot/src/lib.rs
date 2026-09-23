@@ -381,6 +381,13 @@ pub enum RestoreError {
 /// so a forged artifact could otherwise smuggle an out-of-window `base` straight into that pointer
 /// arithmetic. Re-check it here at the deserialization boundary; bindings with no address payload
 /// always pass.
+///
+/// The bound is the window's **reservation**, not its committed image (#1361 step 4): that is what the
+/// live grant path hands out — a root's and a detached child's starter caps span the reservation so
+/// `vm_map` can grow the window into it — and what every host-side use is contained by, since the
+/// reservation's uncommitted tail faults inside the window (the domain the masking lowering confines
+/// guest addresses to). An artifact may carry exactly what a live run can hold; bounding by the image
+/// instead refused every detached child, whose caps always span past it.
 fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
     let (base, size) = match *binding {
         // The whole-window `AddressSpace` form (`{0, u64::MAX}` — the retired `Memory` kind,
@@ -532,7 +539,7 @@ fn freeze_at(
     // error instead of surfacing as a Malformed artifact later.
     if let Some(h) = handles
         .iter()
-        .find(|h| !binding_in_window(&h.binding, window.len() as u64))
+        .find(|h| !binding_in_window(&h.binding, 1u64 << reserved_log2))
     {
         return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
     }
@@ -1116,8 +1123,9 @@ fn restore_at(
         let type_id = u32::try_from(hr.uleb()?).map_err(|_| RestoreError::Malformed)?;
         let binding = read_binding(&mut hr)?;
         // Re-establish the window-containment invariant the §14 JIT instantiator's `unsafe` relies on:
-        // a forged AddressSpace/Instantiator `base`/`size` must not name memory outside `[0, mapped)`.
-        if !binding_in_window(&binding, mapped as u64) {
+        // a forged AddressSpace/Instantiator `base`/`size` must not name memory outside the window's
+        // reservation `[0, 1 << reserved_log2)` (see `binding_in_window`).
+        if !binding_in_window(&binding, reserved) {
             return Err(RestoreError::BindingOutOfWindow);
         }
         handles.push(DurableHandle {
