@@ -163,6 +163,12 @@ jobs:
         run: cargo test -p temen-leng --test nim_e2e -- --nocapture
       - name: Nim language conformance matrix (#956)
         run: cargo test -p temen-leng --test nim_conformance -- --nocapture
+      # #1609: the self-hosted lane end to end, release mode — nimsem (Temen, no C) forks and
+      # execs its own nifler through the chibicc-built POSIX /bin/sh, and its semchecked system
+      # must match native nimony's (paths and index offsets normalized). Mechanism-level coverage
+      # is `nim_shells_out_through_the_posix_sh` in nim_e2e above; this is the whole compiler.
+      - name: Self-hosted nimony lane (must match native)
+        run: bash scripts/ci/nim-selfhost-lane.sh
   # Three mechanical consistency gates that share a runner. Each was its own job; each ran in ~6
   # SECONDS and then held one of the account's ~20 concurrency slots, which is the thing actually
   # rationed once every job is fast (measured on run 4303: longest job 10.5 min, but jobs waited up
