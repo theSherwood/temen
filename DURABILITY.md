@@ -462,10 +462,9 @@ edge — the parent's re-executed `thread.join` reloads it **without re-spawning
 spawn). The residue type, the freeze-capture (completed → capture, else the existing fail-closed
 refusal), the codec, and the thaw-delivery are a verbatim structural mirror of the nested
 completed-result path above; the codec round-trip is pinned by
-`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. The capture and thaw-delivery are
-**inert behind one remaining prerequisite**, so they ship correct-but-unexercised (the #1501/#1502
-pattern): op 15's `!durable` **admission gate** — a durable parent cannot yet spawn a detached child
-(step 4). The second prerequisite is **cleared**: op 15 takes a *module handle*, which
+`roundtrip.rs::a_completed_detached_child_rides_the_control_section`. (The op-15 `!durable` admission
+gate that kept this inert came out with step 4, below.) The module-handle prerequisite was cleared
+first: op 15 takes a *module handle*, which
 `capture_durable_handles` used to refuse outright, so a durable parent that spawned a detached child
 could not be frozen at all; an attested-freezable grant is durable as of #1361 (§12.5 above), and no
 post-spawn cap-close op is needed. Under a scratch
@@ -491,14 +490,36 @@ decides what the whole tree gets back; a child whose module it no longer grants 
 under `REWINDING`, seeds its residue through the same `seed_domain` as the run's root (resolving its
 residue's `parent_task`s through its frozen id), and re-links the spawner's join slot, doorbell, kill
 flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut. Nesting
-depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). The op-15 durable gate
-lifts on all three engines together (step 4, slice 4): until the JIT and the resumable engine capture
-too, only `temen-interp`'s own tests admit a durable detached spawn (`DURABLE_DETACHED_CAPTURE`, and
-only for a parent holding `FreezeScope::DetachedProgeny`). Pinned by
-`temen-interp/src/detached_freeze_tests.rs` (freeze a live child → harvest → re-launch → the join
-delivers the uninterrupted total) and `temen-snapshot/tests/detached_roundtrip.rs` (every field
+depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). A binding in an artifact
+is bounded by the window's **reservation**, not its committed image: a detached child's starter caps
+span its reservation (as a root's do, so `vm_map` can grow into it), and every host-side use is
+contained by the reservation, whose uncommitted tail faults inside the window.
+
+**The JIT captures them too.** A durable detached child on the JIT runs as a child-executor task over
+its own window, with a freeze cell beside its join-table entry (`DurableCell`: its live window base,
+its image once it unwinds). A root freeze **rings** each live child — a store of `UNWINDING` into the
+child's *own* freeze word, which is all `FreezeController::request_freeze` does for the root — and the
+child unwinds at its next poll; its task deposits the image at finish, and the nursery keeps its
+powerbox. `temen_run::jit_cap_run` turns that harvest into the interpreter's `CapturedDetached`
+(`Arc::from_raw` on the kept powerbox), so **one artifact serves both engines**. A thaw prepares each
+child through the same `Host::prepare_detached_relaunch` the interpreter uses, builds its powerbox as a
+spawn does, and re-files its task **at its recorded join slot** on a window holding its image, freeze
+word `NORMAL` and thaw word `REWINDING`. The child records its program on its own powerbox at spawn
+(the import-binding hook sets `self_module`), which is how the harvest names it by digest.
+
+**The gate is lifted on all three engines (step 4).** A durable parent spawns detached exactly when it
+holds `FreezeScope::DetachedProgeny` (#1440) and the module is attested freezable (#1501) — the
+authority half inside the one shared admission, `Host::admit_detached_spawn`, which the oracle, the
+JIT's budget-take hook and the resumable engine all call. The resumable engine hands its child to its
+embedder's driver, so capturing that child is the driver's; the browser's grants neither the authority
+nor an attested module, so its durable reactors refuse op 15 on the same rule. Pinned by
+`temen-interp/src/detached_freeze_tests.rs` (oracle: freeze a live child → harvest → re-launch → the
+join delivers the uninterrupted total), `temen-snapshot/tests/detached_roundtrip.rs` (every field
 survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
-missing grant refuses).
+missing grant refuses), `temen/tests/durable_detached_jit.rs` (freeze on the JIT → codec → thaw on the
+JIT **and** on the interpreter; freeze on the interpreter → thaw on the JIT; without the doorbell nothing
+is captured, without the re-launch the thaw's join traps), and `durable_detached_parity.rs` (the oracle
+and the resumable engine admit with the authority and refuse without it, alike).
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared
@@ -1444,7 +1465,7 @@ resume/suspend — through the freeze→thaw round-trip (R11).
 **3.3.1 landed**: the JIT maintains the per-fiber **shadow-SP swap** in `fiber_resume` (which
 brackets a fiber's residency — entry swaps in, exit swaps back, so `fiber_suspend` needs no change),
 keyed off a `durable` flag + window base armed on the root `FiberRuntime` at entry and a per-`FiberSlot`
-saved-SP. Gated by `compile_and_run_capture_reserved_with_host_durable`; tested by
+saved-SP. Gated by the durable JIT entry (now `compile_and_run_durable`); tested by
 `crates/temen/tests/durable_fibers_jit.rs` (each context routes to its own region, cross-checked
 against `temen_interp`'s `SHADOW_*`). Slice **3.3.2 landed**: the JIT **freeze driver**
 (`fiber_rt::freeze_drive`, hooked into `run_code_raw` after the root unwinds, gated on the
@@ -1459,7 +1480,7 @@ residue per flattened fiber (entry funcref + data-SP retained in the `FiberSlot`
 flattened shadow-SP read after), and a thaw **re-seeds** those fibers into the run-shared table
 before re-entering under `REWINDING` (`fiber_rt::seed_frozen_fibers` builds each via the shared
 `make_fiber`, so a thaw `cont.resume` re-enters its entry → rewinds → re-parks). The durable entry
-(`compile_and_run_capture_reserved_with_host_durable`) takes a `seed` and returns the residue.
+(now `compile_and_run_durable`, #1690) takes a `seed` and returns the residue.
 `durable_fibers_jit.rs` proves both cross-backend directions: interp and JIT freeze a fiber'd domain
 to a **byte-identical §12 artifact** (window image + Section-2 residue), and an **interpreter-frozen
 fiber artifact** restored through the codec **thaws on the JIT** to the uninterrupted result (107).
@@ -1583,6 +1604,42 @@ the codec rightly refuses). *Interp note:* recycling is done interp-side, but th
 STW (single-worker; `arm_freeze_after` flips only the running vCPU's word), so the recycled-context-at-freeze
 stays a **JIT** slice; the interp path is unaffected. *Still optional:* fuzzing the spawn/join/freeze interleaving.
 
+**One durable JIT entry, one residue (#1690, #1691).** The JIT's five durable entries
+(`…_durable`, `_nested`, `_interruptible`, `_mv`, `_mv_interruptible`) each carried a different subset
+of the residue and silently dropped the rest; the embedder's path (`temen_run::jit_cap_run`) carried
+fibers only, so a frozen thread or nested child never reached the artifact. They are now one
+`compile_and_run_durable(…, DurableRun { init_prots, seed, freeze })` over one `DurableResidue { fibers,
+vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and `jit_durable_enter`/`_leave`
+carry all of it through the `Host` both ways. An async freeze controller now always engages the
+concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
+the root's (#1691). Residue the JIT cannot re-create yet (a separate-module or completed nested child,
+a nested child's host state, a detached child that completed before the cut, a live detached child
+whose program the thawing host no longer grants — #1692) is refused whole as `Unsupported` and
+left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
+(`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
+
+**Declined freezes (#1671, owner decision 2026-09-23).** A freeze that cannot complete is **declined at its
+trigger, before anything unwinds** — never a domain-killing trap (INVARIANTS #5). The instant a countdown
+trigger fires (`durable_tick_countdown` promotes `ARMED` → `UNWINDING`, at a fiber safepoint or a back-edge),
+`freeze_census` walks every vCPU of the run (the one executing plus everything the scheduler holds, runnable or
+parked) and asks whether the cut can complete. If not, the freeze word goes straight back to `NORMAL` — no poll
+has read it, so nothing unwound — the run finishes exactly as if it had never been armed, and the run root's
+powerbox records a `FreezeDeclined { cause, task, slot }` for the embedder (`Host::take_freeze_declined`). The
+causes (`DeclineCause`) are the shapes the unwind would refuse: a §14 child completed with a trap
+(`ChildTrapped`), a child domain holding a non-durable handle, a live nested child beside a `thread.spawn`
+thread, a nested child owning fibers, a live detached child with no doorbell, a parked serve handler, a fiber
+parked on a call/ticket/pipe, and a detached window with a §13 region mapped. The **root's** own non-durable
+handles are not a cause: the codec answers those as a `FreezeError` value and its embedder can still drain them.
+The unwind-time refusals (`nested_refused`, `child_state_refused`, `detached_live_refused`, `freeze_drive`)
+stay as the fail-closed backstop for a cause that arises *after* the census — `Blocking.work` entered under a
+landed freeze (4A.7, below) is the one named. The owner's standing rule is that freezes should basically never
+fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap filed to be closed
+(#1703). On the oracle only for now; freeze-from-start (a window that begins `UNWINDING`) and freeze-on-quiesce
+are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a trapped completed child and a
+nested child beside a thread each decline, and the run's result equals the unarmed run's; with the census
+disabled both end `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the
+root's handles are the codec's").
+
 **[~] 4A.7 — parked-vCPU / `Blocking.work` latency — done (fail-closed cut).** A durable stop-the-world freeze
 waits for every vCPU to quiesce *at a safepoint*; a vCPU inside a host `Blocking.work` call has no poll site, so
 the freeze would stall for the whole (latency-unbounded) call — the R6 caveat ("latency bounded by the longest
@@ -1650,7 +1707,7 @@ global `UNWINDING` — it did, and a root woken from a join by a child that unwo
 **Decomposition:**
 - **PR-1 (freeze side) — DONE:** the deferred single-worker path (`defer_spawn` /
   `Domain::drive_frozen_spawns`) + `FrozenVCpu` residue + vCPU-context allocator, exported through
-  `compile_and_run_capture_reserved_with_host_durable_mv`. Pinned by `durable_multivcpu_jit`'s
+  the durable JIT entry (now `compile_and_run_durable`, #1690). Pinned by `durable_multivcpu_jit`'s
   `jit_freezes_a_spawned_vcpu_matching_interp`: a root+child domain freezes to a **byte-identical durable
   reserve** and a **field-identical `FrozenVCpu` residue** vs the interpreter (the multi-vCPU analog of
   `jit_freeze_driver_flattens_a_fiber_matching_interp`).

@@ -29,9 +29,8 @@ const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::Sh
     end: 65536,
 };
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
-    compile_and_run_capture_reserved_with_host_durable_interruptible, FreezeController, JitError,
-    JitOutcome,
+    compile_and_run_capture_reserved_with_host, compile_and_run_durable, DurableResidue,
+    DurableRun, FreezeController, JitError, JitOutcome,
 };
 
 const SIZE_LOG2: u8 = 18;
@@ -232,17 +231,18 @@ fn jit_async_freeze(
     let clk = h.grant_clock();
     let slots = [clk as i64];
     let win = window_with(STATE_NORMAL);
-    let (out, snap, _) = compile_and_run_capture_reserved_with_host_durable_interruptible(
+    let (out, snap, DurableResidue { .. }) = compile_and_run_durable(
         inst,
         0,
         &slots,
         &win,
-        &[],
-        &[],
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut h as *mut Host as *mut c_void,
-        freeze,
+        DurableRun {
+            freeze: Some(freeze),
+            ..Default::default()
+        },
     )
     .expect("durable interruptible run compiles");
     (out, snap)
@@ -256,16 +256,15 @@ fn jit_durable_thaw(inst: &Module, clock: i64, snap: &[u8]) -> (JitOutcome, Vec<
     h.clock_ns = clock;
     let clk = h.grant_clock();
     let slots = [clk as i64];
-    let (out, final_win, _) = compile_and_run_capture_reserved_with_host_durable(
+    let (out, final_win, DurableResidue { .. }) = compile_and_run_durable(
         inst,
         0,
         &slots,
         &win,
-        &[],
-        &[],
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut h as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("durable thaw compiles");
     (out, final_win)

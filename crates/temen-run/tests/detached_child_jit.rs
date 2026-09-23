@@ -11,10 +11,7 @@
 
 use core::ffi::c_void;
 use temen_interp::{run_with_host, Host, Value};
-use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable,
-    compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome,
-};
+use temen_jit::{compile_and_run_capture_reserved_with_host_ex, GrantChildHooks, JitOutcome};
 
 /// #1234 — the production table, derived from one [`temen_run::CapCtx`] so the hook family and
 /// the parent pointer it decodes are chosen together (this used to hand-roll both, and nothing
@@ -186,50 +183,35 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// #1412 — **a durable detached spawn declines identically on the interpreter and the native JIT.**
+/// #1412 / #1501 — **a durable detached spawn of an un-attested module declines identically on the
+/// interpreter and the native JIT.**
 ///
-/// This test previously asserted the opposite, and its old name said so:
-/// `a_durable_detached_spawn_admits_on_the_interpreter_but_still_declines_on_the_native_jit`. It was
-/// added with #1289 R1 to pin what that ruling left behind — R1 lifted the tree-walker's `!durable`
-/// op-15 gate and only the tree-walker's, so the two backends diverged, and this test recorded the
-/// divergence as the intended "transition state".
-///
-/// INVARIANTS #9 does not have a transition state. The tree-walk interpreter defines guest-observable
-/// semantics and the other engines match it or decline to it; two engines giving a verified module two
-/// different answers is the thing the invariant exists to forbid. A test asserting that they disagree
-/// cannot go red when the disagreement is wrong — which is how it stood for six days.
-///
-/// Owner decision 2026-09-14 (#1412): R1's end state stands (freeze authority is a per-grant
-/// capability; a durable parent will spawn detached children whose freeze *captures* them), but its
-/// spawn lift is deferred until freeze authority exists in code (#1440) and the per-child capture
-/// lands (#1361). Until then both backends refuse, probeably, charging nothing.
-///
-/// So the assertion inverts: not "they differ, as planned", but **"they agree"**. That is what makes
-/// this a pin rather than a record. It extends `temen-interp`'s `durable_detached_parity.rs`
-/// (oracle ↔ resumable engine) to the third engine.
+/// INVARIANTS #9 has no transition state: the tree-walk interpreter defines guest-observable semantics
+/// and the other engines match it or decline to it. Since #1361 step 4 a durable domain *does* spawn
+/// detached children — when it holds freeze authority over its detached progeny (#1440) and the module
+/// is attested freezable (#1501) — and its freeze captures them (`temen`'s `durable_detached_jit.rs`).
+/// This pins the refusal half across the third engine: an **un-attested** module is refused on both,
+/// probeably (`-EINVAL`), charging nothing. (The admission half, on the oracle and the resumable engine,
+/// is `temen-interp`'s `durable_detached_parity.rs`.)
 #[test]
-fn a_durable_detached_spawn_declines_the_same_way_on_the_interpreter_and_the_native_jit() {
+fn a_durable_detached_spawn_of_an_unattested_module_declines_the_same_way_on_both_backends() {
     let p = module(SPAWN_ONLY_PARENT);
     let c = module(CHILD);
 
-    // Native JIT tier: still declines. It learns durability from the run entry (`cm.durable` → the
-    // nursery's flag), not from the host, so the durable run entry is the one to use. It installs no
-    // grant hooks: a thunk that reached the hook lookup would trap `CapFault`, so a `-22` here can only
-    // come from the durable gate that precedes it.
+    // Native JIT tier, through the embedder's path (`jit_cap_run`, which installs the grant hooks): the
+    // same `-EINVAL`, from the same rule — `mod_durable_ok` — before the budget is charged.
     {
         let (mut host, h) = host(&c, 1 << 16);
         host.set_durable(true);
         let args = [h[0] as i64, h[1] as i64, h[2] as i64];
-        let (jo, _, _) = compile_and_run_capture_reserved_with_host_durable(
+        let (jo, _) = temen_run::jit_cap_run(
             &p,
             0,
             &args,
             &[],
-            &[],
-            &[],
             temen_ir::DEFAULT_RESERVED_LOG2,
-            temen_run::cap_thunk,
-            &mut host as *mut Host as *mut c_void,
+            0,
+            &mut host,
         )
         .expect("jit run");
         let r = match jo {

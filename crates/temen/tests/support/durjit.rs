@@ -38,8 +38,8 @@ use temen_interp::{
 };
 use temen_ir::{Module, ValType};
 use temen_jit::{
-    compile_and_run_capture_reserved_with_host, compile_and_run_capture_reserved_with_host_durable,
-    FrozenFiber as JitFrozen, JitError, JitOutcome,
+    compile_and_run_capture_reserved_with_host, compile_and_run_durable, DurableResidue,
+    DurableRun, FrozenFiber as JitFrozen, JitError, JitOutcome,
 };
 use temen_snapshot::{freeze, restore};
 
@@ -307,16 +307,21 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
     let mut jhost = Host::new();
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     arm_freeze_after(&mut jwin, arm);
-    let (jout, jsnap, jfibers) = match compile_and_run_capture_reserved_with_host_durable(
+    let (
+        jout,
+        jsnap,
+        DurableResidue {
+            fibers: jfibers, ..
+        },
+    ) = match compile_and_run_durable(
         &inst,
         0,
         &[],
         &jwin,
-        &[],
-        &[], // freeze: no seed
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut jhost as *mut Host as *mut c_void,
+        DurableRun::default(),
     ) {
         Ok(t) => t,
         Err(JitError::Unsupported(_)) => return,
@@ -381,16 +386,21 @@ pub fn fuzz_recycle_fiber_one_xbackend(g: &mut Gen) {
         .collect();
     assert_eq!(seed.len(), 1, "the artifact carried the recycled fiber");
     let mut jhost3 = Host::new();
-    let jthaw = match compile_and_run_capture_reserved_with_host_durable(
+    let jthaw = match compile_and_run_durable(
         &inst,
         0,
         &[],
         &thaw_win,
-        &[],
-        &seed,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut jhost3 as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                fibers: seed.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     ) {
         Ok((o, _, _)) => o,
         Err(JitError::Unsupported(_)) => return,

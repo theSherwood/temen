@@ -3,10 +3,8 @@
 //! under `REWINDING` from them (`relaunch_detached`), and the parent's rewound `thread.join` parks on it
 //! exactly as before the cut.
 //!
-//! These live in the crate because a durable parent may spawn detached only in this crate's own test
-//! build until slice 4 lifts the gate on all three engines ([`DURABLE_DETACHED_CAPTURE`]). The hand-off
-//! between freeze and thaw is in memory here; `temen-snapshot`'s tests carry the same residue through
-//! the codec.
+//! The hand-off between freeze and thaw is in memory here; `temen-snapshot`'s tests carry the same
+//! residue through the codec, and `temen`'s `durable_detached_jit.rs` runs the whole arc on the JIT.
 
 use super::*;
 use temen_durable::{begin_thaw, init_durable_window, read_state, transform_module, write_state};

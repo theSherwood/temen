@@ -791,13 +791,15 @@ fn a_woken_event_parked_fiber_freezes_without_a_placeholder() {
 }
 
 // ---------------------------------------------------------------------------
-// §13.4 step 2, the fail-closed gate: an **unwoken capability park** cannot freeze — a
-// `Leaf` (call.cap) point spills its results *including* the call's, so a placeholder would
-// be reloaded on thaw as if it were the call's real result (reload-not-reissue). The driver
-// probes the park's kind by which scheduler map holds the waiter; a cap park is not in
-// `wait_waiters`, so the freeze refuses with `FiberFault`. The fiber parks in a blocking
-// stdin read (the racing-fibers shape from `fiber_parks.rs`, handle passed through memory —
-// the transform has no conversions).
+// §13.4 step 2, the gate: an **unwoken capability park** cannot freeze — a `Leaf` (call.cap)
+// point spills its results *including* the call's, so a placeholder would be reloaded on thaw
+// as if it were the call's real result (reload-not-reissue). The park's kind is probed by which
+// scheduler map holds the waiter; a cap park is not in `wait_waiters`. Since #1671 the freeze
+// census sees this at the trigger and **declines** — the run goes on as if unarmed and the
+// embedder reads `FiberParkedOnCall` — where it used to unwind and then refuse with `FiberFault`
+// (the unwind-time refusal stays as the backstop). Re-issuing the park instead is #1676. The
+// fiber parks in a blocking stdin read (the racing-fibers shape from `fiber_parks.rs`, handle
+// passed through memory — the transform has no conversions).
 // ---------------------------------------------------------------------------
 
 const SRC_CAP_PARKED_FIBER: &str = r#"
@@ -827,9 +829,9 @@ block 0 (va: i64, vb: i64) {
 "#;
 
 #[test]
-fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
-    use temen_durable::arm_freeze_after;
-    use temen_interp::StreamRole;
+fn an_unwoken_cap_parked_fiber_declines_the_freeze() {
+    use temen_durable::{arm_freeze_after, read_state, STATE_NORMAL};
+    use temen_interp::{DeclineCause, StreamRole};
 
     let mut m = temen_text::parse_module(SRC_CAP_PARKED_FIBER).expect("parse");
     m.memory = Some(Memory {
@@ -839,26 +841,35 @@ fn an_unwoken_cap_parked_fiber_fails_the_freeze_closed() {
     let inst = transform_module_assume_confined(&m).expect("transform");
     temen_verify::verify_module(&inst).expect("verify");
 
-    let mut h = Host::new();
-    h.set_durable(true);
-    let handle = h.grant_stream(StreamRole::In);
-    h.set_stdin_blocking(true);
-    let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    arm_freeze_after(&mut win, 2);
-    let mut fuel = 1_000_000u64;
-    let (r, _) = run_capture_reserved_with_host(
-        &inst,
-        0,
-        &[Value::I32(handle)],
-        &mut fuel,
-        &win,
-        SIZE_LOG2,
-        &mut h,
-    );
+    let run = |arm: bool| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let handle = h.grant_stream(StreamRole::In);
+        h.set_stdin_blocking(true);
+        let mut win = init_durable_window(WINDOW, TEST_ARENA);
+        if arm {
+            arm_freeze_after(&mut win, 2);
+        }
+        let mut fuel = 1_000_000u64;
+        let (r, snap) = run_capture_reserved_with_host(
+            &inst,
+            0,
+            &[Value::I32(handle)],
+            &mut fuel,
+            &win,
+            SIZE_LOG2,
+            &mut h,
+        );
+        (r, read_state(&snap), h.take_freeze_declined())
+    };
+    let (base, _, _) = run(false);
+    let (r, state, declined) = run(true);
+    assert_eq!(r, base, "declined: the run goes on exactly as unarmed");
+    assert_eq!(state, STATE_NORMAL, "nothing unwound");
     assert_eq!(
-        r,
-        Err(Trap::FiberFault),
-        "a cap-parked fiber refuses the freeze (its placeholder would masquerade as a result)"
+        declined.map(|d| (d.cause, d.slot)),
+        Some((DeclineCause::FiberParkedOnCall, Some(0))),
+        "a cap-parked fiber can't ride (its placeholder would masquerade as a result), so the cut declines"
     );
 }
 

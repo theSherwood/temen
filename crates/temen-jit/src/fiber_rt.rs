@@ -491,7 +491,7 @@ impl FiberSlot {
     /// a guest), but is an ordinary `FiberSlot` otherwise, so the single-owner claim, `running_on`,
     /// and `event_park` work unchanged — which is what lets the futex thunk's "inside a fiber ⇒
     /// park the fiber" branch serve a child task with no second park mechanism (INVARIANTS #15).
-    /// Non-durable only for now: a durable run still refuses op 15, so no shadow region is wired.
+    /// A durable child's shadow region is seeded per residency by the executor (#1361 step 4).
     pub(crate) fn platform(fiber: Fiber) -> Arc<FiberSlot> {
         Arc::new(FiberSlot {
             own: Ownership::new_owned_at(0),

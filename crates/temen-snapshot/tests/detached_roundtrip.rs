@@ -2,9 +2,9 @@
 //! root-shaped artifact behind the spawner-held launch record, and restore hands it back as a
 //! [`ThawedDetached`] in its own powerbox, all-or-nothing.
 //!
-//! The child here is frozen as a root (freeze-from-start) and attached to a parent by hand, since a
-//! durable parent cannot yet spawn detached outside `temen-interp`'s own tests (the run-time capture
-//! and re-launch are pinned there, `src/detached_freeze_tests.rs`). What this pins is the codec: every
+//! The child here is frozen as a root (freeze-from-start) and attached to a parent by hand, so the codec
+//! is pinned apart from the run-time capture and re-launch (`temen-interp`'s
+//! `src/detached_freeze_tests.rs`, and `temen`'s `durable_detached_jit.rs`). What this pins: every
 //! field survives, the child's own residue restores into the child's powerbox and not the parent's,
 //! a re-freeze of the restored tree is byte-identical, and a missing module grant refuses the restore.
 

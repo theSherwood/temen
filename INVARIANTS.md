@@ -331,6 +331,10 @@ isolation the spawn asked for. Authority over detached children therefore arrive
 all — and (b) the per-child-artifact capture lands (#1361), which is what the gate is still waiting on. Then the gate comes out everywhere at once and the rule is
 R1's, as written above. Note what this is *not*: it is not a ruling that durable and detached are
 incompatible. The gap is un-wired support, tracked and in flight, exactly as R1 classified it.
+**It came out on 2026-09-23 (#1361 step 4):** all three engines now admit a durable parent's detached
+spawn of an attested-freezable module iff the parent holds `FreezeScope::DetachedProgeny` — asked in the
+one shared admission, `Host::admit_detached_spawn` — and the oracle's and the JIT's freezes capture the
+child as its own artifact inside the parent's (DURABILITY.md §4).
 
 **Accepted exceptions** — a *genuine impossibility* on some axis, each carrying the owner's dated
 approval; adding one always requires owner sign-off:
@@ -355,7 +359,9 @@ directive (invariant 1) is actually about.
 
 A suffix is a parameter that escaped into the name space. `compile_and_run_capture_reserved_with_host_durable_mv_interruptible`
 is the smell in its pure form: the suffix set *is* the axis set, enumerated as names that nothing can
-iterate, rather than as a struct that everything can.
+iterate, rather than as a struct that everything can. (It and its four siblings are now one
+`compile_and_run_durable` taking a `DurableRun` — #1690, where each copy carrying a different subset of
+the residue had silently dropped the rest.)
 
 **The deliberate second implementation is exempt, and it is exempt by naming its differential.** A
 second implementation whose *whole purpose* is to disagree — `temen-spec` restating the semantics

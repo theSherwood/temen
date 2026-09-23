@@ -39,6 +39,44 @@ use temen_ir::errno::EINVAL;
 pub(crate) struct ChildDone {
     pub(crate) state: Mutex<Option<(i64, i64)>>,
     pub(crate) cv: Condvar,
+    /// #1361 step 4 — `Some` for a **durable detached** child: what a freeze of its parent needs to
+    /// reach it and to keep it (see [`DurableCell`]). `None` for every other child.
+    pub(crate) durable: Option<DurableCell>,
+}
+
+/// #1361 step 4 — a durable detached child's freeze cell, shared by its join-table entry and its task.
+/// The parent holds no pointer into the child's window otherwise (detachment severs *read*); this is
+/// the lifecycle linkage a freeze uses, like the interpreter's doorbell.
+pub(crate) struct DurableCell {
+    /// The child's live window base while its window exists, `0` once its task frees it. The lock
+    /// orders a freeze's doorbell store against that free.
+    pub(crate) base: Mutex<usize>,
+    /// The child's window image, deposited by its task at finish **iff** it unwound for a freeze.
+    pub(crate) image: Mutex<Option<Vec<u8>>>,
+    /// The child module's shadow arena: its context-0 region is where the child spills.
+    pub(crate) shadow: temen_ir::durable_abi::ShadowArena,
+    /// What the spawn knew that a thaw needs: the entry and the window geometry.
+    pub(crate) entry: u32,
+    pub(crate) mapped_log2: u8,
+    pub(crate) reserved_log2: u8,
+}
+
+impl DurableCell {
+    pub(crate) fn new(
+        shadow: temen_ir::durable_abi::ShadowArena,
+        entry: u32,
+        mapped_log2: u8,
+        reserved_log2: u8,
+    ) -> DurableCell {
+        DurableCell {
+            base: Mutex::new(0),
+            image: Mutex::new(None),
+            shadow,
+            entry,
+            mapped_log2,
+            reserved_log2,
+        }
+    }
 }
 
 /// One spawned child's join-table entry: its completion cell plus whether it has been `join`ed (a
@@ -62,6 +100,7 @@ impl Child {
             done: std::sync::Arc::new(ChildDone {
                 state: Mutex::new(Some((result, trap))),
                 cv: Condvar::new(),
+                durable: None,
             }),
             joined: false,
             retained: 0,
@@ -115,6 +154,11 @@ unsafe fn file_task(
     chain: Vec<(usize, i64)>,
     retained_ctx: usize,
     teardown: crate::child_exec::Teardown,
+    // #1361 step 4 — a thaw re-files a captured detached child at its recorded join slot; every
+    // spawn appends (`None`).
+    slot: Option<usize>,
+    // #1361 step 4 — a durable detached child's freeze cell (see [`DurableCell`]).
+    durable: Option<DurableCell>,
 ) -> Filed {
     let futex_sched = rt.futex_sched;
     // #1586 — reserve a §15 live-vCPU slot before filing, so a parent cannot hold more concurrency
@@ -129,6 +173,7 @@ unsafe fn file_task(
     let done = std::sync::Arc::new(ChildDone {
         state: Mutex::new(None),
         cv: Condvar::new(),
+        durable,
     });
     let task = unsafe {
         crate::child_exec::ChildTask::new(
@@ -155,12 +200,28 @@ unsafe fn file_task(
             return Filed::Refused;
         }
     };
+    // #1361 step 4 — publish a durable child's window base before it can run, so a freeze's doorbell
+    // reaches it from its first op.
+    if let Some(d) = done.durable.as_ref() {
+        *d.base.lock().unwrap_or_else(|e| e.into_inner()) = task.window_base();
+    }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = children.len();
     let mut child = Child::pending(done);
     // 5c.0 — retain the shared child powerbox for `child_offer` (released at join_children).
     child.retained = retained_ctx;
-    children.push(child);
+    let slot = match slot {
+        None => {
+            children.push(child);
+            children.len() - 1
+        }
+        Some(s) => {
+            while children.len() <= s {
+                children.push(Child::finished(0, 0));
+            }
+            children[s] = child;
+            s
+        }
+    };
     drop(children);
     rt.child_exec.spawn(task);
     Filed::Slot(slot as i32)
@@ -217,6 +278,8 @@ unsafe fn file_carve_task(
         chain,
         retained_ctx,
         teardown,
+        None,
+        None,
     )
 }
 
@@ -705,7 +768,7 @@ impl Nursery {
     /// finished (a `join`/`detach` waited on it, or it ran to completion and the run is ending); a still-
     /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
     /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
-    pub(crate) fn join_children(&self) {
+    pub(crate) fn join_children(&self, froze: bool) {
         // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind,
         // runnable ones finish, then the workers are joined.
         self.child_exec.shutdown_and_join();
@@ -719,6 +782,11 @@ impl Nursery {
             let release: crate::GrantChildReleaser = unsafe { core::mem::transmute(release_addr) };
             let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
             for c in children.iter_mut() {
+                // #1361 step 4 — a frozen run keeps each unjoined durable detached child's powerbox:
+                // it rides the artifact ([`Nursery::take_detached_harvest`] hands it over).
+                if froze && !c.joined && c.done.durable.is_some() {
+                    continue;
+                }
                 let retained = std::mem::take(&mut c.retained);
                 if retained != 0 {
                     // SAFETY: `retained` is a live `GrantChild::retained_ctx` this nursery owns,
@@ -727,6 +795,141 @@ impl Nursery {
                 }
             }
         }
+    }
+
+    /// #1361 step 4 — a freeze reached this domain: ring every live durable detached child's doorbell,
+    /// which is a store of `UNWINDING` into the child's **own** freeze word (what
+    /// [`crate::FreezeController::request_freeze`] does for the root). The child unwinds at its next
+    /// poll like any root and its task deposits its window image at finish.
+    pub(crate) fn ring_detached(&self) {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        for c in children.iter().filter(|c| !c.joined) {
+            let Some(d) = c.done.durable.as_ref() else {
+                continue;
+            };
+            let base = d.base.lock().unwrap_or_else(|e| e.into_inner());
+            if *base != 0 {
+                // SAFETY: a nonzero base is the child's live window (its task retires the base under
+                // this lock before freeing it); `STATE_OFF` is within its first mapped page, and the
+                // word is only ever accessed as an aligned `i32`.
+                unsafe {
+                    (*((*base + temen_ir::durable_abi::STATE_OFF as usize)
+                        as *const std::sync::atomic::AtomicI32))
+                        .store(temen_ir::durable_abi::STATE_UNWINDING, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// #1361 step 4 — after a frozen run's [`Nursery::join_children`]: every unjoined durable detached
+    /// child, with its powerbox handed over (see [`crate::DetachedHarvest`]).
+    pub(crate) fn take_detached_harvest(&self) -> Vec<crate::DetachedHarvest> {
+        let mut children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for (slot, c) in children.iter_mut().enumerate() {
+            if c.joined {
+                continue;
+            }
+            let Some(d) = c.done.durable.as_ref() else {
+                continue;
+            };
+            out.push(crate::DetachedHarvest {
+                slot,
+                entry: d.entry,
+                mapped_log2: d.mapped_log2,
+                reserved_log2: d.reserved_log2,
+                powerbox: std::mem::take(&mut c.retained) as *mut core::ffi::c_void,
+                image: d.image.lock().unwrap_or_else(|e| e.into_inner()).take(),
+                outcome: *c.done.state.lock().unwrap_or_else(|e| e.into_inner()),
+            });
+        }
+        out
+    }
+
+    /// #1361 step 4 — a **thaw**: re-launch a captured detached child at its recorded join slot, on a
+    /// fresh window holding its image, restored to `REWINDING` (the freeze word `NORMAL`, context 0's
+    /// thaw word `REWINDING`), running its own program over its restored powerbox. The parent's
+    /// rewound `join` then parks on it as before the cut. `false` if its code will not compile or the
+    /// executor refuses it; the slot is then left to fail closed at the join.
+    ///
+    /// # Safety
+    /// `seed.child` holds two live counted refs to the child's powerbox, owned from here on.
+    pub(crate) unsafe fn relaunch_detached(&self, seed: crate::DetachedSeed) -> bool {
+        let crate::DetachedSeed {
+            slot,
+            entry,
+            mapped_log2,
+            reserved_log2,
+            funcs,
+            types,
+            shadow,
+            image,
+            child: gc,
+        } = seed;
+        let release_addr = self.grant_release.load(Ordering::Acquire);
+        if release_addr == 0 {
+            return false;
+        }
+        let release: crate::GrantChildReleaser = core::mem::transmute(release_addr);
+        let thunk_addr = self.grant_thunk.load(Ordering::Acquire);
+        let child_thunk: crate::CapThunk = if thunk_addr != 0 {
+            core::mem::transmute::<usize, crate::CapThunk>(thunk_addr)
+        } else {
+            self.cap_thunk
+        };
+        let Ok(code) = crate::compile_child_windowed(
+            &funcs,
+            &types,
+            entry as FuncIdx,
+            mapped_log2,
+            reserved_log2,
+            child_thunk,
+            gc.ctx,
+            self.epoch_addr,
+            0, // a thawed child runs un-metered, as every durable JIT re-attach does
+            self.futex_sched,
+            crate::InstEnv::null(),
+            &self.serve_handlers,
+            gc.jit_table_log2,
+            shadow,
+        ) else {
+            release(gc.ctx);
+            release(gc.retained_ctx);
+            return false;
+        };
+        let n_args = funcs.get(entry as usize).map_or(1, |f| f.params.len());
+        let n_results = funcs.get(entry as usize).map_or(1, |f| f.results.len());
+        let code = std::sync::Arc::new(code);
+        register_serve(self, gc.ctx, &code);
+        let teardown = granted_teardown(self, release, gc.ctx, gc.lane_cap);
+        let thaw_off = shadow.thaw_state_off(0) as usize;
+        let filed = file_task(
+            self,
+            code,
+            mapped_log2,
+            reserved_log2,
+            move |rw| {
+                let n = image.len().min(rw.len());
+                rw[..n].copy_from_slice(&image[..n]);
+                let s = temen_ir::durable_abi::STATE_OFF as usize;
+                if let Some(st) = rw.get_mut(s..s + 4) {
+                    st.copy_from_slice(&temen_ir::durable_abi::STATE_NORMAL.to_le_bytes());
+                }
+                if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
+                    th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
+                }
+            },
+            |_, _, _| true,
+            None,
+            vec![0; n_args], // inert under a rewind: the prologue reloads spilled values
+            n_results,
+            lane_chain_of(&gc),
+            gc.retained_ctx as usize,
+            teardown,
+            Some(slot),
+            Some(DurableCell::new(shadow, entry, mapped_log2, reserved_log2)),
+        );
+        matches!(filed, Filed::Slot(_))
     }
 
     /// Mark the run durable (DURABILITY.md §4) — see the [`Nursery::durable`] field: the nesting
@@ -783,6 +986,19 @@ impl Nursery {
             std::slice::from_raw_parts(rm.types, rm.n_types)
         };
         Some((funcs, types, Some(rm.memory_log2), data, rm.shadow))
+    }
+
+    /// #1501 — whether a `Module` grant is attested **freezable** (instrumented): the other half of what
+    /// a durable domain may spawn. A self child runs this domain's own (durable) program.
+    unsafe fn child_module_durable(&self, module: i64) -> bool {
+        if module < 0 {
+            return true;
+        }
+        let Some(resolver) = self.resolve_module else {
+            return false;
+        };
+        let mut rm = core::mem::MaybeUninit::<crate::ResolvedModule>::zeroed().assume_init();
+        resolver(self.cap_ctx, module as i32, &mut rm) != 0 && rm.durable
     }
 
     /// Resolve `handle` as this domain's `Instantiator` via the run's `call.cap` thunk, returning its
@@ -1642,6 +1858,10 @@ unsafe fn spawn_detached_child(
     // a spawn that fails *after* that commit can hand them back.
     budget: i32,
     child_size: u64,
+    // #1361 step 4 — `Some(arena)` for a durable parent's child: its window starts as a durable one
+    // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
+    durable: Option<temen_ir::durable_abi::ShadowArena>,
+    entry: u32,
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
@@ -1652,7 +1872,8 @@ unsafe fn spawn_detached_child(
         code,
         mapped_log2,
         reserved_log2,
-        // The window image: the module's data segments, then the payload at the args base.
+        // The window image: the module's data segments, then the payload at the args base; a durable
+        // child's window also starts durable (`temen_durable::init_durable_window`'s one word).
         |rw| {
             for (off, bytes) in &seeds {
                 let off = *off as usize;
@@ -1661,6 +1882,9 @@ unsafe fn spawn_detached_child(
                         rw[off..end].copy_from_slice(bytes);
                     }
                 }
+            }
+            if let Some(a) = durable {
+                init_durable_words(rw, a);
             }
         },
         // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the child
@@ -1676,6 +1900,8 @@ unsafe fn spawn_detached_child(
         lane_chain_of(gc),
         gc.retained_ctx as usize,
         teardown,
+        None,
+        durable.map(|a| DurableCell::new(a, entry, mapped_log2, reserved_log2)),
     );
     match filed {
         Filed::Slot(slot) => slot,
@@ -1695,6 +1921,20 @@ unsafe fn spawn_detached_child(
             }
             EINVAL as i32
         }
+    }
+}
+
+/// A fresh durable window's control words, as `temen_durable::init_durable_window` writes them: the
+/// freeze word `NORMAL` and context 0's shadow-SP word at its frame base (the empty stack).
+fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena) {
+    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF};
+    let s = STATE_OFF as usize;
+    let b = a.region_base(0) as usize;
+    if let Some(st) = rw.get_mut(s..s + 4) {
+        st.copy_from_slice(&STATE_NORMAL.to_le_bytes());
+    }
+    if let Some(sp) = rw.get_mut(b..b + 8) {
+        sp.copy_from_slice(&a.frame_base(0).to_le_bytes());
     }
 }
 
@@ -1733,9 +1973,11 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     trap_out: *mut i64,
 ) -> i32 {
     let rt = &*rt;
-    if rt.durable.load(Ordering::Acquire) {
-        return EINVAL as i32;
-    }
+    // #1361 step 4 — a durable parent's detached child is captured by the parent's freeze (its window
+    // rides the artifact as its own), so it spawns durable: an attested-freezable module with a shadow
+    // arena of its own (§4, #1501). The authority half — freeze authority over detached progeny, #1440 —
+    // is the shared admission's (`Host::admit_detached_spawn`, via the budget take below).
+    let durable = rt.durable.load(Ordering::Acquire);
     let build_addr = rt.grant_build_detached.load(Ordering::Acquire);
     let release_addr = rt.grant_release.load(Ordering::Acquire);
     let take_addr = rt.grant_budget_mem_take.load(Ordering::Acquire);
@@ -1797,9 +2039,13 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         Vec::new()
     };
     let args_room = temen_ir::module_args_end() - temen_ir::module_args_base();
+    let durable_ok = !durable
+        || (rt.child_module_durable(module)
+            && child_shadow != temen_ir::durable_abi::ShadowArena::EMPTY);
     if !ok_entry
         || child_size == 0
         || !mod_ok
+        || !durable_ok
         || payload.len() as u64 > args_room
         || size_log2 as u8 > crate::MAX_JIT_WINDOW_LOG2
     {
@@ -1931,6 +2177,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         trap_out,
         budget as i32,
         child_size,
+        durable.then_some(child_shadow),
+        entry as u32,
     )
 }
 

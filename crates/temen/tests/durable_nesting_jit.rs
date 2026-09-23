@@ -35,10 +35,7 @@ use temen_durable::{
     STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
-use temen_jit::{
-    compile_and_run_capture_reserved_with_host_durable,
-    compile_and_run_capture_reserved_with_host_durable_nested, JitOutcome,
-};
+use temen_jit::{compile_and_run_durable, DurableResidue, DurableRun, JitOutcome};
 use temen_text::parse_module;
 use temen_verify::verify_module;
 
@@ -133,16 +130,15 @@ fn jit_durable_same_module_child_matches_interp() {
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, WINDOW as u64);
     let win = init_durable_window(WINDOW, TEST_ARENA);
-    let (jo, _jmem, _residue) = compile_and_run_capture_reserved_with_host_durable(
+    let (jo, _jmem, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[jh as i64],
         &win,
-        &[],
-        &[],
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hj as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("durable run compiles");
     assert!(
@@ -241,16 +237,15 @@ fn jit_durable_depth2_grandchild_matches_interp() {
     hj.set_durable(true);
     let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
     let win = init_durable_window(D2_WINDOW, TEST_ARENA);
-    let (jo, _jmem, _residue) = compile_and_run_capture_reserved_with_host_durable(
+    let (jo, _jmem, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[jh as i64],
         &win,
-        &[],
-        &[],
         D2_SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hj as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("durable depth-2 run compiles");
     assert!(
@@ -366,17 +361,21 @@ fn jit_freeze_captures_live_nested_child_matching_interp() {
     let jh = hj.grant_instantiator(0, WINDOW as u64);
     let mut jwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (
+        jo,
+        jsnap,
+        DurableResidue {
+            nested: jnested, ..
+        },
+    ) = compile_and_run_durable(
         &jinst,
         0,
         &[jh as i64],
         &jwin,
-        &[],
-        &[], // no fiber seed
-        &[], // no nested seed (this is a freeze, not a thaw)
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hj as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("durable freeze run compiles");
     assert_eq!(read_state(&jsnap), STATE_UNWINDING, "JIT artifact frozen");
@@ -410,17 +409,15 @@ fn jit_nested_freeze_thaw_round_trips() {
     let mut h0 = Host::new();
     h0.set_durable(true);
     let ih0 = h0.grant_instantiator(0, WINDOW as u64);
-    let (o0, _w0, _f0, _n0) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (o0, _w0, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[ih0 as i64],
         &init_durable_window(WINDOW, TEST_ARENA),
-        &[], // init_prots
-        &[], // fiber seed
-        &[], // nested seed
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut h0 as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("uninterrupted compiles");
     assert!(
@@ -434,17 +431,15 @@ fn jit_nested_freeze_thaw_round_trips() {
     let ihf = hf.grant_instantiator(0, WINDOW as u64);
     let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
-    let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (_of, artifact, DurableResidue { nested, .. }) = compile_and_run_durable(
         &inst,
         0,
         &[ihf as i64],
         &fwin,
-        &[], // init_prots
-        &[], // fiber seed
-        &[], // nested seed (freeze)
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hf as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("freeze compiles");
     assert_eq!(read_state(&artifact), STATE_UNWINDING, "artifact frozen");
@@ -457,17 +452,21 @@ fn jit_nested_freeze_thaw_round_trips() {
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, WINDOW as u64);
-    let (ot, tsnap, _ft, _nt) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (ot, tsnap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[iht as i64],
         &twin,
-        &[],     // init_prots
-        &[],     // fiber seed
-        &nested, // nested seed — re-attach + rewind the frozen §14 child(ren)
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut ht as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                nested: nested.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("thaw compiles");
     assert!(
@@ -553,17 +552,21 @@ fn jit_depth2_freeze_coalesces_grandchild_at_root() {
     let jh = hj.grant_instantiator(0, D2_WINDOW as u64);
     let mut jwin = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut jwin, STATE_UNWINDING);
-    let (jo, jsnap, _fibers, jnested) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (
+        jo,
+        jsnap,
+        DurableResidue {
+            nested: jnested, ..
+        },
+    ) = compile_and_run_durable(
         &inst,
         0,
         &[jh as i64],
         &jwin,
-        &[], // init_prots
-        &[], // fiber seed
-        &[], // nested seed (freeze)
         D2_SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hj as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("depth-2 durable freeze compiles");
     assert_eq!(read_state(&jsnap), STATE_UNWINDING, "artifact frozen");
@@ -608,17 +611,15 @@ fn jit_depth2_freeze_thaw_round_trips() {
     let mut h0 = Host::new();
     h0.set_durable(true);
     let ih0 = h0.grant_instantiator(0, D2_WINDOW as u64);
-    let (o0, _w0, _f0, _n0) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (o0, _w0, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[ih0 as i64],
         &init_durable_window(D2_WINDOW, TEST_ARENA),
-        &[],
-        &[],
-        &[],
         D2_SIZE_LOG2,
         temen_run::cap_thunk,
         &mut h0 as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("uninterrupted compiles");
     assert!(
@@ -632,17 +633,15 @@ fn jit_depth2_freeze_thaw_round_trips() {
     let ihf = hf.grant_instantiator(0, D2_WINDOW as u64);
     let mut fwin = init_durable_window(D2_WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
-    let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (_of, artifact, DurableResidue { nested, .. }) = compile_and_run_durable(
         &inst,
         0,
         &[ihf as i64],
         &fwin,
-        &[],
-        &[],
-        &[],
         D2_SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hf as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("freeze compiles");
     assert_eq!(read_state(&artifact), STATE_UNWINDING, "artifact frozen");
@@ -655,17 +654,21 @@ fn jit_depth2_freeze_thaw_round_trips() {
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, D2_WINDOW as u64);
-    let (ot, tsnap, _ft, _nt) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (ot, tsnap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[iht as i64],
         &twin,
-        &[],
-        &[],
-        &nested,
         D2_SIZE_LOG2,
         temen_run::cap_thunk,
         &mut ht as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                nested: nested.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("thaw compiles");
     assert!(
@@ -696,17 +699,15 @@ fn jit_pure_child_freeze_thaw_round_trips() {
     let ihf = hf.grant_instantiator(0, WINDOW as u64);
     let mut fwin = init_durable_window(WINDOW, TEST_ARENA);
     write_state(&mut fwin, STATE_UNWINDING);
-    let (_of, artifact, _ff, nested) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (_of, artifact, DurableResidue { nested, .. }) = compile_and_run_durable(
         &inst,
         0,
         &[ihf as i64],
         &fwin,
-        &[],
-        &[],
-        &[],
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut hf as *mut Host as *mut c_void,
+        DurableRun::default(),
     )
     .expect("freeze compiles");
     assert_eq!(read_state(&artifact), STATE_UNWINDING, "artifact frozen");
@@ -722,17 +723,21 @@ fn jit_pure_child_freeze_thaw_round_trips() {
     let mut ht = Host::new();
     ht.set_durable(true);
     let iht = ht.grant_instantiator(0, WINDOW as u64);
-    let (ot, tsnap, _ft, _nt) = compile_and_run_capture_reserved_with_host_durable_nested(
+    let (ot, tsnap, DurableResidue { .. }) = compile_and_run_durable(
         &inst,
         0,
         &[iht as i64],
         &twin,
-        &[],
-        &[],
-        &nested,
         SIZE_LOG2,
         temen_run::cap_thunk,
         &mut ht as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                nested: nested.to_vec(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     )
     .expect("thaw compiles");
     assert!(

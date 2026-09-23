@@ -188,6 +188,13 @@ impl ChildTask {
     }
 }
 
+impl ChildTask {
+    /// The task's window base (its own window's byte 0) — published for a durable child's doorbell.
+    pub(crate) fn window_base(&self) -> usize {
+        self.window.base() as usize
+    }
+}
+
 /// In/out cell for the `Entry`-shaped [`resume_shim`]: the fiber to resume, and what it did.
 struct ResumeCall {
     fib: *mut Fiber,
@@ -506,6 +513,13 @@ impl ChildExec {
             "child task dispatched while claimed"
         );
         let prev_rt = fiber_rt::set_current(&mut *task.rt as *mut FiberRuntime);
+        // #1361 step 4 — a durable child spills into its own window's context-0 region; the register
+        // is per OS thread, so seed it for this residency and give the worker's back after.
+        let prev_shadow = task.done.durable.as_ref().map(|d| {
+            let s = crate::durable_shadow::get();
+            crate::durable_shadow::seed(d.shadow.region_base(0));
+            s
+        });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
         IN_TASK.with(|c| c.set(true));
@@ -534,6 +548,9 @@ impl ChildExec {
         IN_TASK.with(|c| c.set(false));
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
+        if let Some(s) = prev_shadow {
+            crate::durable_shadow::seed(s);
+        }
         fiber_rt::set_current(prev_rt);
         if faulted {
             task.trap.store(mem::FAULT_TRAP, Ordering::Relaxed);
@@ -569,6 +586,20 @@ impl ChildExec {
         let trap = task.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         task.window.restore_rw();
+        // #1361 step 4 — a durable child that unwound for a freeze leaves its window image for the
+        // harvest (the parent's artifact carries it). Retire the base under the cell's lock first, so
+        // no doorbell store can land on a window about to be freed.
+        if let Some(d) = task.done.durable.as_ref() {
+            *d.base.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+            // SAFETY: the window is live (freed only by the `drop(task)` below) and its first page
+            // holds the freeze word at `STATE_OFF`.
+            let unwound =
+                trap == 0 && unsafe { fiber_rt::window_is_unwinding(task.window.base() as u64) };
+            if unwound {
+                *d.image.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(task.window.rw_mut().to_vec());
+            }
+        }
         if let Some(c) = task.copy_back.take() {
             c(task.window.rw_mut());
         }
