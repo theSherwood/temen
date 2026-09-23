@@ -85,16 +85,48 @@ mod callprof {
     pub fn snapshot() -> Vec<u64> {
         COUNTS.with(|c| c.borrow().clone())
     }
+
+    thread_local! {
+        /// Per-op execution counts keyed by the op's IR location `(func, block, inst)` — `inst` carries
+        /// [`super::SRC_TERM`] for a terminator op — so a caller can weight any per-instruction static
+        /// analysis (a call site's spill cost, a function's instruction count) by how often it ran.
+        static OPS: RefCell<std::collections::HashMap<(u32, u32, u32), u64>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    /// Record one execution of the op at IR location `(func, block, inst)`.
+    pub fn op(func: usize, loc: (u32, u32)) {
+        OPS.with(|o| {
+            *o.borrow_mut()
+                .entry((func as u32, loc.0, loc.1))
+                .or_insert(0) += 1
+        });
+    }
+    /// Zero the per-op histogram.
+    pub fn reset_ops() {
+        OPS.with(|o| o.borrow_mut().clear());
+    }
+    /// Snapshot the per-op execution counts.
+    pub fn op_snapshot() -> Vec<((u32, u32, u32), u64)> {
+        OPS.with(|o| o.borrow().iter().map(|(k, v)| (*k, *v)).collect())
+    }
 }
 /// Arm the per-function call profiler with a zeroed `n`-function histogram (opt-in `callprof`).
 #[cfg(feature = "callprof")]
 pub fn callprof_reset(n: usize) {
     callprof::reset(n);
+    callprof::reset_ops();
 }
 /// Snapshot per-function call counts since the last [`callprof_reset`].
 #[cfg(feature = "callprof")]
 pub fn callprof_snapshot() -> Vec<u64> {
     callprof::snapshot()
+}
+/// Per-op execution counts since the last [`callprof_reset`], keyed by each op's IR location
+/// `(func, block, inst)` in the primary module; a terminator op's `inst` carries [`SRC_TERM`]. An op
+/// with no recorded location, and the `IntCmp` a fused `BrIfCmp` absorbs, are not counted.
+#[cfg(feature = "callprof")]
+pub fn callprof_op_snapshot() -> Vec<((u32, u32, u32), u64)> {
+    callprof::op_snapshot()
 }
 
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
@@ -650,7 +682,7 @@ enum Op {
 /// skips them, while [`vm_trap_bt`] (trap backtrace) *reports* them — a trap at a terminator
 /// (`unreachable`, `return_call.dyn`) is real and the tree-walker names it. The flag is the high
 /// bit, never set by a real block/inst count, so masking it off recovers the stored index.
-const SRC_TERM: u32 = 1 << 31;
+pub const SRC_TERM: u32 = 1 << 31;
 
 struct Program {
     ops: Vec<Op>,
@@ -16041,6 +16073,12 @@ impl Vm {
                             }
                         }
                     }
+                }
+            }
+            #[cfg(feature = "callprof")]
+            if module == 0 {
+                if let Some(loc) = c.progs[cur].src.get(pc).copied().flatten() {
+                    callprof::op(cur, loc);
                 }
             }
             match &c.progs[cur].ops[pc] {
