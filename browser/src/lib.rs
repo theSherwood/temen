@@ -3527,25 +3527,11 @@ fn grant_onramp_caps(
     // to the `vm_fs` slot; stdout/stdin stay on the Stream cap. Guest-private, no host disk, dropped at
     // session end (least authority; see temen#1323). Granted only when imported, so bounce/life/Doom
     // cards are unperturbed.
-    let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
-        let mut inner = temen_fs::mem_fs_handler(false)();
-        let h = host.grant_host_proc(Box::new(
-            move |_slot_op: u32,
-                  args: &[i64],
-                  mem: Option<&mut dyn temen_interp::GuestMem>,
-                  minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                let (op, rest) = args
-                    .split_first()
-                    .map(|(o, r)| (*o as u32, r))
-                    .unwrap_or((0, &[][..]));
-                inner(op, rest, mem, minter)
-            },
-        ));
-        host.register_cap_name("vm_fs", h);
-        Some(h)
-    } else {
-        None
-    };
+    let vm_fs_h: Option<i32> = m
+        .imports
+        .iter()
+        .any(|im| im.name == "vm_fs")
+        .then(|| temen_fs::grant_vm_fs(host, None));
     // IMPORTS.md phase 4: a manifest-carrying module executes its `call.import`s through
     // instantiation-time slot bindings — import `i`'s name maps to `(type_id, op)` via the
     // on-ramp policy and to the granted handle by interface. A name outside the policy (or the
@@ -4176,7 +4162,7 @@ fn pg_setup(
 }
 
 /// Run **PostgreSQL `--single`** in the wasm sandbox: mount the data-image `image` on the `fs` cap
-/// (`temen_fs::mem_fs_seeded_handler` — a real in-memory filesystem, no host fs), seed the `--single`
+/// (`temen_fs::MemFsHandle::seeded` — a real in-memory filesystem, no host fs), seed the `--single`
 /// argv, and run the module's `_start` on the **reserved-window** bytecode engine (Postgres grows its
 /// heap through the `memory` cap into the reserved tail). `stdin` is the SQL script; the backend's
 /// output comes back on the captured `stdout`. The one entry that boots a *real database* in the

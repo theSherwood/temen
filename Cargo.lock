@@ -853,6 +853,7 @@ version = "0.0.0"
 dependencies = [
  "temen-durable",
  "temen-encode",
+ "temen-fs",
  "temen-interp",
  "temen-ir",
  "temen-text",

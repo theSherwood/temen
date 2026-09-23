@@ -1529,6 +1529,73 @@ fn a_named_host_cap_round_trips_through_the_codec() {
     );
 }
 
+/// #1491 — a memfs rides the artifact **whole**: a file the guest wrote, and the descriptor it still
+/// has open with its cursor mid-file, are what the thawed guest reads. The registrar rebuilds the
+/// store from the state the artifact carries; it used to be able to offer only a fresh, empty one.
+#[test]
+fn a_memfs_round_trips_through_the_codec_with_its_files_and_cursors() {
+    struct VecMem(Vec<u8>);
+    impl temen_interp::GuestMem for VecMem {
+        fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
+            self.0
+                .get(ptr as usize..(ptr + len) as usize)
+                .map(<[u8]>::to_vec)
+        }
+        fn write_bytes(&mut self, ptr: u64, data: &[u8]) -> Option<()> {
+            let end = ptr as usize + data.len();
+            self.0.get_mut(ptr as usize..end)?.copy_from_slice(data);
+            Some(())
+        }
+    }
+    use temen_fs::{FS_OPEN, FS_READ, FS_SEEK, FS_WRITE, O_CREATE, O_READ, O_WRITE};
+    let vm_fs = |host: &mut Host, h: i32, args: &[i64], mem: &mut VecMem| -> i64 {
+        host.cap_dispatch_slots(temen_interp::cap_id::HOST_PROC, 0, h, args, Some(mem))
+            .expect("vm_fs call")[0]
+    };
+
+    let inst = instrument(SRC);
+    let mut host = Host::new();
+    host.grant_clock();
+    let h = temen_fs::grant_vm_fs(&mut host, None);
+    // Path "f" at 0, payload "hi" at 8.
+    let mut mem = VecMem(vec![0u8; 32]);
+    mem.0[0] = b'f';
+    mem.0[8..10].copy_from_slice(b"hi");
+    let flags = O_CREATE | O_READ | O_WRITE;
+    let fd = vm_fs(&mut host, h, &[FS_OPEN as i64, 0, 1, flags, 0], &mut mem);
+    assert_eq!(
+        vm_fs(&mut host, h, &[FS_WRITE as i64, fd, 8, 2], &mut mem),
+        2
+    );
+    assert_eq!(
+        vm_fs(&mut host, h, &[FS_SEEK as i64, fd, 0, 1], &mut mem),
+        1
+    );
+
+    let win = init_durable_window(WINDOW, TEST_ARENA);
+    let artifact = freeze(&inst, &win, &host).expect("a named memfs is freezable");
+
+    let mut thost = Host::new();
+    thost.set_named_cap_registrar(Box::new(|name, state| {
+        (name == "vm_fs")
+            .then(|| temen_fs::MemFsHandle::from_state(state).ok())
+            .flatten()
+            .map(|fs| temen_fs::vm_fs_handler(&fs))
+    }));
+    restore(&artifact, &inst, &mut thost).expect("restore with a registrar that serves `vm_fs`");
+
+    // The descriptor survived, cursor and all: reading from it picks up after the "h".
+    let mut mem = VecMem(vec![0u8; 32]);
+    assert_eq!(
+        vm_fs(&mut thost, h, &[FS_READ as i64, fd, 16, 8], &mut mem),
+        1
+    );
+    assert_eq!(
+        mem.0[16], b'i',
+        "the thawed guest reads on from where it left off"
+    );
+}
+
 /// The authority seam, through the artifact: a restoring host that does not serve the name grants
 /// nothing and the restore fails, naming what it refused. An artifact asks; it never confers.
 #[test]

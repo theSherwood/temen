@@ -109,7 +109,7 @@ snapshot/restore of the post-boot state (deferred — see the levers above).
   `temen-run` keeps the real-filesystem `host_fs` + the `HostCap` wrappers and re-exports `temen-fs`, so
   `temen_run::fs::*` is unchanged.
 - **✅ Postgres boots in wasm — measured.** The `temen-browser` cdylib's `temen_run_pg` entry (decode +
-  verify → grant `stdout/stdin/exit/memory` + an `temen_fs::mem_fs_seeded_handler` over `pgdata.img` →
+  verify → grant `stdout/stdin/exit/memory` + an `temen_fs::MemFsHandle::seeded` over `pgdata.img` →
   seed the `--single` argv → reserved-window bytecode run) boots the real database on V8 to a queried
   backend, ~6–8 s (`browser/bench_pg.mjs`). The reserved-memory path works in wasm; the module stays
   import-free (no graphical caps granted).

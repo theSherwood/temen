@@ -72,33 +72,14 @@ fn grant_io_powerbox(
     // → `call.sym "vm_fs"`, a flat call with base op 0 and the fs op in arg0). Mirror the browser Run
     // path (`grant_onramp_caps`): grant the same `temen-fs` memfs, wrapped to forward `args[0]` as the
     // op, and bind the `vm_fs` slot to it below. Granted only when the module imports it (a plain
-    // stdout-only program is unaffected); guest-private, no host disk, dropped at session end.
-    let vm_fs_h: Option<i32> = if m.imports.iter().any(|im| im.name == "vm_fs") {
-        // #1323 slice 3: seed the memfs with the launch's fs-image when one was supplied (a lesson's
-        // pre-seeded input files, e.g. a `colors.txt` the guest `fopen`s for read), else an empty
-        // scratch store. Each build clones the seed fresh, so a reverse-`seek` rebuild re-seeds
-        // identically (deterministic replay).
-        let mut inner = match fs_seed {
-            Some((files, dirs)) => temen_fs::mem_fs_seeded_handler(files.clone(), dirs.clone())(),
-            None => temen_fs::mem_fs_handler(false)(),
-        };
-        let h = host.grant_host_proc(Box::new(
-            move |_slot_op: u32,
-                  args: &[i64],
-                  mem: Option<&mut dyn temen_interp::GuestMem>,
-                  minter: Option<&mut dyn temen_interp::RegionMinter>| {
-                let (op, rest) = args
-                    .split_first()
-                    .map(|(o, r)| (*o as u32, r))
-                    .unwrap_or((0, &[][..]));
-                inner(op, rest, mem, minter)
-            },
-        ));
-        host.register_cap_name("vm_fs", h);
-        Some(h)
-    } else {
-        None
-    };
+    // stdout-only program is unaffected); guest-private, no host disk, dropped at session end. Seeded
+    // with the launch's fs-image when one was supplied (#1323 slice 3); its state rides every
+    // checkpoint and rebuild (#1491).
+    let vm_fs_h: Option<i32> = m
+        .imports
+        .iter()
+        .any(|im| im.name == "vm_fs")
+        .then(|| temen_fs::grant_vm_fs(host, fs_seed));
     // #1366 slice (c): the launch's **declared host-completed caps** (`hostCaps`). Each name the
     // module imports gets an offloadable proc that always punts to the host
     // (`OffloadOutcome::Host`): the guest's flat `call.sym "<name>"` parks the run, the request
@@ -782,6 +763,16 @@ impl BytecodeBackend {
         // `step_back` by undo rather than by another rebuild.
         run.map(|mut r| {
             r.set_journal_armed(self.journaling);
+            // #1491 — and its capabilities' declared state (a `vm_fs` store's files and open table).
+            // The rebuild replays the tape, which never enters a handler, so the handler has to hold
+            // the state at the tape's end — the state the live run already holds, since a replay
+            // leaves it untouched and a live advance extends the tape with it. Seeded fresh instead,
+            // a guest seeking back and then running past the tape reads a store that forgot its
+            // own writes.
+            if self.powerbox {
+                let carried = self.run.host().capture_cap_states();
+                r.host_mut().restore_cap_states(&carried);
+            }
             r
         })
     }

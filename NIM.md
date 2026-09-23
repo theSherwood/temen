@@ -852,7 +852,7 @@ files down the chain. Two existing options, no new host op:
 2. **A shared memfs** — the file-based `nifmake` shape (phase N writes `x.nif`, phase N+1 reads it).
    This is the faithful hand-off. It has **two** parts, and they sit on opposite sides of the
    security boundary — worth stating precisely, because the memfs machinery mostly already exists:
-   - (a) **A store shared across domains** — the *data* layer. `mem_fs_seeded_handler` re-seeds a
+   - (a) **A store shared across domains** — the *data* layer. `MemFsHandle::seeded` re-seeds a
      *fresh* store per grant (isolated filesystems), and `mem_fs_seeded_shared` shares one store but
      only host↔handle (its `MemFsHandle` is host-side, built for browser-Postgres session snapshots;
      it's used single-guest in `crates/temen/tests/c_link.rs` to seed the cc1 memfs). Neither shares a

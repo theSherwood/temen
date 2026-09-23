@@ -21748,15 +21748,20 @@ impl Host {
     /// fail-closed gate (#1557).
     ///
     /// False when the guest is using the §3.6 **serve** path (its queue drains rather than appends, so a
-    /// length cannot restore it) or holds a capability with **opaque declared state** (an embedder
-    /// capture/restore blob has no inverse — the case #1556 resolves by segmenting rather than guessing).
-    /// A run that answers false still time-travels: the journal declines to undo across such a point and
-    /// the checkpoint-plus-replay path serves it, exactly as it does today.
+    /// length cannot restore it) or holds a capability with **opaque declared state** that nothing
+    /// records (an embedder capture/restore blob has no inverse). A run that answers false still
+    /// time-travels: the journal declines to undo across such a point and the checkpoint-plus-replay
+    /// path serves it.
+    ///
+    /// Declared state is no obstacle while crossings are **recorded** (#1491): an undo re-arms replay
+    /// from the run's own tape, so re-execution re-serves every crossing up to the tape's end without
+    /// entering the handler, and the handler's live state is exactly the state a live continuation
+    /// past that end needs.
     pub(crate) fn journal_invertible(&self) -> bool {
         let (queue, results, _) = self.svc_state();
         queue.is_empty()
             && results.is_empty()
-            && self.capture_cap_states().iter().all(Option::is_none)
+            && (self.cap_record.is_some() || self.host_procs.iter().all(|e| e.state.is_none()))
     }
 
     /// Whether every **live** host capability carries a registered name — the same reconstruction rule
@@ -21820,7 +21825,15 @@ impl Host {
         // #1455: re-seed each capability's own state into the freshly granted handlers, so a guest
         // resumed at the checkpoint's logical time sees its capabilities as they were then rather than
         // as a fresh powerbox minted them.
-        self.restore_cap_states(&s.cap_states);
+        //
+        // #1491 — except under a replaying tape. There every crossing up to the tape's end is served
+        // from the tape and never enters the handler, so the handler must already hold the state at
+        // the tape's **end** — what a live continuation past it will read (the embedder that armed
+        // the tape seeds it; the DAP carries it from the run it rebuilds). Rewinding it to the
+        // checkpoint's would make the guest's own taped writes vanish the moment it runs live.
+        if self.cap_replay.is_none() {
+            self.restore_cap_states(&s.cap_states);
+        }
     }
 
     /// §15: set this domain's spawn quota (fiber/vCPU ceilings). Each limit is clamped to its hard

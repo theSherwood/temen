@@ -11,6 +11,7 @@ temen-encode.workspace = true
 temen-interp.workspace = true
 
 [dev-dependencies]
+temen-fs.workspace = true
 temen-durable.workspace = true
 temen-text.workspace = true
 temen-verify.workspace = true
