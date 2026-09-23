@@ -146,6 +146,14 @@ fn dump_cache(posix: &temen_posix::Posix, out_p: &str) {
 fn command_module(path: &str, what: &str) -> temen_ir::Module {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}"));
     let m = temen_text::parse_module(&text).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
+    // #1609 — **link the shim's own names** before registering the shell as a command. chibicc
+    // emits `call.sym "__spawn"` / `"__as_region"` / … for the §14 surface, and nothing binds those
+    // at run time: `default_cap_resolver` does not know them (by design — they are this demo's
+    // spellings, bound through §7 late binding), so an unlinked slot stays empty and an empty slot
+    // is a `CapFault` at first use, not a fall-through to the handle operand. A shell without this
+    // starts, reads its argv, and dies silently the moment it spawns something non-builtin — which
+    // is exactly how `sh -c "bin/nifler …"` reaped as a bare 128.
+    let m = temen_run::link_shell_demo(&m).unwrap_or_else(|e| panic!("link {path}: {e:?}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify {path}: {e:?}"));
     eprintln!(
         "{what}: {} funcs, window 2^{}",

@@ -101,27 +101,12 @@ fn c_to_ir_child_with(src: &str, extra: &[&str]) -> String {
     std::fs::read_to_string(&irfile).unwrap()
 }
 
-/// Link the shim's import names to their interfaces — link-time symbol resolution (the phase-4
-/// linker-only `resolve_imports_with`; IMPORTS.md §2.5): `__px_*` names strip the prefix and map
-/// through [`temen_posix::resolve`] to `(HOST_PROC, op)`; `__spawn`/`__join` are the shell's own
-/// `Instantiator` ops (13 / 1, STAGE1.md §5). No handle is baked at link: each lowered `call.cap`
-/// dispatches on the guest's own handle operand, discovered at run time via
-/// `__vm_cap_count`/`__vm_cap_at` reflection (§3c protection at the boundary, IMPORTS.md §2.3
-/// dynamic mode).
+/// Link the shim's import names to their interfaces — [`temen_run::shell_demo_resolver`], the one
+/// copy of this demo's vocabulary. It used to live here, which meant a shell built anywhere *else*
+/// silently kept `call.sym "__spawn"` as an unbindable import slot and died on its first
+/// non-builtin command (#1609: nimsem's `sh -c "bin/nifler …"` reaped as a bare 128).
 fn link_shim(name: &str) -> Option<temen_ir::Resolved> {
-    let cap = match name {
-        "__spawn" => temen_ir::ResolvedCap { type_id: 6, op: 13 },
-        "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
-        // The ring-pipeline surface (STAGE1.md item 6): mint a region (`AddressSpace` op 5) and
-        // alias/query it (`SharedRegion` ops 0/1/3) — the shell pumps stage-0 output into a mapped
-        // ring; the `__stage` filter runner maps its granted rings the same way.
-        "__as_region" => temen_ir::ResolvedCap { type_id: 5, op: 5 },
-        "__rg_map" => temen_ir::ResolvedCap { type_id: 4, op: 0 },
-        "__rg_unmap" => temen_ir::ResolvedCap { type_id: 4, op: 1 },
-        "__rg_granule" => temen_ir::ResolvedCap { type_id: 4, op: 3 },
-        n => temen_posix::resolve(n.strip_prefix("__px_")?)?,
-    };
-    Some(temen_ir::Resolved::Cap(cap))
+    temen_run::shell_demo_resolver(name)
 }
 
 /// The guest libc shim (guest code): standard libc names, adapting C's NUL-terminated `char*` calls
