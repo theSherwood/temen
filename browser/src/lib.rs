@@ -12953,11 +12953,11 @@ pub extern "C" fn temen_exit_code() -> i32 {
 /// are static — valid for the life of the module.
 #[no_mangle]
 pub extern "C" fn temen_trap_ptr() -> *const u8 {
-    unsafe { LAST_TRAP.as_ptr() }
+    unsafe { core::ptr::addr_of!(LAST_TRAP).read() }.as_ptr()
 }
 #[no_mangle]
 pub extern "C" fn temen_trap_len() -> usize {
-    unsafe { LAST_TRAP.len() }
+    unsafe { core::ptr::addr_of!(LAST_TRAP).read() }.len()
 }
 /// #1714 — for a `MemoryFault`, the window-relative faulting address of the most recent run (a NULL
 /// dereference is `0`); `-1` when the run did not fault on an address.
