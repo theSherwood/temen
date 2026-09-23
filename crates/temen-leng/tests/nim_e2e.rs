@@ -2172,6 +2172,133 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
     );
 }
 
+#[path = "../../temen/tests/support/chibicc.rs"]
+mod chibicc_mod;
+
+/// The POSIX build of `demos/shell` — the `/bin/sh` a nim program's `execShellCmd` execs (#1662) —
+/// compiled by the in-tree chibicc exactly as `nim_noc_semcheck --sh` expects it.
+fn posix_sh() -> temen_ir::Module {
+    let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../temen-run/demos/shell/");
+    let src = ["shim.c", "ring.c", "shell_main.c"]
+        .iter()
+        .map(|f| std::fs::read_to_string(format!("{demo}{f}")).expect("read shell source"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let dir = std::env::temp_dir().join(format!("posix_sh_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("mk sh dir");
+    let (c, ir) = (dir.join("sh.c"), dir.join("sh.ir"));
+    std::fs::write(&c, src).expect("write sh.c");
+    let st = Command::new(chibicc_mod::chibicc())
+        .args([
+            "-cc1",
+            "--emit-ir",
+            "--child-entry",
+            "-DTEMEN_SHELL_POSIX",
+            "-cc1-input",
+        ])
+        .arg(&c)
+        .arg("-cc1-output")
+        .arg(&ir)
+        .arg(&c)
+        .status()
+        .expect("run chibicc");
+    assert!(st.success(), "chibicc failed on the POSIX shell");
+    let m = temen_text::parse_module(&std::fs::read_to_string(&ir).expect("read sh.ir"))
+        .expect("parse sh.ir");
+    temen_verify::verify_module(&m).expect("verify sh.ir");
+    m
+}
+
+/// A nim program linked through the POSIX runtime, checked to import only the personality's ops.
+fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
+    let mods = compile_to_leng(path, src);
+    let units: Vec<temen_leng::WholeModule> = mods
+        .iter()
+        .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+        .collect();
+    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("posix runtime");
+    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime).expect("link");
+    temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+    assert!(
+        m.imports
+            .iter()
+            .all(|i| temen_posix::resolve_import(&i.name).is_some()),
+        "a linked program imports only the personality's own ops: {:?}",
+        m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+    );
+    m
+}
+
+/// **The self-hosted shell-out, gated on every PR** — every mechanism nimsem's own `execNifler` rides,
+/// at a size CI can afford. (The full lane — nimsem spawning nifler for `system`'s whole import graph
+/// and matching native nimony — is `scripts/ci/nim-selfhost-lane.sh`; release-mode minutes, not this.)
+///
+/// The parent calls the real `std/os.execShellCmd`, which is fork + `execve("/bin/sh", ["-c", cmd])` +
+/// `waitpid`, inlined. `/bin/sh` is the chibicc-built POSIX shell; `-c` of one simple command execs
+/// it in place. The command is a nim program: it binds against the personality the exec carried,
+/// reads the argv `execve` wrote, writes a file into the shared memfs, and exits with a status of its
+/// own. The parent must see that status — the child's, not the shell's — and the file.
+///
+/// Each link of that chain has broken, silently, at least once: #1621/#1635 (the caller request and
+/// the reap), #1662 (the shell), #1667 (a miscompiled capability call), #1668 (the nim import names
+/// and the `_start` entry). And none of them trapped — they exited, or crashed into a bare status —
+/// so the last assertion is that no command crashed at all (#1665).
+#[test]
+fn nim_shells_out_through_the_posix_sh() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_shells_out_through_the_posix_sh (no toolchain)");
+        return;
+    };
+    let child = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/cmdline\n\
+         try:\n\
+         \x20 writeFile(\"/out.txt\", \"from \" & paramStr(1))\n\
+         except:\n\
+         \x20 quit(9)\n\
+         write(stdout, \"child:\" & paramStr(1) & \"|\")\n\
+         quit(3)\n",
+    );
+    let parent = link_posix_program(
+        &path,
+        "import std/syncio\nimport std/os\n\
+         let rc = execShellCmd(\"bin/child hi\")\n\
+         try:\n\
+         \x20 write(stdout, \"parent:\" & $rc & \"|\" & readFile(\"/out.txt\"))\n\
+         except:\n\
+         \x20 write(stdout, \"parent:\" & $rc & \"|no file\")\n",
+    );
+    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+        std::sync::Arc::new(make);
+    let run = temen_run::nim_noc_run_with_commands(
+        parent,
+        &posix,
+        make,
+        &["parent".to_string()],
+        &[
+            ("/bin/sh".to_string(), posix_sh()),
+            ("bin/child".to_string(), child),
+        ],
+    );
+    let crashed = temen_interp::last_twin_traps();
+    assert!(
+        crashed.is_empty(),
+        "a command crashed:\n{}",
+        crashed
+            .iter()
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(run, Ok(()), "the parent ran to completion");
+    assert_eq!(
+        String::from_utf8_lossy(&posix.stdout()),
+        "child:hi|parent:3|from hi",
+        "the shell became the child; the parent reaped the child's own status and read its file"
+    );
+}
+
 /// #1668 — **a nim program forks and execs a nim program**, the shape every nimony compiler phase
 /// uses to reach the next one (`os.execShellCmd` is fork + `execve` + `waitpid`, inlined).
 ///

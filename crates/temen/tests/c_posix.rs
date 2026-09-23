@@ -3173,6 +3173,55 @@ fn stage_executable(host: &mut Host, posix: &Posix, path: &str, src: &str) {
     posix.register_executable(path, h, wl);
 }
 
+/// #1665 — **a crashed command says where it crashed.** A fork twin's trap does not propagate: its
+/// parent reaps a crash status, the same `128` an `exit(128)` would give. That status is all anything
+/// saw, so a command that died on a NULL read and one that chose its exit code were indistinguishable
+/// — every layer of the #1609 `bin/nifler` chase presented as that silence.
+///
+/// Now the run records it: `last_twin_traps` names the trap, the frames and the faulting address. And
+/// the twin's trap no longer competes for the *run's* trap origin, so a parent that finished cleanly
+/// reports a clean run — before, the first-wins origin would have named the dead child.
+#[test]
+fn c_a_crashed_fork_twin_reports_its_trap() {
+    const SRC: &str = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+static int status;
+int main(void) {
+  long pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    volatile int *p = 0;
+    return *p;                      /* the twin crashes: a NULL read */
+  }
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;
+  return 40 + ((status >> 8) & 0xff);
+}
+"#;
+    let e = run_interp_only(SRC, |_| {});
+    assert_eq!(
+        e.result,
+        vec![Value::I32(40 + 128)],
+        "the parent reaped the crash status"
+    );
+    let traps = temen_interp::last_twin_traps();
+    assert_eq!(traps.len(), 1, "exactly the one crashed twin: {traps:?}");
+    let t = &traps[0];
+    assert_eq!(t.trap, temen_interp::Trap::MemoryFault, "{t}");
+    assert!(
+        !t.backtrace.is_empty(),
+        "the twin's frames survive its reap: {t}"
+    );
+    assert!(
+        t.fault.is_some_and(|a| a < 16),
+        "a NULL read, at a near-zero address: {t}"
+    );
+    assert!(
+        temen_interp::last_capture_backtrace().is_empty(),
+        "the parent finished cleanly, so the run has no trap origin — the child's is its own"
+    );
+}
+
 /// #801 slice A — **the POSIX trinity over the personality**: `fork` → `execve("/bin/rc")` →
 /// `waitpid`. The twin image-replaces itself with a registered command module (resolved by
 /// filesystem path through op 53, exec'd by the guest's own `CAP_SELF_EXEC` call — zero new core
