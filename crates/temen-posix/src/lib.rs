@@ -1028,6 +1028,23 @@ struct World {
     /// The next pid `spawn` hands out for a delegate child. Starts at `1000` and skips occupied
     /// pids (fork twins occupy their `TaskId`s in the same table — one space, no collisions).
     next_pid: i32,
+    /// #1644 — the **most recent fork twin this personality minted**, `(pid, its Proc)`.
+    ///
+    /// `Host::fork_powerbox` runs a fork factory once per `host_procs` entry, so a personality
+    /// spread over several entries is asked for the same twin once per entry (see
+    /// [`fork_factory`]). Every ask must land on ONE process, or the twin gets an fd table per
+    /// entry and a park door on only one of them (#1635). This is that memo — personality-wide, so
+    /// it works across every factory built from this `World`, since those are all one personality.
+    ///
+    /// Deliberately **not** a `procs` lookup by pid: that table is shared, pids are minted in
+    /// another crate, and `crates/temen-interp/src/lib.rs` documents a latent overlap with the
+    /// 1000+ spawn-clone band — so a lookup would answer a colliding pid with an *unrelated live
+    /// process's* state, turning a bookkeeping bug into a cross-process leak. One slot, matched by
+    /// exact pid, can only ever re-offer the twin this personality just made.
+    ///
+    /// A net, not the mechanism: #1645 is one entry per personality, and #1648 is the core-side
+    /// guard that makes a second signal-door claimant refuse the fork instead of splitting it.
+    last_fork_mint: Option<(i32, Arc<Mutex<Proc>>)>,
     /// #798 — the proto-terminal's **foreground process group** (`tcsetpgrp`/`tcgetpgrp`; the
     /// captured stdio stands in for the pty until #797). Init `1` — the root's group — so every
     /// pre-job-control guest is foreground and nothing rings. A background process's terminal
@@ -2256,23 +2273,22 @@ fn exec_remap_hook(proc_: Arc<Mutex<Proc>>) -> temen_interp::ExecRemapHook {
 
 fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFork {
     Arc::new(move |pid: u64| {
-        // World before Proc — the canonical order. (This runs under the core's scheduler lock;
-        // no dispatch fires a scheduler wake while holding the world lock — see [`Ctx::wake_after`]
-        // — so scheduler → world here cannot cross a world → scheduler hold.)
+        let asked = pid; // `pid` is shadowed by the resolved i32 below; only a real ask is deduped
+                         // World before Proc — the canonical order. (This runs under the core's scheduler lock;
+                         // no dispatch fires a scheduler wake while holding the world lock — see [`Ctx::wake_after`]
+                         // — so scheduler → world here cannot cross a world → scheduler hold.)
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
-        // #1609 — **one process per pid**, however many powerbox entries this personality occupies.
-        // `Host::fork_powerbox` runs the factory once per `host_procs` entry, and a lane that grants
-        // a separate entry per bound import (temen-run's `nim_posix_imports`) therefore asks for the
-        // same twin once per import. Minting a fresh `Proc` each time gave one twin a dozen
-        // processes sharing a pid — a dozen fd tables, and (the symptom that found this) a park door
-        // wired by `Scheduler::wire_signal_doors` to only the LAST of them, so `fork`/`execve`
-        // reached through any *other* entry saw `park_req` unset: the twin's `execve` fired nothing,
-        // returned its `-ENOSYS` placeholder, and nim's `execShellCmd` fell through to `exit(127)`.
-        // The first call for a pid mints; the rest re-mint a handler over the SAME `Proc` and
-        // decline the per-process extras (door, exit hook, exec-remap) so each is installed once.
+        // #1644 — a repeat ask for the twin this personality just minted (one `host_procs` entry
+        // per ask; see [`World::last_fork_mint`]). Re-mint a handler over the SAME `Proc` and
+        // decline the per-process extras — door, exit hook, exec-remap — so the core installs
+        // each exactly once instead of once per entry.
         if pid != 0 {
-            if let Some(ProcEntry::Live(existing)) = w.procs.get(&(pid as i32)) {
-                let existing = Arc::clone(existing);
+            if let Some(existing) = w
+                .last_fork_mint
+                .as_ref()
+                .filter(|(p, _)| *p == pid as i32)
+                .map(|(_, c)| Arc::clone(c))
+            {
                 drop(w);
                 return ForkedProc {
                     handler: handler(Arc::clone(&world), Arc::clone(&existing)),
@@ -2302,6 +2318,13 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         let armed = child.sig_armed.clone();
         let child = Arc::new(Mutex::new(child));
         w.procs.insert(pid, ProcEntry::Live(Arc::clone(&child)));
+        // #1644 — remember it for a repeat ask from a sibling powerbox entry. Only a **named** ask
+        // is recorded: an anonymous mint (`pid == 0` on the way in) allocates its own pid and each
+        // one is its own process, so recording it could only ever serve a later named ask that
+        // reused that number — the aliasing this net exists to avoid.
+        if asked != 0 {
+            w.last_fork_mint = Some((pid, Arc::clone(&child)));
+        }
         drop(w);
         // #863 hygiene — the twin's exit retires its table entry: the core fires this with the
         // raw exit status when the twin's task completes, and the process becomes a reapable
@@ -2489,6 +2512,7 @@ fn new_world(stdin: Vec<u8>) -> World {
         spawn_fn: None,
         procs: HashMap::new(),
         next_pid: 1000,
+        last_fork_mint: None,
         fg_pgid: 1,
     }
 }
@@ -5482,20 +5506,30 @@ mod tests {
     /// share their open-file **descriptions** — a fork-inherited fd shares its offset with the
     /// parent (POSIX fork-shares-open-file-descriptions), and a child's cwd/env mutations are
     /// invisible to the parent (the pre-split shared blob got both wrong).
-    /// #1609 — **one process per pid**, however many powerbox entries this personality occupies.
-    /// `Host::fork_powerbox` runs the fork factory once per `host_procs` entry, so a lane that
-    /// grants an entry per bound import (temen-run's `nim_posix_imports`) asks for the same twin
-    /// once per import. Every call must land on the SAME `Proc`: minting a fresh one each time
-    /// gave one twin a dozen processes behind a single pid — a dozen fd tables and cwds, and a
-    /// park door (`Scheduler::wire_signal_doors` installs it on the LAST returned signal source)
-    /// that the handlers of every other entry could not see. That is how nimsem's `execShellCmd`
-    /// died: the twin's `execve` fired nothing, answered its `-ENOSYS` placeholder and fell through
-    /// to `exit(127)`, while the *parent* later found the stale `ExecSelf` in its own cell and
-    /// image-replaced itself with the command.
+    /// #1609/#1644 — **one process per twin**, however many powerbox entries this personality
+    /// occupies. `Host::fork_powerbox` runs the fork factory once per `host_procs` entry, so a lane
+    /// that spreads one personality over several entries asks for the same twin once per entry.
+    /// Every call must land on the SAME `Proc`: minting a fresh one each time gave one twin a dozen
+    /// processes behind a single pid — a dozen fd tables and cwds, and a park door
+    /// (`Scheduler::wire_signal_doors` installs it on one returned signal source) that the handlers
+    /// of every other entry could not see. That is how nimsem's `execShellCmd` died: the twin's
+    /// `execve` fired nothing, answered its `-ENOSYS` placeholder and fell through to `exit(127)`,
+    /// while the *parent* later found the stale `ExecSelf` in its own cell and image-replaced
+    /// itself with the command.
+    ///
+    /// Since #1645 a personality occupies one entry, so this is a **net**, not the mechanism —
+    /// which is why it matches on this personality's own last mint rather than looking the pid up
+    /// in the shared process table, whose pid space another crate mints (see
+    /// [`World::last_fork_mint`]).
     #[test]
     fn every_powerbox_entry_of_one_twin_lands_on_one_process() {
         let mut host = Host::new();
         let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        // Two **separate** factories over one personality, each asked for twin 7 — the shape
+        // `Host::fork_powerbox` produces when a lane mints a factory per grant site (temen-run's
+        // nim lane did exactly that: one for the imports, one for the run driver's own entry). The
+        // memo is personality-wide (`World::last_fork_mint`) precisely so this case dedupes; a
+        // per-closure memo would not, and the cross-call-form parity table catches that.
         let mut first = cap_fork_factory(&posix)(7);
         let mut second = cap_fork_factory(&posix)(7);
         // The per-process extras are installed exactly once — a second door would be the one the

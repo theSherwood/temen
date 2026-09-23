@@ -5121,25 +5121,28 @@ pub fn nim_import_binding(name: &str) -> Option<NimImport> {
     })
 }
 
-/// Bind every retained import of a no-C nim module to one shared **POSIX personality**, returning
-/// the [`Imports`] and the personality itself (so a caller reads back stdout, or a file the guest
-/// wrote). Unserved names are returned rather than panicked on — a caller that wants them fatal can
-/// say so, and a probe reporting "unbound leaves" wants the list.
+/// Bind every retained import of a no-C nim module to one shared **POSIX personality**.
+///
+/// Returns the [`Imports`], the names it could not serve, and the personality's
+/// [`SharedHostProc`] — its single powerbox entry (#1645), which a caller needs to publish the op
+/// vtable on or to reach the personality for something other than an import binding. Unserved
+/// names are returned rather than panicked on: a caller that wants them fatal can say so, and a
+/// probe reporting "unbound leaves" wants the list.
 pub fn nim_posix_imports(
     module: &Module,
     posix: &temen_posix::Posix,
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
-) -> (Imports, Vec<String>) {
-    // #1609 — the personality-served slots bind through temen-posix's OWN fork factory, not
-    // `HostCap::host_proc`'s shared-state default. The default re-mints a twin's handler over the
-    // **parent's** `Proc`, which is wrong for a personality with real per-process state: a forked
-    // twin kept writing the parent's fd table, and its `fork`/`execve` fired the *parent's* park
-    // door — so the twin's own request cell stayed empty (`execve` answered `-ENOSYS`, nim's
-    // `execShellCmd` fell through to `exit(127)`) while the parent picked the stale `ExecSelf` out
-    // of its cell and image-replaced *itself* with the command. One process per twin is the
-    // factory's job (`cap_fork_factory`, which mints once per pid across all of this
-    // personality's powerbox entries).
-    let fork = temen_posix::cap_fork_factory(posix);
+) -> (Imports, Vec<String>, SharedHostProc) {
+    // #1645 — every personality-served slot binds to **one** entry ([`SharedHostProc`]), at its own
+    // op. This lane used to grant an entry per import — sixteen for nimsem — which is what made
+    // #1635: `fork_powerbox` mints one process per entry, so the twin got sixteen `Proc`s behind
+    // one pid and the core's single park door reached only one of them. It is also sixteen factory
+    // calls per `fork()` and sixteen re-grants per `exec_carry`, in a guest that forks per command.
+    //
+    // The slot carries temen-posix's OWN fork factory rather than `HostCap::host_proc`'s
+    // shared-state default, which re-mints a twin's handler over the **parent's** `Proc` — wrong
+    // for a personality with real per-process state (the twin would write the parent's fd table).
+    let slot = SharedHostProc::new(move || (*make)(), temen_posix::cap_fork_factory(posix));
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
@@ -5150,22 +5153,12 @@ pub fn nim_posix_imports(
         let cap = match kind {
             NimImport::Stdout => HostCap::stdout(),
             NimImport::Exit => HostCap::exit(),
-            NimImport::Open => {
-                let make = std::sync::Arc::clone(&make);
-                HostCap::host_proc_forkable(
-                    temen_posix::OP_OPEN,
-                    move || (*make)(),
-                    std::sync::Arc::clone(&fork),
-                )
-            }
-            NimImport::Posix(op) => {
-                let make = std::sync::Arc::clone(&make);
-                HostCap::host_proc_forkable(op, move || (*make)(), std::sync::Arc::clone(&fork))
-            }
+            NimImport::Open => HostCap::host_proc_shared(temen_posix::OP_OPEN, &slot),
+            NimImport::Posix(op) => HostCap::host_proc_shared(op, &slot),
         };
         imports = imports.provide(imp.name.clone(), cap);
     }
-    (imports, unbound)
+    (imports, unbound, slot)
 }
 
 /// **Run one no-C nimony phase** over a shared POSIX personality, with `argv`.
@@ -5207,8 +5200,7 @@ pub fn nim_noc_run_with_commands(
     argv: &[String],
     commands: &[(String, Module)],
 ) -> Result<(), String> {
-    let make_for_setup = std::sync::Arc::clone(&make);
-    let (imports, unbound) = nim_posix_imports(&module, posix, make);
+    let (imports, unbound, slot) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
             "unbound nimony imports (extend `nim_import_binding`): {unbound:?}"
@@ -5224,20 +5216,17 @@ pub fn nim_noc_run_with_commands(
     };
     let inst =
         instantiate_with_imports(module, imports).map_err(|e| format!("instantiate: {e}"))?;
-    // #1609 — install what a **process-shaped** run needs, which the plain import binding above
-    // does not: `nim_posix_imports` grants one `host_proc` per retained import and nothing else,
-    // so this lane had no async-signal door — and therefore no #799 **caller-request door**, which
-    // rides it. Without that door `fork` (op 51) answers `-ENOSYS`, nim's `execShellCmd` reads
-    // that as "fork failed", and the shell-out reports failure having never reached `execve` at
-    // all. The same four installs `posix_cap` does on the powerbox path, for the same reasons and
-    // in the same order: the forkable handler (a twin needs its own fd table/cwd/env over the
-    // shared memfs), the signal+request door, the #972 exec-remap hook, and the #801 op vtable, so
-    // an exec'd image's `__px_*` manifest binds through the coverage walk.
-    let fork_factory = temen_posix::cap_fork_factory(posix);
-    let make_proc = std::sync::Arc::clone(&make_for_setup);
+    // #1609 — install what a **process-shaped** run needs, which binding imports does not: the
+    // async-signal door, and with it the #799 **caller-request door** that rides it. Without that
+    // door `fork` (op 51) answers `-ENOSYS`, nim's `execShellCmd` reads that as "fork failed", and
+    // the shell-out reports failure having never reached `execve` at all. The same installs
+    // `posix_cap` does on the powerbox path, for the same reasons: the signal+request door, the
+    // #972 exec-remap hook, and the #801 op vtable — published on the personality's ONE entry
+    // (#1645), so an exec'd image's `__px_*` manifest binds through the coverage walk against the
+    // same entry the imports resolve to. `install` grants that entry if no import claimed it
+    // (a module with no POSIX-served import still gets a personality to fork).
     let mut setup = |host: &mut temen_interp::Host| {
-        let handle =
-            host.grant_host_proc_forkable((*make_proc)(), std::sync::Arc::clone(&fork_factory));
+        let handle = slot.install(host);
         let (door, armed) = temen_posix::cap_signal_source(posix);
         host.set_signal_source(door, armed);
         host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(posix));
@@ -5977,6 +5966,70 @@ struct OfferBinding {
     policy: temen_interp::OfferPolicy,
 }
 
+/// #1645 — a **shared** `host_proc` slot: ONE powerbox entry serving many import slots.
+///
+/// [`HostCap::host_proc`] and its forkable sibling grant a fresh entry per slot, which is right for
+/// an independent capability and wrong for a **personality**. A provider with real per-process
+/// state must occupy exactly one entry, because two core mechanisms are *entry*-scoped while the
+/// thing they configure is *domain*-scoped:
+///
+/// - `Host::fork_powerbox` runs the fork factory once per entry, so N entries mint N processes for
+///   one twin — N fd tables, N cwds, all behind one pid;
+/// - `Scheduler::wire_signal_doors` installs the domain's wake/stop/kill/**park-request** closures
+///   on the *single* signal source one of those N happened to supply, so the handlers of the other
+///   N-1 fire a door that writes into nobody's cell.
+///
+/// That is #1635: nimsem's twin got sixteen `Proc`s, its `execve` fired the **parent's** door, and
+/// the parent later image-replaced itself with the command. temen-posix now dedupes by pid
+/// defensively (#1644), but the premise is what this type removes.
+///
+/// An entry is not a capability — `(entry, op)` is. So one entry serves `read`, `write`, `fork`,
+/// `execve` … through as many [`HostCap::host_proc_shared`] slots as the module declares, each
+/// keeping its own op, exactly as the manifest path's published vtable does over one handle.
+///
+/// The slot grants on first use **per `Host`** (keyed by `Host::domain_id`, so a run's interp and
+/// JIT hosts each get their own entry) and returns that handle for every later slot. Cloning is a
+/// cheap `Arc` bump and shares the memo — clones of one slot are one slot.
+#[derive(Clone)]
+pub struct SharedHostProc {
+    make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
+    fork: temen_interp::HostProcFork,
+    /// `(domain_id, handle)` per `Host` this slot has been granted on. A `Vec` because the count is
+    /// one or two (interp, JIT) for the life of an `Imports`, and a linear scan says so.
+    granted: Arc<Mutex<Vec<(u64, i32)>>>,
+}
+
+impl SharedHostProc {
+    /// A slot over `make` (the provider's handler factory) and `fork` (its own fork factory — the
+    /// per-process split a personality needs; see [`HostCap::host_proc_forkable`]).
+    pub fn new(
+        make: impl Fn() -> temen_interp::HostProc + Send + Sync + 'static,
+        fork: temen_interp::HostProcFork,
+    ) -> Self {
+        Self {
+            make: Arc::new(make),
+            fork,
+            granted: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// This slot's entry on `host`, granting it if this is the first slot to ask. Idempotent per
+    /// host — every later caller gets the same handle. Embedders call it directly to reach the
+    /// entry for something handle-shaped that is not an import binding (temen-run's nim lane
+    /// publishes the personality's op vtable on it, so an exec'd image's `__px_`-linked manifest
+    /// binds against this same entry).
+    pub fn install(&self, host: &mut Host) -> i32 {
+        let dom = host.domain_id();
+        let mut g = self.granted.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, h)) = g.iter().find(|(d, _)| *d == dom) {
+            return *h;
+        }
+        let handle = host.grant_host_proc_forkable((self.make)(), Arc::clone(&self.fork));
+        g.push((dom, handle));
+        handle
+    }
+}
+
 impl HostCap {
     /// **Install this host-native capability into `host`** and return its handle — the same grant
     /// [`Instance::run_with_caps`] applies for an `extra_caps` entry, exposed so a caller wiring a §14
@@ -6087,6 +6140,20 @@ impl HostCap {
             iface: None,
         }
     }
+    /// #1645 — a [`HostCap`] over a [`SharedHostProc`]: this slot's **one** powerbox entry, at `op`.
+    /// See [`SharedHostProc`] for why a personality wants one entry rather than one per import.
+    pub fn host_proc_shared(op: u32, slot: &SharedHostProc) -> HostCap {
+        let slot = slot.clone();
+        HostCap {
+            type_id: cap_id::HOST_PROC,
+            op,
+            grant: Arc::new(move |h, _| slot.install(h)),
+            unbound: false,
+            offer: None,
+            iface: None,
+        }
+    }
+
     /// An **mmap-capable** host-defined capability (§4b): like [`host_proc`](HostCap::host_proc) but the
     /// handler is registered via [`Host::grant_host_proc_region`], so it is also handed a
     /// [`temen_interp::RegionMinter`] and can mint a file-backed `SharedRegion` to hand the guest for
