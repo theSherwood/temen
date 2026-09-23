@@ -2226,15 +2226,21 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
 /// until the 5c.1 transport lands; minting is the 5c.0 slice.)
 ///
 /// # Safety
-/// `rt` is the run's live nursery; `trap_out` the live trap cell (untouched — no trap paths).
+/// `rt` is the run's live nursery; `mem_base` its live window base; `trap_out` the live trap cell
+/// (written only for a forged `Instantiator`).
 pub(crate) unsafe extern "C" fn child_offer(
     rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
     child: i32,
     export: i64,
-    _trap_out: *mut i64,
+    trap_out: *mut i64,
 ) -> i32 {
     const EINVAL: i32 = -22;
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mint_addr = rt.grant_mint.load(Ordering::Acquire);
     if mint_addr == 0 {
         return EINVAL;
@@ -2257,8 +2263,17 @@ pub(crate) unsafe extern "C" fn child_offer(
     mint(rt.grant_ctx(), retained as *mut core::ffi::c_void, export)
 }
 
-pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i64 {
+pub(crate) unsafe extern "C" fn join(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i64 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = handle as usize;
     let done = match children.get_mut(slot) {
@@ -2359,8 +2374,17 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
 ///
 /// # Safety
 /// As [`join`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
-pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn poll(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get(handle as usize) {
         Some(c) if !c.joined => {
@@ -2384,8 +2408,17 @@ pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: 
 ///
 /// # Safety
 /// As [`join`].
-pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn detach(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get_mut(handle as usize) {
         Some(c) if !c.joined => {
@@ -2407,8 +2440,17 @@ pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out
 ///
 /// # Safety
 /// As [`join`].
-pub(crate) unsafe extern "C" fn kill(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn kill(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get(handle as usize) {
         Some(_) => 0,

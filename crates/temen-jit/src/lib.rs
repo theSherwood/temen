@@ -8935,12 +8935,13 @@ fn lower_instantiator(
             vals.push(r);
         }
         1 => {
-            // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The call.cap's handle
-            // operand (the Instantiator) is unused here — the child handle is the first arg, and the
-            // nursery owns the child table for this run.
+            // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
+            // The nursery owns the child table for this run; the thunk still resolves the call.cap's
+            // `Instantiator` first, as the oracle does for every op (#1729).
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64] {
+            for t in [I64, I64, I32, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -8948,18 +8949,18 @@ fn lower_instantiator(
             let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
         9 | 10 | 12 => {
-            // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.
-            // The call.cap's handle operand (the Instantiator) is unused — the child handle is arg 0,
-            // and the nursery owns the child table (as for `join`).
+            // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,
+            // trap_out:i64) -> status:i32 — resolved and dispatched as `join` is.
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64] {
+            for t in [I64, I64, I32, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -8972,7 +8973,7 @@ fn lower_instantiator(
             let thunk = b.ins().iconst(I64, thunk_addr);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -9014,22 +9015,26 @@ fn lower_instantiator(
             vals.push(r);
         }
         14 => {
-            // CALLS.md 5c.0 child_offer(nursery, child:i32, export:i64, trap_out) -> handle:i32.
-            // Mint a live-callee offer over a granted child's nursery-retained shared powerbox;
-            // every miss is the probeable -EINVAL (the interp op-14 arm, errno-for-errno). No
-            // window args — the mint reads no guest memory.
+            // CALLS.md 5c.0 child_offer(nursery, mem_base, instantiator:i32, child:i32, export:i64,
+            // trap_out) -> handle:i32. Mint a live-callee offer over a granted child's
+            // nursery-retained shared powerbox; every miss is the probeable -EINVAL (the interp op-14
+            // arm, errno-for-errno). A forged `Instantiator` is the `CapFault` every op gives (#1729);
+            // `mem_base` is only for that resolve — the mint reads no guest memory.
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let export = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64, I64] {
+            for t in [I64, I64, I32, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.inst.child_offer_thunk);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[nursery, child, export, trap_out]);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, child, export, trap_out],
+            );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
