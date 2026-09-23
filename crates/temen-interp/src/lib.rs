@@ -28375,27 +28375,27 @@ impl Mem {
 
     /// #1145 — the largest reservation [`Mem::with_reservation`] will eagerly allocate a **flat
     /// `Owned`** backing for on a non-`mmap` target (wasm). Below this, a bounded reservation gets a
-    /// contiguous, lock-free buffer (raw-addressable, tier-up eligible) instead of the `Paged`
-    /// per-access-locked fallback; at or above it, `Paged`'s lazy per-page map is the only affordable
-    /// option. 256 MiB: comfortably covers a browser guest window while capping the eager cost.
+    /// contiguous buffer (raw-addressable, tier-up eligible) instead of the non-flat default; at or
+    /// above it, the default's lazy segment table (`Region::Sparse`, #1710) is the affordable option.
+    /// 256 MiB: comfortably covers a browser guest window while capping the eager cost.
     const FLAT_BACKING_CAP: u64 = 1 << 28;
 
     /// #1145 — the anonymous backing for a `with_reservation` window. [`Region::new`] is the right
-    /// default — a lazy `mmap` on unix — but its non-unix fallback is `Paged`, whose every byte access
-    /// takes a `Mutex` + `BTreeMap` lookup. When the default comes back non-flat **and** the
-    /// reservation is small enough to afford ([`FLAT_BACKING_CAP`]), an eagerly-allocated flat `Owned`
-    /// buffer is strictly faster: lock-free raw reads/writes on the browser cooperative tier.
+    /// default: a lazy `mmap` on unix, and a lazy lock-free segment table (`Region::Sparse`, #1710)
+    /// without `mmap`, which is fast but not flat-addressable. When the default comes back non-flat
+    /// **and** the reservation is small enough to afford ([`FLAT_BACKING_CAP`]), an eagerly-allocated
+    /// flat `Owned` buffer is better still: one contiguous span the emitted tier can serve.
     fn reserved_backing(reserved: u64, page: u64) -> Region {
         Self::reserved_backing_over(Region::new(reserved, page), reserved, page)
     }
 
     /// The decision half of [`reserved_backing`](Mem::reserved_backing), taking the already-built
-    /// default backing — split out so the non-unix (`Paged`-default) arm is unit-testable on a unix
+    /// default backing — split out so the non-unix (non-flat default) arm is unit-testable on a unix
     /// host, where `Region::new` always comes back flat. When the default is non-flat and the
     /// reservation is within [`FLAT_BACKING_CAP`], upgrade to an owned flat buffer sized to `reserved`
     /// (`back.len() == reserved`, so every masked access — confined to `[0, reserved)` — stays in
     /// bounds). Fail-soft: an allocation failure, an over-cap reservation, or an already-flat default
-    /// keeps the `Region::new` default (the window then runs Paged/interpreted, the prior behavior).
+    /// keeps the `Region::new` default (the window then runs on the interpreter only).
     fn reserved_backing_over(default: Region, reserved: u64, page: u64) -> Region {
         if default.raw_base().is_none() && reserved <= Self::FLAT_BACKING_CAP {
             if let Some(flat) = Region::owned_zeroed(reserved, page) {
@@ -28600,13 +28600,13 @@ impl Mem {
 
     /// #816 item 3 — choose a [`fork_private`](Mem::fork_private) twin's private backing.
     /// [`Region::new`] is the right default — a lazy `mmap` on unix — but its non-unix fallback is
-    /// `Paged`: no flat address, so emitted `win + addr` code can never serve the twin's window and
+    /// the non-flat `Sparse` table: no flat address, so emitted `win + addr` code can never serve the twin's window and
     /// the twin interprets forever (the tier-up `tierup_servable` gate strips its bitmap). So when
     /// the default comes back non-flat, this (my) window is itself flat-addressable (the tier-up
     /// shapes: the browser's `Region::shared` window over the cdylib's linear memory), and the
     /// reservation is bounded by my backing's length — the run window size, the cost cap on the
     /// eager allocation (a coop run clamps its reservation to the run window; an unclamped
-    /// `DEFAULT_RESERVED_LOG2` engine-owned `Paged` parent is not flat, so it never lands here) —
+    /// `DEFAULT_RESERVED_LOG2` engine-owned non-flat parent never lands here) —
     /// the twin gets an **owned flat** buffer and tiers up over its private window on every
     /// target. Fail-soft: an allocation failure keeps the default (the twin then stays
     /// interpreted, exactly the pre-seam behavior).
@@ -29890,8 +29890,8 @@ impl Mem {
     }
 
     /// #816 env-routed tier-up: the **flat base address** of this window — the backing region's raw
-    /// base plus the window's absolute base offset — or `None` when the backing is the `Paged`
-    /// fallback (no contiguous address, so the emitted tier cannot serve this window and it stays
+    /// base plus the window's absolute base offset — or `None` when the backing is non-flat (`Sparse`,
+    /// `Paged` or `Foreign`: no contiguous address, so the emitted tier cannot serve this window and it stays
     /// interpreted — the fail-closed arm of the tier-up eligibility gate). For a §14 nested child
     /// this is the parent backing's base plus the carve offset, so the same pointer arithmetic the
     /// emitted `win + addr` accesses perform lands exactly where the interpreter's confined

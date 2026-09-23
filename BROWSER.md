@@ -54,8 +54,9 @@ engine** is reached via `run_fast`/`run_with_host_fast` and is the right target:
   (`bytecode.rs:1202`) takes an embedder `&mut Host` + init-memory image + reservation, runs, and
   returns a `Capture` (results **and** the final memory snapshot). This is the browser entry point;
   no new public API is required.
-- **Clean deps** — `temen-ir`, `temen-mask` (`#![no_std]`), `temen-mem` (non-unix `Paged` fallback),
-  `temen-verify` (pure). `page_size` is native-only (wasm hard-codes the 64 KiB page), so it's not in
+- **Clean deps** — `temen-ir`, `temen-mask` (`#![no_std]`), `temen-mem` (without `mmap`, a lazy
+  lock-free two-level table of 64 KiB segments, `Region::Sparse`: #1710, 1.5–2.5× over the
+  `Mutex`-guarded `Paged` map it replaced on allocation-heavy guests), `temen-verify` (pure). `page_size` is native-only (wasm hard-codes the 64 KiB page), so it's not in
   the wasm dep graph. No `temen-fiber` (asm stack-switch — fibers here are continuation-based) and no
   `temen-jit` (Cranelift). Nothing architecture-specific is dragged in.
 

@@ -28,18 +28,23 @@
 //! Beyond that, a guest data race corrupts only the guest's own confined memory and can never escape
 //! the window (§12) — masking + bounds still gate every access.
 //!
-//! Two backings:
+//! Three lazy backings:
 //! - **`Mapped`** (unix): one anonymous `mmap` of the reserved size (lazy: pages cost nothing until
 //!   touched, then the kernel zero-fills). Page-aligned, so **real** `AtomicU32`/`AtomicU64` ops
 //!   (the §12 hardware atomics the JIT already emits) are sound on it. The substrate parallel
 //!   execution runs on.
-//! - **`Paged`** (non-unix, or a reservation too large to `mmap`): a `BTreeMap` of zeroed pages
-//!   behind a `Mutex`. Correct but serialized — the portable fallback, not the parallel substrate.
+//! - **`Sparse`** (no `mmap`: wasm, native Windows; #1710): a two-level table of 64 KiB segments,
+//!   each allocated zeroed on first write and installed with a compare-and-swap. The software
+//!   stand-in for a page table: lock-free, with `Mapped`'s atomics (each segment is served by the
+//!   raw body in `Shared`), but not contiguous, so not flat-addressable.
+//! - **`Paged`**: a `BTreeMap` of zeroed pages behind a `Mutex`. Correct but serialized, and written
+//!   in safe code: the reference every other backing is fuzzed against, and the fallback for a
+//!   reservation too large for `Sparse`'s table.
 //!
 //! Plus two flat wrappers around the same raw accessor bodies: **`Shared`** (borrowed,
 //! embedder-owned memory — the browser's window-in-linear-memory shape) and **`Owned`** (an
 //! eagerly-allocated heap buffer — the portable flat backing a fork twin's private window needs
-//! where `Paged` would apply, #816).
+//! where the non-flat `Sparse` would apply, #816).
 //!
 //! And one **proxied** backing: **`Foreign`** (#1284, `DETACHED_JIT.md` §3.3) — a region whose bytes
 //! live in memory this process cannot address (a detached child's own `WebAssembly.Memory` on
@@ -85,8 +90,8 @@ pub enum Region {
     Shared(Shared),
     /// An **owned, eagerly-allocated** flat heap buffer: the same raw-pointer hardware atomics as
     /// `Shared`, with the backing's lifecycle owned here (like `Mapped`, but plain `alloc`, so it
-    /// exists on every target). Flat-addressable where [`Region::new`]'s non-unix fallback is
-    /// `Paged` — the #816 twin-backing seam: a fork twin's private window must be a single
+    /// exists on every target). Flat-addressable where [`Region::new`]'s non-unix fallback
+    /// (`Sparse`) is not — the #816 twin-backing seam: a fork twin's private window must be a single
     /// contiguous span for emitted `win + addr` code to serve it. Built via
     /// [`Region::owned_zeroed`]; eager allocation is the cost, so callers bound the size.
     Owned(Owned),
@@ -104,7 +109,16 @@ pub enum Region {
     /// (`temen_par_*`) shares one backing address across Workers and therefore **never** builds this
     /// variant. Built via [`Region::growable`].
     Growable(Growable),
-    /// Portable fallback: zeroed pages in a `Mutex`-guarded map (serialized, not the parallel path).
+    /// **Lazy and lock-free** (#1710): the reservation is split into 64 KiB segments, reached through
+    /// a two-level table and allocated zeroed on first write; an unwritten segment reads zero and
+    /// costs nothing. What [`Region::new`] gives a target without `mmap` (wasm, native Windows): the
+    /// software stand-in for a page table. Each segment is served by the one raw accessor body in
+    /// [`Shared`], so accesses carry the same atomicity as `Mapped`. Not flat-addressable (the
+    /// segments are not contiguous).
+    Sparse(Sparse),
+    /// The safe reference: zeroed pages in a `Mutex`-guarded map. Correct under sharing but fully
+    /// serialized, so it is the differential oracle for the other backings and the fallback for a
+    /// reservation too large for `Sparse`'s table, not the fast path.
     Paged(Paged),
     /// **Proxied**: bytes in memory this process cannot address, reached through a [`ForeignOps`]
     /// table (a detached child's own `WebAssembly.Memory`, #1284). Every accessor is one call into the
@@ -162,6 +176,7 @@ enum Backing<'a> {
     /// `(base, size)`, while the relocatable `Growable` reads its current pair atomically. Taken
     /// afresh per access, so it can never outlive a relocation.
     Raw(Shared),
+    Sparse(&'a Sparse),
     Paged(&'a Paged),
     Foreign(&'a Foreign),
 }
@@ -170,8 +185,9 @@ impl Region {
     /// A region addressing `[0, size)` bytes, all reading as zero until written. `page` is the
     /// host page granularity (the unit [`Region::zero`] re-zeroes and the `Paged` chunk size).
     ///
-    /// On unix a feasible `size` is `mmap`-backed (the shared substrate); a `size` too large to map
-    /// — or any non-unix target — falls back to the paged backing.
+    /// On unix a feasible `size` is `mmap`-backed (the shared substrate). A `size` too large to map,
+    /// or any non-unix target, gets the lazy [`Sparse`](Region::Sparse) table (#1710), and a `size`
+    /// too large even for that gets the paged backing.
     pub fn new(size: u64, page: u64) -> Region {
         #[cfg(unix)]
         {
@@ -181,7 +197,14 @@ impl Region {
                 }
             }
         }
-        Region::Paged(Paged::new(size, page))
+        Region::sparse(size).unwrap_or_else(|| Region::Paged(Paged::new(size, page)))
+    }
+
+    /// #1710: the lazy, lock-free two-level table [`Region::new`] falls back to without `mmap`,
+    /// constructible directly so a unix host can test it. `None` when `size` exceeds what its
+    /// top-level table spans ([`Sparse::MAX_SIZE`]).
+    pub fn sparse(size: u64) -> Option<Region> {
+        Sparse::new(size).map(Region::Sparse)
     }
 
     /// Build a region over **caller-owned** memory `[base, base+size)` — real hardware atomics like
@@ -198,16 +221,16 @@ impl Region {
         Region::Shared(Shared::new(base, size))
     }
 
-    /// The portable `Paged` fallback, **forced** — what [`Region::new`] returns on non-unix
-    /// targets (or an un-`mmap`-able reservation), constructible directly so a unix host can
-    /// exercise the non-flat arm of a backing decision (e.g. the #816 fork-twin seam's tests).
+    /// The portable `Paged` backing, **forced**: the safe reference the other backings are fuzzed
+    /// against, and a non-flat region a unix host can build to exercise the non-flat arm of a backing
+    /// decision (e.g. the #816 fork-twin seam's tests).
     pub fn paged(size: u64, page: u64) -> Region {
         Region::Paged(Paged::new(size, page))
     }
 
     /// A region addressing `[0, size)` over an **owned, zero-initialized flat buffer** — flat-
     /// addressable ([`Region::raw_base`]) on every target, where [`Region::new`] falls back to the
-    /// non-flat `Paged` on non-unix. The buffer is allocated **eagerly** (a `new` reservation is
+    /// non-flat `Sparse` on non-unix. The buffer is allocated **eagerly** (a `new` reservation is
     /// lazy), so callers bound `size` — the #816 fork-twin seam bounds it by the parent backing's
     /// length (the run window size). `None` when `size` is 0 or the allocation fails, so callers
     /// fall back (`Region::new`) rather than abort.
@@ -293,6 +316,7 @@ impl Region {
             Region::Shared(s) => Backing::Raw(*s),
             Region::Owned(o) => Backing::Raw(o.raw),
             Region::Growable(g) => Backing::Raw(g.snapshot()),
+            Region::Sparse(p) => Backing::Sparse(p),
             Region::Paged(p) => Backing::Paged(p),
             Region::Foreign(f) => Backing::Foreign(f),
         }
@@ -313,6 +337,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.size,
             Backing::Paged(p) => p.size,
+            Backing::Sparse(p) => p.size,
             Backing::Foreign(f) => f.len.load(Ordering::Acquire),
         }
     }
@@ -359,6 +384,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.byte(off),
             Backing::Paged(p) => p.byte(off),
+            Backing::Sparse(p) => p.byte(off),
             Backing::Foreign(f) => f.word(off, 1) as u8,
         }
     }
@@ -371,6 +397,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.set_byte(off, b),
             Backing::Paged(p) => p.set_byte(off, b),
+            Backing::Sparse(p) => p.set_byte(off, b),
             Backing::Foreign(f) => f.set_word(off, 1, b as u64),
         }
     }
@@ -385,6 +412,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.zero(off, len),
             Backing::Paged(p) => p.zero(off, len),
+            Backing::Sparse(p) => p.zero(off, len),
             Backing::Foreign(f) => (f.ops.fill)(f.id, off, len, 0),
         }
     }
@@ -401,6 +429,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.fill(off, len, b),
             Backing::Paged(p) => p.fill(off, len, b),
+            Backing::Sparse(p) => p.fill(off, len, b),
             Backing::Foreign(f) => (f.ops.fill)(f.id, off, len, b),
         }
     }
@@ -418,6 +447,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.copy_within(dst, src, len),
             Backing::Paged(p) => p.copy_within(dst, src, len),
+            Backing::Sparse(p) => p.copy_within(dst, src, len),
             Backing::Foreign(f) => (f.ops.copy_within)(f.id, dst, src, len),
         }
     }
@@ -429,6 +459,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.read_into(off, out),
             Backing::Paged(p) => p.read_into(off, out),
+            Backing::Sparse(p) => p.read_into(off, out),
             Backing::Foreign(f) => {
                 // Zero-fill past the end (the flat body's contract), read the in-range prefix.
                 let n = clamp_len(off, out.len() as u64, self.len()) as usize;
@@ -449,6 +480,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.write_from(off, data),
             Backing::Paged(p) => p.write_from(off, data),
+            Backing::Sparse(p) => p.write_from(off, data),
             Backing::Foreign(f) => {
                 let n = clamp_len(off, data.len() as u64, self.len()) as usize;
                 if n != 0 {
@@ -483,6 +515,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.read_word(off, width),
             Backing::Paged(p) => p.read_word(off, width),
+            Backing::Sparse(p) => p.read_word(off, width),
             Backing::Foreign(f) => f.word(off, width),
         }
     }
@@ -497,6 +530,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.write_word(off, width, val),
             Backing::Paged(p) => p.write_word(off, width, val),
+            Backing::Sparse(p) => p.write_word(off, width, val),
             Backing::Foreign(f) => f.set_word(off, width, val),
         }
     }
@@ -510,6 +544,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.atomic_load(off, width),
             Backing::Paged(p) => p.atomic_load(off, width),
+            Backing::Sparse(p) => p.atomic_load(off, width),
             Backing::Foreign(f) => (f.ops.atomic)(f.id, FOREIGN_ATOMIC_LOAD, off, width, 0, 0),
         }
     }
@@ -522,6 +557,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.atomic_store(off, width, val),
             Backing::Paged(p) => p.atomic_store(off, width, val),
+            Backing::Sparse(p) => p.atomic_store(off, width, val),
             Backing::Foreign(f) => {
                 (f.ops.atomic)(f.id, FOREIGN_ATOMIC_STORE, off, width, val, 0);
             }
@@ -536,6 +572,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.atomic_rmw(off, width, op, val),
             Backing::Paged(p) => p.atomic_rmw(off, width, op, val),
+            Backing::Sparse(p) => p.atomic_rmw(off, width, op, val),
             Backing::Foreign(f) => (f.ops.atomic)(f.id, op.code(), off, width, val, 0),
         }
     }
@@ -549,6 +586,7 @@ impl Region {
         match self.backing() {
             Backing::Raw(s) => s.atomic_cmpxchg(off, width, expected, replacement),
             Backing::Paged(p) => p.atomic_cmpxchg(off, width, expected, replacement),
+            Backing::Sparse(p) => p.atomic_cmpxchg(off, width, expected, replacement),
             Backing::Foreign(f) => (f.ops.atomic)(
                 f.id,
                 FOREIGN_ATOMIC_CMPXCHG,
@@ -1176,13 +1214,21 @@ mod growable {
             // Amortize repeated allocator growth (a bump allocator commits page by page) by at least
             // doubling — but fall back to the exact requirement if the doubled ask is refused, so a
             // legitimate grow near the address-space limit is not lost to the overshoot.
+            // `realloc` requires a size that is a valid `Layout` (at most `isize::MAX`); a request
+            // past that is a refusal, never a call.
+            let valid = |n: usize| std::alloc::Layout::from_size_align(n, 8).is_ok();
+            if !valid(need) {
+                return false;
+            }
             let doubled = old_alloc.saturating_mul(2).max(need);
+            let doubled = if valid(doubled) { doubled } else { need };
             let base = self.base.load(Acquire);
             // SAFETY: `base`/`old_alloc` are the live allocation and its exact layout (8-aligned,
             // non-zero). `realloc` keeps the old block valid when it returns null.
             let old_layout = unsafe { std::alloc::Layout::from_size_align_unchecked(old_alloc, 8) };
             let mut new_alloc = doubled;
-            // SAFETY: as above; `new_alloc >= need > old_alloc > 0`, so the new layout is valid.
+            // SAFETY: as above; `new_alloc >= need > old_alloc > 0` and `valid(new_alloc)` (checked
+            // above), so the new size is a valid layout size.
             let mut p = unsafe { std::alloc::realloc(base, old_layout, new_alloc) };
             if p.is_null() && doubled > need {
                 new_alloc = need;
@@ -1218,6 +1264,319 @@ mod growable {
                     *self.base.get_mut(),
                     std::alloc::Layout::from_size_align_unchecked(*self.alloc_len.get_mut(), 8),
                 );
+            }
+        }
+    }
+}
+
+// ================= #1710: the lazy, lock-free two-level table (no `mmap` needed) =================
+
+pub use sparse::Sparse;
+
+/// A software page table: what [`Region::new`] gives a target without `mmap` (see
+/// [`Region::Sparse`]). The reservation is cut into [`SEG`](Sparse::SEG)-byte segments. A top-level
+/// array sized to the reservation points to second-level tables of `L2_LEN` segment pointers, and
+/// both levels are filled in on the first write, with a compare-and-swap so concurrent writers agree
+/// on one allocation. A read of an unwritten segment is zero and allocates nothing.
+///
+/// Every byte access goes through the one raw accessor body in [`Shared`], applied to the segment
+/// that holds it, so the atomicity contract is exactly `Mapped`'s. The only `unsafe` here is the
+/// tables' lifecycle: install, lookup, and `Drop`. A segment, once installed, lives until the
+/// region drops, so a pointer read from a table is valid for the whole `&self` borrow.
+mod sparse {
+    use super::{RmwOp, Shared};
+    use core::ptr;
+    use core::sync::atomic::{
+        AtomicPtr,
+        Ordering::{AcqRel, Acquire},
+    };
+    use std::alloc::Layout;
+
+    /// Segment size: 64 KiB. A multiple of 8, so a naturally-aligned atomic never spans two.
+    const SEG_LOG2: u32 = 16;
+    /// Segments per second-level table: 4096, so one table spans 256 MiB and weighs 32 KiB.
+    const L2_LOG2: u32 = 12;
+    const L2_LEN: usize = 1 << L2_LOG2;
+    /// The most top-level entries a region may have: 2^14, so the top level weighs at most 128 KiB.
+    const L1_MAX_LOG2: u32 = 14;
+
+    type Table = [AtomicPtr<u8>; L2_LEN];
+
+    pub struct Sparse {
+        pub(super) size: u64,
+        l1: Box<[AtomicPtr<Table>]>,
+    }
+
+    impl Sparse {
+        /// The segment size, in bytes.
+        pub const SEG: u64 = 1 << SEG_LOG2;
+        /// The largest `size` the top-level table can span (4 TiB). `Region::new`'s 2^40 on-ramp
+        /// reservation takes 4096 top-level entries, 32 KiB.
+        pub const MAX_SIZE: u64 = 1 << (L1_MAX_LOG2 + L2_LOG2 + SEG_LOG2);
+
+        pub(super) fn new(size: u64) -> Option<Sparse> {
+            if size > Self::MAX_SIZE {
+                return None;
+            }
+            let entries = size.div_ceil(1 << (L2_LOG2 + SEG_LOG2)) as usize;
+            let l1 = (0..entries)
+                .map(|_| AtomicPtr::new(ptr::null_mut()))
+                .collect();
+            Some(Sparse { size, l1 })
+        }
+
+        fn seg_layout() -> Layout {
+            // 8-aligned for the widest (`U64`) atomic.
+            Layout::from_size_align(Self::SEG as usize, 8).expect("a 64 KiB layout is valid")
+        }
+
+        /// The segment holding `off`, if it has been written.
+        #[inline]
+        fn seg(&self, off: u64) -> Option<Shared> {
+            let s = off >> SEG_LOG2;
+            let t = self.l1[(s >> L2_LOG2) as usize].load(Acquire);
+            if t.is_null() {
+                return None;
+            }
+            // SAFETY: a non-null top-level entry is a live `Table` this region installed; tables are
+            // freed only in `Drop`, which `&self` excludes.
+            let p = unsafe { (*t)[s as usize & (L2_LEN - 1)].load(Acquire) };
+            (!p.is_null()).then(|| Shared::new(p, Self::SEG))
+        }
+
+        /// The segment holding `off`, installing it (and its table) zeroed if absent.
+        fn seg_mut(&self, off: u64) -> Shared {
+            let s = off >> SEG_LOG2;
+            let t = install(&self.l1[(s >> L2_LOG2) as usize], new_table, free_table);
+            // SAFETY: `install` returned a live `Table` (as in `seg`).
+            let slot = unsafe { &(*t)[s as usize & (L2_LEN - 1)] };
+            Shared::new(install(slot, new_seg, free_seg), Self::SEG)
+        }
+
+        /// Visit `[off, off+len)` (clamped to `size`) segment by segment, as `(segment start,
+        /// offset in segment, bytes, bytes already visited)`.
+        fn for_segments(&self, off: u64, len: u64, mut f: impl FnMut(u64, u64, usize, usize)) {
+            let len = len.min(self.size.saturating_sub(off));
+            let mut done = 0u64;
+            while done < len {
+                let o = off + done;
+                let idx = o & (Self::SEG - 1);
+                let take = (Self::SEG - idx).min(len - done);
+                f(o - idx, idx, take as usize, done as usize);
+                done += take;
+            }
+        }
+
+        /// Whether `[off, off+width)` lies inside one segment, as nearly every access does.
+        #[inline]
+        fn in_one(off: u64, width: u32) -> bool {
+            (off & (Self::SEG - 1)) + width as u64 <= Self::SEG
+        }
+
+        pub(super) fn byte(&self, off: u64) -> u8 {
+            self.seg(off).map_or(0, |s| s.byte(off & (Self::SEG - 1)))
+        }
+
+        pub(super) fn set_byte(&self, off: u64, b: u8) {
+            self.seg_mut(off).set_byte(off & (Self::SEG - 1), b)
+        }
+
+        pub(super) fn read_word(&self, off: u64, width: u32) -> u64 {
+            if Self::in_one(off, width) {
+                return self
+                    .seg(off)
+                    .map_or(0, |s| s.read_word(off & (Self::SEG - 1), width));
+            }
+            let mut raw = [0u8; 8];
+            self.read_into(off, &mut raw[..width as usize]);
+            u64::from_le_bytes(raw)
+        }
+
+        pub(super) fn write_word(&self, off: u64, width: u32, val: u64) {
+            if Self::in_one(off, width) {
+                return self
+                    .seg_mut(off)
+                    .write_word(off & (Self::SEG - 1), width, val);
+            }
+            self.write_from(off, &val.to_le_bytes()[..width as usize]);
+        }
+
+        /// Zero `[off, off+len)`: only segments already written need it, so this allocates nothing.
+        pub(super) fn zero(&self, off: u64, len: u64) {
+            self.for_segments(off, len, |base, idx, take, _| {
+                if let Some(s) = self.seg(base) {
+                    s.zero(idx, take as u64);
+                }
+            });
+        }
+
+        pub(super) fn fill(&self, off: u64, len: u64, b: u8) {
+            if b == 0 {
+                return self.zero(off, len);
+            }
+            self.for_segments(off, len, |base, idx, take, _| {
+                self.seg_mut(base).fill(idx, take as u64, b)
+            });
+        }
+
+        /// Overlap-safe copy in bounded chunks (at most one segment), walked forward when `dst` is
+        /// below `src` and backward otherwise, so no chunk reads a byte an earlier chunk overwrote.
+        pub(super) fn copy_within(&self, dst: u64, src: u64, len: u64) {
+            let step = Self::SEG.min(len);
+            let mut buf = vec![0u8; step as usize];
+            // Copy `[pos, end)` of the range.
+            let mut chunk = |pos: u64, end: u64| {
+                let n = (end - pos) as usize;
+                self.read_into(src + pos, &mut buf[..n]);
+                self.write_from(dst + pos, &buf[..n]);
+            };
+            if dst <= src {
+                let mut pos = 0;
+                while pos < len {
+                    let end = (pos + step).min(len);
+                    chunk(pos, end);
+                    pos = end;
+                }
+            } else {
+                let mut end = len;
+                while end > 0 {
+                    let pos = end.saturating_sub(step);
+                    chunk(pos, end);
+                    end = pos;
+                }
+            }
+        }
+
+        /// Copy out `[off, off+out.len())`: an unwritten segment reads zero; bytes past `size` are
+        /// left as they are (the flat body's contract).
+        pub(super) fn read_into(&self, off: u64, out: &mut [u8]) {
+            self.for_segments(off, out.len() as u64, |base, idx, take, done| {
+                let dst = &mut out[done..done + take];
+                match self.seg(base) {
+                    Some(s) => s.read_into(idx, dst),
+                    None => dst.fill(0),
+                }
+            });
+        }
+
+        pub(super) fn write_from(&self, off: u64, data: &[u8]) {
+            self.for_segments(off, data.len() as u64, |base, idx, take, done| {
+                self.seg_mut(base).write_from(idx, &data[done..done + take])
+            });
+        }
+
+        // The atomics: the caller guarantees natural alignment, so the access lies in one segment.
+        pub(super) fn atomic_load(&self, off: u64, width: u32) -> u64 {
+            self.seg(off)
+                .map_or(0, |s| s.atomic_load(off & (Self::SEG - 1), width))
+        }
+
+        pub(super) fn atomic_store(&self, off: u64, width: u32, val: u64) {
+            self.seg_mut(off)
+                .atomic_store(off & (Self::SEG - 1), width, val)
+        }
+
+        pub(super) fn atomic_rmw(&self, off: u64, width: u32, op: RmwOp, val: u64) -> u64 {
+            self.seg_mut(off)
+                .atomic_rmw(off & (Self::SEG - 1), width, op, val)
+        }
+
+        pub(super) fn atomic_cmpxchg(
+            &self,
+            off: u64,
+            width: u32,
+            expected: u64,
+            replacement: u64,
+        ) -> u64 {
+            self.seg_mut(off)
+                .atomic_cmpxchg(off & (Self::SEG - 1), width, expected, replacement)
+        }
+
+        /// Segments allocated so far — for tests of the laziness.
+        #[cfg(test)]
+        pub(super) fn segments(&self) -> usize {
+            let mut n = 0;
+            for t in self.l1.iter() {
+                let t = t.load(Acquire);
+                if !t.is_null() {
+                    // SAFETY: as in `seg`.
+                    n += unsafe { (*t).iter() }
+                        .filter(|p| !p.load(Acquire).is_null())
+                        .count();
+                }
+            }
+            n
+        }
+    }
+
+    /// Read `slot`, or install `make()` into it if it is empty. A losing racer frees its own
+    /// allocation and takes the winner's, so every thread sees the same pointer.
+    fn install<T>(slot: &AtomicPtr<T>, make: fn() -> *mut T, free: unsafe fn(*mut T)) -> *mut T {
+        let cur = slot.load(Acquire);
+        if !cur.is_null() {
+            return cur;
+        }
+        let fresh = make();
+        match slot.compare_exchange(ptr::null_mut(), fresh, AcqRel, Acquire) {
+            Ok(_) => fresh,
+            Err(winner) => {
+                // SAFETY: `fresh` was never published, so this thread holds the only pointer to it.
+                unsafe { free(fresh) };
+                winner
+            }
+        }
+    }
+
+    fn new_seg() -> *mut u8 {
+        let layout = Sparse::seg_layout();
+        // SAFETY: a non-zero layout.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        if p.is_null() {
+            // Out of memory committing a page: the same outcome as `Paged`'s page allocation.
+            std::alloc::handle_alloc_error(layout);
+        }
+        p
+    }
+
+    /// # Safety
+    /// `p` came from `new_seg` and is not reachable from any table.
+    unsafe fn free_seg(p: *mut u8) {
+        // SAFETY: the layout `new_seg` allocated with.
+        unsafe { std::alloc::dealloc(p, Sparse::seg_layout()) }
+    }
+
+    fn new_table() -> *mut Table {
+        let slots: Box<[AtomicPtr<u8>]> = (0..L2_LEN)
+            .map(|_| AtomicPtr::new(ptr::null_mut()))
+            .collect();
+        let table: Box<Table> = slots.try_into().expect("exactly L2_LEN slots");
+        Box::into_raw(table)
+    }
+
+    /// # Safety
+    /// `t` came from `new_table` and is not reachable from the top level.
+    unsafe fn free_table(t: *mut Table) {
+        // SAFETY: `t` is a `Box<Table>` `new_table` leaked.
+        drop(unsafe { Box::from_raw(t) });
+    }
+
+    impl Drop for Sparse {
+        fn drop(&mut self) {
+            for t in self.l1.iter_mut() {
+                let t = *t.get_mut();
+                if t.is_null() {
+                    continue;
+                }
+                // SAFETY: `&mut self`: no accessor is running, so every installed table and segment
+                // is reachable only from here, and each is freed exactly once.
+                let mut table = unsafe { Box::from_raw(t) };
+                for slot in table.iter_mut() {
+                    let p = *slot.get_mut();
+                    if !p.is_null() {
+                        // SAFETY: as above; `p` came from `new_seg`.
+                        unsafe { free_seg(p) };
+                    }
+                }
             }
         }
     }
@@ -1884,6 +2243,10 @@ mod growable_tests {
         let (base, len) = (r.raw_base(), r.len());
 
         assert!(!r.grow_to(u64::MAX), "no host serves a 2^64-byte buffer");
+        assert!(
+            !r.grow_to((isize::MAX as u64) + 1),
+            "past isize::MAX is not a valid layout: refused, never passed to realloc"
+        );
         assert_eq!(r.len(), len, "length unchanged after a refusal");
         assert_eq!(r.raw_base(), base, "buffer unchanged after a refusal");
         let mut got = [0u8; 6];
@@ -1930,6 +2293,160 @@ mod growable_tests {
             page,
             0x0f1e_2d3c_4b5a_6978,
         );
+    }
+}
+
+/// #1710 — the lazy, lock-free two-level table `Region::new` falls back to without `mmap`.
+#[cfg(test)]
+mod sparse_tests {
+    use super::*;
+
+    const SEG: u64 = Sparse::SEG;
+
+    fn sparse(size: u64) -> Region {
+        Region::sparse(size).expect("within Sparse::MAX_SIZE")
+    }
+
+    fn segments(r: &Region) -> usize {
+        match r {
+            Region::Sparse(s) => s.segments(),
+            _ => unreachable!("a Sparse region"),
+        }
+    }
+
+    /// The standard differential every backing is gated by, over a region that spans segment
+    /// boundaries, against the safe `Paged` reference.
+    #[test]
+    fn differential_sparse_vs_paged_fuzz() {
+        let (size, page) = (2 * SEG + 3 * 4096, 4096);
+        tests::fuzz_against(
+            &sparse(size),
+            &Region::paged(size, page),
+            size,
+            page,
+            0x5a17_0e5e_1710_0001,
+        );
+    }
+
+    /// Accesses that straddle a segment boundary, and a second-level table boundary (256 MiB), land
+    /// byte-for-byte where `Paged` puts them — and only the touched segments are allocated.
+    #[test]
+    fn straddling_accesses_match_paged() {
+        let table = SEG << 12; // one second-level table's span
+        let size = table + 2 * SEG;
+        let (s, p) = (sparse(size), Region::paged(size, 4096));
+        for edge in [SEG, table] {
+            for (off, width) in [(edge - 3, 8u32), (edge - 1, 2), (edge - 2, 4)] {
+                s.write_word(off, width, 0x0102_0304_0506_0708);
+                p.write_word(off, width, 0x0102_0304_0506_0708);
+                assert_eq!(
+                    s.read_word(off, width),
+                    p.read_word(off, width),
+                    "{off}+{width}"
+                );
+            }
+            let data: Vec<u8> = (0..100).collect();
+            s.write_from(edge - 50, &data);
+            p.write_from(edge - 50, &data);
+            s.fill(edge - 7, 14, 0xee);
+            p.fill(edge - 7, 14, 0xee);
+            let (mut a, mut b) = ([0u8; 128], [0u8; 128]);
+            s.read_into(edge - 64, &mut a);
+            p.read_into(edge - 64, &mut b);
+            assert_eq!(a, b, "bulk ops across the boundary at {edge}");
+        }
+        assert_eq!(
+            segments(&s),
+            4,
+            "two segments at each boundary, nothing else"
+        );
+    }
+
+    /// Overlapping copies longer than a segment, in both directions, against a plain `Vec` model
+    /// (`slice::copy_within` is the memmove the region must match). The model, not `Paged`, keeps the
+    /// test fast under Miri: `Paged` copies byte by byte, and these copies are 64 KiB and up.
+    #[test]
+    fn overlapping_copies_longer_than_a_segment_match_a_vec() {
+        let size = 3 * SEG;
+        let s = sparse(size);
+        let mut model: Vec<u8> = (0..size).map(|i| (i * 7 + 3) as u8).collect();
+        s.write_from(0, &model);
+        for (dst, src, len) in [
+            (100, 5000, SEG + 17),  // dst below src: forward
+            (5000, 100, SEG + 17),  // dst above src: backward
+            (SEG - 1, SEG + 1, 64), // short overlap across a boundary
+            (7, 7, SEG + 5),        // in place
+        ] {
+            s.copy_within(dst, src, len);
+            let (d, sr, n) = (dst as usize, src as usize, len as usize);
+            model.copy_within(sr..sr + n, d);
+            let mut got = vec![0u8; size as usize];
+            s.read_into(0, &mut got);
+            assert!(got == model, "copy_within({dst}, {src}, {len}) diverged");
+        }
+    }
+
+    /// Reads, zeroing and zero fills allocate nothing; a write allocates only the segment it lands in.
+    /// This is what makes a 2^40 reservation affordable.
+    #[test]
+    fn only_writes_allocate() {
+        let r = sparse(1 << 40);
+        let far = (1u64 << 39) + 12345;
+        assert_eq!(r.read_word(far, 8), 0);
+        assert_eq!(r.byte(far), 0);
+        assert_eq!(r.atomic_load(far & !7, 8), 0);
+        let mut buf = [1u8; 64];
+        r.read_into(far, &mut buf);
+        assert_eq!(buf, [0u8; 64], "an unwritten range reads zero");
+        r.zero(far, 3 * SEG);
+        r.fill(far, SEG, 0);
+        assert_eq!(segments(&r), 0, "nothing written, nothing allocated");
+
+        r.write_word(far, 8, 42);
+        assert_eq!(r.read_word(far, 8), 42);
+        assert_eq!(segments(&r), 1);
+        assert_eq!(r.len(), 1 << 40);
+        assert!(
+            r.raw_base().is_none(),
+            "segments are not contiguous: not flat-addressable"
+        );
+    }
+
+    /// The top-level table is bounded: past `MAX_SIZE` there is no `Sparse`, and `Region::new` keeps
+    /// the paged backing instead.
+    #[test]
+    fn the_table_is_bounded() {
+        assert!(Region::sparse(Sparse::MAX_SIZE).is_some());
+        assert!(Region::sparse(Sparse::MAX_SIZE + 1).is_none());
+        assert!(Region::sparse(0).is_some(), "an empty region is valid");
+    }
+
+    /// Threads racing to install the same segment agree on one allocation: an atomic counter they all
+    /// bump in a fresh region adds up, and disjoint plain writes across many segments all land.
+    #[test]
+    fn concurrent_first_writes_install_one_segment() {
+        let threads: u64 = 8;
+        let iters: u64 = if cfg!(miri) { 50 } else { 20_000 };
+        let r = sparse(64 * SEG);
+        std::thread::scope(|sc| {
+            for t in 0..threads {
+                let r = &r;
+                sc.spawn(move || {
+                    for i in 0..iters {
+                        r.atomic_rmw(SEG + 8, 8, RmwOp::Add, 1);
+                        r.set_byte(t * 7 * SEG + (i % 1024), t as u8 + 1);
+                    }
+                });
+            }
+        });
+        assert_eq!(r.atomic_load(SEG + 8, 8), threads * iters);
+        for t in 0..threads {
+            assert_eq!(
+                r.byte(t * 7 * SEG),
+                t as u8 + 1,
+                "thread {t}'s writes landed"
+            );
+        }
     }
 }
 
