@@ -1416,6 +1416,7 @@ fn a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
+            completed_result: n.completed_result,
         })
         .collect();
     let mut jwin = fsnap.clone();

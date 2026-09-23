@@ -502,6 +502,9 @@ pub struct FrozenNested {
     pub size_log2: u8,
     /// The child's entry function index into the parent's own table (same-module).
     pub entry: u32,
+    /// `Some(result)` for a child that finished before the freeze but was not yet joined: the thaw
+    /// hands it to the parent's rewound `join` without re-running the child (#1692).
+    pub completed_result: Option<i64>,
 }
 
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
@@ -1516,16 +1519,24 @@ pub fn compile_and_run_capture_reserved_with_host_prots(
 /// which the interpreter keeps because its window is private/synchronous). The interpreter has no
 /// equivalent — only the JIT's window is a shared mmap a second thread can reach.
 ///
-/// # Lifetime contract
-/// [`Self::request_freeze`] may be called **at most once**, concurrently with an in-flight run whose
-/// loop does not terminate on its own before the request lands — so the window the published base
-/// points at is provably still mapped when the store happens (the store is what ends the run). After
-/// the run returns, the base is retired to a sentinel and `request_freeze` becomes a no-op. A request
-/// that races a run which finishes first is therefore a safe no-op, not a use-after-free.
+/// # Lifetime
+/// [`Self::request_freeze`] may be called at any time; only the first call stores. Its store and the run's
+/// [`Self::retire`] exclude each other through `base` (a request holds [`STORING`] across its store;
+/// retire waits it out), so the store only ever lands in a live window, and a request after the run
+/// ended is a no-op. A request that lands after the guest's last poll but before retire freezes
+/// nothing: the run sees it at retire and treats it as never made (see [`CompiledModule::run`]).
 pub struct FreezeController {
-    /// `0` = window not live yet (spin); `usize::MAX` = run ended (no-op); else the live window base.
+    /// `0` = window not live yet (spin); a live window base; [`STORING`] while a request writes;
+    /// [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
     base: AtomicUsize,
 }
+
+/// [`FreezeController::base`] while a request's store is in flight.
+const STORING: usize = usize::MAX - 2;
+/// [`FreezeController::base`] once a request's store has landed.
+const LANDED: usize = usize::MAX - 1;
+/// [`FreezeController::base`] once the run has ended.
+const RETIRED: usize = usize::MAX;
 
 impl FreezeController {
     /// A fresh controller, shareable with a run and a controller thread.
@@ -1536,23 +1547,30 @@ impl FreezeController {
     }
 
     /// Request a freeze: spin until the run publishes its window base, then store `UNWINDING` into the
-    /// state word. A no-op if the run already ended (the base was retired). At most one call.
+    /// state word. A no-op if the run already ended or another request got there first.
     pub fn request_freeze(&self) {
         loop {
             match self.base.load(Ordering::Acquire) {
-                0 => std::hint::spin_loop(), // window not mapped yet
-                usize::MAX => return,        // run ended before the request landed
+                0 => std::hint::spin_loop(),          // window not mapped yet
+                STORING | LANDED | RETIRED => return, // another request has it, or the run ended
                 base => {
-                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the
-                    // #1094 NULL guard — `base` is the window base, and `[0, guard)` is now unmapped, so a
-                    // store at `base + 0` would fault). STATE_UNWINDING = 1 (must match
-                    // `temen-interp`/`temen-durable`). An aligned atomic i32 store the guest's back-edge
-                    // poll loads (defined under §12 races); release-ordered after the acquire-published base.
-                    // SAFETY: per the lifetime contract the window at `base` is mapped here (the run is
-                    // blocked in its non-terminating loop until this store lands), and `base + STATE_OFF`
-                    // is in the committed RW durable control region.
+                    if self
+                        .base
+                        .compare_exchange(base, STORING, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        continue; // retired meanwhile: the next load says so
+                    }
+                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above
+                    // the #1094 NULL guard). STATE_UNWINDING = 1 (must match `temen-interp` /
+                    // `temen-durable`). An aligned atomic i32 store the guest's back-edge poll loads
+                    // (defined under §12 races).
+                    // SAFETY: `base` was the live window and `retire` cannot complete while this
+                    // request holds `STORING`, so the window is mapped; `base + STATE_OFF` is in the
+                    // committed RW durable control region.
                     let state = base + temen_ir::durable_abi::STATE_OFF as usize;
                     unsafe { (*(state as *const AtomicI32)).store(1, Ordering::Release) };
+                    self.base.store(LANDED, Ordering::Release);
                     return;
                 }
             }
@@ -1564,9 +1582,59 @@ impl FreezeController {
         self.base.store(base, Ordering::Release);
     }
 
-    /// Run-side: retire the base once the guest returns, so a late `request_freeze` is a no-op.
-    fn retire(&self) {
-        self.base.store(usize::MAX, Ordering::Release);
+    /// Run-side: retire the base once the guest returns, so a later `request_freeze` is a no-op.
+    /// Waits out a store in flight. `true` if a request's store landed.
+    fn retire(&self) -> bool {
+        loop {
+            let cur = self.base.load(Ordering::Acquire);
+            if cur == STORING {
+                std::hint::spin_loop();
+                continue;
+            }
+            if self
+                .base
+                .compare_exchange(cur, RETIRED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return cur == LANDED;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod freeze_controller_tests {
+    use super::*;
+
+    const STATE: usize = temen_ir::durable_abi::STATE_OFF as usize;
+
+    fn window() -> Vec<AtomicI32> {
+        (0..STATE / 4 + 1).map(|_| AtomicI32::new(0)).collect()
+    }
+
+    #[test]
+    fn a_request_lands_in_the_live_window_and_retire_reports_it() {
+        let w = window();
+        let fc = FreezeController::new();
+        fc.publish(w.as_ptr() as usize);
+        fc.request_freeze();
+        assert_eq!(w[STATE / 4].load(Ordering::Relaxed), 1, "UNWINDING stored");
+        fc.request_freeze(); // a second request is a no-op
+        assert!(fc.retire(), "retire reports the landed request");
+    }
+
+    #[test]
+    fn a_request_after_retire_stores_nothing() {
+        let w = window();
+        let fc = FreezeController::new();
+        fc.publish(w.as_ptr() as usize);
+        assert!(!fc.retire(), "nothing landed");
+        fc.request_freeze();
+        assert_eq!(
+            w[STATE / 4].load(Ordering::Relaxed),
+            0,
+            "the retired window is untouched"
+        );
     }
 }
 
@@ -3953,6 +4021,10 @@ impl CompiledModule {
                     seed.iter().filter(|s| s.parent_task == 0).collect();
                 roots.sort_by_key(|s| s.slot);
                 for rec in roots {
+                    if let Some(r) = rec.completed_result {
+                        n.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                        continue;
+                    }
                     let my_task = rec.task;
                     let entry = rec.entry as FuncIdx;
                     let nargs = funcs
@@ -4086,7 +4158,25 @@ impl CompiledModule {
             }
         }
         if let Some(fc) = &(*this).freeze_ctl {
-            fc.retire();
+            let landed = fc.retire();
+            // A request that landed after the root's last poll froze nothing: the root returned (or
+            // trapped) without unwinding, so its shadow-SP never left its frame base (an unwinding
+            // root spills at least its entry frame). Undo the mark, so the run reads as the
+            // uninterrupted one it was rather than as a freeze whose artifact holds a finished run.
+            // Only when the root is the last live vCPU: a concurrent child may have seen the mark and
+            // be mid-unwind, and flipping the word under it would resume it on placeholder values.
+            #[cfg(fiber_rt)]
+            if landed
+                && fiber_rt::read_shadow_sp(mem_base as u64, (*this).shadow.region_base(0))
+                    <= (*this).shadow.frame_base(0)
+                && (*this).domain.as_ref().is_none_or(|d| d.live_vcpus() == 1)
+            {
+                let state = mem_base as usize + temen_ir::durable_abi::STATE_OFF as usize;
+                (*(state as *const AtomicI32))
+                    .store(temen_ir::durable_abi::STATE_NORMAL, Ordering::Release);
+            }
+            #[cfg(not(fiber_rt))]
+            let _ = landed;
         }
 
         // §5 W3 — the **root vCPU's** trap-time backtrace capture (this run thread's thread-local): a
@@ -4145,6 +4235,17 @@ impl CompiledModule {
             // `FrozenNested` residue into the run's `Nursery`; drain it now that the root has unwound,
             // read back by the durable-nested entry point.
             if let Some(n) = &(*this)._nursery {
+                if !n.freeze_unjoined() {
+                    // A §14 child finished with a trap before the freeze: fail closed (#1692).
+                    (*(trap_cell.as_ptr() as *const AtomicI64))
+                        .compare_exchange(
+                            0,
+                            TrapKind::ThreadFault as i64,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .ok();
+                }
                 (*this).frozen_nested_out = n.take_frozen_nested();
                 // #1361 step 4 — and reach its detached children, which own windows the freeze word
                 // above is not in: ring each one's own; they unwind and are harvested at teardown.
@@ -5009,6 +5110,10 @@ pub(crate) unsafe fn compile_child_and_run(
                 .collect();
             gkids.sort_by_key(|s| s.slot);
             for rec in gkids {
+                if let Some(r) = rec.completed_result {
+                    cn.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                    continue;
+                }
                 let gc_task = rec.task;
                 let gc_entry = rec.entry as FuncIdx;
                 let gc_nargs = funcs
@@ -5080,7 +5185,16 @@ pub(crate) unsafe fn compile_child_and_run(
     // (spilled its continuation into the carve + returned a placeholder) instead of completing. Detect
     // it from the carve's state word before the copy-back carries the carve into the parent window.
     // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
-    let unwound = durable && !faulted && fiber_rt::window_is_unwinding(child_base as u64);
+    // A child that trapped did not unwind, even under a freeze: it finished, with that trap.
+    let mut unwound =
+        durable && !faulted && trap_cell == 0 && fiber_rt::window_is_unwinding(child_base as u64);
+    // Its own unjoined children ride too (depth-2+). One that finished with a trap fails this child:
+    // reported as finished with `ThreadFault`, not as unwound, so its parent refuses in turn, up to
+    // the root.
+    if unwound && child_nursery.as_ref().is_some_and(|n| !n.freeze_unjoined()) {
+        trap_cell = TrapKind::ThreadFault as i64;
+        unwound = false;
+    }
     child_window.restore_rw();
     {
         let dst = std::slice::from_raw_parts_mut(
