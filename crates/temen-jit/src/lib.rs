@@ -2388,7 +2388,10 @@ pub struct CompiledModule {
     /// #1726 — the programs of installed §22 units that spawn same-module children: each one's
     /// address is baked into that unit's `Instantiator` sites as `self_prog`, so it lives as long as
     /// the code does. Declared after `_nursery`, so it outlives the nursery that resolves it.
+    // The `Box` is the point: each program's address is baked into code, so it must not move when
+    // this `Vec` reallocates.
     #[cfg(fiber_rt)]
+    #[allow(clippy::vec_box)]
     _unit_progs: Vec<Box<instantiator_rt::UnitProg>>,
     /// Kept alive because its address (`setjmp.rt_addr`) is baked into the module's `SetJmp`/`LongJmp`
     /// sites (LLVM.md §"JIT `longjmp`"). Holds the per-run host `jmp_buf` table.
