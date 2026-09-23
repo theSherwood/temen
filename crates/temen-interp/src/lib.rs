@@ -13624,12 +13624,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         },
                                         _ => spawn_quota,
                                     };
+                                    // A same-module child runs the **spawning frame's** module — the
+                                    // one `entry` was validated against above (`cfs`), so an installed
+                                    // §22 unit's child runs the unit's function, not module 0's
+                                    // (#1726; the module-aware rule `thread.spawn` already follows).
                                     let cfuncs = child_mod.as_ref().map_or_else(
-                                        || Arc::clone(&funcs),
+                                        || Arc::clone(&cur_funcs),
                                         |cm| Arc::clone(&cm.funcs),
                                     );
                                     let ctypes = child_mod.as_ref().map_or_else(
-                                        || Arc::clone(&types),
+                                        || Arc::clone(&cur_types),
                                         |cm| Arc::clone(&cm.types),
                                     ); // (#922)
                                     let csched = sched.clone();
