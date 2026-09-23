@@ -7,8 +7,13 @@ fn main() {
         .expect("usage: dump_func <mod.temen> <func> [block]");
     let fi: usize = a.next().expect("func idx").parse().expect("func idx");
     let only: Option<usize> = a.next().map(|s| s.parse().expect("block"));
-    let bytes = std::fs::read(&path).expect("read");
-    let m = temen_encode::decode_module(&bytes).expect("decode");
+    // `.ir` is temen-text; anything else is an encoded `.temen`. A trap backtrace names the same
+    // indices either way, and a text module is what a chibicc/llvm build leaves on disk.
+    let m = if path.ends_with(".ir") {
+        temen_text::parse_module(&std::fs::read_to_string(&path).expect("read")).expect("parse")
+    } else {
+        temen_encode::decode_module(&std::fs::read(&path).expect("read")).expect("decode")
+    };
     for (i, im) in m.imports.iter().enumerate() {
         eprintln!("import {i}: {} {:?}", im.name, im.mode);
     }
