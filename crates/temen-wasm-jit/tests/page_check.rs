@@ -687,7 +687,8 @@ block 0 (v0: i64) {
 "#,
     );
     assert!(m.data.iter().any(|d| d.readonly), "guest carries rodata");
-    let (wasm, emit) = compile_module_tierup_b2_paged(&m, false, 10, 16).expect("emit b2+paged");
+    let (wasm, emit) =
+        compile_module_tierup_b2_paged(&m, false, 10, 16, false).expect("emit b2+paged");
     assert!(emit.iter().any(|&e| e), "some function tiers up");
 
     let engine = Engine::default();

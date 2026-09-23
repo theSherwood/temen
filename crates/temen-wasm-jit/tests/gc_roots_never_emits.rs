@@ -19,7 +19,9 @@
 //!
 //! Hence module granularity — the posture BROWSER.md documented all along. `module_uses_gc_roots`
 //! vetoes the emit at every entry in this crate, so no emitted frame of such a module can exist for
-//! the op to fail to scan, by any route.
+//! the op to fail to scan, by any route. The one opt-out is the B2 tier-up's `gc_spill` (#1627),
+//! where every such frame pushes its live values instead — pinned by `gc_spill.rs`; the calls here
+//! pass `false`.
 
 use temen_wasm_jit::{
     compile_jit, compile_jit_paged, compile_module_reactor, compile_module_reactor_keep,
@@ -117,7 +119,9 @@ fn emitted_everywhere(m: &temen_ir::Module) -> Vec<(&'static str, Vec<bool>)> {
     ));
     out.push((
         "tierup b2 (#888 widened)",
-        compile_module_tierup_b2(m, false, 8).expect("b2 emits").1,
+        compile_module_tierup_b2(m, false, 8, false)
+            .expect("b2 emits")
+            .1,
     ));
     let a = compile_jit(m, Shape::Batch { entry: 0 }, false).expect("compile_jit");
     out.push(("compile_jit batch", a.emitted));

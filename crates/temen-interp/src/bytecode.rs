@@ -85,16 +85,48 @@ mod callprof {
     pub fn snapshot() -> Vec<u64> {
         COUNTS.with(|c| c.borrow().clone())
     }
+
+    thread_local! {
+        /// Per-op execution counts keyed by the op's IR location `(func, block, inst)` — `inst` carries
+        /// [`super::SRC_TERM`] for a terminator op — so a caller can weight any per-instruction static
+        /// analysis (a call site's spill cost, a function's instruction count) by how often it ran.
+        static OPS: RefCell<std::collections::HashMap<(u32, u32, u32), u64>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    /// Record one execution of the op at IR location `(func, block, inst)`.
+    pub fn op(func: usize, loc: (u32, u32)) {
+        OPS.with(|o| {
+            *o.borrow_mut()
+                .entry((func as u32, loc.0, loc.1))
+                .or_insert(0) += 1
+        });
+    }
+    /// Zero the per-op histogram.
+    pub fn reset_ops() {
+        OPS.with(|o| o.borrow_mut().clear());
+    }
+    /// Snapshot the per-op execution counts.
+    pub fn op_snapshot() -> Vec<((u32, u32, u32), u64)> {
+        OPS.with(|o| o.borrow().iter().map(|(k, v)| (*k, *v)).collect())
+    }
 }
 /// Arm the per-function call profiler with a zeroed `n`-function histogram (opt-in `callprof`).
 #[cfg(feature = "callprof")]
 pub fn callprof_reset(n: usize) {
     callprof::reset(n);
+    callprof::reset_ops();
 }
 /// Snapshot per-function call counts since the last [`callprof_reset`].
 #[cfg(feature = "callprof")]
 pub fn callprof_snapshot() -> Vec<u64> {
     callprof::snapshot()
+}
+/// Per-op execution counts since the last [`callprof_reset`], keyed by each op's IR location
+/// `(func, block, inst)` in the primary module; a terminator op's `inst` carries [`SRC_TERM`]. An op
+/// with no recorded location, and the `IntCmp` a fused `BrIfCmp` absorbs, are not counted.
+#[cfg(feature = "callprof")]
+pub fn callprof_op_snapshot() -> Vec<((u32, u32, u32), u64)> {
+    callprof::op_snapshot()
 }
 
 /// Block-argument moves applied on a taken edge: `(src_slot, dst_slot)` pairs (frame-relative), with
@@ -650,7 +682,7 @@ enum Op {
 /// skips them, while [`vm_trap_bt`] (trap backtrace) *reports* them — a trap at a terminator
 /// (`unreachable`, `return_call.dyn`) is real and the tree-walker names it. The flag is the high
 /// bit, never set by a real block/inst count, so masking it off recovers the stored index.
-const SRC_TERM: u32 = 1 << 31;
+pub const SRC_TERM: u32 = 1 << 31;
 
 struct Program {
     ops: Vec<Op>,
@@ -4949,6 +4981,7 @@ impl<'p> Vcpu<'p> {
             &mut self.fuel,
             &mut self.mem,
             &mut cell,
+            Some(&Beneath::task(&self.vt, &self.fibers[..])),
         ) {
             Ok(vals) => {
                 for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
@@ -5057,6 +5090,7 @@ impl<'p> Vcpu<'p> {
                 &mut cell,
                 &mut self.invoke_fibers,
                 None,
+                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
             )?
         } else {
             drive_nested(
@@ -5072,6 +5106,7 @@ impl<'p> Vcpu<'p> {
                     fiber_meta: &mut self.fiber_meta,
                     jit_mirror: mirror,
                 }),
+                None, // #1660: emitted frames lie beneath a bounce; opaque until they spill (#1627)
             )?
         };
         for (i, v) in vals.iter().enumerate() {
@@ -9954,6 +9989,71 @@ fn gc_scan(
     hi: u64,
     mask: u64,
 ) -> std::collections::BTreeSet<u64> {
+    gc_scan_beneath(&Beneath::task(vt, fibers), source, lo, hi, mask)
+}
+
+/// #1660 — the live computations a `gc.roots` must cover, gathered from wherever they are held: the
+/// Vms (a task's active one and its parked resumers, a nested drive's own) and the fiber registries,
+/// outermost first. A nested drive ([`drive_nested`]) is handed the view of what is paused beneath
+/// it; a drive handed none cannot see everything live below it (a bounce out of emitted wasm, whose
+/// frames are opaque until they spill — #1627), so a `gc.roots` there fails closed.
+#[derive(Default)]
+struct Beneath<'a> {
+    vms: Vec<&'a Vm>,
+    fibers: Vec<&'a [FiberState]>,
+    /// Raw candidate words: an emitted wasm region's **spill stack** (#1627) — every integer an
+    /// emitted frame held live across the host-reaching call that led here, stored before the call.
+    words: Vec<&'a [u64]>,
+}
+
+impl<'a> Beneath<'a> {
+    /// A task continuation `vt` and the registry `fibers` it runs over.
+    fn task(vt: &'a VTask, fibers: &'a [FiberState]) -> Self {
+        let mut vms = vec![&vt.active];
+        vms.extend(vt.chain.iter().map(|(_, vm, _)| vm));
+        Beneath {
+            vms,
+            fibers: vec![fibers],
+            words: Vec::new(),
+        }
+    }
+
+    /// This view plus a nested drive's own `active` Vm, resumer `chain` and `fibers` registry — the
+    /// view beneath anything that drive enters, and what a `gc.roots` inside it scans.
+    fn with_drive<'b>(
+        &self,
+        active: &'b Vm,
+        chain: &'b [(usize, Vm, u32)],
+        fibers: &'b [FiberState],
+    ) -> Beneath<'b>
+    where
+        'a: 'b,
+    {
+        let mut vms: Vec<&'b Vm> = self.vms.clone();
+        vms.push(active);
+        vms.extend(chain.iter().map(|(_, vm, _)| vm));
+        let mut regs: Vec<&'b [FiberState]> = self.fibers.clone();
+        regs.push(fibers);
+        Beneath {
+            vms,
+            fibers: regs,
+            words: self.words.clone(),
+        }
+    }
+}
+
+/// §GC — the candidate root set over everything in `view`: every Vm's frames, and every parked
+/// fiber in every registry, masked and range-filtered to `[lo, hi)`. The **one** definition of "what
+/// `gc.roots` scans on this engine", shared by the production drivers (`step_vcpu`), the debug
+/// scheduler (`service_advance`, #1563) and nested drives (#1660) — the scope is a property of the
+/// op (GC.md §3.1's coverage invariant), not of who is driving (INVARIANTS #15).
+fn gc_scan_beneath(
+    view: &Beneath<'_>,
+    source: &ModuleSource,
+    lo: u64,
+    hi: u64,
+    mask: u64,
+) -> std::collections::BTreeSet<u64> {
     let mut roots = std::collections::BTreeSet::new();
     {
         let mut consider = |w: u64| {
@@ -9962,11 +10062,13 @@ fn gc_scan(
                 roots.insert(m);
             }
         };
-        scan_vm_roots(&vt.active, source, &mut consider);
-        for (_, vm, _) in &vt.chain {
+        for vm in &view.vms {
             scan_vm_roots(vm, source, &mut consider);
         }
-        for fib in fibers.iter() {
+        for &w in view.words.iter().flat_map(|ws| ws.iter()) {
+            consider(w);
+        }
+        for fib in view.fibers.iter().flat_map(|r| r.iter()) {
             // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
             // completion) holds live frames exactly like a suspended one — scan all three, or a
             // root held across a fiber's blocking point would be missed (unsound for GC.md §3.2).
@@ -10033,6 +10135,7 @@ fn resolve_jit_unit(host: &Host, h: i32, code: i32) -> Result<(JitUnitBody, (u32
     Ok(((funcs, types), (cd, cu)))
 }
 
+#[allow(clippy::too_many_arguments)] // the nested-drive dispatch shim's inputs, as `coop_bounce`'s
 fn run_invoke(
     source: &ModuleSource,
     table: &SharedSlots,
@@ -10041,6 +10144,7 @@ fn run_invoke(
     fuel: &mut u64,
     mem: &mut Option<Mem>,
     host: &mut HostCell,
+    beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
     let unit = source.get(module).ok_or(Trap::Malformed)?;
     let mut active = Vm::new(&unit, 0, args)?;
@@ -10056,6 +10160,7 @@ fn run_invoke(
         host,
         &mut Vec::new(),
         None,
+        beneath,
     )
 }
 
@@ -10112,6 +10217,9 @@ fn drive_nested(
     // durability `shadow_switch` is deliberately absent — a bounce host is never a durable run
     // (the pump), and the interpreted invoke path passes `None` (invoke-confined registry).
     mut run_meta: Option<BounceRunCtx<'_>>,
+    // #1660 — everything paused beneath this drive, for a `gc.roots` inside it; `None` when that is
+    // not fully in view (a bounce out of emitted wasm), which fails the op closed.
+    beneath: Option<&Beneath<'_>>,
 ) -> Result<Vec<Value>, Trap> {
     // The resumer chain (`(resumer's fiber id, resumer, dst)`). Invariant: `chain` is non-empty
     // iff `active` is a fiber (`active_id` then indexes `fibers`).
@@ -10332,11 +10440,43 @@ fn drive_nested(
                     .map(|(ty, s)| slot_to_val(*ty, *s))
                     .collect();
                 let umod = source.push(unit);
-                let vals = run_invoke(source, table, umod, &child_args, fuel, mem, host)?;
+                // #1660: this drive is paused beneath the unit — hand it on, if our own view is whole.
+                let view = beneath.map(|b| b.with_drive(&active, &chain, fibers));
+                let vals = run_invoke(
+                    source,
+                    table,
+                    umod,
+                    &child_args,
+                    fuel,
+                    mem,
+                    host,
+                    view.as_ref(),
+                )?;
                 for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
                     let re = slot_to_val(*ty, val_to_slot(*v));
                     active.set(dst + i as u32, Reg::from_value(re));
                 }
+            }
+            // §GC `gc.roots` inside a nested drive (#1660): scan what this drive holds — its active
+            // Vm, its resumer chain, the registry it runs over — and everything paused beneath it.
+            // With no `beneath`, something live below is out of view: fail closed rather than
+            // under-report (GC.md §3.2 licenses over-approximation only).
+            Outcome::GcRoots {
+                lo,
+                hi,
+                mask,
+                buf,
+                cap,
+                dst,
+            } => {
+                let roots = {
+                    let view = beneath
+                        .ok_or(Trap::CapFault)?
+                        .with_drive(&active, &chain, fibers);
+                    gc_scan_beneath(&view, source, lo, hi, mask)
+                };
+                let total = gc_write(mem, buf, cap, roots)?;
+                active.set(dst, Reg::from_i64(total));
             }
             _ => return Err(Trap::CapFault),
         }
@@ -13757,6 +13897,7 @@ impl CoopSched {
                             fuel,
                             mem,
                             &mut HostCell::Excl(host),
+                            Some(&Beneath::task(&tasks[ti].vt, &fibers[..])),
                         ),
                         Some(k) => {
                             let ChildEnv {
@@ -13773,6 +13914,7 @@ impl CoopSched {
                                 fuel,
                                 cmem,
                                 &mut HostCell::Shared(chost),
+                                Some(&Beneath::task(&tasks[ti].vt, &fibers[..])),
                             )
                         }
                     };
@@ -14256,7 +14398,20 @@ impl CoopRun {
     /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
     /// only between a [`CoopEvent::TierUp`]/[`CoopEvent::JitInvoke`] and its delivery; `Err(Malformed)` if
     /// nothing is outstanding.
-    pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+    ///
+    /// `spill` (#1627) is the emitted region's **spill stack** — the candidate words its frames stored
+    /// before each host-reaching call. Pass `Some` **only** when every emitted frame live beneath this
+    /// bounce has spilled into it (the region was emitted with spill instrumentation, and no native §22
+    /// unit frame can be live). Then a `gc.roots` inside the bounce is serviced over the paused task's
+    /// frames, the run's fibers, and those words. With `None` — or during a `Jit.invoke`, whose emitted
+    /// unit frames never spill — something live below is out of view and the op fails closed
+    /// (`CapFault`, #1660).
+    pub fn bounce(
+        &mut self,
+        target: u32,
+        io: &mut [i64],
+        spill: Option<&[u64]>,
+    ) -> Result<usize, Trap> {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
         let ti = self
@@ -14307,6 +14462,13 @@ impl CoopRun {
                     }),
                 )
             };
+        // #1627: the view beneath this bounce — the paused task's Vms and the spilled words. The
+        // run's fiber registry is the bounce's own (`bounce_fibers`), which the drive scans itself.
+        let beneath = spill.filter(|_| !in_invoke).map(|words| {
+            let mut b = Beneath::task(&tasks[ti].vt, &[]);
+            b.words.push(words);
+            b
+        });
         match tasks[ti].env {
             // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
             None => {
@@ -14321,6 +14483,7 @@ impl CoopRun {
                     bounce_meta,
                     target,
                     io,
+                    beneath.as_ref(),
                 )
             }
             // §14 confined child: its OWN window, powerbox, table, and fuel — never the root's.
@@ -14341,6 +14504,7 @@ impl CoopRun {
                     }),
                     target,
                     io,
+                    beneath.as_ref(),
                 )
             }
         }
@@ -14392,6 +14556,7 @@ fn coop_bounce(
     fiber_meta: Option<BounceRunCtx<'_>>,
     target: u32,
     io: &mut [i64],
+    beneath: Option<&Beneath<'_>>,
 ) -> Result<usize, Trap> {
     step(fuel, None)?; // fuel unification: the dispatch-site safepoint
     let slot = (target as usize) & (table.len() - 1);
@@ -14418,7 +14583,10 @@ fn coop_bounce(
         .collect();
     let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
     vm.module = ts.module as usize;
-    let vals = drive_nested(source, table, vm, fuel, mem, host, fibers, fiber_meta)?;
+    // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
+    let vals = drive_nested(
+        source, table, vm, fuel, mem, host, fibers, fiber_meta, beneath,
+    )?;
     for (i, v) in vals.iter().enumerate() {
         io[i] = val_to_slot(*v);
     }
@@ -15183,6 +15351,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     &mut fuel,
                     &mut mem,
                     &mut HostCell::Shared(&host),
+                    Some(&Beneath::task(&vt, &fibers[..])),
                 ) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
@@ -16028,6 +16197,12 @@ impl Vm {
                             }
                         }
                     }
+                }
+            }
+            #[cfg(feature = "callprof")]
+            if module == 0 {
+                if let Some(loc) = c.progs[cur].src.get(pc).copied().flatten() {
+                    callprof::op(cur, loc);
                 }
             }
             match &c.progs[cur].ops[pc] {
