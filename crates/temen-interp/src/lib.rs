@@ -2233,18 +2233,10 @@ fn drive_arc(
     } else {
         workers
     };
-    // Thaw seeding (slice 3.1.5): fibers a freeze flattened, to re-create in the registry before the
-    // root re-enters under REWINDING. Taken (cleared) here; empty for a freeze or ordinary run.
-    let thaw_fibers = std::mem::take(&mut host.frozen_fibers);
-    // Thaw seeding (slice 3.2.1): spawned vCPUs a freeze flattened, re-attached by the root's rewound
-    // `thread.spawn` (in ascending task order). Taken here; empty for a freeze or ordinary run.
-    let thaw_vcpus = std::mem::take(&mut host.frozen_vcpus);
-    let thaw_nested = std::mem::take(&mut host.frozen_nested);
-    let thaw_detached = std::mem::take(&mut host.frozen_detached);
-    let thaw_child_state = std::mem::take(&mut host.frozen_child_state);
-    // Thaw seeding (slice 3.2.1): the root's flattened shadow-SP extent (a multi-vCPU thaw only). `None`
-    // ⇒ read the extent from the restored window's active-SP word (the single-vCPU path).
-    let thaw_root_sp = host.frozen_root_sp.take();
+    // Thaw seeding: the residue a restore seeded on the powerbox (fibers, spawned vCPUs, §14 children,
+    // detached children), re-created around the root as it re-enters under REWINDING. Taken (cleared)
+    // here; empty for a freeze or an ordinary run. The root is task 0 in every run.
+    let thaw = ThawResidue::take(host, 0);
     let handoff = host.handoff();
     // The powerbox is **shared** by every vCPU of the run (so spawned threads inherit it): move the
     // caller's host into an `Arc<Mutex<Host>>`, hand a clone to the root (and, on `thread.spawn`, to
@@ -2264,12 +2256,7 @@ fn drive_arc(
         jit_table_log2,
         offer_table_demand,
         durable,
-        thaw_fibers,
-        thaw_vcpus,
-        thaw_nested,
-        thaw_detached,
-        thaw_child_state,
-        thaw_root_sp,
+        thaw,
         handoff,
         jit_reapply,
     );
@@ -2348,26 +2335,50 @@ fn drive_arc_shared(
         jit_table_log2,
         offer_table_demand,
         false,
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        Vec::new(),
-        None,
+        ThawResidue::default(),
         handoff,
         jit_reapply,
     )
 }
 
+/// #1361 step 4 — whether a durable parent's detached spawn (op 15) is admitted, given freeze
+/// authority over its detached progeny. The capture and the re-launch exist on this engine; the gate
+/// lifts on all three engines together (INVARIANTS #9), so until the JIT and the resumable engine
+/// capture too, only this crate's own tests run with it — which is what lets the capture be tested
+/// end to end before it ships.
+const DURABLE_DETACHED_CAPTURE: bool = cfg!(test);
+
 /// A domain's §12 thaw residue: everything its root re-enters with besides the window image, as the
 /// codec's control section carries it. Empty for a freeze or an ordinary run.
+#[derive(Default)]
 struct ThawResidue {
+    /// The id this domain's root had in the frozen run (`0` for the run's root).
+    task: TaskId,
     root_sp: Option<u64>,
     fibers: Vec<FrozenFiber>,
     vcpus: Vec<FrozenVCpu>,
     nested: Vec<FrozenNested>,
     detached: Vec<FrozenDetached>,
     child_state: Vec<FrozenChildState>,
+    /// #1361 step 4 — live detached children, each a domain with its own window and residue.
+    live_detached: Vec<ThawedDetached>,
+}
+
+impl ThawResidue {
+    /// Take a restored domain's residue off its powerbox, where restore seeded it (cleared there).
+    /// Empty for a freeze or an ordinary run. `task` is the id its root had in the frozen run.
+    fn take(host: &mut Host, task: TaskId) -> Self {
+        ThawResidue {
+            task,
+            root_sp: host.frozen_root_sp.take(),
+            fibers: std::mem::take(&mut host.frozen_fibers),
+            vcpus: std::mem::take(&mut host.frozen_vcpus),
+            nested: std::mem::take(&mut host.frozen_nested),
+            detached: std::mem::take(&mut host.frozen_detached),
+            child_state: std::mem::take(&mut host.frozen_child_state),
+            live_detached: std::mem::take(&mut host.thawed_detached),
+        }
+    }
 }
 
 /// Seed a domain's root vCPU for this run — its durable phase and shadow-SP extent — and re-create
@@ -2388,13 +2399,24 @@ fn seed_domain(
     residue: ThawResidue,
 ) {
     let id = root.id;
+    // The residue names tasks by their ids in the **frozen** run. For the run's root the two agree
+    // (both 0); a re-launched detached child is a root that received a fresh id, so its residue's
+    // `parent_task`s are resolved through this map rather than compared with `id` (#1361 step 4).
+    // Re-spawned vCPUs join it below. Nested children still rely on the thaw re-deriving the freeze's
+    // dense ids below this domain's root — #1687.
+    let mut live_ids: BTreeMap<TaskId, TaskId> = BTreeMap::from([(residue.task, id)]);
+    let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| {
+        m.get(&(t as TaskId)).copied().unwrap_or(t as TaskId)
+    };
     let ThawResidue {
+        task: _,
         root_sp: thaw_root_sp,
         fibers: thaw_fibers,
         vcpus: thaw_vcpus,
         nested: thaw_nested,
         detached: thaw_detached,
         child_state: thaw_child_state,
+        live_detached: thaw_live_detached,
     } = residue;
     root.dstate = root
         .mem
@@ -2460,8 +2482,15 @@ fn seed_domain(
         let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
             std::collections::BTreeMap::new();
         for ff in vseed {
-            let cid = ff.task as TaskId;
+            // Preserved when still free (always, for the run's root: its residue is seeded first), so
+            // the §12.6 re-freeze is byte-identical; a fresh id otherwise, never a collision.
+            let cid = if ff.task as TaskId >= s.next_task {
+                ff.task as TaskId
+            } else {
+                s.next_task
+            };
             s.next_task = s.next_task.max(cid + 1);
+            live_ids.insert(ff.task as TaskId, cid);
             s.live += 1;
             let ctx = root.arena().ctx_of_sp(ff.shadow_sp);
             vcpu_mask |= 1 << ctx;
@@ -2488,10 +2517,10 @@ fn seed_domain(
             child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
             child.root_shadow_sp = ff.shadow_sp;
             child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
-            child.parent_task = ff.parent_task as TaskId;
+            let parent = live(&live_ids, ff.parent_task);
+            child.parent_task = parent;
             child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
             // Append the handle into the spawning vCPU's join table (root, or a re-spawned child).
-            let parent = ff.parent_task as TaskId;
             if parent == id {
                 root.threads.push(Some(cid));
             } else if let Some(p) = children.get_mut(&parent) {
@@ -2552,7 +2581,7 @@ fn seed_domain(
             std::collections::BTreeMap::new();
         let mut holder_hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
         for fnr in nseed {
-            let parent = fnr.parent_task as TaskId;
+            let parent = live(&live_ids, fnr.parent_task);
             // The parent-child's absolute carve base (0 for a direct child of the root).
             let parent_base = if parent == id {
                 0
@@ -2686,20 +2715,7 @@ fn seed_domain(
                     // Re-inject the durable-JIT admission fns from the root (the embedder set them
                     // on the root at restore) so a thawed child can also compile *new* units, not
                     // only invoke restored ones. Its own tainted set re-resolves from its module.
-                    let rg = host_shared.lock_unpoisoned();
-                    if let Some(vf) = rg.jit_validator() {
-                        ch.set_jit_validator(vf);
-                    }
-                    if let Some(g) = rg.jit_durable_gate() {
-                        ch.set_jit_durable_gate(g, Vec::new());
-                    }
-                    if let Some(tf) = rg.jit_durable_taint_fn() {
-                        ch.set_jit_durable_taint_fn(tf);
-                    }
-                    if let Some(em) = rg.jit_wasm_emitter() {
-                        ch.set_jit_wasm_emitter(em);
-                    }
-                    ch.set_jit_hosts_durable(rg.jit_hosts_durable());
+                    host_shared.lock_unpoisoned().lend_jit_admission(&mut ch);
                 }
                 ch.set_svc_state(
                     cs.svc_queue.clone(),
@@ -2820,7 +2836,7 @@ fn seed_domain(
             let mut dseed: Vec<FrozenDetached> = thaw_detached;
             dseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
             for fd in dseed {
-                let parent = fd.parent_task as TaskId;
+                let parent = live(&live_ids, fd.parent_task);
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.results.insert(
@@ -2847,11 +2863,174 @@ fn seed_domain(
                 }
             }
         }
+        // #1361 step 4 — re-launch each **live** detached child: a domain of its own window and
+        // powerbox, rewound from its own artifact (see [`relaunch_detached`]), re-linked into its
+        // spawner's join table, doorbell, kill flag and lane at the recorded slot — so the spawner's
+        // rewound `thread.join` (op 15 is a `call.cap` checkpoint: its slot handle reloads, the spawn
+        // is not re-issued) parks on the child exactly as before the cut.
+        let mut lseed = thaw_live_detached;
+        lseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
+        for td in lseed {
+            let parent = live(&live_ids, td.parent_task);
+            let spawner: &mut VCpu = if parent == id {
+                &mut *root
+            } else {
+                match children.get_mut(&parent) {
+                    Some(p) => p,
+                    None => continue, // not re-created ⇒ its own rewound join already fails closed
+                }
+            };
+            if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td, fuel, quota)
+            {
+                s.runnable.push_back(child);
+            }
+        }
         // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
         for (_, child) in children {
             s.runnable.push_back(child);
         }
     }
+}
+
+/// #1361 step 4 — re-launch a live detached child a thaw carries: rebuild its window from its own
+/// image, restore it to `REWINDING`, rebuild its powerbox bounds from the spawner-held
+/// [`DetachedLaunch`], seed its own residue through [`seed_domain`] (it is a root of its own window),
+/// and re-link the spawner's per-slot state — join, doorbell, kill flag, lane, powerbox — exactly as op
+/// 15 minted them. `grants` is the spawner's domain powerbox, which holds the module grant the child
+/// runs. `None` if the grant is gone or the child's imports no longer bind; the spawner's slot then
+/// stays empty and its rewound join fails closed, the same per-child rule a nested child follows.
+fn relaunch_detached(
+    s: &mut Sched,
+    sched: &Arc<Scheduler>,
+    spawner: &mut VCpu,
+    grants: &Arc<Mutex<Host>>,
+    td: ThawedDetached,
+    fuel: u64,
+    quota: Quota,
+) -> Option<Box<VCpu>> {
+    let ThawedDetached {
+        slot,
+        window,
+        reserved_log2,
+        mut host,
+        launch,
+        ..
+    } = td;
+    let g = grants
+        .lock_unpoisoned()
+        .grant_by_digest(&launch.digest)
+        .map(|(_, g)| g.clone())?;
+    // The window: a fresh reservation (a root's shape, as op 15 mints it) holding the child's image,
+    // its freeze word cleared and its context-0 thaw word set — `begin_thaw`, on the child's own window.
+    let mut mem = Mem::with_reservation(reserved_log2, g.memory_log2?, g.shadow);
+    mem.restore_layout(&window);
+    mem.durable_set_state(STATE_NORMAL);
+    let thaw_off = mem.thaw_state_off(0);
+    mem.write_bytes(thaw_off, &STATE_REWINDING.to_le_bytes())?;
+    // The powerbox: restored from the child's own artifact (handles, serve state, attestation, JIT,
+    // named caps); what its *spawner* decided rides the launch record and is re-applied here.
+    let residue = ThawResidue::take(&mut host, launch.task as TaskId);
+    host.set_durable(true);
+    host.set_lane_cap(launch.lane);
+    host.set_channel_cap(launch.channel);
+    host.self_module = Some(Arc::clone(&g.module));
+    for (name, h) in &launch.names {
+        host.register_cap_name(name, *h);
+    }
+    let bound = if launch.same_module {
+        host.bind_same_module_manifest(&g.imports, &g.types)
+    } else {
+        host.bind_child_manifest(&g.imports, &g.types)
+    };
+    bound.ok()?;
+    let dom = host.domain_id() as usize;
+    let child_host = Arc::new(Mutex::new(host));
+    sched.wire_signal_doors(&child_host);
+    // Entry args are inert under a rewind (the prologue reloads spilled values), so pass zero
+    // placeholders of the entry's shape, as the nested re-attach does.
+    let want_as = g
+        .funcs
+        .get(launch.entry as usize)
+        .is_some_and(|f| f.params.len() >= 2);
+    let args = if want_as {
+        vec![Value::I64(0), Value::I64(0)]
+    } else {
+        vec![Value::I64(0)]
+    };
+    let cid = s.next_task;
+    s.next_task += 1;
+    s.live += 1;
+    let cdt = Arc::new(DomainTable::new(
+        &g.funcs,
+        child_host.lock_unpoisoned().jit_table_log2(),
+    ));
+    let child_quota = Quota {
+        max_vcpus: (launch.max_vcpus as usize).min(quota.max_vcpus),
+        max_fibers: quota.max_fibers,
+    };
+    let child_fuel = fuel.min(launch.fuel);
+    let kflag = Arc::new(AtomicBool::new(false));
+    let bell = Arc::new(AtomicBool::new(false));
+    let mut child = Box::new(VCpu::new(
+        Arc::clone(&g.funcs),
+        Arc::clone(&g.types),
+        launch.entry,
+        &args,
+        Some(mem),
+        Arc::clone(&child_host),
+        child_fuel,
+        spawner.depth + 1,
+        cid,
+        SchedRef::Real(Arc::clone(sched)),
+        child_quota,
+        Arc::clone(&cdt),
+    ));
+    child.memop = spawner.memop;
+    child.durable = true;
+    child.kill = Some(Arc::clone(&kflag));
+    child.freeze_bell = Some(Arc::clone(&bell));
+    child.lane_chain = std::iter::once((dom, launch.lane))
+        .chain(spawner.lane_chain.iter().copied())
+        .collect();
+    seed_domain(
+        s,
+        sched,
+        &mut child,
+        &g.funcs,
+        &g.types,
+        &cdt,
+        &child_host,
+        child_fuel,
+        child_quota,
+        residue,
+    );
+    // The spawner's side of the edge, at the recorded slot.
+    while spawner.threads.len() <= slot {
+        spawner.threads.push(None);
+    }
+    spawner.threads[slot] = Some(cid);
+    spawner.child_kill.insert(slot, kflag);
+    spawner.child_freeze.insert(
+        slot,
+        (
+            bell,
+            DetachedSpawn {
+                entry: launch.entry,
+                module: Arc::clone(&g.module),
+                digest: launch.digest,
+                max_vcpus: child_quota.max_vcpus,
+                same_module: launch.same_module,
+            },
+        ),
+    );
+    // D66: re-reserve the child's lane against the spawner's Σ. The thawing host set the spawner's own
+    // cap, so a lane that no longer fits is not re-drawn (and so not credited back at reap) — the child
+    // keeps its own cap either way, which bounds its tasks.
+    if spawner.host.lock_unpoisoned().try_grant_lane(launch.lane) {
+        spawner.child_lane.insert(slot, launch.lane);
+    }
+    spawner.child_hosts.insert(slot, child_host);
+    Some(child)
 }
 
 /// The executor core shared by [`drive_arc`] (owned host, wrapped and unwrapped around the run)
@@ -2873,12 +3052,7 @@ fn drive_over_cell(
     jit_table_log2: u8,
     offer_table_demand: usize,
     durable: bool,
-    thaw_fibers: Vec<FrozenFiber>,
-    thaw_vcpus: Vec<FrozenVCpu>,
-    thaw_nested: Vec<FrozenNested>,
-    thaw_detached: Vec<FrozenDetached>,
-    thaw_child_state: Vec<FrozenChildState>,
-    thaw_root_sp: Option<u64>,
+    thaw: ThawResidue,
     handoff: bool,
     jit_reapply: Vec<JitReapply>,
 ) -> TracedRun {
@@ -3041,14 +3215,7 @@ fn drive_over_cell(
             &host_shared,
             *fuel,
             quota,
-            ThawResidue {
-                root_sp: thaw_root_sp,
-                fibers: thaw_fibers,
-                vcpus: thaw_vcpus,
-                nested: thaw_nested,
-                detached: thaw_detached,
-                child_state: thaw_child_state,
-            },
+            thaw,
         );
         s.runnable.push_back(root);
         id
@@ -3075,35 +3242,58 @@ fn drive_over_cell(
     // powerbox the parent kept. A record left undrained is a child that never reached its poll — it
     // stays in `pending_detached` for the caller to refuse on (#1584), rather than being silently
     // dropped into a partial artifact.
+    //
+    // #1361 step 4 — **recursive**. A captured child rang its own detached children from its own
+    // powerbox (a detached vCPU records into its own host), so each captured child's host is drained
+    // in turn and its captures land on it: the artifacts nest the way the domains do. Unreached
+    // records anywhere in the tree are flattened into the root's list, so one
+    // [`Host::unreached_detached`] check answers for the whole tree (#1689).
     {
-        let pending = std::mem::take(&mut host_shared.lock_unpoisoned().pending_detached);
-        let mut s = sched.lock();
-        let mut captured = Vec::new();
         let mut unreached = Vec::new();
-        for p in pending {
-            // `layout_snapshot` is root-window-only and excludes a §13-region-mapped window; a
-            // detached child's window *is* a root window, and an unsafe one stays unreached rather
-            // than producing a partial image (R4 cross-tree sharing is its own open question).
-            match s
-                .results
-                .remove(&p.child_task)
-                .and_then(|o| o.mem)
-                .filter(|m| m.layout_snapshot_safe())
-            {
-                Some(m) => captured.push(CapturedDetached {
+        let mut owners = vec![Arc::clone(&host_shared)];
+        while let Some(owner) = owners.pop() {
+            let pending = std::mem::take(&mut owner.lock_unpoisoned().pending_detached);
+            let mut captured = Vec::new();
+            for p in pending {
+                // `layout_snapshot` is root-window-only and excludes a §13-region-mapped window; a
+                // detached child's window *is* a root window, and an unsafe one stays unreached rather
+                // than producing a partial image (R4, #1679).
+                let out = sched.lock().results.remove(&p.child_task);
+                let Some((m, fuel)) = out
+                    .and_then(|o| Some((o.mem?, o.fuel)))
+                    .filter(|(m, _)| m.layout_snapshot_safe())
+                else {
+                    unreached.push(p);
+                    continue;
+                };
+                let (lane, channel, names) = {
+                    let h = p.host.lock_unpoisoned();
+                    (h.lane_cap(), h.channel_cap(), h.cap_names.clone())
+                };
+                owners.push(Arc::clone(&p.host));
+                captured.push(CapturedDetached {
                     parent_task: p.parent_task,
                     slot: p.slot,
                     reserved_log2: m.reserved_size().trailing_zeros() as u8,
                     window: m.layout_snapshot(),
                     host: p.host,
-                }),
-                None => unreached.push(p),
+                    launch: DetachedLaunch {
+                        task: p.child_task,
+                        entry: p.spawn.entry,
+                        digest: p.spawn.digest,
+                        fuel,
+                        lane,
+                        channel,
+                        max_vcpus: p.spawn.max_vcpus as u64,
+                        same_module: p.spawn.same_module,
+                        names,
+                    },
+                    module: p.spawn.module,
+                });
             }
+            owner.lock_unpoisoned().set_captured_detached(captured);
         }
-        drop(s);
-        let mut hg = host_shared.lock_unpoisoned();
-        hg.captured_detached = captured;
-        hg.pending_detached = unreached;
+        host_shared.lock_unpoisoned().pending_detached = unreached;
     }
     let (out, trap_origin) = {
         let mut s = sched.lock();
@@ -7437,7 +7627,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             // is the fail-closed case tracked as #1584: a child must not be able to
                             // veto its parent's freeze, but until the parked kinds are reachable the
                             // honest answer is to refuse loudly rather than emit a partial artifact.
-                            if let Some(bell) = v.child_freeze.get(&slot) {
+                            if let Some((bell, spawn)) = v.child_freeze.get(&slot) {
                                 bell.store(true, Ordering::Relaxed);
                                 let host = Arc::clone(&v.child_hosts[&slot]);
                                 let sink =
@@ -7449,6 +7639,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                         slot,
                                         child_task: cid,
                                         host,
+                                        spawn: spawn.clone(),
                                     });
                             } else {
                                 // No doorbell: a child minted before this mechanism existed, or one
@@ -9464,6 +9655,54 @@ pub struct PendingDetached {
     /// the driver captures its handle table — the linkage that survives detachment is the powerbox,
     /// never the window (PROCESS.md §5).
     pub host: Arc<Mutex<Host>>,
+    /// What the spawn recorded for a re-launch (see [`DetachedSpawn`]).
+    pub spawn: DetachedSpawn,
+}
+
+/// #1361 step 4 — what op 15 knew when it minted a detached child that a thaw needs to mint it again,
+/// kept beside the child's freeze doorbell. Everything else a thaw needs is in the child's own
+/// artifact; these are the facts only the spawner held.
+#[derive(Clone)]
+pub struct DetachedSpawn {
+    /// The child's entry function in its module.
+    pub entry: u32,
+    /// The module grant it runs, by §4 content digest — a thaw resolves it against the restoring
+    /// host's durable grants, as a separate-module nested child does.
+    pub module: Arc<Module>,
+    /// The grant's digest ([`module_digest`] of `module`).
+    pub digest: [u8; 32],
+    /// The child's vCPU ceiling (its funding budget's `spawn`, clamped to ours).
+    pub max_vcpus: usize,
+    /// The spawner's own module (`is_self_module`), whose imports bind leniently (#1234).
+    pub same_module: bool,
+}
+
+/// #1361 step 4 — the spawner-held half of a detached child's freeze record: how to launch it again.
+/// The child's own artifact carries its window, handles and residue; this carries what its parent
+/// decided about it — the edge, the program, and the bounds it was granted, as they stood at the cut
+/// (a thaw may narrow these, never widen them).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DetachedLaunch {
+    /// The child's own task id in the frozen run. Its residue's `parent_task`s name this, so the thaw
+    /// resolves them against it rather than against whatever id the re-launch receives.
+    pub task: u64,
+    /// The child's entry function.
+    pub entry: u32,
+    /// The §4 content digest of the module grant it runs.
+    pub digest: [u8; 32],
+    /// The child's remaining fuel at the cut.
+    pub fuel: u64,
+    /// The child's D66 lane cap (`-1` = unbounded).
+    pub lane: i64,
+    /// The child's §3b channel-memory cap (`-1` = unbounded).
+    pub channel: i64,
+    /// The child's vCPU ceiling.
+    pub max_vcpus: u64,
+    /// Whether the child runs its spawner's own module (its imports then bind leniently, #1234).
+    pub same_module: bool,
+    /// The names the spawner registered the child's grants under, `(name, handle)` — what its imports
+    /// resolve by. The handles are the child's own, restored verbatim by its artifact.
+    pub names: Vec<(String, i32)>,
 }
 
 /// #1361 step 3 — a live detached child **after** the harvest: its unwound window plus its powerbox,
@@ -9480,8 +9719,32 @@ pub struct CapturedDetached {
     pub window: MemLayout,
     /// `log2` of the child's reservation, the other half `freeze_layout` needs.
     pub reserved_log2: u8,
-    /// The child's powerbox, for its handle table / JIT / named-cap residue.
+    /// The child's powerbox, for its handle table / JIT / named-cap residue — and, recursively, its
+    /// own captured detached children.
     pub host: Arc<Mutex<Host>>,
+    /// The module the child runs, which `freeze_layout` binds the child's artifact to.
+    pub module: Arc<Module>,
+    /// How a thaw launches it again (#1361 step 4).
+    pub launch: DetachedLaunch,
+}
+
+/// #1361 step 4 — a captured detached child as a **thaw** receives it: its restored window and
+/// powerbox (its own residue already seeded on the powerbox, exactly as a restored root's is) plus the
+/// spawner-held [`DetachedLaunch`]. The run driver re-launches it under `REWINDING` and rebuilds its
+/// parent's join edge, doorbell and lane.
+pub struct ThawedDetached {
+    /// The task that spawned this child in the frozen run — `0` for a direct child of the root.
+    pub parent_task: usize,
+    /// The spawner's join slot.
+    pub slot: usize,
+    /// The child's restored window image.
+    pub window: MemLayout,
+    /// `log2` of the child's reservation.
+    pub reserved_log2: u8,
+    /// The child's restored powerbox.
+    pub host: Host,
+    /// How to launch it.
+    pub launch: DetachedLaunch,
 }
 
 /// A §12 fiber as the run-shared registry holds it: a first-class suspendable computation whose
@@ -10269,7 +10532,8 @@ struct VCpu {
     /// doorbell ([`VCpu::freeze_bell`]), so a subtree freeze can ring it. The detached twin of
     /// [`child_kill`](Self::child_kill), and sparse for the same reason: only op-15 children have one
     /// (a nested child is reached through its carve, a `thread.spawn` sibling shares our window).
-    child_freeze: BTreeMap<usize, Arc<AtomicBool>>,
+    /// Beside the bell, what the spawn knew that a thaw needs to mint the child again (#1361 step 4).
+    child_freeze: BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
     /// D66 — this vCPU's **lane chain**: `(domain, cap)` for its own domain and every ancestor,
     /// innermost first. A worker may run it only while every bounded cap in the chain has room
     /// ([`lane_enter`]); it holds those lanes exactly while it is on a worker and releases them the
@@ -13487,13 +13751,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             let mod_durable_ok = !durable || cm.durable;
                             // D66 — admission is one call, shared by every engine: the funding
                             // budget's lane is reserved against our Σ and its `mem` spent, or neither.
+                            // #1361 step 4 — the lifted form of the gate, R1's endpoint: a durable
+                            // parent may spawn detached iff it holds freeze authority over its
+                            // detached progeny (#1440). Live only where the capture exists end to
+                            // end — this engine's own tests — until slice 4 lands it on all three.
+                            let durable_ok = !durable
+                                || (DURABLE_DETACHED_CAPTURE
+                                    && host
+                                        .lock_unpoisoned()
+                                        .holds_freeze_authority(FreezeScope::DetachedProgeny));
                             let admitted = (ok_entry
                                 && child_size != 0
                                 && mod_ok
                                 && mod_durable_ok
                                 && payload_ok
                                 && premap_ok
-                                && !durable)
+                                && durable_ok)
                                 .then(|| {
                                     host.lock_unpoisoned()
                                         .admit_detached_spawn(budget, child_size)
@@ -13556,75 +13829,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         .then_some(())
                                         .ok_or(Trap::Malformed)?;
                                 }
-                                // #863 slice 3 — a child that inherited a personality signal door
-                                // via the re-grant above gets its own **domain-scoped, weak**
-                                // run-wake at build time (no locks: `ch` is not yet shared), so a
-                                // deliverable signal raised against it interrupts ITS blocked
-                                // syscalls — and only its (invariant 12) — exactly like a fork twin
-                                // at mint. Weak: a post-run fire upgrades to nothing.
-                                if let SchedRef::Real(rs) = &sched {
-                                    if let Some((_, source)) = ch.signal_poll() {
-                                        let dom = ch.domain_id() as usize;
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_pipe_wake(Arc::new(move |pipe| {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.wake_pipe_readers(pipe);
-                                            }
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_wake(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom, true);
-                                            }
-                                        }));
-                                        // #798 slice 2 / #1259 — stop/continue, split: `stop_depth` write
-                                        // is the INLINE apply, the stopped-park drain stays deferred.
-                                        let stop_depth = ch.stop_depth.clone();
-                                        source.set_stop_apply(Arc::new(move |stopped| {
-                                            if stopped {
-                                                stop_depth.fetch_add(1, Ordering::SeqCst);
-                                            } else {
-                                                stop_depth.fetch_sub(1, Ordering::SeqCst);
-                                            }
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_stop(Arc::new(move |stopped| {
-                                            if !stopped {
-                                                if let Some(sc) = sched_weak.upgrade() {
-                                                    sc.wake_stopped(dom);
-                                                }
-                                            }
-                                        }));
-                                        // #1213 — and its child-transition nudge (clean re-scan).
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_chld_wake(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.rescan_reap_parks(dom);
-                                            }
-                                        }));
-                                        // #796 default actions / #1259 — terminate, split: `term_flag`
-                                        // write is the INLINE apply, the vCPU wake stays deferred.
-                                        let term_flag = ch.term_flag.clone();
-                                        source.set_kill_apply(Arc::new(move || {
-                                            term_flag.store(true, Ordering::SeqCst);
-                                        }));
-                                        let sched_weak = Arc::downgrade(rs);
-                                        source.set_kill(Arc::new(move || {
-                                            if let Some(sc) = sched_weak.upgrade() {
-                                                sc.interrupt_interruptible_parks(dom, false);
-                                                sc.wake_stopped(dom);
-                                            }
-                                        }));
-                                        // #799 — and its park-request closure.
-                                        let park_cell = ch.park_request.clone();
-                                        source.set_park_request(Arc::new(move |ev| {
-                                            park_cell.store(ev.encode(), Ordering::SeqCst);
-                                        }));
-                                    }
-                                }
                                 // A child of the running module itself binds leniently (#1234
                                 // — its manifest is the parent's whole import surface).
-                                let bound = if host.lock_unpoisoned().is_self_module(mh) {
+                                let same_module = host.lock_unpoisoned().is_self_module(mh);
+                                let bound = if same_module {
                                     ch.bind_same_module_manifest(&cm.imports, &cm.types)
                                 } else {
                                     ch.bind_child_manifest(&cm.imports, &cm.types)
@@ -13634,6 +13842,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 } else {
                                     ch.self_module = Some(Arc::clone(&cm.module));
                                     let child_host = Arc::new(Mutex::new(ch));
+                                    // #863 slice 3 — a child that inherited a personality signal door
+                                    // via the re-grant above gets its own **domain-scoped, weak**
+                                    // run-wake/stop/kill/park-request set, so a deliverable signal
+                                    // raised against it interrupts ITS blocked syscalls — and only
+                                    // its (invariant 12). The same doors a thaw's re-launch mints.
+                                    if let SchedRef::Real(rs) = &sched {
+                                        rs.wire_signal_doors(&child_host);
+                                    }
                                     let child_host_keep = Arc::clone(&child_host);
                                     let mut child_args = vec![Value::I64(cinst as i64)];
                                     if want_as {
@@ -13677,6 +13893,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         },
                                         _ => spawn_quota,
                                     };
+                                    let spawn_quota_max = spawn_quota.max_vcpus; // #1361 step 4
                                     let cfuncs = Arc::clone(&cm.funcs);
                                     let ctypes = Arc::clone(&cm.types); // child module type section (#922)
                                     let csched = sched.clone();
@@ -13739,7 +13956,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         Some(child_id) => {
                                             threads.push(Some(child_id));
                                             child_kill.insert(threads.len() - 1, kflag);
-                                            child_freeze.insert(threads.len() - 1, bell);
+                                            child_freeze.insert(
+                                                threads.len() - 1,
+                                                (
+                                                    bell,
+                                                    DetachedSpawn {
+                                                        entry: entry as u32,
+                                                        module: Arc::clone(&cm.module),
+                                                        digest: cm.digest,
+                                                        max_vcpus: spawn_quota_max,
+                                                        same_module,
+                                                    },
+                                                ),
+                                            );
                                             child_lane.insert(threads.len() - 1, child_lane_val); // D66
                                                                                                   // Live offers over a detached child work exactly as
                                                                                                   // nested (`child_offer` + caller parking): the
@@ -20138,6 +20367,9 @@ pub struct Host {
     /// #1361 step 3 — the harvested form (see [`CapturedDetached`]): each live detached child's
     /// unwound window + powerbox, for the codec to embed as a sub-artifact.
     captured_detached: Vec<CapturedDetached>,
+    /// #1361 step 4 — the live detached children a **thaw** re-launches (see [`ThawedDetached`]),
+    /// seeded by restore alongside the rest of the residue and taken by the run driver.
+    thawed_detached: Vec<ThawedDetached>,
     /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
     /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
     /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
@@ -20405,7 +20637,7 @@ struct ModuleGrant {
 /// separate-module child re-attaches against the matching re-granted module. Debug info and
 /// (already-resolved) imports are excluded — they don't affect execution, and stripping them keeps
 /// the identity tolerant of a debug-stripped re-grant.
-fn module_digest(m: &Module) -> [u8; 32] {
+pub fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
@@ -20556,6 +20788,7 @@ impl Host {
             frozen_detached: Vec::new(),
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
+            thawed_detached: Vec::new(),
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
@@ -21582,6 +21815,12 @@ impl Host {
         &self.captured_detached
     }
 
+    /// Set the live detached children a freeze captured — the run driver's harvest, or an embedder
+    /// assembling a subtree cut by hand.
+    pub fn set_captured_detached(&mut self, captured: Vec<CapturedDetached>) {
+        self.captured_detached = captured;
+    }
+
     /// #1361 step 3 — detached children the freeze rang the doorbell for that **never reached their
     /// poll** (parked on a futex or a join, so they never unwound). Non-empty means the artifact
     /// would be incomplete: a caller must refuse rather than emit it. Tracked as #1584 — a child
@@ -21593,6 +21832,65 @@ impl Host {
 
     pub fn set_frozen_detached(&mut self, frozen: Vec<FrozenDetached>) {
         self.frozen_detached = frozen;
+    }
+
+    /// The durable-JIT admission fns the embedder set on this (restoring) host, copied onto `child` so
+    /// a thawed child domain can compile *new* units as well as invoke restored ones. Its own tainted
+    /// set re-resolves from its module.
+    pub(crate) fn lend_jit_admission(&self, child: &mut Host) {
+        if let Some(vf) = self.jit_validator() {
+            child.set_jit_validator(vf);
+        }
+        if let Some(g) = self.jit_durable_gate() {
+            child.set_jit_durable_gate(g, Vec::new());
+        }
+        if let Some(tf) = self.jit_durable_taint_fn() {
+            child.set_jit_durable_taint_fn(tf);
+        }
+        if let Some(em) = self.jit_wasm_emitter() {
+            child.set_jit_wasm_emitter(em);
+        }
+        child.set_jit_hosts_durable(self.jit_hosts_durable());
+    }
+
+    /// #1361 step 4 — a fresh durable powerbox to restore a **detached child's** artifact into, holding
+    /// this restoring host's thaw seams: its durable module grants (copied — a child's `Module` handles
+    /// and its own program re-resolve by digest against what the restoring host chose to re-grant), its
+    /// durable-JIT admission fns (copied), and its named-cap registrar and budget hook (**lent** — hand
+    /// them back with [`Host::reclaim_thaw_seams`] once the child is restored). One restoring host
+    /// answers for the whole tree: a child's authority was only ever an attenuation of its spawner's,
+    /// so what it gets back is decided in the same place (INVARIANTS #3).
+    pub fn detached_thaw_host(&mut self) -> Host {
+        let mut child = Host::new();
+        child.set_durable(true);
+        child.modules = self.modules.iter().filter(|g| g.durable).cloned().collect();
+        self.lend_jit_admission(&mut child);
+        child.named_cap_registrar = self.named_cap_registrar.take();
+        child.budget_thaw_hook = self.budget_thaw_hook.take();
+        child
+    }
+
+    /// Take back the seams [`Host::detached_thaw_host`] lent to `child`.
+    pub fn reclaim_thaw_seams(&mut self, child: &mut Host) {
+        self.named_cap_registrar = child.named_cap_registrar.take();
+        self.budget_thaw_hook = child.budget_thaw_hook.take();
+    }
+
+    /// The durable module grant with §4 content digest `digest`, if this host holds one — what a
+    /// detached child's artifact is restored against (#1361 step 4).
+    pub fn durable_module_by_digest(&self, digest: &[u8; 32]) -> Option<Arc<Module>> {
+        self.module_arc_by_digest(digest)
+    }
+
+    /// #1361 step 4 — seed the live detached children a **thaw** re-launches (each with its restored
+    /// window, powerbox and launch record), alongside the restored root window.
+    pub fn set_thawed_detached(&mut self, thawed: Vec<ThawedDetached>) {
+        self.thawed_detached = thawed;
+    }
+
+    /// Take the live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
+    pub fn take_thawed_detached(&mut self) -> Vec<ThawedDetached> {
+        std::mem::take(&mut self.thawed_detached)
     }
 
     /// §13.4 slice 4c — the per-child host-state residue of the last subtree freeze (serve trio +
@@ -22783,6 +23081,11 @@ impl Host {
     /// Grant a `Stream` capability bound to `role` (a powerbox stdio grant, §3e).
     pub fn grant_stream(&mut self, role: StreamRole) -> i32 {
         self.grant(cap_id::STREAM, Binding::Stream { role, sink: None })
+    }
+
+    /// #989 — this domain's host-served channel-memory cap (`-1` = unbounded).
+    pub fn channel_cap(&self) -> i64 {
+        self.channel_cap
     }
 
     /// #989 — set this domain's channel-memory ceiling (bytes); `-1` = unbounded. A §14 spawn calls
@@ -32022,3 +32325,6 @@ mod signal_door_claim_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod detached_freeze_tests;

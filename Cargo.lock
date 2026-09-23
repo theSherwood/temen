@@ -719,6 +719,7 @@ name = "temen-interp"
 version = "0.0.0"
 dependencies = [
  "page_size",
+ "temen-durable",
  "temen-encode",
  "temen-ir",
  "temen-mask",

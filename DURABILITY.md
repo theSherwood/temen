@@ -472,6 +472,33 @@ post-spawn cap-close op is needed. Under a scratch
 gate-lift the admission path and the still-running fail-closed refusal both check out; a completed
 capture at freeze is the scheduling-fragile "child must finish during a parent park" case Finding 1
 flagged, deferred with step 4.
+**Detached children — live capture and re-launch (v29, #1361 steps 3–4).** A **live** detached child
+is reached by a **doorbell**, not a broadcast: the spawner rings it at its unwind, the child sets its
+*own* freeze word at its next op and unwinds like any root, and the run driver **harvests** its unwound
+window and powerbox once every vCPU has finished (`CapturedDetached`). The harvest is recursive (a
+captured child's own detached children rang from *its* powerbox), and an undrained record anywhere in
+the tree is flattened into the root's `unreached_detached()`, which `freeze` refuses as
+`FreezeError::DetachedUnreached` rather than emitting part of the tree. Each captured child rides
+**Section 8** (`TAG_DETACHED`) as its **own root-shaped artifact** — this same format, frozen from its
+own powerbox, so its fibers, vCPUs, nested and detached children ride its own sections — behind the
+spawner-held `DetachedLaunch`: the edge (`parent_task`, `slot`), the child's frozen `task` id, its
+entry and module digest, and the bounds its spawner granted it (fuel left, lane, channel, vCPU
+ceiling, import names). A thaw may narrow those bounds, never widen them. Restore rebuilds each child
+into a fresh powerbox holding the restoring host's thaw seams (`Host::detached_thaw_host`: its durable
+module grants and JIT admission copied, its registrar and budget hook lent), so one restoring host
+decides what the whole tree gets back; a child whose module it no longer grants is
+`ModuleUnresolved`. The oracle's thaw re-launches each child (`relaunch_detached`) on its own window
+under `REWINDING`, seeds its residue through the same `seed_domain` as the run's root (resolving its
+residue's `parent_task`s through its frozen id), and re-links the spawner's join slot, doorbell, kill
+flag and lane — so the spawner's rewound `thread.join` parks on it exactly as before the cut. Nesting
+depth inside one artifact is bounded (`MAX_DETACHED_DEPTH`, on both sides). The op-15 durable gate
+lifts on all three engines together (step 4, slice 4): until the JIT and the resumable engine capture
+too, only `temen-interp`'s own tests admit a durable detached spawn (`DURABLE_DETACHED_CAPTURE`, and
+only for a parent holding `FreezeScope::DetachedProgeny`). Pinned by
+`temen-interp/src/detached_freeze_tests.rs` (freeze a live child → harvest → re-launch → the join
+delivers the uninterrupted total) and `temen-snapshot/tests/detached_roundtrip.rs` (every field
+survives, the child's table restores into the child's powerbox, a re-freeze is byte-identical, a
+missing grant refuses).
 **Separate-module children (v11).** A live child running a *granted separate module* (op 5) survives
 too, with the module **host-supplied at restore** (D-scope): its `FrozenNested` record carries only a
 32-byte **content digest** of the child module's semantic image (`module_digest`, hashed by the shared

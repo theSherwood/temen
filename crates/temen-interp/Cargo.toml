@@ -38,6 +38,10 @@ page_size = "0.6"
 # integration-test crate, which pulls in the Cranelift JIT that Miri can't compile.
 [dev-dependencies]
 temen-text.workspace = true
+# Test-only: instrument durable modules for the #1361 detached-child freeze/thaw tests
+# (`src/detached_freeze_tests.rs`), which need this crate's own test build — the only one where a
+# durable parent may spawn detached before slice 4. Depends on `temen-ir` alone, so no cycle.
+temen-durable.workspace = true
 # Test-only: name `temen_ir::Func` in the JIT Miri check's blob validator (THREADS.md 4c-domain). Pure
 # IR types (no platform surface), so it keeps the test crate Miri-buildable.
 temen-ir.workspace = true
