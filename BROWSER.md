@@ -814,7 +814,10 @@ Three classes, all with existing precedent in this repo:
    non-moving collector frees a live object — the one execution-model feature on this list that
    fails *open* instead of declining. It is excluded from both cross-tier sets (the strict
    `interp_leaf` and the #888 widened `bounce_serviceable` seeds), and the emit fixpoint cascades
-   its callers off, so a `gc.roots`-bearing guest runs wholly on the interpreter. Atomics: wasm atomics are all seq-cst — a safe
+   its callers off, so a `gc.roots`-bearing guest runs wholly on the interpreter — except in
+   **spill mode** (#1627, GC.md §3.2): the cooperative driver's shared-table emit pushes each
+   frame's live values to a host-owned spill stack around every call that can reach the op, and
+   the bounce scans them. Atomics: wasm atomics are all seq-cst — a safe
    over-approximation of Temen's acquire/release. Tail calls: wasm `return_call` shipped (V8 stable);
    maps directly.
 
@@ -825,7 +828,7 @@ Three classes, all with existing precedent in this repo:
 | §13 aliasing, page protection | fast path + deopt on the `call.cap` that creates it | zero until used |
 | atomics orderings | wasm seq-cst (safe over-approx) | negligible |
 | fibers / suspend / durable unwind | interp fallback (`Unsupported`, temen-jit precedent) | n/a |
-| `gc.roots` | interp fallback, **module-granular** (locals unscannable; #1546) | n/a |
+| `gc.roots` | coop shared-table emit: **spill** live values around calls that can reach it (#1627); otherwise interp fallback, **module-granular** (#1546) | a push/pop per such call |
 | debug / single-step | interp tier | n/a |
 | `thread.spawn`/`join`/`wait` | end region, return to the vCPU event loop | boundary only |
 
@@ -1446,8 +1449,9 @@ leaves the emitted caller's frame unscanned. Excluding the op from both cross-ti
 in-subset function that makes a `call.dyn` is emitted regardless, and the host fills **every** program
 slot of the shared table with a bounce shim built from the slot's signature alone
 (`temen_coop_shim_wasm`), so that emitted `call.dyn` still reaches the collector. Hence the module
-veto — `module_uses_gc_roots`, at every entry in `temen-wasm-jit`. Revisit fibers when JSPI / core
-stack-switching ships.
+veto — `module_uses_gc_roots`, at every entry in `temen-wasm-jit`. The B2 tier-up entries later
+gained `gc_spill` (#1627), which lifts the veto by making the emitted frames scannable instead. Revisit
+fibers when JSPI / core stack-switching ships.
 
 ## Verification
 

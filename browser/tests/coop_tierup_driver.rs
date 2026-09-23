@@ -21,12 +21,14 @@ use temen_browser::{
     temen_coop_jit_wasm_ptr, temen_coop_mapped, temen_coop_mapped_now, temen_coop_nfuncs,
     temen_coop_open, temen_coop_paged, temen_coop_pagestate_len, temen_coop_pagestate_ptr,
     temen_coop_run, temen_coop_set_tierup_floor, temen_coop_shim_ptr, temen_coop_shim_wasm,
-    temen_coop_slot_unit, temen_coop_table_gen, temen_coop_table_log2, temen_coop_tierup_win_len,
-    temen_coop_tierup_win_ptr, temen_coop_value, temen_coop_wasm_len, temen_coop_wasm_ptr,
-    temen_coop_win_len, temen_coop_win_ptr, temen_onramp_set_grant_instantiator, temen_run_value,
-    temen_status, temen_stdout_len, temen_stdout_ptr, temen_warm_close, temen_warm_coop_open,
-    temen_warm_coop_prepare, temen_warm_eval, temen_warm_open, COOP_RUN_DONE, COOP_RUN_JIT_INVOKE,
-    COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP, STATUS_UNSUPPORTED,
+    temen_coop_slot_unit, temen_coop_spill_bytes, temen_coop_spill_ptr, temen_coop_table_gen,
+    temen_coop_table_log2, temen_coop_tierup_win_len, temen_coop_tierup_win_ptr, temen_coop_value,
+    temen_coop_wasm_len, temen_coop_wasm_ptr, temen_coop_win_len, temen_coop_win_ptr,
+    temen_onramp_set_grant_instantiator, temen_run_value, temen_status, temen_stdout_len,
+    temen_stdout_ptr, temen_warm_close, temen_warm_coop_open, temen_warm_coop_prepare,
+    temen_warm_eval, temen_warm_open, temen_wasmjit_spill_sp_off, COOP_RUN_DONE,
+    COOP_RUN_JIT_INVOKE, COOP_RUN_TIERUP, COOP_RUN_TRAP, STATUS_OK, STATUS_TRAP,
+    STATUS_UNSUPPORTED,
 };
 use temen_interp::{Host, StreamRole};
 use wasmi::{
@@ -61,6 +63,11 @@ impl Drop for FloorGuard {
 /// Where the wasmi harness places the mirrored window / env cell in the emitted module's memory.
 const WIN_BASE: u32 = 0x4_0000;
 const ENV_PTR: u32 = 1024;
+/// #1627: the harness's spill region — between the env cell and the window. Smaller than the run's
+/// own buffer ([`temen_coop_spill_bytes`]); the emitted code bounds itself by the end this harness
+/// arms, so only a prefix of the run's buffer is ever used.
+const SPILL_BASE: u32 = 0x2000;
+const SPILL_END: u32 = WIN_BASE;
 /// Declared-prefix cell `_start` stages the summed result in before streaming it to stdout. It must
 /// clear the #1094 unconditional NULL guard (`[0, POWERBOX_NULL_GUARD)` = `[0, 16 KiB)` faults on any
 /// guest access) and the relocated args region above it — so it sits at `2 * POWERBOX_NULL_GUARD`
@@ -708,6 +715,8 @@ struct DriverData {
     /// #1233: bounces that found the slot mirror moved underneath the running emitted frame (a §22
     /// install/uninstall *during* an event) and re-synced the table before returning to it.
     bounce_syncs: u32,
+    /// #1627 control: hand every bounce an empty spill, as a driver that forgot the cursor would.
+    drop_spill: bool,
 }
 
 /// Key of an instantiated §22 unit: an **installed** slot's unit by its append-only `(domain, unit)`
@@ -758,7 +767,25 @@ fn call_interp_host(
     unsafe { std::slice::from_raw_parts_mut(win_ptr, win_len) }.copy_from_slice(&w);
     let mut slots = [0u8; 512];
     mem.read(&c, args_ptr as usize, &mut slots).unwrap();
-    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr());
+    // #1627: the browser shares memory with the run's spill buffer; here the emitted frames pushed
+    // into the mirror, so copy `[base, cursor)` into the buffer and pass its length.
+    let mut spill_len = 0;
+    if temen_coop_spill_bytes() != 0 && !c.data().drop_spill {
+        let mut cur = [0u8; 4];
+        mem.read(
+            &c,
+            ENV_PTR as usize + temen_wasmjit_spill_sp_off(),
+            &mut cur,
+        )
+        .unwrap();
+        let mut words = vec![0u8; (u32::from_le_bytes(cur) - SPILL_BASE) as usize];
+        mem.read(&c, SPILL_BASE as usize, &mut words).unwrap();
+        spill_len = words.len() / 8;
+        // SAFETY: the run's buffer is `temen_coop_spill_bytes` long, far more than the mirror.
+        unsafe { std::slice::from_raw_parts_mut(temen_coop_spill_ptr() as *mut u8, words.len()) }
+            .copy_from_slice(&words);
+    }
+    let rc = temen_coop_call_interp(target as u32, slots.as_mut_ptr(), spill_len);
     // #1312: the callback may have `vm_map`-grown the window, which reallocates and can relocate
     // the engine's backing — re-read BOTH base and length, and widen the mirror to match before
     // copying back.
@@ -991,6 +1018,11 @@ impl CoopB2Driver {
         self.memory
             .write(&mut self.store, ENV_PTR as usize, &i64::MAX.to_le_bytes())
             .unwrap();
+        // #1627: every event is an outermost entry — re-arm the spill cursor at the region's base.
+        let mut cursor = SPILL_BASE.to_le_bytes().to_vec();
+        cursor.extend_from_slice(&SPILL_END.to_le_bytes());
+        let off = ENV_PTR as usize + temen_wasmjit_spill_sp_off();
+        self.memory.write(&mut self.store, off, &cursor).unwrap();
         for g in self.store.data().mapped_globals.clone() {
             g.set(&mut self.store, Val::I64(mapped)).unwrap();
         }
@@ -1148,7 +1180,11 @@ impl CoopB2Driver {
 /// Drive an opened coop session to DONE with the full B2 driver. Returns the driver (for its bounce
 /// log) and the `(tierups, invokes)` counters.
 fn drive_coop_b2_session(m: &temen_ir::Module) -> (CoopB2Driver, u32, u32) {
-    let mut d = CoopB2Driver::new();
+    drive_coop_b2(m, CoopB2Driver::new())
+}
+
+/// [`drive_coop_b2_session`] over a driver the caller configured.
+fn drive_coop_b2(m: &temen_ir::Module, mut d: CoopB2Driver) -> (CoopB2Driver, u32, u32) {
     let (mut tierups, mut invokes) = (0u32, 0u32);
     loop {
         match temen_coop_run() {
@@ -4203,6 +4239,105 @@ fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
         d.bounce_syncs(),
         2,
         "the table re-synced inside the install bounce and again inside the uninstall bounce"
+    );
+    temen_coop_close();
+}
+
+// ---- #1627: a collecting guest tiers up, and its emitted frame's roots reach `gc.roots` ----------
+
+/// The heap range the collector scans, and a root inside it. `ROOT + 8` is derived inside the
+/// emitted leaf and never leaves it, so the only way the scan can see it is the spill.
+const GC_LO: i64 = 0x9000;
+const GC_HI: i64 = 0xA000;
+const GC_ROOT: i64 = 0x9100;
+
+/// `_start` passes `ROOT` to the leaf `f1`, which tiers up. `f1` derives `vq = ROOT + 8`, calls the
+/// interpreter-resident collector `f2` (it holds `gc.roots`) with nothing, then uses both `v0` and
+/// `vq` — so both are live across the bounce — and returns `count + (vq - v0)`. The in-range words
+/// are `ROOT` (in `_start`'s frame and the spill), `ROOT + 8` (the spill alone) and `GC_LO` (the
+/// collector's own frame): three, on the oracle and on the coop path alike.
+fn gc_spill_guest_text() -> String {
+    format!(
+        r#"memory 16
+func () -> (i64) {{
+block 0 () {{
+  vp = i64.const {GC_ROOT}
+  vr = call 1 (vp)
+  return vr
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+  vk = i64.const 8
+  vq = i64.add v0 vk
+  vn = call 2 ()
+  vd = i64.sub vq v0
+  vr = i64.add vn vd
+  return vr
+  }}
+}}
+func () -> (i64) {{
+block 0 () {{
+  vlo = i64.const {GC_LO}
+  vhi = i64.const {GC_HI}
+  vmask = i64.const -1
+  vbuf = i64.const 45056
+  vcap = i64.const 64
+  vn = gc.roots vlo vhi vmask vbuf vcap
+  return vn
+  }}
+}}
+export 0 func "_start" 0
+"#
+    )
+}
+
+fn open_gc_spill_guest() -> temen_ir::Module {
+    let m = temen_text::parse_module(&gc_spill_guest_text()).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let bytes = temen_encode::encode_module(&m);
+    let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
+    assert_eq!(opened, 0, "open (status {})", temen_status());
+    m
+}
+
+#[test]
+fn a_collecting_guest_tiers_up_and_its_spilled_roots_are_scanned() {
+    let _g = ffi_guard();
+    let m = temen_text::parse_module(&gc_spill_guest_text()).expect("parse");
+    let want = onramp_exec(&m, b"");
+    assert_eq!(want.status, STATUS_OK, "oracle sanity");
+    assert_eq!(
+        want.value,
+        3 + 8,
+        "oracle: ROOT, ROOT + 8 and GC_LO, plus vq - v0"
+    );
+
+    let m = open_gc_spill_guest();
+    assert_ne!(temen_coop_spill_bytes(), 0, "a collecting B2 guest spills");
+    let (d, tierups, _) = drive_coop_b2_session(&m);
+    assert!(tierups >= 1, "the leaf holding the roots must run emitted");
+    assert_eq!(d.bounces(), [2], "the collector runs in the bounce");
+    assert_eq!(temen_status(), want.status, "status parity");
+    assert_eq!(
+        temen_coop_value(),
+        want.value,
+        "the spilled ROOT + 8 is a root"
+    );
+    temen_coop_close();
+
+    // Non-vacuity: the same run with the spill withheld loses exactly the word only the emitted
+    // frame held.
+    let m = open_gc_spill_guest();
+    let mut d = CoopB2Driver::new();
+    d.store.data_mut().drop_spill = true;
+    let (_, tierups, _) = drive_coop_b2(&m, d);
+    assert!(tierups >= 1);
+    assert_eq!(temen_status(), STATUS_OK);
+    assert_eq!(
+        temen_coop_value(),
+        2 + 8,
+        "without the spill, ROOT + 8 is missed"
     );
     temen_coop_close();
 }

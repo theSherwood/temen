@@ -229,6 +229,16 @@ over-approximation argument does **not** license. Under-approximation frees live
 therefore excluded from both cross-tier callee sets, and the emit fixpoint cascades its callers off
 the emitted tier.
 
+**The exception is spill mode (#1627), and the cooperative browser driver uses it.** A guest that
+emits over the shared table is compiled with `gc_spill`. Around every call that can reach the op, an
+emitted frame pushes the values the call leaves live onto a host-owned spill stack, and restores the
+stack's cursor after the call. At a bounce the driver hands `[base, cursor)` to `CoopRun::bounce`,
+and the bounced scan covers those words alongside the paused task. The caller chain is then fully
+enumerable again. Two paths still fail closed with `CapFault` rather than scan incompletely:
+
+- a bounce inside a `Jit.invoke`, because a §22 unit's native frames do not spill;
+- a guest the local-table fallback emits, because that mode has no spill path.
+
 ### 3.3. Soundness preconditions (caller obligations temen cannot cheaply enforce)
 
 - `gc.roots` is sound **only under STW** — temen does the range-check; the guest
