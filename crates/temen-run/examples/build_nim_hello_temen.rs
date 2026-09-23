@@ -115,8 +115,8 @@ fn main() {
         .collect();
     // Two runtimes over one compute half (see `temen_leng::nim_posix_runtime`): the default folds
     // the syscalls onto the single STREAM `write` cap — right for a program that only prints — while
-    // `--posix` leaves them as **retained manifest imports** a host binds to a real `temen_posix`
-    // personality. A compiler phase needs the latter: it opens, reads and writes files, and (for
+    // `--posix` forwards them to a real `temen_posix` personality under its own op names (`__px_*`,
+    // #1668), so the result binds like any command — at root, or `execve`'d. A compiler phase needs the latter: it opens, reads and writes files, and (for
     // nimsem) spawns `nifler` through an `exec` cap.
     // The **prebuilt guest libc** (`LIBC_SERVED`): `snprintf`/`strtod`/libm, which no hand-written
     // shim reasonably carries. Without it those stay unbound manifest imports and the program cannot
@@ -132,7 +132,8 @@ fn main() {
         })
         .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("read libc {p:?}: {e}")));
     let module = if posix {
-        let mut runtime = temen_leng::nim_posix_runtime(&units)
+        let (px_names, px_sigs) = temen_posix::cap_vtable();
+        let mut runtime = temen_leng::nim_posix_runtime(&units, (&px_names, &px_sigs))
             .unwrap_or_else(|e| panic!("nim posix runtime: {e}"));
         if let Some(libc) = libc.as_deref() {
             runtime.extend(

@@ -11153,11 +11153,21 @@ fn build_exec_req(
     let win_log2 = win_bytes
         .is_power_of_two()
         .then(|| win_bytes.trailing_zeros() as u8);
-    let entry_params = cmod
-        .as_ref()
-        .and_then(|cm| cm.funcs.get(entry as usize))
-        .filter(|f| bytecode::child_entry_ok(&f.params, &f.results))
-        .map(|f| f.params.len());
+    // #1668 — a command enters one of two ways, and both get the same powerbox: the chibicc
+    // `--child-entry` ABI takes its starter caps as arguments, and a powerbox `_start` — how every
+    // nimony program enters — takes none and finds what it needs by name, reading its argv from the
+    // args region the exec already wrote. Admitting only the first meant no nim program could be
+    // exec'd at all: `sh -c "bin/nifler …"` reached nifler and was refused `-EINVAL` here.
+    let entry_params = cmod.as_ref().and_then(|cm| {
+        let f = cm.funcs.get(entry as usize)?;
+        if bytecode::child_entry_ok(&f.params, &f.results) {
+            Some(f.params.len())
+        } else if entry == 0 && temen_ir::is_named_powerbox_entry(&cm.module) {
+            Some(0)
+        } else {
+            None
+        }
+    });
     let admissible = !durable
         && clean_root
         && grants.is_some()
@@ -11195,11 +11205,11 @@ fn build_exec_req(
     match built {
         Some((ch, cinst, cas, child_size)) => {
             let cm = cmod.expect("built");
-            let want_as = entry_params == Some(2);
-            let mut entry_args = vec![Value::I64(cinst as i64)];
-            if want_as {
-                entry_args.push(Value::I64(cas as i64));
-            }
+            let entry_args = match entry_params {
+                Some(0) => Vec::new(),
+                Some(2) => vec![Value::I64(cinst as i64), Value::I64(cas as i64)],
+                _ => vec![Value::I64(cinst as i64)],
+            };
             // FORK.md §8.6 — the old powerbox is about to be dropped by the image
             // -replace: release its pipe write *and* read ends (the fork-inherited ones
             // this exec did not carry into the new image) and wake any pipe that thereby

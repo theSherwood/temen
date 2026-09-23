@@ -157,7 +157,7 @@ fn link_shim(name: &str) -> Option<Resolved> {
     let cap = match name {
         "__spawn" => temen_ir::ResolvedCap { type_id: 6, op: 13 },
         "__join" => temen_ir::ResolvedCap { type_id: 6, op: 1 },
-        n => temen_posix::resolve(n.strip_prefix("__px_")?)?,
+        n => temen_posix::resolve_import(n)?,
     };
     Some(Resolved::Cap(cap))
 }

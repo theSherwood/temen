@@ -753,7 +753,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // to bind by name below, so this deliberately does not take `nim_powerbox_runtime`'s stdout-only
     // adapter. It is the same runtime the file-I/O and nifler2 routes take — one route through this
     // bottom edge, whether the program prints or also opens files.
-    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
     // Link with a synthesized **powerbox `_start`** at function 0: it reads the post-link data-stack
     // base (`data.top` → `powerbox_entry_sp`, page-aligned above the globals) and calls the C-shaped
     // `main($sp, argc, argv, envp)` with `argc/argv/envp = 0` — a real powerbox entry, not a
@@ -788,23 +788,14 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     interp_out
 }
 
-/// The nimony-import → personality-op map, **`temen_run`'s own** (`nim_import_binding` /
-/// `NimImport`) rather than a copy of it.
-///
-/// This table has now been consolidated twice, for the same reason both times. First within this
-/// file: the binder matched on a prefix chain while the #760 probe carried its own hardcoded
-/// `["sysWrite", "sysRead", "sysClose", "sysLseek", "getcwd"]`, so adding `cExitSys` to
-/// `POSIX_SERVED_LEAVES` taught the binder about it and left the probe calling it unbound.
-///
-/// Then across crates: this file kept a byte-identical copy of the library's public enum and
-/// table, and adding `fork`/`execve`/`wait4`/`exitnow` to `POSIX_SERVED_LEAVES` (#1609) made
-/// `memfiles.open`'s module retain `wait4` — which the library knew and the copy did not, so a
-/// test with nothing to do with exec failed in CI with `unmapped nimony import`. `temen-run`'s
-/// *library* does not depend on `temen-leng` (only its own tests do), so this dev-edge is already
-/// available and there is no reason for a second answer to "what serves this leaf?"
-/// (INVARIANTS #15).
-use temen_run::{nim_import_binding, NimImport};
-
+/// The personality's published op vocabulary, for [`temen_leng::nim_posix_runtime`] — which forwards
+/// every POSIX leaf to these names, so a linked program imports nothing else (#1668).
+fn px_vtable() -> temen_leng::PersonalityVtable<'static> {
+    static V: std::sync::OnceLock<(Vec<String>, Vec<temen_ir::FuncType>)> =
+        std::sync::OnceLock::new();
+    let v = V.get_or_init(temen_posix::cap_vtable);
+    (&v.0, &v.1)
+}
 /// Run the linked I/O program's powerbox `_start` (function 0) on `backend` through the reference
 /// embedding (`Instance`), with every retained nim-name syscall import bound to a single shared
 /// **POSIX personality**. Returns the personality itself, so the caller reads back whatever it cares
@@ -826,26 +817,13 @@ fn run_io_capture(
     let make = std::sync::Arc::new(make);
     let mut imports = temen_run::Imports::new();
     for imp in &m.imports {
-        let Some(kind) = nim_import_binding(&imp.name) else {
-            panic!(
-                "unmapped nimony import `{}` — extend nim_import_binding",
-                imp.name
-            );
+        // The linked program's imports are the personality's own names (#1668): `resolve_import`
+        // is the whole binding — the one a chibicc command's imports go through too.
+        let Some(c) = temen_posix::resolve_import(&imp.name) else {
+            panic!("import `{}` is not a personality op (`__px_*`)", imp.name);
         };
-        let cap = match kind {
-            NimImport::Stdout => temen_run::HostCap::stdout(),
-            // `quit` bottoms out here (`quit` -> `cExit` -> `cExitSys`, all `noreturn`), so this
-            // must be a capability that actually ends the program.
-            NimImport::Exit => temen_run::HostCap::exit(),
-            NimImport::Open => {
-                let make = std::sync::Arc::clone(&make);
-                temen_run::HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
-            }
-            NimImport::Posix(op) => {
-                let make = std::sync::Arc::clone(&make);
-                temen_run::HostCap::host_proc(op, move || (*make)())
-            }
-        };
+        let make = std::sync::Arc::clone(&make);
+        let cap = temen_run::HostCap::host_proc(c.op, move || (*make)());
         imports = imports.provide(imp.name.clone(), cap);
     }
     for (path, bytes) in seed {
@@ -2177,7 +2155,7 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
     let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -2191,6 +2169,82 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         String::from_utf8_lossy(&posix.stdout()),
         "size=12|mapped bytes",
         "the mapping must carry the file's real size and its real bytes"
+    );
+}
+
+/// #1668 — **a nim program forks and execs a nim program**, the shape every nimony compiler phase
+/// uses to reach the next one (`os.execShellCmd` is fork + `execve` + `waitpid`, inlined).
+///
+/// Both halves used to be impossible for the same reason: a nim program's POSIX imports were
+/// nimony's mangled leaf names, which only temen-run's root linker could match, and exec admitted only
+/// the chibicc child-entry shape. Now the POSIX runtime forwards every leaf to the personality's own
+/// op names — the parent imports exactly what a C command does — and exec admits a powerbox `_start`.
+/// So this exercises the whole chain: the parent binds at root; its twin execs; the child's manifest
+/// binds against the personality the exec carried, with no host-side table in sight; the child reads
+/// the argv `execve` wrote; and the parent reaps the child's own status.
+#[test]
+fn nim_forks_and_execs_a_nim_program() {
+    let Some(path) = toolchain_path() else {
+        eprintln!("SKIP nim_forks_and_execs_a_nim_program (no toolchain)");
+        return;
+    };
+    let link = |src: &str| -> temen_ir::Module {
+        let mods = compile_to_leng(&path, src);
+        let units: Vec<temen_leng::WholeModule> = mods
+            .iter()
+            .map(|(stem, src)| temen_leng::WholeModule { stem, src })
+            .collect();
+        let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("posix runtime");
+        let m = temen_leng::link_whole_powerbox_manifest(&units, runtime).expect("link");
+        temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
+        assert!(
+            m.imports
+                .iter()
+                .all(|i| temen_posix::resolve_import(&i.name).is_some()),
+            "a linked program imports only the personality's own ops: {:?}",
+            m.imports.iter().map(|i| &i.name).collect::<Vec<_>>()
+        );
+        m
+    };
+    let child = link(
+        "import std/syncio\nimport std/cmdline\n\
+         write(stdout, \"child:\" & paramStr(1) & \"|\")\n\
+         quit(7)\n",
+    );
+    // `execShellCmd`'s own sequence (std/os), pointed at the child instead of a shell.
+    let parent = link(
+        "import std/syncio\nimport std/posix/posix\n\
+         var path = \"/bin/child\"\n\
+         var arg1 = \"hi\"\n\
+         let argv = cast[ptr UncheckedArray[cstring]](alloc0(3 * sizeof(cstring)))\n\
+         argv[0] = path.toCString\n\
+         argv[1] = arg1.toCString\n\
+         argv[2] = nil.cstring\n\
+         let pid = fork()\n\
+         if pid == Pid(0):\n\
+         \x20 discard execve(path.toCString, cast[CCharArray](argv), cast[CCharArray](posix_environ))\n\
+         \x20 exitnow(127'i32)\n\
+         var status: cint = 0'i32\n\
+         if waitpid(pid, status, 0'i32).int < 0:\n\
+         \x20 write(stdout, \"waitpid failed\")\n\
+         else:\n\
+         \x20 write(stdout, \"parent:\" & $WEXITSTATUS(status))\n",
+    );
+    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+        std::sync::Arc::new(make);
+    let run = temen_run::nim_noc_run_with_commands(
+        parent,
+        &posix,
+        make,
+        &["parent".to_string()],
+        &[("/bin/child".to_string(), child)],
+    );
+    assert_eq!(run, Ok(()), "the parent ran to completion");
+    assert_eq!(
+        String::from_utf8_lossy(&posix.stdout()),
+        "child:hi|parent:7",
+        "the child ran with the argv execve wrote, and the parent reaped its own exit status"
     );
 }
 
@@ -2214,7 +2268,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
     let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
@@ -2415,10 +2469,11 @@ fn nifler2_links_through_leng() {
         .collect();
     // The **POSIX personality route**, not `link_nim_powerbox`: that one's `SYSCALL_ADAPTER` is a
     // stdout-only bottom edge (`sysOpen` → `-1`, `sysRead` → `0`), so a program that reads a file
-    // cannot work on it at all. Linking against the compute shim *alone* leaves the true syscalls as
-    // retained manifest imports, which `run_io_capture` binds to `temen_posix`'s real fd ops over an
-    // in-memory filesystem — the same route `run_io_program` already uses for stdout, with files.
-    let mut runtime = temen_leng::nim_posix_runtime(&units).expect("nim posix runtime");
+    // cannot work on it at all. The POSIX runtime forwards the true syscalls to the personality's own
+    // op names, which `run_io_capture` binds to `temen_posix`'s real fd ops over an in-memory
+    // filesystem — the same route `run_io_program` already uses for stdout, with files.
+    let mut runtime =
+        temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
     if let Some(libc) = guest_libc() {
         runtime.extend(temen_leng::nim_libc_units(&libc, &units).expect("guest libc units"));
     }
@@ -2432,14 +2487,14 @@ fn nifler2_links_through_leng() {
                 m.imports.len(),
                 v.map(|_| "ok")
             );
-            // The five raw syscalls are *meant* to survive here — the POSIX personality binds them
-            // by name at instantiation. Anything else is a leaf nothing serves.
+            // The personality's own ops are *meant* to survive here — they bind by name at
+            // instantiation. Anything else is a leaf nothing serves.
             let unbound: Vec<&str> = m
                 .imports
                 .iter()
                 .map(|i| i.name.as_str())
                 // Ask the binder, rather than keeping a second list of what it binds.
-                .filter(|n| nim_import_binding(n).is_none())
+                .filter(|n| temen_posix::resolve_import(n).is_none())
                 .collect();
             eprintln!(
                 "  nifler2: imports: {:?}",

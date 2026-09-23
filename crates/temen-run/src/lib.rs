@@ -5060,68 +5060,14 @@ fn folds_to_oracle(m: &temen_ir::Module) -> bool {
 /// trapped program has usually already told you what went wrong — a progress line, an `ereport`, an
 /// assertion — so surfacing that output turns an opaque "guest trapped" into a legible diagnostic.
 /// The streams are merged into the powerbox `Stream` (there is one endpoint), so both are shown.
-/// How a retained nimony syscall import is served — the **one** table for the no-C (Leng) bottom
-/// edge, consulted both by the binder and by anything reporting unbound leaves.
-///
-/// They were two: a binder matching `write`/`open` then a prefix chain, and a probe carrying its own
-/// hardcoded list. Teaching one about a newly served leaf left the other reporting it unbound — the
-/// second route through one behaviour that INVARIANTS #15 is about.
-#[derive(Clone, Copy, Debug)]
-pub enum NimImport {
-    /// The guest libc's `write` — a §3e STREAM cap (ordinary powerbox stdout), not a syscall leaf.
-    Stdout,
-    /// `cExitSys` — the `Exit` **lifecycle** capability. Not a `temen_posix` op: exiting is not a
-    /// file operation, and the compute shim's `{ return }` stub made `quit` a no-op, so every nim
-    /// CLI error path ran on past the `quit` that should have ended it.
-    Exit,
-    /// `temen_leng`'s `POSIX_OPEN_ADAPTER` forward: a bare `open` taking the `(ptr, len, flags)` the
-    /// op wants. Binding C's `open` directly reads the flags word as the path length.
-    Open,
-    /// A retained nimony syscall leaf → the matching `temen_posix` op.
-    Posix(u32),
-}
-
-/// Which [`NimImport`] serves `name`, or `None` if nothing does.
-pub fn nim_import_binding(name: &str) -> Option<NimImport> {
-    Some(match name {
-        "write" => NimImport::Stdout,
-        "open" => NimImport::Open,
-        // The mmap adapter's own bottom edge (#1595): it seeks and reads the file into the pages
-        // the shim's allocator handed it.
-        "read" => NimImport::Posix(temen_posix::OP_READ),
-        // The path-ABI adapter's other forwards (#1595): nim writes files atomically, so a file
-        // write is write-temp + rename, with an unlink on the failure path.
-        "unlink" => NimImport::Posix(temen_posix::OP_UNLINK),
-        "rename" => NimImport::Posix(temen_posix::OP_RENAME),
-        "lseek" => NimImport::Posix(temen_posix::OP_LSEEK),
-        // The by-path stat the open adapter forwards to (#1595) — `OP_STAT`'s short `{mode, size}`
-        // read at the declared `st_mode`/`st_size` offsets answers garbage, so `fileExists` is false
-        // for every file and a compiler cannot find its own inputs.
-        "statp" => NimImport::Posix(temen_posix::OP_STATP),
-        n if n.starts_with("cExitSys") => NimImport::Exit,
-        n if n.starts_with("sysWrite") => NimImport::Posix(temen_posix::OP_WRITE),
-        n if n.starts_with("sysRead") => NimImport::Posix(temen_posix::OP_READ),
-        n if n.starts_with("sysClose") => NimImport::Posix(temen_posix::OP_CLOSE),
-        n if n.starts_with("sysLseek") => NimImport::Posix(temen_posix::OP_LSEEK),
-        n if n.starts_with("getcwd") => NimImport::Posix(temen_posix::OP_GETCWD),
-        n if n.starts_with("chdir") => NimImport::Posix(temen_posix::OP_CHDIR),
-        // #1595: `memfiles.open` sizes a mapping with `fstat`, so a 0-returning stub made every
-        // mapped file look empty.
-        n if n.starts_with("fstat") => NimImport::Posix(temen_posix::OP_FSTAT),
-        // #1609 — the whole-`execve` leaf. nimony's `os.execShellCmd` is fork + `execve("/bin/sh",
-        // ["-c", cmd])` + waitpid inlined, so this is the bottom edge of "run that command" for a
-        // no-C nim program: bound, a self-hosting nimsem spawns nifler itself; unbound, it cannot.
-        n if n.starts_with("execve") => NimImport::Posix(temen_posix::OP_EXECVE),
-        // The rest of `execShellCmd`'s sequence (#1609). `wait4` rather than `waitpid`: nimony
-        // binds the syscall and provides `waitpid` as an inline wrapper over it.
-        n if n.starts_with("fork") => NimImport::Posix(temen_posix::OP_FORK),
-        n if n.starts_with("wait4") => NimImport::Posix(temen_posix::OP_WAIT4),
-        n if n.starts_with("exitnow") => NimImport::Exit,
-        _ => return None,
-    })
-}
-
 /// Bind every retained import of a no-C nim module to one shared **POSIX personality**.
+///
+/// The module's POSIX imports are the personality's own names (`__px_<op>`, #1668) — the same as a
+/// chibicc command's — so this is [`temen_posix::resolve_import`] and nothing else. It used to be a
+/// table of nimony's mangled leaf names matched by prefix, plus a host stdout `Stream` for the guest
+/// libc's `write` and the `Exit` capability for `_exit`: a vocabulary only this root linker knew, and
+/// two authorities an `execve`'d image does not hold. temen-leng's POSIX edge now forwards every one of
+/// those to the personality, so a nim program binds identically at root and after an exec.
 ///
 /// Returns the [`Imports`], the names it could not serve, and the personality's
 /// [`SharedHostProc`] — its single powerbox entry (#1645), which a caller needs to publish the op
@@ -5146,17 +5092,11 @@ pub fn nim_posix_imports(
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
-        let Some(kind) = nim_import_binding(&imp.name) else {
+        let Some(c) = temen_posix::resolve_import(&imp.name) else {
             unbound.push(imp.name.clone());
             continue;
         };
-        let cap = match kind {
-            NimImport::Stdout => HostCap::stdout(),
-            NimImport::Exit => HostCap::exit(),
-            NimImport::Open => HostCap::host_proc_shared(temen_posix::OP_OPEN, &slot),
-            NimImport::Posix(op) => HostCap::host_proc_shared(op, &slot),
-        };
-        imports = imports.provide(imp.name.clone(), cap);
+        imports = imports.provide(imp.name.clone(), HostCap::host_proc_shared(c.op, &slot));
     }
     (imports, unbound, slot)
 }
@@ -5203,7 +5143,7 @@ pub fn nim_noc_run_with_commands(
     let (imports, unbound, slot) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
-            "unbound nimony imports (extend `nim_import_binding`): {unbound:?}"
+            "unbound imports — not personality ops (`__px_*`): {unbound:?}"
         ));
     }
     let cfg = RunConfig {
@@ -5285,7 +5225,7 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
         "__rg_map" => temen_ir::ResolvedCap { type_id: 4, op: 0 },
         "__rg_unmap" => temen_ir::ResolvedCap { type_id: 4, op: 1 },
         "__rg_granule" => temen_ir::ResolvedCap { type_id: 4, op: 3 },
-        n => temen_posix::resolve(n.strip_prefix("__px_")?)?,
+        n => temen_posix::resolve_import(n)?,
     };
     Some(temen_ir::Resolved::Cap(cap))
 }

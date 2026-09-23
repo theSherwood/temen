@@ -79,12 +79,10 @@ fn bind_shim(m: &temen_ir::Module, host: &mut Host, handle: i32) {
     let bindings = m
         .imports
         .iter()
-        .map(
-            |i| match i.name.strip_prefix("__px_").and_then(temen_posix::resolve) {
-                Some(c) => temen_interp::BoundImport::required(c.type_id, c.op, handle),
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            },
-        )
+        .map(|i| match temen_posix::resolve_import(&i.name) {
+            Some(c) => temen_interp::BoundImport::required(c.type_id, c.op, handle),
+            None => temen_interp::BoundImport::rebindable(0, 0, None),
+        })
         .collect();
     host.set_import_bindings(bindings);
 }

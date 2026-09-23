@@ -88,7 +88,7 @@ fn main() {
     let (imports, unbound, _slot) = temen_run::nim_posix_imports(&module, &posix, make);
     assert!(
         unbound.is_empty(),
-        "unbound nimony imports (extend `temen_run::nim_import_binding`): {unbound:?}"
+        "unbound imports — not personality ops (`__px_*`): {unbound:?}"
     );
 
     let mut seed: Vec<(String, Vec<u8>)> = Vec::new();
