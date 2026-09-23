@@ -2260,6 +2260,29 @@ fn fork_factory(world: Arc<Mutex<World>>, proc_: Arc<Mutex<Proc>>) -> HostProcFo
         // no dispatch fires a scheduler wake while holding the world lock — see [`Ctx::wake_after`]
         // — so scheduler → world here cannot cross a world → scheduler hold.)
         let mut w = world.lock().unwrap_or_else(|e| e.into_inner());
+        // #1609 — **one process per pid**, however many powerbox entries this personality occupies.
+        // `Host::fork_powerbox` runs the factory once per `host_procs` entry, and a lane that grants
+        // a separate entry per bound import (temen-run's `nim_posix_imports`) therefore asks for the
+        // same twin once per import. Minting a fresh `Proc` each time gave one twin a dozen
+        // processes sharing a pid — a dozen fd tables, and (the symptom that found this) a park door
+        // wired by `Scheduler::wire_signal_doors` to only the LAST of them, so `fork`/`execve`
+        // reached through any *other* entry saw `park_req` unset: the twin's `execve` fired nothing,
+        // returned its `-ENOSYS` placeholder, and nim's `execShellCmd` fell through to `exit(127)`.
+        // The first call for a pid mints; the rest re-mint a handler over the SAME `Proc` and
+        // decline the per-process extras (door, exit hook, exec-remap) so each is installed once.
+        if pid != 0 {
+            if let Some(ProcEntry::Live(existing)) = w.procs.get(&(pid as i32)) {
+                let existing = Arc::clone(existing);
+                drop(w);
+                return ForkedProc {
+                    handler: handler(Arc::clone(&world), Arc::clone(&existing)),
+                    signal: None,
+                    refork: Some(fork_factory(Arc::clone(&world), existing)),
+                    exit: None,
+                    exec_remap: None,
+                };
+            }
+        }
         let mut child = proc_.lock().unwrap_or_else(|e| e.into_inner()).fork();
         // #799 — a non-zero pid IS the twin's scheduler TaskId: exactly the processes the core's
         // twin-completion wake covers, so exactly the ones blocking `waitpid` may bench on.
@@ -5459,6 +5482,65 @@ mod tests {
     /// share their open-file **descriptions** — a fork-inherited fd shares its offset with the
     /// parent (POSIX fork-shares-open-file-descriptions), and a child's cwd/env mutations are
     /// invisible to the parent (the pre-split shared blob got both wrong).
+    /// #1609 — **one process per pid**, however many powerbox entries this personality occupies.
+    /// `Host::fork_powerbox` runs the fork factory once per `host_procs` entry, so a lane that
+    /// grants an entry per bound import (temen-run's `nim_posix_imports`) asks for the same twin
+    /// once per import. Every call must land on the SAME `Proc`: minting a fresh one each time
+    /// gave one twin a dozen processes behind a single pid — a dozen fd tables and cwds, and a
+    /// park door (`Scheduler::wire_signal_doors` installs it on the LAST returned signal source)
+    /// that the handlers of every other entry could not see. That is how nimsem's `execShellCmd`
+    /// died: the twin's `execve` fired nothing, answered its `-ENOSYS` placeholder and fell through
+    /// to `exit(127)`, while the *parent* later found the stale `ExecSelf` in its own cell and
+    /// image-replaced itself with the command.
+    #[test]
+    fn every_powerbox_entry_of_one_twin_lands_on_one_process() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        let mut first = cap_fork_factory(&posix)(7);
+        let mut second = cap_fork_factory(&posix)(7);
+        // The per-process extras are installed exactly once — a second door would be the one the
+        // core wires the park cell onto, and a second exit hook would retire the pid twice.
+        assert!(
+            first.signal.is_some(),
+            "the first entry mints the twin's door"
+        );
+        assert!(
+            second.signal.is_none(),
+            "a second entry for the same pid must not mint a second door"
+        );
+        assert!(
+            first.exit.is_some() && second.exit.is_none(),
+            "one exit hook per process, not per powerbox entry"
+        );
+        assert!(
+            first.exec_remap.is_some() && second.exec_remap.is_none(),
+            "one exec-remap hook per process, not per powerbox entry"
+        );
+        assert!(
+            second.refork.is_some(),
+            "a fork-of-fork through any entry still forks the TWIN's state"
+        );
+        // ...and both handlers drive the same process state: `chdir` through one is visible to
+        // `getcwd` through the other.
+        let mut win = vec![0u8; 256];
+        win[0..4].copy_from_slice(b"/sub");
+        let mut mem = temen_interp::WindowMem::new(&mut win, 256);
+        assert_eq!(
+            (first.handler)(OP_CHDIR, &[0, 4], Some(&mut mem), None).unwrap()[0],
+            0,
+            "chdir through the first entry"
+        );
+        assert!(
+            (second.handler)(OP_GETCWD, &[64, 64], Some(&mut mem), None).unwrap()[0] > 0,
+            "getcwd through the second entry"
+        );
+        let got = &win[64..][..win[64..].iter().position(|&b| b == 0).unwrap_or(0)];
+        assert_eq!(
+            got, b"/sub",
+            "the second entry sees the first entry's cwd — one process"
+        );
+    }
+
     #[test]
     fn fork_clones_the_process_side_and_shares_descriptions() {
         let world = Arc::new(Mutex::new(new_world(Vec::new())));

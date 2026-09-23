@@ -10825,23 +10825,31 @@ enum CallerRequest {
     /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
     /// still running (POSIX: `execve` returns only on failure).
     ExecRefused,
+    /// Bench this vCPU until `child` exits — a blocking `waitpid`/`wait4`. Unlike fork/exec this
+    /// one **rewinds**: the op re-executes on wake and reaps from the personality's now-retired
+    /// table entry. [`REAP_ANY_CHILD`] is the `wait(-1)` wildcard.
+    Reap(TaskId),
 }
 
 /// #799/#1609/#1621 — service the **caller request** a host op left in the door, identically
 /// however the op was reached.
 ///
-/// `fork` and `exec` are requests, not parks: the op fires one and returns a placeholder, and the
-/// drive loop acts on it at once. Both need the same gate — only a **root fiber on the real
-/// scheduler** can be handed to the fork engine or have its image replaced — and a context that
-/// fails it keeps the placeholder.
+/// `fork`, `exec` and a blocking `waitpid`'s bench are requests, not postures: the op fires one and
+/// returns a placeholder, and the drive loop acts on it at once. All three need the same gate —
+/// only a **root fiber on the real scheduler** can be handed to the fork engine, have its image
+/// replaced, or be benched — and a context that fails it keeps the placeholder (for `waitpid` that
+/// is the historical `-ECHILD` poll).
 ///
 /// This lived twice, in the `call.cap` and `call.sym` arms. `call.import` had neither: it drained
 /// the request and dropped it, so an op reached as an import could not fork or exec at all. That
 /// is invisible to a chibicc guest, whose `__px_*` calls arrive as `call.cap`/`call.sym`, and
 /// fatal to a no-C nim module, whose personality ops arrive as imports — `fork` answered
 /// `-ENOSYS`, nim read `pid < 0` as "fork failed", and `execShellCmd` reported failure having
-/// never called `execve` (#1621). One decision, three callers, so a fourth call form cannot
-/// quietly acquire a fourth answer (INVARIANTS #15).
+/// never called `execve` (#1621). The reap bench joined it in #1609, from the other half of the
+/// same split: `call.cap`/`call.sym` each carried their own copy of the park and the import routes
+/// carried none, so an import-routed `wait4` answered `-ECHILD` without ever benching. One
+/// decision, four callers, so a fifth call form cannot quietly acquire a fifth answer
+/// (INVARIANTS #15).
 ///
 /// Read parking is deliberately **not** here: it legitimately differs per arm (an import-routed
 /// blocking read keeps its historical 0-EOF rather than parking), and that posture is a separate
@@ -10864,6 +10872,14 @@ fn service_caller_request(
     }
     match ev {
         ParkEvent::ForkSelf => CallerRequest::Fork,
+        // #1609 — a blocking `waitpid`'s bench. This was the one caller request still decided per
+        // arm (`call.cap`/`call.sym` parked on it; `call.import`/`call.dyn` dropped it), which is
+        // the #1621 asymmetry over again: an import-routed `wait4` answered `-ECHILD` at once, so
+        // nim's `execShellCmd` reported failure for a command that had in fact run.
+        ParkEvent::TaskExit(id) => CallerRequest::Reap(id),
+        // #802 rung 3 — the any-child bench: the sentinel flows through the same rewind+park; the
+        // drive loop's insert translates it to the per-parent key.
+        ParkEvent::TaskExitAny => CallerRequest::Reap(REAP_ANY_CHILD),
         // The op resolved the path against the command registry and packed argv/envp into the
         // powerbox args region, so only the resolved command handle rides the request.
         ParkEvent::ExecSelf { cmd } => {
@@ -10872,7 +10888,6 @@ fn service_caller_request(
                 None => CallerRequest::ExecRefused,
             }
         }
-        _ => CallerRequest::None,
     }
 }
 
@@ -14247,20 +14262,21 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // `waitpid`) or clone the caller (`fork`). Taken here like every transient
                     // (consume-everywhere).
                     let request = hg.take_park_request();
-                    let reap_park = match request {
-                        Some(ParkEvent::TaskExit(id)) => Some(id),
-                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
-                        // rewind+park; the drive loop's insert translates it to the per-parent key.
-                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
-                        _ => None,
-                    };
+                    // Whether that request is a blocking `waitpid`'s bench — needed *here*, under
+                    // the host lock, only as the `sig_intr` predicate below. The park itself is
+                    // [`service_caller_request`]'s decision ([`CallerRequest::Reap`]), taken once
+                    // for every call form after the lock drops.
+                    let reap_park = matches!(
+                        request,
+                        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+                    );
                     // #796 L1 — a `raise()` interrupted a parked blocking op: consume the EINTR flag, but
                     // only when *this* op is actually about to park (a completed read/write must not eat
                     // it). Short-circuits so `take_sig_interrupt` fires only on a genuine park. (`fork`
                     // does not participate: POSIX fork is not interruptible — it succeeds or EAGAINs.)
                     let sig_intr = (pipe_park.is_some()
                         || pipe_write_park.is_some()
-                        || reap_park.is_some())
+                        || reap_park)
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -14302,23 +14318,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
-                    // #799 — bench a blocking `waitpid` on its child's exit: the pipe discipline
-                    // exactly (rewind so the op re-executes on wake and reaps from the
-                    // personality's now-retired table entry; a consumed interrupt completes
-                    // `-EINTR`; SA_RESTART re-parks via the re-executed op's re-request).
-                    if let Some(child) = reap_park {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            if sig_intr {
-                                frames[top].vals.push(Reg::from_i64(EINTR));
-                                eintr_done = true;
-                            } else {
-                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
-                                return Ok(Inner::Park(Blocked::ReapWait { child }));
-                            }
-                        }
-                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
-                    }
-                    // #799/#1609 — the `fork`/`exec` caller requests, serviced by the one
+                    // #799/#1609 — the `fork`/`exec`/reap caller requests, serviced by the one
                     // decision every call form shares (#1621).
                     let mut exec_refused = false;
                     match service_caller_request(
@@ -14333,6 +14333,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // The pipe-park discipline exactly: rewind so the op re-executes on wake
+                        // and reaps the retired entry; a consumed interrupt completes `-EINTR`
+                        // instead (SA_RESTART re-parks via the re-executed op's re-request).
+                        CallerRequest::Reap(child) => {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
                         CallerRequest::None => {}
                     }
                     if !eintr_done {
@@ -14524,6 +14536,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // Rewind and bench: the op re-executes on wake and reaps the retired
+                        // entry. No `-EINTR` arm — this route declines the interrupt posture for
+                        // blocking ops generally (see the read-parking note on the servicer), and
+                        // a wait that benches is strictly better than one that never could.
+                        CallerRequest::Reap(child) => {
+                            frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                            return Ok(Inner::Park(Blocked::ReapWait { child }));
+                        }
                         CallerRequest::None => {}
                     }
                     if exec_refused {
@@ -14663,18 +14683,19 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     // #799 — a personality caller request (blocking `waitpid` / `fork`); this
                     // named-import route is where a shim-linked guest's calls land.
                     let request = hg.take_park_request();
-                    let reap_park = match request {
-                        Some(ParkEvent::TaskExit(id)) => Some(id),
-                        // #802 rung 3 — the any-child bench: the sentinel flows through the same
-                        // rewind+park; the drive loop's insert translates it to the per-parent key.
-                        Some(ParkEvent::TaskExitAny) => Some(REAP_ANY_CHILD),
-                        _ => None,
-                    };
+                    // Whether that request is a blocking `waitpid`'s bench — needed *here*, under
+                    // the host lock, only as the `sig_intr` predicate below. The park itself is
+                    // [`service_caller_request`]'s decision ([`CallerRequest::Reap`]), taken once
+                    // for every call form after the lock drops.
+                    let reap_park = matches!(
+                        request,
+                        Some(ParkEvent::TaskExit(_) | ParkEvent::TaskExitAny)
+                    );
                     // #796 L1 — take the EINTR flag only when this named-import op is about to park (as in
                     // the `call.cap` arm above), so a raised signal completes it `-EINTR` not re-parks.
                     let sig_intr = (pipe_park.is_some()
                         || pipe_write_park.is_some()
-                        || reap_park.is_some())
+                        || reap_park)
                         && hg.take_sig_interrupt()
                         // #796 SA_RESTART: a restart-flagged delivery re-parks silently instead
                         && !hg.signal_restart();
@@ -14705,20 +14726,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         }
                         // A non-parkable context (a fiber, the explorer) keeps the placeholder result.
                     }
-                    // #799 — bench a blocking `waitpid` (see the `call.cap` arm for the shape).
-                    if let Some(child) = reap_park {
-                        if *cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_)) {
-                            if sig_intr {
-                                frames[top].vals.push(Reg::from_i64(EINTR));
-                                eintr_done = true;
-                            } else {
-                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
-                                return Ok(Inner::Park(Blocked::ReapWait { child }));
-                            }
-                        }
-                        // A non-parkable context keeps the placeholder answer (the -ECHILD poll).
-                    }
-                    // #799/#1609 — the `fork`/`exec` caller requests (see the `call.cap` arm).
+                    // #799/#1609 — the `fork`/`exec`/reap caller requests (see the `call.cap` arm).
                     let mut exec_refused = false;
                     match service_caller_request(
                         request,
@@ -14732,6 +14740,18 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // The pipe-park discipline exactly: rewind so the op re-executes on wake
+                        // and reaps the retired entry; a consumed interrupt completes `-EINTR`
+                        // instead (SA_RESTART re-parks via the re-executed op's re-request).
+                        CallerRequest::Reap(child) => {
+                            if sig_intr {
+                                frames[top].vals.push(Reg::from_i64(EINTR));
+                                eintr_done = true;
+                            } else {
+                                frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                                return Ok(Inner::Park(Blocked::ReapWait { child }));
+                            }
+                        }
                         CallerRequest::None => {}
                     }
                     if let Some(pipe) = pipe_wake {
@@ -14809,6 +14829,14 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                         CallerRequest::Fork => return Ok(Inner::Park(Blocked::ForkSelf)),
                         CallerRequest::Exec(req) => return Ok(Inner::Exec(req)),
                         CallerRequest::ExecRefused => exec_refused = true,
+                        // Rewind and bench: the op re-executes on wake and reaps the retired
+                        // entry. No `-EINTR` arm — this route declines the interrupt posture for
+                        // blocking ops generally (see the read-parking note on the servicer), and
+                        // a wait that benches is strictly better than one that never could.
+                        CallerRequest::Reap(child) => {
+                            frames[top].inst -= 1; // rewind: the waitpid re-executes on wake
+                            return Ok(Inner::Park(Blocked::ReapWait { child }));
+                        }
                         CallerRequest::None => {}
                     }
                     if exec_refused {
@@ -20208,6 +20236,25 @@ impl Default for Host {
 /// through the same call as a separate-module child's (#1234).
 pub const SELF_MODULE: i32 = -1;
 
+/// How far [`Host::bind_manifest`]'s step-3 withhold bends for a given kind of child (§3.3).
+///
+/// The three callers differ in *whose* manifest they are reading, and that is the whole reason the
+/// answers differ — see each `bind_*_manifest` for the argument.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lenience {
+    /// A separate-module child spawn: an unmet `required` slot fails the spawn closed.
+    Strict,
+    /// An `execve` image-replace: a name **no provider has** is left empty (it may not be a
+    /// capability request at all), but a name a provider *does* have and cannot satisfy — a
+    /// coverage or signature mismatch — still refuses. Shape drift stays a bind-time error
+    /// (#1524), which is what keeps `execve` returning `-EINVAL` instead of becoming a command it
+    /// cannot run and trapping inside it.
+    UnknownOnly,
+    /// A same-module child: its manifest is the *parent's* whole import surface, which it never
+    /// declared, so any unmet slot is left empty.
+    All,
+}
+
 impl Host {
     pub fn new() -> Host {
         Host {
@@ -20597,14 +20644,15 @@ impl Host {
     ///    import index; callers surface `-EINVAL` before any child code runs).
     ///
     /// Shared by the interpreter's inline spawn and the JIT's child builders (differential
-    /// lockstep). [`Host::bind_same_module_manifest`] is the same walk with step 3 softened — see
-    /// there for why a same-module child may not refuse over an unmet `required` slot.
+    /// lockstep). [`Host::bind_same_module_manifest`] and [`Host::bind_exec_manifest`] are the
+    /// same walk with step 3 softened — see each for why a child running the parent's own program,
+    /// and an image replacing its caller, may not refuse over an unmet `required` slot.
     pub fn bind_child_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, false)
+        self.bind_manifest(imports, tsec, Lenience::Strict)
     }
 
     /// #1234 — [`Host::bind_child_manifest`] for a §14 **same-module** child: the identical walk,
@@ -20623,14 +20671,46 @@ impl Host {
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
     ) -> Result<(), u32> {
-        self.bind_manifest(imports, tsec, true)
+        self.bind_manifest(imports, tsec, Lenience::All)
+    }
+
+    /// #1628 — [`Host::bind_child_manifest`] for an **`execve` image-replace**, which takes the
+    /// softened step 3 for a different reason than a same-module child does.
+    ///
+    /// An exec'd image is not spawned into confinement — it **becomes its caller**, in the same
+    /// process: same window, same fds, same pid, same personality ([`Host::exec_carry`] moves all
+    /// of it across). §3.3's "a separate module's manifest is that child's own honest declaration
+    /// of need, so withhold" describes a *spawn*, and reading it onto exec had a concrete cost:
+    /// **a program that runs fine at top level could not be exec'd.**
+    ///
+    /// `demos/shell` is the case. Its pipeline runner calls `__spawn`/`__join`/`__as_region`/
+    /// `__rg_*` — which are **not** name-resolved capabilities. They are `call.sym`s carrying the
+    /// handle the shell discovered by reflection, and an unbound name falls through to dispatching
+    /// on that operand. The shell runs as a root program with its whole name registry empty and
+    /// every one of those calls working. The strict walk refused the exec at `__as_region` before
+    /// a single instruction ran, over names that were never asking the runtime for anything.
+    ///
+    /// **Authority is unchanged**, which is what makes this safe rather than a loosening:
+    ///
+    /// - An empty slot `CapFault`s on use, exactly as for a same-module child.
+    /// - The handle fallback cannot invent authority — the guest dispatches on a handle it already
+    ///   holds, and it holds only what it was granted.
+    ///
+    /// So an exec'd shell that was given no `Instantiator` faults the moment it tries to run a
+    /// pipeline, and runs `sh -c "<one command>"` fine. That is the right answer to both.
+    pub fn bind_exec_manifest(
+        &mut self,
+        imports: &[temen_ir::Import],
+        tsec: &[temen_ir::TypeEntry],
+    ) -> Result<(), u32> {
+        self.bind_manifest(imports, tsec, Lenience::UnknownOnly)
     }
 
     fn bind_manifest(
         &mut self,
         imports: &[temen_ir::Import],
         tsec: &[temen_ir::TypeEntry],
-        lenient: bool,
+        lenient: Lenience,
     ) -> Result<(), u32> {
         if imports.is_empty() {
             return Ok(());
@@ -20718,11 +20798,24 @@ impl Host {
         let mut reqs: Vec<(Vec<String>, Vec<FuncType>)> = Vec::with_capacity(imports.len());
         for (i, im) in imports.iter().enumerate() {
             let rebindable = im.mode == temen_ir::ImportMode::Rebindable;
-            // Whether an unmet slot may be left empty rather than refusing the spawn: a
-            // `rebindable` one always may (it is declared empty-able), and every one may for a
-            // same-module child (see `bind_same_module_manifest`). The *entry* still records the
-            // declared mode, so a lenient-empty `required` slot stays un-attachable.
-            let soft = rebindable || lenient;
+            // Whether an unmet slot may be left empty rather than refusing the spawn. A
+            // `rebindable` one always may (it is declared empty-able). Beyond that the two
+            // questions are different, and #1628 is why they are now asked separately:
+            //
+            // `soft_shape` — a provider **has this name** and still could not satisfy it, i.e. a
+            // coverage or signature mismatch. Only a same-module child forgives that; for an
+            // `execve` it stays a refusal, so shape drift is a bind-time `-EINVAL` (#1524) rather
+            // than an image that replaces its caller and then traps on its first call.
+            //
+            // `soft_absent` — **nothing anywhere** has the name. For an exec that is not
+            // necessarily a capability request: a `call.sym` carries its own handle operand, and
+            // an unbound name falls through to dispatching on it (which is how `demos/shell`'s
+            // `__spawn`/`__as_region` work as a root program, with the name registry empty).
+            //
+            // The *entry* still records the declared mode either way, so a lenient-empty
+            // `required` slot stays un-attachable.
+            let soft_shape = rebindable || lenient == Lenience::All;
+            let soft_absent = rebindable || lenient != Lenience::Strict;
             let unmet = || {
                 if rebindable {
                     BoundImport::rebindable(0, 0, None)
@@ -20751,7 +20844,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft => {
+                        None if soft_shape => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -20782,7 +20875,7 @@ impl Host {
                             }
                             None => return Err(i as u32),
                         },
-                        None if soft => {
+                        None if soft_shape => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -20807,7 +20900,7 @@ impl Host {
                             remaps.push(Some(remap));
                             continue;
                         }
-                        None if soft => {
+                        None if soft_shape => {
                             bindings.push(unmet());
                             remaps.push(None);
                             continue;
@@ -20852,7 +20945,7 @@ impl Host {
                     bindings.push(BoundImport::required(tid, iop, c));
                     remaps.push(None);
                 }
-                None if soft => {
+                None if soft_absent => {
                     bindings.push(unmet());
                     remaps.push(None);
                 }
@@ -25444,7 +25537,7 @@ impl Host {
                 remap.push((old_h, nh));
             }
         }
-        match child.bind_child_manifest(imports, types) {
+        match child.bind_exec_manifest(imports, types) {
             Ok(()) => {
                 for hook in self.exec_remap_hooks.iter() {
                     hook(&remap);

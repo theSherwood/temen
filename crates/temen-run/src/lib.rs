@@ -5130,7 +5130,16 @@ pub fn nim_posix_imports(
     posix: &temen_posix::Posix,
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
 ) -> (Imports, Vec<String>) {
-    let _ = posix;
+    // #1609 — the personality-served slots bind through temen-posix's OWN fork factory, not
+    // `HostCap::host_proc`'s shared-state default. The default re-mints a twin's handler over the
+    // **parent's** `Proc`, which is wrong for a personality with real per-process state: a forked
+    // twin kept writing the parent's fd table, and its `fork`/`execve` fired the *parent's* park
+    // door — so the twin's own request cell stayed empty (`execve` answered `-ENOSYS`, nim's
+    // `execShellCmd` fell through to `exit(127)`) while the parent picked the stale `ExecSelf` out
+    // of its cell and image-replaced *itself* with the command. One process per twin is the
+    // factory's job (`cap_fork_factory`, which mints once per pid across all of this
+    // personality's powerbox entries).
+    let fork = temen_posix::cap_fork_factory(posix);
     let mut imports = Imports::new();
     let mut unbound = Vec::new();
     for imp in &module.imports {
@@ -5143,11 +5152,15 @@ pub fn nim_posix_imports(
             NimImport::Exit => HostCap::exit(),
             NimImport::Open => {
                 let make = std::sync::Arc::clone(&make);
-                HostCap::host_proc(temen_posix::OP_OPEN, move || (*make)())
+                HostCap::host_proc_forkable(
+                    temen_posix::OP_OPEN,
+                    move || (*make)(),
+                    std::sync::Arc::clone(&fork),
+                )
             }
             NimImport::Posix(op) => {
                 let make = std::sync::Arc::clone(&make);
-                HostCap::host_proc(op, move || (*make)())
+                HostCap::host_proc_forkable(op, move || (*make)(), std::sync::Arc::clone(&fork))
             }
         };
         imports = imports.provide(imp.name.clone(), cap);

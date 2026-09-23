@@ -3322,6 +3322,107 @@ int main(void) {{\n\
     );
 }
 
+/// The `demos/shell` sources, compiled here as a **command** rather than a root program — the
+/// three files `c_shell.rs` already builds, reached the other way.
+const SH_SHIM: &str = include_str!("../../temen-run/demos/shell/shim.c");
+const SH_RING: &str = include_str!("../../temen-run/demos/shell/ring.c");
+const SH_MAIN: &str = include_str!("../../temen-run/demos/shell/shell_main.c");
+
+/// A caller window big enough to exec the shell into: `exec_module` reuses the caller's window, so
+/// it admits a command only if the command's declared memory fits. The shell declares 2^22.
+const WIN_PAD_23: &str = "static char xs_win_pad23_[6000000];\n";
+
+/// A parent that forks, `execve`s `/bin/sh -c <script>` in the child, and reports the reaped status
+/// as `40 + code` — so a refused exec shows up as `40 + errno`, told apart from any exit the shell
+/// itself chose. Writing `alive` afterwards proves the caller survived either way.
+fn sh_caller(script: &str) -> String {
+    format!(
+        "{WIN_PAD_23}\
+long __px_execve(int cap, long path, long argv, long envp);\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static char *av[] = {{ \"/bin/sh\", \"-c\", \"{script}\", 0 }};\n\
+static int status;\n\
+static long pid; static long h;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    long r = __px_execve(0, (long)\"/bin/sh\", (long)av, 0);\n\
+    return (int)(-r);   /* never reached on success; otherwise the errno */\n\
+  }}\n\
+  h = __px_waitpid(0, pid, (long)&status, 0);\n\
+  if (h != pid) return 2;\n\
+  __px_write(0, 1, (long)\"alive\", 5);\n\
+  return 40 + ((status >> 8) & 0xff);\n\
+}}\n"
+    )
+}
+
+/// #1628 — **the real shell runs as an exec'd command.** This is what registering it at
+/// `/bin/sh` needs, and what #1609's last step was blocked on.
+///
+/// `c_shell.rs` compiles these same three files with `c_to_ir` and runs them as a *root* powerbox
+/// program; every existing shell test is that shape. A command is `c_to_ir_child` and arrives
+/// through an image-replace instead — and that used to be refused before a single instruction ran.
+///
+/// The cause was not startup, which the total absence of output suggested. `bind_child_manifest`
+/// refused at `__as_region`: the shell's pipeline runner declares `__spawn`/`__join`/`__as_region`/
+/// `__rg_*` as `Required`, and a §14 child's walk binds a fixed allow-list. But those are not
+/// name-resolved capabilities at all — they are `call.sym`s carrying a reflection-discovered
+/// handle, and the shell runs at top level with its whole name registry empty. Exec now takes the
+/// softened step 3 ([`Host::bind_exec_manifest`]): an image replacing its caller leaves an
+/// unbindable slot empty rather than refusing, because it is becoming that caller, not being
+/// spawned into confinement.
+///
+/// Deliberately the smallest script: this asks whether the shell *starts* and reads its own argv.
+/// `c_execve_runs_a_shell_pipeline_as_a_command` covers the authority question underneath it.
+#[test]
+fn c_execve_runs_the_real_shell_as_a_command() {
+    let sh = format!("{SH_SHIM}\n{SH_RING}\n{SH_MAIN}");
+    let src = sh_caller("true");
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/sh", &sh);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(40)],
+        "40 = the shell became the image, read `-c true` from its own argv, and exited 0 \
+         (62 = 40 + EINVAL, the pre-#1628 manifest refusal)"
+    );
+    assert_eq!(
+        e.stdout, b"alive",
+        "the caller reaped it and kept its own personality"
+    );
+}
+
+/// #1628 — and the authority underneath is unchanged: an exec'd shell reaching for the **pipeline**
+/// machinery gets whatever its own capability table holds, not whatever it declared.
+///
+/// This is the half that makes the softened bind safe rather than a loosening. An empty slot
+/// `CapFault`s on use, and the `call.sym` handle fallback can only dispatch on a handle the guest
+/// already holds — which it holds only because it was granted. So the pipeline either works on the
+/// image's own auto-granted `Instantiator`/`AddressSpace` (confined to its own window, like its
+/// heap) or faults; it cannot reach anything the caller did not have.
+#[test]
+fn c_execve_runs_a_shell_pipeline_as_a_command() {
+    let sh = format!("{SH_SHIM}\n{SH_RING}\n{SH_MAIN}");
+    let src = sh_caller("echo hi | cat");
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/sh", &sh);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(40)],
+        "the pipeline ran on the exec'd image's own granted caps and exited 0"
+    );
+    assert_eq!(
+        e.stdout, b"hi\nalive",
+        "`echo hi | cat` crossed the ring between two stage children of the exec'd shell"
+    );
+}
+
 /// #1609 — the **whole-`execve` personality op** (`OP_EXECVE`), the route a guest with no
 /// `exec.c` of its own takes. Deliberately the same scenario as
 /// `c_execve_runs_a_px_linked_command` above, with the one difference that matters: that test
