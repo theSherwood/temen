@@ -1042,8 +1042,12 @@ struct World {
     /// process's* state, turning a bookkeeping bug into a cross-process leak. One slot, matched by
     /// exact pid, can only ever re-offer the twin this personality just made.
     ///
-    /// A net, not the mechanism: #1645 is one entry per personality, and #1648 is the core-side
-    /// guard that makes a second signal-door claimant refuse the fork instead of splitting it.
+    /// This and #1648 cover different halves, and together they are exhaustive. **One** personality
+    /// over several entries lands here: every ask after the first re-offers the same `Proc` and
+    /// declines the per-process extras, so exactly one door is claimed and the fork proceeds.
+    /// **Two** personalities each mint their own, so two doors reach `Host::fork_powerbox` and it
+    /// refuses the fork closed — a domain cannot have two signal sources. #1645 (one entry per
+    /// personality) is what keeps the first case rare; this is what keeps it correct.
     last_fork_mint: Option<(i32, Arc<Mutex<Proc>>)>,
     /// #798 — the proto-terminal's **foreground process group** (`tcsetpgrp`/`tcgetpgrp`; the
     /// captured stdio stands in for the pty until #797). Init `1` — the root's group — so every
