@@ -163,3 +163,16 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     let wide: Vec<&str> = wide.iter().map(String::as_str).collect();
     assert!(err(plan(&wide, vec![node(&[])])).contains("do not fit"));
 }
+
+/// A node the spawn refuses (here: an entry that is not a child-entry shape, so op 15 answers
+/// `-EINVAL`) ends the run with a trap when the root joins the refused handle. It used to panic the
+/// driver (`drive_op13` indexed its child list with the negative handle).
+#[test]
+fn a_refused_node_ends_the_run_with_a_trap_not_a_host_panic() {
+    let m = temen_text::parse_module(
+        "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vz = i32.const 0\n  return vz\n  }\n}\n",
+    )
+    .expect("parse");
+    let plan = Plan::single(16, &[], &[]);
+    assert!(run(&plan, &[&m], Host::new(), &[]).is_err());
+}

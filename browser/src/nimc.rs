@@ -476,8 +476,14 @@ pub(crate) fn drive_op13<'p>(
                 children.push(r);
                 vcpu.deliver_handle(handle);
             }
+            // A handle this driver never delivered (a refused spawn's `-errno`, or a forged value) is
+            // answered exactly as the op13jit driver answers it — never an out-of-bounds host panic.
             bytecode::VcpuEvent::Join { handle } => {
-                vcpu.deliver_join(children[handle as usize].clone());
+                let banked = children
+                    .get(handle as usize)
+                    .cloned()
+                    .unwrap_or(Err(Trap::Malformed));
+                vcpu.deliver_join(banked);
             }
             // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
             // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own
