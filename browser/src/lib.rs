@@ -30,6 +30,7 @@ use temen_interp::{bytecode, Host, StreamRole, Trap, Value};
 // The `webgpu` capability's host import (browser: `navigator.gpu` via `webgpu_op`). Wasm-only — native
 // builds (the Rust reactor tests) have no such import, so the cap is simply not granted there.
 mod nimc;
+pub mod plan;
 #[cfg(target_arch = "wasm32")]
 mod webgpu;
 
@@ -11847,7 +11848,7 @@ fn op13jit_open_driver(driver: temen_ir::Module, child: temen_ir::Module, minter
 
 /// **Open the op-13 loop over a real phase child** (#1025 Path 1 scaling to nifler): decode the
 /// child-entry phase module `child` (nifler_ce), mount a shared memfs seeded with `src` at `file`, build
-/// the real `nimc::detached_parent_src` driver (argv `nifler --portablePaths --deps parse <file> <out>`),
+/// the real one-node [`plan::Plan`] driver (argv `nifler --portablePaths --deps parse <file> <out>`),
 /// grant it `{fs, stdout, exit}` + the child `Module` + an `Instantiator`, and stand up the resumable
 /// root over a linear-memory window. Drive with [`temen_op13jit_step`] (which does the child-entry setup
 /// and runs the child EMITTED over its carve); after `OP13JIT_DONE`, read the produced `.p.nif` with
@@ -12127,7 +12128,7 @@ fn parse_packed_files(b: &[u8]) -> Option<Vec<(String, Vec<u8>)>> {
 }
 
 /// Shared core of the op-13 tier-up phase drivers: decode+verify the `--child-entry` phase module,
-/// seed `seeds` into a shared memfs, build the `{fs, stdout, exit[, exec]}` `nimc::detached_parent_src`
+/// seed `seeds` into a shared memfs, build the `{fs, stdout, exit[, exec]}` one-node [`plan::Plan`]
 /// driver over `argv`, and stand up the resumable root the JS loop ([`temen_op13jit_step`]) drives —
 /// the phase runs **detached** (#1288): the servicer mints it its own `WebAssembly.Memory`, emits it and
 /// stages [`OP13JIT_CHILD_DETACHED`]. No carve, no `PHASE_CARVE_MAX`: the child grows into its own memory
@@ -12198,7 +12199,10 @@ unsafe fn op13_phase_open_impl(
     } else {
         &["fs", "stdout", "exit", "exec"]
     };
-    let driver_src = nimc::detached_parent_src(decl, argv, caps);
+    let plan = plan::Plan::single(decl, argv, caps);
+    let Ok(driver_src) = plan.root_src() else {
+        return -STATUS_UNSUPPORTED;
+    };
     let Ok(driver) = temen_text::parse_module(&driver_src) else {
         return -STATUS_DECODE_ERR;
     };
@@ -12219,21 +12223,7 @@ unsafe fn op13_phase_open_impl(
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let win = 1u64 << 16; // the driver's own window: grant records + the args blob
-    let inst = host.grant_instantiator(0, win);
-    let modh = host.grant_module(&child);
-    // The minter's quota is the mint (the declared window); the minted memory's `maximum` bounds growth.
-    let minter = host.grant_budget(0, (1u64 << decl) as i64, 0);
-    // Grant args in the order the parent's params expect: inst, module, minter, then the caps. The exec
-    // (when present) is granted forkable so op-15's `regrant_into_child` can carry it (`can_regrant`).
-    let mut grant_args = vec![
-        Value::I32(inst),
-        Value::I32(modh),
-        Value::I32(minter),
-        Value::I32(fs_h),
-        Value::I32(stdout_h),
-        Value::I32(exit_h),
-    ];
+    let mut cap_handles = vec![fs_h, stdout_h, exit_h];
     // The `exec` cap = `make_exec` over the SAME shared memfs (`factory`) — for nimsem's `exec("nifler …
     // parse …")` sub-spawn. Two postures (see [`ExecMode`]): `Inline` runs the top-level nifler on the
     // interpreter (`make_exec`'s `None` grandchild arm; #1364, the memory-lean whole-card path), `Grandchild`
@@ -12269,8 +12259,12 @@ unsafe fn op13_phase_open_impl(
             })
         };
         let exec_h = host.grant_host_proc_forkable(exec_init, exec_fork);
-        grant_args.push(Value::I32(exec_h));
+        cap_handles.push(exec_h);
     }
+    // The driver's Instantiator, the child `Module` and the budget its window is minted from (quota = the
+    // declared window; the minted memory's `maximum` bounds growth), in the order its params expect.
+    let grant_args = plan.root_args(&mut host, &[&child], &cap_handles);
+    let win = 1u64 << plan::ROOT_WINDOW_LOG2; // the driver's own window: grant records + the args blob
 
     let Ok(layout) = Layout::from_size_align(win as usize, 8) else {
         unsafe { drop(Box::from_raw(prog)) };
