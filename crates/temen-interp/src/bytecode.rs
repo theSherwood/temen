@@ -6569,10 +6569,12 @@ enum DbgTaskState {
         slot: usize,
         dst: u32,
     },
-    /// Parked on `memory.wait` at futex key `key` until `memory.notify` or the logical `clock` reaches
-    /// `deadline`; the status (`WAIT_WOKEN` / `WAIT_TIMED_OUT`) lands at `dst`.
+    /// Parked on `memory.wait` at address `addr` of its own window until a `memory.notify` whose
+    /// futex key matches, or the logical `clock` reaches `deadline`; the status (`WAIT_WOKEN` /
+    /// `WAIT_TIMED_OUT`) lands at `dst`. The key is computed at notify time, from the windows as they
+    /// are then, so it survives a `restore` that rebuilds a child's window.
     BlockedWait {
-        key: u64,
+        addr: u64,
         /// Logical-clock deadline, or `None` for an infinite wait — which is therefore not a
         /// clock-advance candidate in `dbg_pick_runnable` (#1638).
         deadline: Option<u64>,
@@ -6866,7 +6868,7 @@ fn trace_tags(tasks: &[DbgTask]) -> Vec<(u8, u64)> {
         .map(|t| match t.state {
             DbgTaskState::Runnable => (0, 0),
             DbgTaskState::BlockedJoin { child, .. } => (1, child as u64),
-            DbgTaskState::BlockedWait { key, .. } => (2, key),
+            DbgTaskState::BlockedWait { addr, .. } => (2, addr),
             DbgTaskState::Done(_) => (3, 0),
             DbgTaskState::BlockedStdin => (4, 0),
             DbgTaskState::CapParked { id, .. } => (5, id),
@@ -7115,11 +7117,12 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                dbg_wait(tasks, ti, mem, clock, base, expected, width, timeout, dst);
+                let m = dbg_env_mem(mem, extra_envs, tasks[ti].env);
+                dbg_wait(tasks, ti, m, clock, base, expected, width, timeout, dst);
             }
             Outcome::MemoryNotify { base, count, dst } => {
                 *turn += 1;
-                dbg_notify(tasks, ti, base, count, dst);
+                dbg_notify(tasks, ti, mem, extra_envs, base, count, dst);
             }
             // §14 `instantiate` (op 0): spawn a confined executor child as its own scheduled vCPU.
             Outcome::Instantiate {
@@ -7842,13 +7845,32 @@ fn step_active_invoke(
     }
 }
 
-/// `memory.wait`: park the caller on futex key `base` until a `notify` or the deadline, unless the
-/// value already changed (the compare-under-lock analogue). Mirrors `drive`'s `Wait`.
+/// The window a task steps against: its §14 env's, or the root's for `env == None`.
+fn dbg_env_mem<'a>(
+    mem: &'a Option<Mem>,
+    envs: &'a [DbgEnv],
+    env: Option<usize>,
+) -> Option<&'a Mem> {
+    match env {
+        None => mem.as_ref(),
+        Some(k) => envs[k].mem.as_ref(),
+    }
+}
+
+/// The futex rendezvous key of `addr` in window `m` (#1731): backing identity plus address, as the
+/// cooperative driver keys it. Every detached window starts at base 0, so the address alone would
+/// rendezvous across windows (#1283).
+fn dbg_futex_key(m: Option<&Mem>, addr: u64) -> super::FutexKey {
+    m.map_or(super::FutexKey::Anon(0, addr), |m| m.futex_key(addr))
+}
+
+/// `memory.wait`: park the caller at `base` until a `notify` or the deadline, unless the value in its
+/// own window `mem` already changed (the compare-under-lock analogue). Mirrors `drive`'s `Wait`.
 #[allow(clippy::too_many_arguments)]
 fn dbg_wait(
     tasks: &mut [DbgTask],
     ti: usize,
-    mem: &Option<Mem>,
+    mem: Option<&Mem>,
     clock: u64,
     base: u64,
     expected: u64,
@@ -7856,10 +7878,7 @@ fn dbg_wait(
     timeout: Option<u64>,
     dst: u32,
 ) {
-    let cur = mem
-        .as_ref()
-        .map(|m| m.atomic_value(base, width))
-        .unwrap_or(0);
+    let cur = mem.map(|m| m.atomic_value(base, width)).unwrap_or(0);
     if cur != expected {
         tasks[ti]
             .vt
@@ -7867,7 +7886,7 @@ fn dbg_wait(
             .set(dst, Reg::from_i32(super::WAIT_NOT_EQUAL));
     } else {
         tasks[ti].state = DbgTaskState::BlockedWait {
-            key: base,
+            addr: base,
             // #1638: an infinite wait carries no deadline, so it is not a clock-advance
             // candidate below — it ends by `notify` or not at all (the deadlock exit).
             deadline: timeout.map(|t| clock.saturating_add(t)),
@@ -7876,17 +7895,30 @@ fn dbg_wait(
     }
 }
 
-/// `memory.notify`: wake up to `count` waiters on `base` (lowest task index first, deterministic); the
-/// woken count lands at `dst`. Mirrors `drive`'s `Notify`.
-fn dbg_notify(tasks: &mut [DbgTask], ti: usize, base: u64, count: i32, dst: u32) {
+/// `memory.notify`: wake up to `count` waiters whose futex key matches `base` in the caller's window
+/// (lowest task index first, deterministic); the woken count lands at `dst`. Mirrors `drive`'s
+/// `Notify`.
+fn dbg_notify(
+    tasks: &mut [DbgTask],
+    ti: usize,
+    mem: &Option<Mem>,
+    envs: &[DbgEnv],
+    base: u64,
+    count: i32,
+    dst: u32,
+) {
+    let key = dbg_futex_key(dbg_env_mem(mem, envs, tasks[ti].env), base);
     let want = count as u32;
     let mut woken = 0u32;
     for t in tasks.iter_mut() {
         if woken >= want {
             break;
         }
-        if let DbgTaskState::BlockedWait { key, dst: wdst, .. } = t.state {
-            if key == base {
+        if let DbgTaskState::BlockedWait {
+            addr, dst: wdst, ..
+        } = t.state
+        {
+            if dbg_futex_key(dbg_env_mem(mem, envs, t.env), addr) == key {
                 t.vt.active.set(wdst, Reg::from_i32(super::WAIT_WOKEN));
                 t.state = DbgTaskState::Runnable;
                 woken += 1;
