@@ -14973,9 +14973,10 @@ fn coop_emit_for(m0: &temen_ir::Module, shared: bool, win_log2: u8) -> Result<Co
             shared,
             table_log2 as u32,
             page_log2,
+            false, // #1627 slice C wires the spill region
         )
     } else if all_shimmable {
-        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32)
+        temen_wasm_jit::compile_module_tierup_b2(&emit_m, shared, table_log2 as u32, false)
     } else {
         temen_wasm_jit::compile_module_tierup(&emit_m, shared)
     };

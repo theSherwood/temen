@@ -92,6 +92,10 @@ pub const TRAP_OUT_OF_FUEL: i32 = 1;
 /// Trap code delivered through `env.trap` when an access fails the trap-confinement bounds
 /// check (`addr + offset + width > mapped` — the §4 `MemoryFault` at the offending access).
 pub const TRAP_MEMORY_FAULT: i32 = 2;
+/// Trap code delivered through `env.trap` when a #1627 spill push would run past the host's spill
+/// region (`[ENV_SPILL_SP_OFF] + bytes > [ENV_SPILL_END_OFF]`) — the spill-mode analogue of the
+/// interpreter's call-depth `StackOverflow`, which is how the host reports it.
+pub const TRAP_SPILL_OVERFLOW: i32 = 3;
 
 /// Why a module was refused. Fail-closed: the caller runs the module on the interpreter tier.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1234,10 +1238,12 @@ fn module_uses_page_ops(m: &Module) -> bool {
 ///   why narrowing the cross set alone cannot fix this, and why the veto is module-wide.
 ///
 /// The cost is bounded: a collecting guest runs wholly on the interpreter, which is the only tier
-/// that can see its roots at all. A precise wasm-tier realization is possible in principle (the
-/// durable transform's shadow stack already computes the live set in verified IR, DURABILITY.md §2);
-/// #1546 §3 tracks it, and until it exists this is a limitation of the *conservative-scan
-/// realization*, not of the capability.
+/// that can see its roots at all.
+///
+/// **The exception (#1627):** the B2 tier-up entries take `gc_spill`, which lifts this veto. Every
+/// emitted frame that can sit beneath the op then pushes its live values to a host-owned spill
+/// stack around the call ([`emit_spill_push`]), and the bounce scans them. Every other entry keeps
+/// the veto.
 fn module_uses_gc_roots(m: &Module) -> bool {
     m.funcs.iter().any(Func::uses_gc_roots)
 }
@@ -1491,13 +1497,23 @@ fn func_uses_indirect(f: &Func) -> bool {
 ///
 /// **Keep the seeds in lockstep with `drive_nested`'s match arms.** Widening that loop to service an
 /// op (e.g. over #1359's yielding bounce) is what earns dropping a seed here — not the reverse.
-fn bounce_serviceable(m: &Module) -> Vec<bool> {
+fn bounce_serviceable(m: &Module, gc_spill: bool) -> Vec<bool> {
+    // #1627: in spill mode every emitted frame beneath a bounce has pushed its live words, so a
+    // bounce into `gc.roots` scans them (`CoopRun::bounce`'s `spill`) and the fourth seed drops.
+    reaches(m, |f| {
+        f.uses_threads() || f.uses_futex() || f.uses_suspend() || (!gc_spill && f.uses_gc_roots())
+    })
+    .into_iter()
+    .map(|b| !b)
+    .collect()
+}
+
+/// `out[i]` ⇔ function `i` can transitively reach a function satisfying `seed`: through a direct
+/// call, or — once any function is a seed — through any `call.dyn` (fail-closed on indirect reach,
+/// the posture [`analyze_from`] takes).
+fn reaches(m: &Module, seed: impl Fn(&Func) -> bool) -> Vec<bool> {
     let n = m.funcs.len();
-    let mut bad: Vec<bool> = m
-        .funcs
-        .iter()
-        .map(|f| f.uses_threads() || f.uses_futex() || f.uses_suspend() || f.uses_gc_roots())
-        .collect();
+    let mut bad: Vec<bool> = m.funcs.iter().map(seed).collect();
     // Monotone (only sets), so it converges in ≤ n passes.
     loop {
         let mut changed = false;
@@ -1519,7 +1535,7 @@ fn bounce_serviceable(m: &Module) -> Vec<bool> {
             break;
         }
     }
-    bad.into_iter().map(|b| !b).collect()
+    bad
 }
 
 /// Whether `f` is safe to run as a cross-tier interpreter leaf (see [`Analysis::interp_leaf`]).
@@ -1729,9 +1745,18 @@ pub const XCALL_MAX_SLOTS: usize = 64;
 const GROUP_SCRATCH_SLOTS: usize = 256;
 /// Byte offset of the group-edge scratch in the `env` cell (past fuel + the call scratch).
 const GROUP_SCRATCH_OFF: u64 = ENV_SCRATCH_OFF + (XCALL_MAX_SLOTS as u64) * 8;
+/// #1627 — the **spill stack** cursor, past the group scratch: an `i32` linear-memory address the
+/// emitted code bumps by each push and restores after the call ([`emit_spill_push`]). Read and
+/// written only by modules compiled with `gc_spill` (the B2 tier-up entries); the host points it at
+/// the base of a region outside the guest window before the outermost entry into emitted code, and
+/// at a bounce hands `[base, cursor)` to `CoopRun::bounce` as the emitted frames' live words.
+pub const ENV_SPILL_SP_OFF: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_SLOTS * 8;
+/// #1627 — the spill region's end (`i32`, exclusive). A push that would cross it traps
+/// [`TRAP_SPILL_OVERFLOW`] instead of writing.
+pub const ENV_SPILL_END_OFF: usize = ENV_SPILL_SP_OFF + 4;
 /// Bytes the host must allocate for the `env` cell: the `i64` fuel counter + the cross-tier call scratch
-/// + the group-edge scratch.
-pub const ENV_CELL_BYTES: usize = GROUP_SCRATCH_OFF as usize + GROUP_SCRATCH_SLOTS * 8;
+/// + the group-edge scratch + the spill cursor pair.
+pub const ENV_CELL_BYTES: usize = ENV_SPILL_END_OFF + 4;
 
 /// Compile every function of a **verified** `m` into one wasm module (whole-module, all-integer).
 /// Exports `f{i}` per Temen function; imports `env.memory` (shared iff `shared_memory`), `env.trap`,
@@ -1765,6 +1790,7 @@ pub fn compile_module_with(m: &Module, shared_memory: bool) -> Result<Vec<u8>, E
         false,
         None,
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
+        &[],
         &[],
         &[],
     )
@@ -1813,6 +1839,7 @@ pub fn compile_module_with_split(
         Some(temen_ir::module_null_guard()),
         &[],
         &split_plan,
+        &[],
     )
 }
 
@@ -1922,6 +1949,7 @@ fn compile_module_nested_inner(
         true,
         paged,
         null_guard,
+        &[],
         &[],
         &[],
     )?;
@@ -2177,6 +2205,7 @@ pub fn compile_module_b2(
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
         &[],
+        &[],
     )
 }
 
@@ -2232,6 +2261,7 @@ pub fn compile_module_b2_split(
         Some(temen_ir::module_null_guard()),
         &[],
         &split_plan,
+        &[],
     )
 }
 
@@ -2299,6 +2329,7 @@ pub fn compile_module_split(
         None,
         emit_null_guard_extent(m),
         &cross_module,
+        &[],
         &[],
     )
 }
@@ -2774,6 +2805,7 @@ fn compile_module_reactor_inner(
             emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
             &[],
             &split_plan,
+            &[],
         )?;
         // Measure the emitted bodies and pull any over-large *marshallable* one out for a re-emit as a
         // cross-tier leaf. An over-large body that can't be crossed (non-marshallable sig) has nowhere
@@ -2869,6 +2901,7 @@ pub fn compile_module_reactor_keep(
         emit_null_guard_extent(m), // #964/#1094: the guard is unconditional on every entry
         &[],
         &[],
+        &[],
     )?;
     Ok((wasm, emitted_bitmap))
 }
@@ -2914,6 +2947,7 @@ pub fn compile_module_tierup_caps(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
+        false,
     )
 }
 
@@ -2937,10 +2971,20 @@ pub fn compile_module_tierup_caps(
 /// window/powerbox/fuel (the pump's `temen_onramp_tierup_call_interp` → the live-state bounce) — the
 /// same contract the bounce shims already impose — not the throwaway-window bounce the leaf-only
 /// drivers use.
+///
+/// #1627 — `gc_spill` lifts the #1546 `gc.roots` veto for this mode. A module that can reach the op
+/// then emits a **spill push** around every call that can reach it ([`emit_spill_push`]): the
+/// call site's live values go to the spill stack named by the env cell's
+/// [`ENV_SPILL_SP_OFF`]/[`ENV_SPILL_END_OFF`] pair, and the cursor is restored when the call
+/// returns. The host contract grows accordingly: point the cursor at a region outside the window
+/// before the outermost entry into emitted code (not a nested one — a bounce can re-enter), and at
+/// a bounce pass `[base, cursor)` to `CoopRun::bounce`, whose drive then scans those words beneath
+/// it. A module that does not use `gc.roots` emits byte-identical code either way.
 pub fn compile_module_tierup_b2(
     m: &Module,
     shared_memory: bool,
     table_log2: u32,
+    gc_spill: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     compile_module_tierup_inner(
         m,
@@ -2950,6 +2994,7 @@ pub fn compile_module_tierup_b2(
         Some(table_log2),
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
+        gc_spill,
     )
 }
 
@@ -2971,6 +3016,7 @@ pub fn compile_module_tierup_b2_budgeted(
         Some(table_log2),
         None,
         module_budget,
+        false,
     )
 }
 
@@ -2984,11 +3030,13 @@ pub fn compile_module_tierup_b2_budgeted(
 /// of both — service `env.call_interp` over the **live** window (B2), and before each emitted call
 /// refresh the page-state table from the live map and write its base to `"pagestate"` + its coverage
 /// to `"mapped"` (#750). This is what the single-shot pump uses for a rodata-bearing card.
+/// `gc_spill` is [`compile_module_tierup_b2`]'s.
 pub fn compile_module_tierup_b2_paged(
     m: &Module,
     shared_memory: bool,
     table_log2: u32,
     page_log2: u8,
+    gc_spill: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     compile_module_tierup_inner(
         m,
@@ -2998,6 +3046,7 @@ pub fn compile_module_tierup_b2_paged(
         Some(table_log2),
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
+        gc_spill,
     )
 }
 
@@ -3029,6 +3078,7 @@ pub fn compile_module_tierup_paged(
         None,
         None,
         MAX_EST_EMITTED_MODULE_BYTES,
+        false,
     )
 }
 
@@ -3060,6 +3110,7 @@ pub fn compile_module_tierup_nullguard(
         None,
         Some(guard),
         MAX_EST_EMITTED_MODULE_BYTES,
+        false,
     )
 }
 
@@ -3072,6 +3123,7 @@ fn compile_module_tierup_inner(
     reserved_table_log2: Option<u32>,
     null_guard: Option<u64>,
     module_budget: usize,
+    gc_spill: bool,
 ) -> Result<(Vec<u8>, Vec<bool>), Error> {
     // #964/#1094: every module opts into the NULL guard — derive it from `module_null_guard`
     // (unconditional now) whenever the caller didn't force one (the measurement entry still can), so
@@ -3106,6 +3158,7 @@ fn compile_module_tierup_inner(
             nested_caps,
             paged,
             null_guard,
+            &[],
             &[],
             &[],
         )?;
@@ -3144,7 +3197,18 @@ fn compile_module_tierup_inner(
     // here, at the funnel every tier-up entry shares, so no mode can acquire an emitted frame that
     // the op would fail to scan. The compile still succeeds: an all-`false` bitmap is the ordinary
     // "runs on the interpreter" shape, not an error.
-    let gc_veto = module_uses_gc_roots(m);
+    //
+    // #1627: unless the entry asked for spill mode (B2 only — its bounce is the one that can scan
+    // spilled words), where every emitted frame that can sit beneath the op pushes its live values
+    // instead. `gc_reach[i]` ⇔ a call to `i` can reach the op, and is empty when nothing spills.
+    debug_assert!(!gc_spill || (reserved_table_log2.is_some() && !nested_caps));
+    let uses_gc = module_uses_gc_roots(m);
+    let gc_veto = uses_gc && !gc_spill;
+    let gc_reach = if uses_gc && gc_spill {
+        reaches(m, Func::uses_gc_roots)
+    } else {
+        Vec::new()
+    };
     // The cross-tier set — functions an emitted `Call`/`call.dyn` routes to `env.call_interp`.
     // Two widths, by who services the bounce:
     //   * **local table** (`reserved_table_log2 == None`): the strict [`interp_leaf`] set —
@@ -3162,7 +3226,7 @@ fn compile_module_tierup_inner(
     // (transitively) uses threads/futex/`suspend` cannot complete — and #1546: one that reaches
     // `gc.roots` *would* complete, with this emitted frame's roots unscanned. Both are seeds of
     // [`bounce_serviceable`], which cascades their callers off the emit set.
-    let serviceable = bounce_serviceable(m);
+    let serviceable = bounce_serviceable(m, gc_spill);
     let leaf: Vec<bool> = (0..n)
         .map(|i| {
             !in_subset[i]
@@ -3239,6 +3303,7 @@ fn compile_module_tierup_inner(
         null_guard,
         &[],
         &[],
+        &gc_reach,
     )?;
     Ok((wasm, emit))
 }
@@ -3338,6 +3403,7 @@ fn compile_interp_only(
         nested_caps,
         None,
         emit_null_guard_extent(m), // #964 (vacuous here — no bodies — but kept uniform)
+        &[],
         &[],
         &[],
     )?;
@@ -3465,6 +3531,7 @@ fn emit_module(
     null_guard: Option<u64>,
     cross_module: &[bool],
     split_plan: &[Option<Vec<usize>>],
+    gc_reach: &[bool],
 ) -> Result<Vec<u8>, Error> {
     // #1120 Slice 2b intra-function split: `split_plan[fi] = Some(block_group)` ⇒ emit function `fi` as
     // its wrapper (at its normal index) plus K appended block-group functions. Empty ⇒ no splitting (the
@@ -3780,6 +3847,7 @@ fn emit_module(
                 paged,
                 null_guard,
                 cross_module,
+                gc_reach,
             )?);
         }
     }
@@ -3807,6 +3875,7 @@ fn emit_module(
                 nested_caps,
                 paged,
                 null_guard,
+                gc_reach,
             )?);
             group_type_idx.push(fs.group_type);
         }
@@ -4404,6 +4473,9 @@ struct FnCtx {
     /// i64 locals otherwise (TurboFan drops them).
     span_page_l: u32,
     span_last_page_l: u32,
+    /// #1627 spill mode: the `i32` local holding the spill cursor a call site pushed from, which
+    /// [`emit_spill_pop`] writes back after the call. `None` outside spill mode.
+    spill_l: Option<u32>,
     /// Open label count inside the body; the dispatcher `loop` is the first label opened, so a
     /// branch back to it from depth `d` is `br (d - 1)`.
     depth: u32,
@@ -4446,6 +4518,7 @@ fn emit_func(
     paged: Option<u8>,
     null_guard: Option<u64>,
     cross_module: &[bool],
+    gc_reach: &[bool],
 ) -> Result<Vec<u8>, Error> {
     let n_params = 2 + f.params.len() as u32; // win, env, then the Temen params
 
@@ -4543,6 +4616,11 @@ fn emit_func(
     local_types.push(ValType::I64);
     let span_last_page_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I64);
+    // #1627: the spill cursor saved across one call ([`emit_spill_push`]) — spill mode only.
+    let spill_l = (!gc_reach.is_empty()).then(|| {
+        local_types.push(ValType::I32);
+        n_params + local_types.len() as u32 - 1
+    });
 
     let mut cx = FnCtx {
         local_of,
@@ -4552,6 +4630,7 @@ fn emit_func(
         atomic_addr_l,
         span_page_l,
         span_last_page_l,
+        spill_l,
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         // The pagestate global (paged mode only) sits immediately after `mapped`.
@@ -4618,6 +4697,7 @@ fn emit_func(
             nested_caps,
             cross_module,
             None, // monolithic emit: no block-group split
+            gc_reach,
         )?;
     }
     code.push(OP_END); // close the loop
@@ -4667,6 +4747,7 @@ fn emit_split_group(
     nested_caps: bool,
     paged: Option<u8>,
     null_guard: Option<u64>,
+    gc_reach: &[bool],
 ) -> Result<Vec<u8>, Error> {
     let n_params = 3u32; // win, env, entry
     let nblocks = f.blocks.len();
@@ -4751,6 +4832,11 @@ fn emit_split_group(
     local_types.push(ValType::I64);
     let span_last_page_l = n_params + local_types.len() as u32;
     local_types.push(ValType::I64);
+    // #1627: the spill cursor saved across one call ([`emit_spill_push`]) — spill mode only.
+    let spill_l = (!gc_reach.is_empty()).then(|| {
+        local_types.push(ValType::I32);
+        n_params + local_types.len() as u32 - 1
+    });
 
     let mut cx = FnCtx {
         local_of,
@@ -4760,6 +4846,7 @@ fn emit_split_group(
         atomic_addr_l,
         span_page_l,
         span_last_page_l,
+        spill_l,
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: paged.map(|pl| (pl, PAGESTATE_GLOBAL_IDX)),
@@ -4860,6 +4947,7 @@ fn emit_split_group(
             nested_caps,
             &[],
             Some(split),
+            gc_reach,
         )?;
     }
     code.push(OP_END); // close the trap default arm
@@ -4904,6 +4992,7 @@ fn emit_split_wrapper(f: &Func, entry_ord0: u32, group0_widx: u32) -> Result<Vec
         atomic_addr_l: 0,
         span_page_l: 0,
         span_last_page_l: 0,
+        spill_l: None,
         depth: 0,
         mapped_global_idx: MAPPED_GLOBAL_IDX,
         page_check: None,
@@ -5168,6 +5257,7 @@ pub fn compile_split_fn(
                 None,
                 null_guard,
                 &[],
+                &[],
             )?);
         }
     }
@@ -5186,6 +5276,7 @@ pub fn compile_split_fn(
             false,
             None,
             null_guard,
+            &[],
         )?);
     }
 
@@ -5910,6 +6001,121 @@ fn emit_edge(
     uleb(code, cx.next_l as u64);
 }
 
+/// #1627 — `last[v]` is the index of the last instruction of `b` that reads value `v`
+/// (`b.insts.len()` for the terminator; `0` if nothing does). Values are block-scoped (see
+/// [`emit_func`]), so this is all the liveness a call site needs: `v` is live across the call at `j`
+/// iff `last[v] > j`.
+fn last_uses(b: &Block, n_vals: usize) -> Vec<usize> {
+    let mut last = vec![0; n_vals];
+    for (j, inst) in b.insts.iter().enumerate() {
+        inst.clone().for_each_operand_mut(&mut |v| {
+            if let Some(l) = last.get_mut(*v as usize) {
+                *l = j;
+            }
+        });
+    }
+    b.term.clone().for_each_operand_mut(&mut |v| {
+        if let Some(l) = last.get_mut(*v as usize) {
+            *l = b.insts.len();
+        }
+    });
+    last
+}
+
+/// #1627 — before the call at instruction `j` of block `k`, push every value it leaves live
+/// (defined before it, read after it) to the spill stack as 8-byte words (a `v128` takes two), so a
+/// `gc.roots` in a bounce beneath this frame scans them (`CoopRun::bounce`'s `spill`). Returns
+/// whether it pushed: a call with nothing live across it pushes nothing and needs no
+/// [`emit_spill_pop`]. Traps [`TRAP_SPILL_OVERFLOW`] rather than write past the region's end.
+/// `ref`/`cap` values are table indices and handles, never window words, so they are not pushed.
+///
+/// The addresses come only from the host-written env cell, never from a guest value — the same
+/// footing as the cross-tier scratch — so this is no confinement surface.
+fn emit_spill_push(
+    cx: &mut FnCtx,
+    code: &mut Vec<u8>,
+    k: usize,
+    tys: &[ValType],
+    last: &[usize],
+    j: usize,
+    defined: usize,
+) -> bool {
+    let Some(sp) = cx.spill_l else {
+        return false;
+    };
+    let live: Vec<usize> = (0..defined)
+        .filter(|&v| last[v] > j && !matches!(tys[v], ValType::Ref | ValType::Cap))
+        .collect();
+    if live.is_empty() {
+        return false;
+    }
+    let bytes: u64 = live.iter().map(|&v| slots_of(tys[v]) * 8).sum();
+    // sp = [env + SP]; trap unless sp + bytes <= [env + END].
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    code.push(0x28); // i32.load
+    code.push(0x02);
+    uleb(code, ENV_SPILL_SP_OFF as u64);
+    code.push(OP_LOCAL_TEE);
+    uleb(code, sp as u64);
+    code.push(OP_I32_CONST);
+    sleb32(code, bytes as i32);
+    code.push(0x6a); // i32.add
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    code.push(0x28); // i32.load
+    code.push(0x02);
+    uleb(code, ENV_SPILL_END_OFF as u64);
+    code.push(0x4b); // i32.gt_u
+    code.push(OP_IF);
+    code.push(BLOCKTYPE_VOID);
+    cx.depth += 1;
+    emit_trap(code, TRAP_SPILL_OVERFLOW);
+    code.push(OP_END);
+    cx.depth -= 1;
+    let mut off = 0u64;
+    for v in live {
+        code.push(OP_LOCAL_GET);
+        uleb(code, sp as u64);
+        code.push(OP_I32_CONST);
+        sleb32(code, off as i32);
+        code.push(0x6a); // i32.add
+        code.push(OP_LOCAL_GET);
+        uleb(code, cx.local_of[k][v] as u64);
+        if tys[v] == ValType::F32 {
+            code.push(0xbc); // i32.reinterpret_f32: a whole zero-extended word, like an i32
+            emit_slot_store(code, ValType::I32);
+        } else {
+            emit_slot_store(code, tys[v]);
+        }
+        off += slots_of(tys[v]) * 8;
+    }
+    // Publish the bumped cursor, so a nested push lands above these words.
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    code.push(OP_LOCAL_GET);
+    uleb(code, sp as u64);
+    code.push(OP_I32_CONST);
+    sleb32(code, bytes as i32);
+    code.push(0x6a); // i32.add
+    code.push(0x36); // i32.store
+    code.push(0x02);
+    uleb(code, ENV_SPILL_SP_OFF as u64);
+    true
+}
+
+/// #1627 — after a call [`emit_spill_push`] pushed around, restore the cursor it pushed from.
+fn emit_spill_pop(cx: &FnCtx, code: &mut Vec<u8>) {
+    let sp = cx.spill_l.expect("a push happened, so spill mode is on");
+    code.push(OP_LOCAL_GET);
+    uleb(code, 1); // env
+    code.push(OP_LOCAL_GET);
+    uleb(code, sp as u64);
+    code.push(0x36); // i32.store
+    code.push(0x02);
+    uleb(code, ENV_SPILL_SP_OFF as u64);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_block_body(
     m: &Module,
@@ -5927,6 +6133,7 @@ fn emit_block_body(
     nested_caps: bool,
     cross_module: &[bool],
     split: Option<&SplitCtx>,
+    gc_reach: &[bool],
 ) -> Result<(), Error> {
     let is_xmod = |i: usize| cross_module.get(i).copied().unwrap_or(false);
     let mut next_val = b.params.len(); // where the next instruction's results land
@@ -5942,7 +6149,13 @@ fn emit_block_body(
         code.push(OP_LOCAL_GET);
         uleb(code, cx.local_of[k][v as usize] as u64);
     };
-    for inst in &b.insts {
+    // #1627 spill mode: where each value is last read, so a call site pushes exactly the live ones.
+    let last_use = if cx.spill_l.is_some() {
+        last_uses(b, value_types.len())
+    } else {
+        Vec::new()
+    };
+    for (j, inst) in b.insts.iter().enumerate() {
         let val_before = next_val;
         match inst {
             Inst::ConstI32(v) => {
@@ -6382,6 +6595,8 @@ fn emit_block_body(
             Inst::Call { func, args } => {
                 let callee = &m.funcs[*func as usize];
                 let n_results = callee.results.len();
+                let spilled = gc_reach.get(*func as usize).copied().unwrap_or(false)
+                    && emit_spill_push(cx, code, k, value_types, &last_use, j, next_val);
                 match wasm_of[*func as usize] {
                     // Same-tier: a direct wasm call to the emitted function (win/env threaded).
                     Some(widx) => {
@@ -6483,6 +6698,9 @@ fn emit_block_body(
                         }
                     }
                 }
+                if spilled {
+                    emit_spill_pop(cx, code);
+                }
                 next_val += n_results;
             }
             // A funcref is the function index as plain `i32` data (§3c) — `RefFunc { func }` ⇒
@@ -6500,6 +6718,9 @@ fn emit_block_body(
             Inst::CallIndirect { ty, idx, args } => {
                 let ft = sig_of(&m.types, *ty); // #922: resolve interned call type index
                 let n_results = ft.results.len();
+                // #1627: any slot may hold a bounce shim into a collector (see `reaches`).
+                let spilled = !gc_reach.is_empty()
+                    && emit_spill_push(cx, code, k, value_types, &last_use, j, next_val);
                 code.push(OP_LOCAL_GET);
                 uleb(code, 0); // win
                 code.push(OP_LOCAL_GET);
@@ -6517,6 +6738,9 @@ fn emit_block_body(
                 for i in (0..n_results).rev() {
                     code.push(OP_LOCAL_SET);
                     uleb(code, cx.local_of[k][next_val + i] as u64);
+                }
+                if spilled {
+                    emit_spill_pop(cx, code);
                 }
                 next_val += n_results;
             }

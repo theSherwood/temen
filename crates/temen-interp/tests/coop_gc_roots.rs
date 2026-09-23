@@ -57,9 +57,10 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
         eligible: std::sync::Arc::from(vec![false, true, false]),
         page_checked: false,
     };
-    let mut run = bytecode::CoopRun::new(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))
-        .expect("supported")
-        .expect("entry in range");
+    let mut run =
+        bytecode::CoopRun::new(&m, 0, &[Value::I64(root)], FUEL, Host::new(), Some(tierup))
+            .expect("supported")
+            .expect("entry in range");
     loop {
         match run.run() {
             bytecode::CoopEvent::Done(vals) => return Ok(vals),
@@ -67,10 +68,8 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
             bytecode::CoopEvent::TierUp { func, .. } => {
                 assert_eq!(func, 1, "only func 1 is eligible");
                 let mut io = vec![0i64; 8];
-                match run.bounce(2, &mut io, spill) {
-                    Ok(n) => run.deliver_tierup(&io[..n]),
-                    Err(t) => return Err(t),
-                }
+                let n = run.bounce(2, &mut io, spill)?;
+                run.deliver_tierup(&io[..n]);
             }
             _ => panic!("unexpected event (no fibers, threads or JIT units in this guest)"),
         }
@@ -80,7 +79,10 @@ fn run_with_spill(root: i64, spill: Option<&[u64]>) -> Result<Vec<Value>, Trap> 
 #[test]
 fn bounce_scans_the_paused_task_and_the_spilled_words() {
     // Roots: the collector's 4096, the paused func 0's 5000, the spilled 6000 → total 3; + 5000.
-    assert_eq!(run_with_spill(5000, Some(&[6000])), Ok(vec![Value::I64(5003)]));
+    assert_eq!(
+        run_with_spill(5000, Some(&[6000])),
+        Ok(vec![Value::I64(5003)])
+    );
 }
 
 #[test]
@@ -92,7 +94,10 @@ fn an_empty_spill_stack_still_scans_the_paused_task() {
 #[test]
 fn spilled_words_are_range_filtered_like_any_candidate() {
     // Out-of-range spilled words are not roots: still {4096, 5000} → total 2; + 5000.
-    assert_eq!(run_with_spill(5000, Some(&[1, 9000, u64::MAX])), Ok(vec![Value::I64(5002)]));
+    assert_eq!(
+        run_with_spill(5000, Some(&[1, 9000, u64::MAX])),
+        Ok(vec![Value::I64(5002)])
+    );
 }
 
 #[test]

@@ -14595,7 +14595,9 @@ fn coop_bounce(
     let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
     vm.module = ts.module as usize;
     // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
-    let vals = drive_nested(source, table, vm, fuel, mem, host, fibers, fiber_meta, beneath)?;
+    let vals = drive_nested(
+        source, table, vm, fuel, mem, host, fibers, fiber_meta, beneath,
+    )?;
     for (i, v) in vals.iter().enumerate() {
         io[i] = val_to_slot(*v);
     }

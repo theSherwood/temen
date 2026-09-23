@@ -103,7 +103,7 @@ fn an_emitted_frame_follows_the_window_across_a_relocating_bounce() {
     // The **B2** emit — the shape the cooperative driver runs (`coop_emit_for`): a shared reserved
     // dispatch table and the #888 widened cross-tier set, so an in-subset leaf that calls a
     // cap-bearing helper stays emitted with its bounce intact. That bounce is the whole point here.
-    let (wasm, eligible) = compile_module_tierup_b2(&m, false, TABLE_LOG2).expect("emit");
+    let (wasm, eligible) = compile_module_tierup_b2(&m, false, TABLE_LOG2, false).expect("emit");
     assert!(
         eligible[1] && !eligible[2],
         "the leaf emits; the cap-bearing helper stays interpreter-resident (so `call 2` bounces): {eligible:?}"

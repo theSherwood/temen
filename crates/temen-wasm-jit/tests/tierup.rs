@@ -399,7 +399,7 @@ fn widened_cross_tier_uncascades_the_caller() {
         vec![false, false, false],
         "local table: f1 cascades to the interpreter (f2 isn't a strict interp_leaf)"
     );
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, true, false],
@@ -474,7 +474,7 @@ fn futex_callee_is_not_a_widened_cross_tier_leaf() {
     );
     // B2 must now agree: f2 is not bounce-serviceable, so f1 cascades off rather than being emitted
     // into a bounce that CapFaults. Before #1370 this was `[false, true, false]`.
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],
@@ -492,8 +492,8 @@ fn the_futex_gate_does_not_narrow_the_888_widening() {
     let cap = build(CASCADE);
     // Identical shape (f0 interp-driven root, f1 pure compute calling f2); the ONLY difference is
     // what f2 does — futex ops vs a `call.cap`.
-    let (_, futex_widened) = compile_module_tierup_b2(&futex, false, 10).expect("B2 emit");
-    let (_, cap_widened) = compile_module_tierup_b2(&cap, false, 10).expect("B2 emit");
+    let (_, futex_widened) = compile_module_tierup_b2(&futex, false, 10, false).expect("B2 emit");
+    let (_, cap_widened) = compile_module_tierup_b2(&cap, false, 10, false).expect("B2 emit");
     assert_eq!(
         futex_widened,
         vec![false, false, false],
@@ -556,7 +556,7 @@ fn a_futex_reaching_callee_closure_is_not_a_leaf() {
     // f2's own body is clean — only f3 carries the futex. The closure is what disqualifies it.
     assert!(!m.funcs[2].uses_futex(), "f2's own body must be clean");
     assert!(m.funcs[3].uses_futex(), "f3 carries the futex");
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false, false],
@@ -602,7 +602,7 @@ block 0 (v0: i64) {
 fn a_suspending_callee_is_not_a_widened_cross_tier_leaf() {
     let m = build(SUSPEND_CALLEE);
     assert!(m.funcs[2].uses_suspend(), "f2 must carry the suspend");
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],
@@ -710,7 +710,7 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
     // With a futex op in the module, the indirect-dispatching callee f2 could reach it → not a leaf,
     // so f1 cascades off.
     let dirty = build(INDIRECT_DISPATCH);
-    let (_, widened) = compile_module_tierup_b2(&dirty, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&dirty, false, 10, false).expect("B2 tier-up emit");
     assert!(
         !widened[1],
         "an indirect callee may dispatch to the futex function, so its caller must cascade off: \
@@ -719,7 +719,8 @@ fn an_indirect_caller_is_gated_only_when_the_module_has_an_unserviceable_op() {
 
     // Same module, nothing unserviceable: the indirect clause is dormant and f1 still emits.
     let clean = build(INDIRECT_DISPATCH_CLEAN);
-    let (_, widened_clean) = compile_module_tierup_b2(&clean, false, 10).expect("B2 tier-up emit");
+    let (_, widened_clean) =
+        compile_module_tierup_b2(&clean, false, 10, false).expect("B2 tier-up emit");
     assert!(
         widened_clean[1],
         "with no unserviceable op anywhere the indirect clause must not fire — the #888 widening \
@@ -802,7 +803,7 @@ fn gc_roots_callee_is_not_a_cross_tier_leaf_on_either_table() {
     );
     // B2 widened table: same verdict by the bounce-serviceable seed. Before #1546: `[false, true,
     // false]`.
-    let (_, widened) = compile_module_tierup_b2(&m, false, 10).expect("B2 tier-up emit");
+    let (_, widened) = compile_module_tierup_b2(&m, false, 10, false).expect("B2 tier-up emit");
     assert_eq!(
         widened,
         vec![false, false, false],
