@@ -11689,18 +11689,9 @@ fn build_exec_req(
     // exec closed, before we mutate anything.
     let grants: Option<Vec<(String, i32)>> = (|| {
         let m = mem.as_ref()?;
-        let mut list = Vec::new();
-        for i in 0..grants_n {
-            let rec = m.read_window(grants_ptr + i * 16, 16).ok()?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name_bytes = m.read_window(name_off, name_len).ok()?;
-            let name = String::from_utf8(name_bytes).ok()?;
-            host.lock_unpoisoned().can_regrant(handle).then_some(())?;
-            list.push((name, handle));
-        }
-        Some(list)
+        let list = read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).ok()?;
+        let hg = host.lock_unpoisoned();
+        list.iter().all(|(_, h)| hg.can_regrant(*h)).then_some(list)
     })();
     // Admissibility: a resolvable non-durable command whose declared window **fits the
     // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
@@ -13178,37 +13169,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             let grants_ptr = sr.grants_ptr;
                             let grants_n = sr.grants_n;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    match serve_live_export(handle) {
-                                        // #744 — a live self-serve grant names one of OUR impl-exports,
-                                        // not a table handle: validate the export exists (its shape
-                                        // resolves). (A tagged value is negative, so `can_regrant`
-                                        // would refuse it as a non-grant — that is the fail-closed
-                                        // path every *other* record reader takes, unchanged.)
-                                        Some(k) => {
-                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
-                                        }
-                                        None => {
-                                            hg.can_regrant(handle)
-                                                .then_some(())
-                                                .ok_or(Trap::CapFault)?;
-                                        }
-                                    }
-                                }
-                                list.push((name, handle));
-                            }
+                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
+                                m.read_window(o, l)
+                            })?;
+                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
                             if pager != u32::MAX {
                                 let hg = host.lock_unpoisoned();
                                 // A missing/empty pager export fails the spawn closed (§3.3).
@@ -13277,37 +13241,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.get(2).ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    match serve_live_export(handle) {
-                                        // #744 — a live self-serve grant names one of OUR impl-exports,
-                                        // not a table handle: validate the export exists (its shape
-                                        // resolves). (A tagged value is negative, so `can_regrant`
-                                        // would refuse it as a non-grant — that is the fail-closed
-                                        // path every *other* record reader takes, unchanged.)
-                                        Some(k) => {
-                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
-                                        }
-                                        None => {
-                                            hg.can_regrant(handle)
-                                                .then_some(())
-                                                .ok_or(Trap::CapFault)?;
-                                        }
-                                    }
-                                }
-                                list.push((name, handle));
-                            }
+                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
+                                m.read_window(o, l)
+                            })?;
+                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
                             (0, Some(g), 3, list)
                         }
                         o => (o, None, 0, Vec::new()),
@@ -13975,23 +13912,20 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                             };
                             // Named grants (the op-11 record format), pre-validated fail-closed.
-                            let mut glist: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
+                            let glist = match grants_n {
+                                0 => Vec::new(),
+                                _ => {
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    read_grant_records(grants_ptr, grants_n, |o, l| {
+                                        m.read_window(o, l)
+                                    })?
                                 }
-                                glist.push((name, gh));
+                            };
+                            {
+                                let hg = host.lock_unpoisoned();
+                                if !glist.iter().all(|(_, h)| hg.can_regrant(*h)) {
+                                    return Err(Trap::CapFault);
+                                }
                             }
                             let cfs: &[Func] = &cm.funcs;
                             let want_as =
@@ -19704,6 +19638,49 @@ pub const CAP_SELF_PIPE: u32 = 16;
 /// went to `reap` first, so `fuel.remaining` takes 13.
 pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 
+/// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
+/// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
+/// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
+/// caller's bounded window read. `flags` is reserved and ignored (see [`GRANT_SERVE_LIVE_TAG`] for
+/// why), and `handle` is returned as written — tag decoding and the authority check are the caller's
+/// policy, applied to the whole list after it parses.
+///
+/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` is
+/// untrusted, so nothing is sized from it: the list grows one record at a time and the first
+/// out-of-window record ends it.
+pub fn read_grant_records(
+    grants_ptr: u64,
+    grants_n: u64,
+    read: impl Fn(u64, usize) -> Result<Vec<u8>, Trap>,
+) -> Result<Vec<(String, i32)>, Trap> {
+    let mut list = Vec::new();
+    for i in 0..grants_n {
+        let off = i
+            .checked_mul(16)
+            .and_then(|d| grants_ptr.checked_add(d))
+            .ok_or(Trap::MemoryFault)?;
+        let rec = read(off, 16)?;
+        let word = |at: usize| [rec[at], rec[at + 1], rec[at + 2], rec[at + 3]];
+        let name_off = u32::from_le_bytes(word(0)) as u64;
+        let name_len = u32::from_le_bytes(word(4)) as usize;
+        let handle = i32::from_le_bytes(word(8));
+        let name = String::from_utf8(read(name_off, name_len)?).map_err(|_| Trap::CapFault)?;
+        list.push((name, handle));
+    }
+    Ok(list)
+}
+
+/// [`read_grant_records`]' `read` over a window held as a byte slice: `[off, off+len)`, or
+/// `MemoryFault` when any of it falls outside.
+pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> {
+    let start = usize::try_from(off).map_err(|_| Trap::MemoryFault)?;
+    let end = start.checked_add(len).ok_or(Trap::MemoryFault)?;
+    window
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(Trap::MemoryFault)
+}
+
 /// #744 (EXEC.md row 4) — the **live self-serve grant** tag on a §14 named-grant record's `handle`
 /// field. A grant record whose `handle`, read as `u32`, has its top two bits `10` (this tag set,
 /// bit 30 clear) is not a table handle at all: it names the *granter's own impl-export*
@@ -19725,6 +19702,23 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 /// builders) sees a negative handle and refuses it fail-closed through the unchanged `can_regrant` —
 /// no new code there. Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+
+/// The eval-loop spawn arms' authority check over a parsed grant list (ops 13 and 17): each handle is
+/// a re-grantable table handle, or — #744 — a live self-serve grant naming one of the granter's own
+/// impl-exports, which must exist. (A tagged value is negative, so `can_regrant` would refuse it as a
+/// non-grant: the fail-closed path every *other* record reader takes, unchanged.)
+fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap> {
+    for (_, handle) in list {
+        let ok = match serve_live_export(*handle) {
+            Some(k) => host.offer_shape(k).is_some(),
+            None => host.can_regrant(*handle),
+        };
+        if !ok {
+            return Err(Trap::CapFault);
+        }
+    }
+    Ok(())
+}
 
 /// #744 — decode a named-grant `handle`: `Some(export)` when it carries [`GRANT_SERVE_LIVE_TAG`] (top
 /// two bits `10`), else `None` (an ordinary table handle, or an `-errno`-range negative that stays a
@@ -26318,29 +26312,11 @@ impl Host {
         grants_n: u64,
         child_size: u64,
     ) -> Result<(Host, i32, i32), GrantMarshalError> {
-        // Bounded read of `[off, off+len)` within the window slice, or `None` (out of window).
-        let read = |off: u64, len: u64| -> Option<&[u8]> {
-            let end = off.checked_add(len)?;
-            window.get(usize::try_from(off).ok()?..usize::try_from(end).ok()?)
-        };
-        // Do NOT pre-size on `grants_n` — it is untrusted (a huge value would abort on the allocation
-        // before any bounds check). Records are 16 bytes each and must fit the window, so the loop bails
-        // at the first out-of-window record; the Vec grows to at most `window.len() / 16` entries.
-        let mut grants: Vec<(String, i32)> = Vec::new();
-        for i in 0..grants_n {
-            let rec_off = i
-                .checked_mul(16)
-                .and_then(|d| grants_ptr.checked_add(d))
-                .ok_or(GrantMarshalError::OutOfWindow)?;
-            let rec = read(rec_off, 16).ok_or(GrantMarshalError::OutOfWindow)?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name_bytes = read(name_off, name_len).ok_or(GrantMarshalError::OutOfWindow)?;
-            let name =
-                String::from_utf8(name_bytes.to_vec()).map_err(|_| GrantMarshalError::BadName)?;
-            grants.push((name, handle));
-        }
+        let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))
+            .map_err(|t| match t {
+                Trap::CapFault => GrantMarshalError::BadName,
+                _ => GrantMarshalError::OutOfWindow,
+            })?;
         self.spawn_named_child(&grants, child_size)
             .ok_or(GrantMarshalError::NotRegrantable)
     }
