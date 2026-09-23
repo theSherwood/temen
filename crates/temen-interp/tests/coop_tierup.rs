@@ -282,7 +282,7 @@ fn coop_tierup_bounce_matches_pure_interp() {
                 assert_eq!(func, 1, "only func 1 (L) is eligible / tiers up");
                 // Emulate f1's emitted body: `call_interp(func 2, argv)` — the cross-tier bounce.
                 let mut io: Vec<i64> = argv.to_vec();
-                let n = run.bounce(2, &mut io).expect("bounce resolves + runs");
+                let n = run.bounce(2, &mut io, None).expect("bounce resolves + runs");
                 bounces += 1;
                 assert_eq!(n, 1, "C returns exactly one result");
                 run.deliver_tierup(&io[..n]);

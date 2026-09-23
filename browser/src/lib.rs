@@ -15522,7 +15522,8 @@ pub extern "C" fn temen_coop_call_interp(target: u32, args_ptr: *mut u8) -> i32 
     let max_slots = temen_wasm_jit::XCALL_MAX_SLOTS;
     // SAFETY: the host passes the env scratch, at least `max_slots` i64s wide.
     let io = unsafe { core::slice::from_raw_parts_mut(args_ptr as *mut i64, max_slots) };
-    match s.run.bounce(target, io) {
+    // #1627 slice C wires the spill stack; until then a `gc.roots` in a bounce fails closed.
+    match s.run.bounce(target, io, None) {
         Ok(_) => {
             // #1009 paged: a bounced callback may have grown the window mid-invoke — refresh the
             // page-state table (version-guarded) so the post-bounce emitted access admits the growth

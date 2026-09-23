@@ -10001,6 +10001,9 @@ fn gc_scan(
 struct Beneath<'a> {
     vms: Vec<&'a Vm>,
     fibers: Vec<&'a [FiberState]>,
+    /// Raw candidate words: an emitted wasm region's **spill stack** (#1627) — every integer an
+    /// emitted frame held live across the host-reaching call that led here, stored before the call.
+    words: Vec<&'a [u64]>,
 }
 
 impl<'a> Beneath<'a> {
@@ -10011,6 +10014,7 @@ impl<'a> Beneath<'a> {
         Beneath {
             vms,
             fibers: vec![fibers],
+            words: Vec::new(),
         }
     }
 
@@ -10030,7 +10034,11 @@ impl<'a> Beneath<'a> {
         vms.extend(chain.iter().map(|(_, vm, _)| vm));
         let mut regs: Vec<&'b [FiberState]> = self.fibers.clone();
         regs.push(fibers);
-        Beneath { vms, fibers: regs }
+        Beneath {
+            vms,
+            fibers: regs,
+            words: self.words.clone(),
+        }
     }
 }
 
@@ -10056,6 +10064,9 @@ fn gc_scan_beneath(
         };
         for vm in &view.vms {
             scan_vm_roots(vm, source, &mut consider);
+        }
+        for &w in view.words.iter().flat_map(|ws| ws.iter()) {
+            consider(w);
         }
         for fib in view.fibers.iter().flat_map(|r| r.iter()) {
             // §3.6 slice 5a / F2: an event-parked fiber (`WaitParked` futex, `CapParked` punt
@@ -14398,7 +14409,20 @@ impl CoopRun {
     /// die when the invoke resolves). Marshals results back into `io` and returns the result count. Call
     /// only between a [`CoopEvent::TierUp`]/[`CoopEvent::JitInvoke`] and its delivery; `Err(Malformed)` if
     /// nothing is outstanding.
-    pub fn bounce(&mut self, target: u32, io: &mut [i64]) -> Result<usize, Trap> {
+    ///
+    /// `spill` (#1627) is the emitted region's **spill stack** — the candidate words its frames stored
+    /// before each host-reaching call. Pass `Some` **only** when every emitted frame live beneath this
+    /// bounce has spilled into it (the region was emitted with spill instrumentation, and no native §22
+    /// unit frame can be live). Then a `gc.roots` inside the bounce is serviced over the paused task's
+    /// frames, the run's fibers, and those words. With `None` — or during a `Jit.invoke`, whose emitted
+    /// unit frames never spill — something live below is out of view and the op fails closed
+    /// (`CapFault`, #1660).
+    pub fn bounce(
+        &mut self,
+        target: u32,
+        io: &mut [i64],
+        spill: Option<&[u64]>,
+    ) -> Result<usize, Trap> {
         // The paused task is whichever host round-trip is outstanding — a tier-up region or a
         // surfaced `Jit.invoke` unit; both bounce cross-tier the same way. (#926 slice 2e)
         let ti = self
@@ -14449,6 +14473,13 @@ impl CoopRun {
                     }),
                 )
             };
+        // #1627: the view beneath this bounce — the paused task's Vms and the spilled words. The
+        // run's fiber registry is the bounce's own (`bounce_fibers`), which the drive scans itself.
+        let beneath = spill.filter(|_| !in_invoke).map(|words| {
+            let mut b = Beneath::task(&tasks[ti].vt, &[]);
+            b.words.push(words);
+            b
+        });
         match tasks[ti].env {
             // Root / `thread.spawn` thread: the run's shared window, powerbox, and domain table.
             None => {
@@ -14463,6 +14494,7 @@ impl CoopRun {
                     bounce_meta,
                     target,
                     io,
+                    beneath.as_ref(),
                 )
             }
             // §14 confined child: its OWN window, powerbox, table, and fuel — never the root's.
@@ -14483,6 +14515,7 @@ impl CoopRun {
                     }),
                     target,
                     io,
+                    beneath.as_ref(),
                 )
             }
         }
@@ -14534,6 +14567,7 @@ fn coop_bounce(
     fiber_meta: Option<BounceRunCtx<'_>>,
     target: u32,
     io: &mut [i64],
+    beneath: Option<&Beneath<'_>>,
 ) -> Result<usize, Trap> {
     step(fuel, None)?; // fuel unification: the dispatch-site safepoint
     let slot = (target as usize) & (table.len() - 1);
@@ -14560,8 +14594,8 @@ fn coop_bounce(
         .collect();
     let mut vm = Vm::new(&tm, ts.func as usize, &args)?;
     vm.module = ts.module as usize;
-    // #1660: emitted frames lie beneath a bounce; opaque to `gc.roots` until they spill (#1627).
-    let vals = drive_nested(source, table, vm, fuel, mem, host, fibers, fiber_meta, None)?;
+    // #1660/#1627: `beneath` is `Some` only when the emitted frames under this bounce have spilled.
+    let vals = drive_nested(source, table, vm, fuel, mem, host, fibers, fiber_meta, beneath)?;
     for (i, v) in vals.iter().enumerate() {
         io[i] = val_to_slot(*v);
     }
