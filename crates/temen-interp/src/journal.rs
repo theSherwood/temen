@@ -91,6 +91,10 @@ pub struct JournalStats {
     /// Pre-image bytes ever appended, including those since coalesced away. The ratio of this to
     /// [`bytes`](Self::bytes) after [`coalesce`](Journal::coalesce) is the coalescing ratio.
     pub appended_bytes: usize,
+    /// Pre-image bytes ever re-read by [`coalesce`](Journal::coalesce) passes — what compaction has
+    /// cost. Amortized compaction keeps this a small multiple of `appended_bytes`; growing with its
+    /// square is the quadratic the policy exists to avoid.
+    pub rewalked_bytes: usize,
 }
 
 /// The engine state as it stood **before** the op at `coord` ran: the continuation plus the compact
@@ -166,6 +170,10 @@ impl Default for JournalPolicy {
 /// higher steady-state cost sets its own.
 pub const DEFAULT_STATE_STRIDE: u64 = 256;
 
+/// The held pre-image size below which [`Journal::apply_policy`] never compacts — history this small
+/// costs less to keep fine than to re-walk. About what the old 1024-entry floor held.
+const MIN_COALESCE_BYTES: usize = 8 * 1024;
+
 /// An ordered journal of window pre-images and per-op engine state (see the module docs).
 ///
 /// Disarmed by default and inert when disarmed: [`record_write`](Self::record_write) returns immediately, so
@@ -199,9 +207,21 @@ pub struct Journal {
     ///
     /// Coalescing on a fixed turn stride fixes the cliff but stays quadratic — each pass re-walks
     /// history that is already minimal, so cost still grows with total writes. Waiting until the
-    /// journal has **doubled** since the last pass makes the re-walk geometric: every entry is
+    /// journal has **doubled** since the last pass makes the re-walk geometric: every byte is
     /// re-coalesced O(log n) times over a run instead of O(n / stride).
-    coalesced_len: usize,
+    ///
+    /// **Doubled in bytes, not entries** — a pass costs the bytes it re-walks, so that is what has to
+    /// grow geometrically. Measuring entries was quadratic for exactly the guests that write the most:
+    /// coalescing merges contiguous pre-images into single spans, so a fill loop's whole history
+    /// collapses to *one* entry plus the fine tail. The entry count fell back to a few hundred after
+    /// every pass and the next one fired ~600 stores later, each re-walking every byte ever written —
+    /// a 320x240 `fb_clear` took 1.6 s armed against 0.1 s disarmed, and four of them 13 s.
+    coalesced_bytes: usize,
+    /// Bytes of pre-image currently held — `entries`' `pre` lengths summed, kept as a running count so
+    /// the per-op policy never has to walk the journal to learn it.
+    held_bytes: usize,
+    /// See [`JournalStats::rewalked_bytes`].
+    rewalked_bytes: usize,
 }
 
 impl Journal {
@@ -227,10 +247,11 @@ impl Journal {
     pub fn stats(&self) -> JournalStats {
         JournalStats {
             entries: self.entries.len(),
-            bytes: self.entries.iter().map(|e| e.pre.len()).sum(),
+            bytes: self.held_bytes,
             states: self.states.len(),
             appended: self.appended,
             appended_bytes: self.appended_bytes,
+            rewalked_bytes: self.rewalked_bytes,
         }
     }
 
@@ -252,6 +273,7 @@ impl Journal {
         let pre = mem.read_abs(abs_base, width as usize);
         self.appended += 1;
         self.appended_bytes += pre.len();
+        self.held_bytes += pre.len();
         self.entries.push(Entry {
             coord,
             base: abs_base,
@@ -320,6 +342,7 @@ impl Journal {
             // A pre-image goes back through the same pure byte view it was read through, so undo is
             // symmetric with capture and a protection change made after the write cannot block it.
             mem.write_abs(e.base, &e.pre);
+            self.held_bytes -= e.pre.len();
             applied += 1;
         }
         self.entries.truncate(first);
@@ -333,6 +356,7 @@ impl Journal {
     /// reports what it recorded).
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.held_bytes = 0;
         self.states.clear();
         self.floor = u64::MAX; // nothing is restorable until something is recorded again
     }
@@ -355,12 +379,30 @@ impl Journal {
             // longer, which is strictly *more* undo capability (a coalesced segment can only be undone
             // to its start), so the only thing traded is a bounded amount of memory.
             // `partition_point` is the O(log n) bounds check the old guard claimed to be; `coalesce`
-            // itself is O(retained bytes), so it runs only once the journal has doubled since the
-            // last pass.
+            // itself is O(retained bytes), so it runs only once the held bytes have doubled since the
+            // last pass (see `coalesced_bytes` for why bytes and not entries).
             let aged = self.entries.partition_point(|e| e.coord < cut);
-            if aged > 0 && self.entries.len() >= self.coalesced_len.saturating_mul(2).max(1024) {
+            if aged > 0
+                && self.held_bytes
+                    >= self
+                        .coalesced_bytes
+                        .saturating_mul(2)
+                        .max(MIN_COALESCE_BYTES)
+            {
                 self.coalesce(cut);
-                self.coalesced_len = self.entries.len();
+                self.coalesced_bytes = self.held_bytes;
+            }
+            // **States age on their own.** Each is a whole continuation (a `Vm` clone), one per
+            // `state_stride` turns whether or not the turn wrote anything, so tying their release to
+            // the byte-paced pass above let them pile up through any stretch that reads without
+            // writing — a pixel-counting scan held gigabytes of them. Dropping the aged ones down to
+            // the earliest is exactly what `coalesce` does to them, and is safe without it: an undo
+            // target resolves to the nearest state at or before it and replays forward from there, so
+            // fewer anchors mean longer replays, never a wrong window. Cheap: the fine tail stays
+            // short, and a state ages out at most once per stride.
+            let s_aged = self.states.partition_point(|s| s.coord < cut);
+            if s_aged > 1 {
+                self.states.drain(1..s_aged);
             }
         }
         if policy.byte_budget == 0 {
@@ -378,16 +420,24 @@ impl Journal {
         // fix and is not a one-liner: it has to keep the floor honest about which pre-images survive,
         // and a first attempt at it restored windows that never existed. Left as a documented
         // constraint rather than a hasty fix; #1558 carries it.
-        let mut held: usize = self.entries.iter().map(|e| e.pre.len()).sum();
-        while held > policy.byte_budget && !self.entries.is_empty() {
-            let dropped = self.entries.remove(0);
-            held -= dropped.pre.len();
-            // History before the *next* remaining entry is now incomplete: that is the new floor, and
-            // `can_undo_to` declines every anchor below it. Fail-closed by construction — a dropped
-            // turn becomes unreachable, never wrong.
-            self.floor = self.entries.first().map_or(dropped.coord + 1, |e| e.coord);
-            self.states.retain(|s| s.coord >= self.floor);
+        //
+        // The running `held_bytes` makes the common case O(1); when something does go, the oldest
+        // entries leave in one `drain` rather than one `remove(0)` apiece.
+        if self.held_bytes <= policy.byte_budget {
+            return;
         }
+        let mut drop = 0;
+        while self.held_bytes > policy.byte_budget && drop < self.entries.len() {
+            self.held_bytes -= self.entries[drop].pre.len();
+            drop += 1;
+        }
+        let last_dropped = self.entries[drop - 1].coord;
+        self.entries.drain(..drop);
+        // History before the *next* remaining entry is now incomplete: that is the new floor, and
+        // `can_undo_to` declines every anchor below it. Fail-closed by construction — a dropped turn
+        // becomes unreachable, never wrong.
+        self.floor = self.entries.first().map_or(last_dropped + 1, |e| e.coord);
+        self.states.retain(|s| s.coord >= self.floor);
     }
 
     /// **Level 2**: coalesce every entry with a coordinate `< before` down to one pre-image per
@@ -414,6 +464,7 @@ impl Journal {
         // address-range-keyed one would not.
         let mut earliest: std::collections::BTreeMap<u64, u8> = std::collections::BTreeMap::new();
         for e in self.entries.iter() {
+            self.rewalked_bytes += e.pre.len();
             for (i, b) in e.pre.iter().enumerate() {
                 earliest.entry(e.base + i as u64).or_insert(*b);
             }
@@ -432,6 +483,7 @@ impl Journal {
             }
         }
         out.extend(tail);
+        self.held_bytes = out.iter().map(|e| e.pre.len()).sum();
         self.entries = out;
         // The same earliest-wins rule for state: a coalesced segment can only be undone to its start,
         // so exactly one continuation — the earliest — survives it. The fine tail keeps per-op state.

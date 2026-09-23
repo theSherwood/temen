@@ -446,6 +446,100 @@ fn the_policy_keeps_recent_history_fine_and_ages_the_rest() {
     );
 }
 
+/// A loop storing `n` distinct, contiguous words — the shape a framebuffer clear has, and the one
+/// coalescing can merge into a single span but never shrink.
+fn fill_src(n: i32) -> String {
+    format!(
+        r#"memory 20
+func () -> (i32) {{
+block 0 () {{
+  v0 = i32.const 0
+  br 1(v0)
+}}
+block 1 (vi: i32) {{
+  vn = i32.const {n}
+  vlt = i32.lt_u vi vn
+  br_if vlt 3(vi) 2(vi)
+}}
+block 2 (vr: i32) {{
+  return vr
+}}
+block 3 (vk: i32) {{
+  v4 = i32.const 4
+  voff = i32.mul vk v4
+  vbase = i32.const 65536
+  vaddr = i32.add voff vbase
+  vaddr64 = i64.extend_i32_u vaddr
+  i32.store vaddr64 vk
+  v1 = i32.const 1
+  vnext = i32.add vk v1
+  br 1(vnext)
+  }}
+}}"#
+    )
+}
+
+/// **Compaction is amortized in bytes, so a fill loop stays linear.** Every coalesce pass re-reads the
+/// whole aged-out history, so passes have to get geometrically rarer *as that history grows*. They
+/// were paced by entry count instead, and coalescing merges contiguous pre-images into one span: after
+/// each pass a fill loop's journal was back to a few hundred entries, the next pass came ~600 stores
+/// later, and each re-read every byte ever written. A 320x240 `fb_clear` ran 15x slower armed than
+/// disarmed, growing with the square of the frame. `rewalked_bytes` counts what compaction re-read, so
+/// the bound is checked directly rather than through a timing: a geometric series of passes re-reads
+/// a small multiple of what was written; the old pacing re-read ~16x at this size, and more with every
+/// store.
+#[test]
+fn compaction_re_reads_a_bounded_multiple_of_what_a_fill_loop_writes() {
+    let m = temen_text::parse_module(&fill_src(20_000)).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let mut r = ScheduledDebugRun::new(&m, 0, &[]).expect("in the bytecode debug subset");
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let s = r.journal_stats();
+    assert_eq!(s.appended_bytes, 20_000 * 4, "every store journaled once");
+    assert!(
+        s.rewalked_bytes > 0,
+        "the run is long enough that compaction ran at all"
+    );
+    assert!(
+        s.rewalked_bytes <= 4 * s.appended_bytes,
+        "compaction re-read {} bytes for {} written — passes are not amortized in bytes",
+        s.rewalked_bytes,
+        s.appended_bytes,
+    );
+}
+
+/// **States are released through a stretch that writes nothing.** A continuation is journaled every
+/// `state_stride` turns whether or not the turn wrote, but aged ones were only ever released by the
+/// byte-paced compaction — so a loop that reads without writing, which never grows the byte history,
+/// kept every one. A 320x240 pixel-counting scan held 2.4 GB of them. They age on their own now: what
+/// survives is the fine tail plus the one earliest anchor, however long the run.
+#[test]
+fn a_read_only_stretch_does_not_accumulate_states() {
+    let src = fill_src(100_000).replace("i32.store vaddr64 vk", "vload = i32.load vaddr64");
+    let m = temen_text::parse_module(&src).expect("parse");
+    temen_verify::verify_module(&m).expect("verify");
+    let mut r = ScheduledDebugRun::new(&m, 0, &[]).expect("in the bytecode debug subset");
+    r.set_journal_armed(true);
+    let mut fuel = FUEL;
+    while r.tick(&mut fuel) {}
+    let policy = temen_interp::journal::JournalPolicy::default();
+    let s = r.journal_stats();
+    assert_eq!(s.appended, 0, "the loop writes nothing");
+    assert!(
+        r.op_turn() > 100 * policy.fine_turns,
+        "long enough that states would pile up"
+    );
+    let bound = (policy.fine_turns / policy.state_stride) as usize + 2;
+    assert!(
+        s.states <= bound,
+        "{} states held after {} read-only turns; the fine tail plus one anchor is {bound}",
+        s.states,
+        r.op_turn(),
+    );
+}
+
 /// **The byte budget bounds the journal, and does so fail-closed.** Past the ceiling the oldest history
 /// is dropped: the journal stays under budget, and the turns that went away simply decline to be
 /// undone rather than coming back wrong.
