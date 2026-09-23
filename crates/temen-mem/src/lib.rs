@@ -2362,26 +2362,27 @@ mod sparse_tests {
         );
     }
 
-    /// Overlapping copies longer than a segment, in both directions, against `Paged`.
+    /// Overlapping copies longer than a segment, in both directions, against a plain `Vec` model
+    /// (`slice::copy_within` is the memmove the region must match). The model, not `Paged`, keeps the
+    /// test fast under Miri: `Paged` copies byte by byte, and these copies are 64 KiB and up.
     #[test]
-    fn overlapping_copies_longer_than_a_segment_match_paged() {
-        let size = 4 * SEG;
-        let (s, p) = (sparse(size), Region::paged(size, 4096));
-        let image: Vec<u8> = (0..size).map(|i| (i * 7 + 3) as u8).collect();
-        s.write_from(0, &image);
-        p.write_from(0, &image);
+    fn overlapping_copies_longer_than_a_segment_match_a_vec() {
+        let size = 3 * SEG;
+        let s = sparse(size);
+        let mut model: Vec<u8> = (0..size).map(|i| (i * 7 + 3) as u8).collect();
+        s.write_from(0, &model);
         for (dst, src, len) in [
-            (100, 5000, 2 * SEG + 17), // dst below src: forward
-            (5000, 100, 2 * SEG + 17), // dst above src: backward
-            (SEG - 1, SEG + 1, SEG),   // short overlap across a boundary
-            (7, 7, SEG + 5),           // in place
+            (100, 5000, SEG + 17),  // dst below src: forward
+            (5000, 100, SEG + 17),  // dst above src: backward
+            (SEG - 1, SEG + 1, 64), // short overlap across a boundary
+            (7, 7, SEG + 5),        // in place
         ] {
             s.copy_within(dst, src, len);
-            p.copy_within(dst, src, len);
-            let (mut a, mut b) = (vec![0u8; size as usize], vec![0u8; size as usize]);
-            s.read_into(0, &mut a);
-            p.read_into(0, &mut b);
-            assert!(a == b, "copy_within({dst}, {src}, {len}) diverged");
+            let (d, sr, n) = (dst as usize, src as usize, len as usize);
+            model.copy_within(sr..sr + n, d);
+            let mut got = vec![0u8; size as usize];
+            s.read_into(0, &mut got);
+            assert!(got == model, "copy_within({dst}, {src}, {len}) diverged");
         }
     }
 
