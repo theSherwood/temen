@@ -343,6 +343,13 @@ fn a_notify_of_one_wakes_the_oldest_of_a_fiber_and_a_vcpu_on_both_engines() {
 ///
 /// The `notify(key, 0)` result needs no settling to be meaningful: a zero budget wakes nobody
 /// whether or not the waiters have registered yet, so that digit is race-free on its own.
+///
+/// `n_all` is the **sum** of the `notify(key, 10)` claims, retried until both siblings are
+/// claimed (#1657). A guest cannot observe a park: a sibling can bump PARKED and be descheduled
+/// before it reaches `wait`, for longer than any settle spin. Stopping at the first nonzero claim
+/// then read `1` as "the queue", and the late sibling timed out unwoken (`101`, seen on Windows
+/// CI). Summing keeps both ends of the contract pinned: every claim is at most what is parked, so
+/// an over-claim still shows as `n_all > 2`, and `woken` must equal it.
 const NOTIFY_ZERO_THEN_ALL: &str = r#"memory 16
 func () -> (i64) {
 block 0 () {
@@ -392,24 +399,24 @@ block 6 (vunused: i64) {
   vn0 = atomic.notify vka vzc
   vn064 = i64.extend_i32_u vn0
   vz6 = i64.const 0
-  br 7(vn064, vz6)
+  br 7(vn064, vz6, vz6)
 }
-block 7 (vn0a: i64, vr: i64) {
+block 7 (vn0a: i64, vr: i64, vsum: i64) {
   vka7 = i64.const 16392
   vcten = i32.const 10
   vna = atomic.notify vka7 vcten
   vna64 = i64.extend_i32_u vna
-  vz7 = i64.const 0
-  vgt = i64.lt_u vz7 vna64
-  br_if vgt 9(vn0a, vna64) 8(vn0a, vr)
+  vsum7 = i64.add vsum vna64
+  vone7 = i64.const 1
+  vall = i64.lt_u vone7 vsum7
+  br_if vall 9(vn0a, vsum7) 8(vn0a, vr, vsum7)
 }
-block 8 (vn0b: i64, vr2: i64) {
-  vrl = i64.const 100000
+block 8 (vn0b: i64, vr2: i64, vsum8: i64) {
+  vrl = i64.const 20000000
   vlt8 = i64.lt_u vr2 vrl
   vone8 = i64.const 1
   vr3 = i64.add vr2 vone8
-  vz8 = i64.const 0
-  br_if vlt8 7(vn0b, vr3) 9(vn0b, vz8)
+  br_if vlt8 7(vn0b, vr3, vsum8) 9(vn0b, vsum8)
 }
 block 9 (vn0c: i64, vnac: i64) {
   vz9 = i64.const 0
