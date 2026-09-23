@@ -2438,3 +2438,215 @@ fn dap_over_bytecode_step_back_from_a_finished_run_lands_on_the_last_source_line
     }
     assert!(saw_one, "further stepBacks keep walking back through main");
 }
+
+/// `main` (func 1) calls `helper` (func 2) on line 11; the breakpoint is inside `helper`, on line 3.
+const NEXT_OVER_BP: &str = r#"memory 16
+func () -> (i32) {
+block 0 () {
+  v0 = call 1 ()
+  return v0
+  }
+}
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 1
+  v1 = call 2 (v0)
+  v2 = i32.const 5
+  v3 = i32.add v1 v2
+  return v3
+  }
+}
+func (i32) -> (i32) {
+block 0 (v0: i32) {
+  v1 = i32.const 2
+  v2 = i32.mul v0 v1
+  return v2
+  }
+}
+
+debug.file 0 "main.c"
+debug.fname 1 "main"
+debug.fname 2 "helper"
+debug.loc 1 0 0 0 10 1
+debug.loc 1 0 1 0 11 1
+debug.loc 1 0 2 0 12 1
+debug.loc 2 0 0 0 3 1
+"#;
+
+/// **`next` stops at a breakpoint inside the call it steps over** (#1712).
+///
+/// The backend holds the breakpoint set and handed it to the run only on `continue`; the stepping
+/// verbs ran against whatever the run last held — nothing, if the session had only stepped since the
+/// breakpoint was set. So a `next` over `helper(…)` ran straight through a breakpoint inside it, and
+/// c_interpret's Run-with-a-breakpoint (which auto-steps with `next`) ignored every breakpoint that
+/// was not in `main`.
+#[test]
+fn dap_over_bytecode_next_stops_at_a_breakpoint_inside_the_call() {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let out = s.handle(&req(
+        2,
+        "launch",
+        Json::obj(vec![
+            ("programText", Json::s(NEXT_OVER_BP)),
+            ("function", Json::i(0)),
+            ("engine", Json::s("bytecode")),
+        ]),
+    ));
+    assert_eq!(
+        response(&out).get("success"),
+        Some(&Json::Bool(true)),
+        "launch ok"
+    );
+    let bp = s.handle(&req(
+        3,
+        "setBreakpoints",
+        Json::obj(vec![
+            ("source", Json::obj(vec![("path", Json::s("main.c"))])),
+            (
+                "breakpoints",
+                Json::Arr(vec![Json::obj(vec![("line", Json::i(3))])]),
+            ),
+        ]),
+    ));
+    let bound = &response(&bp)
+        .get("body")
+        .unwrap()
+        .get("breakpoints")
+        .unwrap()
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(
+        bound.get("verified"),
+        Some(&Json::Bool(true)),
+        "the breakpoint in helper binds"
+    );
+
+    // Into main (the entry has no source line), then `next` until something stops us.
+    s.handle(&req(4, "stepIn", Json::obj(vec![("threadId", Json::i(1))])));
+    assert_eq!(top_frame(&mut s, 5), ("#0 main".to_string(), 10));
+    let mut seq = 10;
+    let mut stopped_in_helper = false;
+    for _ in 0..3 {
+        seq += 1;
+        let out = s.handle(&req(seq, "next", Json::obj(vec![("threadId", Json::i(1))])));
+        let reason = event(&out, "stopped")
+            .and_then(|e| e.get("body"))
+            .and_then(|b| b.get("reason"))
+            .and_then(Json::as_str)
+            .map(str::to_string);
+        if reason.as_deref() == Some("breakpoint") {
+            seq += 1;
+            assert_eq!(top_frame(&mut s, seq), ("#0 helper".to_string(), 3));
+            stopped_in_helper = true;
+            break;
+        }
+        assert!(
+            event(&out, "exited").is_none(),
+            "ran to the end without stopping in helper"
+        );
+    }
+    assert!(
+        stopped_in_helper,
+        "a `next` over `helper(…)` stops at the breakpoint inside it"
+    );
+}
+
+/// `int main() { int x = 10; return x; }` — `x` lives in a register, so line 11 is nothing but the
+/// `return` terminator.
+const RETURN_ONLY_LINE: &str = r#"memory 16
+func () -> (i32) {
+block 0 () {
+  v0 = call 1 ()
+  return v0
+  }
+}
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const 10
+  return v0
+  }
+}
+
+debug.file 0 "main.c"
+debug.fname 1 "main"
+debug.loc 1 0 0 0 10 1
+debug.loc 1 0 1 0 11 1
+"#;
+
+fn launch_return_only_line(engine: Option<&str>) -> DapServer {
+    let mut s = DapServer::new();
+    s.handle(&req(1, "initialize", Json::obj(vec![])));
+    let mut args = vec![
+        ("programText", Json::s(RETURN_ONLY_LINE)),
+        ("function", Json::i(0)),
+    ];
+    if let Some(e) = engine {
+        args.push(("engine", Json::s(e)));
+    }
+    let out = s.handle(&req(2, "launch", Json::obj(args)));
+    assert_eq!(response(&out).get("success"), Some(&Json::Bool(true)));
+    s
+}
+
+/// **A line whose only code is a terminator is a stop position** (#1713), on both engines.
+///
+/// chibicc emits nothing for `return x;` beyond the `return` itself when `x` is already in a register
+/// (a `while (cond)` header is the same with a `br_if`). Terminators used to be skipped by both
+/// engines' debug seams, so a breakpoint on the line was refused and a `next` from line 10 ran off the
+/// end of the program — the second step of the shortest teaching program terminated it.
+#[test]
+fn a_return_only_line_takes_a_breakpoint_and_a_step_on_both_engines() {
+    for engine in [Some("bytecode"), None] {
+        let mut s = launch_return_only_line(engine);
+        let bp = s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("main.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(11))])]),
+                ),
+            ]),
+        ));
+        let bound = &response(&bp)
+            .get("body")
+            .and_then(|b| b.get("breakpoints"))
+            .and_then(Json::as_array)
+            .expect("breakpoints")[0];
+        assert_eq!(bound.get("verified"), Some(&Json::Bool(true)), "{engine:?}");
+        assert_eq!(bound.get("line"), Some(&Json::i(11)), "{engine:?}");
+        let out = s.handle(&req(4, "continue", Json::obj(vec![])));
+        let reason = event(&out, "stopped")
+            .and_then(|e| e.get("body"))
+            .and_then(|b| b.get("reason"))
+            .and_then(Json::as_str)
+            .map(str::to_string);
+        assert_eq!(reason.as_deref(), Some("breakpoint"), "{engine:?}");
+        assert_eq!(
+            top_frame(&mut s, 5),
+            ("#0 main".to_string(), 11),
+            "{engine:?}"
+        );
+
+        // Stepping: into main at line 10, then one `next` lands on line 11 instead of the exit.
+        let mut s = launch_return_only_line(engine);
+        s.handle(&req(3, "stepIn", Json::obj(vec![("threadId", Json::i(1))])));
+        assert_eq!(
+            top_frame(&mut s, 4),
+            ("#0 main".to_string(), 10),
+            "{engine:?}"
+        );
+        let out = s.handle(&req(5, "next", Json::obj(vec![("threadId", Json::i(1))])));
+        assert!(
+            event(&out, "exited").is_none(),
+            "{engine:?}: the step ran off the end"
+        );
+        assert_eq!(
+            top_frame(&mut s, 6),
+            ("#0 main".to_string(), 11),
+            "{engine:?}"
+        );
+    }
+}

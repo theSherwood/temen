@@ -12,11 +12,11 @@
 //! scripting a DAP conversation; [`run_stdio`] is the thin `Content-Length`-framed wire loop a real
 //! client connects to.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use temen_interp::{Inspector, IrPc, Stop, StopReason, Trap, Value, VarValue, WatchId, WatchKind};
-use temen_ir::{DebugInfo, Encoding, Module, TypeDef, TypeId, ValType, VarInfo, VarLoc};
+use temen_ir::{DebugInfo, Encoding, TypeDef, TypeId, ValType, VarInfo, VarLoc};
 
 mod backend;
 mod expr;
@@ -48,16 +48,10 @@ struct Session {
     /// model, no sink, no cost.
     mem_model: Option<Arc<Mutex<models::MemModel>>>,
     debug: Option<DebugInfo>,
-    /// `(file, line) → first *stoppable* IR pc on that line` — the reverse of `Inspector::source_loc`,
-    /// for binding source-line breakpoints. Only non-terminator pcs are indexed (a terminator is never
-    /// a stoppable position — see [`terminator_only_lines`](Session::terminator_only_lines)).
+    /// `(file, line) → first IR pc on that line` — the reverse of `Inspector::source_loc`, for
+    /// binding source-line breakpoints. A terminator is a pc like any other (#1713), so a line whose
+    /// only code is `return x;` or a loop condition's branch binds.
     line_index: BTreeMap<(u32, u32), IrPc>,
-    /// `(file, line)`s whose *only* mapped ops are block terminators (`return`/`br`) — e.g. a bare
-    /// `return x;` where `x` was computed on an earlier line. No engine can pause at a terminator
-    /// (`cur_ir_pc`/`before_op` never fire there), so a breakpoint on such a line can never stop:
-    /// `setBreakpoints` reports it `verified: false` rather than falsely binding it (which silently ran
-    /// the guest to completion). Kept distinct from "line has no code at all" so the message can say why.
-    terminator_only_lines: BTreeSet<(u32, u32)>,
     /// IR pcs currently set as breakpoints (so `setBreakpoints` can replace them per the protocol).
     breakpoints: Vec<IrPc>,
     /// Conditional breakpoints (DAP `condition`): an IR pc → an integer expression that must be
@@ -314,10 +308,7 @@ impl DapServer {
             .unwrap_or(1_000_000_000) as u64;
 
         let debug = module.debug_info.clone();
-        let (line_index, terminator_only_lines) = debug
-            .as_ref()
-            .map(|di| build_line_index(di, &module))
-            .unwrap_or_default();
+        let line_index = debug.as_ref().map(build_line_index).unwrap_or_default();
         // Execution mode (DEBUGGING.md Milestone B): `seed` ⇒ a fuzzed interleaving; `schedule`
         // (possibly empty) ⇒ a fixed multithreaded interleaving (a witness, or the deterministic
         // default); neither ⇒ single-threaded. Multithreaded debugging surfaces every `thread.spawn`
@@ -487,7 +478,6 @@ impl DapServer {
             mem_model,
             debug,
             line_index,
-            terminator_only_lines,
             breakpoints: Vec::new(),
             conditions: BTreeMap::new(),
             frame_refs: Vec::new(),
@@ -527,22 +517,6 @@ impl DapServer {
         let mut out = Vec::new();
         for bp in &requested {
             let line = bp.get("line").and_then(|l| l.as_i64()).unwrap_or(0) as u32;
-            // A line whose only ops are terminators (a bare `return x;` etc.) has no stoppable pc:
-            // report it unverified with a reason, rather than binding a breakpoint that never fires.
-            if file_idx.is_some_and(|fi| session.terminator_only_lines.contains(&(fi, line))) {
-                out.push(Json::obj(vec![
-                    ("verified", Json::Bool(false)),
-                    ("line", Json::i(line as i64)),
-                    (
-                        "message",
-                        Json::s(
-                            "no stoppable instruction on this line (it maps only to a return/branch); \
-                             set the breakpoint on an earlier line",
-                        ),
-                    ),
-                ]));
-                continue;
-            }
             match file_idx.and_then(|fi| resolve_line(&session.line_index, fi, line)) {
                 Some((actual_line, pc)) => {
                     session.inspector.set_breakpoint(pc);
@@ -1656,7 +1630,7 @@ impl DapServer {
                 // Both are optional/additive — a clean exit carries neither field.
                 let mut body = vec![("exitCode", Json::i(exit_code_of(&result) as i64))];
                 if let Err(trap) = &result {
-                    body.push(("trap", Json::s(trap_name(trap))));
+                    body.push(("trap", Json::s(trap.name())));
                     if matches!(trap, Trap::MemoryFault) {
                         if let Some(addr) =
                             self.session.as_ref().and_then(|s| s.inspector.fault_addr())
@@ -1721,27 +1695,6 @@ fn exit_code_of(result: &Result<Vec<Value>, Trap>) -> i32 {
         },
         Err(Trap::Exit(code)) => *code,
         Err(_) => 1,
-    }
-}
-
-/// The `trap` field name for a run that ended in a trap (#1190) — the involuntary-crash kind, so a
-/// client distinguishes e.g. a memory fault from a chosen `exit(k)`. `Trap::Exit` is the clean-exit
-/// path (surfaced via `exitCode`, not a crash) and is named here only for completeness.
-fn trap_name(trap: &Trap) -> &'static str {
-    match trap {
-        Trap::OutOfFuel => "OutOfFuel",
-        Trap::DivByZero => "DivByZero",
-        Trap::IntOverflow => "IntOverflow",
-        Trap::MemoryFault => "MemoryFault",
-        Trap::StackOverflow => "StackOverflow",
-        Trap::IndirectCallType => "IndirectCallType",
-        Trap::Unreachable => "Unreachable",
-        Trap::BadConversion => "BadConversion",
-        Trap::CapFault => "CapFault",
-        Trap::Exit(_) => "Exit",
-        Trap::FiberFault => "FiberFault",
-        Trap::ThreadFault => "ThreadFault",
-        Trap::Malformed => "Malformed",
     }
 }
 
@@ -1870,25 +1823,11 @@ fn dap_reason(r: StopReason) -> &'static str {
     }
 }
 
-/// The source-line breakpoint tables: `(file, line) → smallest stoppable IR pc`, and the set of
-/// `(file, line)`s that map *only* to a block terminator (so they can't bind — see `build_line_index`).
-type LineTables = (BTreeMap<(u32, u32), IrPc>, BTreeSet<(u32, u32)>);
-
-/// Build the `(file, line) → smallest stoppable IR pc` index used to bind source-line breakpoints,
-/// plus the set of lines that map *only* to block terminators. A terminator (`Block::term`, whose IR
-/// `inst` index is `>= block.insts.len()`) is never a stoppable position — no engine pauses at one —
-/// so it is excluded from the index; a line left with no stoppable pc is recorded as terminator-only
-/// so `setBreakpoints` can report it honestly instead of binding a breakpoint that never fires.
-fn build_line_index(di: &DebugInfo, module: &Module) -> LineTables {
-    let is_terminator = |pc: &IrPc| {
-        module
-            .funcs
-            .get(pc.func as usize)
-            .and_then(|f| f.blocks.get(pc.block))
-            .is_none_or(|b| pc.inst >= b.insts.len())
-    };
+/// Build the `(file, line) → smallest IR pc` index used to bind source-line breakpoints. Every
+/// mapped op is a stop position on both engines — a block terminator (`inst == insts.len()`) too
+/// (#1713) — so every loc is indexed.
+fn build_line_index(di: &DebugInfo) -> BTreeMap<(u32, u32), IrPc> {
     let mut idx: BTreeMap<(u32, u32), IrPc> = BTreeMap::new();
-    let mut has_term: BTreeSet<(u32, u32)> = BTreeSet::new(); // lines seen with a terminator loc
     for l in &di.locs {
         let pc = IrPc {
             module: 0,
@@ -1896,10 +1835,6 @@ fn build_line_index(di: &DebugInfo, module: &Module) -> LineTables {
             block: l.block as usize,
             inst: l.inst as usize,
         };
-        if is_terminator(&pc) {
-            has_term.insert((l.file, l.line));
-            continue;
-        }
         idx.entry((l.file, l.line))
             .and_modify(|e| {
                 if pc < *e {
@@ -1908,12 +1843,7 @@ fn build_line_index(di: &DebugInfo, module: &Module) -> LineTables {
             })
             .or_insert(pc);
     }
-    // Terminator-only = saw a terminator on this line and *no* non-terminator op (order-independent).
-    let term_only = has_term
-        .into_iter()
-        .filter(|k| !idx.contains_key(k))
-        .collect();
-    (idx, term_only)
+    idx
 }
 
 /// Bind a requested line to the nearest line at/after it that has code (so a breakpoint on a blank

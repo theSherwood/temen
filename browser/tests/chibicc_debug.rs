@@ -910,88 +910,83 @@ fn inspect_struct_array_and_pointer_locals() {
     );
 }
 
-/// **A breakpoint on a bare `return x;` line is reported unverified, not silently dropped.** Such a
-/// line maps only to the block's `return` terminator, which no engine can pause at — so binding it
-/// used to verify-then-run-to-completion. The DAP now reports `verified: false` with a reason, while a
-/// line with a real op (line 8) still binds. Regression test for the terminator-only-line binding fix.
+/// **A breakpoint on a bare `return x;` line binds and stops there** (#1713). chibicc emits nothing
+/// for `return sum;` but the block's `return` terminator (`sum` is already in a register). Terminators
+/// used to be skipped by both engines, so the DAP refused the line as unverified. A terminator is a
+/// stop position now: the breakpoint binds, the run stops on line 9 with `sum` readable, and a `next`
+/// from line 8 lands on line 9 rather than running off the end.
 #[test]
-fn breakpoint_on_bare_return_line_is_unverified() {
+fn breakpoint_on_bare_return_line_stops_there() {
     let Some(bytes) = chibicc_temen() else {
         eprintln!("SKIP: chibicc.temen absent");
         return;
     };
     let chibicc = temen_encode::decode_module(&bytes).expect("decode");
     let ir = compile_g(&chibicc, RICH_SRC);
+    let launch = |s: &mut DapServer| {
+        s.handle(&req(1, "initialize", Json::obj(vec![])));
+        s.handle(&req(
+            2,
+            "launch",
+            Json::obj(vec![
+                ("programText", Json::s(&ir)),
+                ("function", Json::i(0)),
+                ("args", Json::Arr(vec![])),
+                ("engine", Json::s("bytecode")),
+            ]),
+        ));
+    };
+    let set_bp = |s: &mut DapServer, line: i64| -> Json {
+        let out = s.handle(&req(
+            3,
+            "setBreakpoints",
+            Json::obj(vec![
+                ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
+                (
+                    "breakpoints",
+                    Json::Arr(vec![Json::obj(vec![("line", Json::i(line))])]),
+                ),
+            ]),
+        ));
+        response(&out)
+            .get("body")
+            .and_then(|b| b.get("breakpoints"))
+            .and_then(|b| b.as_array())
+            .expect("breakpoints")[0]
+            .clone()
+    };
 
+    // Line 9 is `return sum;` — only the return terminator.
     let mut s = DapServer::new();
-    s.handle(&req(1, "initialize", Json::obj(vec![])));
-    s.handle(&req(
-        2,
-        "launch",
-        Json::obj(vec![
-            ("programText", Json::s(&ir)),
-            ("function", Json::i(0)),
-            ("args", Json::Arr(vec![])),
-            ("engine", Json::s("bytecode")),
-        ]),
-    ));
-    // Line 9 is `return sum;` (only the return terminator); line 8 has the sum computation.
-    let out = s.handle(&req(
-        3,
-        "setBreakpoints",
-        Json::obj(vec![
-            ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
-            (
-                "breakpoints",
-                Json::Arr(vec![
-                    Json::obj(vec![("line", Json::i(9))]),
-                    Json::obj(vec![("line", Json::i(8))]),
-                ]),
-            ),
-        ]),
-    ));
-    let bps = response(&out)
-        .get("body")
-        .unwrap()
-        .get("breakpoints")
-        .unwrap()
-        .as_array()
-        .unwrap();
+    launch(&mut s);
+    let bp = set_bp(&mut s, 9);
     assert_eq!(
-        bps[0].get("verified"),
-        Some(&Json::Bool(false)),
-        "the bare-return line is reported unverified"
-    );
-    assert!(
-        bps[0]
-            .get("message")
-            .and_then(|m| m.as_str())
-            .is_some_and(|m| !m.is_empty()),
-        "the unverified breakpoint carries an explanatory message"
-    );
-    assert_eq!(
-        bps[1].get("verified"),
+        bp.get("verified"),
         Some(&Json::Bool(true)),
-        "a line with a real op still binds"
+        "the bare-return line binds"
     );
+    assert_eq!(bp.get("line").and_then(|l| l.as_i64()), Some(9));
+    let out = s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(stopped_reason(&out).as_deref(), Some("breakpoint"));
+    assert_eq!(
+        top_frame(&mut s, 5).map(|f| f.0),
+        Some(9),
+        "stopped on the return line"
+    );
+    assert_eq!(eval_in_frame(&mut s, 6, "sum").as_deref(), Some("17"));
 
-    // And it really doesn't fire: running with only the (unverifiable) line-9 breakpoint set runs to
-    // completion — the honest outcome, versus the old silent verify-then-blow-past.
-    s.handle(&req(
-        4,
-        "setBreakpoints",
-        Json::obj(vec![
-            ("source", Json::obj(vec![("path", Json::s("/in.c"))])),
-            (
-                "breakpoints",
-                Json::Arr(vec![Json::obj(vec![("line", Json::i(9))])]),
-            ),
-        ]),
-    ));
-    let out = s.handle(&req(5, "configurationDone", Json::obj(vec![])));
-    assert!(
-        event(&out, "terminated") && !event(&out, "stopped"),
-        "with only the bare-return breakpoint, the program runs to completion"
+    // Stepping: from the line-8 breakpoint, one `next` lands on line 9.
+    let mut s = DapServer::new();
+    launch(&mut s);
+    set_bp(&mut s, 8);
+    s.handle(&req(4, "configurationDone", Json::obj(vec![])));
+    assert_eq!(top_frame(&mut s, 5).map(|f| f.0), Some(8));
+    let out = s.handle(&req(6, "next", Json::obj(vec![("threadId", Json::i(1))])));
+    assert!(!event(&out, "terminated"), "the step ran off the end");
+    assert_eq!(
+        top_frame(&mut s, 7).map(|f| f.0),
+        Some(9),
+        "`next` lands on the return line"
     );
 }
 

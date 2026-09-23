@@ -936,6 +936,23 @@ impl BytecodeBackend {
 
     /// Map a multithreaded [`SchedStop`] to the DAP [`Stop`] — the `SchedBreak` reason carries whether
     /// it was a breakpoint, a data breakpoint (with the confined address + read/write), or a step.
+    /// **Every forward verb, through one path.** A fresh fuel budget per resume (debugging is
+    /// interactive; the run replays from scratch on a seek, so a shared decrementing counter would be
+    /// inconsistent), the current breakpoint set, and the cap inputs the advance recorded absorbed
+    /// for a later reverse seek.
+    ///
+    /// The breakpoint set used to reach the run only on `continue`. The stepping verbs ran with
+    /// whatever the run last held — nothing, if the session had only stepped since the breakpoint was
+    /// set — so a `next` over a call ran straight through a breakpoint inside it (#1712): the step
+    /// loop in `drive` does check breakpoints at every depth, but against an empty list.
+    fn resume(&mut self, verb: impl FnOnce(&mut ScheduledDebugRun, &mut u64) -> SchedStop) -> Stop {
+        let mut fuel = self.fuel;
+        self.run.set_breakpoints(self.breakpoints.clone());
+        let stop = Self::sched_stop(verb(&mut self.run, &mut fuel));
+        self.capture_tape();
+        stop
+    }
+
     fn sched_stop(s: SchedStop) -> Stop {
         match s {
             SchedStop::Break { pc, reason } => {
@@ -969,31 +986,16 @@ impl BytecodeBackend {
 
 impl Debuggee for BytecodeBackend {
     fn run_until_stop(&mut self) -> Stop {
-        // A fresh fuel budget per resume (debugging is interactive; the run replays from scratch on a
-        // seek, so a shared decrementing counter would be inconsistent).
-        let mut fuel = self.fuel;
-        self.run.set_breakpoints(self.breakpoints.clone());
-        let stop = Self::sched_stop(self.run.run_until_stop(&mut fuel));
-        self.capture_tape(); // absorb any new cap inputs this advance recorded (for a later reverse seek)
-        stop
+        self.resume(ScheduledDebugRun::run_until_stop)
     }
     fn step(&mut self) -> Stop {
-        let mut fuel = self.fuel;
-        let stop = Self::sched_stop(self.run.step(&mut fuel));
-        self.capture_tape();
-        stop
+        self.resume(ScheduledDebugRun::step)
     }
     fn step_over(&mut self) -> Stop {
-        let mut fuel = self.fuel;
-        let stop = Self::sched_stop(self.run.step_over(&mut fuel));
-        self.capture_tape();
-        stop
+        self.resume(ScheduledDebugRun::step_over)
     }
     fn step_out(&mut self) -> Stop {
-        let mut fuel = self.fuel;
-        let stop = Self::sched_stop(self.run.step_out(&mut fuel));
-        self.capture_tape();
-        stop
+        self.resume(ScheduledDebugRun::step_out)
     }
     // Reverse debugging by **deterministic replay** (DEBUGGING.md W1): the debug run is pure compute
     // plus a recorded cap tape, so seeking to an earlier turn = rebuild a fresh run and replay to that

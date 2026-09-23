@@ -475,9 +475,10 @@ fn ssa_var_value_parity_per_step() {
     }
 
     // The debugger's variable API over the SSA locations: `a = v2 = 6`, `b = v3 = 36`, both defined at
-    // the last recorded step (before `v4`). They must match the bytecode slots 2 and 3.
+    // the last recorded step — the `return` terminator (#1713), where every value v0..v4 is defined.
+    // They must match the bytecode slots 2 and 3.
     let last = tw.len() - 1;
-    assert_eq!(tw[last].1.len(), 4, "v0..v3 defined at the last step");
+    assert_eq!(tw[last].1.len(), 5, "v0..v4 defined at the last step");
     let mut insp2 = Inspector::attach(&m, 0, &args, 100_000);
     insp2.seek(last as u64);
     assert_eq!(
@@ -764,18 +765,14 @@ block 0 (v0: i32) {
 }
 "#;
 
-/// The **legitimate, engine-agnostic** step_out outcome, pinned so it is not mistaken for a debugger
-/// regression: stepping out of a callee whose caller has *no remaining steppable op* — its only
-/// remaining action is its own `return` terminator — runs the guest to completion on **both** engines,
-/// rather than stopping "at the return line" in the caller. Block terminators (`return`/`br`) are
-/// non-stoppable positions by construction (the stop check `DebugCtx::before_op` only fires for
-/// `block.insts`, never the terminator; the bytecode engine mirrors this via `cur_ir_pc` returning
-/// `None` for a `SRC_TERM` op). So there is no op at the caller's depth to land on, and step_out —
-/// which the docstrings describe as running to completion "from the outermost frame" — does the same
-/// here for the general reason: **no caller frame has a remaining steppable op**. The two engines must
-/// agree on this (both finish with the same result), which is exactly what this pins.
+/// Stepping out of a callee whose caller does nothing after the call but `return` lands **on that
+/// `return`**, on both engines (#1713). A block terminator is a stop position (at
+/// `inst == insts.len()`), so the caller's `return v1` is the first position back at the caller's
+/// depth. The call's result is visible there, and one more step finishes the run. (Before #1713
+/// terminators were skipped, so this step_out ran the guest to completion, and a C `return x;` line
+/// could never be stopped on.)
 #[test]
-fn stepout_runs_to_completion_when_caller_immediately_returns() {
+fn stepout_lands_on_the_callers_return_when_it_immediately_returns() {
     let m = parse_module(TAILCALL_DBG).expect("parse");
     let args = [Value::I32(5)];
     let in_callee = IrPc {
@@ -784,6 +781,12 @@ fn stepout_runs_to_completion_when_caller_immediately_returns() {
         block: 0,
         inst: 1,
     }; // v2 = mul, inside the callee
+    let callers_return = IrPc {
+        module: 0,
+        func: 0,
+        block: 0,
+        inst: 1,
+    };
 
     // Tree-walker (reference): stop inside the callee, then step_out.
     let mut insp = Inspector::attach(&m, 0, &args, 100_000);
@@ -794,23 +797,34 @@ fn stepout_runs_to_completion_when_caller_immediately_returns() {
     );
     let tw_out = insp.step_out();
     assert!(
-        matches!(&tw_out, Stop::Finished(Ok(vals)) if vals == &[Value::I32(10)]),
-        "tree-walker step_out runs to completion (no steppable op in the caller), got {tw_out:?}"
+        matches!(&tw_out, Stop::Break { pc, .. } if *pc == callers_return),
+        "tree-walker step_out lands on the caller's return, got {tw_out:?}"
+    );
+    assert_eq!(
+        insp.read_ir_value(0, 1),
+        Some(Value::I32(10)),
+        "the call's result"
     );
     assert!(
-        insp.backtrace().is_empty(),
-        "the guest has finished — no frame to stop in"
+        matches!(insp.step(), Stop::Finished(Ok(vals)) if vals == [Value::I32(10)]),
+        "one more step finishes the run"
     );
 
-    // Bytecode engine: identical outcome (this is the parity claim, not a divergence).
+    // Bytecode engine: identical outcome.
     let mut dbg = bytecode::ScheduledDebugRun::new(&m, 0, &args).expect("bytecode debug session");
     let mut fuel = 100_000u64;
     assert_eq!(run_to(&mut dbg, &[in_callee], &mut fuel), Some(in_callee));
     assert_eq!(dbg.depth(), 2, "stopped inside the callee");
     assert_eq!(
         sched_pc(dbg.step_out(&mut fuel)),
+        Some(callers_return),
+        "bytecode step_out lands on the caller's return"
+    );
+    assert_eq!(dbg.value(1), Some(Value::I32(10)), "the call's result");
+    assert_eq!(
+        sched_pc(dbg.step(&mut fuel)),
         None,
-        "bytecode step_out reports no stop — the run finished"
+        "one more step finishes"
     );
     assert_eq!(
         dbg.result().cloned(),

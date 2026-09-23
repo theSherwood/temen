@@ -225,6 +225,29 @@ pub enum Trap {
     Malformed,
 }
 
+impl Trap {
+    /// The trap's kind as a stable name — what an embedder reports and matches on (a memory fault
+    /// vs a chosen `exit(k)`). One definition for every surface that names a trap: the DAP `exited`
+    /// event (#1190) and the browser release run (#1714).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Trap::OutOfFuel => "OutOfFuel",
+            Trap::DivByZero => "DivByZero",
+            Trap::IntOverflow => "IntOverflow",
+            Trap::MemoryFault => "MemoryFault",
+            Trap::StackOverflow => "StackOverflow",
+            Trap::IndirectCallType => "IndirectCallType",
+            Trap::Unreachable => "Unreachable",
+            Trap::BadConversion => "BadConversion",
+            Trap::CapFault => "CapFault",
+            Trap::Exit(_) => "Exit",
+            Trap::FiberFault => "FiberFault",
+            Trap::ThreadFault => "ThreadFault",
+            Trap::Malformed => "Malformed",
+        }
+    }
+}
+
 /// Maximum nested `call` depth before the interpreter traps, bounding the size of the
 /// **explicit** guest call stack (a `Vec<Frame>`, §12) so adversarial (or merely deep)
 /// guest recursion yields a clean `Trap::StackOverflow` rather than unbounded growth.
@@ -619,7 +642,7 @@ impl DebugCtx {
     fn before_op(
         &mut self,
         pc: IrPc,
-        inst: &Inst,
+        inst: Option<&Inst>,
         accesses: [MemAccess; 2],
         frame_vals: &[Reg],
         depth: usize,
@@ -656,7 +679,7 @@ impl DebugCtx {
                     addr: 0,
                     write: true,
                 })
-            } else if let Some(r) = sh.cap_stop(inst) {
+            } else if let Some(r) = inst.and_then(|i| sh.cap_stop(i)) {
                 Some(r)
             } else if self.step_target == Some(self.clock) {
                 Some(StopReason::Step)
@@ -12559,7 +12582,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     [MemAccess::None; 2]
                 };
                 if let Some(reason) =
-                    dbg.before_op(pc, inst, accesses, &frames[top].vals, frames.len())
+                    dbg.before_op(pc, Some(inst), accesses, &frames[top].vals, frames.len())
                 {
                     return Ok(Inner::Pause(reason, pc));
                 }
@@ -16350,6 +16373,22 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             }
         }
 
+        // The debug seam for the terminator (#1713): it is a stop position at `inst == insts.len()`,
+        // so a line whose only code is a `return x;` or a loop condition's branch can hold a
+        // breakpoint and a step lands on it. It touches no memory, so there are no accesses to watch.
+        if let Some(dbg) = debug.as_mut() {
+            let pc = IrPc {
+                module: frames[top].module,
+                func: frames[top].func,
+                block: frames[top].block,
+                inst: frames[top].inst,
+            };
+            let accesses = [MemAccess::None; 2];
+            if let Some(reason) = dbg.before_op(pc, None, accesses, &frames[top].vals, frames.len())
+            {
+                return Ok(Inner::Pause(reason, pc));
+            }
+        }
         // Fuel unification: the terminator no longer charges fuel unconditionally. A *back-edge* branch
         // (target block <= current) charges in its arm below; tail calls charge as function entries;
         // forward branches and `return` are free (bounded straight-line control flow). `kill` stays
