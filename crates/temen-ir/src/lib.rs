@@ -5194,11 +5194,9 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
-                let slot = match inst {
-                    Inst::CallSym { import, .. }
-                    | Inst::CallImport { import, .. }
-                    | Inst::ImportAttach { import, .. } => *import,
-                    _ => continue,
+                let slot = match import_slot_mut(inst) {
+                    Some(slot) => *slot,
+                    None => continue,
                 };
                 let disp = disps
                     .get(slot as usize)
@@ -5584,6 +5582,114 @@ pub fn stub_unreachable_funcs(
         di.func_names.retain(|nm| live[nm.func as usize]);
     }
     Ok(StubbedFuncs { stubbed })
+}
+
+/// The [`Module::imports`] slot an instruction names, if it names one.
+///
+/// The **single definition** of "which IR forms carry an index into the import table" — the import
+/// twin of the edge set [`offset_func_indices`] and [`stub_unreachable_funcs`] share. Every pass that
+/// renumbers or counts import references goes through here, so adding an import-bearing form is one
+/// edit rather than a hunt (INVARIANTS #15): miss a site and the failure is a silently mis-dispatched
+/// capability call, the #1524 shape.
+fn import_slot_mut(inst: &mut Inst) -> Option<&mut u32> {
+    match inst {
+        Inst::CallSym { import, .. }
+        | Inst::CallImport { import, .. }
+        | Inst::ImportAttach { import, .. } => Some(import),
+        _ => None,
+    }
+}
+
+/// What [`prune_unused_imports`] did.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct PrunedImports {
+    /// How many manifest slots were dropped (`0` ⇒ the module is unchanged).
+    pub pruned: usize,
+}
+
+/// **Drop every manifest import nothing reaches, and renumber the rest** (#1629) — the import-table
+/// twin of [`stub_unreachable_funcs`], and the pass that makes a linked program's manifest describe
+/// *the program* rather than the libraries it happened to link against.
+///
+/// [`link`] publishes every unit's imports in the merged table whether or not anything in the linked
+/// program can reach them. [`stub_unreachable_funcs`] then empties the dead *bodies* — but the import
+/// rows those bodies were the only users of survive, so a program that links a graphics library it
+/// never calls still declares `fb_present`/`fb_poll` in its manifest. That is the opposite of what the
+/// powerbox is for: [`Module::imports`] is the answer to "what capabilities does this need", and an
+/// embedder reading it cannot tell "wants a framebuffer" from "linked against something that has one".
+/// Downstream it is load-bearing, not cosmetic — c_interpret routes a program to its fast release
+/// runner only when every declared cap is served, so one unreachable row silently took the fast path
+/// away from every lesson (theSherwood/c_interpret#35).
+///
+/// # Why it renumbers where the function DCE would not
+///
+/// [`stub_unreachable_funcs`] keeps dead functions precisely because a funcidx is **forgeable**: it
+/// can arrive at `call.indirect` from arithmetic, so renumbering would silently retarget a call. An
+/// import index is the opposite — it is an **immediate**, never a value. No instruction computes one,
+/// there is no indirect dispatch through the manifest, and nothing bakes one into the data image (the
+/// data→code case is funcidx-only, [`Module::data_funcrefs`]). So the complete set of references is
+/// the one [`import_slot_mut`] names, the remap is exact, and the table can actually shrink. That is
+/// also why this needs no `data_funcrefs` gate, unlike the function pass.
+///
+/// # Order
+///
+/// Run it **after** [`stub_unreachable_funcs`]: a dead function's body still names its imports until
+/// the body is emptied, so pruning first would keep every row the DCE is about to orphan. Run alone
+/// on a module that has not been DCE'd and it is very nearly a no-op, which is the honest outcome —
+/// every row really is reachable.
+///
+/// Declines (changing nothing) if any reference is out of range — renumbering around a broken index
+/// is the verifier's problem to report, not this pass's to paper over.
+pub fn prune_unused_imports(m: &mut Module) -> PrunedImports {
+    let n = m.imports.len();
+    if n == 0 {
+        return PrunedImports { pruned: 0 };
+    }
+    let mut used = alloc::vec![false; n];
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Some(slot) = import_slot_mut(inst) {
+                    match used.get_mut(*slot as usize) {
+                        Some(u) => *u = true,
+                        // Out of range: fail closed, leave the module exactly as it was.
+                        None => return PrunedImports { pruned: 0 },
+                    }
+                }
+            }
+        }
+    }
+    let pruned = used.iter().filter(|u| !**u).count();
+    if pruned == 0 {
+        return PrunedImports { pruned: 0 };
+    }
+    // Survivors keep their relative order, so a host that binds by position sees the same sequence
+    // with the dead rows removed — and one that binds by name (the manifest's own contract) is
+    // unaffected either way.
+    let mut remap = alloc::vec![0u32; n];
+    let mut next = 0u32;
+    for (i, &u) in used.iter().enumerate() {
+        if u {
+            remap[i] = next;
+            next += 1;
+        }
+    }
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Some(slot) = import_slot_mut(inst) {
+                    *slot = remap[*slot as usize];
+                }
+            }
+        }
+    }
+    let mut i = 0;
+    m.imports.retain(|_| {
+        let keep = used[i];
+        i += 1;
+        keep
+    });
+    PrunedImports { pruned }
 }
 
 /// An initialized data segment (§3a / D40). Placed in the window `[offset, offset+bytes.len())`

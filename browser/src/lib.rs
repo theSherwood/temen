@@ -9903,6 +9903,12 @@ pub fn link_program_multi(
         // point of entering there — so it needs no separate root, and anything neither reaches is
         // genuinely dead.
         let _ = temen_ir::stub_unreachable_funcs(&mut linked, &[entry_idx]);
+        // ...and then the manifest rows those emptied bodies were the only users of (#1629). The
+        // linker publishes every unit's imports, so linking the prebuilt graphics unit made *every*
+        // program declare `fb_present`/`fb_poll` — capabilities it has no path to. It must run after
+        // the DCE (a dead body still names its imports until it is emptied) and before
+        // `synth_manifest_start`, which reads the table this reports.
+        let _ = temen_ir::prune_unused_imports(&mut linked);
     }
     let module =
         temen_ir::synth_manifest_start(linked, entry_idx, false).map_err(|_| STATUS_UNSUPPORTED)?;

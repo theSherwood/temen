@@ -186,6 +186,22 @@ pub struct Journal {
     /// would re-apply a partial set and hand back a window that never existed. Raised only by
     /// dropping, so it is monotone, like every other thing the policy does.
     floor: u64,
+    /// How many entries the last [`coalesce`](Self::coalesce) left behind, so
+    /// [`apply_policy`](Self::apply_policy) can amortize compaction geometrically instead of running
+    /// it every turn.
+    ///
+    /// Without this the aged-out prefix is re-coalesced on **every op** past `fine_turns`: the guard
+    /// asks only whether anything has aged out, and once something has, coalescing re-tags the merged
+    /// entries with the segment's earliest coord — still below the cut — so the same question answers
+    /// yes again next turn, forever. That made an armed debug run ~1000x slower than an unarmed one
+    /// (#1633). `journal_cost` missed it because every guest it measures stops while still inside the
+    /// fine window, where the branch is never taken at all.
+    ///
+    /// Coalescing on a fixed turn stride fixes the cliff but stays quadratic — each pass re-walks
+    /// history that is already minimal, so cost still grows with total writes. Waiting until the
+    /// journal has **doubled** since the last pass makes the re-walk geometric: every entry is
+    /// re-coalesced O(log n) times over a run instead of O(n / stride).
+    coalesced_len: usize,
 }
 
 impl Journal {
@@ -332,9 +348,19 @@ impl Journal {
             return;
         }
         if let Some(cut) = now.checked_sub(policy.fine_turns) {
-            // Only worth walking if something has actually aged out of the fine window.
-            if self.entries.first().is_some_and(|e| e.coord < cut) {
+            // Only worth walking if something has actually aged out of the fine window — **and only
+            // once per fine window**, not once per turn. `coalesce` rebuilds the whole aged-out
+            // segment through a byte-keyed map, so its cost is the size of retained history, and
+            // paying that every turn is what #1633 was. Deferring it holds finer history a little
+            // longer, which is strictly *more* undo capability (a coalesced segment can only be undone
+            // to its start), so the only thing traded is a bounded amount of memory.
+            // `partition_point` is the O(log n) bounds check the old guard claimed to be; `coalesce`
+            // itself is O(retained bytes), so it runs only once the journal has doubled since the
+            // last pass.
+            let aged = self.entries.partition_point(|e| e.coord < cut);
+            if aged > 0 && self.entries.len() >= self.coalesced_len.saturating_mul(2).max(1024) {
                 self.coalesce(cut);
+                self.coalesced_len = self.entries.len();
             }
         }
         if policy.byte_budget == 0 {
