@@ -85,7 +85,7 @@ fn main() {
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
     let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
         std::sync::Arc::new(make);
-    let (imports, unbound) = temen_run::nim_posix_imports(&module, &posix, make);
+    let (imports, unbound, _slot) = temen_run::nim_posix_imports(&module, &posix, make);
     assert!(
         unbound.is_empty(),
         "unbound nimony imports (extend `temen_run::nim_import_binding`): {unbound:?}"
