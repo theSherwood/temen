@@ -7142,6 +7142,166 @@ fn admit_parks_for_freeze(s: &mut Sched) {
     }
 }
 
+/// #1671 — one vCPU as the freeze census sees it: the parts of its state a cut depends on. Built from
+/// a parked vCPU ([`VCpu::seat`]) or, for the vCPU whose poll the trigger fired on, from the locals
+/// `run_inner` holds.
+struct Seat<'a> {
+    id: TaskId,
+    nested_child: bool,
+    threads: &'a [Option<TaskId>],
+    nested_children: &'a [NestedChildInfo],
+    child_hosts: &'a BTreeMap<usize, Arc<Mutex<Host>>>,
+    child_freeze: &'a BTreeMap<usize, (Arc<AtomicBool>, DetachedSpawn)>,
+    handler_parked: bool,
+    /// Whether its window's image can be taken (no §13 region mapped).
+    window_safe: bool,
+    host: &'a Arc<Mutex<Host>>,
+    registry: &'a Arc<FiberRegistry>,
+}
+
+impl VCpu {
+    fn seat(&self) -> Seat<'_> {
+        Seat {
+            id: self.id,
+            nested_child: self.nested_child,
+            threads: &self.threads,
+            nested_children: &self.nested_children,
+            child_hosts: &self.child_hosts,
+            child_freeze: &self.child_freeze,
+            handler_parked: !self.handler_parks.is_empty(),
+            window_safe: self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe()),
+            host: &self.host,
+            registry: &self.registry,
+        }
+    }
+}
+
+/// Whether join slot `slot` holds a `thread.spawn` sibling — a thread of this domain, neither a
+/// nested child (a carve) nor a detached one (a window of its own). The two §14 kinds re-attach at
+/// their recorded slot on thaw; a thread re-attaches by push, so it is the one that can't be mixed
+/// with a nested child yet (#1673).
+fn is_thread_slot(seat: &Seat, slot: usize) -> bool {
+    !seat.nested_children.iter().any(|c| c.slot == slot) && !seat.child_hosts.contains_key(&slot)
+}
+
+/// Every vCPU the scheduler holds — runnable or parked anywhere. With the durable single worker, that
+/// is every vCPU of the run but the one executing. The collections [`teardown_run`] sweeps.
+fn scheduled_vcpus(s: &Sched) -> Vec<&VCpu> {
+    fn waiter(w: &Waiter) -> Option<&VCpu> {
+        match w {
+            Waiter::VCpu(v) => Some(v),
+            Waiter::Fiber { .. } => None,
+        }
+    }
+    let mut out: Vec<&VCpu> = Vec::new();
+    out.extend(s.runnable.iter().map(|v| &**v));
+    out.extend(s.join_waiters.values().map(|v| &**v));
+    out.extend(s.lane_waiters.iter().map(|v| &**v));
+    out.extend(s.stopped.values().flatten().map(|v| &**v));
+    out.extend(s.reap_any_waiters.iter().map(|v| &**v));
+    out.extend(
+        s.wait_waiters
+            .values()
+            .flatten()
+            .filter_map(|(_, w)| waiter(w)),
+    );
+    out.extend(s.cap_waiters.values().flatten().filter_map(waiter));
+    out.extend(s.ticket_waiters.values().filter_map(waiter));
+    out.extend(s.completion_waiters.values().filter_map(waiter));
+    out.extend(s.svc_waiters.values().flatten().map(|v| &**v));
+    out.extend(s.admit_waiters.values().flatten().map(|v| &**v));
+    out.extend(s.pipe_waiters.values().flatten().filter_map(waiter));
+    out.extend(s.pipe_write_waiters.values().flatten().filter_map(waiter));
+    out.extend(s.posix_reap_waiters.values().flatten().map(|v| &**v));
+    out
+}
+
+/// #1671 — the **freeze census**: at the instant a freeze trigger fires, before anything unwinds, can
+/// the cut complete? `me` is the vCPU whose poll the trigger fired on, `root` the run root's powerbox
+/// (whose own handles are the codec's to answer, since its embedder can still drain them). Walks every
+/// vCPU of the run. `None` = go ahead; `Some` = decline, and the caller leaves the run untouched.
+///
+/// Mirrors the fail-closed refusals the unwind makes (`nested_refused`, `child_state_refused`,
+/// `detached_live_refused`, `freeze_drive`), which stay as the backstop for a cause that arises after
+/// this — the census is what makes them unreachable for everything visible here. Each cause is a gap
+/// filed to be closed (#1703); this is the fallback, not the design point.
+fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option<FreezeDeclined> {
+    let SchedRef::Real(rs) = sched else {
+        return None; // the deterministic explorer has no durable freeze
+    };
+    let declined = |cause, task: TaskId, slot| Some(FreezeDeclined { cause, task, slot });
+    // Phase 1, under the scheduler lock: the structural facts, and the powerboxes and fiber tables to
+    // look into once it is released (a powerbox lock is never taken under the scheduler's).
+    let mut hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
+    let mut registries: Vec<(TaskId, bool, Arc<FiberRegistry>)> = Vec::new();
+    {
+        let s = rs.lock();
+        let others: Vec<Seat> = scheduled_vcpus(&s).into_iter().map(VCpu::seat).collect();
+        for seat in std::iter::once(me).chain(others.iter()) {
+            if seat.handler_parked {
+                return declined(DeclineCause::ServeHandlerParked, seat.id, None);
+            }
+            let mut live_nested = false;
+            let mut live_thread = false;
+            for (slot, cid) in seat
+                .threads
+                .iter()
+                .enumerate()
+                .filter_map(|(i, t)| t.map(|c| (i, c)))
+            {
+                if is_thread_slot(seat, slot) {
+                    live_thread = true;
+                    continue;
+                }
+                let nested = seat.nested_children.iter().any(|c| c.slot == slot);
+                live_nested |= nested;
+                match s.results.get(&cid) {
+                    Some(o) if o.result.is_err() => {
+                        return declined(DeclineCause::ChildTrapped, seat.id, Some(slot));
+                    }
+                    None if !nested && !seat.child_freeze.contains_key(&slot) => {
+                        return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
+                    }
+                    _ => {}
+                }
+            }
+            if live_nested && live_thread {
+                return declined(DeclineCause::NestedWithThread, seat.id, None);
+            }
+            let root_domain = Arc::ptr_eq(seat.host, root);
+            if !seat.nested_child && !root_domain && !seat.window_safe {
+                return declined(DeclineCause::SharedRegionWindow, seat.id, None);
+            }
+            if !root_domain && !hosts.iter().any(|(_, h)| Arc::ptr_eq(h, seat.host)) {
+                hosts.push((seat.id, Arc::clone(seat.host)));
+            }
+            if !registries
+                .iter()
+                .any(|(_, _, r)| Arc::ptr_eq(r, seat.registry))
+            {
+                registries.push((seat.id, seat.nested_child, Arc::clone(seat.registry)));
+            }
+        }
+    }
+    // Phase 2: the child powerboxes' handle tables and the fiber tables.
+    for (task, h) in &hosts {
+        if let Err(nd) = h.lock_unpoisoned().capture_durable_handles() {
+            return declined(DeclineCause::NonDurableHandle(nd), *task, None);
+        }
+    }
+    for (task, nested_child, reg) in &registries {
+        if *nested_child && reg.has_freeze_residue() {
+            return declined(DeclineCause::NestedChildFibers, *task, None);
+        }
+        for (slot, woken) in reg.blocked_parks() {
+            if !woken && !rs.fiber_wait_parked(reg, slot) {
+                return declined(DeclineCause::FiberParkedOnCall, *task, Some(slot));
+            }
+        }
+    }
+    None
+}
+
 /// #1624 — is every remaining futex park **unsatisfiable**, so that the only thing still keeping the
 /// run alive is the [`MAX_WAIT`] backstop?
 ///
@@ -7451,12 +7611,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         .collect();
                     if live.is_empty() {
                         false
-                    } else if v.threads.iter().enumerate().any(|(slot, t)| {
-                        // A live `thread.spawn` sibling (a `threads` slot not backed by a
-                        // `nested_children` entry): its thaw seeding and the §14 seeding would contend
-                        // for the join table — fail closed.
-                        t.is_some() && !v.nested_children.iter().any(|c| c.slot == slot)
-                    }) || v.mem.is_none()
+                    } else if v
+                        .threads
+                        .iter()
+                        .enumerate()
+                        .any(|(slot, t)| t.is_some() && is_thread_slot(&v.seat(), slot))
+                        || v.mem.is_none()
                     {
                         true // uncovered shape / malformed durable freeze
                     } else {
@@ -10140,6 +10300,14 @@ impl FiberRegistry {
     /// §3.6 slice 5a — whether any fiber is **event-parked** (`ParkedOn`). A durable freeze
     /// fails closed on one: its wake is host-side scheduler state (a waiter entry) that no
     /// snapshot can carry — durable event-parks are a recorded follow-up.
+    /// #1671 — whether a freeze would flatten any fiber here (a suspend-parked or event-parked one).
+    fn has_freeze_residue(&self) -> bool {
+        self.lock()
+            .fibers
+            .iter()
+            .any(|f| matches!(f, RegFiber::Parked(_) | RegFiber::ParkedOn { .. }))
+    }
+
     fn has_blocked_parks(&self) -> bool {
         self.lock()
             .fibers
@@ -11657,7 +11825,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
         threads,
         nested_children,
         child_hosts,
-        nested_child: _,
+        nested_child,
         nested_slot: _,
         depth,
         pending,
@@ -11707,6 +11875,31 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
     let stop_depth = host.lock_unpoisoned().stop_depth.clone();
     // #796 default actions — the domain's terminate flag, same one-relaxed-load-per-op shape.
     let term_flag = host.lock_unpoisoned().term_flag.clone();
+    // #1671 — the freeze census at a trigger: `$m` is this vCPU's window, whose countdown just fired
+    // (its freeze word now reads `UNWINDING`). If the cut cannot complete, put the word back to
+    // `NORMAL` before any poll reads it — nothing has unwound, so the run continues untouched — and
+    // record the decline on the run root's powerbox for the embedder.
+    macro_rules! freeze_census_at_trigger {
+        ($m:expr) => {{
+            let seat = Seat {
+                id: *id,
+                nested_child: *nested_child,
+                threads: threads.as_slice(),
+                nested_children: nested_children.as_slice(),
+                child_hosts: &*child_hosts,
+                child_freeze: &*child_freeze,
+                handler_parked: !handler_parks.is_empty(),
+                window_safe: $m.layout_snapshot_safe(),
+                host: &*host,
+                registry: &*registry,
+            };
+            let root = freeze_sink.clone().unwrap_or_else(|| Arc::clone(host));
+            if let Some(d) = freeze_census(&seat, sched, &root) {
+                $m.durable_set_state(STATE_NORMAL);
+                root.lock_unpoisoned().freeze_declined = Some(d);
+            }
+        }};
+    }
 
     // Reusable scratch for branch edge-args (block parameters). Each taken edge gathers its
     // args here and swaps the buffer into the frame's value slot, so steady-state branching —
@@ -12420,7 +12613,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             // general mid-run freeze.
             if durable && matches!(inst, Inst::ContResume { .. } | Inst::Suspend { .. }) {
                 if let Some(m) = mem.as_mut() {
-                    m.durable_tick_arm();
+                    if m.durable_tick_arm() {
+                        freeze_census_at_trigger!(m);
+                    }
                 }
             }
 
@@ -16141,7 +16336,9 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
             )
         {
             if let Some(m) = mem.as_mut() {
-                m.durable_tick_arm_backedge();
+                if m.durable_tick_arm_backedge() {
+                    freeze_census_at_trigger!(m);
+                }
             }
         }
         match &block.term {
@@ -18481,6 +18678,47 @@ pub enum JitRestoreError {
     Verify,
 }
 
+/// #1671 — why a freeze was **declined**: the run was about to begin a cut it could not complete, so
+/// it did not begin it. See [`FreezeDeclined`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DeclineCause {
+    /// A §14 child completed with a trap and has not been joined; a trap cannot ride the artifact
+    /// yet (#1674).
+    ChildTrapped,
+    /// A child domain holds a handle no artifact can carry (§12.5). The root's own handles are the
+    /// codec's to answer ([`Host::capture_durable_handles`]), since its embedder can still drain them.
+    NonDurableHandle(NonDurableHandle),
+    /// A live §14 nested child beside a live `thread.spawn` sibling (#1673).
+    NestedWithThread,
+    /// A §14 nested child owns fibers (#1675).
+    NestedChildFibers,
+    /// A live detached child has no freeze doorbell, so nothing can reach it.
+    DetachedUnreachable,
+    /// A serve handler is parked (#1677).
+    ServeHandlerParked,
+    /// A fiber is parked on a capability call, a ticket or a pipe (#1676).
+    FiberParkedOnCall,
+    /// A detached child's window has a §13 region mapped, so its image cannot be taken (#1679).
+    SharedRegionWindow,
+}
+
+/// #1671 — a freeze the run **declined**. At the instant a freeze trigger fires, a census asks
+/// whether the cut can complete; when it cannot, the freeze word goes back to `NORMAL` and the run
+/// continues untouched — the guest never sees it (INVARIANTS #5: a lifecycle event is never a
+/// domain-killing surprise). The embedder reads the answer with [`Host::take_freeze_declined`].
+///
+/// A decline is a fallback, not a design point: every [`DeclineCause`] is a gap filed to be closed
+/// (#1703). Only causes that can arise *after* the trigger stay fail-closed (a `Blocking.work` entered
+/// under a landed freeze, #1678).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FreezeDeclined {
+    pub cause: DeclineCause,
+    /// The task whose state declined it (its id in this run).
+    pub task: u64,
+    /// The task's child slot the cause is about, when it is about a child.
+    pub slot: Option<usize>,
+}
+
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
 /// out-of-line host state or native pointers, so it isn't re-grantable (DURABILITY.md §12.5).
 /// Freeze refuses with this rather than silently dropping authority, so restore is
@@ -20370,6 +20608,8 @@ pub struct Host {
     /// #1361 step 4 — the live detached children a **thaw** re-launches (see [`ThawedDetached`]),
     /// seeded by restore alongside the rest of the residue and taken by the run driver.
     thawed_detached: Vec<ThawedDetached>,
+    /// #1671 — the last freeze this run declined, if any (see [`FreezeDeclined`]).
+    freeze_declined: Option<FreezeDeclined>,
     /// §13.4 slice 4c — per-child **host state** residue of a subtree freeze: a serving (or
     /// cap-holding) nested child's serve trio + durable handle table, keyed by the same
     /// `(parent_task, slot)` as its [`FrozenNested`] record (pushed by the child's own
@@ -20789,6 +21029,7 @@ impl Host {
             pending_detached: Vec::new(),
             captured_detached: Vec::new(),
             thawed_detached: Vec::new(),
+            freeze_declined: None,
             frozen_child_state: Vec::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
@@ -21886,6 +22127,12 @@ impl Host {
     /// window, powerbox and launch record), alongside the restored root window.
     pub fn set_thawed_detached(&mut self, thawed: Vec<ThawedDetached>) {
         self.thawed_detached = thawed;
+    }
+
+    /// #1671 — take the freeze this domain's run declined, if one was (see [`FreezeDeclined`]). A
+    /// declined freeze leaves the run to finish normally, so its result is the run's own.
+    pub fn take_freeze_declined(&mut self) -> Option<FreezeDeclined> {
+        self.freeze_declined.take()
     }
 
     /// Take the live detached children seeded for the next thaw (see [`Host::set_thawed_detached`]).
@@ -29255,25 +29502,26 @@ impl Mem {
     /// promote the state word to `UNWINDING` — so the safepoint's trailing poll begins the freeze. A
     /// no-op unless armed (the common case: one `i32` read per safepoint, no write), so an unarmed run
     /// is byte-identical. Call once per fiber safepoint — see the `run_inner` dispatch.
-    fn durable_tick_arm(&mut self) {
-        self.durable_tick_countdown(ARM_COUNTDOWN_OFF);
+    fn durable_tick_arm(&mut self) -> bool {
+        self.durable_tick_countdown(ARM_COUNTDOWN_OFF)
     }
 
     /// Back-edge variant (Phase-4 Slice A): on an `ARMED` run, count down [`ARM_BACKEDGE_OFF`] at
     /// each branch terminator and promote to `UNWINDING` at 0, so the next loop-header poll begins
     /// the freeze — reaching a poll-free compute loop. Inert unless armed for back-edges (the slot
     /// is positive), so a fiber-armed or ordinary run is byte-identical. Call at branch terminators.
-    fn durable_tick_arm_backedge(&mut self) {
-        self.durable_tick_countdown(ARM_BACKEDGE_OFF);
+    fn durable_tick_arm_backedge(&mut self) -> bool {
+        self.durable_tick_countdown(ARM_BACKEDGE_OFF)
     }
 
     /// Decrement the countdown at `off` on an `ARMED` run and promote to `UNWINDING` at 0. Guarded
     /// on the slot being **positive**, so the two countdowns (fiber-safepoint / back-edge) never
     /// interfere: arming one leaves the other at 0, where this is a no-op. An unarmed run is one
-    /// `i32` state read, no write.
-    fn durable_tick_countdown(&mut self, off: u64) {
+    /// `i32` state read, no write. `true` exactly when this tick fired the trigger — the moment the
+    /// freeze census (#1671) runs.
+    fn durable_tick_countdown(&mut self, off: u64) -> bool {
         if self.durable_state() != STATE_ARMED {
-            return;
+            return false;
         }
         let cur = self
             .read_bytes_impl(off, 8)
@@ -29281,13 +29529,14 @@ impl Mem {
             .map(i64::from_le_bytes)
             .unwrap_or(0);
         if cur <= 0 {
-            return; // not armed for this countdown
+            return false; // not armed for this countdown
         }
         let n = cur - 1;
         let _ = self.write_bytes_impl(off, &n.to_le_bytes());
         if n <= 0 {
             self.durable_set_state(STATE_UNWINDING);
         }
+        n <= 0
     }
 
     fn read_le(&self, base: u64, width: u32) -> u64 {
@@ -32328,3 +32577,6 @@ mod signal_door_claim_tests {
 
 #[cfg(test)]
 mod detached_freeze_tests;
+
+#[cfg(test)]
+mod freeze_census_tests;

@@ -1583,6 +1583,28 @@ the codec rightly refuses). *Interp note:* recycling is done interp-side, but th
 STW (single-worker; `arm_freeze_after` flips only the running vCPU's word), so the recycled-context-at-freeze
 stays a **JIT** slice; the interp path is unaffected. *Still optional:* fuzzing the spawn/join/freeze interleaving.
 
+**Declined freezes (#1671, owner decision 2026-09-23).** A freeze that cannot complete is **declined at its
+trigger, before anything unwinds** — never a domain-killing trap (INVARIANTS #5). The instant a countdown
+trigger fires (`durable_tick_countdown` promotes `ARMED` → `UNWINDING`, at a fiber safepoint or a back-edge),
+`freeze_census` walks every vCPU of the run (the one executing plus everything the scheduler holds, runnable or
+parked) and asks whether the cut can complete. If not, the freeze word goes straight back to `NORMAL` — no poll
+has read it, so nothing unwound — the run finishes exactly as if it had never been armed, and the run root's
+powerbox records a `FreezeDeclined { cause, task, slot }` for the embedder (`Host::take_freeze_declined`). The
+causes (`DeclineCause`) are the shapes the unwind would refuse: a §14 child completed with a trap
+(`ChildTrapped`), a child domain holding a non-durable handle, a live nested child beside a `thread.spawn`
+thread, a nested child owning fibers, a live detached child with no doorbell, a parked serve handler, a fiber
+parked on a call/ticket/pipe, and a detached window with a §13 region mapped. The **root's** own non-durable
+handles are not a cause: the codec answers those as a `FreezeError` value and its embedder can still drain them.
+The unwind-time refusals (`nested_refused`, `child_state_refused`, `detached_live_refused`, `freeze_drive`)
+stay as the fail-closed backstop for a cause that arises *after* the census — `Blocking.work` entered under a
+landed freeze (4A.7, below) is the one named. The owner's standing rule is that freezes should basically never
+fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap filed to be closed
+(#1703). On the oracle only for now; freeze-from-start (a window that begins `UNWINDING`) and freeze-on-quiesce
+are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a trapped completed child and a
+nested child beside a thread each decline, and the run's result equals the unarmed run's; with the census
+disabled both end `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the
+root's handles are the codec's").
+
 **[~] 4A.7 — parked-vCPU / `Blocking.work` latency — done (fail-closed cut).** A durable stop-the-world freeze
 waits for every vCPU to quiesce *at a safepoint*; a vCPU inside a host `Blocking.work` call has no poll site, so
 the freeze would stall for the whole (latency-unbounded) call — the R6 caveat ("latency bounded by the longest
