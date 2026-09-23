@@ -798,6 +798,7 @@ unsafe fn make_fiber(
     mask: u64,
     type_id: u32,
     call_tramp: FiberCallTramp,
+    fuel_addr: u64,
 ) -> Option<Fiber> {
     Fiber::new(FIBER_STACK, move |y: &Yielder, arg: u64| -> u64 {
         // The *resuming* vCPU's runtime — read dynamically at **each** use, never carried across
@@ -815,6 +816,14 @@ unsafe fn make_fiber(
                 fault(trap_out);
                 0u64
             } else {
+                // Fuel unification (#1642): the `cont.resume` starting this fiber already charged the
+                // one fuel a start costs — on the interpreters that resume is the *whole* cost of
+                // entering a fiber. The entry's prologue is about to charge again, unable to tell a
+                // start from a call, so refund one. It cannot underflow or trap: the resume's check
+                // passed, so the cell holds at least the one this adds back. `0` ⇒ un-armed.
+                if fuel_addr != 0 {
+                    *(fuel_addr as *mut u64) += 1;
+                }
                 // §2b path B: this fiber runs on its own control stack; pass its low bound as the
                 // stack-limit so the guest's prologue checks trap before overflowing it (per-vCPU by
                 // construction — each fiber supplies its own, threaded on as an ABI param).
@@ -862,15 +871,17 @@ pub(crate) unsafe fn make_task_fiber(
 /// registry), or traps (`-1`) on a fiber-bomb (the **per-domain** §15 quota).
 ///
 /// # Safety
-/// `fn_table_base`/`trap_out` are the threaded context. The running vCPU's fiber runtime is read from
-/// the [`CURRENT_RT`] thread-local. The funcref is resolved (and type-checked) lazily on first resume,
-/// matching the interpreter.
+/// `fn_table_base`/`trap_out` are the threaded context; `fuel_addr` is this compile's counted-fuel
+/// cell (`0` ⇒ un-armed), for [`make_fiber`]'s start refund. The running vCPU's fiber runtime is read
+/// from the [`CURRENT_RT`] thread-local. The funcref is resolved (and type-checked) lazily on first
+/// resume, matching the interpreter.
 pub(crate) unsafe extern "C" fn fiber_new(
     mem_base: u64,
     fn_table_base: u64,
     trap_out: u64,
     funcref: i32,
     sp: u64,
+    fuel_addr: u64,
 ) -> i64 {
     let rt = current();
     if rt.is_null() {
@@ -903,6 +914,7 @@ pub(crate) unsafe extern "C" fn fiber_new(
         mask,
         type_id,
         call_tramp,
+        fuel_addr,
     ) {
         Some(f) => f,
         None => {
@@ -1354,6 +1366,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
     let mut seed = seed.to_vec();
     seed.sort_by_key(|f| f.slot);
     for (expected, f) in seed.iter().enumerate() {
+        // `0`: no counted-fuel entry runs durable, so a thawed fiber has no budget to refund into.
         let Some(fiber) = make_fiber(
             f.func,
             f.sp as u64,
@@ -1363,6 +1376,7 @@ pub(crate) unsafe fn seed_frozen_fibers(
             mask,
             type_id,
             call_tramp,
+            0,
         ) else {
             // The OS refused a thaw control-stack reservation — recoverable, not an abort (I1).
             fault(trap_out);

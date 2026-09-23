@@ -10795,25 +10795,14 @@ fn step_vcpu(
                         };
                         let fired = woken.take().or_else(|| {
                             // #1638: an infinite wait has no real deadline to poll against, so
-                            // a busy resume-poll loop over one never fabricates a timeout here.
-                            //
-                            // MEASURED TRADE, recorded because it is a liveness *regression* in
-                            // one shape: a **non-blocking** `cont.resume` spin loop over an
-                            // unsatisfiable infinite fiber wait never idles this driver (the
-                            // resumer stays runnable), so the deadlock exit at idle is never
-                            // reached and the run now spins forever. Before this change it ended
-                            // — with `WAIT_TIMED_OUT` at 10.000979 s, i.e. only by the backstop
-                            // fabricating the very status #1638 is about.
-                            //
-                            // It is still the right trade, and not a free one: the tree-walk
-                            // oracle and the Cranelift JIT **both already hang on that exact
-                            // kernel**, measured before and after. Terminating here would make
-                            // the bytecode engine the one that answers where the oracle does
-                            // not — an INVARIANTS #9 divergence in the other direction, which is
-                            // what #1638 is a bug report about. So this path matches the oracle,
-                            // and the shared gap — no engine asks the deadlock predicate from a
-                            // resume poll, only at driver idle — is #1642, rather than papered
-                            // over in this one engine with a status the guest never asked for.
+                            // a busy resume-poll loop over one never fabricates a timeout here —
+                            // it runs until the poller itself `notify`s the fiber, or until fuel
+                            // runs out. That is the answer, not a gap (#1642): the poller is live
+                            // guest code, so whether it will ever notify is undecidable and no
+                            // engine may call the loop a deadlock. Fuel bounds it like any other
+                            // guest loop, at the identical safepoint on all three engines
+                            // (`jit_fuel.rs`). Before #1638 this engine alone ended it, with a
+                            // `WAIT_TIMED_OUT` at 10 s that the guest never asked for.
                             real_deadline
                                 .filter(|dl| sched_wall_now() >= *dl)
                                 .map(|_| super::WAIT_TIMED_OUT)
@@ -14465,13 +14454,11 @@ impl Futex {
     /// must not tie at a 10 s cap and wake in the wrong order.
     ///
     /// `None` (an infinite wait) is the one case this driver still backstops with [`MAX_WAIT`],
-    /// and that is a **known remaining gap**, not a semantics choice: the cooperative schedulers
-    /// answer an unsatisfiable infinite wait with the deadlock their clock already implies
-    /// (#1638), and the tree-walk oracle with `futex_parks_unsatisfiable` + `run_deadlocked`, but
-    /// this driver runs each vCPU on its own OS thread and has no cross-thread park census to ask.
-    /// Dropping the backstop here would trade a wrong status for an unbounded hang — the worse
-    /// half of INVARIANTS #9 — so it stays until that predicate exists. See #1638's closing note:
-    /// four engines each restating "can this wait ever be satisfied?" is the thing to fix.
+    /// and it is a **known divergence** from the oracle in both directions (#1652): a satisfiable
+    /// wait longer than the cap returns a spurious `WAIT_TIMED_OUT` where the oracle waits it out,
+    /// and an unsatisfiable one returns `WAIT_TIMED_OUT` at 10 s where the oracle faults. It stays
+    /// only because this driver runs each vCPU on its own OS thread with no cross-thread park
+    /// census, so dropping the backstop outright would turn the second case into a hang.
     fn wait(&self, mem: &Mem, base: u64, expected: u64, width: u32, timeout: Option<u64>) -> i32 {
         let waiter = {
             let mut buckets = self.buckets.lock().unwrap();

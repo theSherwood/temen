@@ -25,14 +25,16 @@
 //! deadlocks → `ThreadFault`**)"* — and that path was simply unreachable while every infinite
 //! wait carried a backstop deadline. The fix makes an infinite wait carry **no** deadline, so it
 //! is not a clock-advance candidate and the deadlock exit is reached by construction.
-
-//! **Scope, measured.** Both kernels here poll with `cont.resume.block`, which idles the
-//! resumer on the fiber (I48) so the run quiesces and each engine's deadlock predicate fires.
-//! The **non-blocking** `cont.resume` spin variant is deliberately absent: it never lets the
-//! driver idle, so no engine's predicate is reached and it hangs on **all three** backends —
-//! before this fix as well as after (only the bytecode engine terminated, and only by
-//! fabricating `WAIT_TIMED_OUT` at 10.000979 s from the same backstop). That is #1642; a gate
-//! for it would hang CI rather than fail it, so it is recorded there, not here.
+//!
+//! **Where this contract stops.** The fiber kernel polls with `cont.resume.block`, which idles
+//! the resumer on the fiber (I48). Then nothing in the run is runnable, and that state — every
+//! vCPU parked, no wake possible — is the only one in which "this wait can never be satisfied"
+//! is decidable. A **non-blocking** `cont.resume` poll loop is not that state, and is correctly
+//! *not* a deadlock: the poller is live guest code that may `notify` its own fiber on any later
+//! poll. (#1642 proposed asking the predicate from the poll; it would fault correct programs.)
+//! Such a loop is bounded by fuel like any other, and both halves are pinned three-engine in
+//! `jit_fuel.rs`: the poller that wakes its fiber after 1000 polls completes, and the one that
+//! never does exhausts its budget at the identical safepoint.
 
 use std::time::{Duration, Instant};
 use temen_run::{instantiate, Backend, RunConfig};

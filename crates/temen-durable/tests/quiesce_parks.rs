@@ -14,10 +14,12 @@
 //! transform already instruments as re-issue suspend points (`SuspendKind::MemoryWait`), exactly
 //! like the serve op. The scheduler simply never woke them.
 
+use std::time::{Duration, Instant};
 use temen_durable::{
-    arm_freeze_on_quiesce, begin_thaw, init_durable_window, transform_module_assume_confined,
+    arm_freeze_after_backedges, arm_freeze_on_quiesce, begin_thaw, init_durable_window,
+    transform_module_assume_confined, write_state, STATE_UNWINDING,
 };
-use temen_interp::{run_capture_reserved_with_host, Host, Value};
+use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::Memory;
 
 const TEST_ARENA: temen_ir::durable_abi::ShadowArena = temen_ir::durable_abi::ShadowArena {
@@ -178,4 +180,250 @@ fn a_join_parked_root_takes_the_freeze_its_child_was_re_admitted_for() {
         Ok(vec![Value::I64(2100)]),
         "the thawed subtree re-issues both suspend points and completes"
     );
+}
+
+// The shapes below reach a park from the other side: the freeze is already under way when the
+// scheduler finds a vCPU parked. #1619 taught the quiesce arm to drain every park the scheduler
+// owns, but only the quiesce arm; a freeze triggered any other way left a parked vCPU where it was,
+// and the deadlock check then reaped it — so the "freeze" returned `Ok` with that vCPU missing from
+// the cut. The same body now runs for both triggers.
+
+type Inst = std::sync::Arc<temen_ir::Module>;
+
+/// Run `inst` durably with the window prepared by `arm`; return the result, the snapshot, and the
+/// host holding the freeze residue.
+fn freeze(
+    inst: &Inst,
+    arm: impl FnOnce(&mut Vec<u8>),
+) -> (Result<Vec<Value>, Trap>, Vec<u8>, Host) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.set_self_module(inst);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm(&mut win);
+    let mut fuel = 1_000_000u64;
+    let (r, snap) =
+        run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h);
+    (r, snap, h)
+}
+
+/// Thaw `snap` with the residue `h` recorded, after changing the word every kernel here waits on —
+/// so each re-issued wait returns `NOT_EQUAL` at once instead of parking again.
+fn thaw_with_the_word_changed(inst: &Inst, snap: &[u8], h: &Host) -> Result<Vec<Value>, Trap> {
+    let mut h2 = Host::new();
+    h2.set_durable(true);
+    h2.set_self_module(inst);
+    h2.set_frozen_vcpus(h.frozen_vcpus().to_vec());
+    if let Some(sp) = h.frozen_root_sp() {
+        h2.set_frozen_root_sp(sp);
+    }
+    h2.set_frozen_fibers(h.frozen_fibers().to_vec());
+    let mut win = snap.to_vec();
+    win[66000..66004].copy_from_slice(&1i32.to_le_bytes());
+    begin_thaw(&mut win, TEST_ARENA, 0);
+    let mut fuel = 1_000_000u64;
+    run_capture_reserved_with_host(inst, 0, &[], &mut fuel, &win, SIZE_LOG2, &mut h2).0
+}
+
+/// The root spawns a sibling that parks forever, then sleeps 1 ms in a timed wait on a private word
+/// — the single freeze worker runs the sibling meanwhile, so it is parked *before* anything else
+/// happens — then runs a loop in which the back-edge countdown fires the freeze, then joins.
+const SRC_SIBLING_PARKED_BEFORE_THE_FREEZE: &str = r#"
+memory 17
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  vsl = i64.const 66008
+  vse = i32.const 0
+  vto = i64.const 1000000
+  vslept = i32.atomic.wait vsl vse vto
+  vi0 = i64.const 0
+  br 1(vt, vi0)
+}
+block 1 (vt1: i32, vi: i64) {
+  vone = i64.const 1
+  vi2 = i64.add vi vone
+  vlim = i64.const 1000
+  vmore = i64.ne vi2 vlim
+  br_if vmore 1(vt1, vi2) 2(vt1)
+}
+block 2 (vt2: i32) {
+  vr = thread.join vt2
+  vk = i64.const 2000
+  vs = i64.add vk vr
+  return vs
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  vk = i64.const 100
+  vr = i64.mul vst64 vk
+  return vr
+  }
+}
+"#;
+
+/// **A freeze that arrives while a sibling is parked brings it through.** The sibling parked in
+/// `NORMAL`, before the freeze existed, so it holds no phase and reaches no safepoint. It used to be
+/// reaped once the root had unwound: the freeze returned `Ok` with **no residue for the sibling**, a
+/// cut with a vCPU missing, and thawing it faulted `ThreadFault`. Now the in-flight freeze
+/// re-admits it, it unwinds at its wait, and the round trip reproduces the uninterrupted answer.
+#[test]
+fn a_freeze_in_flight_brings_a_sibling_parked_before_it() {
+    let inst = instrumented(SRC_SIBLING_PARKED_BEFORE_THE_FREEZE);
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_after_backedges(w, 5));
+    assert_eq!(
+        r,
+        Ok(vec![Value::I64(0)]),
+        "the root unwinds for the freeze"
+    );
+    assert_eq!(
+        h.frozen_vcpus().len(),
+        1,
+        "the parked sibling is in the cut — it used to be reaped and silently left out"
+    );
+    assert_eq!(
+        thaw_with_the_word_changed(&inst, &snap, &h),
+        Ok(vec![Value::I64(2100)]),
+        "the sibling re-issues its wait (NOT_EQUAL, 1·100), the root finishes its loop and joins"
+    );
+}
+
+/// **A child that parks inside a freeze is captured.** The run starts `UNWINDING`, the root spawns a
+/// child and joins it, and the child's first act is an infinite wait. Under a freeze a futex wait
+/// still parks, so the child parked *with* the phase and nothing ever woke it: the deadlock check
+/// reaped the whole run with `ThreadFault`, where the JIT (whose futex park observes a freeze on
+/// its own) freezes the same program. A parked vCPU carrying the phase is a freeze in flight, so it
+/// is re-admitted like any other.
+#[test]
+fn a_child_that_parks_inside_an_in_flight_freeze_is_captured() {
+    let inst = instrumented(SRC_JOIN_ON_A_FUTEX_PARKED_CHILD);
+    let (r, snap, h) = freeze(&inst, |w| write_state(w, STATE_UNWINDING));
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "a freeze, not a ThreadFault");
+    assert_eq!(
+        h.frozen_vcpus().len(),
+        1,
+        "the child recorded its re-attach residue"
+    );
+    assert_eq!(
+        thaw_with_the_word_changed(&inst, &snap, &h),
+        Ok(vec![Value::I64(2100)])
+    );
+}
+
+/// The root drives a fiber with `cont.resume.block`; the fiber parks forever in `atomic.wait`.
+/// Returns `1000 + fiber value` once the fiber returns, where the fiber returns `100 + status`.
+const SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME: &str = r#"
+memory 17
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 0
+  v2 = cont.new v0 v1
+  br 1(v2)
+}
+block 1 (vk: i64) {
+  vz = i64.const 0
+  vs, vv = cont.resume.block vk vz
+  vone = i32.const 1
+  vdone = i32.eq vs vone
+  br_if vdone 2(vv) 1(vk)
+}
+block 2 (vr: i64) {
+  vk2 = i64.const 1000
+  vout = i64.add vk2 vr
+  return vout
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  vaddr = i64.const 66000
+  vexp = i32.const 0
+  vinf = i64.const -1
+  vst = i32.atomic.wait vaddr vexp vinf
+  vst64 = i64.extend_i32_u vst
+  vk = i64.const 100
+  vr = i64.add vk vst64
+  return vr
+  }
+}
+"#;
+
+/// **A futex-parked fiber does not veto freeze-on-quiesce.** Two things stood in the way. A durable
+/// run took I48's advisory downgrade unconditionally, so `cont.resume.block` returned `FIBER_PARKED`
+/// and the resumer **spun** — the run never quiesced, and instead of freezing it ran its whole fuel
+/// budget out (`OutOfFuel`, 2.6 s on this kernel). And `quiesced_parks_only` held the arm off for any
+/// fiber waiter. Now the resumer idles like it does on a non-durable run, the fiber park counts as
+/// quiesced, the resumer is re-admitted to unwind, and the fiber is flattened by `freeze_drive`.
+#[test]
+fn a_futex_parked_fiber_does_not_veto_freeze_on_quiesce() {
+    let inst = instrumented(SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME);
+    let t = Instant::now();
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w));
+    assert_eq!(r, Ok(vec![Value::I64(0)]), "a freeze, not OutOfFuel");
+    assert!(
+        t.elapsed() < Duration::from_secs(4),
+        "idle, not a spin: {:?}",
+        t.elapsed()
+    );
+    assert_eq!(
+        h.frozen_fibers().len(),
+        1,
+        "the parked fiber is flattened into the cut"
+    );
+    assert_eq!(
+        thaw_with_the_word_changed(&inst, &snap, &h),
+        Ok(vec![Value::I64(1101)]),
+        "the fiber re-issues its wait (NOT_EQUAL → 100 + 1), the resumer collects it"
+    );
+}
+
+/// The same kernel on a durable run **not** armed to freeze. The fiber's wait can never be
+/// satisfied, and the resumer is now idle rather than spinning, so the run is a genuine deadlock
+/// and faults promptly — what a non-durable run already does (#1639) — instead of burning its fuel
+/// before `OutOfFuel`.
+#[test]
+fn an_unarmed_durable_run_idles_into_the_deadlock_verdict() {
+    let inst = instrumented(SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME);
+    let t = Instant::now();
+    let (r, _, _) = freeze(&inst, |_| {});
+    assert_eq!(r, Err(Trap::ThreadFault));
+    assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+}
+
+/// **And the thawed run is the same run.** Thaw that freeze with the word *unchanged* and the quiesce
+/// arm set again: the fiber re-issues its wait and parks, the resumer — its rewind complete — idles
+/// on it once more, and the run freezes a second time. This is the path the durable idle opens that
+/// nothing else exercises: a resumer parking after a thaw rather than before a freeze.
+#[test]
+fn a_thawed_fiber_park_idles_and_freezes_again() {
+    let inst = instrumented(SRC_FIBER_PARKED_UNDER_A_BLOCKING_RESUME);
+    let (r, snap, h) = freeze(&inst, |w| arm_freeze_on_quiesce(w));
+    assert_eq!(r, Ok(vec![Value::I64(0)]));
+
+    let mut h2 = Host::new();
+    h2.set_durable(true);
+    h2.set_self_module(&inst);
+    h2.set_frozen_fibers(h.frozen_fibers().to_vec());
+    if let Some(sp) = h.frozen_root_sp() {
+        h2.set_frozen_root_sp(sp);
+    }
+    let mut win2 = snap.clone();
+    begin_thaw(&mut win2, TEST_ARENA, 0);
+    arm_freeze_on_quiesce(&mut win2);
+    let mut fuel = 1_000_000u64;
+    let (r2, _) =
+        run_capture_reserved_with_host(&inst, 0, &[], &mut fuel, &win2, SIZE_LOG2, &mut h2);
+    assert_eq!(
+        r2,
+        Ok(vec![Value::I64(0)]),
+        "the thawed run parks again and re-freezes"
+    );
+    assert_eq!(h2.frozen_fibers().len(), 1, "the fiber is back in the cut");
 }
