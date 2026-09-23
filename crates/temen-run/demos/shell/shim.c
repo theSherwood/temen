@@ -72,3 +72,16 @@ long closedir(long dir) { return __px_closedir(__px(), dir); }
 /* The host-side argument vector (personality extension): sh reads its own argv here. */
 int argc_(void) { return (int)__px_argc(__px()); }
 long getarg(int i, char *buf, long cap) { return __px_argv(__px(), i, (long)buf, cap); }
+#ifdef TEMEN_SHELL_POSIX
+/* The POSIX process model (#1662): under a POSIX personality a command is a *process*, created the
+   way any POSIX program creates one — so it inherits this process's fds, cwd and environment and
+   nothing has to be granted. `envp = 0` carries the environment across the exec unchanged. */
+long __px_fork(int cap, long a);
+long __px_execve(int cap, long path, long argv, long envp);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_dup2(int cap, long oldfd, long newfd);
+long fork(void) { return __px_fork(__px(), 0); }
+long execve(char *path, char **argv) { return __px_execve(__px(), (long)path, (long)argv, 0); }
+long waitpid(long pid, int *status) { return __px_waitpid(__px(), pid, (long)status, 0); }
+long dup2(long oldfd, long newfd) { return __px_dup2(__px(), oldfd, newfd); }
+#endif

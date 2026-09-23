@@ -5232,28 +5232,6 @@ pub fn nim_noc_run_with_commands(
         host.push_exec_remap_hook(temen_posix::cap_exec_remap_hook(posix));
         let (names, sigs) = temen_posix::cap_vtable();
         host.set_host_proc_vtable(handle, names, sigs);
-        if !commands.is_empty() {
-            // #1609 — what a registered command needs when that command is a **shell**. A shell
-            // runs builtins itself but spawns anything else as a §14 op-13 child, handing it one
-            // grant record: `{"stdout", exec_stdout()}`. `exec_stdout` answers `0` until an
-            // embedder supplies a forwardable `Stream`, and a grant record naming a handle the
-            // caller cannot re-grant fails the **whole spawn** closed (`can_regrant` → `CapFault`).
-            // Unwired, `sh -c "bin/nifler …"` therefore reached `main`, read its argv, and died
-            // with no diagnostic at all — a fork twin's trap reaps as a bare 128.
-            //
-            // Same wiring `c_shell.rs` gives the differential harness, for the same reasons: the
-            // personality's fd-1 routes to the host's shared sink so the shell's own writes and a
-            // spawned child's re-granted `Stream` land in one stream; a forwardable stdin pipe so a
-            // filter stage's `read(0, …)` sees its input; and the shared-region factory so a ring
-            // pipeline's regions alias for real.
-            let sink = host.shared_stdout();
-            let out_h = host.grant_stream(StreamRole::Out);
-            let (in_h, in_fifo) = host.grant_input_pipe();
-            posix.set_stdout_sink(sink);
-            posix.set_exec_stdout(out_h);
-            posix.set_exec_stdin(in_h, in_fifo);
-            host.set_region_factory(new_shared_region);
-        }
         // The commands this run may become, granted on the very host it uses.
         for (path, m) in commands {
             let wl = m.memory.map_or(0, |mc| mc.size_log2);
@@ -5290,11 +5268,11 @@ pub fn nim_noc_run_with_commands(
 /// `__vm_cap_at` reflection — so the authority check stays where it belongs, on `Host::resolve`
 /// against a handle the guest actually holds.
 ///
-/// **Linking is not optional.** An unlinked `call.sym "__spawn"` is an import slot, and no
-/// resolver anywhere knows that name, so it binds to nothing — and an unbound slot is a
-/// `Trap::CapFault` at first use, not a fall-through to the handle operand. A shell built without
-/// this reaches `main`, reads its argv, and dies with no diagnostic the moment it tries to spawn
-/// something that is not a builtin (#1609: nimsem's `sh -c "bin/nifler …"` reaped as a bare 128).
+/// **For the default (op-13) build, linking is not optional.** An unlinked `call.sym "__spawn"`
+/// is an import slot no resolver anywhere knows, and an unbound slot is refused at bind — or, when
+/// #1628 bound exec'd images leniently, a `Trap::CapFault` at first use. The POSIX build
+/// (`-DTEMEN_SHELL_POSIX`, #1662) calls none of these names: its imports are all `__px_*`, which
+/// bind against the personality like any other command's, so it needs no linking at all.
 pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
     let cap = match name {
         // The shell's own `Instantiator` ops (STAGE1.md §5).
@@ -5310,14 +5288,6 @@ pub fn shell_demo_resolver(name: &str) -> Option<temen_ir::Resolved> {
         n => temen_posix::resolve(n.strip_prefix("__px_")?)?,
     };
     Some(temen_ir::Resolved::Cap(cap))
-}
-
-/// Link a `demos/shell` module's imports through [`shell_demo_resolver`], so its `call.sym`s become
-/// `call.cap`s on the guest's own reflection-discovered handles. Every consumer of that shell —
-/// the differential tests, the browser harness, a driver registering it at `/bin/sh` — needs this
-/// exact step, so it lives here rather than once per harness.
-pub fn link_shell_demo(m: &Module) -> Result<Module, temen_ir::ImportError> {
-    temen_ir::resolve_imports_with(m, shell_demo_resolver)
 }
 
 /// nimony's **module stem** for a source path — the `<stem>` in `<nimcache>/<stem>.p.nif`.

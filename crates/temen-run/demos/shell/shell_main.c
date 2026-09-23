@@ -4,6 +4,19 @@
 #define O_TRUNC  01000
 #define O_APPEND 02000
 
+/* Three builds of one shell, differing in exactly one thing — how a non-builtin command runs:
+     default                  as a §14 op-13 child with an explicit grant list: the capability shell
+                              (STAGE1.md), whose stages get a ring and a stdout and nothing else;
+     -D TEMEN_SHELL_SEQUENTIAL it doesn't — `<cmd>: not found` (the browser playground);
+     -D TEMEN_SHELL_POSIX      fork + execve + waitpid through the personality (#1662). The command is
+                              a process of the same personality, so it inherits fds, cwd and env and
+                              nothing is granted. This is the `/bin/sh` a POSIX caller's `system()` /
+                              `execShellCmd` expects — register this build there, not the default.
+   The op-13 build is the only one with spawn/ring code; it keys everything below. */
+#if !defined(TEMEN_SHELL_SEQUENTIAL) && !defined(TEMEN_SHELL_POSIX)
+#define TEMEN_SHELL_OP13 1
+#endif
+
 /* #1059/#1094 NULL guard: chibicc lays the powerbox args buffer one 16 KiB guard up
  * (`temen_ir::module_args_base` == guard + 128), so a command reads its argv at `carve + guard + 128`
  * (the unconditional guarded layout). Every command we spawn is chibicc-compiled, so pack there. */
@@ -25,7 +38,7 @@ static int streq(char *a, char *b) { int i = 0; while (a[i] && a[i] == b[i]) i++
 static long ring_out = 0;
 static int ring_out_closed = 0;
 static long wr_out(char *b, long n) {
-#ifndef TEMEN_SHELL_SEQUENTIAL
+#ifdef TEMEN_SHELL_OP13
   if (out_fd == -2) {
     if (ring_out_closed) return n;
     long r = ring_write(ring_out, b, n);
@@ -233,7 +246,7 @@ static int glob_expand(char *tok, char **out, int *oc, char store[][256], int *s
    The command's stdout is the personality's forwardable `Stream` (`exec_stdout`), re-granted by name so
    its `write(1, …)` reaches the shell's sink — a `>`/`|` redirect on an external command is not honored
    (that needs the Power-2 `Endpoint`, STAGE1.md); the command always writes to the terminal sink. */
-#ifndef TEMEN_SHELL_SEQUENTIAL
+#ifdef TEMEN_SHELL_OP13
 /* The size a ring stage is spawned into — equal to the `__stage` runner's declared window (a §14
    child's carve must equal its declared memory). Default 18 (256 KiB), the size chibicc lands the
    runner at under the native 16 KiB data page; the browser's 64 KiB page rounds the runner up to 19
@@ -294,7 +307,55 @@ static int spawn_cmd(long mod, int argc, char **argv) {
   long child = __spawn(__inst(), mod, base, gn, 0, carve, wl, 0);
   return (int)__join(__inst(), child);
 }
-#endif /* TEMEN_SHELL_SEQUENTIAL */
+#endif /* TEMEN_SHELL_OP13 */
+
+#ifdef TEMEN_SHELL_POSIX
+/* Set by `sh -c` when the whole command line is ONE simple command: then the shell *becomes* it
+   rather than forking a child to run it (dash's rule). The caller's `waitpid` reaps the command's
+   own status, and no second copy of the window is made just to be thrown away by the exec. */
+static int exec_in_place = 0;
+
+/* Point fds 0/1 at this command's redirects, then become `av[0]`. Returns only if the exec failed,
+   with the status POSIX sh reports: 127 for a command that does not exist, 126 for one that exists
+   but cannot run here (not executable, too big for the window, a manifest the personality cannot
+   bind). Loudly — a failed exec that printed nothing is how #1662 hid for three layers. */
+static int exec_cmd(char **av) {
+  if (in_fd != 0) dup2(in_fd, 0);
+  if (out_fd != 1) dup2(out_fd, 1);
+  long r = execve(av[0], av);
+  puts_(av[0]);
+  if (r == -2) { puts_(": not found\n"); return 127; }      /* -ENOENT */
+  puts_(": cannot execute (errno "); put_num(-r); puts_(")\n");
+  return 126;
+}
+
+/* Run a non-builtin as a process. The fork twin gets its own copy of the fd table, so the child's
+   `dup2`s leave the shell's stdio alone. */
+static int run_external(int argc, char **argv) {
+  static char *av[MAXARGS + 1];
+  for (int i = 0; i < argc; i++) av[i] = argv[i];
+  av[argc] = 0;
+  if (exec_in_place) return exec_cmd(av);
+  long pid = fork();
+  if (pid < 0) { puts_("sh: fork failed\n"); return 2; }
+  if (pid == 0) exit(exec_cmd(av));
+  static int status;
+  if (waitpid(pid, &status) != pid) { puts_("sh: waitpid failed\n"); return 2; }
+  if ((status & 0x7f) == 0) return (status >> 8) & 0xff;   /* exited */
+  return 128 + (status & 0x7f);                            /* killed, as POSIX sh reports it */
+}
+
+/* Is `line` one simple command — nothing a list, pipeline, redirect or `if` would need the shell to
+   stay alive for? Conservative: any of these characters anywhere keeps the fork path. */
+static int simple_command(char *line) {
+  for (int i = 0; line[i]; i++) {
+    char c = line[i];
+    if (c == ';' || c == '|' || c == '&' || c == '<' || c == '>' || c == '#' || c == '\n') return 0;
+  }
+  while (*line == ' ' || *line == '\t') line++;
+  return !(line[0] == 'i' && line[1] == 'f' && (line[2] == ' ' || line[2] == 0));
+}
+#endif
 
 static int exec_line(char *line) {
   char *argv[MAXARGS];
@@ -477,10 +538,12 @@ static int exec_line(char *line) {
        an external child (STAGE1.md §5); otherwise the classic `<cmd>: not found`. In the sequential
        build (the browser playground) there is no spawn path, so an unknown command is always
        `not found`. */
-#ifndef TEMEN_SHELL_SEQUENTIAL
+#if defined(TEMEN_SHELL_OP13)
     long mod = __px_exec_lookup(__px(), (long)cmd, slen(cmd));
     if (mod < 0) { puts_(cmd); puts_(": not found\n"); st = 127; }
     else st = spawn_cmd(mod, argc, argv);
+#elif defined(TEMEN_SHELL_POSIX)
+    st = run_external(argc, argv);
 #else
     puts_(cmd); puts_(": not found\n"); st = 127;
 #endif
@@ -533,7 +596,7 @@ done:
 /* A command with its own redirects but default stdin/stdout. */
 static int run_line(char *line) { return run_line_io(line, 0, 1); }
 
-#ifndef TEMEN_SHELL_SEQUENTIAL
+#ifdef TEMEN_SHELL_OP13
 /* ---- Ring pipelines (STAGE1.md item 6): concurrent children over SharedRegion rings ---- */
 
 /* Is stage text `st` (a stage AFTER the first) a pure ring filter — runnable by the `__stage`
@@ -636,7 +699,7 @@ static int run_ring_pipeline(char **stages, int ns, long mod) {
   __rg_unmap(rh[0], mapoff, g);
   return st;
 }
-#endif /* TEMEN_SHELL_SEQUENTIAL */
+#endif /* TEMEN_SHELL_OP13 */
 
 /* Run a pipeline `A | B | C`. When every stage after the first is a pure filter and the `__stage`
    runner is on PATH, the stages run **concurrently** — stage 0 in the shell, the rest as spawned
@@ -654,7 +717,7 @@ static int run_pipeline(char *seg) {
     else i++;
   }
   if (ns == 1) return run_line(stages[0]);
-#ifndef TEMEN_SHELL_SEQUENTIAL
+#ifdef TEMEN_SHELL_OP13
   if (ns <= 4) {
     int ok = 1;
     for (int s = 1; s < ns; s++) if (!ring_filter_ok(stages[s])) { ok = 0; break; }
@@ -780,7 +843,13 @@ int main(void) {
   /* `sh -c "<command>"` — a single command line delivered via argv. */
   if (argc_() >= 3) {
     static char flag[8];
-    if (getarg(1, flag, 8) > 0 && streq(flag, "-c") && getarg(2, cmd, 256) > 0) {
+    if (getarg(1, flag, 8) > 0 && streq(flag, "-c")) {
+      /* A command that does not fit is an error. It used to fall through to the stdin loop below,
+         read EOF and exit 0 — so a caller asking for work that never ran was told it succeeded. */
+      if (getarg(2, cmd, sizeof cmd) < 0) { puts_("sh: -c: command too long\n"); return 2; }
+#ifdef TEMEN_SHELL_POSIX
+      exec_in_place = simple_command(cmd);
+#endif
       return run_top(cmd);
     }
   }

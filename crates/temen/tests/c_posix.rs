@@ -3360,27 +3360,29 @@ int main(void) {{\n\
     )
 }
 
-/// #1628 — **the real shell runs as an exec'd command.** This is what registering it at
-/// `/bin/sh` needs, and what #1609's last step was blocked on.
+/// The POSIX build of the demo shell — the `/bin/sh` a POSIX caller execs (#1662). It runs a
+/// non-builtin as a process of the same personality (fork/exec/wait, fds inherited), not as a §14
+/// child with a grant list, so its imports are all `__px_*` and bind like any other command's.
+fn posix_sh() -> String {
+    format!("#define TEMEN_SHELL_POSIX 1\n{SH_SHIM}\n{SH_RING}\n{SH_MAIN}")
+}
+
+/// **The real shell runs as an exec'd command** — what registering it at `/bin/sh` needs.
 ///
-/// `c_shell.rs` compiles these same three files with `c_to_ir` and runs them as a *root* powerbox
-/// program; every existing shell test is that shape. A command is `c_to_ir_child` and arrives
-/// through an image-replace instead — and that used to be refused before a single instruction ran.
+/// `c_shell.rs` compiles these same three files as a *root* powerbox program. A command arrives
+/// through an image-replace instead, and its manifest binds strictly: an import nothing can satisfy
+/// refuses the `execve` with `-EINVAL` while the caller still exists to report it.
 ///
-/// The cause was not startup, which the total absence of output suggested. `bind_child_manifest`
-/// refused at `__as_region`: the shell's pipeline runner declares `__spawn`/`__join`/`__as_region`/
-/// `__rg_*` as `Required`, and a §14 child's walk binds a fixed allow-list. But those are not
-/// name-resolved capabilities at all — they are `call.sym`s carrying a reflection-discovered
-/// handle, and the shell runs at top level with its whole name registry empty. Exec now takes the
-/// softened step 3 ([`Host::bind_exec_manifest`]): an image replacing its caller leaves an
-/// unbindable slot empty rather than refusing, because it is becoming that caller, not being
-/// spawned into confinement.
+/// #1628 once made that bind lenient so the *default* build could be exec'd, on the claim that its
+/// unbindable `__spawn`/`__as_region` slots "fall through to dispatching on the handle operand".
+/// They do not — an unbound slot `CapFault`s — and the default build is the wrong shell for a POSIX
+/// caller anyway: it spawns commands as §14 children holding only a granted stdout, which cannot
+/// open a file. The POSIX build is the right one, and it binds strictly with nothing left over.
 ///
 /// Deliberately the smallest script: this asks whether the shell *starts* and reads its own argv.
-/// `c_execve_runs_a_shell_pipeline_as_a_command` covers the authority question underneath it.
 #[test]
 fn c_execve_runs_the_real_shell_as_a_command() {
-    let sh = format!("{SH_SHIM}\n{SH_RING}\n{SH_MAIN}");
+    let sh = posix_sh();
     let src = sh_caller("true");
     let e = run_interp_setup(&src, |host, posix| {
         stage_executable(host, posix, "/bin/sh", &sh);
@@ -3389,7 +3391,7 @@ fn c_execve_runs_the_real_shell_as_a_command() {
         e.result,
         vec![Value::I32(40)],
         "40 = the shell became the image, read `-c true` from its own argv, and exited 0 \
-         (62 = 40 + EINVAL, the pre-#1628 manifest refusal)"
+         (62 = 40 + EINVAL: the manifest was refused at bind)"
     );
     assert_eq!(
         e.stdout, b"alive",
@@ -3397,17 +3399,13 @@ fn c_execve_runs_the_real_shell_as_a_command() {
     );
 }
 
-/// #1628 — and the authority underneath is unchanged: an exec'd shell reaching for the **pipeline**
-/// machinery gets whatever its own capability table holds, not whatever it declared.
-///
-/// This is the half that makes the softened bind safe rather than a loosening. An empty slot
-/// `CapFault`s on use, and the `call.sym` handle fallback can only dispatch on a handle the guest
-/// already holds — which it holds only because it was granted. So the pipeline either works on the
-/// image's own auto-granted `Instantiator`/`AddressSpace` (confined to its own window, like its
-/// heap) or faults; it cannot reach anything the caller did not have.
+/// A pipeline in the exec'd shell. `echo hi | cat` is two builtins, which the shell runs itself —
+/// no process is created. (#1628's version of this test claimed the output "crossed the ring
+/// between two stage children". It never did: the ring runs only when a `__stage` runner is
+/// registered, and none is here, so it always took this in-shell path.)
 #[test]
 fn c_execve_runs_a_shell_pipeline_as_a_command() {
-    let sh = format!("{SH_SHIM}\n{SH_RING}\n{SH_MAIN}");
+    let sh = posix_sh();
     let src = sh_caller("echo hi | cat");
     let e = run_interp_setup(&src, |host, posix| {
         stage_executable(host, posix, "/bin/sh", &sh);
@@ -3415,12 +3413,84 @@ fn c_execve_runs_a_shell_pipeline_as_a_command() {
     assert_eq!(
         e.result,
         vec![Value::I32(40)],
-        "the pipeline ran on the exec'd image's own granted caps and exited 0"
+        "the pipeline ran in the exec'd shell and exited 0"
     );
     assert_eq!(
         e.stdout, b"hi\nalive",
-        "`echo hi | cat` crossed the ring between two stage children of the exec'd shell"
+        "`echo hi | cat` through the shell's builtins"
     );
+}
+
+/// A command the POSIX shell runs: prints its one argument, then `P` if its parent is the root
+/// caller (pid 1) or `C` if it is the shell, and exits with the argument's digit. The parent is
+/// what tells exec-in-place (the shell *became* the command) from fork (the shell ran it).
+///
+/// (No `?:` inside the `__px_write` arguments: #1667, a branching argument to a capability extern
+/// is silently miscompiled.)
+const RC: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+long __px_getppid(int cap);
+static char who[2];
+int main(int argc, char **argv) {
+  if (argc != 2) return 90;
+  __px_write(0, 1, (long)argv[1], 1);
+  who[0] = 'C';
+  if (__px_getppid(0) == 1) who[0] = 'P';
+  __px_write(0, 1, (long)who, 1);
+  return argv[1][0] - '0';
+}
+"#;
+
+fn run_posix_sh(script: &str) -> Effects {
+    let sh = posix_sh();
+    run_interp_setup(&sh_caller(script), |host, posix| {
+        stage_executable(host, posix, "/bin/sh", &sh);
+        stage_executable(host, posix, "rc", RC);
+    })
+}
+
+/// #1662 — **`sh -c "<one simple command>"` execs the command in place** (dash's rule). This is
+/// nimsem's shell-out: `execShellCmd` forks, the twin execs `/bin/sh -c "bin/nifler …"`, and the
+/// shell becomes nifler. The command is a process of the caller's own personality — same fds, so
+/// its write lands on the caller's stdout with nothing granted — and the caller reaps the
+/// *command's* status, with no second fork.
+#[test]
+fn c_posix_sh_execs_a_simple_command_in_place() {
+    let e = run_posix_sh("rc 4");
+    assert_eq!(e.result, vec![Value::I32(44)], "40 + rc's own exit status");
+    assert_eq!(
+        e.stdout, b"4Palive",
+        "`P`: rc's parent is the root caller — the shell became rc, it did not fork it"
+    );
+}
+
+/// #1662 — a list needs the shell to outlive its first command, so each one is forked, exec'd and
+/// reaped; `$?` is the last one's.
+#[test]
+fn c_posix_sh_forks_each_command_of_a_list() {
+    let e = run_posix_sh("rc 3; rc 5");
+    assert_eq!(
+        e.result,
+        vec![Value::I32(45)],
+        "the list's status is its last command's"
+    );
+    assert_eq!(
+        e.stdout, b"3C5Calive",
+        "`C`: each command's parent is the shell, which forked it and waited"
+    );
+}
+
+/// #1662 — a command that does not exist is `127` **and says so**. Every layer of #1662 presented
+/// as silence; a failed exec that prints nothing is how it hid.
+#[test]
+fn c_posix_sh_reports_a_missing_command() {
+    let e = run_posix_sh("nope");
+    assert_eq!(
+        e.result,
+        vec![Value::I32(40 + 127)],
+        "POSIX sh's not-found status"
+    );
+    assert_eq!(e.stdout, b"nope: not found\nalive");
 }
 
 /// #1609 — the **whole-`execve` personality op** (`OP_EXECVE`), the route a guest with no
