@@ -7123,6 +7123,15 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
             v.durable_sp_ctx = v.vcpu_ctx;
             let root_word = v.arena().region_base(v.vcpu_ctx);
             if let Some(m) = v.mem.as_mut() {
+                // #1655 — a freeze is one-way and run-global: once any vCPU has begun one (a countdown
+                // tripped on its turn, or a host wrote `UNWINDING`), every vCPU dispatched after it
+                // unwinds too. Its saved phase predates that, so restoring it would take the run back to
+                // `ARMED` and let this vCPU run on past the freeze — e.g. a root woken from a join by a
+                // child that unwound, reading the child's placeholder as a result. Only `REWINDING` is
+                // per-vCPU, and it lives in the vCPU's own thaw word.
+                if v.dstate != STATE_REWINDING && m.durable_state() == STATE_UNWINDING {
+                    v.dstate = STATE_UNWINDING;
+                }
                 // §12.8 concurrent-thaw stage 1: route this vCPU's phase across the global freeze word and
                 // its own per-context thaw word, so its rewind can't disturb a sibling's.
                 m.durable_store_dstate(v.vcpu_ctx, v.dstate);

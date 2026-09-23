@@ -28,7 +28,8 @@
 
 use core::ffi::c_void;
 use temen_durable::{
-    begin_thaw, init_durable_window, transform_module_assume_confined, write_state, STATE_UNWINDING,
+    arm_freeze_after, begin_thaw, init_durable_window, transform_module_assume_confined,
+    write_state, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 use temen_ir::{Memory, Module};
@@ -906,4 +907,202 @@ fn jit_and_interp_freeze_a_futex_parked_child_identically() {
     )
     .expect("JIT thaw of the oracle's cut");
     assert_eq!(tout, JitOutcome::Returned(vec![2100]));
+}
+
+// #1655 — an **armed** durable run defers every spawn (the window is not `NORMAL`), so on the JIT a
+// root that joins a child before the trigger fires used to wait on a child nothing would start. The
+// interpreter's single worker runs the child when the root parks in the join. `SRC_CHILD_FIBER`'s
+// root joins its child, and the child owns a fiber, so the fiber-safepoint countdown has somewhere to
+// fire: 100 never fires, 1 fires inside the child while the root is parked in its join.
+
+/// Run the JIT durable entry on `win` from a fresh host whose clock reads 42, on a helper thread
+/// with a deadline, so a regression to the hang fails instead of wedging the test binary. `None` when
+/// the JIT declines the module on this host.
+#[allow(clippy::type_complexity)]
+fn jit_durable_run_bounded(
+    inst: &Module,
+    win: Vec<u8>,
+) -> Option<(JitOutcome, Vec<u8>, Vec<JitFiber>, Vec<JitVCpu>, u64)> {
+    let inst = inst.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h.clock_ns = 42;
+        let clk = h.grant_clock();
+        let r = compile_and_run_capture_reserved_with_host_durable_mv(
+            &inst,
+            0,
+            &[clk as i64],
+            &win,
+            &[],
+            &[],
+            &[],
+            TEST_ARENA.region_base(0),
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut h as *mut Host as *mut c_void,
+        );
+        let _ = tx.send(match r {
+            Ok(t) => Some(t),
+            Err(JitError::Unsupported(_)) => None,
+            Err(JitError::Backend(msg)) if msg.contains("Allocation error") => None,
+            Err(e) => panic!("JIT failed on a verified durable module: {e:?}"),
+        });
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the JIT durable run hung (#1655)")
+}
+
+/// The interpreter's run of `inst` on `win` with the clock at `clock_ns`, seeded with `seed` (the
+/// residues and root extent of a cut to thaw, or empty): result, window, and residues.
+#[allow(clippy::type_complexity)]
+fn interp_durable_run(
+    inst: &Module,
+    win: &[u8],
+    clock_ns: i64,
+    seed: Option<(
+        Vec<temen_interp::FrozenFiber>,
+        Vec<temen_interp::FrozenVCpu>,
+        u64,
+    )>,
+) -> (
+    Result<Vec<Value>, temen_interp::Trap>,
+    Vec<u8>,
+    Vec<temen_interp::FrozenFiber>,
+    Vec<temen_interp::FrozenVCpu>,
+    Option<u64>,
+) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    h.clock_ns = clock_ns;
+    let clk = h.grant_clock();
+    if let Some((fibers, vcpus, root_sp)) = seed {
+        h.set_frozen_fibers(fibers);
+        h.set_frozen_vcpus(vcpus);
+        h.set_frozen_root_sp(root_sp);
+    }
+    let mut fuel = 1_000_000u64;
+    let (r, snap) = run_capture_reserved_with_host(
+        inst,
+        0,
+        &[Value::I32(clk)],
+        &mut fuel,
+        win,
+        SIZE_LOG2,
+        &mut h,
+    );
+    (
+        r,
+        snap,
+        h.frozen_fibers().to_vec(),
+        h.frozen_vcpus().to_vec(),
+        h.frozen_root_sp(),
+    )
+}
+
+/// Armed, trigger never fires: both engines finish the ordinary run, `42 + (5 + 100)`.
+#[test]
+fn an_armed_run_that_joins_before_its_trigger_completes_on_both_engines() {
+    let inst = instrument_child_fiber();
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 100);
+
+    let (ir, ..) = interp_durable_run(&inst, &win, 42, None);
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(147)]),
+        "the oracle's ordinary result"
+    );
+
+    let Some((jout, ..)) = jit_durable_run_bounded(&inst, win) else {
+        return;
+    };
+    assert!(
+        matches!(jout, JitOutcome::Returned(ref v) if v == &[147]),
+        "the JIT runs the joined child instead of waiting on it: {jout:?}"
+    );
+}
+
+/// Armed, trigger fires inside the child while the root is parked in its join: both engines freeze
+/// the child and the root at the same points, byte-identically, and the cut thaws to the
+/// uninterrupted result on both. Before #1655 the JIT hung here, and the oracle let the root run on
+/// past the freeze (its dispatch restored the root's pre-freeze `ARMED` phase), returning a result
+/// built from the child's unwind placeholder.
+#[test]
+fn a_trigger_that_fires_in_a_joined_child_freezes_identically_on_both_engines() {
+    let inst = instrument_child_fiber();
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 1);
+
+    let (ir, isnap, ifibers, ivcpus, iroot_sp) = interp_durable_run(&inst, &win, 42, None);
+    assert_eq!(
+        ir,
+        Ok(vec![Value::I64(0)]),
+        "the oracle freezes: a placeholder result"
+    );
+    assert_eq!(ivcpus.len(), 1, "the oracle captured the child");
+    assert_eq!(ifibers.len(), 1, "the oracle flattened the child's fiber");
+
+    let Some((jout, jsnap, jfibers, jvcpus, jroot_sp)) = jit_durable_run_bounded(&inst, win) else {
+        return;
+    };
+    assert!(
+        matches!(jout, JitOutcome::Returned(_)),
+        "JIT freeze: {jout:?}"
+    );
+    let reserve = TEST_ARENA.end as usize;
+    assert_eq!(
+        &isnap[..reserve],
+        &jsnap[..reserve],
+        "both engines cut the same durable reserve"
+    );
+    assert_eq!(Some(jroot_sp), iroot_sp, "same root extent");
+    assert_eq!(jvcpus.len(), ivcpus.len(), "same vCPU residue count");
+    assert_eq!(jfibers.len(), ifibers.len(), "same fiber residue count");
+    for (j, i) in jvcpus.iter().zip(&ivcpus) {
+        assert_eq!(
+            (j.task, j.func, &j.args, j.shadow_sp),
+            (i.task, i.func, &i.args, i.shadow_sp),
+            "same vCPU residue"
+        );
+    }
+    for (j, i) in jfibers.iter().zip(&ifibers) {
+        assert_eq!(
+            (j.slot, j.func, j.shadow_sp),
+            (i.slot, i.func, i.shadow_sp),
+            "same fiber residue"
+        );
+    }
+
+    // The cut thaws to the uninterrupted result on both engines, reloading the clock read it took
+    // (42) rather than re-reading the advanced clock (99).
+    let mut iwin = isnap.clone();
+    begin_thaw(&mut iwin, TEST_ARENA, 0);
+    let (tr, ..) = interp_durable_run(&inst, &iwin, 99, Some((ifibers, ivcpus, jroot_sp)));
+    assert_eq!(tr, Ok(vec![Value::I64(147)]), "the oracle thaws its cut");
+    let mut twin = jsnap.clone();
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    thost.clock_ns = 99;
+    let tclk = thost.grant_clock();
+    let (tout, ..) = compile_and_run_capture_reserved_with_host_durable_mv(
+        &inst,
+        0,
+        &[tclk as i64],
+        &twin,
+        &[],
+        &jfibers,
+        &jvcpus,
+        jroot_sp,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut thost as *mut Host as *mut c_void,
+    )
+    .expect("JIT thaw");
+    assert!(
+        matches!(tout, JitOutcome::Returned(ref v) if v == &[147]),
+        "the thawed cut finishes the uninterrupted run: {tout:?}"
+    );
 }
