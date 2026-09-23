@@ -1680,8 +1680,20 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
 /// #1361 step 4 — the captured detached children a restore seeded, as JIT re-launch seeds: each child's
 /// program resolved and its powerbox prepared by the same [`Host::prepare_detached_relaunch`] the
 /// interpreter's thaw uses, then built into a shared child powerbox exactly as a spawn builds one
-/// ([`finish_child_build`]). A child whose program the host no longer grants refuses the thaw whole.
+/// ([`finish_child_build`]). A child whose program the host no longer grants refuses the thaw whole,
+/// leaving the residue in place.
 fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen_jit::JitError> {
+    // Checked before anything is taken, so the refusal leaves the residue on the Host (as the other
+    // refusals in `jit_durable_enter` do) for a thaw that re-grants the program.
+    if host
+        .thawed_detached()
+        .iter()
+        .any(|td| host.durable_module_by_digest(&td.launch.digest).is_none())
+    {
+        return Err(temen_jit::JitError::Unsupported(
+            "durable JIT thaw: a detached child's program is not granted",
+        ));
+    }
     let mut out = Vec::new();
     for td in host.take_thawed_detached() {
         let temen_interp::ThawedDetached {
@@ -1694,7 +1706,7 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
         } = td;
         let Some(r) = host.prepare_detached_relaunch(&launch, child) else {
             return Err(temen_jit::JitError::Unsupported(
-                "durable JIT thaw: a detached child's program is not granted",
+                "durable JIT thaw: a detached child's imports no longer bind",
             ));
         };
         if !host.try_grant_lane(launch.lane) {

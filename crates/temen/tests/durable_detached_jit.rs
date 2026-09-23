@@ -144,8 +144,22 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
         (h, w)
     };
 
+    // A thawing host that no longer grants the child's program refuses the JIT thaw whole, and the
+    // detached residue stays on it for a host that does.
+    let (mut granted, twin) = restore();
+    let mut bare = Host::new();
+    bare.set_durable(true);
+    bare.set_thawed_detached(granted.take_thawed_detached());
+    let refused = temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut bare);
+    assert!(
+        matches!(refused, Err(JitError::Unsupported(_))),
+        "an ungranted child program refuses the thaw: {refused:?}"
+    );
+    assert_eq!(bare.thawed_detached().len(), 1, "and keeps the residue");
+    granted.set_thawed_detached(bare.take_thawed_detached());
+
     // Thaw on the JIT: the child re-launches at its slot and the join delivers the total.
-    let (mut thost, twin) = restore();
+    let (mut thost, twin) = (granted, twin);
     let (tout, tsnap) =
         temen_run::jit_cap_run(&parent, 0, &fargs, &twin, PARENT_LOG2, 0, &mut thost)
             .expect("JIT thaw");
