@@ -1613,7 +1613,8 @@ vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and
 carry all of it through the `Host` both ways. An async freeze controller now always engages the
 concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
 the root's (#1691). Residue the JIT cannot re-create yet (a separate-module or completed nested child,
-a nested child's host state, a detached child — #1692, #1361) is refused whole as `Unsupported` and
+a nested child's host state, a detached child that completed before the cut, a live detached child
+whose program the thawing host no longer grants — #1692) is refused whole as `Unsupported` and
 left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
 (`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
 
