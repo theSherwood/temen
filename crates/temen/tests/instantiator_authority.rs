@@ -21,10 +21,8 @@ const FORGED: i32 = 9999;
 /// live child through `FORGED`.
 fn guest(op: u32) -> temen_ir::Module {
     let call = match op {
-        1 => format!("  vr = call.cap 6 1 (i32) -> (i64) vf (vh)"),
-        14 => format!(
-            "  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vf (vh, vx)\n  vr = i64.extend_i32_s vo"
-        ),
+        1 => "  vr = call.cap 6 1 (i32) -> (i64) vf (vh)".to_string(),
+        14 => "  vx = i64.const 0\n  vo = call.cap 6 14 (i32, i64) -> (i32) vf (vh, vx)\n  vr = i64.extend_i32_s vo".to_string(),
         _ => format!("  vs = call.cap 6 {op} (i32) -> (i32) vf (vh)\n  vr = i64.extend_i32_s vs"),
     };
     let src = format!(
