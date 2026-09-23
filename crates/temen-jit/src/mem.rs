@@ -773,22 +773,30 @@ mod pal {
     /// Walk the frame-pointer chain from `fp` into `out`, returning the count — the Rust analog of the
     /// unix shim's `temen_walk_fp_chain` (DEBUGGING.md §5/W3). The JIT's `preserve_frame_pointers` gives
     /// every guest frame a `{ saved_fp, ret_addr }` record (`*fp` = caller's saved fp, `*(fp+1)` = its
-    /// return address). Bounded — aligned, non-null, strictly-increasing links, a span backstop, the
-    /// frame cap — so a corrupt chain terminates instead of looping or reading wild memory.
+    /// return address). Bounded — aligned, strictly-increasing links inside `[lo, hi)`, the frame
+    /// cap — so a corrupt chain terminates instead of looping or reading wild memory.
+    ///
+    /// `[lo, hi)` is the running thread's committed stack. The walk runs inside the VEH, where a fault
+    /// of its own has no recovery and kills the process, and `fp` is whatever the faulting `Rbp` held:
+    /// code without frame pointers leaves any value there. So every record read must lie in memory
+    /// known to be mapped (#1487, #1575).
     ///
     /// # Safety
-    /// `fp` must be a live frame pointer of guest JIT code (the faulting `CONTEXT`'s `Rbp`); reads the
-    /// intact-at-fault guest stack. Called only from the VEH, before anything unwinds.
-    unsafe fn walk_fp_chain(fp: usize, out: &mut [usize; TRAP_MAXFRAMES]) -> usize {
-        const SPAN: usize = 8 * 1024 * 1024; // don't chase a corrupt chain off the stack
+    /// `[lo, hi)` must be committed, readable memory (the thread's stack, from its TEB).
+    unsafe fn walk_fp_chain(
+        fp: usize,
+        lo: usize,
+        hi: usize,
+        out: &mut [usize; TRAP_MAXFRAMES],
+    ) -> usize {
+        const RECORD: usize = 2 * core::mem::size_of::<usize>(); // { saved_fp, ret_addr }
         let align = core::mem::size_of::<usize>() - 1;
-        let (mut cur, start) = (fp, fp);
+        let mut cur = fp;
         let mut n = 0;
         while n < TRAP_MAXFRAMES
-            && cur != 0
             && cur & align == 0
-            && cur >= start
-            && cur - start < SPAN
+            && cur >= lo
+            && cur.checked_add(RECORD).is_some_and(|end| end <= hi)
         {
             let next = *(cur as *const usize);
             let ret = *((cur + core::mem::size_of::<usize>()) as *const usize);
@@ -810,7 +818,10 @@ mod pal {
     /// `ctx` is the live faulting context for an in-window access violation in guest JIT code.
     unsafe fn capture_trap_frame(ctx: &CONTEXT) {
         let mut rets = [0usize; TRAP_MAXFRAMES];
-        let n = walk_fp_chain(ctx.Rbp as usize, &mut rets);
+        // The TEB's `StackLimit`/`StackBase` name the committed stack the fault ran on; the fiber
+        // switch keeps them current, so a fault on a fiber bounds the walk to that fiber's stack.
+        let (base, limit, _) = teb_stack_fields();
+        let n = walk_fp_chain(ctx.Rbp as usize, limit as usize, base as usize, &mut rets);
         TRAP_PC.with(|c| c.set(ctx.Rip as usize));
         TRAP_RETS.with(|c| c.set(rets));
         TRAP_N.with(|c| c.set(n));
@@ -1103,6 +1114,57 @@ mod tests {
         assert!(
             guarded(&win, read_in_tail),
             "a read in the reserved-but-inaccessible tail must be caught by the guard"
+        );
+    }
+
+    /// Where `read_in_tail_with_a_wild_rbp` points `rbp`: inaccessible memory *outside* the guarded
+    /// window, so a fault there is not a guard fault the handler would recover.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    static WILD_RBP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// As `read_in_tail`, but first points `rbp` at [`WILD_RBP`]. The guard's
+    /// trap-backtrace walk starts from the faulting `rbp`, and code without frame pointers (this
+    /// probe, or any host code a fault lands in) leaves whatever value there. The walk runs inside the
+    /// fault handler, where a fault of its own has no recovery, so it must stop rather than read.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    extern "C" fn read_in_tail_with_a_wild_rbp(
+        _a: *const i64,
+        _r: *mut i64,
+        mem: *mut u8,
+        _t: *const c_void,
+        _tc: *mut i64,
+    ) {
+        // SAFETY: the read is expected to fault in-window; the guard restores the recovery context
+        // (with the caller's `rbp`), so the `pop` never runs and the stack is not left unbalanced.
+        unsafe {
+            core::arch::asm!(
+                "push rbp",
+                "mov rbp, {wild}",
+                "mov {tmp}, byte ptr [{addr}]",
+                "pop rbp",
+                wild = in(reg) WILD_RBP.load(std::sync::atomic::Ordering::Relaxed),
+                addr = in(reg) mem.add(512 << 10),
+                tmp = out(reg_byte) _,
+            );
+        }
+    }
+
+    /// #1575: the windows memory-fault handler's backtrace walk dereferenced any aligned `rbp` within
+    /// 8 MiB of itself, so a non-frame `rbp` naming unmapped memory faulted inside the handler and
+    /// killed the process. It now reads only inside the thread's committed stack.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn a_guard_fault_with_a_wild_frame_pointer_is_caught_not_fatal() {
+        let _serial = pal_test_guard();
+        let win = GuestWindow::new(64 << 10, 1 << 20);
+        let elsewhere = GuestWindow::new(64 << 10, 1 << 20);
+        WILD_RBP.store(
+            elsewhere.base() as usize + (512 << 10),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(
+            guarded(&win, read_in_tail_with_a_wild_rbp),
+            "the tail fault is caught although rbp names no frame"
         );
     }
 

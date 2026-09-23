@@ -215,7 +215,10 @@ use temen_ir::Module;
 /// as its own root-shaped artifact (this same format, recursively) behind its spawner-held launch
 /// record. Elided when the domain captured none, so such an artifact is byte-identical to v28 but for
 /// the version field.
-const FORMAT_VERSION: u16 = 29;
+/// v30 (#1687): each nested-child record carries the child's own frozen **`task`** after its
+/// `parent_task`, so a thaw resolves every `parent_task` through a `freeze id → thaw id` map instead of
+/// assuming it re-derives the freeze's ids.
+const FORMAT_VERSION: u16 = 30;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -671,6 +674,7 @@ fn freeze_at(
                     // child of the root; a grandchild carries its parent-child's task. The interp thaw
                     // groups the residue by this to re-attach parents before their children.
                     write_uleb(b, n.parent_task as u64);
+                    write_uleb(b, n.task as u64); // v30 (#1687): the child's own task
                     write_uleb(b, n.carve_off);
                     write_uleb(b, n.size_log2 as u64);
                     write_uleb(b, n.entry as u64);
@@ -1485,6 +1489,8 @@ fn decode_control(
             last = Some(key);
             let parent_task =
                 usize::try_from(parent_task_raw).map_err(|_| RestoreError::Malformed)?;
+            // v30 (#1687): the child's own task, which its children's `parent_task` names.
+            let task = usize::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let carve_off = cr.uleb()?;
             let size_log2 = u8::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
             let entry = u32::try_from(cr.uleb()?).map_err(|_| RestoreError::Malformed)?;
@@ -1552,6 +1558,7 @@ fn decode_control(
                 // v12: carried on the wire (above), so a restored subtree reconstructs to arbitrary
                 // depth — a grandchild's `parent_task` is its parent-child's task, not `0`.
                 parent_task,
+                task,
                 slot: usize::try_from(slot).map_err(|_| RestoreError::Malformed)?,
                 carve_off,
                 size_log2,

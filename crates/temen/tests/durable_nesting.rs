@@ -23,8 +23,8 @@
 
 use std::sync::Arc;
 use temen_durable::{
-    arm_freeze_after, begin_thaw, init_durable_window, read_state, transform_module, write_state,
-    STATE_NORMAL, STATE_UNWINDING,
+    arm_freeze_after, arm_freeze_after_backedges, begin_thaw, init_durable_window, read_state,
+    transform_module, write_state, STATE_NORMAL, STATE_UNWINDING,
 };
 use temen_interp::{run_capture_reserved_with_host, Host, Trap, Value};
 use temen_ir::{Func, Module};
@@ -1231,6 +1231,219 @@ fn depth2_nested_artifact_serializes_restores_and_thaws_through_the_codec() {
         "the codec-restored depth-2 subtree completed; both joins delivered the total"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// #1687: a root that joins a trivial child C before instantiating B, then loops. The armed freeze
+/// fires in the loop, so B (live, unstarted) freezes with its grandchild H, while C has already
+/// completed and been joined. C consumed a task id, so B's frozen id is 2, not the 1 a thaw would
+/// derive from B's rank among the records.
+///   • func 0 (root): C at `[128 KiB, 256 KiB)`, join C, B at `[256 KiB, 512 KiB)`, loop `0..100`,
+///     join B, return C + loop + B.
+///   • func 1 (B): H at its child-relative `[128 KiB, 256 KiB)`, join H, return H + 1000.
+///   • func 2 (H): the `0..100 = 4950` loop.
+///   • func 3 (C): returns 7.
+const PARENT_SHIFTED_IDS: &str = "memory 19 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 3
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  v7 = i64.const 1
+  v8 = i64.const 262144
+  v9 = i64.const 18
+  v10 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v7, v8, v9, v4)
+  br 1(v4, v4, v0, v6, v10)
+}
+block 1 (v11: i64, v12: i64, v13: i32, v14: i64, v15: i32) {
+  v16 = i64.const 100
+  v17 = i64.lt_s v11 v16
+  br_if v17 2(v11, v12, v13, v14, v15) 3(v12, v13, v14, v15)
+}
+block 2 (v18: i64, v19: i64, v20: i32, v21: i64, v22: i32) {
+  v23 = i64.add v19 v18
+  v24 = i64.const 1
+  v25 = i64.add v18 v24
+  br 1(v25, v23, v20, v21, v22)
+}
+block 3 (v26: i64, v27: i32, v28: i64, v29: i32) {
+  v30 = call.cap 6 1 (i32) -> (i64) v27 (v29)
+  v31 = i64.add v28 v26
+  v32 = i64.add v31 v30
+  return v32
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.const 256
+  v2 = i64.const 2
+  v3 = i64.const 131072
+  v4 = i64.const 17
+  v5 = i64.const 0
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = call.cap 6 1 (i32) -> (i64) v1 (v6)
+  v8 = i64.const 1000
+  v9 = i64.add v7 v8
+  return v9
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i64.const 0
+  br 1(v1, v2)
+}
+block 1 (v3: i64, v4: i64) {
+  v5 = i64.const 100
+  v6 = i64.lt_s v3 v5
+  br_if v6 2(v3, v4) 3(v4)
+}
+block 2 (v7: i64, v8: i64) {
+  v9 = i64.add v8 v7
+  v10 = i64.const 1
+  v11 = i64.add v7 v10
+  br 1(v11, v9)
+}
+block 3 (v12: i64) {
+  return v12
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 7
+  return v1
+  }
+}
+";
+
+/// #1687: the thaw resolves each nested record's `parent_task` through the tasks it re-created, not
+/// by assuming it re-derives the freeze's ids. Here a completed, joined sibling (C) shifts the middle
+/// child B's frozen id, so the old thaw, which numbered B by its rank, attached nothing under B's
+/// real id and orphaned the grandchild H. Frozen with B and H live, through the codec, thawed: the
+/// result equals the uninterrupted run, and the canonical re-freeze is byte-identical (the thaw keeps
+/// each frozen id).
+#[test]
+fn a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_the_ids() {
+    let parent = instrument(PARENT_SHIFTED_IDS);
+    let run = |host: &mut Host, win: &[u8], ih: i32| {
+        let mut fuel = 50_000_000u64;
+        run_capture_reserved_with_host(
+            &parent,
+            0,
+            &[Value::I32(ih)],
+            &mut fuel,
+            win,
+            D2_SIZE_LOG2,
+            host,
+        )
+    };
+
+    // Control: uninterrupted, 7 + 4950 + (4950 + 1000).
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, D2_WINDOW as u64);
+    let (base, _) = run(&mut host, &init_durable_window(D2_WINDOW, TEST_ARENA), ih);
+    assert_eq!(base, Ok(vec![Value::I64(10907)]), "uninterrupted total");
+
+    // Freeze mid-loop: C is done and joined; B and H are live.
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, D2_WINDOW as u64);
+    let mut win = init_durable_window(D2_WINDOW, TEST_ARENA);
+    arm_freeze_after_backedges(&mut win, 10);
+    let (fr, fsnap) = run(&mut fhost, &win, fih);
+    assert!(fr.is_ok(), "freeze placeholder: {fr:?}");
+    assert_eq!(
+        read_state(&fsnap),
+        STATE_UNWINDING,
+        "the armed freeze landed"
+    );
+    let residue = fhost.frozen_nested().to_vec();
+    assert_eq!(residue.len(), 2, "B and H ride; C was joined: {residue:?}");
+    let b = residue.iter().find(|n| n.parent_task == 0).expect("B");
+    let h = residue.iter().find(|n| n.parent_task != 0).expect("H");
+    assert_eq!(h.parent_task, b.task, "H names B");
+    assert!(
+        b.task > 1,
+        "the precondition: C's id shifted B off the rank a thaw would derive ({})",
+        b.task
+    );
+
+    // Through the codec: the own task rides the wire, and the re-freeze is canonical.
+    let artifact = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = temen_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "residue round-trips"
+    );
+    assert_eq!(
+        temen_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze is byte-identical"
+    );
+
+    // Thaw: B re-attaches under the root, H under B, and both joins deliver.
+    let mut twin = window;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let caps = thost.capture_durable_handles().expect("durable handles");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let (tr, tsnap) = run(&mut thost, &twin, tih);
+    assert_eq!(
+        tr,
+        Ok(vec![Value::I64(10907)]),
+        "freeze → thaw ≡ uninterrupted"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+
+    // The same frozen image thaws on the JIT: its re-attach runs each child as its recorded task
+    // rather than replaying a counter, so H finds B there too. (Seeded directly: the embedder path
+    // still refuses a nested child's host state, #1692.)
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let nested = fhost
+        .frozen_nested()
+        .iter()
+        .map(|n| temen_jit::FrozenNested {
+            parent_task: n.parent_task,
+            task: n.task,
+            slot: n.slot,
+            carve_off: n.carve_off,
+            size_log2: n.size_log2,
+            entry: n.entry,
+        })
+        .collect();
+    let mut jwin = fsnap.clone();
+    begin_thaw(&mut jwin, TEST_ARENA, 0);
+    let mut jhost = Host::new();
+    jhost.set_durable(true);
+    let jih = jhost.grant_instantiator(0, D2_WINDOW as u64);
+    let (jo, _, _) = temen_jit::compile_and_run_durable(
+        &parent,
+        0,
+        &[jih as i64],
+        &jwin,
+        D2_SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut jhost as *mut Host as *mut std::ffi::c_void,
+        temen_jit::DurableRun {
+            seed: temen_jit::DurableResidue {
+                nested,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("JIT thaw compiles");
+    assert!(
+        matches!(jo, temen_jit::JitOutcome::Returned(ref r) if r == &[10907]),
+        "JIT thaw ≡ uninterrupted: {jo:?}"
+    );
 }
 
 /// #1289 R1 / O14 — a thawed nested child's `self.attest` reports the correct exposure. The child

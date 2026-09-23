@@ -570,6 +570,20 @@ which also retires the v11 `FreezeError::NestedTooDeep` freeze-time refusal. Pin
 through the real artifact, plus the §12.6 canonical re-freeze byte-identity). Next: JIT parity for the
 whole nesting subsystem (depth-1 and depth-2).
 
+**Task identity across a thaw (#1687, v30).** A `parent_task` names a task by its id in the *frozen*
+run, and the thaw hands out its own. The thaw used to assume the two agree, so that a nested child
+numbered by its rank among the records got its frozen id back. They differ whenever a spawn order
+is not the sorted order: a joined or completed sibling that consumed an id, spawns interleaved across
+levels, or an id assigned by an earlier thaw. The grandchild then re-attached to a stranger or to nobody.
+Each `FrozenNested` now carries the child's own frozen `task` (a `uleb` after `parent_task`). The
+interpreter's thaw enters every task it re-creates (spawned vCPU, nested child, the domain's root)
+into one `freeze id → thaw id` map and resolves every `parent_task` through it. A parent the thaw did
+not re-create resolves to nothing, so its child is not re-created and the parent's rewound join fails
+closed. A re-created task keeps its frozen id when that id is still free, so the canonical re-freeze
+stays byte-identical. The JIT's re-attach runs each child as its recorded `task` instead of replaying
+a counter. Pinned by `durable_nesting.rs::a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_the_ids`
+(interpreter and JIT thaw of one artifact).
+
 **JIT parity (design; the interpreter is the oracle).** All of the above — depth-1, depth-2, and the
 codec — is **interpreter-only**. The JIT's durable `instantiate`/`coro_spawn` **fail closed**
 (`temen-jit/instantiator_rt.rs`: `if rt.durable { -EINVAL }`; the nursery's `durable` flag is set at the

@@ -2392,15 +2392,23 @@ fn seed_domain(
     residue: ThawResidue,
 ) {
     let id = root.id;
-    // The residue names tasks by their ids in the **frozen** run. For the run's root the two agree
-    // (both 0); a re-launched detached child is a root that received a fresh id, so its residue's
-    // `parent_task`s are resolved through this map rather than compared with `id` (#1361 step 4).
-    // Re-spawned vCPUs join it below. Nested children still rely on the thaw re-deriving the freeze's
-    // dense ids below this domain's root — #1687.
+    // The residue names tasks by their ids in the **frozen** run; the thaw hands out its own. Every
+    // re-created task enters this `freeze id → thaw id` map as it is created, and every `parent_task`
+    // resolves through it (#1687), so a record re-attaches to the parent it names whatever order ids
+    // are handed out in. A parent the thaw did not re-create resolves to nothing, and its child is not
+    // re-created either: the parent's rewound join then fails closed rather than meeting a stranger.
     let mut live_ids: BTreeMap<TaskId, TaskId> = BTreeMap::from([(residue.task, id)]);
-    let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| {
-        m.get(&(t as TaskId)).copied().unwrap_or(t as TaskId)
+    let live = |m: &BTreeMap<TaskId, TaskId>, t: usize| m.get(&(t as TaskId)).copied();
+    // A re-created task keeps its frozen id when still free, so the §12.6 canonical re-freeze is
+    // byte-identical; a fresh id otherwise, never a collision.
+    let claim = |s: &mut Sched, want: usize| {
+        let cid = (want as TaskId).max(s.next_task);
+        s.next_task = cid + 1;
+        cid
     };
+    // Every vCPU the thaw re-creates below the root (spawned and nested), by thaw id, so any record
+    // can attach to any of them. Enqueued together at the end, ascending id = parents first.
+    let mut children: BTreeMap<TaskId, Box<VCpu>> = BTreeMap::new();
     let ThawResidue {
         task: _,
         root_sp: thaw_root_sp,
@@ -2465,24 +2473,16 @@ fn seed_domain(
         //   • context — *derived* from the restored shadow-SP (`ShadowArena::ctx_of_sp`), since
         //     the region rides in the absolute shadow-SP; collected into the occupancy mask so a
         //     post-thaw spawn lands in a genuinely-free context.
-        //   • task id — *preserved* (`cid = ff.task`), so the §12.6 canonical re-freeze is byte-identical.
+        //   • task id — *preserved* when free (`claim`), so the §12.6 canonical re-freeze is byte-identical.
         //   • join handle — appended into the **parent's** `threads` in ascending-task (= spawn)
         //     order, so the guest's reloaded handle resolves in the table of whoever spawned it
         //     (the root for a direct child, a re-spawned child for a grandchild).
         let mut vcpu_mask: u64 = 0;
-        // Re-spawned children held by task id so a grandchild can attach to its (already re-spawned)
-        // parent; the root is mutated directly. `BTreeMap` keeps the enqueue order ascending-task.
-        let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
-            std::collections::BTreeMap::new();
         for ff in vseed {
-            // Preserved when still free (always, for the run's root: its residue is seeded first), so
-            // the §12.6 re-freeze is byte-identical; a fresh id otherwise, never a collision.
-            let cid = if ff.task as TaskId >= s.next_task {
-                ff.task as TaskId
-            } else {
-                s.next_task
+            let Some(parent) = live(&live_ids, ff.parent_task) else {
+                continue;
             };
-            s.next_task = s.next_task.max(cid + 1);
+            let cid = claim(s, ff.task);
             live_ids.insert(ff.task as TaskId, cid);
             s.live += 1;
             let ctx = root.arena().ctx_of_sp(ff.shadow_sp);
@@ -2510,7 +2510,6 @@ fn seed_domain(
             child.dstate = STATE_REWINDING; // re-enter under rewind, from its restored extent
             child.root_shadow_sp = ff.shadow_sp;
             child.vcpu_ctx = ctx; // freed on a post-thaw finish, like a freshly-spawned child
-            let parent = live(&live_ids, ff.parent_task);
             child.parent_task = parent;
             child.spawn_residue = Some((ff.func as FuncIdx, ff.args.clone()));
             // Append the handle into the spawning vCPU's join table (root, or a re-spawned child).
@@ -2519,16 +2518,10 @@ fn seed_domain(
             } else if let Some(p) = children.get_mut(&parent) {
                 p.threads.push(Some(cid));
             }
-            // (A parent not in the set can't happen on a dense freeze — every live ancestor unwinds
-            // too; a missing handle would surface as a clean `ThreadFault`, not a mis-attach.)
             children.insert(cid, child);
         }
         // Seed the registry's vCPU-context occupancy from the re-spawned children (recycling).
         root.registry.seed_vcpu_mask(vcpu_mask);
-        // Enqueue every re-spawned child, parents first (ascending task via the `BTreeMap`).
-        for (_, child) in children {
-            s.runnable.push_back(child);
-        }
     }
     // §4 subtree thaw (DURABILITY.md): re-attach the §14 nested children a subtree freeze
     // recorded — now to **arbitrary depth** (parent→child→grandchild, …). Each child's whole
@@ -2544,19 +2537,10 @@ fn seed_domain(
     // until its rewound child completes, exactly as pre-freeze.
     {
         let mut nseed: Vec<FrozenNested> = thaw_nested;
-        // Sort by `parent_task` then `slot`: a parent's task id is always < its children's (it
-        // was instantiated first), so this re-attaches **parents before their grandchildren** —
-        // a parent-child VCpu exists before any of its children attach to it. `slot` is the
-        // deterministic tiebreak (the freeze's canonical order). The subtree freeze reproduces
-        // the same dense task ids as the freeze (root = 0, then the sorted-order children get
-        // 1, 2, …), so a grandchild's recorded `parent_task` equals its parent-child's fresh cid
-        // here — the key `children` is stored under.
-        nseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
-        // Re-created child domains, held by their fresh cid so a grandchild can attach to its
-        // (already re-created) parent-child; the root is mutated directly. `BTreeMap` keeps the
-        // enqueue order ascending-cid (parents first).
-        let mut children: std::collections::BTreeMap<TaskId, Box<VCpu>> =
-            std::collections::BTreeMap::new();
+        // Ascending own task id: a parent's id is always < its children's (it was instantiated
+        // first, and the thaw keeps that order), so this re-creates **parents before their
+        // children**, and claiming ids in this order keeps each one free to be preserved.
+        nseed.sort_by_key(|n| n.task);
         // Each re-created child's **absolute** (root-window-relative) carve offset. A record's
         // `carve_off` is relative to *its parent's* window (the parent's Instantiator base is 0
         // in its own view), so a grandchild's offset into the root image is its parent-child's
@@ -2574,7 +2558,9 @@ fn seed_domain(
             std::collections::BTreeMap::new();
         let mut holder_hosts: Vec<(TaskId, Arc<Mutex<Host>>)> = Vec::new();
         for fnr in nseed {
-            let parent = live(&live_ids, fnr.parent_task);
+            let Some(parent) = live(&live_ids, fnr.parent_task) else {
+                continue;
+            };
             // The parent-child's absolute carve base (0 for a direct child of the root).
             let parent_base = if parent == id {
                 0
@@ -2586,8 +2572,7 @@ fn seed_domain(
             // straight into the scheduler and mapped to the recording parent's join slot, so the
             // parent's re-executed `thread.join` delivers it without re-running the child.
             if let Some(r) = fnr.completed_result {
-                let cid = s.next_task;
-                s.next_task += 1;
+                let cid = claim(s, fnr.task);
                 s.results.insert(
                     cid,
                     Outcome {
@@ -2736,8 +2721,8 @@ fn seed_domain(
                     vec![Value::I64(cinst as i64)]
                 }
             };
-            let cid = s.next_task;
-            s.next_task += 1;
+            let cid = claim(s, fnr.task);
+            live_ids.insert(fnr.task as TaskId, cid);
             s.live += 1;
             // True nesting depth: a direct child of the root is depth 1; a grandchild is its
             // parent-child's depth + 1 (the parent is already in `children`, built first).
@@ -2829,7 +2814,9 @@ fn seed_domain(
             let mut dseed: Vec<FrozenDetached> = thaw_detached;
             dseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
             for fd in dseed {
-                let parent = live(&live_ids, fd.parent_task);
+                let Some(parent) = live(&live_ids, fd.parent_task) else {
+                    continue;
+                };
                 let cid = s.next_task;
                 s.next_task += 1;
                 s.results.insert(
@@ -2864,21 +2851,20 @@ fn seed_domain(
         let mut lseed = thaw_live_detached;
         lseed.sort_by(|a, b| a.parent_task.cmp(&b.parent_task).then(a.slot.cmp(&b.slot)));
         for td in lseed {
-            let parent = live(&live_ids, td.parent_task);
-            let spawner: &mut VCpu = if parent == id {
-                &mut *root
-            } else {
-                match children.get_mut(&parent) {
+            let spawner: &mut VCpu = match live(&live_ids, td.parent_task) {
+                Some(p) if p == id => &mut *root,
+                Some(p) => match children.get_mut(&p) {
                     Some(p) => p,
-                    None => continue, // not re-created ⇒ its own rewound join already fails closed
-                }
+                    None => continue,
+                },
+                None => continue, // not re-created ⇒ its own rewound join already fails closed
             };
             if let Some(child) = relaunch_detached(s, sched, spawner, host_shared, td, fuel, quota)
             {
                 s.runnable.push_back(child);
             }
         }
-        // Enqueue every re-created child, parents first (ascending cid via the `BTreeMap`).
+        // Enqueue every re-created child, spawned and nested, parents first (ascending cid).
         for (_, child) in children {
             s.runnable.push_back(child);
         }
@@ -7701,6 +7687,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
                             sink.lock_unpoisoned().frozen_nested.push(FrozenNested {
                                 parent_task: v.id as usize,
+                                task: cid as usize,
                                 slot: c.slot,
                                 carve_off: c.carve_off,
                                 size_log2: c.size_log2,
@@ -9803,6 +9790,10 @@ pub struct FrozenNested {
     /// root's. Depth-1 residue carries `0` and is byte-identical over the codec (not yet on the
     /// wire — a depth-2 artifact is refused at freeze; see `temen-snapshot`).
     pub parent_task: usize,
+    /// The child's own task id in the frozen run — what its children's `parent_task` names. The thaw
+    /// maps it to the id the re-created child receives, so a grandchild re-attaches to its recorded
+    /// parent whatever order the thaw assigns ids in (#1687).
+    pub task: usize,
     /// The parent's join-table slot for this child (the guest-held handle value).
     pub slot: usize,
     /// The carve's window-relative base.
