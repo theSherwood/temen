@@ -133,15 +133,7 @@ fn main() {
         .map(|p| std::fs::read(&p).unwrap_or_else(|e| panic!("read libc {p:?}: {e}")));
     let module = if posix {
         let (px_names, px_sigs) = temen_posix::cap_vtable();
-        let mut runtime = temen_leng::nim_posix_runtime(&units, (&px_names, &px_sigs))
-            .unwrap_or_else(|e| panic!("nim posix runtime: {e}"));
-        if let Some(libc) = libc.as_deref() {
-            runtime.extend(
-                temen_leng::nim_libc_units(libc, &units)
-                    .unwrap_or_else(|e| panic!("nim libc units: {e}")),
-            );
-        }
-        temen_leng::link_whole_powerbox_manifest(&units, runtime)
+        temen_leng::link_nim_posix(&units, (&px_names, &px_sigs), libc.as_deref())
             .unwrap_or_else(|e| panic!("nim→posix bridge: {e}"))
     } else {
         temen_leng::link_nim_powerbox(&units, libc.as_deref())
