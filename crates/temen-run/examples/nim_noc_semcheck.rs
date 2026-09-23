@@ -136,6 +136,55 @@ fn dump_cache(posix: &temen_posix::Posix, out_p: &str) {
     eprintln!("dumped {n} nimcache files to {dir}");
 }
 
+/// A `.s.nif` in the form two runs of the same compiler over the same inputs can be compared in.
+///
+/// Everything nimsem computed is kept. What differs between two *placements* of the same inputs is
+/// not: the source paths it records — the native run's are relative to its own cwd
+/// (`../../<abs>/nimony/lib/std/system/x.nim`), the guest's to a memfs rooted at the nimony tree
+/// (`lib/system/x.nim`) — and the index's byte offsets, which those path lengths shift. So paths are
+/// rewritten to the tree-relative form, the body is then compared **exactly**, and in the trailing
+/// index only each entry's offset is masked. (#1668: that is the whole difference between nimsem on
+/// Temen, spawning its own nifler, and native nimony — 30,079 identical body lines for `system`.)
+fn normalize_semcheck(text: &str, libdir: &str) -> String {
+    let root = Path::new(libdir)
+        .parent()
+        .and_then(|p| p.to_str())
+        .unwrap_or("")
+        .trim_start_matches('/');
+    let mut s = text.replace(&format!("{root}/"), "");
+    while s.contains("../lib/") {
+        s = s.replace("../lib/", "lib/");
+    }
+    let s = s.replace("lib/std/", "lib/");
+    let (body, index) = s.split_at(s.find("(.index@").unwrap_or(s.len()));
+    let body = body
+        .lines()
+        .map(|l| {
+            if l.starts_with("(.indexat") {
+                "(.indexat N)"
+            } else {
+                l
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let index = index
+        .lines()
+        .map(|l| {
+            // ` <entry> 130)` → ` <entry> N)`: the offset is the one field a path length moves.
+            let masked = l.strip_suffix(')').and_then(|t| {
+                let sp = t.rfind(' ')?;
+                let n = &t[sp + 1..];
+                (!n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                    .then(|| format!("{} N)", &t[..sp]))
+            });
+            masked.unwrap_or_else(|| l.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{body}\n{index}")
+}
+
 /// Load a chibicc-emitted **command module** (IR text, `--child-entry`) — the `/bin/sh` that turns
 /// nimsem's shell-out into a real `execve`. Kept out of the asset pipeline deliberately: the shell
 /// is host environment, the way a kernel is, and passing it in keeps #763's "no C compiler"
@@ -194,8 +243,14 @@ fn semcheck(
         if !commands.is_empty() {
             // With `/bin/sh` registered nimsem spawns nifler itself, so reaching here means the
             // real exec path did not work — serving it from outside would hide exactly the thing
-            // this mode exists to prove. See the module docs for the one blocker that remains.
+            // this mode exists to prove.
             eprint!("--- nimsem said ---\n{said}--- stderr ---\n{said_err}");
+            // #1665 — a command that *crashed* reaps as status 128, like one that exited 128; this
+            // is the only place its trap and frames survive. (After an `execve` the frames name the
+            // new image — `dump_func <image> <func> <block>` reads one.)
+            for t in temen_interp::last_twin_traps() {
+                eprintln!("--- a command crashed ---\n{t}");
+            }
             dump_cache(posix, out_p);
             panic!(
                 "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
@@ -325,10 +380,19 @@ fn main() {
         a.drain(i..=i + 1);
         v
     });
+    // `--expect <native.s.nif>`: the run checks itself — its `.s.nif` must be the native compiler's
+    // (see [`normalize_semcheck`] for the one thing allowed to differ). What makes the self-hosted
+    // lane a *test* rather than a demo: `scripts/ci/nim-selfhost-lane.sh` passes native nimony's own.
+    let expect = a.iter().position(|t| t == "--expect").map(|i| {
+        let v = a.get(i + 1).cloned().expect("--expect needs a path");
+        a.drain(i..=i + 1);
+        v
+    });
     let [nimsem_p, nifler_p, libdir, sys_pnif, sys_stem, out_p] = &a[..] else {
         panic!(
-            "usage: nim_noc_semcheck [--sh <sh.ir>] [--check <lib/std/x.nim>] <nimsem.temen> \
-             <nifler2.temen> <libdir> <sys.p.nif> <sys-stem> <out.s.nif>"
+            "usage: nim_noc_semcheck [--sh <sh.ir>] [--check <lib/std/x.nim>] \
+             [--expect <native.s.nif>] <nimsem.temen> <nifler2.temen> <libdir> <sys.p.nif> \
+             <sys-stem> <out.s.nif>"
         );
     };
 
@@ -469,10 +533,44 @@ fn main() {
     match posix.read_file(&produced) {
         Some(b) => {
             std::fs::write(out_p, &b).unwrap_or_else(|e| panic!("write {out_p}: {e}"));
-            eprintln!(
-                "✅ {produced} ({} bytes) after {served} nifler2 run(s) → {out_p}",
-                b.len()
-            );
+            // With `--sh`, nimsem runs its own nifler in the guest; the host serves nothing.
+            let how = if commands.is_empty() {
+                format!("after {served} host-served nifler2 run(s)")
+            } else {
+                "nimsem ran its own nifler through /bin/sh".to_string()
+            };
+            eprintln!("✅ {produced} ({} bytes), {how} → {out_p}", b.len());
+            if let Some(native) = &expect {
+                let want = std::fs::read(native).unwrap_or_else(|e| panic!("read {native}: {e}"));
+                let lib = std::fs::canonicalize(libdir)
+                    .unwrap_or_else(|e| panic!("canonicalize {libdir}: {e}"));
+                let lib = lib.to_str().expect("utf-8 libdir");
+                let (got, want) = (
+                    normalize_semcheck(&String::from_utf8_lossy(&b), lib),
+                    normalize_semcheck(&String::from_utf8_lossy(&want), lib),
+                );
+                if got != want {
+                    let (g, w): (Vec<_>, Vec<_>) = (got.lines().collect(), want.lines().collect());
+                    let at = g
+                        .iter()
+                        .zip(&w)
+                        .position(|(a, b)| a != b)
+                        .unwrap_or(g.len().min(w.len()));
+                    let show =
+                        |v: &[&str]| v[at.saturating_sub(2)..(at + 3).min(v.len())].join("\n");
+                    panic!(
+                        "the self-hosted semcheck differs from native nimony's ({native}) at line {}\n\
+                         --- temen ---\n{}\n--- native ---\n{}",
+                        at + 1,
+                        show(&g),
+                        show(&w)
+                    );
+                }
+                eprintln!(
+                    "✅ matches native nimony's {native} ({} lines)",
+                    got.lines().count()
+                );
+            }
         }
         None => {
             eprint!(

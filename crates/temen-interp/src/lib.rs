@@ -3278,14 +3278,15 @@ fn drive_over_cell(
         }
         host_shared.lock_unpoisoned().pending_detached = unreached;
     }
-    let (out, trap_origin) = {
+    let (out, trap_origin, twin_traps) = {
         let mut s = sched.lock();
         // Present even when the root never finished on its own: a §12 teardown (owner 2026-07-24)
         // synthesizes the root's outcome — the domain's ending trap, with its `mem`/`fuel`
         // residue — when a sibling's trap/exit killed it while parked or running.
         let out = s.results.remove(&root_id).expect("root vCPU finished");
-        (out, s.trap_origin.take())
+        (out, s.trap_origin.take(), std::mem::take(&mut s.twin_traps))
     };
+    LAST_TWIN_TRAPS.with(|c| *c.borrow_mut() = twin_traps);
     *fuel = out.fuel;
     *mem = out.mem;
     // Prefer the trap-origin capture (the first vCPU to actually trap) over the root's own outcome,
@@ -3436,6 +3437,59 @@ thread_local! {
 /// different bugs, and the backtrace alone does not separate them.
 pub fn last_capture_fault_addr() -> Option<u64> {
     LAST_CAPTURE_FAULT.with(|c| *c.borrow())
+}
+
+/// #1665 — a **fork twin that trapped**: a command that crashed rather than exited.
+///
+/// Its parent sees only the crash status (`128`, the same number an `exit(128)` produces), so without
+/// this a crashing command and one that chose its status are indistinguishable, and there is nowhere
+/// to look. The root run's own trap has always had [`last_capture_backtrace`]; this is the same for
+/// the processes it forked. Every layer of the #1609 `bin/nifler` chase presented as exactly that
+/// silence, and was found only by adding a temporary trace.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TwinTrap {
+    /// The twin's task id — its pid under a POSIX personality.
+    pub task: u64,
+    pub trap: Trap,
+    /// The trap-time call stack, innermost frame first. Frames name the image the twin was running
+    /// when it trapped — after an `execve`, the *new* image, not the program that forked it.
+    pub backtrace: Vec<IrPc>,
+    /// The window-relative faulting address, for a `MemoryFault` (see [`last_capture_fault_addr`]).
+    pub fault: Option<u64>,
+}
+
+impl std::fmt::Display for TwinTrap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "task {} trapped: {:?}", self.task, self.trap)?;
+        if let Some(a) = self.fault {
+            write!(f, " at window offset {a:#x}")?;
+        }
+        for (i, pc) in self.backtrace.iter().enumerate() {
+            let sep = if i == 0 { "\n  at " } else { "\n  <- " };
+            write!(
+                f,
+                "{sep}func {} block {} inst {}",
+                pc.func, pc.block, pc.inst
+            )?;
+        }
+        Ok(())
+    }
+}
+
+thread_local! {
+    /// The fork twins that trapped in the most recent run on this thread, recorded by [`drive`]
+    /// beside [`LAST_CAPTURE_BACKTRACE`] and read the same way — immediately after the run.
+    static LAST_TWIN_TRAPS: core::cell::RefCell<Vec<TwinTrap>> =
+        const { core::cell::RefCell::new(Vec::new()) };
+}
+
+/// Every fork twin that **trapped** in the last run on this thread, in completion order — empty if
+/// none did (a twin that `exit`s, with any status, is not a trap). The run itself can have finished
+/// cleanly: a crashed command is its parent's business, reaped as status `128`, and this is the only
+/// place the crash's kind and frames survive. Tree-walker runs only, the same scope as
+/// [`last_capture_backtrace`].
+pub fn last_twin_traps() -> Vec<TwinTrap> {
+    LAST_TWIN_TRAPS.with(|c| c.borrow().clone())
 }
 
 /// The durable snapshot's window-image page granularity (DURABILITY.md §12.3 / `temen-snapshot`'s
@@ -5604,6 +5658,12 @@ struct Sched {
     /// instead, so the trap diagnostic names *where the guest actually trapped* — the interpreter
     /// counterpart to the JIT's `Domain` trap-capture handoff. `None` on a clean run.
     trap_origin: Option<TrapOrigin>,
+    /// #1665 — every **fork twin** that trapped this run, in completion order. A twin's trap never
+    /// propagates — reap is not join; it becomes the crash status its parent `wait`s on — so it is
+    /// not a candidate for [`Self::trap_origin`] (it used to be, first-wins, which could name a dead
+    /// shell as the origin of an unrelated root trap). It is recorded here instead, and [`drive`]
+    /// publishes it through [`last_twin_traps`].
+    twin_traps: Vec<TwinTrap>,
 }
 
 impl Scheduler {
@@ -7911,7 +7971,22 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // First-wins trap-origin capture (§5 W3 / §23-D57): the first vCPU to trap records its own
                 // backtrace + fiber, so a later join-propagated re-trap on the root can't overwrite the
                 // true origin. A clean finish leaves it untouched.
-                if outcome.result.is_err() {
+                //
+                // #1665 — except a **fork twin's**: it does not propagate (its parent reaps a crash
+                // status), so it is recorded apart, with the frames and fault a bare status 128 would
+                // otherwise lose. A twin's `exit(code)` is a clean exit, not a trap, and records nothing.
+                if s.forked_twins.contains_key(&id) {
+                    if let Err(trap) = &outcome.result {
+                        if !matches!(trap, Trap::Exit(_)) {
+                            s.twin_traps.push(TwinTrap {
+                                task: id,
+                                trap: trap.clone(),
+                                backtrace: outcome.trap_bt.clone(),
+                                fault: outcome.trap_fault,
+                            });
+                        }
+                    }
+                } else if outcome.result.is_err() {
                     s.trap_origin.get_or_insert_with(|| TrapOrigin {
                         bt: outcome.trap_bt.clone(),
                         fiber: outcome.trap_fiber,
