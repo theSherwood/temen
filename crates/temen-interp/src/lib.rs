@@ -13039,6 +13039,15 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                     args,
                     ..
                 } => {
+                    // #1578 — DESIGN §22: an **invoked** unit is a seam-free leaf, so the whole
+                    // `Instantiator` is unavailable inside a `Jit.invoke` (a non-empty `below` — the
+                    // invokers paused beneath this vCPU — is exactly "running inside one"). A spawn
+                    // here would outlive the synchronous invoke over code nothing keeps: the unit is
+                    // never installed, and its handle names this transient vCPU's child, which no
+                    // one can join. An *installed* unit spawns like the base module (#1726).
+                    if !below.is_empty() {
+                        return Err(Trap::CapFault);
+                    }
                     let h = get_i32(&frames[top].vals, *handle)?;
                     let (ibase, isize) = {
                         let hg = host.lock_unpoisoned();

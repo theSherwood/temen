@@ -10490,6 +10490,20 @@ fn drive_nested(
                 let total = gc_write(mem, buf, cap, roots)?;
                 active.set(dst, Reg::from_i64(total));
             }
+            // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
+            // whole `Instantiator` is unavailable inside it — named here rather than left to the
+            // catch-all, because it is the contract, not an unserviced seam. The tree-walker refuses
+            // the same way (its `below` guard) and the native tier before it trampolines
+            // (`temen_run::invoke_refuses`). An *installed* unit spawns like the base module (#1726).
+            // (A tier-up bounce — `run_meta` `Some` — keeps the catch-all's refusal below.)
+            Outcome::Instantiate { .. }
+            | Outcome::InstantiateModule { .. }
+            | Outcome::InstantiateDetached { .. }
+            | Outcome::ChildOffer { .. }
+                if run_meta.is_none() =>
+            {
+                return Err(Trap::CapFault)
+            }
             _ => return Err(Trap::CapFault),
         }
     }
