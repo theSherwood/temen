@@ -383,73 +383,6 @@ fn run_phase(phase: &Phase, argv: &[&str], fs: HostProc, exec: Option<HostProc>)
 // (func 0 = `[I64]->[I64]`, built `--child-entry`); `{fs, stdout, exit}` are re-granted into it (`vm_map`
 // auto-binds to the child's AddressSpace), argv is seeded into its carve, and its joined status returns.
 
-/// Build the **detached** phase parent (#1288): re-grants `caps` (by name, in order — the child
-/// resolves them by name and its manifest binds them) to a `--child-entry` child spawned
-/// `instantiate_detached` (op 15) into a **fresh window** of the child's declared `1 << child_log2`,
-/// with `argv` carried as the spawn-time args payload (the op's optional 8th/9th args — seeded by the
-/// host at the child's `module_args_base()`). No carve, no buddy parent: the parent is `memory 16` and
-/// holds only its grant records (`guard+1024`), their names (`guard+2048`) and the args blob
-/// (`guard+4096`), all above the #1094 NULL guard. Params are `(inst, module, minter, cap0, …)`;
-/// `grants_n = N` (3 for nifler/hexer `{fs,stdout,exit}`, 4 for nimsem `+exec`).
-pub(crate) fn detached_parent_src(child_log2: u8, argv: &[&str], caps: &[&str]) -> String {
-    let guard = temen_ir::POWERBOX_NULL_GUARD;
-    let rec_base = guard + 1024;
-    let name_base = guard + 2048;
-    let argv_off = guard + 4096;
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&(argv.len() as u32).to_le_bytes()); // argc
-    blob.extend_from_slice(&0u32.to_le_bytes()); // envc
-    for s in argv {
-        blob.extend_from_slice(s.as_bytes());
-        blob.push(0);
-    }
-    let argv_len = blob.len();
-    let argv_esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
-
-    let n = caps.len();
-    let mut data = String::new();
-    let mut records = String::new();
-    for (i, name) in caps.iter().enumerate() {
-        let noff = name_base + i as u64 * 16;
-        let roff = rec_base + i as u64 * 16;
-        data.push_str(&format!("data {noff} \"{name}\"\n"));
-        let w0 = noff | ((name.len() as u64) << 32);
-        // record word0 = {name_off:u32 | name_len:u32<<32} at roff; the cap handle (param v{3+i}) at roff+8.
-        records.push_str(&format!(
-            "  xr{roff} = i64.const {w0}\n  or{roff} = i64.const {roff}\n  i64.store or{roff} xr{roff}\n  \
-             h{roff} = i64.extend_i32_u v{vi}\n  oh{roff} = i64.const {hoff}\n  i64.store oh{roff} h{roff}\n",
-            vi = 3 + i,
-            hoff = roff + 8,
-        ));
-    }
-    let sig: String = vec!["i32"; 3 + n].join(", ");
-    let bparams: String = (0..3 + n)
-        .map(|i| format!("v{i}: i32"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        r#"memory 16
-{data}data {argv_off} "{argv_esc}"
-func ({sig}) -> (i64) {{
-block 0 ({bparams}) {{
-{records}  vmh = i64.extend_i32_u v1
-  vmin = i64.extend_i32_u v2
-  vgptr = i64.const {rec_base}
-  vgn = i64.const {n}
-  ventry = i64.const 0
-  vlog = i64.const {child_log2}
-  vq = i64.const 0
-  vap = i64.const {argv_off}
-  val = i64.const {argv_len}
-  vh = call.cap 6 15 (i64, i64, i64, i64, i64, i64, i64, i64, i64) -> (i32) v0 (vmin, vmh, vgptr, vgn, ventry, vlog, vq, vap, val)
-  vr = call.cap 6 1 (i32) -> (i64) v0 (vh)
-  return vr
-  }}
-}}
-"#,
-    )
-}
-
 /// The resumable-engine drive loop (mirrors `temen-run/tests/child_entry_fs.rs`). On a **detached**
 /// spawn (op 15, #1288 — how the phases are spawned) the host owns the fresh window: a root-sized
 /// lazily-reserved `Region::new` (an `mmap` natively; the sparse `Paged` fallback on wasm32), seeded with
@@ -591,13 +524,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     let Some(decl) = child.memory.as_ref().map(|m| m.size_log2) else {
         return -1;
     };
-    let src = detached_parent_src(decl, argv, &["fs", "stdout", "exit"]);
-    let Ok(parent) = temen_text::parse_module(&src) else {
-        return -1;
-    };
-    let Some(prog) = bytecode::VcpuProgram::compile(&parent) else {
-        return -1;
-    };
+    let plan = crate::plan::Plan::single(decl, argv, &["fs", "stdout", "exit"]);
     let mut host = Host::new();
     let fs_init: HostProc = (*factory)();
     let fs_fork: HostProcFork = {
@@ -607,45 +534,7 @@ fn run_phase_op13(child: &Module, argv: &[&str], factory: &FsFactory) -> i64 {
     let fs_h = host.grant_host_proc_forkable(fs_init, fs_fork);
     let stdout_h = host.grant_stream(StreamRole::Out);
     let exit_h = host.grant_exit();
-    let win = 1u64 << 16;
-    let inst = host.grant_instantiator(0, win);
-    let modh = host.grant_module(child);
-    // The minter's quota is the mint (the declared window); growth is bounded by the reservation.
-    let minter = host.grant_budget(0, (1u64 << decl) as i64, 0);
-
-    let size = win as usize;
-    let Ok(layout) = std::alloc::Layout::from_size_align(size, 8) else {
-        return -1;
-    };
-    // SAFETY: non-zero 8-aligned layout; `size` valid bytes owned here until the dealloc below, after
-    // every vCPU and region view is dropped.
-    let mem_base = unsafe { std::alloc::alloc_zeroed(layout) };
-    if mem_base.is_null() {
-        return -1;
-    }
-    let back = std::sync::Arc::new(unsafe { Region::shared(mem_base, win) });
-    let status = match bytecode::Vcpu::new_root_with_powerbox(
-        &prog,
-        0,
-        &[
-            Value::I32(inst),
-            Value::I32(modh),
-            Value::I32(minter),
-            Value::I32(fs_h),
-            Value::I32(stdout_h),
-            Value::I32(exit_h),
-        ],
-        std::sync::Arc::clone(&back),
-        &[],
-        host,
-    ) {
-        Ok(root) => drive_op13(&prog, mem_base, root, Some(child)),
-        Err(t) => Err(t),
-    };
-    drop(back);
-    // SAFETY: same layout; the root vCPU and its region views are dropped above.
-    unsafe { std::alloc::dealloc(mem_base, layout) };
-    match status {
+    match crate::plan::run(&plan, &[child], host, &[fs_h, stdout_h, exit_h]) {
         Ok(v) => v.first().map_or(0, |x| match x {
             Value::I64(n) => *n,
             Value::I32(n) => *n as i64,
