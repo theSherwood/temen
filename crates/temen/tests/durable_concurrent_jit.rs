@@ -68,12 +68,29 @@ fn le_i64(w: &[u8], off: i64) -> i64 {
 /// A concurrent freeze result: `(outcome, window image, fiber residue, vCPU residue, root extent)`.
 type FreezeOutcome = (JitOutcome, Vec<u8>, Vec<FrozenFiber>, Vec<FrozenVCpu>, u64);
 
+/// Who requests the freeze once the guest signals.
+#[derive(Clone, Copy)]
+enum FreezeFrom {
+    /// An embedder thread that sees the signal and then freezes, racing the run as a real async
+    /// freeze does. The program must keep running after its signal until the freeze lands.
+    Controller,
+    /// The signal itself, before the signalling vCPU leaves its `call.cap`: the freeze always lands
+    /// while that vCPU is live, for a program that would otherwise end on its own (#1748).
+    Signal,
+}
+
 /// Run the durable concurrent freeze with the spawn-before-freeze handshake. `v0` = clock handle (for
 /// the children), `v1` = host-fn handle (the root calls it to signal "children spawned"). Returns the
 /// freeze outcome, or `None` to skip (unsupported shape / host alloc pressure).
 fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
+    concurrent_freeze_from(inst, FreezeFrom::Controller)
+}
+
+fn concurrent_freeze_from(inst: &Module, from: FreezeFrom) -> Option<FreezeOutcome> {
     let spawned = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&spawned);
+    let freeze = FreezeController::new();
+    let at_signal = matches!(from, FreezeFrom::Signal).then(|| Arc::clone(&freeze));
     let mut host = Host::new();
     // Declare durability on the *Host* (the JIT signals it to its own runtime via `set_durable_env`,
     // but the shared `cap_dispatch_slots` reads `Host::is_durable` — e.g. the §12.8 4A.7 `Blocking`
@@ -83,18 +100,22 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
     let clk = host.grant_clock();
     // The root calls this once it has spawned its children; it flips the flag the controller waits on.
     let hf = host.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
-        sig.store(true, Ordering::SeqCst);
+        match &at_signal {
+            Some(fc) => fc.request_freeze(),
+            None => sig.store(true, Ordering::SeqCst),
+        }
         Ok(vec![0])
     }));
 
-    let freeze = FreezeController::new();
-    let fc = Arc::clone(&freeze);
-    let controller = std::thread::spawn(move || {
-        // Wait until the children are spawned (so they run concurrently, not deferred), then freeze.
-        while !spawned.load(Ordering::SeqCst) {
-            std::hint::spin_loop();
-        }
-        fc.request_freeze();
+    let controller = matches!(from, FreezeFrom::Controller).then(|| {
+        let fc = Arc::clone(&freeze);
+        std::thread::spawn(move || {
+            // Wait until the children are spawned (so they run concurrently, not deferred), then freeze.
+            while !spawned.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+            fc.request_freeze();
+        })
     });
 
     let res = compile_and_run_durable(
@@ -114,7 +135,9 @@ fn concurrent_freeze(inst: &Module) -> Option<FreezeOutcome> {
             ..Default::default()
         },
     );
-    controller.join().unwrap();
+    if let Some(c) = controller {
+        c.join().unwrap();
+    }
     match res {
         Ok((o, s, r)) => Some((o, s, r.fibers, r.vcpus, r.root_sp.unwrap_or(0))),
         Err(JitError::Unsupported(_)) => None,
@@ -808,8 +831,10 @@ fn nested_concurrent_tree_freezes_and_thaws() {
 // root spawns a concurrent child and *immediately* parks in `atomic.wait` on `FLAG_OFF` (expected 0, no
 // timeout), so it is blocked when the freeze lands. The **child** drives the spawn-before-freeze
 // handshake, but only *after* it has stored `FLAG_OFF = 1` (a plain atomic store — **no** notify, so the
-// parked root is **not** woken): the controller therefore freezes with the value already changed in the
-// window. On thaw the root re-issues the wait, which re-checks the value, finds `1 != 0`, and resolves
+// parked root is **not** woken), and the signal itself requests the freeze (`FreezeFrom::Signal`): it
+// lands with the value already changed in the window, while the child is still inside that call. An
+// embedder thread's freeze could land after the child exited instead, when nothing is left to notify
+// the root and the run ends on its own in a deadlock (#1748). On thaw the root re-issues the wait, which re-checks the value, finds `1 != 0`, and resolves
 // immediately with `WAIT_NOT_EQUAL` — no re-park, no notifier needed. This is the thaw-able case: the
 // wake landed as a value change that rode the snapshot.
 // Owner decision 2026-07-24 (domain teardown, DESIGN.md §12): after its wait resolves, the root
@@ -864,30 +889,20 @@ block 2 (v8: i64) {
 #[test]
 fn concurrent_freeze_while_root_blocked_in_wait_thaws_when_value_changed() {
     let inst = instrument(SRC_WAIT_WORKS);
-    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) = concurrent_freeze(&inst) else {
+    let Some((fout, fsnap, ffibers, fvcpus, froot_sp)) =
+        concurrent_freeze_from(&inst, FreezeFrom::Signal)
+    else {
         return;
     };
 
-    if read_state(&fsnap) != STATE_UNWINDING {
-        // No frozen artifact (the freeze didn't engage), so there's nothing to thaw. Two valid races:
-        // the root's wait found the changed value before parking (`NOT_EQUAL`, riding the snapshot), or —
-        // rarer — it had parked and the freeze raced past it, so the child's plain store (no `notify`)
-        // can't wake it and the run deadlock-traps (`ThreadFault`, the interp's join-deadlock). A
-        // `Returned` with any other recorded status would be a real bug.
-        match fout {
-            JitOutcome::Returned(_) => assert_eq!(
-                le_i64(&fsnap, OFF_ROOT),
-                WAIT_NOT_EQUAL,
-                "no-freeze completion: the root's wait resolved NOT_EQUAL",
-            ),
-            JitOutcome::Trapped(TrapKind::ThreadFault) => {}
-            other => panic!("unexpected no-freeze outcome: {other:?}"),
-        }
-        return;
-    }
+    assert_eq!(
+        read_state(&fsnap),
+        STATE_UNWINDING,
+        "the freeze always lands"
+    );
     assert!(
         matches!(fout, JitOutcome::Returned(_)),
-        "freeze placeholder while the root was blocked in the wait",
+        "freeze placeholder while the root was blocked in the wait: {fout:?}",
     );
 
     let (tout, tfinal) = thaw(&inst, &fsnap, &ffibers, &fvcpus, froot_sp);
