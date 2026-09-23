@@ -2899,6 +2899,11 @@ pub struct PbOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub framebuffer: Option<Frame>,
+    /// The trap the run ended in, when it ended in one (`STATUS_TRAP`; `None` for a clean finish or an
+    /// `exit`). Carried so an embedder can tell a segfault from any other crash (#1714).
+    pub trap: Option<Trap>,
+    /// For a `MemoryFault`, the window-relative faulting address (a NULL deref is `0`).
+    pub fault_addr: Option<u64>,
 }
 
 /// The canonical names of the browser powerbox's capabilities, in grant order — the vocabulary a
@@ -2964,6 +2969,8 @@ pub fn powerbox_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
             },
         };
     PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value,
         exit_code,
@@ -3651,6 +3658,8 @@ pub fn onramp_exec_with_tee(
     tee: Option<temen_interp::StdoutTee>,
 ) -> PbOutcome {
     let unsupported = || PbOutcome {
+        trap: None,
+        fault_addr: None,
         status: STATUS_UNSUPPORTED,
         value: 0,
         exit_code: 0,
@@ -3677,11 +3686,15 @@ pub fn onramp_exec_with_tee(
     // (no OS threads — so this runs on the wasm32 cdylib, unlike the tree-walker's thread pool). A
     // C guest that grows a large heap with sub-64-KiB `vm_map`s runs unchanged now that the interp's
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
+    let mut trap = None;
     let (status, value, exit_code) =
         match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
             Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-            Some(Err(_)) => (STATUS_TRAP, 0, 0),
+            Some(Err(t)) => {
+                trap = Some(t);
+                (STATUS_TRAP, 0, 0)
+            }
             Some(Ok(vals)) => match vals.first() {
                 Some(Value::I64(x)) => (STATUS_OK, *x, 0),
                 Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
@@ -3690,6 +3703,11 @@ pub fn onramp_exec_with_tee(
         };
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
+        trap: trap.clone(),
+        fault_addr: match trap {
+            Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr(),
+            _ => None,
+        },
         status,
         value,
         exit_code,
@@ -3728,6 +3746,8 @@ pub fn onramp_jit_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
 /// uses; the personality's `HostProc` dispatches through the guest window `bytecode` hands it.
 pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
     let unsupported = || PbOutcome {
+        trap: None,
+        fault_addr: None,
         status: STATUS_UNSUPPORTED,
         value: 0,
         exit_code: 0,
@@ -3761,6 +3781,8 @@ pub fn onramp_posix_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
             },
         };
     PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value,
         exit_code,
@@ -3806,6 +3828,8 @@ pub fn bash_exec_with(
     bins: &[(&str, &temen_ir::Module, u8)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value: 0,
         exit_code: 0,
@@ -3842,6 +3866,8 @@ fn bash_run_over_compiled(
     bins: &[(&str, &temen_ir::Module, u8)],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value: 0,
         exit_code: 0,
@@ -3874,6 +3900,8 @@ fn bash_run_over_compiled(
     };
     // The personality owns bash's fd 1/2 — its captured streams are the run's output.
     PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value,
         exit_code,
@@ -4087,6 +4115,8 @@ pub fn posix_shell_exec_with(
             None => (STATUS_UNSUPPORTED, 0, 0),
         };
     PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value,
         exit_code,
@@ -4220,6 +4250,8 @@ pub fn onramp_fs_exec(
     stdin: &[u8],
 ) -> PbOutcome {
     let unsupported = |status: i32| PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value: 0,
         exit_code: 0,
@@ -4252,6 +4284,8 @@ pub fn onramp_fs_exec(
         },
     };
     PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value,
         exit_code,
@@ -4276,6 +4310,8 @@ pub fn onramp_fs_exec_readback(
     out_key: &str,
 ) -> (PbOutcome, Vec<u8>) {
     let unsupported = |status: i32| PbOutcome {
+        trap: None,
+        fault_addr: None,
         status,
         value: 0,
         exit_code: 0,
@@ -4316,6 +4352,8 @@ pub fn onramp_fs_exec_readback(
         .unwrap_or_default();
     (
         PbOutcome {
+            trap: None,
+            fault_addr: None,
             status,
             value,
             exit_code,
@@ -4367,6 +4405,8 @@ pub extern "C" fn temen_run_pg(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -4767,6 +4807,8 @@ pub extern "C" fn temen_run_onramp_fs(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -4818,6 +4860,8 @@ pub extern "C" fn temen_run_nifler_fs(
         stash(&mut *core::ptr::addr_of_mut!(OUT), produced);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -5562,6 +5606,8 @@ pub extern "C" fn temen_selfhost_emit_object_fs(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -7638,6 +7684,10 @@ pub fn instantiate_exec(m: &temen_ir::Module) -> (i32, i64) {
 static mut OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 static mut EXIT_CODE: i32 = 0;
+/// The most recent run's trap name ([`temen_trap_ptr`]); empty when it did not trap.
+static mut LAST_TRAP: &str = "";
+/// The most recent run's faulting address ([`temen_fault_addr`]); `-1` when none.
+static mut FAULT_ADDR: i64 = -1;
 /// The value the guest's top-level function returned on the most recent run (the `value` in
 /// [`temen_run_onramp`]'s outcome, and the single-shot JIT run's captured `f0` return). Read via
 /// [`temen_run_value`] so both tiers surface the same result for a *returned* run — the parity the
@@ -7745,6 +7795,8 @@ pub extern "C" fn temen_run_pb(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -7793,6 +7845,8 @@ pub extern "C" fn temen_run_onramp(
         FB_W = fb_w;
         FB_H = fb_h;
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -7863,6 +7917,8 @@ pub extern "C" fn temen_run_onramp_stream(
         FB_W = fb_w;
         FB_H = fb_h;
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -8720,6 +8776,8 @@ pub extern "C" fn temen_run_onramp_posix(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -8819,6 +8877,8 @@ pub extern "C" fn temen_run_shell(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -8878,6 +8938,8 @@ pub extern "C" fn temen_run_bash(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -9950,6 +10012,8 @@ pub fn link_run_units(
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),
         Err(status) => PbOutcome {
+            trap: None,
+            fault_addr: None,
             status,
             value: 0,
             exit_code: 0,
@@ -10026,6 +10090,8 @@ fn link_run_against_multi(
         stash(&mut *core::ptr::addr_of_mut!(OUT), out.stdout);
         stash(&mut *core::ptr::addr_of_mut!(ERR), out.stderr);
         EXIT_CODE = out.exit_code;
+        LAST_TRAP = out.trap.as_ref().map_or("", Trap::name);
+        FAULT_ADDR = out.fault_addr.map_or(-1, |a| a as i64);
     }
     out.value
 }
@@ -12879,6 +12945,25 @@ pub extern "C" fn temen_stderr_len() -> usize {
 #[no_mangle]
 pub extern "C" fn temen_exit_code() -> i32 {
     unsafe { EXIT_CODE }
+}
+
+/// #1714 — the trap the most recent run ended in, by name (`Trap::name`: `"MemoryFault"`,
+/// `"DivByZero"`, …), or empty when it did not trap. [`temen_status`] says only `STATUS_TRAP`; this
+/// is what lets an embedder report a segfault as a segfault rather than a generic crash. The bytes
+/// are static — valid for the life of the module.
+#[no_mangle]
+pub extern "C" fn temen_trap_ptr() -> *const u8 {
+    unsafe { LAST_TRAP.as_ptr() }
+}
+#[no_mangle]
+pub extern "C" fn temen_trap_len() -> usize {
+    unsafe { LAST_TRAP.len() }
+}
+/// #1714 — for a `MemoryFault`, the window-relative faulting address of the most recent run (a NULL
+/// dereference is `0`); `-1` when the run did not fault on an address.
+#[no_mangle]
+pub extern "C" fn temen_fault_addr() -> i64 {
+    unsafe { FAULT_ADDR }
 }
 
 /// The value the guest's top-level function returned on the most recent single-shot JIT run (valid when

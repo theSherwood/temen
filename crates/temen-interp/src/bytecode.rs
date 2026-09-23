@@ -2370,7 +2370,17 @@ pub fn compile_and_run_with_host(
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m);
-    Some(run(dom, func, args, fuel, &mut mem, host))
+    let r = run(dom, func, args, fuel, &mut mem, host);
+    // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
+    // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
+    // embedder of a plain run could not say *where* a segfault was. Cleared on any other outcome,
+    // so a later clean run never reports an earlier run's fault.
+    let fault = match &r {
+        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
+        _ => None,
+    };
+    super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
+    Some(r)
 }
 
 /// What [`compile_and_run_with_host_traced`] returns — the shared traced-run shape (result + trap-time

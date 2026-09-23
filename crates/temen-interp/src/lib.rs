@@ -225,6 +225,29 @@ pub enum Trap {
     Malformed,
 }
 
+impl Trap {
+    /// The trap's kind as a stable name — what an embedder reports and matches on (a memory fault
+    /// vs a chosen `exit(k)`). One definition for every surface that names a trap: the DAP `exited`
+    /// event (#1190) and the browser release run (#1714).
+    pub fn name(&self) -> &'static str {
+        match self {
+            Trap::OutOfFuel => "OutOfFuel",
+            Trap::DivByZero => "DivByZero",
+            Trap::IntOverflow => "IntOverflow",
+            Trap::MemoryFault => "MemoryFault",
+            Trap::StackOverflow => "StackOverflow",
+            Trap::IndirectCallType => "IndirectCallType",
+            Trap::Unreachable => "Unreachable",
+            Trap::BadConversion => "BadConversion",
+            Trap::CapFault => "CapFault",
+            Trap::Exit(_) => "Exit",
+            Trap::FiberFault => "FiberFault",
+            Trap::ThreadFault => "ThreadFault",
+            Trap::Malformed => "Malformed",
+        }
+    }
+}
+
 /// Maximum nested `call` depth before the interpreter traps, bounding the size of the
 /// **explicit** guest call stack (a `Vec<Frame>`, §12) so adversarial (or merely deep)
 /// guest recursion yields a clean `Trap::StackOverflow` rather than unbounded growth.
