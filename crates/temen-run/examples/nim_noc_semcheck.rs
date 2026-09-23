@@ -25,13 +25,14 @@
 //!   `sh -c "bin/nifler …"` is one simple command, so the shell execs nifler in place: nimsem's
 //!   shell-out is one fork and two image-replaces, and nimsem reaps nifler's own status.
 //!
-//!   **One blocker short: #1668.** Everything up to the last step runs — nimsem forks, the twin
-//!   execs `/bin/sh`, the shell parses `-c` and execs `bin/nifler` — and that exec is refused
-//!   (`bin/nifler: cannot execute (errno 22)`): exec admits only the chibicc child-entry shape, and
-//!   nimony's decorated import names bind only through temen-run's root linker. Until then, `--sh`
-//!   fails at that line and the hand-crank below is the working path.
+//!   **This is the working path** (#1668). nimsem runs its own shell-out for every dependency, and
+//!   the result is the native compiler's: `system`'s semcheck matches native nimony's line for line
+//!   (only recorded paths, and the byte offsets they shift, differ). That needed every POSIX import of
+//!   a nim program to be the personality's own name (`__px_*`), so an `execve`'d nifler binds exactly
+//!   as a C command does, and exec to admit a powerbox `_start`.
 //!
-//! * **Without `--sh`, a hand-crank.** Run nimsem; when it quits with `FAILURE: nifler … parse <src>
+//! * **Without `--sh`, a hand-crank** — kept as the fallback and as a differential against the real
+//!   path. Run nimsem; when it quits with `FAILURE: nifler … parse <src>
 //!   <out>`, run nifler2 over the same memfs with exactly those arguments; run nimsem again. The
 //!   guest names the file it wants, so nothing here guesses a path or a cache stem. It converges
 //!   because each round makes one more dependency current, and it refuses to spin: a command it has
@@ -199,8 +200,8 @@ fn semcheck(
             panic!(
                 "nimsem wrote no {produced} with /bin/sh registered — the in-guest exec path \
                  failed: {outcome:?}\nThe shell reports a failed exec on stdout (`<cmd>: not \
-                 found` / `cannot execute (errno N)`), shown above; `bin/nifler: cannot execute \
-                 (errno 22)` is #1668. Nothing there usually means /bin/sh is not the \
+                 found` / `cannot execute (errno N)`), shown above. Nothing there usually means \
+                 /bin/sh is not the \
                  -DTEMEN_SHELL_POSIX build: the default build's manifest does not bind under a \
                  POSIX personality, so its own exec is refused."
             );

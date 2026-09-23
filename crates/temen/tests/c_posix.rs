@@ -79,12 +79,10 @@ fn bind_shim(m: &temen_ir::Module, host: &mut Host, handle: i32) {
     let bindings = m
         .imports
         .iter()
-        .map(
-            |i| match i.name.strip_prefix("__px_").and_then(temen_posix::resolve) {
-                Some(c) => temen_interp::BoundImport::required(c.type_id, c.op, handle),
-                None => temen_interp::BoundImport::rebindable(0, 0, None),
-            },
-        )
+        .map(|i| match temen_posix::resolve_import(&i.name) {
+            Some(c) => temen_interp::BoundImport::required(c.type_id, c.op, handle),
+            None => temen_interp::BoundImport::rebindable(0, 0, None),
+        })
         .collect();
     host.set_import_bindings(bindings);
 }
@@ -3425,18 +3423,14 @@ fn c_execve_runs_a_shell_pipeline_as_a_command() {
 /// caller (pid 1) or `C` if it is the shell, and exits with the argument's digit. The parent is
 /// what tells exec-in-place (the shell *became* the command) from fork (the shell ran it).
 ///
-/// (No `?:` inside the `__px_write` arguments: #1667, a branching argument to a capability extern
-/// is silently miscompiled.)
+/// The `?:` inside `__px_write`'s arguments is the construct that found #1667.
 const RC: &str = r#"
 long __px_write(int cap, long fd, long buf, long len);
 long __px_getppid(int cap);
-static char who[2];
 int main(int argc, char **argv) {
   if (argc != 2) return 90;
   __px_write(0, 1, (long)argv[1], 1);
-  who[0] = 'C';
-  if (__px_getppid(0) == 1) who[0] = 'P';
-  __px_write(0, 1, (long)who, 1);
+  __px_write(0, 1, (long)(__px_getppid(0) == 1 ? "P" : "C"), 1);
   return argv[1][0] - '0';
 }
 "#;
@@ -3478,6 +3472,40 @@ fn c_posix_sh_forks_each_command_of_a_list() {
         e.stdout, b"3C5Calive",
         "`C`: each command's parent is the shell, which forked it and waited"
     );
+}
+
+/// #1667 — **a branching argument to a builtin.** chibicc lowered a builtin's arguments straight
+/// into its instruction, so an argument that opened a block (`?:`, `&&`, `||`) stranded every value
+/// computed before it: the call landed in the merge block, where those value numbers named
+/// something else. It verified and ran — `__px_write(0, 1, (long)(c ? "P" : "C"), 1)` passed the
+/// string pointer as the capability handle. Every argument position, a capability extern and a
+/// non-import builtin both, and a generic call as the control (it always spilled, and must be
+/// unchanged).
+#[test]
+fn c_branching_arguments_to_a_builtin_keep_their_neighbours() {
+    const SRC: &str = r#"
+long __px_write(int cap, long fd, long buf, long len);
+long __vm_atomic_add(void *p, long v);
+static long acc;
+static int yes(void) { return 1; }
+static long sum3(long a, long b, long c) { return a + b + c; }
+int main(void) {
+  int k = yes();
+  __px_write(0, 1, (long)(k ? "a" : "X"), 1);   /* the buffer branches */
+  __px_write(0, k ? 1 : 2, (long)"b", 1);       /* the fd branches */
+  __px_write(0, 1, (long)"c", k && 1);          /* the length branches */
+  __px_write(k ? 0 : 0, 1, (long)"d", k || 0);  /* the handle and the length */
+  __vm_atomic_add(&acc, k ? 40 : 1);            /* a non-import builtin */
+  __vm_atomic_add(&acc, (k && 1) + 1);
+  return (int)(acc + sum3(1, 2, k ? 3 : 100) - 6);   /* 42 */
+}
+"#;
+    let e = run_interp_only(SRC, |_| {});
+    assert_eq!(
+        e.stdout, b"abcd",
+        "each write reached stdout with its own arguments"
+    );
+    assert_eq!(e.result, vec![Value::I32(42)]);
 }
 
 /// #1662 — a command that does not exist is `127` **and says so**. Every layer of #1662 presented

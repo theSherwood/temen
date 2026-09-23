@@ -508,7 +508,7 @@ static int spill_top;   // next free scratch slot (8-byte slots, LIFO)
 
 // True if evaluating `n` opens any block (so values live across it must be spilled).
 static bool has_branch(Node *n) {
-  if (!n)
+  if (!n || n->kind == ND_PREVAL)
     return false;
   if (n->kind == ND_LOGAND || n->kind == ND_LOGOR || n->kind == ND_COND)
     return true;
@@ -1202,8 +1202,8 @@ static int gen_builtin_cap(Node *node) {
 // `__vm_cap`), the rest are the operation arguments, and the op signature is the C signature minus
 // the handle. The host binds the name to a concrete `(type_id, op)` at load (the §7 late binding,
 // `temen_run::default_cap_resolver`), so a brand-new capability needs no frontend change — just an
-// `extern` declaration and a host that knows the name. Args are simple expressions (no branching),
-// like the other capability builtins.
+// `extern` declaration and a host that knows the name. An argument that branches is fine: the
+// call reaches every builtin with its arguments already evaluated (`gen_call_preval`, #1667).
 static int gen_builtin_import(Node *node) {
   char *name = node->lhs->var->name;
   Node *a = node->args;
@@ -1659,7 +1659,7 @@ static int gen_builtin_fiber_suspend(Node *node) {
 
 // Peel casts/address-of to find a direct function designator (for the static `thread.spawn` funcidx).
 static Obj *fn_designator(Node *n) {
-  while (n->kind == ND_CAST || n->kind == ND_ADDR)
+  while (n->kind == ND_CAST || n->kind == ND_ADDR || n->kind == ND_PREVAL)
     n = n->lhs;
   if (n->kind == ND_VAR && n->var && n->var->is_function)
     return n->var;
@@ -1866,8 +1866,47 @@ static int gen_builtin_mm_store_ps(Node *node) {
   return 0; // void
 }
 
+// #1667 — a call whose arguments branch, evaluated once, for every lowering at the same time.
+//
+// A builtin lowers its arguments straight into its own instruction, so an argument that opens a
+// block (`&&`, `||`, `?:`) strands every value computed before it: the instruction lands in the
+// merge block, where those value numbers name something else. It verified and ran — a capability
+// call handed the ternary's string pointer as its *handle*. Rather than teach ~50 lowerings to
+// spill, evaluate the argument list here exactly as the generic call below does (left to right,
+// each spilled across the branch, all reloaded in the final block) and re-dispatch on a copy of the
+// call whose arguments are those values. Every lowering then sees plain values, and an ordinary
+// call's output is unchanged: this is the generic path's own spill, emitted one step earlier.
+static int gen_call_preval(Node *node) {
+  int argv[64], slot[64];
+  Node *orig[64];
+  int n = 0;
+  int save = spill_top;
+  for (Node *a = node->args; a; a = a->next) {
+    if (n == 64)
+      error_tok(node->tok, "codegen_ir: too many call arguments");
+    orig[n] = a;
+    argv[n] = gen_expr(a);
+    slot[n] = spill(argv[n], pass_irty(a->ty));
+    n++;
+  }
+  for (int i = 0; i < n; i++)
+    argv[i] = reload(slot[i], pass_irty(orig[i]->ty));
+  spill_top = save;
+  Node pv[64];
+  for (int i = 0; i < n; i++) {
+    pv[i] = (Node){.kind = ND_PREVAL, .ty = orig[i]->ty, .tok = orig[i]->tok,
+                   .lhs = orig[i], .val = argv[i]};
+    pv[i].next = i + 1 < n ? &pv[i + 1] : NULL;
+  }
+  Node call = *node;
+  call.args = n ? &pv[0] : NULL;
+  return gen_expr(&call);
+}
+
 static int gen_expr(Node *node) {
   switch (node->kind) {
+  case ND_PREVAL:
+    return (int)node->val;
   case ND_NUM: {
     int r = nv++;
     if (is_flt(node->ty))
@@ -1967,6 +2006,11 @@ static int gen_expr(Node *node) {
     // A call is direct when the callee is a named function; otherwise it is an indirect
     // call through a function-pointer *value* (a funcref index, §3c).
     bool direct = node->lhs->kind == ND_VAR && node->lhs->var->is_function;
+    if (direct) {
+      for (Node *a = node->args; a; a = a->next)
+        if (has_branch(a))
+          return gen_call_preval(node); // #1667
+    }
     // Intercept the stdio builtins (powerbox §3e) before treating it as a guest call.
     if (direct) {
       char *fname = node->lhs->var->name;

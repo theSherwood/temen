@@ -1229,13 +1229,22 @@ fn libc_serves(c_name: &str) -> bool {
 
 /// The **guest-libc leaves** a set of nim units imports, as `(import symbol, C name)` — the `importc`
 /// procs whose C name is in [`LIBC_SERVED`]. Drives both the frame seeding and [`nim_libc_units`].
+pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
+    let mut out = importc_leaves_of(units)?;
+    out.retain(|(_, c)| libc_serves(c));
+    Ok(out)
+}
+
+/// **Every** `importc` leaf a set of nim units declares, as `(import symbol, C name)` — the one walk
+/// both the guest libc ([`libc_leaves_of`]) and the POSIX edge ([`nim_posix_runtime`]) read, so the
+/// two can never disagree about what a leaf is called.
 ///
 /// Each leaf is yielded under **both spellings the linker may see**: the bare leng symbol
 /// (`c_snprintf.0.`, how a module calls a leaf it declares itself) and the stem-suffixed global
 /// (`sin.2.mat7cnfv21`, how a *sibling* module calls a leaf `std/math` declares). A cross-module call
 /// resolves the callee to its global name, so binding only the bare form would leave every libm leaf
 /// an unbound manifest import.
-pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
+fn importc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, LengError> {
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |name: String, c: &str| {
         if !out.iter().any(|(s, _)| *s == name) {
@@ -1245,10 +1254,8 @@ pub fn libc_leaves_of(units: &[WholeModule]) -> Result<Vec<(String, String)>, Le
     for u in units {
         let root = nif::parse(u.src).map_err(LengError::Parse)?;
         for (sym, c) in translate::Translator::importc_procs(&root)? {
-            if libc_serves(&c) {
-                push(format!("{sym}{}", u.stem), &c);
-                push(sym, &c);
-            }
+            push(format!("{sym}{}", u.stem), &c);
+            push(sym, &c);
         }
     }
     out.sort();
@@ -1372,17 +1379,20 @@ func (i32, i64, i32) -> (i64) { block 0 (v0: i32, v1: i64, v2: i32) { v3 = i64.c
 /// mapped a file. Func 0 serves the `sysOpen` shape, func 1 the `open` shape; the differing `mode`
 /// width is why one func cannot serve both (the link checks import shape, #1524).
 ///
-/// Funcs 2–4 are `unlink`, `rename` and `stat`, here for the same reason and doing the same walk.
+/// Funcs 2–5 are `unlink`, `rename`, `stat` and `chdir`, here for the same reason and doing the same
+/// walk. (`chdir` was bound argument-for-argument until #1668, handing the op a C string where it
+/// takes `(ptr, len)` — the bug #1595 fixed for `open`, still latent one leaf over.)
 /// `stat` is the one that decides whether a compiler can *start*: nimony's `fileExists` is
 /// `stat(path, res) >= 0 and S_ISREG(res.st_mode)`, so on the shim's fail-closed stub no file it
 /// looked for existed, and nimsem's first act on a real module was `cannot find <input>`. It
 /// forwards to `statp`, the by-path op that writes the **declared** `struct stat` — not `stat`,
 /// whose short `{mode, size}` a caller with its own `Stat` reads as a garbage mode.
 const POSIX_OPEN_ADAPTER: &str = "\
-import 0 \"open\" (i64, i64, i64) -> (i64)
-import 1 \"unlink\" (i64, i64) -> (i64)
-import 2 \"rename\" (i64, i64, i64, i64) -> (i64)
-import 3 \"statp\" (i64, i64, i64) -> (i64)
+import 0 \"__px_open\" (i64, i64, i64) -> (i64)
+import 1 \"__px_unlink\" (i64, i64) -> (i64)
+import 2 \"__px_rename\" (i64, i64, i64, i64) -> (i64)
+import 3 \"__px_statp\" (i64, i64, i64) -> (i64)
+import 4 \"__px_chdir\" (i64, i64) -> (i64)
 
 func (i64, i32, i64) -> (i32) {
 block 0 (v0: i64, v1: i32, v2: i64) { br 1(v0, v1, v0) }
@@ -1480,6 +1490,23 @@ block 2 (v0: i64, v1: i64, v2: i64) {
   v5 = i32.wrap_i64 v4
   return v5
   }
+}
+
+func (i64) -> (i32) {
+block 0 (v0: i64) { br 1(v0, v0) }
+block 1 (v0: i64, v1: i64) {
+  v2 = i32.load8_u v1
+  v3 = i32.eqz v2
+  v4 = i64.const 1
+  v5 = i64.add v1 v4
+  br_if v3 2(v0, v1) 1(v0, v5)
+  }
+block 2 (v0: i64, v1: i64) {
+  v2 = i64.sub v1 v0
+  v3 = call.import 4 (v0, v2)
+  v4 = i32.wrap_i64 v3
+  return v4
+  }
 }";
 
 /// The private alias under which [`nim_posix_runtime`] re-exports the compute shim's **anonymous**
@@ -1511,8 +1538,8 @@ const MMAP_ANON_ALIAS: &str = "__temen_mmap_anon";
 /// `memfiles.open` raises — the caller sees "cannot open", never a half-filled buffer.
 const POSIX_MMAP_ADAPTER: &str = "\
 import 0 \"__temen_mmap_anon\" (i64, i64, i32, i32, i32, i64) -> (i64)
-import 1 \"read\" (i64, i64, i64) -> (i64)
-import 2 \"lseek\" (i64, i64, i64) -> (i64)
+import 1 \"__px_read\" (i64, i64, i64) -> (i64)
+import 2 \"__px_lseek\" (i64, i64, i64) -> (i64)
 
 func (i64, i64, i32, i32, i32, i64) -> (i64) {
 block 0 (v0: i64, v1: i64, v2: i32, v3: i32, v4: i32, v5: i64) {
@@ -1679,10 +1706,10 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
     compute_shim_unit(nim_compute_exports(units)?.0)
 }
 
-/// Bottom-edge leaves the **host** serves for real, so [`nim_posix_runtime`] leaves them to it
-/// instead of binding [`POWERBOX_COMPUTE_SHIM`]'s stub. Each is passed through with its C ABI
-/// unchanged — a leaf that needs reconciling (a NUL-terminated path where the op wants `(ptr, len)`)
-/// belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
+/// Bottom-edge leaves the **personality** serves for real, so [`nim_posix_runtime`] withholds them from
+/// [`POWERBOX_COMPUTE_SHIM`]'s stubs and its POSIX edge forwards each to the op of the same C name
+/// ([`posix_edge_unit`]) — argument-for-argument; a leaf that needs reconciling (a NUL-terminated
+/// path where the op wants `(ptr, len)`) belongs in [`POSIX_OPEN_ADAPTER`] instead, not here.
 ///
 /// - `getcwd` → the matching `temen_posix` op. Bound to the shim it returns NULL and nim's
 ///   `getCurrentDir()` raises, which is right for a stdout-only powerbox and wrong where a real cwd
@@ -1690,8 +1717,8 @@ pub fn nim_compute_shim_unit(units: &[WholeModule]) -> Result<temen_ir::LinkUnit
 /// - `fstat` → the matching `temen_posix` op. Bound to the shim it reports **size 0**, so
 ///   `memfiles.open` (`open` + `fstat` + `mmap`) maps every file as empty and the program reads a
 ///   zero-length buffer rather than its input — #1595.
-/// - `cExitSys` → the **`Exit` lifecycle capability**, not a `temen_posix` op. Exiting is not
-///   compute, and the shim's stub for it is `func (i32) -> () { return }` — so `quit()` *returns*
+/// - `cExitSys` → the personality's `exit`, which ends the domain with `Trap::Exit` exactly as the
+///   `Exit` capability does. Not the shim: its stub is `func (i32) -> () { return }` — so `quit()` *returns*
 ///   and the program runs on past the error path that called it. nimsem printed `command expected`
 ///   three times and then `command missing` where native printed it once and stopped. Every nim CLI
 ///   error path is built on `quit`, so on this route none of them ended the program.
@@ -1711,12 +1738,39 @@ const POSIX_SERVED_LEAVES: &[&str] = &[
 ///
 /// Both are `[compute shim, syscall edge]`. They differ only in what stands behind the syscalls:
 /// `nim_powerbox_runtime` uses [`SYSCALL_ADAPTER`], which folds them onto the single §3e STREAM
-/// `write` cap and fails every file operation closed (a stdout-only program). This leaves them as
-/// **retained manifest imports** the host binds to a real `temen_posix` personality — so a program
-/// that opens and reads files (`nifler2 parse in.nim out.nif`) works — and adds only
-/// [`POSIX_OPEN_ADAPTER`], the one ABI reconciliation that edge needs.
-pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
+/// `write` cap and fails every file operation closed (a stdout-only program). This forwards them to
+/// a real `temen_posix` personality — so a program that opens and reads files (`nifler2 parse in.nim
+/// out.nif`) works — through [`POSIX_OPEN_ADAPTER`] (the path ops' NUL walk),
+/// [`POSIX_MMAP_ADAPTER`], and the generated POSIX edge ([`posix_edge_unit`]).
+///
+/// **The linked program imports only the personality's own names** (#1668), exactly as `personality`
+/// publishes them — `__px_write`, `__px_open`, … — so it binds the way a chibicc command does: by the
+/// same table at root, and through the personality's vtable in an `execve`'d image. Before, the
+/// manifest carried nimony's mangled leaf names, which only temen-run's root linker could match.
+pub fn nim_posix_runtime(
+    units: &[WholeModule],
+    personality: PersonalityVtable,
+) -> Result<Vec<temen_ir::LinkUnit>, LengError> {
     let (mut compute_exports, m1) = nim_compute_exports(units)?;
+    // The shapes the POSIX edge forwards from, captured before the shim loses the served leaves: a
+    // withheld leaf is no longer a shim export, and it is not a pass-1 import either (pass 1 bound
+    // it to the shim), so this is the only place its nim-side signature is still visible.
+    let shim = temen_text::parse_module(POWERBOX_COMPUTE_SHIM)
+        .map_err(|e| LengError::Malformed(format!("compute shim parse: {e:?}")))?;
+    let withheld: Vec<(String, temen_ir::FuncType)> = compute_exports
+        .iter()
+        .filter(|(n, _)| POSIX_SERVED_LEAVES.iter().any(|p| n.starts_with(p)))
+        .map(|(n, i)| {
+            let f = &shim.funcs[*i as usize];
+            (
+                n.clone(),
+                temen_ir::FuncType {
+                    params: f.params.clone(),
+                    results: f.results.clone(),
+                },
+            )
+        })
+        .collect();
     // Withhold the leaves the **personality serves for real** from the compute shim, whose versions
     // of them are deliberate fail-closed stubs ("a playground guest is granted no ambient
     // filesystem"). Bound to the stub, `getcwd` returns NULL and nim's `getCurrentDir()` raises —
@@ -1770,12 +1824,27 @@ pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit
             .filter(|(n, _)| n.starts_with("stat") || n.starts_with("lstat"))
             .map(|(n, _)| (n.clone(), 4)),
     );
+    // `chdir` (#1668): the same walk, and the same bug until now — it was bound argument-for-argument,
+    // handing the op a C string where it takes `(ptr, len)`.
+    opens.extend(
+        m1.imports
+            .iter()
+            .map(|i| &i.name)
+            .chain(compute_exports.iter().map(|(n, _)| n))
+            .filter(|n| n.starts_with("chdir"))
+            .map(|n| (n.clone(), 5)),
+    );
     compute_exports.retain(|(n, _)| {
         !n.starts_with("unlink")
             && !n.starts_with("c_rename")
             && !n.starts_with("stat")
             && !n.starts_with("lstat")
+            && !n.starts_with("chdir")
     });
+    // One entry per name: a leaf can reach this list twice — retained by pass 1, then widened into the
+    // shim's set — and a link unit exporting a name twice is a duplicate symbol.
+    let mut seen = std::collections::BTreeSet::new();
+    opens.retain(|(n, _)| seen.insert(n.clone()));
     let open_adapter = temen_ir::LinkUnit {
         module: temen_text::parse_module(POSIX_OPEN_ADAPTER)
             .map_err(|e| LengError::Malformed(format!("posix open adapter parse: {e:?}")))?,
@@ -1812,7 +1881,251 @@ pub fn nim_posix_runtime(units: &[WholeModule]) -> Result<Vec<temen_ir::LinkUnit
     };
     let mut out = vec![compute_shim_unit(compute_exports)?, open_adapter];
     out.extend(mmap_adapter);
+    // #1668 — **the POSIX edge**: every leaf nothing above serves, forwarded to the personality op of
+    // the same C name. The leaves the pass-1 link retained, and the ones withheld from the shim — less
+    // any a unit above now exports (pass 1 *widens* the shim with leaves it finds among its own
+    // retained imports, so "retained in pass 1" does not mean "unserved").
+    let claimed = |n: &str| out.iter().any(|u| u.exports.iter().any(|(e, _)| e == n));
+    let mut leaves: Vec<(String, temen_ir::FuncType)> = m1
+        .imports
+        .iter()
+        .filter_map(|i| {
+            let (p, r) = import_sig(&m1, i)?;
+            Some((
+                i.name.clone(),
+                temen_ir::FuncType {
+                    params: p.to_vec(),
+                    results: r.to_vec(),
+                },
+            ))
+        })
+        .collect();
+    // A leaf can arrive both ways: retained by pass 1, then widened into the shim's set, then withheld.
+    for (n, t) in withheld {
+        if leaves.iter().all(|(m, _)| *m != n) {
+            leaves.push((n, t));
+        }
+    }
+    leaves.retain(|(n, _)| !claimed(n));
+    let edge = posix_edge_unit(&leaves, &importc_leaves_of(units)?, personality)?;
+    out.push(edge);
+    check_personality_imports(&out, personality)?;
     Ok(out)
+}
+
+/// The personality's published op vocabulary — what `temen_posix::cap_vtable()` returns: each op's
+/// import name (`__px_<op>`) and its exact signature, op number = position.
+///
+/// temen-leng cannot depend on the personality (it is compiled to a guest itself, and the personality
+/// pulls in the engines), so the caller hands the vocabulary in as data. It is the **one** convention
+/// a program's POSIX imports are spelled in (#1668): a nim program linked against it imports exactly
+/// what a chibicc command does, so the same binding serves both — at root, and in an `execve`'d image
+/// whose only authority is the personality it carried.
+pub type PersonalityVtable<'a> = (&'a [String], &'a [temen_ir::FuncType]);
+
+fn valtype_text(t: ValType) -> &'static str {
+    match t {
+        ValType::I32 => "i32",
+        ValType::I64 => "i64",
+        ValType::F32 => "f32",
+        ValType::F64 => "f64",
+        // Only integers reach a forwarder (the edge refuses anything else); this spelling only ever
+        // lands in that refusal's message.
+        _ => "?",
+    }
+}
+
+fn functype_text(params: &[ValType], results: &[ValType]) -> String {
+    let join = |ts: &[ValType]| {
+        ts.iter()
+            .map(|t| valtype_text(*t))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    format!("({}) -> ({})", join(params), join(results))
+}
+
+/// #1668 — the **POSIX edge**: a generated forwarder for each argument-for-argument syscall leaf,
+/// calling the personality op of the same C name.
+///
+/// Nimony spells these leaves as mangled nim symbols (`sysWrite.0.`, `getcwd.0.pososrh1q1`), and until
+/// now they reached the manifest that way and a host-side table matched them by name prefix — a
+/// second vocabulary only temen-run's root linker knew, so an `execve`'d nim program could bind none of
+/// them. The leaf's `importc` C name *is* the personality's name for it (`_exit` aside), so the edge is
+/// derived rather than listed: C name → `__px_<name>` in `personality`, with the shape reconciled
+/// mechanically — each `i32` argument sign-extended to the op's `i64`, the `i64` result narrowed to what
+/// the leaf declares or dropped.
+///
+/// Only a leaf whose arity matches its op is forwarded. A mismatch means the ABIs genuinely differ — a
+/// C string where the op takes `(ptr, len)` — and belongs in [`POSIX_OPEN_ADAPTER`]'s walk; it is an
+/// error here, so it cannot be bound wrong in silence. Two exceptions, both named: `fork`, whose op
+/// takes an unused operand the leaf does not have; and the guest libc's fd-less stdout `write`
+/// (`(buf, len)`, [`LIBC_CAP_STUBS`]), which is `write` to fd 1.
+fn posix_edge_unit(
+    leaves: &[(String, temen_ir::FuncType)],
+    importc: &[(String, String)],
+    personality: PersonalityVtable,
+) -> Result<temen_ir::LinkUnit, LengError> {
+    let (px_names, px_sigs) = personality;
+    let op = |c: &str| {
+        let name = format!("__px_{c}");
+        px_names
+            .iter()
+            .position(|n| *n == name)
+            .map(|i| (name, &px_sigs[i]))
+    };
+    // (export name, leaf shape, op name, op shape, leading constant args)
+    let mut fwds: Vec<(
+        String,
+        temen_ir::FuncType,
+        String,
+        temen_ir::FuncType,
+        Vec<i64>,
+    )> = Vec::new();
+    for (name, shape) in leaves {
+        let Some((_, c)) = importc.iter().find(|(s, _)| s == name) else {
+            continue; // not an `importc` leaf: left to whatever else serves it (or reported unbound)
+        };
+        let c = if c == "_exit" { "exit" } else { c.as_str() };
+        let Some((opname, opsig)) = op(c) else {
+            continue; // not a personality op: left retained, as before
+        };
+        let pad = c == "fork" && shape.params.is_empty() && opsig.params.len() == 1;
+        let arity_ok = shape.params.len() == opsig.params.len() || pad;
+        let args_ok = shape
+            .params
+            .iter()
+            .all(|t| matches!(t, ValType::I32 | ValType::I64));
+        let results_ok = matches!(
+            (opsig.results.as_slice(), shape.results.as_slice()),
+            ([], []) | ([ValType::I64], [] | [ValType::I64] | [ValType::I32])
+        );
+        if !(arity_ok && args_ok && results_ok) {
+            return Err(LengError::Unsupported(format!(
+                "POSIX leaf `{name}` (C `{c}`) is {} but `{opname}` is {} — a leaf whose ABI differs \
+                 from its op's needs an adapter (the NUL walk in POSIX_OPEN_ADAPTER), not a forward",
+                functype_text(&shape.params, &shape.results),
+                functype_text(&opsig.params, &opsig.results),
+            )));
+        }
+        let lead = if pad { vec![0] } else { Vec::new() };
+        fwds.push((name.clone(), shape.clone(), opname, opsig.clone(), lead));
+    }
+    // The guest libc's stdout: `write(buf, len)` is `write(1, buf, len)`.
+    if let Some((opname, opsig)) = op("write") {
+        let shape = temen_ir::FuncType {
+            params: vec![ValType::I64; 2],
+            results: vec![ValType::I64],
+        };
+        fwds.push(("write".into(), shape, opname, opsig.clone(), vec![1]));
+    }
+
+    let mut imports: Vec<(String, temen_ir::FuncType)> = Vec::new();
+    let mut text = String::new();
+    let mut funcs = String::new();
+    let mut exports = Vec::new();
+    for (i, (name, shape, opname, opsig, lead)) in fwds.iter().enumerate() {
+        let k = match imports.iter().position(|(n, _)| n == opname) {
+            Some(k) => k,
+            None => {
+                imports.push((opname.clone(), opsig.clone()));
+                imports.len() - 1
+            }
+        };
+        let params: Vec<String> = shape
+            .params
+            .iter()
+            .enumerate()
+            .map(|(j, t)| format!("v{j}: {}", valtype_text(*t)))
+            .collect();
+        funcs.push_str(&format!(
+            "func {} {{\nblock 0 ({}) {{\n",
+            functype_text(&shape.params, &shape.results),
+            params.join(", ")
+        ));
+        let mut next = shape.params.len();
+        let mut args = Vec::new();
+        for c in lead {
+            funcs.push_str(&format!("  v{next} = i64.const {c}\n"));
+            args.push(format!("v{next}"));
+            next += 1;
+        }
+        for (j, t) in shape.params.iter().enumerate() {
+            if *t == ValType::I32 {
+                funcs.push_str(&format!("  v{next} = i64.extend_i32_s v{j}\n"));
+                args.push(format!("v{next}"));
+                next += 1;
+            } else {
+                args.push(format!("v{j}"));
+            }
+        }
+        if opsig.results.is_empty() {
+            funcs.push_str(&format!(
+                "  call.import {k} ({})\n  return\n",
+                args.join(", ")
+            ));
+        } else {
+            let r = next;
+            funcs.push_str(&format!("  v{r} = call.import {k} ({})\n", args.join(", ")));
+            match shape.results.as_slice() {
+                [] => funcs.push_str("  return\n"),
+                [ValType::I32] => funcs.push_str(&format!(
+                    "  v{} = i32.wrap_i64 v{r}\n  return v{}\n",
+                    r + 1,
+                    r + 1
+                )),
+                _ => funcs.push_str(&format!("  return v{r}\n")),
+            }
+        }
+        funcs.push_str("  }\n}\n\n");
+        exports.push((name.clone(), i as u32));
+    }
+    for (k, (n, t)) in imports.iter().enumerate() {
+        text.push_str(&format!(
+            "import {k} \"{n}\" {}\n",
+            functype_text(&t.params, &t.results)
+        ));
+    }
+    text.push('\n');
+    text.push_str(&funcs);
+    let module = temen_text::parse_module(&text)
+        .map_err(|e| LengError::Malformed(format!("posix edge parse: {e:?}\n{text}")))?;
+    Ok(temen_ir::LinkUnit {
+        module,
+        exports,
+        ..Default::default()
+    })
+}
+
+/// Every import the POSIX runtime emits must be a personality op, spelled and shaped exactly as the
+/// personality publishes it — or served by another runtime unit (the mmap adapter's call into the
+/// shim's allocator). A drift here is a bind-time refusal in every consumer, root and `execve` alike,
+/// so it is caught while linking instead.
+fn check_personality_imports(
+    units: &[temen_ir::LinkUnit],
+    (px_names, px_sigs): PersonalityVtable,
+) -> Result<(), LengError> {
+    for u in units {
+        for imp in &u.module.imports {
+            if units
+                .iter()
+                .any(|v| v.exports.iter().any(|(e, _)| *e == imp.name))
+            {
+                continue;
+            }
+            let shape = import_sig(&u.module, imp);
+            let ok = px_names.iter().zip(px_sigs).any(|(n, t)| {
+                *n == imp.name && shape == Some((t.params.as_slice(), t.results.as_slice()))
+            });
+            if !ok {
+                return Err(LengError::Malformed(format!(
+                    "POSIX runtime import `{}` {:?} is not a personality op as published",
+                    imp.name, shape
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`POWERBOX_COMPUTE_SHIM`] as a link unit exporting `exports` (its func order is the table's).

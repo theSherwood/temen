@@ -223,6 +223,7 @@ typedef enum {
   ND_LABEL,     // Labeled statement
   ND_LABEL_VAL, // [GNU] Labels-as-values
   ND_FUNCALL,   // Function call
+  ND_PREVAL,    // codegen_ir: a call argument already evaluated (#1667); `val` = its SSA value, `lhs` = the original expression
   ND_EXPR_STMT, // Expression statement
   ND_STMT_EXPR, // Statement expression
   ND_VAR,       // Variable

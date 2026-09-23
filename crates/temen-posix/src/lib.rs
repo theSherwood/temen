@@ -1796,6 +1796,15 @@ impl Posix {
     }
 }
 
+/// A program's import of this personality **by its own name** — `__px_<op>`, exactly as
+/// [`cap_vtable`] publishes it — to the capability + op that serves it. This is the one spelling a
+/// program's POSIX imports take whatever compiled it (#1668): a chibicc command and a nimony program
+/// link against the same names, so the same lookup binds both at root, and the vtable binds both in an
+/// `execve`'d image. `None` for anything else, so binding fails closed.
+pub fn resolve_import(name: &str) -> Option<ResolvedCap> {
+    resolve(name.strip_prefix("__px_")?)
+}
+
 /// The §7 import-name policy for the POSIX subset: maps libc symbol names to the
 /// [`cap_id::HOST_PROC`] capability + op — the name vocabulary [`bind`] installs as slot bindings.
 /// Unknown names return `None`, so binding fails closed. Both bare (`"write"`) and `"posix."`-
@@ -5079,14 +5088,14 @@ impl Ctx<'_> {
         ) else {
             return Ok(vec![EFAULT]);
         };
-        // #801 exec ABI: `{argc:i32, envc:i32}` then the NUL-packed strings, argv first.
-        let mut blob = Vec::with_capacity(64);
-        blob.extend_from_slice(&(argv.len() as i32).to_le_bytes());
-        blob.extend_from_slice(&(envp.len() as i32).to_le_bytes());
-        for sv in argv.iter().chain(envp.iter()) {
-            blob.extend_from_slice(sv);
-            blob.push(0);
-        }
+        // #801 exec ABI: the powerbox args blob, from its one definition — what a chibicc crt and a
+        // nimony `_start` both parse (#1668: the latter is exec'd too now, so a second hand-packed
+        // copy of the layout here would be a second answer to "what does `_start` read?").
+        let blob = {
+            let a: Vec<&[u8]> = argv.iter().map(|v| v.as_slice()).collect();
+            let e: Vec<&[u8]> = envp.iter().map(|v| v.as_slice()).collect();
+            temen_ir::write_args_blob(&a, &e)
+        };
         let base = temen_ir::module_args_base();
         if base + blob.len() as u64 > temen_ir::module_args_end() {
             return Ok(vec![E2BIG]);
