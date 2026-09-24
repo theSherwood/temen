@@ -3974,7 +3974,10 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
 /// carried across an `execve` like theirs.
 fn px_import_sig(name: &str) -> Option<temen_ir::FuncType> {
     let (names, sigs) = temen_posix_abi::vtable();
-    names.iter().position(|n| n == name).map(|i| sigs[i].clone())
+    names
+        .iter()
+        .position(|n| n == name)
+        .map(|i| sigs[i].clone())
 }
 
 fn cap_import_name(name: &str) -> Option<&'static str> {
