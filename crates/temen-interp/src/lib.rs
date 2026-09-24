@@ -186,7 +186,7 @@ impl Reg {
 }
 
 /// Reasons execution stopped without producing results.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trap {
     /// Ran out of fuel (potential infinite loop) — see `run`.
     OutOfFuel,
@@ -244,6 +244,80 @@ impl Trap {
             Trap::FiberFault => "FiberFault",
             Trap::ThreadFault => "ThreadFault",
             Trap::Malformed => "Malformed",
+        }
+    }
+
+    /// The trap's stable numeric code: the JIT's trap-cell numbering (`TrapKind`, with `Exit` as
+    /// `7 | code << 32`), which is also what the snapshot codec writes for a trap that rides an
+    /// artifact (#1674). One numbering for both, so a trap crosses engines and artifacts unchanged.
+    pub fn code(self) -> i64 {
+        match self {
+            Trap::DivByZero => 1,
+            Trap::IntOverflow => 2,
+            Trap::BadConversion => 3,
+            Trap::Unreachable => 4,
+            Trap::IndirectCallType => 5,
+            Trap::CapFault => 6,
+            Trap::Exit(k) => 7 | ((k as u32 as i64) << 32),
+            Trap::MemoryFault => 8,
+            Trap::FiberFault => 9,
+            Trap::ThreadFault => 10,
+            Trap::OutOfFuel => 11,
+            Trap::Malformed => 12,
+            Trap::StackOverflow => 13,
+        }
+    }
+
+    /// The trap a [`Self::code`] names, if any.
+    pub fn from_code(c: i64) -> Option<Trap> {
+        Some(match c & 0xffff_ffff {
+            1 => Trap::DivByZero,
+            2 => Trap::IntOverflow,
+            3 => Trap::BadConversion,
+            4 => Trap::Unreachable,
+            5 => Trap::IndirectCallType,
+            6 => Trap::CapFault,
+            7 => Trap::Exit((c >> 32) as i32),
+            8 => Trap::MemoryFault,
+            9 => Trap::FiberFault,
+            10 => Trap::ThreadFault,
+            11 => Trap::OutOfFuel,
+            12 => Trap::Malformed,
+            13 => Trap::StackOverflow,
+            _ => return None,
+        })
+        .filter(|t| t.code() == c)
+    }
+}
+
+#[cfg(test)]
+mod trap_code_tests {
+    use super::Trap;
+
+    #[test]
+    fn every_trap_round_trips_through_its_code_and_nothing_else_decodes() {
+        let all = [
+            Trap::OutOfFuel,
+            Trap::DivByZero,
+            Trap::IntOverflow,
+            Trap::MemoryFault,
+            Trap::StackOverflow,
+            Trap::IndirectCallType,
+            Trap::Unreachable,
+            Trap::BadConversion,
+            Trap::CapFault,
+            Trap::Exit(0),
+            Trap::Exit(-2),
+            Trap::Exit(i32::MAX),
+            Trap::FiberFault,
+            Trap::ThreadFault,
+            Trap::Malformed,
+        ];
+        for t in all {
+            assert_eq!(Trap::from_code(t.code()), Some(t), "{t:?}");
+        }
+        for bad in [0, 14, 1 | (1 << 32), -1] {
+            assert_eq!(Trap::from_code(bad), None, "{bad:#x} is no trap's code");
         }
     }
 }
@@ -2599,7 +2673,7 @@ fn seed_domain(
                 s.results.insert(
                     cid,
                     Outcome {
-                        result: Ok(vec![Value::I64(r)]),
+                        result: r.map(|x| vec![Value::I64(x)]),
                         mem: None,
                         fuel,
                         trap_bt: Vec::new(),
@@ -2696,9 +2770,7 @@ fn seed_domain(
             let cstate = thaw_child_state
                 .iter()
                 .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
-            let want_as = cfuncs
-                .get(fnr.entry as usize)
-                .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
+            let arity = cfuncs.get(fnr.entry as usize).map_or(0, |f| f.params.len());
             let child_args = if let Some(cs) = cstate {
                 ch.restore_durable_handles(&cs.handles);
                 // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
@@ -2730,19 +2802,17 @@ fn seed_domain(
                         None => hg.self_module.clone(),
                     }
                 };
-                if want_as {
-                    vec![Value::I64(0), Value::I64(0)]
-                } else {
-                    vec![Value::I64(0)]
-                }
+                bytecode::child_entry_args(arity, 0, 0)
             } else {
                 let cinst = ch.grant_instantiator(0, csize);
-                if want_as {
-                    let cas = ch.grant_address_space(0, csize);
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                // A one-arg entry manages no pages of its own; a two-arg entry takes its
+                // AddressSpace, and a powerbox entry (#1720) binds its manifest's `vm_map` to it.
+                let cas = if arity == 1 {
+                    0
                 } else {
-                    vec![Value::I64(cinst as i64)]
-                }
+                    ch.grant_address_space(0, csize)
+                };
+                bytecode::child_entry_args(arity, cinst, cas)
             };
             let cid = claim(s, fnr.task);
             live_ids.insert(fnr.task as TaskId, cid);
@@ -2845,7 +2915,7 @@ fn seed_domain(
                 s.results.insert(
                     cid,
                     Outcome {
-                        result: Ok(vec![Value::I64(fd.completed_result)]),
+                        result: fd.completed_result.map(|x| vec![Value::I64(x)]),
                         mem: None,
                         fuel,
                         trap_bt: Vec::new(),
@@ -2941,14 +3011,10 @@ fn relaunch_detached(
     sched.wire_signal_doors(&child_host);
     // Entry args are inert under a rewind (the prologue reloads spilled values), so pass zero
     // placeholders of the entry's shape, as the nested re-attach does.
-    let want_as = funcs
+    let arity = funcs
         .get(launch.entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let args = if want_as {
-        vec![Value::I64(0), Value::I64(0)]
-    } else {
-        vec![Value::I64(0)]
-    };
+        .map_or(0, |f| f.params.len());
+    let args = bytecode::child_entry_args(arity, 0, 0);
     let cid = s.next_task;
     s.next_task += 1;
     s.live += 1;
@@ -6845,7 +6911,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     if s.dead.contains_key(&key) {
         return; // already down (a second member's trap raced the sweep)
     }
-    s.dead.insert(key, reason.clone());
+    s.dead.insert(key, *reason);
     // I40: any orphaned reply destined *for* this domain (as a callee) will never arrive now —
     // its handler is being torn down — so its recorded orphan entry can never be consumed. Drop it.
     s.orphan_tickets.retain(|(callee, _)| *callee != key);
@@ -6905,7 +6971,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     s.admit_waiters.retain(|_, q| !q.is_empty());
     let mut tickets: Vec<u64> = Vec::new();
     for v in victims {
-        tickets.extend(reap(s, v, reason.clone()));
+        tickets.extend(reap(s, v, *reason));
     }
     // The dying domain's *queued* (never-admitted) dispatches: their callers wake too.
     tickets.extend(
@@ -7307,14 +7373,11 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
                 }
                 let nested = seat.nested_children.iter().any(|c| c.slot == slot);
                 live_nested |= nested;
-                match s.results.get(&cid) {
-                    Some(o) if o.result.is_err() => {
-                        return declined(DeclineCause::ChildTrapped, seat.id, Some(slot));
-                    }
-                    None if !nested && !seat.child_freeze.contains_key(&slot) => {
-                        return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
-                    }
-                    _ => {}
+                if !nested
+                    && !s.results.contains_key(&cid)
+                    && !seat.child_freeze.contains_key(&slot)
+                {
+                    return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
                 }
             }
             if live_nested && live_thread {
@@ -7675,23 +7738,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
                         // child may record its own live children (grandchildren), tagged with this
                         // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
-                        let mut refuse = false;
                         for c in &live {
                             let cid = v.threads[c.slot].expect("filtered to Some");
                             let completed_result = if v.sched.has_result(cid) {
-                                // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
-                                // a completed-with-trap child is not yet representable — fail closed.
-                                match v.sched.take_result(cid).map(|o| o.result) {
-                                    Some(Ok(vals)) => Some(match vals.first() {
-                                        Some(Value::I64(x)) => *x,
-                                        Some(Value::I32(x)) => *x as i64,
-                                        _ => 0,
-                                    }),
-                                    _ => {
-                                        refuse = true;
-                                        break;
-                                    }
-                                }
+                                // Take the finished child's join outcome — its value, or its trap
+                                // (#1674) — which rides the artifact for the rewound `join`.
+                                v.sched.take_result(cid).map(|o| join_outcome(o.result))
                             } else {
                                 // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
                                 if let Some(m) = v.mem.as_mut() {
@@ -7719,7 +7771,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 completed_result,
                             });
                         }
-                        refuse
+                        false
                     }
                 };
                 // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
@@ -7787,8 +7839,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // `completed_result` — its result is taken from the scheduler and its separate window
                 // need not ride (reload-not-reissue on thaw, exactly like a completed nested child).
                 // A **still-running** one is rung (step 3) and captured by the harvest (step 4). A
-                // completed-**trapped** one is not representable yet (#1674; the freeze census
-                // declines it at the trigger, #1671).
+                // completed-**trapped** one rides its trap the same way (#1674).
                 let detached_live_refused = froze && {
                     let detached: Vec<usize> = v
                         .child_hosts
@@ -7802,29 +7853,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let mut refuse = false;
                     for slot in detached {
                         let cid = v.threads[slot].expect("filtered to Some");
-                        if v.sched.has_result(cid) {
-                            match v.sched.take_result(cid).map(|o| o.result) {
-                                Some(Ok(vals)) => {
-                                    let r = match vals.first() {
-                                        Some(Value::I64(x)) => *x,
-                                        Some(Value::I32(x)) => *x as i64,
-                                        _ => 0,
-                                    };
-                                    let sink = v
-                                        .freeze_sink
-                                        .clone()
-                                        .unwrap_or_else(|| Arc::clone(&v.host));
-                                    sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
-                                        parent_task: v.id as usize,
-                                        slot,
-                                        completed_result: r,
-                                    });
-                                }
-                                _ => {
-                                    refuse = true; // completed-with-trap: not representable yet
-                                    break;
-                                }
-                            }
+                        if let Some(o) = v.sched.take_result(cid) {
+                            let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                            sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
+                                parent_task: v.id as usize,
+                                slot,
+                                completed_result: join_outcome(o.result),
+                            });
                         } else {
                             // #1361 step 3 — **still running**: ring the freeze doorbell and record
                             // the child for harvest. We do not wait for it: this vCPU is itself
@@ -7990,7 +8025,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         if !matches!(trap, Trap::Exit(_)) {
                             s.twin_traps.push(TwinTrap {
                                 task: id,
-                                trap: trap.clone(),
+                                trap: *trap,
                                 backtrace: outcome.trap_bt.clone(),
                                 fault: outcome.trap_fault,
                             });
@@ -8044,7 +8079,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // completes vCPUs early on purpose.)
                 if !froze && outcome.result.is_ok() {
                     if let Some(t) = s.dead.get(&key) {
-                        outcome.result = Err(t.clone());
+                        outcome.result = Err(*t);
                     }
                 }
                 let died: Option<Trap> = outcome.result.as_ref().err().cloned();
@@ -8889,7 +8924,7 @@ impl DetState {
 /// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
     let outcome = Outcome {
-        result: Err(reason.clone()),
+        result: Err(*reason),
         mem: v.mem.take(),
         fuel: v.fuel,
         trap_bt: Vec::new(), // the origin's own Done recorded the true backtrace
@@ -9831,13 +9866,13 @@ pub struct FrozenNested {
     /// modules (host-supplied at restore, D-scope — the module bytes never ride the artifact). A
     /// missing / mismatched re-grant makes the thaw fail closed (per-child R5 identity gate).
     pub module_digest: Option<[u8; 32]>,
-    /// `Some(result)` for a **completed-but-unjoined** child — one that finished before the freeze
-    /// point, so its `thread.join` result must survive in the artifact (its continuation is gone; the
-    /// scheduler result cell isn't captured). The thaw delivers this straight into the parent's join
-    /// table **without re-running** the child (reload-not-reissue — no double side effects); its carve
-    /// gets no `UNWINDING` broadcast (nothing to unwind). `None` for a still-running child (re-attached
-    /// + rewound on thaw). Mirrors [`FrozenVCpu::completed_result`] for `thread.spawn` children.
-    pub completed_result: Option<i64>,
+    /// `Some(outcome)` for a **completed-but-unjoined** child — one that finished before the freeze
+    /// point, so its `thread.join` outcome must survive in the artifact (its continuation is gone; the
+    /// scheduler result cell isn't captured): its value, or the trap its `join` re-raises (#1674).
+    /// The thaw delivers this straight into the parent's join table **without re-running** the child
+    /// (reload-not-reissue — no double side effects); its carve gets no `UNWINDING` broadcast (nothing
+    /// to unwind). `None` for a still-running child (re-attached + rewound on thaw).
+    pub completed_result: Option<Result<i64, Trap>>,
 }
 
 /// #1361 step 2 — a **completed-but-unjoined detached §14 child** captured at a subtree freeze. A
@@ -9857,8 +9892,19 @@ pub struct FrozenDetached {
     pub parent_task: usize,
     /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
     pub slot: usize,
-    /// The child's clean `thread.join` result (an `i64`; an `i32` result is sign-extended at capture).
-    pub completed_result: i64,
+    /// The child's `thread.join` outcome: its value (an `i32` result is sign-extended at capture), or
+    /// the trap its `join` re-raises (#1674).
+    pub completed_result: Result<i64, Trap>,
+}
+
+/// A finished child's `thread.join` outcome as a freeze records it: its first result as an `i64` (an
+/// `i32` sign-extended), or its trap.
+fn join_outcome(r: Result<Vec<Value>, Trap>) -> Result<i64, Trap> {
+    r.map(|vals| match vals.first() {
+        Some(Value::I64(x)) => *x,
+        Some(Value::I32(x)) => *x as i64,
+        _ => 0,
+    })
 }
 
 /// #1361 step 3 — a **live** detached §14 child the freeze rang the doorbell for, recorded while the
@@ -11724,18 +11770,9 @@ fn build_exec_req(
     // exec closed, before we mutate anything.
     let grants: Option<Vec<(String, i32)>> = (|| {
         let m = mem.as_ref()?;
-        let mut list = Vec::new();
-        for i in 0..grants_n {
-            let rec = m.read_window(grants_ptr + i * 16, 16).ok()?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name_bytes = m.read_window(name_off, name_len).ok()?;
-            let name = String::from_utf8(name_bytes).ok()?;
-            host.lock_unpoisoned().can_regrant(handle).then_some(())?;
-            list.push((name, handle));
-        }
-        Some(list)
+        let list = read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).ok()?;
+        let hg = host.lock_unpoisoned();
+        list.iter().all(|(_, h)| hg.can_regrant(*h)).then_some(list)
     })();
     // Admissibility: a resolvable non-durable command whose declared window **fits the
     // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
@@ -11747,8 +11784,6 @@ fn build_exec_req(
     // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
     // fully-regrantable grant list are also required. Anything else is a probeable
     // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
-    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
-    // (Instantiator).
     // The real capacity bound is the caller's **backed prefix**
     // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
     // runs the command in the caller's window, and pages beyond the backed prefix
@@ -11761,20 +11796,13 @@ fn build_exec_req(
     let win_log2 = win_bytes
         .is_power_of_two()
         .then(|| win_bytes.trailing_zeros() as u8);
-    // #1668 — a command enters one of two ways, and both get the same powerbox: the chibicc
-    // `--child-entry` ABI takes its starter caps as arguments, and a powerbox `_start` — how every
-    // nimony program enters — takes none and finds what it needs by name, reading its argv from the
-    // args region the exec already wrote. Admitting only the first meant no nim program could be
-    // exec'd at all: `sh -c "bin/nifler …"` reached nifler and was refused `-EINVAL` here.
+    // #1668 / #1720 — a command enters any way a §14 child may (`bytecode::child_entry_ok`, the one
+    // rule): the chibicc `--child-entry` ABI takes its starter caps as arguments, and a powerbox
+    // `_start` — how every nimony program enters — takes none and finds what it needs by name, reading
+    // its argv from the args region the exec already wrote.
     let entry_params = cmod.as_ref().and_then(|cm| {
         let f = cm.funcs.get(entry as usize)?;
-        if bytecode::child_entry_ok(&f.params, &f.results) {
-            Some(f.params.len())
-        } else if entry == 0 && temen_ir::is_named_powerbox_entry(&cm.module) {
-            Some(0)
-        } else {
-            None
-        }
+        bytecode::child_entry_ok(&f.params, &f.results).then_some(f.params.len())
     });
     let admissible = !durable
         && clean_root
@@ -11813,11 +11841,7 @@ fn build_exec_req(
     match built {
         Some((ch, cinst, cas, child_size)) => {
             let cm = cmod.expect("built");
-            let entry_args = match entry_params {
-                Some(0) => Vec::new(),
-                Some(2) => vec![Value::I64(cinst as i64), Value::I64(cas as i64)],
-                _ => vec![Value::I64(cinst as i64)],
-            };
+            let entry_args = bytecode::child_entry_args(entry_params.unwrap_or(1), cinst, cas);
             // FORK.md §8.6 — the old powerbox is about to be dropped by the image
             // -replace: release its pipe write *and* read ends (the fork-inherited ones
             // this exec did not carry into the new image) and wake any pipe that thereby
@@ -13213,37 +13237,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             }
                             let grants_ptr = sr.grants_ptr;
                             let grants_n = sr.grants_n;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    match serve_live_export(handle) {
-                                        // #744 — a live self-serve grant names one of OUR impl-exports,
-                                        // not a table handle: validate the export exists (its shape
-                                        // resolves). (A tagged value is negative, so `can_regrant`
-                                        // would refuse it as a non-grant — that is the fail-closed
-                                        // path every *other* record reader takes, unchanged.)
-                                        Some(k) => {
-                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
-                                        }
-                                        None => {
-                                            hg.can_regrant(handle)
-                                                .then_some(())
-                                                .ok_or(Trap::CapFault)?;
-                                        }
-                                    }
-                                }
-                                list.push((name, handle));
-                            }
+                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
+                                m.read_window(o, l)
+                            })?;
+                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
                             if pager != u32::MAX {
                                 let hg = host.lock_unpoisoned();
                                 // A missing/empty pager export fails the spawn closed (§3.3).
@@ -13312,37 +13309,10 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 get_i64(&frames[top].vals, *args.get(2).ok_or(Trap::Malformed)?)?
                                     as u64;
                             let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    match serve_live_export(handle) {
-                                        // #744 — a live self-serve grant names one of OUR impl-exports,
-                                        // not a table handle: validate the export exists (its shape
-                                        // resolves). (A tagged value is negative, so `can_regrant`
-                                        // would refuse it as a non-grant — that is the fail-closed
-                                        // path every *other* record reader takes, unchanged.)
-                                        Some(k) => {
-                                            hg.offer_shape(k).ok_or(Trap::CapFault)?;
-                                        }
-                                        None => {
-                                            hg.can_regrant(handle)
-                                                .then_some(())
-                                                .ok_or(Trap::CapFault)?;
-                                        }
-                                    }
-                                }
-                                list.push((name, handle));
-                            }
+                            let list = read_grant_records(grants_ptr, grants_n, |o, l| {
+                                m.read_window(o, l)
+                            })?;
+                            authorize_eval_grants(&host.lock_unpoisoned(), &list)?;
                             (0, Some(g), 3, list)
                         }
                         o => (o, None, 0, Vec::new()),
@@ -13370,8 +13340,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // `AddressSpace`. A missing/mistyped entry is rejected, not run. (The
                             // op-8 positional 3-arg grant form died with §3d — a child discovers
                             // re-granted caps by name, via the record's grant list.)
-                            let want_as =
-                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
+                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
@@ -13651,10 +13620,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // §3.6 slice 3: keep a live reference past the move into
                                     // the child vCPU, for `child_offer` (op 14).
                                     let child_host_keep = Arc::clone(&child_host);
-                                    let mut child_args = vec![Value::I64(cinst as i64)];
-                                    if want_as {
-                                        child_args.push(Value::I64(cas as i64));
-                                    }
+                                    let child_args = bytecode::child_entry_args(arity, cinst, cas);
                                     // Quota: the child's fuel, sub-allocated from (and capped
                                     // by) ours. §3b: a budget-funded spawn draws fuel from the
                                     // budget instead (bounded 0 = literally zero fuel — distinct
@@ -14010,27 +13976,23 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 }
                             };
                             // Named grants (the op-11 record format), pre-validated fail-closed.
-                            let mut glist: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let m = mem.as_ref().ok_or(Trap::Malformed)?;
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                {
-                                    let hg = host.lock_unpoisoned();
-                                    hg.can_regrant(gh).then_some(()).ok_or(Trap::CapFault)?;
+                            let glist = match grants_n {
+                                0 => Vec::new(),
+                                _ => {
+                                    let m = mem.as_ref().ok_or(Trap::Malformed)?;
+                                    read_grant_records(grants_ptr, grants_n, |o, l| {
+                                        m.read_window(o, l)
+                                    })?
                                 }
-                                glist.push((name, gh));
+                            };
+                            {
+                                let hg = host.lock_unpoisoned();
+                                if !glist.iter().all(|(_, h)| hg.can_regrant(*h)) {
+                                    return Err(Trap::CapFault);
+                                }
                             }
                             let cfs: &[Func] = &cm.funcs;
-                            let want_as =
-                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
+                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
@@ -14152,10 +14114,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         rs.wire_signal_doors(&child_host);
                                     }
                                     let child_host_keep = Arc::clone(&child_host);
-                                    let mut child_args = vec![Value::I64(cinst as i64)];
-                                    if want_as {
-                                        child_args.push(Value::I64(cas as i64));
-                                    }
+                                    let child_args = bytecode::child_entry_args(arity, cinst, cas);
                                     // §3b: budget-funded spawn — same consumption as the
                                     // same-module branch above.
                                     let rec_b = rec_budget_h.take().and_then(|bh| {
@@ -18804,9 +18763,6 @@ pub enum JitRestoreError {
 /// it did not begin it. See [`FreezeDeclined`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeclineCause {
-    /// A §14 child completed with a trap and has not been joined; a trap cannot ride the artifact
-    /// yet (#1674).
-    ChildTrapped,
     /// A child domain holds a handle no artifact can carry (§12.5). The root's own handles are the
     /// codec's to answer ([`Host::capture_durable_handles`]), since its embedder can still drain them.
     NonDurableHandle(NonDurableHandle),
@@ -19739,6 +19695,49 @@ pub const CAP_SELF_PIPE: u32 = 16;
 /// went to `reap` first, so `fuel.remaining` takes 13.
 pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 
+/// **The §14 by-name grant list parser** — the one reader of every spawn's grant records (#1736):
+/// `grants_n` records of 16 bytes `{name_off: u32, name_len: u32, handle: i32, flags: u32}` at
+/// window-relative `grants_ptr`, each naming a window-relative UTF-8 string. `read(off, len)` is the
+/// caller's bounded window read. `flags` is reserved and ignored (see [`GRANT_SERVE_LIVE_TAG`] for
+/// why), and `handle` is returned as written — tag decoding and the authority check are the caller's
+/// policy, applied to the whole list after it parses.
+///
+/// A record or name outside the window is `MemoryFault`, a non-UTF-8 name `CapFault`. `grants_n` is
+/// untrusted, so nothing is sized from it: the list grows one record at a time and the first
+/// out-of-window record ends it.
+pub fn read_grant_records(
+    grants_ptr: u64,
+    grants_n: u64,
+    read: impl Fn(u64, usize) -> Result<Vec<u8>, Trap>,
+) -> Result<Vec<(String, i32)>, Trap> {
+    let mut list = Vec::new();
+    for i in 0..grants_n {
+        let off = i
+            .checked_mul(16)
+            .and_then(|d| grants_ptr.checked_add(d))
+            .ok_or(Trap::MemoryFault)?;
+        let rec = read(off, 16)?;
+        let word = |at: usize| [rec[at], rec[at + 1], rec[at + 2], rec[at + 3]];
+        let name_off = u32::from_le_bytes(word(0)) as u64;
+        let name_len = u32::from_le_bytes(word(4)) as usize;
+        let handle = i32::from_le_bytes(word(8));
+        let name = String::from_utf8(read(name_off, name_len)?).map_err(|_| Trap::CapFault)?;
+        list.push((name, handle));
+    }
+    Ok(list)
+}
+
+/// [`read_grant_records`]' `read` over a window held as a byte slice: `[off, off+len)`, or
+/// `MemoryFault` when any of it falls outside.
+pub fn read_slice(window: &[u8], off: u64, len: usize) -> Result<Vec<u8>, Trap> {
+    let start = usize::try_from(off).map_err(|_| Trap::MemoryFault)?;
+    let end = start.checked_add(len).ok_or(Trap::MemoryFault)?;
+    window
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or(Trap::MemoryFault)
+}
+
 /// #744 (EXEC.md row 4) — the **live self-serve grant** tag on a §14 named-grant record's `handle`
 /// field. A grant record whose `handle`, read as `u32`, has its top two bits `10` (this tag set,
 /// bit 30 clear) is not a table handle at all: it names the *granter's own impl-export*
@@ -19760,6 +19759,23 @@ pub const CAP_SELF_FUEL_REMAINING: u32 = 13;
 /// builders) sees a negative handle and refuses it fail-closed through the unchanged `can_regrant` —
 /// no new code there. Non-durable (`callee_slot: None` — freeze refuses), the deferred durability story.
 pub const GRANT_SERVE_LIVE_TAG: u32 = 0x8000_0000;
+
+/// The eval-loop spawn arms' authority check over a parsed grant list (ops 13 and 17): each handle is
+/// a re-grantable table handle, or — #744 — a live self-serve grant naming one of the granter's own
+/// impl-exports, which must exist. (A tagged value is negative, so `can_regrant` would refuse it as a
+/// non-grant: the fail-closed path every *other* record reader takes, unchanged.)
+fn authorize_eval_grants(host: &Host, list: &[(String, i32)]) -> Result<(), Trap> {
+    for (_, handle) in list {
+        let ok = match serve_live_export(*handle) {
+            Some(k) => host.offer_shape(k).is_some(),
+            None => host.can_regrant(*handle),
+        };
+        if !ok {
+            return Err(Trap::CapFault);
+        }
+    }
+    Ok(())
+}
 
 /// #744 — decode a named-grant `handle`: `Some(export)` when it carries [`GRANT_SERVE_LIVE_TAG`] (top
 /// two bits `10`), else `None` (an ordinary table handle, or an `-errno`-range negative that stays a
@@ -26353,29 +26369,11 @@ impl Host {
         grants_n: u64,
         child_size: u64,
     ) -> Result<(Host, i32, i32), GrantMarshalError> {
-        // Bounded read of `[off, off+len)` within the window slice, or `None` (out of window).
-        let read = |off: u64, len: u64| -> Option<&[u8]> {
-            let end = off.checked_add(len)?;
-            window.get(usize::try_from(off).ok()?..usize::try_from(end).ok()?)
-        };
-        // Do NOT pre-size on `grants_n` — it is untrusted (a huge value would abort on the allocation
-        // before any bounds check). Records are 16 bytes each and must fit the window, so the loop bails
-        // at the first out-of-window record; the Vec grows to at most `window.len() / 16` entries.
-        let mut grants: Vec<(String, i32)> = Vec::new();
-        for i in 0..grants_n {
-            let rec_off = i
-                .checked_mul(16)
-                .and_then(|d| grants_ptr.checked_add(d))
-                .ok_or(GrantMarshalError::OutOfWindow)?;
-            let rec = read(rec_off, 16).ok_or(GrantMarshalError::OutOfWindow)?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name_bytes = read(name_off, name_len).ok_or(GrantMarshalError::OutOfWindow)?;
-            let name =
-                String::from_utf8(name_bytes.to_vec()).map_err(|_| GrantMarshalError::BadName)?;
-            grants.push((name, handle));
-        }
+        let grants = read_grant_records(grants_ptr, grants_n, |o, l| read_slice(window, o, l))
+            .map_err(|t| match t {
+                Trap::CapFault => GrantMarshalError::BadName,
+                _ => GrantMarshalError::OutOfWindow,
+            })?;
         self.spawn_named_child(&grants, child_size)
             .ok_or(GrantMarshalError::NotRegrantable)
     }

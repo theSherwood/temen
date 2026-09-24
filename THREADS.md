@@ -319,9 +319,19 @@ property, so in practice:
   import bindings), so a `.temen` off the on-ramp toolchain whose runtime spawns threads runs them on
   real Workers. Its root takes no args (the manifest `_start`) and reserves exactly the window, as
   children do; an `exit` from any vCPU ends the run. Proven: `browser/tests/par_onramp.rs` (real OS
-  threads, against the cooperative `onramp_exec`) and the `#capio` item in Chromium. **Not yet for
-  fiber runtimes:** each `Vcpu` keeps its own fiber registry, so a fiber can't migrate between
-  Workers (#1761), and JACL's pool needs that.
+  threads, against the cooperative `onramp_exec`) and the `#capio` item in Chromium. **Fiber
+  runtimes too (#1761):** a run's vCPUs share one fiber registry (`bytecode::SharedFibers`, owned by
+  the run's `VcpuProgram` and attached to the root and every `thread.spawn` child), so a fiber
+  created on one Worker resumes on another — the D57 claim protocol, locked per fiber transition
+  only. `vcpu.tls` is the executing vCPU's word (a migrated fiber reads its new vCPU's), and each
+  child is seeded with its dense id in spawn order (`PAR_SPAWN`'s `ev_d` → `temen_par_child`). The
+  native parallel driver (`drive_parallel`) shares the registry the same way. A JACL card built
+  with 4 pool workers runs on it at ~3.7× its 1-worker build (native OS-thread harness, 4 cores). A
+  member's trap or `exit` ends its **domain** on both thread-per-vCPU drivers too (DESIGN.md §12 / I37,
+  the cooperative `teardown_domains` rule): a spawned thread's trap becomes the run's result instead of
+  waiting on a `thread.join` that may never come. Natively each domain (`ParDomain`) records its first
+  trap and its members die at their next safepoint (a 1M-op quantum, or a futex wait / join the kill
+  wakes); on Workers a root-domain vCPU's trap ends the run. A §14 confined child stays its own domain.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
   interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
   editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/

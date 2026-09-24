@@ -476,6 +476,9 @@ pub(crate) fn drive_op13<'p>(
                 children.push(Some(r));
                 vcpu.deliver_handle(handle);
             }
+            // A handle this driver never delivered (a refused spawn's `-errno`, or a forged value), or
+            // one already joined, traps by the oracle's child-table rule — never an out-of-bounds host
+            // panic, and the same answer the op13jit driver gives.
             bytecode::VcpuEvent::Join { handle } => {
                 vcpu.deliver_join(temen_interp::take_child(&mut children, handle).and_then(|r| r));
             }

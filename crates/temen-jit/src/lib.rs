@@ -502,9 +502,10 @@ pub struct FrozenNested {
     pub size_log2: u8,
     /// The child's entry function index into the parent's own table (same-module).
     pub entry: u32,
-    /// `Some(result)` for a child that finished before the freeze but was not yet joined: the thaw
-    /// hands it to the parent's rewound `join` without re-running the child (#1692).
-    pub completed_result: Option<i64>,
+    /// `Some(outcome)` for a child that finished before the freeze but was not yet joined: its value,
+    /// or its trap-cell code (#1674). The thaw hands it to the parent's rewound `join` without
+    /// re-running the child (#1692).
+    pub completed_result: Option<Result<i64, i64>>,
 }
 
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
@@ -4022,7 +4023,8 @@ impl CompiledModule {
                 roots.sort_by_key(|s| s.slot);
                 for rec in roots {
                     if let Some(r) = rec.completed_result {
-                        n.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                        // Finished before the cut (#1692), with a value or a trap (#1674).
+                        n.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
                         continue;
                     }
                     let my_task = rec.task;
@@ -4235,17 +4237,7 @@ impl CompiledModule {
             // `FrozenNested` residue into the run's `Nursery`; drain it now that the root has unwound,
             // read back by the durable-nested entry point.
             if let Some(n) = &(*this)._nursery {
-                if !n.freeze_unjoined() {
-                    // A §14 child finished with a trap before the freeze: fail closed (#1692).
-                    (*(trap_cell.as_ptr() as *const AtomicI64))
-                        .compare_exchange(
-                            0,
-                            TrapKind::ThreadFault as i64,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .ok();
-                }
+                n.freeze_unjoined();
                 (*this).frozen_nested_out = n.take_frozen_nested();
                 // #1361 step 4 — and reach its detached children, which own windows the freeze word
                 // above is not in: ring each one's own; they unwind and are harvested at teardown.
@@ -5111,7 +5103,8 @@ pub(crate) unsafe fn compile_child_and_run(
             gkids.sort_by_key(|s| s.slot);
             for rec in gkids {
                 if let Some(r) = rec.completed_result {
-                    cn.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                    // Finished before the cut (#1692), with a value or a trap (#1674).
+                    cn.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
                     continue;
                 }
                 let gc_task = rec.task;
@@ -5186,14 +5179,13 @@ pub(crate) unsafe fn compile_child_and_run(
     // it from the carve's state word before the copy-back carries the carve into the parent window.
     // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
     // A child that trapped did not unwind, even under a freeze: it finished, with that trap.
-    let mut unwound =
+    let unwound =
         durable && !faulted && trap_cell == 0 && fiber_rt::window_is_unwinding(child_base as u64);
-    // Its own unjoined children ride too (depth-2+). One that finished with a trap fails this child:
-    // reported as finished with `ThreadFault`, not as unwound, so its parent refuses in turn, up to
-    // the root.
-    if unwound && child_nursery.as_ref().is_some_and(|n| !n.freeze_unjoined()) {
-        trap_cell = TrapKind::ThreadFault as i64;
-        unwound = false;
+    // Its own unjoined children ride too (depth-2+).
+    if unwound {
+        if let Some(n) = &child_nursery {
+            n.freeze_unjoined();
+        }
     }
     child_window.restore_rw();
     {
@@ -6575,7 +6567,14 @@ fn build_trampoline(
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
         for (i, r) in rets.iter().enumerate() {
-            let slot = encode_slot(&mut b, *r);
+            // A result slot holds what the interpreter's `Reg` would (#1720): an `i32` sign-extends,
+            // so a §14 child's `_start` status reaches its joiner identically on every tier. Every
+            // other reader decodes the slot by the declared type, where the extension is invisible.
+            let slot = if b.func.dfg.value_type(*r) == I32 {
+                b.ins().sextend(I64, *r)
+            } else {
+                encode_slot(&mut b, *r)
+            };
             b.ins()
                 .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
         }
@@ -9049,12 +9048,13 @@ fn lower_instantiator(
             vals.push(r);
         }
         1 => {
-            // join(nursery, child_handle:i32, trap_out:i64) -> result:i64. The call.cap's handle
-            // operand (the Instantiator) is unused here — the child handle is the first arg, and the
-            // nursery owns the child table for this run.
+            // join(nursery, mem_base, instantiator:i32, child_handle:i32, trap_out:i64) -> result:i64.
+            // The nursery owns the child table for this run; the thunk still resolves the call.cap's
+            // `Instantiator` first, as the oracle does for every op (#1729).
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64] {
+            for t in [I64, I64, I32, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I64));
@@ -9062,18 +9062,18 @@ fn lower_instantiator(
             let thunk = b.ins().iconst(I64, lower.inst.join_thunk);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
         }
         9 | 10 | 12 => {
-            // S3 lifecycle: poll / detach / kill (nursery, child:i32, trap_out:i64) -> status:i32.
-            // The call.cap's handle operand (the Instantiator) is unused — the child handle is arg 0,
-            // and the nursery owns the child table (as for `join`).
+            // S3 lifecycle: poll / detach / kill (nursery, mem_base, instantiator:i32, child:i32,
+            // trap_out:i64) -> status:i32 — resolved and dispatched as `join` is.
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64] {
+            for t in [I64, I64, I32, I32, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
@@ -9086,7 +9086,7 @@ fn lower_instantiator(
             let thunk = b.ins().iconst(I64, thunk_addr);
             let call = b
                 .ins()
-                .call_indirect(tref, thunk, &[nursery, child, trap_out]);
+                .call_indirect(tref, thunk, &[nursery, mem_base, h, child, trap_out]);
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);
@@ -9128,22 +9128,26 @@ fn lower_instantiator(
             vals.push(r);
         }
         14 => {
-            // CALLS.md 5c.0 child_offer(nursery, child:i32, export:i64, trap_out) -> handle:i32.
-            // Mint a live-callee offer over a granted child's nursery-retained shared powerbox;
-            // every miss is the probeable -EINVAL (the interp op-14 arm, errno-for-errno). No
-            // window args — the mint reads no guest memory.
+            // CALLS.md 5c.0 child_offer(nursery, mem_base, instantiator:i32, child:i32, export:i64,
+            // trap_out) -> handle:i32. Mint a live-callee offer over a granted child's
+            // nursery-retained shared powerbox; every miss is the probeable -EINVAL (the interp op-14
+            // arm, errno-for-errno). A forged `Instantiator` is the `CapFault` every op gives (#1729);
+            // `mem_base` is only for that resolve — the mint reads no guest memory.
+            let h = slot_i32(b, get(vals, handle)?);
             let child = slot_i32(b, get(vals, *args.first().ok_or(JitError::Malformed)?)?);
             let export = slot_i64(b, get(vals, *args.get(1).ok_or(JitError::Malformed)?)?);
             let mut tsig = module.make_signature();
-            for t in [I64, I32, I64, I64] {
+            for t in [I64, I64, I32, I32, I64, I64] {
                 tsig.params.push(AbiParam::new(t));
             }
             tsig.returns.push(AbiParam::new(I32));
             let tref = b.import_signature(tsig);
             let thunk = b.ins().iconst(I64, lower.inst.child_offer_thunk);
-            let call = b
-                .ins()
-                .call_indirect(tref, thunk, &[nursery, child, export, trap_out]);
+            let call = b.ins().call_indirect(
+                tref,
+                thunk,
+                &[nursery, mem_base, h, child, export, trap_out],
+            );
             emit_trap_propagate(b, lower);
             let r = result_as(b, b.inst_results(call)[0], sig.results[0]);
             vals.push(r);

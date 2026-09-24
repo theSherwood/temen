@@ -108,8 +108,9 @@ fn a_live_detached_child_without_a_doorbell_declines() {
     );
 }
 
+/// #1674: a trap now rides the artifact, so a child that finished with one is no reason to decline.
 #[test]
-fn a_detached_child_that_completed_with_a_trap_declines() {
+fn a_detached_child_that_completed_with_a_trap_does_not_decline() {
     let f = Fixture::new().with_detached_child(true);
     if let SchedRef::Real(rs) = &f.sched {
         rs.lock().results.insert(
@@ -124,7 +125,7 @@ fn a_detached_child_that_completed_with_a_trap_declines() {
             },
         );
     }
-    assert_eq!(f.census(&f.root_seat()), Some(DeclineCause::ChildTrapped));
+    assert_eq!(f.census(&f.root_seat()), None);
 }
 
 #[test]

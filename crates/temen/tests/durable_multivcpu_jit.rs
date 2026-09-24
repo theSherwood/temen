@@ -1278,7 +1278,7 @@ fn the_embedder_jit_path_refuses_residue_it_cannot_recreate_and_keeps_it() {
     let detached = temen_interp::FrozenDetached {
         parent_task: 0,
         slot: 0,
-        completed_result: 7,
+        completed_result: Ok(7),
     };
     h.set_frozen_detached(vec![detached]);
     let r = temen_run::jit_cap_run(

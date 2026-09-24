@@ -60,7 +60,7 @@ use temen_interp::{
     Attestation, BudgetState, BudgetThawRefused, CapturedDetached, CapturedProt, DetachedLaunch,
     DurableBinding, DurableHandle, DurableJitTable, DurableJitUnit, DurableNamedCap, FreezeScope,
     FrozenChildState, FrozenDetached, FrozenFiber, FrozenNested, FrozenVCpu, Host, MemLayout,
-    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached,
+    NonDurableHandle, ShadowArena, StreamRole, SvcDispatch, ThawedDetached, Trap,
 };
 use temen_ir::Module;
 
@@ -218,7 +218,11 @@ use temen_ir::Module;
 /// v30 (#1687): each nested-child record carries the child's own frozen **`task`** after its
 /// `parent_task`, so a thaw resolves every `parent_task` through a `freeze id → thaw id` map instead of
 /// assuming it re-derives the freeze's ids.
-const FORMAT_VERSION: u16 = 30;
+/// v31 (#1674): a completed-but-unjoined child's join outcome is `0` none | `1` + value | `2` + the
+/// trap's code ([`Trap::code`]), so a child that finished with a trap rides the artifact and the
+/// thawed `join` re-raises it. A nested record's `0 | 1 + value` is unchanged; a detached record's
+/// bare value gains the tag.
+const FORMAT_VERSION: u16 = 31;
 /// Window-image page granularity (§12.3). The window length is a power of two `≥ PAGE`, so
 /// every page is exactly `PAGE` bytes (no partial tail). Tied to the interpreter's capture
 /// granularity so a captured prot map lines up with the image, one entry per page.
@@ -688,15 +692,9 @@ fn freeze_at(
                             b.extend_from_slice(&d);
                         }
                     }
-                    // v9: a completed-but-unjoined child carries its join result (1 + the i64); a
-                    // still-running child writes 0 (re-attached + rewound on thaw instead).
-                    match n.completed_result {
-                        None => write_uleb(b, 0),
-                        Some(r) => {
-                            write_uleb(b, 1);
-                            write_uleb(b, r as u64);
-                        }
-                    }
+                    // v9/v31: a completed-but-unjoined child carries its join outcome; a still-running
+                    // child writes 0 (re-attached + rewound on thaw instead).
+                    write_join_outcome(b, n.completed_result);
                     // v14 (§13.4 slice 4c): the child's host state — serve trio + durable
                     // handle table — when its self-unwind recorded one; 0 for a plain child.
                     let cs = child_state
@@ -731,7 +729,7 @@ fn freeze_at(
                 for d in &detached {
                     write_uleb(b, d.parent_task as u64);
                     write_uleb(b, d.slot as u64);
-                    write_uleb(b, d.completed_result as u64);
+                    write_join_outcome(b, Some(d.completed_result));
                 }
             }
         });
@@ -798,6 +796,33 @@ fn freeze_at(
     }
 
     Ok(out)
+}
+
+/// v31 (#1674): a finished child's `join` outcome — `0` none, `1` + its value, `2` + its trap's code.
+fn write_join_outcome(b: &mut Vec<u8>, o: Option<Result<i64, Trap>>) {
+    match o {
+        None => write_uleb(b, 0),
+        Some(Ok(r)) => {
+            write_uleb(b, 1);
+            write_uleb(b, r as u64);
+        }
+        Some(Err(t)) => {
+            write_uleb(b, 2);
+            write_uleb(b, t.code() as u64);
+        }
+    }
+}
+
+/// The inverse of [`write_join_outcome`]; an unknown tag or trap code is malformed.
+fn read_join_outcome(r: &mut Reader<'_>) -> Result<Option<Result<i64, Trap>>, RestoreError> {
+    Ok(match r.uleb()? {
+        0 => None,
+        1 => Some(Ok(r.uleb()? as i64)),
+        2 => Some(Err(
+            Trap::from_code(r.uleb()? as i64).ok_or(RestoreError::Malformed)?
+        )),
+        _ => return Err(RestoreError::Malformed),
+    })
 }
 
 /// Serialize Section 8 (v29): the live detached children, canonical ascending `(parent_task, slot)`.
@@ -1503,11 +1528,8 @@ fn decode_control(
                         .map_err(|_| RestoreError::Malformed)?,
                 ),
             };
-            // v9: completed-but-unjoined child's join result.
-            let completed_result = match cr.uleb()? {
-                0 => None,
-                _ => Some(cr.uleb()? as i64),
-            };
+            // v9/v31: completed-but-unjoined child's join outcome.
+            let completed_result = read_join_outcome(&mut cr)?;
             // v14 (§13.4 slice 4c): the child's optional host state.
             if cr.uleb()? != 0 {
                 let (svc_queue, svc_results, svc_next_ticket) = read_serve_trio(&mut cr)?;
@@ -1583,7 +1605,7 @@ fn decode_control(
                 return Err(RestoreError::Malformed); // non-canonical: (parent_task, slot) must ascend
             }
             last = Some(key);
-            let completed_result = cr.uleb()? as i64;
+            let completed_result = read_join_outcome(&mut cr)?.ok_or(RestoreError::Malformed)?;
             detached.push(FrozenDetached {
                 parent_task: usize::try_from(parent_task_raw)
                     .map_err(|_| RestoreError::Malformed)?,
