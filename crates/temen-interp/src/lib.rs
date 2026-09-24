@@ -1776,10 +1776,12 @@ impl Inspector {
                         let slot = loclist_value(locs, frame.block, frame.inst)? as usize;
                         (ValueSite::List(locs.clone()), slot)
                     }
-                    // Memory-located (or a fixed global): watchable by address, not by value.
-                    VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => {
-                        return None
-                    }
+                    // Memory-located (a fixed global or a thread-local too): watchable by address,
+                    // not by value.
+                    VarLoc::Window { .. }
+                    | VarLoc::WindowVia { .. }
+                    | VarLoc::Fixed { .. }
+                    | VarLoc::Tls { .. } => return None,
                 };
                 Some((frame.func, site, frame.vals.get(slot).copied()))
             })
@@ -2037,6 +2039,8 @@ impl Inspector {
                 }
                 // A module-scoped global at a fixed absolute window address (frame-independent).
                 VarLoc::Fixed { addr } => window_read(*addr, 0),
+                // A thread-local: the focused thread's own block (#1715).
+                VarLoc::Tls { off } => window_read(di.tls_addr(v.tls, *off)?, 0),
             }
         })
         .flatten()
@@ -2062,6 +2066,7 @@ impl Inspector {
                     frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
                 }
                 VarLoc::Fixed { addr } => *addr,
+                VarLoc::Tls { off } => di.tls_addr(v.tls, *off)?,
                 VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
             };
             Some(base)
@@ -8859,7 +8864,8 @@ impl DetState {
         if let Some(v) = self.runnable.iter().find(|v| v.id == id) {
             return Some(v);
         }
-        if let Some(v) = self.join_waiters.get(&id) {
+        // Keyed by the thread being joined, so find the waiter among the values.
+        if let Some(v) = self.join_waiters.values().find(|v| v.id == id) {
             return Some(v);
         }
         if let Some(w) = self.wait_waiters.iter().find(|w| w.vcpu.id == id) {
@@ -8877,7 +8883,8 @@ impl DetState {
             .runnable
             .iter()
             .map(|v| v.id)
-            .chain(self.join_waiters.keys().copied())
+            // Keyed by the thread being joined; the value is the (live) thread doing the joining.
+            .chain(self.join_waiters.values().map(|v| v.id))
             .chain(self.wait_waiters.iter().map(|w| w.vcpu.id))
             .chain(self.spin_waiters.iter().map(|w| w.vcpu.id))
             .collect();
@@ -21026,6 +21033,7 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
         data: m.data.clone(),

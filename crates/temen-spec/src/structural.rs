@@ -337,7 +337,15 @@ pub fn struct_rows() -> Vec<StructRow> {
         encoding: Enc::Byte(0x07),
         verifies: true,
         is_term: false,
-        module: inst_module(vec![], Inst::DataSelf { offset: 8 }, false, vec![]),
+        module: inst_module(
+            vec![],
+            Inst::DataSelf {
+                offset: 8,
+                tls: false,
+            },
+            false,
+            vec![],
+        ),
     });
     rows.push(StructRow {
         id: "data_sym".into(),
@@ -349,6 +357,39 @@ pub fn struct_rows() -> Vec<StructRow> {
             Inst::DataSym {
                 name: b"g".to_vec(),
                 addend: 4,
+                tls: false,
+            },
+            false,
+            vec![],
+        ),
+    });
+    // #1715: the same two forms as thread-local references (an offset in the per-thread block).
+    rows.push(StructRow {
+        id: "data_self_tls".into(),
+        encoding: Enc::Byte(0x07),
+        verifies: true,
+        is_term: false,
+        module: inst_module(
+            vec![],
+            Inst::DataSelf {
+                offset: 8,
+                tls: true,
+            },
+            false,
+            vec![],
+        ),
+    });
+    rows.push(StructRow {
+        id: "data_sym_tls".into(),
+        encoding: Enc::Byte(0x08),
+        verifies: true,
+        is_term: false,
+        module: inst_module(
+            vec![],
+            Inst::DataSym {
+                name: b"t".to_vec(),
+                addend: 0,
+                tls: true,
             },
             false,
             vec![],
@@ -758,7 +799,7 @@ mod tests {
     #[test]
     fn structural_row_tally() {
         let rows = struct_rows();
-        assert_eq!(rows.len(), 37, "structural row count (update on new ops)");
+        assert_eq!(rows.len(), 39, "structural row count (update on new ops)");
         let mut ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
         ids.sort_unstable();
         ids.dedup();

@@ -104,7 +104,7 @@ static long emit_unit(char *buf, long k, long w) {
   eb(&e, 'T'); eb(&e, 'E'); eb(&e, 'M'); eb(&e, 'E'); eb(&e, 'N');
   eb(&e, 0); eb(&e, 0); eb(&e, 0);
   eb(&e, 0); eb(&e, 0);                 // kind = module
-  eb(&e, (11) & 0xff); eb(&e, (11) >> 8); // version (u16)
+  eb(&e, (12) & 0xff); eb(&e, (12) >> 8); // version (u16)
   eb(&e, 0); eb(&e, 0); eb(&e, 0); eb(&e, 0); // flags
   // Memory descriptor: present, size_log2 17 — must match this module's window (the validator's
   // memory-match precondition), which chibicc keeps at the 64 KiB default for a small program.

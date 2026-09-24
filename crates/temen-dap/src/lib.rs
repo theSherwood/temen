@@ -809,6 +809,8 @@ impl DapServer {
             .iter()
             .filter(|v| v.func == temen_ir::GLOBAL_SCOPE)
         {
+            // A thread-local (`VarLoc::Tls`) is not shared state — each thread has its own — so the
+            // panel does not list it.
             if let VarLoc::Fixed { addr } = v.loc {
                 // Scalars only: an aggregate carries a type_id whose TypeDef is Array/Aggregate.
                 let is_aggregate = v
@@ -928,12 +930,15 @@ impl DapServer {
         vars.sort_by_key(|v| !v.4);
         let mut out = Vec::new();
         for (name, ty, loc, type_id, _) in vars {
-            // A memory-located aggregate/array (`Window`, the wasm `WindowVia`, or a global's
-            // `Fixed` address) is expandable: name a `Place` at its base address (resolved per pc by
-            // the Inspector).
+            // A memory-located aggregate/array (`Window`, the wasm `WindowVia`, a global's `Fixed`
+            // address, or a thread-local in the focused thread's block) is expandable: name a `Place`
+            // at its base address (resolved per pc and thread by the Inspector).
             let is_mem = matches!(
                 loc,
-                VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. }
+                VarLoc::Window { .. }
+                    | VarLoc::WindowVia { .. }
+                    | VarLoc::Fixed { .. }
+                    | VarLoc::Tls { .. }
             );
             if let Some(tid_ref) = type_id.filter(|&t| is_mem && self.is_expandable(t)) {
                 if let Some(base) = self.session.as_ref()?.inspector.var_addr(frame_idx, &name) {
@@ -2098,10 +2103,13 @@ impl expr::Resolver for EvalEnv<'_> {
             (v.func == self.func || v.func == temen_ir::GLOBAL_SCOPE) && v.name == name
         })?;
         match &var.loc {
-            // A memory-located var (`Window` data-SP slot, the wasm `WindowVia` runtime base, or a
-            // global's `Fixed` address) is a typed `Place` (so member/index/expansion work),
-            // resolved per pc by the Inspector.
-            VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => {
+            // A memory-located var (`Window` data-SP slot, the wasm `WindowVia` runtime base, a
+            // global's `Fixed` address, or a thread-local in the focused thread's block) is a typed
+            // `Place` (so member/index/expansion work), resolved per pc and thread by the Inspector.
+            VarLoc::Window { .. }
+            | VarLoc::WindowVia { .. }
+            | VarLoc::Fixed { .. }
+            | VarLoc::Tls { .. } => {
                 let addr = self.inspector.var_addr(self.frame_idx, name)?;
                 match var.type_id {
                     Some(type_id) => Some(expr::Value::Place { addr, type_id }),

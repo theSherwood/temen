@@ -197,12 +197,16 @@ fn inspect_other_threads_at_a_watchpoint() {
         !others.is_empty(),
         "another worker is live while this one is at the watch"
     );
+    // The root (thread 0) is parked in `thread.join` in `main` (function 0); every other worker is
+    // inside the worker function.
+    assert!(others.contains(&0), "the joining root is a live thread");
     for o in others {
-        insp.select_task(o);
+        assert!(insp.select_task(o));
         let bt = insp.backtrace();
+        let func = if o == 0 { 0 } else { 1 };
         assert!(
-            bt.iter().all(|f| f.pc.func == 1),
-            "the other thread is inside the worker function"
+            !bt.is_empty() && bt.iter().all(|f| f.pc.func == func),
+            "thread {o} is inside function {func}"
         );
     }
 }

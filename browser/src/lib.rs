@@ -9463,12 +9463,11 @@ pub extern "C" fn temen_link_run(
         }
     };
     let lib_exports = link_lib_exports(&lib);
-    let lib_data = link_unit_data_exports(&lib);
     link_run_against(
         temen_ir::LinkUnitRef {
             module: &lib,
             exports: &lib_exports,
-            data_exports: &lib_data,
+            data_exports: &lib.data_exports,
         },
         prog_ptr,
         prog_len,
@@ -9488,10 +9487,6 @@ struct LinkLib {
     module: temen_ir::Module,
     /// The library's inline exports as link symbols (`name → local funcidx`), computed once.
     exports: Vec<(String, temen_ir::FuncIdx)>,
-    /// Its **data** symbols, likewise (#1392). A separately compiled libc publishes globals a program
-    /// unit reads across the link — the seeded `<stdio.h>`'s `stdout` is `&__pg_std[1]`, so a resident
-    /// library that dropped these would leave every `fprintf(stdout, …)` unresolved.
-    data_exports: Vec<(String, u64)>,
 }
 
 static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
@@ -9508,14 +9503,9 @@ pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32
         return -1;
     };
     let exports = link_lib_exports(&module);
-    let data_exports = link_unit_data_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.
     let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
-    let lib = Some(LinkLib {
-        module,
-        exports,
-        data_exports,
-    });
+    let lib = Some(LinkLib { module, exports });
     let h = match libs.iter().position(Option::is_none) {
         Some(i) => {
             libs[i] = lib;
@@ -9569,7 +9559,7 @@ pub extern "C" fn temen_link_run_lib(
         temen_ir::LinkUnitRef {
             module: &lib.module,
             exports: &lib.exports,
-            data_exports: &lib.data_exports,
+            data_exports: &lib.module.data_exports,
         },
         prog_ptr,
         prog_len,
@@ -9641,11 +9631,10 @@ pub extern "C" fn temen_link_text(
         return fail(STATUS_DECODE_ERR);
     };
     let lib_exports = link_lib_exports(&lib);
-    let lib_data = link_unit_data_exports(&lib);
     let unit = temen_ir::LinkUnitRef {
         module: &lib,
         exports: &lib_exports,
-        data_exports: &lib_data,
+        data_exports: &lib.data_exports,
     };
     match link_program(unit, &program, entry) {
         Ok(m) => {
@@ -9696,7 +9685,7 @@ pub extern "C" fn temen_link_text_lib(
     let unit = temen_ir::LinkUnitRef {
         module: &lib.module,
         exports: &lib.exports,
-        data_exports: &lib.data_exports,
+        data_exports: &lib.module.data_exports,
     };
     match link_program(unit, &program, entry) {
         Ok(m) => {
@@ -9726,7 +9715,7 @@ fn resident_units(handles: &[i32]) -> Option<Vec<temen_ir::LinkUnitRef<'static>>
         out.push(temen_ir::LinkUnitRef {
             module: &lib.module,
             exports: &lib.exports,
-            data_exports: &lib.data_exports,
+            data_exports: &lib.module.data_exports,
         });
     }
     Some(out)
@@ -9975,7 +9964,7 @@ pub extern "C" fn temen_link_encode_lib(
     let unit = temen_ir::LinkUnitRef {
         module: &lib.module,
         exports: &lib.exports,
-        data_exports: &lib.data_exports,
+        data_exports: &lib.module.data_exports,
     };
     match link_program(unit, &program, entry) {
         Ok(m) => {
@@ -9987,16 +9976,6 @@ pub extern "C" fn temen_link_encode_lib(
         }
         Err(status) => fail(status),
     }
-}
-
-/// A unit's **data** symbols for the linker (the twin of [`link_lib_exports`]): a separately
-/// compiled libc publishes its globals (`errno`, allocator bookkeeping) as data symbols, and a
-/// program unit that reads one resolves it cross-unit.
-fn link_unit_data_exports(m: &temen_ir::Module) -> Vec<(String, u64)> {
-    m.data_exports
-        .iter()
-        .map(|d| (d.name.clone(), d.offset))
-        .collect()
 }
 
 /// Link `program` (unit 1) against `lib` (unit 0), take `entry` as the program's entry, wrap it in
@@ -10057,12 +10036,11 @@ pub fn link_program_multi(
     if !prog_exports.iter().any(|(n, _)| n == entry) {
         prog_exports.push((entry.to_string(), 0));
     }
-    let prog_data = link_unit_data_exports(program);
     let mut units: Vec<temen_ir::LinkUnitRef<'_>> = libs.to_vec();
     units.push(temen_ir::LinkUnitRef {
         module: program,
         exports: &prog_exports,
-        data_exports: &prog_data,
+        data_exports: &program.data_exports,
     });
     let mut linked = temen_ir::link_with_manifest_ref(&units).map_err(|_| STATUS_UNSUPPORTED)?;
     // The frontend bootstrap when the program unit had one, else `entry` itself — a hand-written unit
@@ -10127,11 +10105,10 @@ pub fn link_run_units(
     stdin: &[u8],
 ) -> PbOutcome {
     let lib_exports = link_lib_exports(lib);
-    let lib_data = link_unit_data_exports(lib);
     let unit = temen_ir::LinkUnitRef {
         module: lib,
         exports: &lib_exports,
-        data_exports: &lib_data,
+        data_exports: &lib.data_exports,
     };
     match link_program(unit, program, entry) {
         Ok(m) => onramp_exec(&m, stdin),

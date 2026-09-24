@@ -29,6 +29,7 @@ fn unit_a() -> Module {
         data_exports: vec![DataExport {
             name: "g_val".into(),
             offset: 16384,
+            tls: false,
         }],
         ..Default::default()
     }
@@ -54,15 +55,20 @@ fn unit_b() -> Module {
                 name: "g_val".into(),
                 addend: 0,
             },
+            tls: false,
         }],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         funcs: vec![Func {
             params: vec![],
             results: vec![ValType::I64],
             blocks: vec![Block {
                 params: vec![],
                 insts: vec![
-                    Inst::DataSelf { offset: 0 }, // v0 = &slot (this unit's data base + 0)
+                    Inst::DataSelf {
+                        offset: 0,
+                        tls: false,
+                    }, // v0 = &slot (this unit's data base + 0)
                     Inst::Load {
                         op: LoadOp::I64,
                         addr: 0,

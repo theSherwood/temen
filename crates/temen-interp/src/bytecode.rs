@@ -6482,6 +6482,9 @@ impl<'a> FrameReader<'a> {
                 })
             }
             VarLoc::Fixed { addr } => Some(WriteTarget::Win { addr: *addr }),
+            VarLoc::Tls { off } => Some(WriteTarget::Win {
+                addr: di?.tls_addr(self.vm.tls, *off)?,
+            }),
         }
     }
 
@@ -6519,6 +6522,8 @@ impl<'a> FrameReader<'a> {
                 window_read(addr.wrapping_add(*off as u64))
             }
             VarLoc::Fixed { addr } => window_read(*addr),
+            // A thread-local: this thread's own block (#1715).
+            VarLoc::Tls { off } => window_read(di.tls_addr(self.vm.tls, *off)?),
         }
     }
 
@@ -6544,6 +6549,7 @@ impl<'a> FrameReader<'a> {
                 Some(addr.wrapping_add(*off as u64))
             }
             VarLoc::Fixed { addr } => Some(*addr),
+            VarLoc::Tls { off } => di.tls_addr(self.vm.tls, *off),
         }
     }
 
@@ -6562,7 +6568,10 @@ impl<'a> FrameReader<'a> {
                 super::loclist_value(locs, block, inst)? as usize,
             ),
             // Memory-located: watchable by address (the window-range watch), not by value.
-            VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => return None,
+            VarLoc::Window { .. }
+            | VarLoc::WindowVia { .. }
+            | VarLoc::Fixed { .. }
+            | VarLoc::Tls { .. } => return None,
         };
         let off = *self.md_for(module)?.1.get(func)?.get(block)? as usize;
         let last = *self.vm.regs.get(base + off + idx)?;
