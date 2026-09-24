@@ -891,9 +891,13 @@ static Node *declaration(Token **rest, Token *tok, Type *basety, VarAttr *attr) 
     if (!ty->name)
       error_tok(ty->name_pos, "variable name omitted");
 
+    if (attr && attr->is_tls && !attr->is_static && !attr->is_extern)
+      error_tok(ty->name, "a block-scope _Thread_local must also be static or extern");
+
     if (attr && attr->is_static) {
       // static local variable
       Obj *var = new_anon_gvar(ty);
+      var->is_tls = attr->is_tls;
       push_scope(get_ident(ty->name))->var = var;
       if (equal(tok, "="))
         gvar_initializer(&tok, tok->next, var);

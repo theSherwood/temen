@@ -2352,6 +2352,167 @@ fn c_pthread_join_returns_value() {
     }
 }
 
+// ---- `_Thread_local` (#1715) --------------------------------------------------------------------
+// A thread-local lives in a per-thread block: the root thread's is placed with the program's data,
+// and `pthread_create` gives each new thread its own, copied from the program's initial values.
+
+/// Three threads and the root each see their own copy of every thread-local, starting from the
+/// initial values, never another thread's writes: a scalar (`counter = 100`), an array (`tag`), a
+/// pointer whose initializer is the address of a plain global (`pshared = &shared`, relocated in the
+/// block), and a block-scope `static _Thread_local` (zero-initialized). Thread `i` returns
+/// `i*100000 + (100+i)*1000 + 2*10 + 7`; the root adds its own `counter` (5, set before any thread
+/// started) and a million if its `tag` still reads "root".
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_thread_local_each_thread_has_its_own_copy() {
+    let src = "#include <pthread.h>\n\
+        _Thread_local long counter = 100;\n\
+        _Thread_local char tag[8] = \"root\";\n\
+        long shared = 7;\n\
+        _Thread_local long *pshared = &shared;\n\
+        static void *work(void *arg) {\n\
+        \x20 long id = (long)arg;\n\
+        \x20 static _Thread_local int calls;\n\
+        \x20 counter += id;\n\
+        \x20 tag[0] = 'w';\n\
+        \x20 tag[1] = '0' + id;\n\
+        \x20 calls++;\n\
+        \x20 calls++;\n\
+        \x20 return (void *)((tag[1] - '0') * 100000 + counter * 1000 + calls * 10 + *pshared);\n\
+        }\n\
+        int main(void) {\n\
+        \x20 counter = 5;\n\
+        \x20 pthread_t t[3];\n\
+        \x20 for (long i = 0; i < 3; i++) pthread_create(&t[i], 0, work, (void *)(i + 1));\n\
+        \x20 long sum = 0;\n\
+        \x20 for (int i = 0; i < 3; i++) { void *r; pthread_join(t[i], &r); sum += (long)r; }\n\
+        \x20 return sum + counter + (tag[0] == 'r') * 1000000;\n\
+        }\n";
+    let want = 201_027 + 302_027 + 403_027 + 5 + 1_000_000;
+    match run_c_full(src).outcome {
+        Outcome::Returned(v) => assert_eq!(v.as_slice(), [Value::I32(want)]),
+        Outcome::Exited(c) => panic!("unexpected exit({c})"),
+    }
+}
+
+/// A program without thread-locals carries none of the machinery: no block, no root, and no
+/// thread-local address. Its threads still start through `<pthread.h>`, whose install step is its
+/// own function (the only `vcpu.tls` in the module), which such a program never calls.
+#[test]
+fn c_without_thread_locals_emits_no_block() {
+    let ir = c_to_ir(
+        "#include <pthread.h>\n\
+         static void *f(void *a) { return a; }\n\
+         int main(void) { pthread_t t; pthread_create(&t, 0, f, 0); return pthread_join(t, 0); }\n",
+    );
+    assert!(!ir.contains("debug.tls_root"), "no root block:\n{ir}");
+    assert!(
+        !ir.contains("vcpu.tls.get"),
+        "no thread-local address:\n{ir}"
+    );
+    let m = parse_module(&ir).expect("parse");
+    let with_set: Vec<usize> = m
+        .funcs
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| matches!(i, temen_ir::Inst::VcpuTlsSet { .. }))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        with_set.len(),
+        1,
+        "exactly the install helper sets vcpu.tls:\n{ir}"
+    );
+    let spawned: Vec<u32> = m
+        .funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter().flat_map(|b| &b.insts))
+        .filter_map(|i| match i {
+            temen_ir::Inst::ThreadSpawn { func, .. } => Some(*func),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !spawned.contains(&(with_set[0] as u32)),
+        "the thread entry itself must not contain vcpu.tls:\n{ir}"
+    );
+}
+
+/// `-g` locates a thread-local within the selected thread's block (`debug.var … tls <off>`) and names
+/// the root thread's block (`debug.tls_root`), so the debugger reads the root's copy — here, the
+/// initial 100 placed in the writable root block — while a plain global stays `fixed`.
+#[test]
+fn c_thread_local_debug_info_locates_the_root_copy() {
+    let ir = c_to_ir_g(
+        "_Thread_local long counter = 100;\n\
+         long plain = 3;\n\
+         int main(void) { return (int)(counter + plain); }\n",
+    );
+    let m = parse_module(&ir).expect("parse");
+    let dbg = m.debug_info.as_ref().expect("-g emits debug info");
+    let var = |name: &str| {
+        dbg.vars
+            .iter()
+            .find(|v| v.name == name)
+            .unwrap_or_else(|| panic!("no debug var `{name}`:\n{ir}"))
+    };
+    assert!(matches!(var("plain").loc, temen_ir::VarLoc::Fixed { .. }));
+    let temen_ir::VarLoc::Tls { off } = var("counter").loc else {
+        panic!("`counter` should be a thread-local location:\n{ir}");
+    };
+    let addr = dbg.tls_addr(0, off).expect("the root block is recorded");
+    let seg = m
+        .data
+        .iter()
+        .find(|d| d.offset <= addr && addr + 8 <= d.offset + d.bytes.len() as u64)
+        .unwrap_or_else(|| panic!("no data segment covers the root copy at {addr}:\n{ir}"));
+    assert!(!seg.readonly, "the root block is writable");
+    let at = (addr - seg.offset) as usize;
+    assert_eq!(seg.bytes[at..at + 8], 100i64.to_le_bytes());
+}
+
+/// What C forbids is refused with a diagnostic: a thread-local's address as a constant initializer
+/// (each thread has its own copy), a block-scope `_Thread_local` that is neither `static` nor
+/// `extern`, and an alignment the per-thread block cannot honor.
+#[test]
+fn c_thread_local_misuse_is_a_clean_error() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    for src in [
+        "_Thread_local int t; int *p = &t; int main(void) { return *p; }",
+        "_Thread_local int t; _Thread_local int *q = &t; int main(void) { return *q; }",
+        "int main(void) { _Thread_local int t = 1; return t; }",
+        "_Alignas(32) _Thread_local int t; int main(void) { return t; }",
+    ] {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("temen_cfe_tls_{}_{id}", std::process::id()));
+        let cfile = base.with_extension("c");
+        std::fs::write(&cfile, src).unwrap();
+        let status = Command::new(chibicc())
+            .args([
+                "-cc1",
+                "--emit-ir",
+                "-cc1-input",
+                cfile.to_str().unwrap(),
+                "-cc1-output",
+                base.with_extension("temen").to_str().unwrap(),
+                cfile.to_str().unwrap(),
+            ])
+            .status()
+            .expect("run chibicc");
+        assert!(!status.success(), "should be rejected:\n{src}");
+        assert!(
+            status.code().is_some(),
+            "must exit with a diagnostic, not crash:\n{src}"
+        );
+    }
+}
+
 /// `pthread_cond_t` handoff: a consumer waits on the cond under the mutex until `ready`, the producer
 /// (main) publishes a payload, sets the predicate, and signals. Correct whether the consumer parks
 /// first (woken by the signal) or the signal lands first (predicate already true, no wait) — the
