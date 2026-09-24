@@ -100,6 +100,9 @@ struct Child {
     /// reachable after its thread exits (the interp's `child_hosts` retention, JIT twin).
     /// Released exactly once, at [`Nursery::join_children`], via the grant hooks' releaser.
     retained: usize,
+    /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
+    /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
+    nested: Option<(crate::FrozenNested, bool)>,
 }
 
 impl Child {
@@ -114,6 +117,7 @@ impl Child {
             }),
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 
@@ -124,6 +128,7 @@ impl Child {
             done,
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 }
@@ -726,13 +731,38 @@ impl Nursery {
         std::sync::Arc::clone(&self.task_counter)
     }
 
-    /// Push a captured §14 nested-child re-attach record into the **shared** subtree sink (coalesces at
-    /// the root). `instantiate` calls this when a child left its carve `UNWINDING`.
-    pub(crate) fn push_frozen_nested(&self, rec: crate::FrozenNested) {
-        self.frozen_nested_sink
+    /// §4 — this nursery's owner is unwinding for a freeze: record each of its still-unjoined durable
+    /// §14 children into the **shared** subtree sink (coalesces at the root). A child that unwound
+    /// into its carve is re-attached on thaw; one that finished first carries its result, which the
+    /// thaw delivers to the owner's rewound `join` without re-running it (#1692), as the interpreter
+    /// does. `false` if one finished with a trap: a trap cannot ride the artifact, so the freeze must
+    /// fail closed rather than hand the owner's thaw a join result of 0.
+    pub(crate) fn freeze_unjoined(&self) -> bool {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sink = self
+            .frozen_nested_sink
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(rec);
+            .unwrap_or_else(|e| e.into_inner());
+        for c in children.iter().filter(|c| !c.joined) {
+            let Some((rec, unwound)) = &c.nested else {
+                continue;
+            };
+            let mut rec = rec.clone();
+            if !unwound {
+                let (result, trap) = c
+                    .done
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("a durable child runs synchronously, so it has finished");
+                if trap != 0 {
+                    return false;
+                }
+                rec.completed_result = Some(result);
+            }
+            sink.push(rec);
+        }
+        true
     }
 
     /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
@@ -1231,20 +1261,22 @@ pub(crate) unsafe extern "C" fn instantiate(
         };
         let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
         let slot = children.len();
-        children.push(Child::finished(result, trap));
-        drop(children);
-        // §4 freeze export: the child left its carve `UNWINDING` — record its re-attach residue into the
-        // shared subtree sink tagged with this nursery's task, so a thaw re-creates the child domain.
-        if unwound {
-            rt.push_frozen_nested(crate::FrozenNested {
+        let mut child = Child::finished(result, trap);
+        // §4 freeze export: what a freeze records for this child if it is still unjoined when this
+        // nursery's owner unwinds ([`Nursery::freeze_unjoined`]).
+        child.nested = Some((
+            crate::FrozenNested {
                 parent_task: rt.my_task(),
                 task: child_task,
                 slot,
                 carve_off: base + off,
                 size_log2: size_log2 as u8,
                 entry: entry as u32,
-            });
-        }
+                completed_result: None,
+            },
+            unwound,
+        ));
+        children.push(child);
         return slot as i32;
     }
 
