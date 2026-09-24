@@ -277,6 +277,14 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # `run:` defaults to PowerShell on windows-latest, and this is a bash script — so it names its
       # shell. The cargo steps below are shell-agnostic and don't need it.
+      # #1605 — install-nextest.sh keeps its verified archive here; restoring it spares the job a
+      # fetch from get.nexte.st, whose outages turned runs red before a line compiled. Keyed on the
+      # script, where the pinned version and checksums live.
+      - name: cache cargo-nextest archive
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci
+          key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
       - name: install cargo-nextest (pinned + checksummed per platform)
         shell: bash
         run: scripts/ci/install-nextest.sh
@@ -499,6 +507,14 @@ jobs:
       # fmt+clippy+compile — and `cargo test` runs the 99 integration-test binaries one at a time, so
       # three of the runner's four cores sat idle for most of it. See the script for the pin and the
       # numbers.
+      # #1605 — install-nextest.sh keeps its verified archive here; restoring it spares the job a
+      # fetch from get.nexte.st, whose outages turned runs red before a line compiled. Keyed on the
+      # script, where the pinned version and checksums live.
+      - name: cache cargo-nextest archive
+        uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4
+        with:
+          path: ~/.cache/temen-ci
+          key: nextest-${{ runner.os }}-${{ hashFiles('scripts/ci/install-nextest.sh') }}
       - name: install cargo-nextest
         timeout-minutes: 5
         run: bash scripts/ci/install-nextest.sh
@@ -968,13 +984,12 @@ jobs:
         timeout-minutes: 10
         working-directory: browser
         run: |
-          # I67/#1017/#1374: `--with-deps` runs its own internal `apt-get update`, so the third-party
-          # source scrub must happen here too — the hardened LLVM step below runs after this one.
-          # Scrub only (no packages): `--with-deps` installs what it needs itself. Absolute path —
-          # this step's `working-directory` is `browser/`.
-          bash "$GITHUB_WORKSPACE/scripts/ci/apt-prep.sh"
+          # No `--with-deps` (#1788): Chromium's shared libraries are already on the image (its
+          # preinstalled Chrome needs the same ones), so all `--with-deps` added was fonts and Xvfb that
+          # headless tests never use — and an `apt-get update` against Ubuntu's mirrors, which failed
+          # this step whenever one was mid-sync (`Hash Sum mismatch`).
           npm install playwright@1.56.1
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
 
       # LLVM is needed on EVERY run, not just a cold one: build-pg-assets.mjs hands the translator
       # `postgres_shimmed.bc`, and the `.bc` path shells `llvm-dis` out-of-process (temen-llvm links no
@@ -1298,17 +1313,13 @@ jobs:
       # root and `crates/temen-llvm` caches that job restores would be dead weight in this one.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with: { workspaces: browser }
-      # Same I34 stall bound as `browser-real`'s copy of this step.
+      # Same I34 stall bound, and the same no-`--with-deps` install (#1788), as `browser-real`'s copy.
       - name: Install Playwright + Chromium
         timeout-minutes: 10
         working-directory: browser
         run: |
-          # I67/#1017/#1374: `--with-deps` runs its own internal `apt-get update`, so the third-party
-          # source scrub must happen here too. Scrub only (no packages). Absolute path — this step's
-          # `working-directory` is `browser/`.
-          bash "$GITHUB_WORKSPACE/scripts/ci/apt-prep.sh"
           npm install playwright@1.56.1
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
       - name: Build threads module
         working-directory: browser
         run: |
