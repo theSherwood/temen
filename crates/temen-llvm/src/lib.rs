@@ -749,7 +749,9 @@ fn translate_impl(
     // is linked with a program and wrapped by `synth_manifest_start`, and from then on the host and
     // the prepended `_start` write the scratch exactly as for any powerbox program. Basing such a
     // unit's globals at `guard + 16` (the old entry-less layout) put them under those writes: JACL's
-    // runtime had its worker table across the heap words and the whole args region.
+    // runtime had its worker table across the heap words and the whole args region. (#1776 briefly
+    // made this an opt-in `TranslateOptions::powerbox_layout`; an opt-in the translator cannot know
+    // to set — it cannot see whether the unit will be wrapped — is the footgun, so it is the layout.)
     let globals_base = stack_page;
     let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols, tls_layout) =
         globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
@@ -12890,6 +12892,35 @@ fn lower_vm_builtin(
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 13,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
+        // long grants_ptr, long grants_n, long entry, long size_log2, long quota, long args_ptr,
+        // long args_len)` → `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n,
+        // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
+        // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
+        // module's declared memory), not a carve of the spawner's, with the same named-grant records as
+        // `__vm_instantiate` and a spawn-time args payload copied to its `module_args_base()` (length 0
+        // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
+        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
+        "__vm_instantiate_detached" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let args = (1..10)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; 9],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 15,
                 sig,
                 handle,
                 args,

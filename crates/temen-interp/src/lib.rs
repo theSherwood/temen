@@ -3004,9 +3004,10 @@ fn relaunch_detached(
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host)?;
-    // The window: a fresh reservation (a root's shape, as op 15 mints it) holding the child's image,
-    // its freeze word cleared and its context-0 thaw word set — `begin_thaw`, on the child's own window.
-    let mut mem = Mem::with_reservation(reserved_log2, memory_log2, shadow);
+    // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
+    // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
+    // `begin_thaw`, on the child's own window.
+    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data);
     mem.restore_layout(&window);
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
@@ -7254,7 +7255,8 @@ fn admit_parks_for_freeze(s: &mut Sched) {
                 Waiter::VCpu(mut v) => {
                     v.wait_indefinite = false;
                     v.dstate = STATE_UNWINDING;
-                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                    // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                    v.pending = Some(Pending::Wait(temen_ir::durable_abi::WAIT_FROZEN));
                     s.runnable.push_back(v);
                 }
                 fiber @ Waiter::Fiber { .. } => {
@@ -11388,16 +11390,17 @@ impl VCpu {
         }
         // §13.4 step 2 — flatten the event-parked fibers (classified above): a woken park's
         // frames already carry its delivered result (no placeholder — the point's spill reloads
-        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and an
-        // inert status is delivered — the `MemoryWait` point spills `out − nres` (the status is
-        // never captured) and its thaw arm re-issues the wait, which re-checks the restored
-        // guest value (the O10 re-issue rule turned inward).
+        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and the
+        // freeze's `WAIT_FROZEN` is delivered — the `MemoryWait` point spills it, and its thaw arm
+        // re-issues exactly such a wait, which re-checks the restored guest value (the O10
+        // re-issue rule turned inward; #1769).
         while let Some((slot, frames, woken)) = self.registry.take_blocked_for_freeze() {
             let placeholder = if woken {
                 None
             } else {
                 self.sched.purge_fiber_wait_park(&self.registry, slot);
-                Some(Reg::from_i32(0))
+                // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN))
             };
             self.flatten_fiber_for_freeze(slot, frames, placeholder)?;
         }
@@ -14049,13 +14052,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
-                                let mut fm = Mem::with_reservation(
+                                let mut fm = Mem::detached(
                                     DEFAULT_RESERVED_LOG2,
                                     size_log2 as u8,
                                     cm.shadow,
+                                    &cm.data,
                                 );
-                                fm.init_data(&cm.data);
-                                fm.seed_null_guard(temen_ir::module_null_guard()); // #964
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
@@ -21546,6 +21548,12 @@ impl Host {
         // guest that compiles code can spawn a confined copy of itself that can too — the Forth
         // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
         // is what confers the authority; this list only lets the child's manifest *reach* it.
+        // `vm_region_create` (AddressSpace op 5): a child already holds its own `AddressSpace`, whose
+        // op 5 mints a fresh §13/§14 region (per-region anti-bomb cap, `MAX_MINTED_REGION`) — so a
+        // guest can already do this through a dynamic `call.cap`. Listing the name lets a child's
+        // *manifest* reach it: a separately-compiled runtime (JACL's, whose channels create regions)
+        // imports it as `Required`, and without this such a runtime fails closed at spawn even when
+        // the child never mints. Binds to the child's own `AddressSpace` (`first_of`), as `vm_map` does.
         // `stream_write`/`stream_read` are the *same two caps* as `write`/`read` — the frontend's raw
         // stream spelling (`__vm_stream_write`/`__vm_stream_read`), which `default_cap_resolver` maps
         // onto the identical `(type_id, op)` and handle. They are listed because this table is keyed by
@@ -21563,6 +21571,7 @@ impl Host {
             "vm_unmap",
             "vm_protect",
             "vm_page_size",
+            "vm_region_create",
             "vm_jit_compile",
             "vm_jit_compile_linked",
             "vm_jit_invoke2",
@@ -28316,6 +28325,23 @@ impl MemLayout {
         }
     }
 
+    /// #1733 — a detached child's captured `image` under the page map its window was built with
+    /// ([`Mem::detached`]: the NULL guard, the `readonly` data segments), for a capture that cannot
+    /// read the live map (the JIT's harvest). Protections its guest changed through the Memory
+    /// capability are not recorded.
+    pub fn detached_image(module: &Module, image: Vec<u8>, mapped_log2: u8) -> MemLayout {
+        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data);
+        let space = m.space.read_unpoisoned();
+        MemLayout {
+            bytes: image,
+            map: PageMap {
+                prot: space.prot.clone(),
+                page: m.page,
+                mapped: m.window.mapped(),
+            },
+        }
+    }
+
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
     /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole
@@ -28462,6 +28488,21 @@ struct AddrSpace {
 }
 
 impl Mem {
+    /// A detached (op 15) child's window as it starts: a fresh reservation holding its module's data
+    /// segments (the `readonly` ones RO) under the #964 NULL guard. The one build for a spawn and for
+    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift.
+    fn detached(
+        reserved_log2: u8,
+        mapped_log2: u8,
+        shadow: Option<ShadowArena>,
+        data: &[Data],
+    ) -> Mem {
+        let mut m = Mem::with_reservation(reserved_log2, mapped_log2, shadow);
+        m.init_data(data);
+        m.seed_null_guard(temen_ir::module_null_guard());
+        m
+    }
+
     /// A window whose mask domain is `1 << reserved_log2` bytes but whose backed region is the
     /// declared `1 << mapped_log2` prefix; an access into the reserved-but-unmapped tail faults
     /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,

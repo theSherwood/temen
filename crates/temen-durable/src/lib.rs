@@ -168,7 +168,7 @@ pub use temen_ir::durable_abi::STATE_OFF;
 pub use temen_ir::durable_abi::SHADOW_STRIDE;
 /// The shadow arena — one definition of placement (see the region-layout note above) — and the end
 /// of the always-live control words below it.
-pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
+pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END, WAIT_FROZEN};
 
 // Block layout of an instrumented function with `S` forward segments (each original
 // block is split at its suspend ops into `points+1` segments; non-suspend blocks are one
@@ -646,10 +646,12 @@ enum SuspendKind {
     /// recorded result. `handle` is the joined vCPU handle's block-local index (spilled + reloaded).
     ThreadJoin { handle: ValIdx },
     /// `<ty>.atomic.wait` (§12.8 parked-vCPU slice): a vCPU blocked in a futex wait is a freeze
-    /// safepoint too — the `thread_wait` thunk returns on observing `UNWINDING`, the trailing poll
-    /// unwinds, and the wait is **re-issued on thaw** (like `thread.join`): the re-executed wait
-    /// re-checks the guest value, so a wake that landed as a value change (already in the snapshot, or
-    /// replayed by another re-run vCPU) resolves it immediately with `WAIT_NOT_EQUAL`. A re-issue that
+    /// safepoint too — the `thread_wait` thunk returns on observing `UNWINDING` (with `WAIT_FROZEN`),
+    /// the trailing poll unwinds, and the status is spilled with the frame (#1769). On thaw a wait
+    /// that completed before the cut delivers its status as it was; one the freeze ended is
+    /// **re-issued** (like `thread.join`): the re-executed wait re-checks the guest value, so a wake
+    /// that landed as a value change (already in the snapshot, or replayed by another re-run vCPU)
+    /// resolves it immediately with `WAIT_NOT_EQUAL`. A re-issue that
     /// would still *park* on the single-worker thaw can't be satisfied (no concurrent notifier) and
     /// fails closed (`ThreadFault`, matching the interp's join-deadlock). `ty` reconstructs the op;
     /// `addr`/`expected`/`timeout` are its block-local operands (spilled + reloaded).
@@ -1096,7 +1098,9 @@ fn transform_func(
                 // (`save_end == out`); a propagated frame re-issues its call, so the call's
                 // results `[save_end, out)` are recomputed, not spilled.
                 let save_end = match kind {
-                    SuspendKind::Leaf => out,
+                    // A wait's status is spilled too (#1769): one the wait completed with before the
+                    // cut is delivered on thaw; only the freeze's own `WAIT_FROZEN` re-issues it.
+                    SuspendKind::Leaf | SuspendKind::MemoryWait { .. } => out,
                     // The op's results are recomputed (re-issue) or redelivered (resume), so
                     // they aren't spilled — same as a propagated call.
                     SuspendKind::Propagated { .. }
@@ -1104,7 +1108,6 @@ fn transform_func(
                     | SuspendKind::Resume { .. }
                     | SuspendKind::Yield { .. }
                     | SuspendKind::ThreadJoin { .. }
-                    | SuspendKind::MemoryWait { .. }
                     | SuspendKind::SvcServe { .. } => out - nres,
                     // Header polls are built separately (above), never from an in-block op.
                     SuspendKind::LoopHeader => unreachable!("loop-header point not from an op"),
@@ -1140,6 +1143,10 @@ fn transform_func(
                 // from the single operand table (#915).
                 for o in kind.operands() {
                     used[o as usize] = true;
+                }
+                // A wait's thaw arm reads its own status to decide re-issue vs. deliver (#1769).
+                if matches!(kind, SuspendKind::MemoryWait { .. }) {
+                    used[out - 1] = true;
                 }
                 let spilled: Vec<usize> = if conservative {
                     (0..save_end).collect()
@@ -1201,6 +1208,9 @@ fn transform_func(
     // ---- UNWIND (check + spill pair) / ARM_g, per resume point ----
     let mut unwind_blocks: Vec<Block> = Vec::with_capacity(2 * total_points);
     let mut arm_blocks: Vec<Block> = Vec::with_capacity(total_points);
+    // Blocks an arm needs beyond its own, appended after the trap block so no index above moves:
+    // a wait's re-issue (#1769).
+    let mut extra_blocks: Vec<Block> = Vec::new();
     for (gid, pt) in points.iter().enumerate() {
         // index in `pt.spilled` (and thus the reloaded vec) of a block-local value, if spilled
         let spill_slot = |i: usize| pt.spilled.binary_search(&i).ok();
@@ -1341,32 +1351,13 @@ fn transform_func(
                     reloaded[spill_slot(*handle as usize).expect("thread.join handle spilled")];
                 ab.many(Inst::ThreadJoin { handle: hh }, pt.nres)
             }
-            // `atomic.wait` re-issue: like `thread.join`, the wait is the globally-deepest frozen frame
-            // on this thread (the notifier is a *separate* vCPU), so flip the state word to `NORMAL`
-            // itself, then reload the spilled `addr`/`expected`/`timeout` and re-execute the wait. The
-            // re-issued wait re-checks the value: a wake that landed as a value change resolves it with
-            // `WAIT_NOT_EQUAL` (no block); a would-park fails closed in the thunk (`ThreadFault`).
-            SuspendKind::MemoryWait {
-                ty,
-                addr,
-                expected,
-                timeout,
-            } => {
-                let aa = reloaded[spill_slot(*addr as usize).expect("atomic.wait addr spilled")];
-                let ee =
-                    reloaded[spill_slot(*expected as usize).expect("atomic.wait expected spilled")];
-                let tt =
-                    reloaded[spill_slot(*timeout as usize).expect("atomic.wait timeout spilled")];
-                ab.many(
-                    Inst::MemoryWait {
-                        ty: *ty,
-                        addr: aa,
-                        expected: ee,
-                        timeout: tt,
-                    },
-                    pt.nres,
-                )
-            }
+            // `atomic.wait`: like `thread.join`, the wait is the globally-deepest frozen frame on this
+            // thread (the notifier is a *separate* vCPU), so the state word was flipped to `NORMAL`
+            // above. Its status was spilled and is reloaded into the continuation; the terminator
+            // below branches on it (#1769). A wait that completed before the cut (woken, not-equal,
+            // timed out) delivers that status as it was. One the freeze ended (`WAIT_FROZEN`) is
+            // re-issued with its reloaded operands, and re-checks the restored value.
+            SuspendKind::MemoryWait { .. } => vec![],
             // Serve-op re-issue (§13.4 slice 4b): the mid-handler gate guarantees this point is
             // the globally-deepest frozen frame on its thread (no handler was in flight), so —
             // like `atomic.wait` — flip the state word to `NORMAL` itself, then reload the
@@ -1411,10 +1402,57 @@ fn transform_func(
                 }
             })
             .collect();
-        arm_blocks.push(ab.finish(Terminator::Br {
-            target: pt.cont_seg,
-            args: cont_args,
-        }));
+        let term = match &pt.kind {
+            SuspendKind::MemoryWait {
+                ty,
+                addr,
+                expected,
+                timeout,
+            } => {
+                let ops = [*addr, *expected, *timeout].map(|v| {
+                    reloaded[spill_slot(v as usize).expect("atomic.wait operand spilled")]
+                });
+                let status = cont_args[pt.out - 1];
+                let frozen = ab.one(Inst::ConstI32(WAIT_FROZEN));
+                let reissue = ab.one(icmp(IntTy::I32, CmpOp::Eq, status, frozen));
+                // The re-issue block: the continuation's args but the status, then the operands.
+                let kept = pt.out - 1;
+                let mut params = pt.slot_types[..kept].to_vec();
+                params.extend([*addr, *expected, *timeout].map(|v| pt.slot_types[v as usize]));
+                let mut rb = Bb::new(params);
+                let n = kept as u32;
+                let r = rb.many(
+                    Inst::MemoryWait {
+                        ty: *ty,
+                        addr: n,
+                        expected: n + 1,
+                        timeout: n + 2,
+                    },
+                    pt.nres,
+                );
+                let mut args: Vec<ValIdx> = (0..n).collect();
+                args.extend(r);
+                let blk = trap_blk + 1 + extra_blocks.len() as u32;
+                extra_blocks.push(rb.finish(Terminator::Br {
+                    target: pt.cont_seg,
+                    args,
+                }));
+                let mut then_args = cont_args[..kept].to_vec();
+                then_args.extend(ops);
+                Terminator::BrIf {
+                    cond: reissue,
+                    then_blk: blk,
+                    then_args,
+                    else_blk: pt.cont_seg,
+                    else_args: cont_args,
+                }
+            }
+            _ => Terminator::Br {
+                target: pt.cont_seg,
+                args: cont_args,
+            },
+        };
+        arm_blocks.push(ab.finish(term));
     }
 
     // ---- TRAP — br_table default / forged resume id ----
@@ -1432,6 +1470,7 @@ fn transform_func(
     blocks.extend(unwind_blocks);
     blocks.extend(arm_blocks);
     blocks.push(trap);
+    blocks.extend(extra_blocks);
 
     let max_frame = points.iter().map(|pt| pt.frame_size).max().unwrap_or(0);
     let func = Func {
