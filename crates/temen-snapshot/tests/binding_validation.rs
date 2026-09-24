@@ -152,3 +152,85 @@ fn restore_rejects_out_of_window_address_space_binding() {
         "an out-of-window AddressSpace binding must be rejected on restore"
     );
 }
+
+/// #1700: a nested child's recorded host state carries its own handle table; `binding` is its one
+/// handle. The child's window is the carve `[128 KiB, 256 KiB)`, so its bindings are carve-relative
+/// and must fit `[0, 128 KiB)`.
+fn host_with_nested_child_binding(binding: temen_interp::DurableBinding) -> Host {
+    use temen_interp::{cap_id, DurableHandle, FrozenChildState, FrozenNested};
+    let mut host = Host::new();
+    host.set_frozen_nested(vec![FrozenNested {
+        parent_task: 0,
+        task: 1,
+        slot: 0,
+        carve_off: 1 << 17,
+        size_log2: 17,
+        entry: 0,
+        module_digest: None,
+        completed_result: None,
+    }]);
+    host.set_frozen_child_state(vec![FrozenChildState {
+        parent_task: 0,
+        slot: 0,
+        svc_queue: Vec::new(),
+        svc_results: Vec::new(),
+        svc_next_ticket: 0,
+        handles: vec![DurableHandle {
+            slot: 0,
+            generation: 0,
+            type_id: cap_id::ADDRESS_SPACE,
+            binding,
+        }],
+        jit_tables: Vec::new(),
+        jit_table_log2: 0,
+    }]);
+    host
+}
+
+/// #1700: freeze applies restore's child-window gate too. Control: an in-window child binding
+/// freezes and restores.
+#[test]
+fn freeze_accepts_an_in_window_nested_child_binding() {
+    let m = module();
+    let window = vec![0u8; WINDOW];
+    let host = host_with_nested_child_binding(temen_interp::DurableBinding::AddressSpace {
+        base: 0,
+        size: 1 << 16,
+    });
+    let art = freeze(&m, &window, &host).expect("an in-window child binding must freeze");
+    let mut rhost = Host::new();
+    restore(&art, &m, &mut rhost).expect("and restore");
+}
+
+/// #1700: a child binding outside the child's own window is refused at freeze, where restore would
+/// refuse the artifact (`RestoreError::BindingOutOfWindow`) after the frozen run is gone.
+#[test]
+fn freeze_rejects_an_out_of_window_nested_child_binding() {
+    let m = module();
+    let window = vec![0u8; WINDOW];
+    let host = host_with_nested_child_binding(temen_interp::DurableBinding::AddressSpace {
+        base: 1 << 17,
+        size: 4096,
+    });
+    let r = freeze(&m, &window, &host);
+    assert!(
+        matches!(r, Err(FreezeError::BindingOutOfWindow { slot: 0 })),
+        "an out-of-window child binding must be rejected at freeze: {:?}",
+        r.map(|a| a.len())
+    );
+}
+
+/// #1700: a window smaller than the module's declared memory is refused at freeze, where restore
+/// would refuse the artifact (`GeometryMismatch`). Control: the declared size itself freezes.
+#[test]
+fn freeze_rejects_a_window_smaller_than_the_declared_memory() {
+    let m = module(); // declares 1 << SIZE_LOG2
+    let host = Host::new();
+    assert!(freeze(&m, &vec![0u8; WINDOW], &host).is_ok(), "control");
+    let r = freeze(&m, &vec![0u8; WINDOW / 2], &host);
+    assert!(
+        matches!(r, Err(FreezeError::WindowGeometry(n)) if n == WINDOW / 2),
+        "a window under the declared memory must be rejected at freeze: {:?}",
+        r.map(|a| a.len())
+    );
+}
