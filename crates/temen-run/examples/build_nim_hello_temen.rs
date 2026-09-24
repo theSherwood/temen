@@ -22,7 +22,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    // `[--posix] [--root <tree>] [--native <out-exe>] <src> <out.temen>`.
+    // `[--posix] [--root <tree>] [--native <out-exe>] [--nimcache <dir>] <src> <out.temen>`.
     //
     // `--native` also keeps the **native** binary nimony built from the same source on the way (it
     // runs the whole chain, gcc included): the same compiler, only the target differs. That is the
@@ -35,6 +35,9 @@ fn main() {
     // one `nim_program_closure` matches on. A nimony phase's imports are relative so it cannot be
     // copied to a scratch dir, and running from the file's own directory instead creates a second
     // `nimcache` beside the source and records a path that matches nothing.
+    //
+    // `--nimcache` gives the build a cache of its own instead of `<tree>/nimcache`, which every
+    // in-tree build shares: fine one build after another, a race when several run at once.
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let posix = argv.iter().any(|a| a == "--posix");
     let root = argv
@@ -45,6 +48,10 @@ fn main() {
         .iter()
         .position(|a| a == "--native")
         .and_then(|i| argv.get(i + 1).cloned());
+    let nimcache = argv
+        .iter()
+        .position(|a| a == "--nimcache")
+        .and_then(|i| argv.get(i + 1).cloned());
     let positional: Vec<&String> = {
         let mut skip_next = false;
         argv.iter()
@@ -53,7 +60,7 @@ fn main() {
                     skip_next = false;
                     return false;
                 }
-                if *a == "--root" || *a == "--native" {
+                if *a == "--root" || *a == "--native" || *a == "--nimcache" {
                     skip_next = true;
                     return false;
                 }
@@ -64,7 +71,7 @@ fn main() {
     let [nim, out] = positional.as_slice() else {
         panic!(
             "usage: build_nim_hello_temen [--posix] [--root <tree>] [--native <out-exe>] \
-             <prog.nim> <out.temen>"
+             [--nimcache <dir>] <prog.nim> <out.temen>"
         );
     };
     let (nim, out) = (nim.to_string(), out.to_string());
@@ -91,8 +98,18 @@ fn main() {
     } else {
         format!("{}:{}", prefix.join(":"), path_env)
     };
-    let status = Command::new("nimony")
-        .args(["c", "--isMain"])
+    // nimony resolves a relative `--nimcache:` against its own cwd (`dir`), so it gets the absolute
+    // path the caller meant, relative to ours.
+    let cache = match &nimcache {
+        Some(c) => std::path::absolute(c).unwrap_or_else(|e| panic!("--nimcache {c}: {e}")),
+        None => dir.join("nimcache"),
+    };
+    let mut nimony = Command::new("nimony");
+    nimony.args(["c", "--isMain"]);
+    if nimcache.is_some() {
+        nimony.arg(format!("--nimcache:{}", cache.display()));
+    }
+    let status = nimony
         .arg(file)
         .current_dir(dir)
         .env("PATH", &full_path)
@@ -101,11 +118,11 @@ fn main() {
     assert!(status.success(), "nimony c failed");
 
     let mut mods: Vec<(String, String)> = Vec::new();
-    temen_run::collect_x_nif(&dir.join("nimcache"), &mut mods);
+    temen_run::collect_x_nif(&cache, &mut mods);
     // An **in-tree** build (a nimony phase, whose imports are relative so it cannot be copied to a
     // scratch dir) shares one `nimcache` with every other program built there. Narrow to this
     // program's own closure, or the link sees two `main`s.
-    if let Some(note) = temen_run::nim_program_closure(&dir.join("nimcache"), &nim, &mut mods) {
+    if let Some(note) = temen_run::nim_program_closure(&cache, &nim, &mut mods) {
         // A fallback means the closure belongs to some *other* program. Linking it anyway writes a
         // plausible artifact for the wrong source and reports success — which is what happened the
         // first time this ran: 581 funcs written where nimsem has ~12,725, under the message
@@ -113,7 +130,7 @@ fn main() {
         panic!(
             "{note}\n    `{nim}` names no module in {:?} — refusing to link a different program's \
              closure. For an in-tree source pass `--root <tree> <path-relative-to-tree>`.",
-            dir.join("nimcache")
+            cache
         );
     }
     assert!(
@@ -130,7 +147,7 @@ fn main() {
             .map(|(s, _)| s.as_str())
             .expect("no program module in the closure");
         let name = file.file_stem().expect("nim file stem");
-        let exe = dir.join("nimcache").join(stem).join(name);
+        let exe = cache.join(stem).join(name);
         std::fs::copy(&exe, native).unwrap_or_else(|e| panic!("copy {exe:?} to {native}: {e}"));
         eprintln!("wrote {native} — the same source, as nimony built it natively");
     }
