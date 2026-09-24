@@ -446,6 +446,9 @@ pub(crate) struct Nursery {
     /// the domain closed over its nesting subtree". The interpreter is the reference for durable
     /// nesting; JIT parity is a follow-up.
     durable: AtomicBool,
+    /// #1693 — the run's async freeze controller, if any (set at run entry, like `durable`): each
+    /// durable child registers its window with it, so a request reaches the child mid-run.
+    freeze: Mutex<Option<std::sync::Arc<crate::FreezeController>>>,
     /// This nursery's own §14 domain **task id** — `0` for the root, and a subtree-unique id (from
     /// [`Nursery::task_counter`]) for each nested child's nursery. `instantiate` stamps it as the
     /// recorded child's `parent_task` (DURABILITY.md §4 depth-2), so a thaw can group residue by parent
@@ -581,6 +584,7 @@ impl Nursery {
             grant_parent_domain: std::sync::atomic::AtomicU64::new(0),
             grant_parent_lane_cap: std::sync::atomic::AtomicI64::new(-1),
             durable: AtomicBool::new(false),
+            freeze: Mutex::new(None),
             my_task,
             task_counter,
             frozen_nested_sink,
@@ -980,6 +984,19 @@ impl Nursery {
         self.durable.store(durable, Ordering::Release);
     }
 
+    /// Set the run's async freeze controller (#1693) — see [`Nursery::freeze`].
+    pub(crate) fn set_freeze(&self, fc: Option<std::sync::Arc<crate::FreezeController>>) {
+        *self.freeze.lock().unwrap_or_else(|e| e.into_inner()) = fc;
+    }
+
+    /// The run's async freeze controller, for a durable child to register with (#1693).
+    pub(crate) fn freeze(&self) -> Option<std::sync::Arc<crate::FreezeController>> {
+        self.freeze
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The program a **self** child runs (#1726): the spawning code's own — `self_prog`, an installed
     /// unit's [`UnitProg`], or `0` for this nursery's module-0 program.
     ///
@@ -1255,6 +1272,7 @@ pub(crate) unsafe extern "C" fn instantiate(
             rt.nested_sink(),
             rt.task_counter(),
             &[], // a live `instantiate` re-attaches no frozen residue (that is the thaw path)
+            rt.freeze(),
         ) {
             Ok(outcome) => outcome,
             Err(_) => {

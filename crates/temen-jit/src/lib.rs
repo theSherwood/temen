@@ -1540,6 +1540,46 @@ pub struct FreezeController {
     /// `0` = window not live yet (spin); a live window base; [`STORING`] while a request writes;
     /// [`LANDED`] once it wrote; [`RETIRED`] once the run ended.
     base: AtomicUsize,
+    /// #1693 — the durable §14 children running now, each in its own window: a request rings them
+    /// too (see [`Self::enter_child`]).
+    children: std::sync::Mutex<RungChildren>,
+}
+
+/// [`FreezeController::children`]: the live child window bases (they run synchronously and nested,
+/// so this is a stack) and whether a request has landed.
+#[derive(Default)]
+struct RungChildren {
+    bases: Vec<usize>,
+    requested: bool,
+}
+
+/// Store `UNWINDING` into the durable state word of the window at `base` — what a request does to the
+/// root's window and to each live child's.
+///
+/// # Safety
+/// `base` is a live durable window: `base + STATE_OFF` is in its committed RW control region.
+unsafe fn ring(base: usize) {
+    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above the #1094 NULL
+    // guard). STATE_UNWINDING = 1 (must match `temen-interp` / `temen-durable`). An aligned atomic i32
+    // store the guest's back-edge poll loads (defined under §12 races).
+    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
+    (*(state as *const AtomicI32)).store(1, Ordering::Release);
+}
+
+/// A live durable child's registration with its run's [`FreezeController`]; dropping it deregisters
+/// the window, which must happen before the window is freed.
+pub(crate) struct ChildRing<'a> {
+    fc: &'a FreezeController,
+    base: usize,
+}
+
+impl Drop for ChildRing<'_> {
+    fn drop(&mut self) {
+        let mut c = self.fc.children.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = c.bases.iter().rposition(|&b| b == self.base) {
+            c.bases.remove(i);
+        }
+    }
 }
 
 /// [`FreezeController::base`] while a request's store is in flight.
@@ -1554,6 +1594,7 @@ impl FreezeController {
     pub fn new() -> Arc<Self> {
         Arc::new(FreezeController {
             base: AtomicUsize::new(0),
+            children: std::sync::Mutex::new(RungChildren::default()),
         })
     }
 
@@ -1572,20 +1613,39 @@ impl FreezeController {
                     {
                         continue; // retired meanwhile: the next load says so
                     }
-                    // The durable state word lives at `base + STATE_OFF` (STATE_OFF relocated above
-                    // the #1094 NULL guard). STATE_UNWINDING = 1 (must match `temen-interp` /
-                    // `temen-durable`). An aligned atomic i32 store the guest's back-edge poll loads
-                    // (defined under §12 races).
                     // SAFETY: `base` was the live window and `retire` cannot complete while this
-                    // request holds `STORING`, so the window is mapped; `base + STATE_OFF` is in the
-                    // committed RW durable control region.
-                    let state = base + temen_ir::durable_abi::STATE_OFF as usize;
-                    unsafe { (*(state as *const AtomicI32)).store(1, Ordering::Release) };
+                    // request holds `STORING`, so the window is mapped.
+                    unsafe { ring(base) };
+                    // #1693: then every live durable child, each polling only its own window. The
+                    // root first: a child that unwinds returns into its parent's `instantiate`, whose
+                    // trailing poll must already see the freeze. SAFETY: a registered window is live
+                    // until its `ChildRing` drops, which takes this lock.
+                    let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
+                    c.requested = true;
+                    for &b in &c.bases {
+                        unsafe { ring(b) };
+                    }
+                    drop(c);
                     self.base.store(LANDED, Ordering::Release);
                     return;
                 }
             }
         }
+    }
+
+    /// #1693 — a durable §14 child starts running in its own window at `base`: register it so a
+    /// request rings it too, and if one has already landed, ring it now (it was born `NORMAL` from a
+    /// parent that had not polled yet). The window stays registered until the returned guard drops.
+    ///
+    /// # Safety
+    /// `base` is the child's live durable window, and outlives the returned guard.
+    pub(crate) unsafe fn enter_child(&self, base: usize) -> ChildRing<'_> {
+        let mut c = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        if c.requested {
+            ring(base);
+        }
+        c.bases.push(base);
+        ChildRing { fc: self, base }
     }
 
     /// Run-side: publish the live window base (the run is now blocked in the guest).
@@ -3885,6 +3945,7 @@ impl CompiledModule {
             let t = &*this;
             if let Some(n) = &t._nursery {
                 n.set_durable(t.durable);
+                n.set_freeze(t.freeze_ctl.clone());
             }
         }
         // ---- Setup: references into `*this` live only inside this block. ----
@@ -4097,6 +4158,7 @@ impl CompiledModule {
                         std::sync::Arc::clone(&sink),
                         std::sync::Arc::clone(&counter),
                         &seed, // the full subtree residue — each level re-attaches its own children
+                        n.freeze(),
                     ) {
                         Ok((result, trap, _)) => n.seed_child_result(rec.slot, result, trap),
                         Err(_) => n.seed_child_result(rec.slot, 0, TrapKind::CapFault as i64),
@@ -4992,6 +5054,9 @@ pub(crate) unsafe fn compile_child_and_run(
     nested_sink: std::sync::Arc<std::sync::Mutex<Vec<FrozenNested>>>,
     task_counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     nested_seeds: &[FrozenNested],
+    // #1693 — the run's async freeze controller: the child registers its window with it while it
+    // runs, and hands it to its own nursery for its grandchildren.
+    freeze: Option<std::sync::Arc<FreezeController>>,
 ) -> Result<(i64, i64, bool), JitError> {
     let child_size = 1u64 << child_size_log2; // bounded ≤ MAX by compile_child's reject (audit #3)
 
@@ -5037,6 +5102,7 @@ pub(crate) unsafe fn compile_child_and_run(
             child_shadow,
         ));
         n.set_durable(true); // the subtree is durable — the grandchild `instantiate` re-checks §4
+        n.set_freeze(freeze.clone());
         Some(n)
     } else {
         None
@@ -5107,6 +5173,8 @@ pub(crate) unsafe fn compile_child_and_run(
     const STATE_OFF: usize = temen_ir::durable_abi::STATE_OFF as usize; // global durable state word
     let ctx0_sp_off = child_shadow.region_base(0) as usize;
     let ctx0_thaw_off = child_shadow.thaw_state_off(0) as usize;
+    // Born into a freeze (its parent's window was already `UNWINDING`) — see `unwound` below.
+    let mut born_unwinding = false;
     if durable && (child_size as usize) >= ctx0_thaw_off + 4 {
         let ctx0_frame_base = child_shadow.frame_base(0);
         const STATE_REWINDING: i32 = 2;
@@ -5129,6 +5197,7 @@ pub(crate) unsafe fn compile_child_and_run(
                 i32::from_le_bytes([p[0], p[1], p[2], p[3]])
             };
             w[STATE_OFF..STATE_OFF + 4].copy_from_slice(&parent_phase.to_le_bytes()); // global state = parent's phase
+            born_unwinding = parent_phase == temen_ir::durable_abi::STATE_UNWINDING;
             w[ctx0_thaw_off..ctx0_thaw_off + 4].copy_from_slice(&0i32.to_le_bytes()); // ctx-0 thaw = NORMAL
             w[ctx0_sp_off..ctx0_sp_off + 8].copy_from_slice(&ctx0_frame_base.to_le_bytes());
             // ctx-0 SP
@@ -5178,6 +5247,7 @@ pub(crate) unsafe fn compile_child_and_run(
                     std::sync::Arc::clone(&nested_sink),
                     std::sync::Arc::clone(&task_counter),
                     nested_seeds,
+                    freeze.clone(),
                 );
                 match out {
                     Ok((r, t, _)) => cn.seed_child_result(rec.slot, r, t),
@@ -5203,6 +5273,12 @@ pub(crate) unsafe fn compile_child_and_run(
         durable_shadow::seed(child_shadow.region_base(0));
         s
     });
+    // #1693: the child polls only its own window, so an async freeze must reach it here too.
+    // SAFETY: the window is live until after the ring is dropped below.
+    let ring = freeze
+        .as_ref()
+        .filter(|_| durable)
+        .map(|fc| fc.enter_child(child_base as usize));
     let faulted = mem::run_guarded(
         &child_window,
         code,
@@ -5212,6 +5288,7 @@ pub(crate) unsafe fn compile_child_and_run(
         fn_table_ptr as *const core::ffi::c_void,
         &mut trap_cell,
     );
+    drop(ring);
     if let Some(s) = saved_shadow {
         durable_shadow::seed(s);
     }
@@ -5225,9 +5302,17 @@ pub(crate) unsafe fn compile_child_and_run(
     // (spilled its continuation into the carve + returned a placeholder) instead of completing. Detect
     // it from the carve's state word before the copy-back carries the carve into the parent window.
     // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
-    // A child that trapped did not unwind, even under a freeze: it finished, with that trap.
-    let unwound =
-        durable && !faulted && trap_cell == 0 && fiber_rt::window_is_unwinding(child_base as u64);
+    // A child that trapped did not unwind, even under a freeze: it finished, with that trap. Nor did
+    // one an async request rang after its last poll (#1693): it ran to the end, its shadow stack still
+    // empty, as the root's late-request check reads it. A child born unwinding keeps its rule: it is
+    // recorded, and a thaw re-runs it.
+    let unwound = durable
+        && !faulted
+        && trap_cell == 0
+        && fiber_rt::window_is_unwinding(child_base as u64)
+        && (born_unwinding
+            || fiber_rt::read_shadow_sp(child_base as u64, child_shadow.region_base(0))
+                > child_shadow.frame_base(0));
     // Its own unjoined children ride too (depth-2+).
     if unwound {
         if let Some(n) = &child_nursery {

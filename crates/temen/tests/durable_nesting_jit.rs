@@ -990,3 +990,93 @@ fn jit_freeze_carries_a_trapped_unjoined_grandchilds_trap() {
     let (to, _, _) = run(&twin, seed);
     assert_eq!(to, base, "thaw ≡ uninterrupted");
 }
+
+/// #1693 item 2: an **async** freeze that lands while a durable §14 child runs reaches it. The child
+/// runs synchronously in its own window, so a request that stored `UNWINDING` only into the root's
+/// window was never seen by it: the freeze waited for the child to finish (forever, for a child that
+/// loops). Here the child's loop is long enough that it is still running when the request lands, so
+/// it must be cut mid-loop — captured as a live child, not a finished one — and the thaw must finish
+/// it with the uninterrupted total.
+#[test]
+fn an_async_freeze_reaches_a_running_nested_child() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    const N: i64 = 3_000_000_000;
+    let inst = instrument(&FREEZE_PARENT.replacen(
+        "  v5 = i64.const 100\n",
+        &format!("  v5 = i64.const {N}\n"),
+        1,
+    ));
+    // A request that lands before the root reaches `instantiate` freezes it with no child at all;
+    // that run is not the case under test, so retry it.
+    let mut attempts = 0;
+    let (artifact, nested) = loop {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let ih = h.grant_instantiator(0, WINDOW as u64);
+        let fc = temen_jit::FreezeController::new();
+        let req = std::sync::Arc::clone(&fc);
+        let requester = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            req.request_freeze();
+        });
+        let (_o, artifact, DurableResidue { nested, .. }) = compile_and_run_durable(
+            &inst,
+            0,
+            &[ih as i64],
+            &init_durable_window(WINDOW, TEST_ARENA),
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut h as *mut Host as *mut c_void,
+            DurableRun {
+                freeze: Some(fc),
+                ..Default::default()
+            },
+        )
+        .expect("freeze run compiles");
+        requester.join().expect("requester");
+        if !nested.is_empty() {
+            break (artifact, nested);
+        }
+        attempts += 1;
+        assert!(
+            attempts < 5,
+            "the request never landed after the child's spawn"
+        );
+    };
+    assert_eq!(read_state(&artifact), STATE_UNWINDING, "the run froze");
+    assert_eq!(nested.len(), 1, "one nested child");
+    assert_eq!(
+        nested[0].completed_result, None,
+        "the child was cut mid-loop, not run to completion"
+    );
+
+    let mut twin = artifact.clone();
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let mut ht = Host::new();
+    ht.set_durable(true);
+    let iht = ht.grant_instantiator(0, WINDOW as u64);
+    let (ot, _, _) = compile_and_run_durable(
+        &inst,
+        0,
+        &[iht as i64],
+        &twin,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut ht as *mut Host as *mut c_void,
+        DurableRun {
+            seed: DurableResidue {
+                nested,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .expect("thaw compiles");
+    assert_eq!(
+        ot,
+        JitOutcome::Returned(vec![N * (N - 1) / 2]),
+        "the thaw finishes the loop"
+    );
+}
