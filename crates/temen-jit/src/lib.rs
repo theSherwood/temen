@@ -1624,6 +1624,41 @@ mod freeze_controller_tests {
         assert!(fc.retire(), "retire reports the landed request");
     }
 
+    /// #1693: a run that fails before publishing its window (here a bad entry index) still retires
+    /// its controller, so a request returns rather than spinning for a window that never comes.
+    #[test]
+    fn a_run_that_fails_before_publishing_retires_its_controller() {
+        let m = temen_text::parse_module(
+            "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 0\n  return v0\n  }\n}\n",
+        )
+        .expect("parse");
+        let fc = Arc::new(FreezeController::new());
+        let run = DurableRun {
+            freeze: Some(Arc::clone(&fc)),
+            ..DurableRun::default()
+        };
+        let r = compile_and_run_durable(
+            &m,
+            7,
+            &[],
+            &[],
+            16,
+            empty_cap_thunk,
+            core::ptr::null_mut(),
+            run,
+        );
+        assert!(r.is_err(), "entry 7 does not exist");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            fc.request_freeze();
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "request_freeze returned"
+        );
+    }
+
     #[test]
     fn a_request_after_retire_stores_nothing() {
         let w = window();
