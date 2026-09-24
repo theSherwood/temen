@@ -113,6 +113,14 @@ opt-level = 2
 opt-level = 2
 [profile.test.package.temen-wasm-jit]
 opt-level = 2
+# And every dependency (the `"*"` glob, which is dependencies only): the JIT generates code with
+# Cranelift, so each JIT run in a test first compiles its module through a dependency, and an
+# unoptimized Cranelift takes longer than the run. A 665-function nim program's `run_powerbox` goes
+# **6.0s -> 0.5s**; the `nim_e2e` target 838s -> 293s; a whole `cargo test --workspace` run 7m05s ->
+# 3m04s. Dependencies rebuild only when `Cargo.lock` or the toolchain moves, and CI caches them, so
+# the one cost is ~70s on a cold cache.
+[profile.test.package."*"]
+opt-level = 2
 
 [profile.release]
 opt-level = 3
