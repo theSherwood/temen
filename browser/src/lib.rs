@@ -3827,7 +3827,7 @@ pub fn onramp_exec_with_tee(
         };
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
-        trap: trap.clone(),
+        trap,
         fault_addr: match trap {
             Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr(),
             _ => None,
@@ -11723,8 +11723,8 @@ struct Op13JitDriver {
     child: std::sync::Arc<temen_ir::Module>,
     mem_base: *mut u8,
     layout: Layout,
-    /// Joined child results, indexed by the handle `instantiate` returns (the `join` reads them).
-    children: Vec<Result<Vec<Value>, Trap>>,
+    /// Joined child results, indexed by the handle `instantiate` returns (the `join` takes them).
+    children: Vec<Option<Result<Vec<Value>, Trap>>>,
     /// The driver's final return value (set on `Done`).
     result: i64,
     /// The shared memfs a phase child reads/writes, and the key its output lands at (`nimcache/…p.nif`) —
@@ -12684,7 +12684,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                                 Err(t) => Err(t),
                             };
                             let handle = d.children.len() as i32;
-                            d.children.push(r);
+                            d.children.push(Some(r));
                             d.root.deliver_handle(handle);
                             continue; // the driver's `join` on this handle is serviced inline below
                         }
@@ -12831,7 +12831,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             Err(t) => Err(t),
                         };
                         let handle = d.children.len() as i32;
-                        d.children.push(r);
+                        d.children.push(Some(r));
                         d.root.deliver_handle(handle);
                         continue;
                     }
@@ -12895,11 +12895,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
             bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Join { handle } => {
-                let banked = d
-                    .children
-                    .get(handle as usize)
-                    .cloned()
-                    .unwrap_or(Err(Trap::Malformed));
+                let banked = temen_interp::take_child(&mut d.children, handle).and_then(|r| r);
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
@@ -12995,7 +12991,7 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
         }
     }
     let handle = d.children.len() as i32;
-    d.children.push(Ok(vec![Value::I64(value)]));
+    d.children.push(Some(Ok(vec![Value::I64(value)])));
     d.root.deliver_handle(handle);
     STATUS_OK
 }

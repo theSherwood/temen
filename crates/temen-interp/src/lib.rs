@@ -10563,6 +10563,41 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
     Ok(slot)
 }
 
+/// Join child `handle`: take its entry out of `children` and retire the slot, by the
+/// [`resolve_thread`] rule: a negative handle, or one whose masked slot is spent or was never issued,
+/// is `ThreadFault`. For drivers that
+/// keep their own child table (the browser's op-13 loops) so they answer a join as the oracle does
+/// (#1728).
+pub fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
+    let slot = resolve_thread(children, handle)?;
+    Ok(children[slot]
+        .take()
+        .expect("resolve_thread checked liveness"))
+}
+
+#[cfg(test)]
+mod take_child_tests {
+    //! #1728 — the join rule an embedder's child table gets from [`take_child`].
+    use super::*;
+
+    #[test]
+    fn a_join_takes_the_entry_once() {
+        let mut children = vec![Some('a'), Some('b')];
+        assert_eq!(take_child(&mut children, 1), Ok('b'));
+        assert_eq!(take_child(&mut children, 1), Err(Trap::ThreadFault));
+        assert_eq!(take_child(&mut children, 0), Ok('a'));
+    }
+
+    #[test]
+    fn a_negative_out_of_range_or_empty_handle_is_a_thread_fault() {
+        let mut children = vec![Some('a'), Some('b'), Some('c')];
+        for bad in [-1, i32::MIN, 3, 7] {
+            assert_eq!(take_child(&mut children, bad), Err(Trap::ThreadFault));
+        }
+        assert_eq!(take_child::<char>(&mut [], 0), Err(Trap::ThreadFault));
+    }
+}
+
 /// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
 /// a spawned vCPU borrows nothing from its parent and can run on a detached OS thread (the seam for a
 /// `'static` worker pool). The shared runtime state — thread `budget`, the `parking` lot, the
