@@ -108,8 +108,9 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     };
     assert_eq!(base, vec![4950], "uninterrupted total");
 
-    // Freeze from the start: the parent spawns the child, unwinds at its next poll; the freeze rings
-    // the child's own freeze word and the harvest carries its window + powerbox onto the Host.
+    // Freeze from the start: the parent spawns the child while already unwinding, so the child starts
+    // with its own freeze word set (#1760) and unwinds at its first poll, however its thread is
+    // scheduled; the harvest carries its window + powerbox onto the Host.
     let (mut fhost, fargs) = powerbox(&child);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, STATE_UNWINDING);

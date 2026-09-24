@@ -268,6 +268,14 @@ pub struct TranslateOptions {
     /// program keeps its paramless entry. Only meaningful when a `_start` is synthesized at all (a
     /// program that uses the powerbox); an argv-taking `main` under this mode is not yet supported.
     pub child_entry: bool,
+    /// Lay a module with no `main` out as a powerbox program: its globals start at `stack_page`,
+    /// above the reserved low scratch, as a program with a synthesized `_start`'s do. **Off by
+    /// default**, which keeps an entry-less kernel's globals at the guarded `DATA_BASE`. Set it for a
+    /// library that becomes a powerbox program later, through `temen_ir::synth_manifest_start` or
+    /// `synth_manifest_child_start` (a separately linked runtime): its host seeds the argument blob at
+    /// `module_args_base()` (a top-level run's argv, op 15's payload), which the default layout
+    /// puts inside the library's own globals.
+    pub powerbox_layout: bool,
     /// Reserve a **durable shadow arena** of this many per-context regions and declare it in the
     /// memory descriptor (`memory N shadow BASE END`), making the guest freezable (#1534).
     ///
@@ -294,6 +302,7 @@ impl Default for TranslateOptions {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
             child_entry: false,
+            powerbox_layout: false,
             shadow_contexts: None,
         }
     }
@@ -749,7 +758,7 @@ fn translate_impl(
     // too (`scratch + DATA_BASE`), so `[0, guard)` stays empty and a marker-aware host can seed it
     // unmapped — the same NULL-trap the synthesized-`_start` path already gets. `scratch == 0` leaves
     // the legacy `DATA_BASE` byte-identical.
-    let globals_base = if synth {
+    let globals_base = if synth || opts.powerbox_layout {
         stack_page
     } else {
         scratch + DATA_BASE
@@ -12894,6 +12903,35 @@ fn lower_vm_builtin(
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 13,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
+        // long grants_ptr, long grants_n, long entry, long size_log2, long quota, long args_ptr,
+        // long args_len)` → `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n,
+        // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
+        // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
+        // module's declared memory), not a carve of the spawner's, with the same named-grant records as
+        // `__vm_instantiate` and a spawn-time args payload copied to its `module_args_base()` (length 0
+        // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
+        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
+        "__vm_instantiate_detached" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let args = (1..10)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; 9],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 15,
                 sig,
                 handle,
                 args,

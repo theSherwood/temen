@@ -804,9 +804,9 @@ impl Nursery {
     /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
     /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
     pub(crate) fn join_children(&self, froze: bool) {
-        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind,
-        // runnable ones finish, then the workers are joined.
-        self.child_exec.shutdown_and_join();
+        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
+        // unless this is a freeze the carve children end with the domain; then the workers are joined.
+        self.child_exec.shutdown_and_join(!froze);
         // CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted
         // live-impls hold their own counted refs, so a parent-held offer handle stays valid at the
         // host layer; the run is over regardless). After the joins above, so no child thread still
@@ -899,6 +899,7 @@ impl Nursery {
             types,
             shadow,
             image,
+            prots,
             child: gc,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
@@ -954,6 +955,9 @@ impl Nursery {
                 if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
                     th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
                 }
+                // Its protections as captured (the guard follows, as on every child window).
+                let mapped = rw.len() as u64;
+                w.apply_prots(0, &prots, mapped);
             },
             |_, _, _| true,
             None,
@@ -1927,6 +1931,9 @@ unsafe fn spawn_detached_child(
     // (context 0's shadow-SP word at its frame base) and carries a freeze cell recording `entry`.
     durable: Option<temen_ir::durable_abi::ShadowArena>,
     entry: u32,
+    // #1760 — the parent is already unwinding for a freeze: the child's freeze word starts
+    // `UNWINDING` (see [`init_durable_words`]).
+    parent_freezing: bool,
 ) -> i32 {
     let code = std::sync::Arc::new(code);
     register_serve(rt, gc.ctx, &code);
@@ -1957,7 +1964,7 @@ unsafe fn spawn_detached_child(
                 rw[off..off + s.bytes.len()].copy_from_slice(&s.bytes);
             }
             if let Some(a) = durable {
-                init_durable_words(rw, a);
+                init_durable_words(rw, a, parent_freezing);
             }
             for s in seeds.iter().filter(|s| s.readonly) {
                 w.protect_ro(s.offset, s.bytes.len() as u64);
@@ -2009,13 +2016,24 @@ struct Seed {
 }
 
 /// A fresh durable window's control words, as `temen_durable::init_durable_window` writes them: the
-/// freeze word `NORMAL` and context 0's shadow-SP word at its frame base (the empty stack).
-fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena) {
-    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF};
+/// freeze word (`NORMAL`, unless `freezing`) and context 0's shadow-SP word at its frame base (the
+/// empty stack).
+///
+/// #1760 — a child spawned by a parent that is already unwinding for a freeze starts `UNWINDING`,
+/// as if the freeze's doorbell had rung at its birth: the freeze was requested before the child
+/// existed, so the child freezes at its first poll rather than running on until the parent's
+/// harvest reaches it — how far it got used to depend on how the OS scheduled its thread.
+fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena, freezing: bool) {
+    use temen_ir::durable_abi::{STATE_NORMAL, STATE_OFF, STATE_UNWINDING};
     let s = STATE_OFF as usize;
     let b = a.region_base(0) as usize;
+    let state = if freezing {
+        STATE_UNWINDING
+    } else {
+        STATE_NORMAL
+    };
     if let Some(st) = rw.get_mut(s..s + 4) {
-        st.copy_from_slice(&STATE_NORMAL.to_le_bytes());
+        st.copy_from_slice(&state.to_le_bytes());
     }
     if let Some(sp) = rw.get_mut(b..b + 8) {
         sp.copy_from_slice(&a.frame_base(0).to_le_bytes());
@@ -2270,6 +2288,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         child_size,
         durable.then_some(child_shadow),
         entry as u32,
+        // SAFETY: a durable run's window is live and its first page holds the freeze word.
+        durable && unsafe { crate::fiber_rt::window_is_unwinding(mem_base) },
     )
 }
 

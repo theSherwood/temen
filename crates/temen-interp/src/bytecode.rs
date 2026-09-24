@@ -1412,9 +1412,7 @@ fn admit_detached_child(
     {
         return Ok(None);
     }
-    let mut mem = Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow);
-    mem.init_data(&cdata);
-    mem.seed_null_guard(temen_ir::module_null_guard());
+    let mut mem = Mem::detached(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow, &cdata);
     if !payload.is_empty() {
         let _ = mem.write_bytes(temen_ir::module_args_base(), &payload);
     }
@@ -2887,6 +2885,12 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: std::sync::Arc<super::Region>,
     host: &mut Host,
 ) -> Option<Capture> {
+    // #1694 — the parallel driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a
+    // durable host is outside it: `None`, and the caller runs it where durability is kept, rather
+    // than here silently non-durable.
+    if host.is_durable() {
+        return None;
+    }
     let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
@@ -4114,7 +4118,19 @@ impl<'p> Vcpu<'p> {
 
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
     /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
+    ///
+    ///
+    /// A **durable** host runs durable (#1694): each fiber switch keeps the per-context shadow-SP.
+    /// This driver has no freeze driver, though, so a run that ends frozen with a parked fiber, whose
+    /// continuation only a freeze driver could flatten, fails closed (`FiberFault`) rather than hand
+    /// back an artifact missing it. A freeze with no parked fiber is driven wholly by the IR. The
+    /// cooperative scheduler ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`])
+    /// flattens them.
     pub fn run(&mut self) -> VcpuEvent {
+        let durable = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().is_durable(),
+            None => self.host.is_durable(),
+        };
         // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
         // punts on its host. A cheap flag store per resume.
         match self.shared_host {
@@ -4140,7 +4156,7 @@ impl<'p> Vcpu<'p> {
                 table: &dom.table,
                 fuel: &mut self.fuel,
                 mem: &mut self.mem,
-                durable: false,
+                durable,
                 host: match self.shared_host {
                     Some(m) => HostCell::Shared(m),
                     None => HostCell::Excl(&mut self.host),
@@ -4195,7 +4211,23 @@ impl<'p> Vcpu<'p> {
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
                 | Ok(VcpuStop::Preempted) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
-                Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
+                Ok(VcpuStop::Done(vals)) => {
+                    let froze = durable
+                        && self.mem.as_ref().map(|m| m.durable_state())
+                            == Some(super::STATE_UNWINDING);
+                    let parked = self.fibers.iter().any(|f| {
+                        matches!(
+                            f,
+                            FiberState::Parked { .. }
+                                | FiberState::WaitParked { .. }
+                                | FiberState::CapParked { .. }
+                        )
+                    });
+                    if froze && parked {
+                        return VcpuEvent::Trapped(Trap::FiberFault);
+                    }
+                    return VcpuEvent::Done(vals);
+                }
                 Ok(VcpuStop::TierUp {
                     func,
                     argv,
@@ -5259,13 +5291,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
@@ -5284,6 +5310,24 @@ pub fn compile_and_run_capture_reserved_with_host(
         reserved_log2,
         host,
     )
+}
+
+/// The modules the reserved-window entries refuse before compiling: multi-vCPU `thread.*` and §14
+/// nesting (`Instantiator` calls) — see [`compile_and_run_capture_reserved_with_host`] for why.
+fn outside_reserved_subset(m: &Module) -> bool {
+    m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+        })
+    })
+}
+
+/// Whether this engine runs `m` at all on the reserved-window path — the question a caller that
+/// must not silently fall back to the tree-walker has to ask first (the answer
+/// [`compile_and_run_capture_reserved_with_host`] gives as `None`, after the fact).
+pub fn admits_reserved(m: &Module) -> bool {
+    !outside_reserved_subset(m) && compile_module_for(m).is_some()
 }
 
 /// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
@@ -5315,13 +5359,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
 ) -> Option<Capture> {
     // Same out-of-scope gate as the compile-and-run entry — a cached program from a caller that also
     // holds the module must still refuse the `thread.*`/§14-nesting shapes the freeze path can't drive.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     if func as usize >= compiled.progs.len() {
@@ -9310,7 +9348,15 @@ fn exec_image_build(
     // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
     // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
     let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
-    cur_host.exec_carry(&mut child_host, &cmodule, &cmodule.imports, &cmodule.types)?;
+    let mut starters = [cinst, cas];
+    cur_host.exec_carry(
+        &mut child_host,
+        &cmodule,
+        &cmodule.imports,
+        &cmodule.types,
+        &mut starters,
+    )?;
+    let [cinst, cas] = starters;
     let child_args = child_entry_args(arity, cinst, cas);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
@@ -10025,8 +10071,8 @@ fn shadow_switch(
     }
     let Some(m) = mem.as_mut() else { return };
     // §12.8 4A.5: each context's SP word lives in its own region (root = context 0, fiber slot `s` =
-    // context `s + 1`). (This bytecode durable path is unreachable today — durable hosts always run on
-    // the tree-walker — but kept correct and compiling.)
+    // context `s + 1`). Reached by every durable run on the cooperative scheduler; the drivers that
+    // cannot keep it refuse durable hosts (#1694).
     let arena = m.shadow_arena();
     let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
     let sp = m.durable_get_sp(region_of(out_ctx));
@@ -10041,6 +10087,19 @@ fn shadow_switch(
         fiber_sp[in_ctx]
     };
     m.durable_set_sp(region_of(in_ctx), in_sp);
+    // As the tree-walker's `shadow_switch`: carry the active **thaw** phase from the outgoing context
+    // to the incoming one (a resumer does not flip its own word; the deepest frame's flip to `NORMAL`
+    // propagates back up through the switches), and re-arm an incoming fiber whose restored region
+    // still holds a frame (SP above its frame base: seeded frozen residue not yet rewound) to
+    // `REWINDING` whatever the carried phase. Without the re-arm, a thawed fiber first claimed by
+    // post-rewind `NORMAL` code starts fresh and orphans its spilled frame (#1769: a woken wait then
+    // re-parks instead of delivering its wake).
+    let ctx_of = |ctx: usize| if ctx == ROOT_FIBER { 0 } else { ctx + 1 };
+    let phase = m.durable_thaw_state(ctx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_of(in_ctx), phase);
+    if in_ctx != ROOT_FIBER && in_sp > arena.frame_base(ctx_of(in_ctx)) {
+        m.durable_set_thaw_state(ctx_of(in_ctx), super::STATE_REWINDING);
+    }
 }
 
 /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
@@ -10080,33 +10139,69 @@ fn freeze_drive(
         .as_ref()
         .map(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
+    // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
+    // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
+    // fails the whole freeze closed.
+    if fibers
+        .iter()
+        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
+    {
+        return Err(Trap::FiberFault);
+    }
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
+    // Each park's resume value is delivered first, as the tree-walker's flatten does (#1694): a
+    // suspend park gets the inert placeholder (the thaw redelivers); a woken event park gets its
+    // delivered status or result, which the point's spill reloads at thaw; an unwoken futex park gets
+    // an inert status (the point spills without it, and its thaw arm re-issues the wait, which
+    // re-checks the restored value). Taking the state also takes the waiter: a notify finds waiters
+    // by scanning these states.
     for slot in 0..fibers.len() {
-        let (vm, suspend_dst, consumed) =
-            match std::mem::replace(&mut fibers[slot], FiberState::Done) {
-                FiberState::Parked {
-                    vm,
-                    suspend_dst,
-                    consumed,
-                } => (vm, suspend_dst, consumed),
-                other => {
-                    fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
-                    continue;
-                }
-            };
+        let (vm, consumed) = match std::mem::replace(&mut fibers[slot], FiberState::Done) {
+            FiberState::Parked {
+                mut vm,
+                suspend_dst,
+                consumed,
+            } => {
+                vm.set(suspend_dst, Reg::from_i64(0));
+                (vm, consumed)
+            }
+            FiberState::WaitParked {
+                mut vm,
+                wait_dst,
+                woken,
+                ..
+            } => {
+                vm.set(
+                    wait_dst,
+                    Reg::from_i32(woken.unwrap_or(temen_ir::durable_abi::WAIT_FROZEN)),
+                );
+                (vm, false)
+            }
+            FiberState::CapParked {
+                mut vm,
+                dst,
+                woken: Some(r),
+                ..
+            } => {
+                vm.set(dst, Reg::from_i64(r));
+                (vm, false)
+            }
+            other => {
+                fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
+                continue;
+            }
+        };
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(arena.region_base(slot + 1), arena.frame_base(slot + 1));
         }
-        // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
-        // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
-        // suspend). `step_vcpu` runs the active `Vm` to completion in one call, and the unwind does no
-        // fiber/thread ops, so the run-shared registries are untouched and the only stop is `Done`.
-        let mut vm = vm;
-        vm.set(suspend_dst, Reg::from_i64(0));
+        // Drive the fiber to its base return under `UNWINDING` (zero forward progress: the poll fires
+        // immediately after the park). `step_vcpu` runs the active `Vm` to completion in one call, and
+        // the unwind does no fiber/thread ops, so the run-shared registries are untouched and the only
+        // stop is `Done`.
         let mut sub = VTask {
             active: vm,
             active_id: ROOT_FIBER,

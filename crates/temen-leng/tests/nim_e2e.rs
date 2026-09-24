@@ -1818,10 +1818,17 @@ fn real_unsigned_32bit_halves_match_native() {
 // The nim differential corpus.
 // ---------------------------------------------------------------------------
 
-/// Run `src` with the **native** toolchain (`nimony c --isMain --run`) and return what it printed —
-/// the oracle. `Err` carries the compiler's own diagnostic, so a corpus program outside nimony's
-/// subset says so rather than looking like a Temen failure.
-fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String> {
+/// Build and run `src` with the **native** toolchain (`nimony c --isMain --run`), returning what it
+/// printed — the oracle — and every module's Leng (`.x.nif`). The native binary is lowered from those
+/// same `.x.nif` files (hexer → dce → lengc → cc), so the Temen run starts from exactly the frontend
+/// output the oracle was built from, and each case is compiled once rather than once per side.
+/// `Err` carries the compiler's own diagnostic, so a corpus program outside nimony's subset says so
+/// rather than looking like a Temen failure.
+fn native_build(
+    nim_path: &str,
+    name: &str,
+    src: &str,
+) -> Result<(String, Vec<(String, String)>), String> {
     let dir = std::env::temp_dir().join(format!("temen_nim_diff_n_{}_{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1832,6 +1839,8 @@ fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String
         .env("PATH", nim_path)
         .output()
         .map_err(|e| e.to_string())?;
+    let mut mods = Vec::new();
+    collect_x_nif(&dir.join("nimcache"), &mut mods);
     let _ = std::fs::remove_dir_all(&dir);
     if !out.status.success() {
         return Err(format!(
@@ -1844,18 +1853,9 @@ fn native_output(nim_path: &str, name: &str, src: &str) -> Result<String, String
                 .join(" | ")
         ));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok((String::from_utf8_lossy(&out.stdout).into_owned(), mods))
 }
 
-/// Run `src` on **Temen**: the real toolchain to Leng, `link_nim_powerbox` against the guest libc,
-/// then `_start` under the standard powerbox. Returns what the program printed **and how the run
-/// ended**. Every failure mode (nimony, link, verify, trap) comes back as `Err` with its reason, so
-/// the differential reports *where* a program diverged rather than panicking on the first one.
-///
-/// The outcome is returned alongside the bytes because a program that produces no output has told
-/// you nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing),
-/// `Exited(127)` (panicked through `cAbort`) and a trap are three different bugs that a bare `""`
-/// renders identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
 /// `NIM_DIFF_DUMP=<dir>` writes the linked module as text next to its bound import list. A program
 /// that runs cleanly and prints nothing gives the Nim side no way to say why; reading the generated
 /// IR for the write path is what found the dropped-`scope` miscompile, after a day of bisecting from
@@ -1895,13 +1895,20 @@ fn import_sig_dbg(
     }
 }
 
+/// Run a program's Leng on **Temen**: `link_nim_powerbox` against the guest libc, then `_start`
+/// under the standard powerbox. Returns what the program printed **and how the run ended**. Every
+/// failure mode (link, verify, trap) comes back as `Err` with its reason, so the differential
+/// reports *where* a program diverged rather than panicking on the first one.
+///
+/// The outcome is returned alongside the bytes because a program that produces no output has told
+/// you nothing about *why*: `Returned([I32(0)])` (ran to completion and printed nothing),
+/// `Exited(127)` (panicked through `cAbort`) and a trap are three different bugs that a bare `""`
+/// renders identical. That ambiguity is what made the v0.6.2 empty-output blocker expensive.
 fn temen_output(
-    nim_path: &str,
     libc: &[u8],
     name: &str,
-    src: &str,
+    mods: &[(String, String)],
 ) -> Result<(String, String), String> {
-    let mods = try_compile_to_leng(nim_path, name, src)?;
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
@@ -1927,8 +1934,8 @@ fn temen_output(
     ))
 }
 
-/// **The nim differential corpus** — every `tests/nim_diff/*.nim` compiled and run twice, on Temen and
-/// on native nimony, with the two outputs diffed byte for byte.
+/// **The nim differential corpus** — every `tests/nim_diff/*.nim` built once by native nimony and run
+/// twice, natively and on Temen, with the two outputs diffed byte for byte.
 ///
 /// This exists because the wrong-answer bugs keep being found by accident. `$3.14` printing
 /// `17.966570549813729` (#1472) sat in `main` behind a suite that only ever asserted `formatFloat`;
@@ -1954,8 +1961,8 @@ fn nim_differential_corpus() {
     let mut cases = nim_cases(dir);
     assert!(!cases.is_empty(), "no corpus programs in {dir:?}");
     // `NIM_DIFF_ONLY=a,b,c` narrows the run to a few cases. The full corpus drives the whole
-    // toolchain twice per case (native oracle + temen), so chasing one divergence over the whole
-    // corpus costs ~30 min of wall clock to reach the case you care about. Filtering here — rather
+    // toolchain for every case (native oracle + temen), so chasing one divergence over the whole
+    // corpus costs minutes of wall clock to reach the case you care about. Filtering here — rather
     // than in a hand-rolled probe harness — keeps the one code path: the case runs under exactly the
     // driver that reports it, oracle comparison included.
     let only = std::env::var("NIM_DIFF_ONLY").unwrap_or_default();
@@ -1993,73 +2000,102 @@ fn nim_differential_corpus() {
         Vec::new()
     };
 
-    let mut failures: Vec<String> = Vec::new();
-    for case in &cases {
-        let name = case.file_stem().unwrap().to_string_lossy().to_string();
-        let src = std::fs::read_to_string(case).expect("read case");
-        // Announce the case **before** running it, and time it. Reporting only on success makes a
-        // slow or non-terminating case invisible: the suite just stops producing output, which reads
-        // as "hung on the first case" no matter which case it actually is. That cost real debugging
-        // time on the v0.6.2 bump.
-        eprintln!("  {name}: …");
-        let started = std::time::Instant::now();
-        let want = match native_output(&path, &name, &src) {
-            Ok(s) => s,
-            // Outside nimony's own subset: the corpus program is wrong, not Temen. Say so loudly —
-            // a case that never runs natively silently tests nothing.
-            Err(e) => {
-                failures.push(format!("{name}: does not run under native nimony — {e}"));
-                continue;
-            }
-        };
-        match temen_output(&path, &libc, &name, &src) {
-            // The bytes are only half the answer. `native_output` rejects a program that exits
-            // non-zero natively, so every corpus case ends cleanly on the oracle — a Temen run that
-            // ends any other way has diverged even when it printed the right bytes. `Exited(127)` is
-            // what a nim panic looks like once `cAbort` reaches the stubbed `kill`, and a program
-            // that panics after printing its output would otherwise pass.
-            Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => failures.push(
-                format!("{name}: output matches but the run ended {outcome} (native exits 0)"),
-            ),
-            Ok((got, _)) if got == want => {
-                eprintln!(
-                    "  {name}: ok in {}ms ({:?})",
-                    started.elapsed().as_millis(),
-                    elide(&got)
-                )
-            }
-            Ok((got, outcome)) => failures.push(format!(
-                "{name}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
-                elide(&got),
-                elide(&want)
-            )),
-            Err(e) => failures.push(format!("{name}: {e}  (native prints {:?})", elide(&want))),
+    // Every case is independent — its own temp directory, build and run — so the cases share out
+    // across the cores. Run one after another, they were most of the `nim-e2e` CI job's wall clock.
+    let work: Vec<(&std::path::Path, bool)> = cases
+        .iter()
+        .map(|c| (c.as_path(), false))
+        .chain(gaps.iter().map(|g| (g.as_path(), true)))
+        .collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..std::thread::available_parallelism().map_or(1, |n| n.get()) {
+            s.spawn(|| {
+                while let Some(&(case, known_gap)) =
+                    work.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                {
+                    if let Some(f) = corpus_case(&path, &libc, case, known_gap) {
+                        failures.lock().unwrap().push(f);
+                    }
+                }
+            });
         }
-    }
-    for case in &gaps {
-        let name = case.file_stem().unwrap().to_string_lossy().to_string();
-        let src = std::fs::read_to_string(case).expect("read case");
-        let Ok(want) = native_output(&path, &name, &src) else {
-            failures.push(format!(
-                "known_gaps/{name}: does not run under native nimony either"
-            ));
-            continue;
-        };
-        match temen_output(&path, &libc, &name, &src) {
-            Ok((got, _)) if got == want => failures.push(format!(
-                "known_gaps/{name}: NOW MATCHES native — the gap is fixed. Move it into \
-                 tests/nim_diff/ and close the issue named in its header."
-            )),
-            Ok(_) | Err(_) => eprintln!("  known_gaps/{name}: still diverges (expected)"),
-        }
-    }
+    });
+    let mut failures = failures.into_inner().unwrap();
+    failures.sort();
     assert!(
         failures.is_empty(),
         "{} of {} corpus programs diverged from native nimony:\n  - {}",
         failures.len(),
-        cases.len() + gaps.len(),
+        work.len(),
         failures.join("\n  - ")
     );
+}
+
+/// One corpus program, native nimony against Temen: `None` when the two agree — or, for a
+/// `known_gaps/` program, when they still disagree as expected — else the failure to report.
+fn corpus_case(
+    nim_path: &str,
+    libc: &[u8],
+    case: &std::path::Path,
+    known_gap: bool,
+) -> Option<String> {
+    let name = case.file_stem().unwrap().to_string_lossy().to_string();
+    let src = std::fs::read_to_string(case).expect("read case");
+    if known_gap {
+        let Ok((want, mods)) = native_build(nim_path, &name, &src) else {
+            return Some(format!(
+                "known_gaps/{name}: does not run under native nimony either"
+            ));
+        };
+        return match temen_output(libc, &name, &mods) {
+            Ok((got, _)) if got == want => Some(format!(
+                "known_gaps/{name}: NOW MATCHES native — the gap is fixed. Move it into \
+                 tests/nim_diff/ and close the issue named in its header."
+            )),
+            Ok(_) | Err(_) => {
+                eprintln!("  known_gaps/{name}: still diverges (expected)");
+                None
+            }
+        };
+    }
+    // Announce the case **before** running it, and time it. Reporting only on success makes a slow
+    // or non-terminating case invisible: the suite just stops producing output, which reads as "hung
+    // on the first case" no matter which case it actually is. That cost real debugging time on the
+    // v0.6.2 bump.
+    eprintln!("  {name}: …");
+    let started = std::time::Instant::now();
+    let (want, mods) = match native_build(nim_path, &name, &src) {
+        Ok(built) => built,
+        // Outside nimony's own subset: the corpus program is wrong, not Temen. Say so loudly — a
+        // case that never runs natively silently tests nothing.
+        Err(e) => return Some(format!("{name}: does not run under native nimony — {e}")),
+    };
+    match temen_output(libc, &name, &mods) {
+        // The bytes are only half the answer. `native_build` rejects a program that exits non-zero
+        // natively, so every corpus case ends cleanly on the oracle — a Temen run that ends any
+        // other way has diverged even when it printed the right bytes. `Exited(127)` is what a nim
+        // panic looks like once `cAbort` reaches the stubbed `kill`, and a program that panics after
+        // printing its output would otherwise pass.
+        Ok((got, outcome)) if got == want && !is_clean_exit(&outcome) => Some(format!(
+            "{name}: output matches but the run ended {outcome} (native exits 0)"
+        )),
+        Ok((got, _)) if got == want => {
+            eprintln!(
+                "  {name}: ok in {}ms ({:?})",
+                started.elapsed().as_millis(),
+                elide(&got)
+            );
+            None
+        }
+        Ok((got, outcome)) => Some(format!(
+            "{name}: OUTPUT DIFFERS ({outcome})\n       temen: {:?}\n      native: {:?}",
+            elide(&got),
+            elide(&want)
+        )),
+        Err(e) => Some(format!("{name}: {e}  (native prints {:?})", elide(&want))),
+    }
 }
 
 /// Did the Temen run end the way a normally-terminating program does — `main` returning 0, or an
@@ -2265,35 +2301,43 @@ fn nim_shells_out_through_the_posix_sh() {
          except:\n\
          \x20 write(stdout, \"parent:\" & $rc & \"|no file\")\n",
     );
-    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-        std::sync::Arc::new(make);
-    let run = temen_run::nim_noc_run_with_commands(
-        parent,
-        &posix,
-        make,
-        &["parent".to_string()],
-        &[
-            ("/bin/sh".to_string(), posix_sh()),
-            ("bin/child".to_string(), child),
-        ],
-    );
-    let crashed = temen_interp::last_twin_traps();
-    assert!(
-        crashed.is_empty(),
-        "a command crashed:\n{}",
-        crashed
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert_eq!(run, Ok(()), "the parent ran to completion");
-    assert_eq!(
-        String::from_utf8_lossy(&posix.stdout()),
-        "child:hi|parent:3|from hi",
-        "the shell became the child; the parent reaped the child's own status and read its file"
-    );
+    // Both interpreters: the tree-walker is the oracle, and the bytecode engine must agree — its
+    // exec path used to refuse a nim `_start` the tree-walker admitted (one rule now, #1668).
+    let sh = posix_sh();
+    for engine in [temen_run::Backend::TreeWalk, temen_run::Backend::Bytecode] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+            std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &[
+                ("/bin/sh".to_string(), sh.clone()),
+                ("bin/child".to_string(), child.clone()),
+            ],
+            engine,
+        );
+        // The twin-trap record is the tree-walker's (#1665); a bytecode crash shows in the output.
+        let crashed = temen_interp::last_twin_traps();
+        assert!(
+            engine != temen_run::Backend::TreeWalk || crashed.is_empty(),
+            "{engine:?}: a command crashed:\n{}",
+            crashed
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "child:hi|parent:3|from hi",
+            "{engine:?}: the shell became the child; the parent reaped the child's own status and \
+             read its file"
+        );
+    }
 }
 
 /// #1668 — **a nim program forks and execs a nim program**, the shape every nimony compiler phase
@@ -2356,12 +2400,13 @@ fn nim_forks_and_execs_a_nim_program() {
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
     let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
         std::sync::Arc::new(make);
-    let run = temen_run::nim_noc_run_with_commands(
+    let run = temen_run::nim_noc_run(
         parent,
         &posix,
         make,
         &["parent".to_string()],
         &[("/bin/child".to_string(), child)],
+        temen_run::Backend::TreeWalk,
     );
     assert_eq!(run, Ok(()), "the parent ran to completion");
     assert_eq!(
