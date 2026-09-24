@@ -15961,7 +15961,10 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 };
                 // Validate the entry against the *child module* and the carve; a separate-module
                 // child's carve must equal its declared memory (§14 transparency).
-                let arity = child_compiled.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
+                let arity = child_compiled
+                    .sigs
+                    .get(entry as usize)
+                    .map_or(0, |(p, _)| p.len());
                 let ok_entry = child_compiled
                     .sigs
                     .get(entry as usize)
