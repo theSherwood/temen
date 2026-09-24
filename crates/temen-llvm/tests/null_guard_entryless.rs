@@ -3,11 +3,16 @@
 //! an entry-less module's globals sat at `DATA_BASE` (16) — *inside* the would-be guard region — so it
 //! could never be seeded `Unmapped`.
 //!
-//! This pins the fix: an entry-less module bases its globals one guard up (`scratch + DATA_BASE`),
-//! leaving `[0, guard)` empty, so a host seeds the reserved region `Unmapped` and a NULL dereference
-//! traps — exactly like the `_start` path, and **unconditionally** (#1094 — the one canonical layout;
-//! no `__null_guard` marker export needed). No clang: the fixture is inline textual LLVM IR, so this
-//! runs in every job.
+//! This pins the fix: an entry-less module leaves `[0, guard)` empty, so a host seeds the reserved
+//! region `Unmapped` and a NULL dereference traps — exactly like the `_start` path, and
+//! **unconditionally** (#1094 — the one canonical layout; no `__null_guard` marker export needed).
+//!
+//! #1777 took the same step for the rest of the low scratch: an entry-less unit's globals start at
+//! the globals base every module uses (`stack_page`), not one guard up. An entry-less *library* (a
+//! language runtime) is linked with a program and wrapped by `synth_manifest_start`, whose `_start`
+//! seeds the heap words at `guard + 32/40` and whose host seeds the §3e args blob at `guard + 128` —
+//! both used to land on the library's globals. No clang: the fixture is inline textual LLVM IR, so
+//! this runs in every job.
 
 use temen_interp::Value;
 
@@ -64,6 +69,13 @@ fn entryless_kernel_is_guarded_and_keeps_the_null_region_empty() {
         kernel.data.iter().all(|d| d.offset >= guard),
         "no data segment intrudes on [0, {guard})"
     );
+    // ...and so is the low scratch above it (#1777): the heap words, the durable control words and
+    // the args blob a host seeds there never land on a global.
+    let scratch_end = guard + temen_ir::POWERBOX_ARGS_END;
+    assert!(
+        kernel.data.iter().all(|d| d.offset >= scratch_end),
+        "no data segment intrudes on the low scratch [{guard}, {scratch_end})"
+    );
 
     // Behavior: the shift is pure relocation — `tick(x) = g + x = 100 + x`. The interpreter sets up
     // the module's own window and applies its baked data (the `g = 100` initializer); `tick` takes the
@@ -91,4 +103,56 @@ fn entryless_kernel_is_guarded_and_keeps_the_null_region_empty() {
             "guarded tick({x}) — shifted layout, same value"
         );
     }
+}
+
+/// An entry-less **library** in the shape of a language runtime: a zero-initialized table (BSS — no
+/// data segment, so the layout assertion above cannot see it) and a function that reads it back.
+const LIBRARY: &str = r#"
+@table = global [256 x i64] zeroinitializer
+
+define i64 @table_or() {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i1, %loop ]
+  %acc = phi i64 [ 0, %entry ], [ %a1, %loop ]
+  %p = getelementptr [256 x i64], ptr @table, i64 0, i64 %i
+  %v = load i64, ptr %p
+  %a1 = or i64 %acc, %v
+  %i1 = add i64 %i, 1
+  %c = icmp ult i64 %i1, 256
+  br i1 %c, label %loop, label %done
+done:
+  ret i64 %a1
+}
+"#;
+
+/// #1777: wrapped as a powerbox program by `synth_manifest_start` — the way a language runtime is run
+/// once linked with its program — and given argv + env, the library's zeroed globals stay zero. The
+/// host seeds the §3e args blob at `guard + 128`; with the old entry-less base (`guard + 16`) the
+/// 2 KiB table sat under it, and the run read the blob's bytes back as the table's contents.
+#[test]
+fn an_entryless_librarys_globals_survive_a_seeded_args_blob() {
+    let t =
+        temen_llvm::translate_ll_str_with_options(LIBRARY, temen_llvm::TranslateOptions::default())
+            .expect("translate library");
+    let entry = t
+        .module
+        .resolve_export("table_or")
+        .expect("table_or export");
+    let program = temen_ir::synth_manifest_start(t.module, entry, false).expect("powerbox wrap");
+    let cfg = temen_run::RunConfig {
+        args: vec![b"prog".to_vec(), b"an-argument".to_vec()],
+        env: vec![b"KEY=a-value-long-enough-to-matter".to_vec()],
+        ..Default::default()
+    };
+    let run = temen_run::instantiate(program)
+        .expect("instantiate")
+        .run_diff(&cfg)
+        .expect("run (interp == JIT)");
+    assert_eq!(
+        run.outcome,
+        temen_run::Outcome::Returned(vec![Value::I64(0)]),
+        "the library's zeroed table must read back zero: seeding argv/env may not reach a global"
+    );
 }

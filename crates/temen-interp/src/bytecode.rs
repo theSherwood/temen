@@ -2316,9 +2316,12 @@ fn compile_inst(
 
 /// Build the linear-memory window from `m`'s memory declaration + data segments, exactly like
 /// [`crate::run`] (a module with no memory yields `None`).
-fn build_mem(m: &Module) -> Option<Mem> {
+/// `m`'s window: `init_mem` seeded at offset 0 (the §3e args/env blob a host places at
+/// `module_args_base()`; empty for none), then `m`'s data segments over it, then the NULL guard.
+fn build_mem(m: &Module, init_mem: &[u8]) -> Option<Mem> {
     m.memory.map(|mc| {
         let mut mm = Mem::with_reservation(DEFAULT_RESERVED_LOG2, mc.size_log2, mc.shadow);
+        mm.seed(init_mem);
         mm.init_data(&m.data);
         mm.seed_null_guard(temen_ir::module_null_guard()); // #964
         mm
@@ -2352,6 +2355,22 @@ pub fn compile_and_run_with_host(
     fuel: &mut u64,
     host: &mut Host,
 ) -> Option<Result<Vec<Value>, Trap>> {
+    compile_and_run_seeded_with_host(m, func, args, fuel, &[], host)
+}
+
+/// [`compile_and_run_with_host`] over a window whose low bytes are first seeded with `init_mem` — the
+/// §3e args/env blob at `temen_ir::module_args_base()`, laid out as `temen-run`'s `RunConfig` seeds it
+/// for the other tiers. Unlike the durable [`compile_and_run_capture_reserved_with_host`] seam, this
+/// drives everything the plain run does (`thread.*` included), so a threaded on-ramp guest can be given
+/// an environment.
+pub fn compile_and_run_seeded_with_host(
+    m: &Module,
+    func: FuncIdx,
+    args: &[Value],
+    fuel: &mut u64,
+    init_mem: &[u8],
+    host: &mut Host,
+) -> Option<Result<Vec<Value>, Trap>> {
     let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some(Err(Trap::Malformed));
@@ -2362,7 +2381,7 @@ pub fn compile_and_run_with_host(
     // Size the dispatch table to the granted `Jit` table reservation (matching the tree-walker's
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, init_mem);
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
@@ -2410,7 +2429,7 @@ pub fn compile_and_run_with_host_traced(
         return Some((Err(Trap::Malformed), Vec::new(), None));
     }
     let dom = Domain::new(c, host.jit_table_log2());
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, &[]);
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
         Err(e) => return Some((Err(e), Vec::new(), None)),
@@ -3030,7 +3049,7 @@ impl Reactor {
         Some(Reactor {
             source: std::sync::Arc::new(ModuleSource::new(c)),
             n_funcs,
-            mem: build_mem(m),
+            mem: build_mem(m, &[]),
         })
     }
 
@@ -5410,7 +5429,7 @@ pub fn ir_trace(m: &Module, func: FuncIdx, args: &[Value], fuel: &mut u64) -> Op
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -5459,7 +5478,7 @@ pub fn ir_window_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -5526,7 +5545,7 @@ pub fn ir_value_trace(
         return Some((Vec::new(), Err(Trap::Malformed)));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, &[]);
     let mut host = Host::new();
     let mut vm = match Vm::new(&dom.source.primary(), func as usize, args) {
         Ok(v) => v,
@@ -8153,7 +8172,7 @@ impl ScheduledDebugRun {
         let c = compile_module_unfused(&m.funcs, &m.types, m.memory.and_then(|x| x.shadow))?; // unfused: debug stepping (Slice 5a)
         let table = SharedSlots::new(c.progs.len(), host.jit_table_log2(), 0);
         let source = std::sync::Arc::new(ModuleSource::over(std::sync::Arc::new(c)));
-        let mem = build_mem(m);
+        let mem = build_mem(m, &[]);
         let vt = VTask::new(&source.primary(), func as usize, args).ok()?;
         Some(ScheduledDebugRun {
             source,
@@ -9263,7 +9282,7 @@ pub fn compile_and_run_sliced(
         return Some(Err(Trap::Malformed));
     }
     let dom = Domain::new(c, 0);
-    let mut mem = build_mem(m);
+    let mut mem = build_mem(m, &[]);
     let mut host = Host::new();
     Some(drive(
         dom,
@@ -10085,6 +10104,19 @@ fn shadow_switch(
         fiber_sp[in_ctx]
     };
     m.durable_set_sp(region_of(in_ctx), in_sp);
+    // As the tree-walker's `shadow_switch`: carry the active **thaw** phase from the outgoing context
+    // to the incoming one (a resumer does not flip its own word; the deepest frame's flip to `NORMAL`
+    // propagates back up through the switches), and re-arm an incoming fiber whose restored region
+    // still holds a frame (SP above its frame base: seeded frozen residue not yet rewound) to
+    // `REWINDING` whatever the carried phase. Without the re-arm, a thawed fiber first claimed by
+    // post-rewind `NORMAL` code starts fresh and orphans its spilled frame (#1769: a woken wait then
+    // re-parks instead of delivering its wake).
+    let ctx_of = |ctx: usize| if ctx == ROOT_FIBER { 0 } else { ctx + 1 };
+    let phase = m.durable_thaw_state(ctx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_of(in_ctx), phase);
+    if in_ctx != ROOT_FIBER && in_sp > arena.frame_base(ctx_of(in_ctx)) {
+        m.durable_set_thaw_state(ctx_of(in_ctx), super::STATE_REWINDING);
+    }
 }
 
 /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
@@ -10158,7 +10190,10 @@ fn freeze_drive(
                 woken,
                 ..
             } => {
-                vm.set(wait_dst, Reg::from_i32(woken.unwrap_or(0)));
+                vm.set(
+                    wait_dst,
+                    Reg::from_i32(woken.unwrap_or(temen_ir::durable_abi::WAIT_FROZEN)),
+                );
                 (vm, false)
             }
             FiberState::CapParked {
@@ -14402,7 +14437,7 @@ impl CoopRun {
         tierup: Option<TierUpConfig>,
     ) -> Option<Result<CoopRun, Trap>> {
         // A fresh engine-sized window built from `m`'s declaration + data (the native/test path).
-        Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m))
+        Self::assemble(m, entry, args, fuel, host, tierup, build_mem(m, &[]))
     }
 
     /// Like [`new`](Self::new), but the linear-memory window is built **over a caller-provided

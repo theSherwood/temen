@@ -1,7 +1,8 @@
 # The nim differential corpus
 
-Each `.nim` file here is compiled and run **twice** — once on Temen, once by native `nimony c --run` —
-and the two outputs are diffed byte for byte by `nim_differential_corpus` in `../nim_e2e.rs`.
+Each `.nim` file here is built once by native `nimony c --run` and run **twice** — natively, and on
+Temen from that build's Leng — and the two outputs are diffed byte for byte by
+`nim_differential_corpus` in `../nim_e2e.rs`.
 
 **Adding a case is adding a file.** There is no expected value to write down: the native toolchain is
 the oracle, so a case cannot bake in a wrong constant, and a case that stops compiling natively is

@@ -7250,7 +7250,8 @@ fn admit_parks_for_freeze(s: &mut Sched) {
                 Waiter::VCpu(mut v) => {
                     v.wait_indefinite = false;
                     v.dstate = STATE_UNWINDING;
-                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                    // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                    v.pending = Some(Pending::Wait(temen_ir::durable_abi::WAIT_FROZEN));
                     s.runnable.push_back(v);
                 }
                 fiber @ Waiter::Fiber { .. } => {
@@ -11384,16 +11385,17 @@ impl VCpu {
         }
         // §13.4 step 2 — flatten the event-parked fibers (classified above): a woken park's
         // frames already carry its delivered result (no placeholder — the point's spill reloads
-        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and an
-        // inert status is delivered — the `MemoryWait` point spills `out − nres` (the status is
-        // never captured) and its thaw arm re-issues the wait, which re-checks the restored
-        // guest value (the O10 re-issue rule turned inward).
+        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and the
+        // freeze's `WAIT_FROZEN` is delivered — the `MemoryWait` point spills it, and its thaw arm
+        // re-issues exactly such a wait, which re-checks the restored guest value (the O10
+        // re-issue rule turned inward; #1769).
         while let Some((slot, frames, woken)) = self.registry.take_blocked_for_freeze() {
             let placeholder = if woken {
                 None
             } else {
                 self.sched.purge_fiber_wait_park(&self.registry, slot);
-                Some(Reg::from_i32(0))
+                // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN))
             };
             self.flatten_fiber_for_freeze(slot, frames, placeholder)?;
         }
@@ -21558,6 +21560,12 @@ impl Host {
         // guest that compiles code can spawn a confined copy of itself that can too — the Forth
         // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
         // is what confers the authority; this list only lets the child's manifest *reach* it.
+        // `vm_region_create` (AddressSpace op 5): a child already holds its own `AddressSpace`, whose
+        // op 5 mints a fresh §13/§14 region (per-region anti-bomb cap, `MAX_MINTED_REGION`) — so a
+        // guest can already do this through a dynamic `call.cap`. Listing the name lets a child's
+        // *manifest* reach it: a separately-compiled runtime (JACL's, whose channels create regions)
+        // imports it as `Required`, and without this such a runtime fails closed at spawn even when
+        // the child never mints. Binds to the child's own `AddressSpace` (`first_of`), as `vm_map` does.
         // `stream_write`/`stream_read` are the *same two caps* as `write`/`read` — the frontend's raw
         // stream spelling (`__vm_stream_write`/`__vm_stream_read`), which `default_cap_resolver` maps
         // onto the identical `(type_id, op)` and handle. They are listed because this table is keyed by
@@ -21575,6 +21583,7 @@ impl Host {
             "vm_unmap",
             "vm_protect",
             "vm_page_size",
+            "vm_region_create",
             "vm_jit_compile",
             "vm_jit_compile_linked",
             "vm_jit_invoke2",

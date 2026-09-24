@@ -738,22 +738,21 @@ fn translate_impl(
             break;
         }
     }
-    // Globals live low (from `DATA_BASE`); the data stack starts just above them. For a powerbox
-    // program the writable **handle stash + allocator/format state** occupies the reserved low scratch
-    // (page 0, below `STACK_PAGE`), so start the globals one page up (`STACK_PAGE`): a *read-only*
-    // global (D40, protected page-granularly) must never share a page with the stash, or `_start`'s
-    // handle stores would fault on the read-only page (the same page-isolation the data stack gets).
+    // Globals start at `stack_page`, above the whole reserved low scratch `[guard, guard +
+    // POWERBOX_ARGS_END)` — the durable control words, the heap words `synth_manifest_start` seeds,
+    // the format buffer and the §3e args blob a host seeds — and the data stack starts just above
+    // them. A read-only global (D40, protected page-granularly) also never shares a page with that
+    // writable scratch.
     //
-    // #964/#1094: an **entry-less** kernel (no `_start` — a reactor `tick`) has no reserved scratch, so
-    // its globals start at `DATA_BASE`. Under the guard (`scratch > 0`) shift that base up by the guard
-    // too (`scratch + DATA_BASE`), so `[0, guard)` stays empty and a marker-aware host can seed it
-    // unmapped — the same NULL-trap the synthesized-`_start` path already gets. `scratch == 0` leaves
-    // the legacy `DATA_BASE` byte-identical.
-    let globals_base = if synth {
-        stack_page
-    } else {
-        scratch + DATA_BASE
-    };
+    // This holds for an **entry-less** unit too (#1777), not only one whose `_start` is synthesized
+    // here: "entry-less" says nothing about the final program. A library unit (a language runtime)
+    // is linked with a program and wrapped by `synth_manifest_start`, and from then on the host and
+    // the prepended `_start` write the scratch exactly as for any powerbox program. Basing such a
+    // unit's globals at `guard + 16` (the old entry-less layout) put them under those writes: JACL's
+    // runtime had its worker table across the heap words and the whole args region. (#1776 briefly
+    // made this an opt-in `TranslateOptions::powerbox_layout`; an opt-in the translator cannot know
+    // to set — it cannot see whether the unit will be wrapped — is the footgun, so it is the layout.)
+    let globals_base = stack_page;
     let (globals, mut data, mut globals_end, cstrs, gbytes, data_symbols, tls_layout) =
         globals_layout(m, &name2idx, globals_base, ba, stack_page)?;
     // Synthesize the glibc ctype tables (flags + lower/upper case maps) as **read-only data in the
@@ -1393,11 +1392,10 @@ fn translate_impl(
     })
 }
 
-/// The low window offset where globals begin (kept off a null-like 0).
-const DATA_BASE: u64 = 16;
 /// The **default** page granularity the data stack is aligned to above the globals (≥ the largest OS
-/// page so a stack write never lands in a read-only global's protected page, D40). For a powerbox
-/// program this is also the globals base, so `[0, stack_page)` is the reserved low scratch — the
+/// page so a stack write never lands in a read-only global's protected page, D40). It is also the
+/// globals base of every module, entry-less or not (#1777), so `[0, stack_page)` is the reserved low
+/// scratch — the
 /// allocator/format state and the §3e args buffer live there (the handle stash is retired; imports
 /// are manifest slots the runtime binds). The powerbox layout is a public ABI
 /// ([`temen_ir::POWERBOX_STACK_PAGE`]).
@@ -12894,6 +12892,35 @@ fn lower_vm_builtin(
             let r = ctx.push(Inst::CapCall {
                 type_id: INSTANTIATOR_TYPE_ID,
                 op: 13,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
+        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
+        // long grants_ptr, long grants_n, long entry, long size_log2, long quota, long args_ptr,
+        // long args_len)` → `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n,
+        // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
+        // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
+        // module's declared memory), not a carve of the spawner's, with the same named-grant records as
+        // `__vm_instantiate` and a spawn-time args payload copied to its `module_args_base()` (length 0
+        // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
+        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
+        "__vm_instantiate_detached" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let args = (1..10)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; 9],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 15,
                 sig,
                 handle,
                 args,

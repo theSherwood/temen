@@ -1659,6 +1659,10 @@ struct ParIoCfg {
     /// ([`temen_par_powerbox_onramp`]): its entry is the paramless manifest `_start`, and its root's
     /// reservation is the window itself (see [`temen_par_root`]).
     out: Option<i32>,
+    /// The root window's seed prefix — the on-ramp recipe's environment ([`onramp_env_init`] of
+    /// [`RUN_ENV`]), seeded before the data segments exactly as the single-threaded on-ramp seeds it.
+    /// Empty for none.
+    init: Vec<u8>,
 }
 
 /// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1674,16 +1678,17 @@ pub extern "C" fn temen_par_powerbox_io() -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
-    par_publish_io(host, Some(out));
+    par_publish_io(host, Some(out), Vec::new());
     1
 }
 
 /// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: Workers
 /// hold `&'static` borrows of it for the rest of the run, and the next publish replaces the pointer.
-fn par_publish_io(host: Host, out: Option<i32>) {
+fn par_publish_io(host: Host, out: Option<i32>, init: Vec<u8>) {
     let cfg = Box::into_raw(Box::new(ParIoCfg {
         host: std::sync::Mutex::new(host),
         out,
+        init,
     }));
     PAR_IO.store(cfg as usize, std::sync::atomic::Ordering::Release);
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
@@ -1726,7 +1731,7 @@ pub extern "C" fn temen_par_powerbox_onramp(
     let mut host = Host::new();
     host.stdin = stdin.to_vec();
     grant_onramp_caps(&mut host, &m, None);
-    par_publish_io(host, None);
+    par_publish_io(host, None, onramp_env_init(&run_env()));
     1
 }
 
@@ -2167,7 +2172,7 @@ pub extern "C" fn temen_par_root(
     // `vm_map` past it is refused, rather than succeeding into a tail the shared window drops writes
     // to. The other recipes keep the default reservation over the window.
     let root = match io {
-        Some(ParIoCfg { out: None, .. }) => {
+        Some(cfg @ ParIoCfg { out: None, .. }) => {
             if !win_size.is_power_of_two() {
                 par_vcpu_retire();
                 return core::ptr::null_mut();
@@ -2176,7 +2181,7 @@ pub extern "C" fn temen_par_root(
                 prog,
                 func,
                 &args,
-                &[],
+                &cfg.init,
                 Host::new(),
                 win_size.trailing_zeros() as u8,
                 back,
@@ -3764,12 +3769,17 @@ const ONRAMP_NESTED_CAPS: [&str; 10] = [
 ];
 
 /// Wrap `m` for a nested on-ramp run (#1720): the one-node plan that spawns it as a §14 child of a
-/// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds. Returns the root module
-/// and its args (the root's Instantiator, `m`'s `Module` and the budget are granted on `host` here).
+/// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds; `env` is seeded as the
+/// child's §3e environment, in its own window. Returns the root module and its args (the root's
+/// Instantiator, `m`'s `Module` and the budget are granted on `host` here).
 /// `None` for a module that cannot be a child — one with no window, or whose func 0 is not an admitted
 /// child entry (`temen-llvm`'s bare `main(sp)` for an import-free C program, #1779): it runs at the
 /// root.
-fn nest_onramp(m: &temen_ir::Module, host: &mut Host) -> Option<(temen_ir::Module, Vec<Value>)> {
+fn nest_onramp(
+    m: &temen_ir::Module,
+    env: &[Vec<u8>],
+    host: &mut Host,
+) -> Option<(temen_ir::Module, Vec<Value>)> {
     let window = m.memory.as_ref()?.size_log2;
     let entry = m.funcs.first()?;
     if !temen_ir::child_entry_ok(&entry.params, &entry.results) {
@@ -3781,7 +3791,8 @@ fn nest_onramp(m: &temen_ir::Module, host: &mut Host) -> Option<(temen_ir::Modul
         .collect();
     let names: Vec<&str> = held.iter().map(|(n, _)| *n).collect();
     let handles: Vec<i32> = held.iter().map(|(_, h)| *h).collect();
-    let plan = plan::Plan::single(window, &[], &names);
+    let mut plan = plan::Plan::single(window, &[], &names);
+    plan.nodes[0].env = env.to_vec();
     let root = temen_text::parse_module(&plan.root_src().ok()?).ok()?;
     let args = plan.root_args(host, &[m], &handles);
     Some((root, args))
@@ -3800,19 +3811,75 @@ fn nest_onramp(m: &temen_ir::Module, host: &mut Host) -> Option<(temen_ir::Modul
 /// shape is fail-closed (`STATUS_UNSUPPORTED`). The `fs` capability (SQLite Phase B, Lua
 /// `files.lua`) is a `host_proc` resolved by name — a Stage-1 follow-on, not part of this prefix.
 pub fn onramp_exec(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    onramp_exec_with_tee(m, stdin, None)
+    onramp_exec_with_tee(m, stdin, &[], None)
 }
 
-/// [`onramp_exec`] with an optional **live stdout tee** ([`Host::set_stdout_tee`]): `tee` is called with
-/// each stdout chunk as the guest produces it (the browser playground relays it to the page for live
-/// streaming). The captured `stdout` in the returned [`PbOutcome`] is unchanged — the tee is additive —
-/// so callers that read the final bytes (and the interp≡JIT differential) are unaffected.
+/// The §3e environment (`KEY=VALUE` entries) every on-ramp run the FFI starts is given —
+/// [`temen_run_onramp`], its streaming twin, the link-and-run entries, and the parallel Worker
+/// driver's [`temen_par_powerbox_onramp`] — set by [`temen_set_run_env`]. Empty (the default) seeds
+/// nothing, so a run is byte-identical to one with no environment. This is how a language runtime is
+/// handed per-run configuration by its embedder (#1777; JACL's worker-pool size, jacl #152). The Rust
+/// entries take the environment as a parameter instead, so native callers share no hidden state.
+static RUN_ENV: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+
+fn run_env() -> Vec<Vec<u8>> {
+    RUN_ENV.lock().map(|e| e.clone()).unwrap_or_default()
+}
+
+/// Set the environment of every later on-ramp run (see [`RUN_ENV`]): `[ptr, len)` holds `KEY=VALUE`
+/// entries, each NUL-terminated, back to back; an empty range clears it. Returns `0`, or `-1` — and
+/// the environment is left unchanged — when an entry is unterminated or has no `=`, or the §3e blob
+/// would not fit the args region.
+#[no_mangle]
+pub extern "C" fn temen_set_run_env(ptr: *const u8, len: usize) -> i32 {
+    let bytes: &[u8] = if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        // SAFETY: the host guarantees `[ptr, len)` is a live allocation it just filled.
+        unsafe { core::slice::from_raw_parts(ptr, len) }
+    };
+    let env: Vec<Vec<u8>> = match bytes.split_last() {
+        None => Vec::new(),
+        Some((0, entries)) => entries.split(|&b| b == 0).map(<[u8]>::to_vec).collect(),
+        Some(_) => return -1, // the last entry is unterminated
+    };
+    if env.iter().any(|e| !e.contains(&b'='))
+        || onramp_env_init(&env).len() as u64 > temen_ir::module_args_end()
+    {
+        return -1;
+    }
+    match RUN_ENV.lock() {
+        Ok(mut g) => {
+            *g = env;
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+/// The window prefix that gives an on-ramp run its environment: zeros up to `module_args_base()`, then
+/// the §3e blob (`argc = 0`: an on-ramp `_start` takes no argv). Empty for no environment.
+fn onramp_env_init(env: &[Vec<u8>]) -> Vec<u8> {
+    if env.is_empty() {
+        return Vec::new();
+    }
+    let refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    args_init_mem_raw(&temen_ir::write_args_blob(&[], &refs))
+}
+
+/// [`onramp_exec`] with an environment and an optional **live stdout tee** ([`Host::set_stdout_tee`]).
+/// `env` (`KEY=VALUE` entries; empty for none) is seeded as the §3e blob a `getenv` or a language
+/// runtime reads. `tee` is called with each stdout chunk as the guest produces it (the browser
+/// playground relays it to the page for live streaming). The captured `stdout` in the returned
+/// [`PbOutcome`] is unchanged — the tee is additive — so callers that read the final bytes (and the
+/// interp≡JIT differential) are unaffected.
 pub fn onramp_exec_with_tee(
     m: &temen_ir::Module,
     stdin: &[u8],
+    env: &[Vec<u8>],
     tee: Option<temen_interp::StdoutTee>,
 ) -> PbOutcome {
-    onramp_run(m, stdin, tee, true)
+    onramp_run(m, stdin, env, tee, true)
 }
 
 /// [`onramp_exec`] at the **root** position — the oracle for a tier that still runs a card at the root
@@ -3820,7 +3887,7 @@ pub fn onramp_exec_with_tee(
 /// capabilities by name runs identically either way; one that hardcodes the §3e prefix's handle
 /// numbers (a driver fixture) only at the root.
 pub fn onramp_exec_root(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
-    onramp_run(m, stdin, None, false)
+    onramp_run(m, stdin, &[], None, false)
 }
 
 /// The on-ramp run behind [`onramp_exec_with_tee`] and [`onramp_exec_root`]: `nested` runs `m` as a
@@ -3828,6 +3895,7 @@ pub fn onramp_exec_root(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
 fn onramp_run(
     m: &temen_ir::Module,
     stdin: &[u8],
+    env: &[Vec<u8>],
     tee: Option<temen_interp::StdoutTee>,
     nested: bool,
 ) -> PbOutcome {
@@ -3857,14 +3925,16 @@ fn onramp_run(
     // [`plan::Plan`]), re-granted by name every on-ramp capability this powerbox holds that can cross
     // into a child. The module runs exactly as built (a powerbox `_start` is an admitted child entry),
     // over its own window, finding its capabilities by name and through its manifest as at the root.
+    // The environment rides the plan into the child's window; a root run seeds its own.
     let nest = if nested {
-        nest_onramp(m, &mut host)
+        nest_onramp(m, env, &mut host)
     } else {
         None
     };
-    let (entry, args) = nest
-        .as_ref()
-        .map_or((m, &[][..]), |(r, a)| (r, a.as_slice()));
+    let (entry, args, init) = match &nest {
+        Some((root, args)) => (root, args.as_slice(), Vec::new()),
+        None => (m, &[][..], onramp_env_init(env)),
+    };
     let mut fuel = u64::MAX;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
@@ -3873,20 +3943,21 @@ fn onramp_run(
     // C guest that grows a large heap with sub-64-KiB `vm_map`s runs unchanged now that the interp's
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
     let mut trap = None;
-    let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(entry, 0, args, &mut fuel, &mut host) {
-            None => (STATUS_UNSUPPORTED, 0, 0),
-            Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
-            Some(Err(t)) => {
-                trap = Some(t);
-                (STATUS_TRAP, 0, 0)
-            }
-            Some(Ok(vals)) => match vals.first() {
-                Some(Value::I64(x)) => (STATUS_OK, *x, 0),
-                Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
-                _ => (STATUS_BAD_RESULT, 0, 0),
-            },
-        };
+    let (status, value, exit_code) = match bytecode::compile_and_run_seeded_with_host(
+        entry, 0, args, &mut fuel, &init, &mut host,
+    ) {
+        None => (STATUS_UNSUPPORTED, 0, 0),
+        Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
+        Some(Err(t)) => {
+            trap = Some(t);
+            (STATUS_TRAP, 0, 0)
+        }
+        Some(Ok(vals)) => match vals.first() {
+            Some(Value::I64(x)) => (STATUS_OK, *x, 0),
+            Some(Value::I32(x)) => (STATUS_OK, *x as i64, 0),
+            _ => (STATUS_BAD_RESULT, 0, 0),
+        },
+    };
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
         trap,
@@ -4330,10 +4401,9 @@ pub(crate) fn args_init_mem(argv: &[&[u8]]) -> Vec<u8> {
     init_mem
 }
 
-/// [`args_init_mem`] for an already-built args blob (the op-15 spawn-time payload, #1286): zeros up to
-/// `module_args_base()`, then the blob verbatim. An empty payload seeds nothing. Used by the wasm32
-/// threads-build servicer only (dead on native).
-#[allow(dead_code)]
+/// [`args_init_mem`] for an already-built args blob (the op-15 spawn-time payload, #1286, and an
+/// on-ramp run's environment, [`onramp_env_init`]): zeros up to `module_args_base()`, then the blob
+/// verbatim. An empty payload seeds nothing.
 pub(crate) fn args_init_mem_raw(blob: &[u8]) -> Vec<u8> {
     if blob.is_empty() {
         return Vec::new();
@@ -8017,7 +8087,7 @@ pub extern "C" fn temen_run_onramp(
             return 0;
         }
     };
-    let out = onramp_exec(&m, stdin);
+    let out = onramp_exec_with_tee(&m, stdin, &run_env(), None);
     set(out.status);
     let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
         Some(f) => (f.rgba, f.width, f.height),
@@ -8089,7 +8159,7 @@ pub extern "C" fn temen_run_onramp_stream(
             return 0;
         }
     };
-    let out = onramp_exec_with_tee(&m, stdin, stream_tee());
+    let out = onramp_exec_with_tee(&m, stdin, &run_env(), stream_tee());
     set(out.status);
     let (fb_rgba, fb_w, fb_h) = match out.framebuffer {
         Some(f) => (f.rgba, f.width, f.height),
@@ -10246,7 +10316,7 @@ fn link_run_against_multi(
         }
     };
 
-    let out = onramp_exec(&module, stdin);
+    let out = onramp_exec_with_tee(&module, stdin, &run_env(), None);
     set(out.status);
     // SAFETY: single-threaded wasm; capture slots read back only via the export accessors.
     unsafe {

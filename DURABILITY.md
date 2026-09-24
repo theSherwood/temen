@@ -2080,6 +2080,25 @@ rather than deadlocking. Pinned by `concurrent_freeze_while_root_blocked_in_wait
 `…_fails_closed_on_thaw` (value unchanged → thaw traps `ThreadFault`). **Lifting the fail-closed** — a
 re-park resolvable only by reordering — needs the concurrent-thaw rework below.
 
+**A wait that completed before the cut keeps its status (#1769).** Re-issuing every frozen wait
+was right only for a wait the freeze itself ended. A wait that had already completed (woken by a
+notify, not-equal, or timed out) and was frozen before the guest read its status lost that status. Its
+re-issue re-checked the value, so a notify that changed nothing re-parked it with its notifier spent:
+the thawed run spun out of fuel or deadlocked where the uninterrupted one finished. Now:
+- every engine returns `WAIT_FROZEN` (`-1`, `temen_ir::durable_abi`) when a freeze, not the wait's
+  own event, ends a wait. That covers the interpreter's freeze re-admit and fiber flatten, the bytecode
+  fiber flatten, and the JIT vCPU park and fiber-wait poll. No guest observes it, because the trailing
+  poll unwinds first;
+- the `MemoryWait` point spills its status with the frame. Its thaw arm delivers any other status as
+  it was, and branches to a re-issue block (appended after the trap block, so no index moves) only for
+  `WAIT_FROZEN`.
+
+Porting it exposed a bytecode gap. Its `shadow_switch` carried no thaw phase and had no per-fiber
+re-arm, so a thawed fiber first claimed after the root's rewind started fresh and orphaned its spilled
+frame. It now carries both, as the tree-walker's does. Pinned by
+`bytecode_durable_fibers_freeze.rs::a_wait_woken_by_a_notify_that_changed_nothing_keeps_its_wake_across_a_thaw`
+(both engines thaw to 100; `OutOfFuel` if the arm always re-issues, or if bytecode lacks the re-arm).
+
 #### Concurrent thaw — design + staging (lifts the `atomic.wait` fail-closed)
 
 *Why the current thaw can't satisfy a re-parking wait.* `thaw_reattach_and_run` runs the frozen vCPUs

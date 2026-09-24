@@ -32,6 +32,10 @@
 //! [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site (futex `wait`,
 //! `thread.join`) returns on observing a non-zero cell — woken promptly by
 //! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
+//! *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the same cell at
+//! every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
+//! unwinds from there. A §14 carve child has a cell of its own, which the parent's teardown sets
+//! (`ChildExec::shutdown_and_join`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
 
@@ -2146,12 +2150,15 @@ unsafe fn fiber_futex_wait_loop(
         // Mirror the OS park's exits (kill / teardown / freeze): consume the waiter entry and
         // return as if woken — the caller's trailing guards (the epoch poll, the trap
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
-        if epoch_fired(dom.env().epoch_addr)
-            || load_trap(trap_out as *mut i64) != 0
-            || (unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base))
-        {
+        let frozen = unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
+        if epoch_fired(dom.env().epoch_addr) || load_trap(trap_out as *mut i64) != 0 || frozen {
             wait_deregister(&mut lock(&dom.futex), key, cell);
-            return WAIT_WOKEN;
+            // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
+            return if frozen {
+                temen_ir::durable_abi::WAIT_FROZEN
+            } else {
+                WAIT_WOKEN
+            };
         }
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
@@ -2437,7 +2444,8 @@ fn futex_wait(
         // committed window base, offset 0 RW for the run.
         #[cfg(not(loom))]
         if unwind_base != 0 && unsafe { fiber_rt::window_is_unwinding(unwind_base) } {
-            break WAIT_WOKEN;
+            // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+            break temen_ir::durable_abi::WAIT_FROZEN;
         }
         // Owner decision 2026-07-24 (domain teardown; DESIGN.md §12, D37 death-is-revocation): the
         // domain is over — a trap/exit from any vCPU, or the root's completion (the internal
