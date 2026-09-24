@@ -1209,12 +1209,35 @@ mod tests {
     // reservation the way production does, release it, then `VirtualQuery` the original range and
     // assert not one byte remains mapped/committed/reserved. (Non-vacuous: the pre-fix single-release
     // leaks all-but-the-first fragment here.)
+    //
+    // That walk reads the address map of the whole process. Any allocation another thread makes
+    // after the release can land in the freed range and read as a leak, and `cargo test` runs the
+    // other tests on other threads meanwhile (#1793). So the check runs alone: the test re-runs
+    // itself as the only test in a child process of this binary.
     #[cfg(windows)]
     #[test]
     fn pal_release_frees_all_placeholder_fragments_no_leak() {
         use windows_sys::Win32::System::Memory::{
             VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_FREE,
         };
+
+        const ALONE: &str = "TEMEN_PAL_RELEASE_ALONE";
+        if std::env::var_os(ALONE).is_none() {
+            let name = "mem::tests::pal_release_frees_all_placeholder_fragments_no_leak";
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", name, "--test-threads=1"])
+                .env(ALONE, "1")
+                .output()
+                .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // "1 passed", not just a zero exit: a filter that matched nothing would exit 0 too.
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "the no-leak check failed in its own process:\n{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
 
         let _serial = pal_test_guard();
         let page = pal::page_size();
@@ -1234,8 +1257,8 @@ mod tests {
         // SAFETY: release exactly the reservation created above.
         unsafe { pal::release(base, total) };
 
-        // Walk the original range: every region must now be `MEM_FREE` (nothing leaked). Nothing
-        // allocates between the release and this walk, so the freed VA is not reused under us.
+        // Walk the original range: every region must now be `MEM_FREE` (nothing leaked). This process
+        // runs no other test, so nothing allocates into the freed VA before the walk reads it.
         let lo = base as usize;
         let hi = lo + total;
         let mut addr = lo;
