@@ -64,6 +64,10 @@ temen-spec = { path = "crates/temen-spec" }
 temen-wasm-jit = { path = "crates/temen-wasm-jit" }
 temen-parity = { path = "crates/temen-parity" }
 
+# Changing any profile below? Bump `RUST_CACHE_EPOCH` in `.github/workflows/ci.yml` in the same
+# change. CI's dependency caches are not keyed on this file, so without the bump every job keeps
+# restoring dependencies built under the old profile and rebuilds them on every run.
+#
 # CI wall clock + the local pre-push hook: this tree's tests are **execution** bound, not compile
 # bound. A `cargo test --workspace` run spends its time with guests *running* inside the engines
 # (`temen-interp`'s tree-walker above all), so building those engines unoptimized charges an
