@@ -247,3 +247,61 @@ fn carve_below_guard_refused_on_native_jit() {
         "carve above the guard spawns: {iv}/{jv}"
     );
 }
+
+/// A carve child reserves its own `[0, guard)`, as the interpreter's `nested_view` does: its NULL load
+/// faults on both backends rather than reading the parent's byte at the carve base.
+#[test]
+fn a_carve_childs_null_load_traps_on_native_jit() {
+    if !guard_active() || !temen_jit::fiber_supported() {
+        return;
+    }
+    // Parent (f0): instantiate f1 in a 32 KiB carve at 64 KiB, join it, return what it returns.
+    let src = "memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 65536
+  v3 = i64.const 15
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 0
+  v2 = i32.load v1
+  v3 = i64.extend_i32_u v2
+  return v3
+  }
+}
+";
+    let m = parse_module(src).expect("parse");
+    verify_module(&m).expect("verify");
+    let am = Arc::new(m.clone());
+    // A marker at the carve base: an unguarded child would read it back.
+    let mut init = vec![0u8; 1 << 17];
+    init[65536] = 0x5a;
+    let mut hi = Host::new();
+    hi.set_self_module(&am);
+    let ih = hi.grant_instantiator(0, 1 << 17);
+    let mut hj = Host::new();
+    hj.set_self_module(&am);
+    let jh = hj.grant_instantiator(0, 1 << 17);
+    let mut fuel = 5_000_000u64;
+    let (ir, _) =
+        run_capture_reserved_with_host(&m, 0, &[Value::I32(ih)], &mut fuel, &init, 0, &mut hi);
+    let (jo, _) = compile_and_run_capture_reserved_with_host(
+        &m,
+        0,
+        &[jh as i64],
+        &init,
+        0,
+        temen_run::cap_thunk,
+        &mut hj as *mut Host as *mut core::ffi::c_void,
+    )
+    .expect("jit");
+    assert_eq!(ir, Err(Trap::MemoryFault), "interp");
+    assert_eq!(jo, JitOutcome::Trapped(TrapKind::MemoryFault), "jit");
+}

@@ -1764,6 +1764,18 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 .shadow
                 .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
             image: window.bytes().to_vec(),
+            prots: window
+                .dense_prots()
+                .into_iter()
+                .map(|p| match p {
+                    temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
+                    temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
+                    // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
+                    temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed => {
+                        temen_jit::WindowProt::Rw
+                    }
+                })
+                .collect(),
             // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
             child: unsafe { gc.assume_init() },
         });
@@ -1817,12 +1829,7 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
         });
         match (h.image, outcome) {
             (Some(image), _) => {
-                let pages = image.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
-                let window = temen_interp::MemLayout::from_dense(
-                    image,
-                    &vec![temen_interp::CapturedProt::Rw; pages],
-                    1u64 << h.mapped_log2,
-                );
+                let window = temen_interp::MemLayout::detached_image(&module, image, h.mapped_log2);
                 captured.push(temen_interp::CapturedDetached {
                     parent_task: 0,
                     slot: h.slot,
@@ -5395,7 +5402,7 @@ pub fn nim_posix_imports(
     (imports, unbound, slot)
 }
 
-/// **Run one no-C nimony phase** over a shared POSIX personality, with `argv`.
+/// **Run one no-C nim program** over a shared POSIX personality, with `argv`, on `backend`.
 ///
 /// The single route every no-C driver takes: bind the module's retained imports with
 /// [`nim_posix_imports`], refuse if any name is unserved, instantiate, and run with `argv` as the
@@ -5404,6 +5411,22 @@ pub fn nim_posix_imports(
 /// one instance would see the first run's globals and heap, which for a compiler phase is not a
 /// rerun at all.
 ///
+/// `commands` is the run's **command registry**: each `(path, module)` is granted on the guest's
+/// `Host` and registered as a filesystem executable, so the guest's own `execve(path, …)`
+/// ([`temen_posix::OP_EXECVE`], #1609) can become it. That is what lets a nim program spawn its own
+/// helpers — nimony's driver runs nifmake, which runs every phase — rather than a host cranking the
+/// shell-outs from outside. The grant rides `run_with_caps_and_host`'s per-run host hook: authority
+/// arrives down the grant graph (invariant 3), and a command the embedder did not pass is simply
+/// not there.
+///
+/// `backend` is honoured or refused, never quietly swapped: [`Backend::Bytecode`] normally falls
+/// back to the tree-walker for a module outside its subset, which would turn an engine
+/// differential into the oracle checked against itself. So a module the bytecode engine does not
+/// admit is an error here. (Its exec'd images need no such check: the engine compiles each one, and
+/// refuses the exec rather than fall back.) [`Backend::Jit`] serves no fork/exec yet (#1768): a
+/// program that spawns gets the failure back as its own. Which programs spawn is not decidable from
+/// imports — every linked nim program imports the whole personality — so the caller decides.
+///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
 /// and the trap alone does not.
 pub fn nim_noc_run(
@@ -5411,29 +5434,15 @@ pub fn nim_noc_run(
     posix: &temen_posix::Posix,
     make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
     argv: &[String],
-) -> Result<(), String> {
-    nim_noc_run_with_commands(module, posix, make, argv, &[])
-}
-
-/// [`nim_noc_run`], plus a **command registry** for this run: each `(path, module)` is granted on
-/// the guest's `Host` and registered as a filesystem executable, so the guest's own
-/// `execve(path, …)` ([`temen_posix::OP_EXECVE`], #1609) can become it.
-///
-/// This is what lets a no-C nim phase spawn its own helpers instead of a driver cranking the
-/// shell-out from outside: `nimsem`'s `deps.nim` reaches `os.execShellCmd`, which on posix is
-/// `fork` + `execve("/bin/sh", ["-c", cmd])` + `waitpid`, and every one of those now has a real
-/// implementation under it.
-///
-/// The grant rides `run_with_caps_and_host`'s existing per-run host hook — authority arrives down
-/// the grant graph (invariant 3), and a command the embedder did not pass is simply not there.
-/// [`nim_noc_run`] is this with an empty registry, so there is one run path, not two.
-pub fn nim_noc_run_with_commands(
-    module: Module,
-    posix: &temen_posix::Posix,
-    make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
-    argv: &[String],
     commands: &[(String, Module)],
+    backend: Backend,
 ) -> Result<(), String> {
+    if matches!(backend, Backend::Bytecode) && !temen_interp::bytecode::admits_reserved(&module) {
+        return Err(
+            "the bytecode engine does not admit this module (it would run on the tree-walker)"
+                .to_string(),
+        );
+    }
     let (imports, unbound, slot) = nim_posix_imports(&module, posix, make);
     if !unbound.is_empty() {
         return Err(format!(
@@ -5473,7 +5482,7 @@ pub fn nim_noc_run_with_commands(
             posix.register_executable(path, h, wl);
         }
     };
-    inst.run_with_caps_and_host(Backend::TreeWalk, &cfg, &[], Some(&mut setup))
+    inst.run_with_caps_and_host(backend, &cfg, &[], Some(&mut setup))
         .map_err(|e| {
             let err = posix.stderr();
             if err.is_empty() {

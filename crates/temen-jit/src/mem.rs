@@ -170,6 +170,26 @@ impl GuestWindow {
         unsafe { pal::protect(self.base.add(start), end - start, Prot::None) };
     }
 
+    /// Re-establish a captured page map on a freshly seeded window (DURABILITY.md §12.3): one
+    /// [`crate::WindowProt`] per [`crate::DURABLE_SNAPSHOT_PAGE`] from window-relative `base`, over
+    /// the first `mapped` bytes; `Rw` entries keep the default. A thawed guest then faults on a
+    /// restored `Ro`/`Unmapped` page exactly as the frozen one would — matching `temen-interp`'s
+    /// `apply_prots`. The root's thaw and a detached child's (#1733) both apply theirs here.
+    pub(crate) fn apply_prots(&self, base: u64, prots: &[crate::WindowProt], mapped: u64) {
+        let page = crate::DURABLE_SNAPSHOT_PAGE as u64;
+        for (i, &p) in prots.iter().enumerate() {
+            let off = i as u64 * page;
+            if off >= mapped {
+                break;
+            }
+            match p {
+                crate::WindowProt::Ro => self.protect_ro(base + off, page),
+                crate::WindowProt::Unmapped => self.protect_none(base + off, page),
+                crate::WindowProt::Rw => {}
+            }
+        }
+    }
+
     /// #964/#1094: reserve `[0, guard)` inaccessible — the unconditional NULL guard: a NULL
     /// dereference faults into the guard handler (hardware enforcement at zero per-access cost),
     /// matching the interpreter oracle's `[0, guard)` `Unmapped` seeding.

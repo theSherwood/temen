@@ -899,6 +899,7 @@ impl Nursery {
             types,
             shadow,
             image,
+            prots,
             child: gc,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
@@ -954,6 +955,9 @@ impl Nursery {
                 if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
                     th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
                 }
+                // Its protections as captured (the guard follows, as on every child window).
+                let mapped = rw.len() as u64;
+                w.apply_prots(0, &prots, mapped);
             },
             |_, _, _| true,
             None,
