@@ -13186,8 +13186,8 @@ fn py_escape(bytes: &[u8]) -> String {
 /// **The interactive oracle** (#802 rung 3): native `bash --norc --noprofile -i` under a real pty,
 /// driven by `demos/bash/pty_oracle.py` with the prompt-wait protocol (type the next chunk only once a
 /// fresh prompt arrived), returning the pty master's byte stream — prompt, echo, and output
-/// interleaved in arrival order. `None` when `python3` is unavailable or the oracle fails; the caller
-/// skips loudly.
+/// interleaved in arrival order. `None` when `python3` is unavailable (the caller skips loudly); an
+/// oracle that runs and fails is a test failure, never a skip.
 fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Option<Vec<u8>> {
     let mut cmd = Command::new("python3");
     cmd.arg(bash_demo_dir().join("pty_oracle.py")).arg(oracle);
@@ -13198,13 +13198,12 @@ fn bash_pty_oracle_transcript(oracle: &std::path::Path, chunks: &[&str]) -> Opti
         cmd.arg(py_escape(c.as_bytes()));
     }
     let out = cmd.output().ok()?;
-    if !out.status.success() {
-        eprintln!(
-            "note: pty_oracle.py failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        return None;
-    }
+    assert!(
+        out.status.success(),
+        "pty_oracle.py failed ({}): {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
     Some(out.stdout)
 }
 
