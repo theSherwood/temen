@@ -19,7 +19,7 @@
 #
 #   Usage:  bash scripts/rebuild-assets.sh              # rebuild everything the toolchain allows
 #           ONLY=leng,nim_hello bash scripts/...        # rebuild a subset (comma-separated step names)
-#   Steps:  leng chibicc pg_libc onramp shell coreutils forth uxn nifler nim_hello nim_phases
+#   Steps:  leng chibicc pg_libc coop_grow onramp shell coreutils forth uxn nifler nim_hello nim_phases
 #           nim_driver_guest lua_snapshot
 #
 # Toolchains, per step: leng needs rustc (+rust-src) & llvm; chibicc/onramp need clang &
@@ -122,6 +122,17 @@ if want pg_libc; then
   ( cd "$REPO/browser" && cargo run --release --bin genlibc ) \
     && note "pg_libc ✓ (web/assets/pg_libc.temeno)" \
     || note "pg_libc ✗ (chibicc.temen decodable? see output above)"
+fi
+
+# --- 2c) coop_grow_past_window.temen (the #1312 coop-grow JS gate's guest, generated text IR) ---------
+# No toolchain: `genfixture` writes the hand-built guest `browser-coop-grow-test.mjs` runs.
+if want coop_grow; then
+  echo "=== [coop_grow] browser: cargo run --bin genfixture (grow_past_window) ==="
+  F=browser/tests/fixtures/coop_grow_past_window.temen
+  ( cd "$REPO/browser" && cargo run --release --bin genfixture -- "$REPO/$F" grow_past_window ) \
+    && validate "$F" \
+    && note "coop_grow ✓ ($F)" \
+    || note "coop_grow ✗ (see output above)"
 fi
 
 # --- 3) on-ramp C guests + qjs (build-onramp-assets.mjs; also copies temen-leng into web/assets) -----

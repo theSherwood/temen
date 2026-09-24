@@ -52,19 +52,10 @@ block 3 (v17: i64) {
 /// `-EINVAL`; like the real synthesized allocator this guest does not check that, so the following
 /// store faulted and the run trapped with zero tier-ups.
 ///
-/// Handles are the on-ramp powerbox's grant order (stdout, stdin, exit, memory), so the guest needs
-/// no imports. `PROBE` is 32 MiB + 16 — inside the page mapped at the window's end.
+/// The guest finds `stdout` and `memory` by name (`self.resolve`), as every on-ramp program does, so it
+/// needs no imports and runs the same at the root or nested as a plan's child (#1720). `PROBE` is
+/// 32 MiB + 16 — inside the page mapped at the window's end.
 fn grow_past_window() -> String {
-    // Replay `grant_onramp_caps`'s grant order (stdout, stdin, exit, memory) against a fresh `Host`
-    // to learn the handle values, rather than hardcoding them — the same trick the native coop
-    // differential uses. Deterministic per session, so an import-free guest can `call.cap` them.
-    let (stdout, memory) = {
-        let mut h = temen_interp::Host::new();
-        let out = h.grant_stream(temen_interp::StreamRole::Out);
-        let _stdin = h.grant_stream(temen_interp::StreamRole::In);
-        let _exit = h.grant_exit();
-        (out, h.grant_memory())
-    };
     const WIN: u64 = 1 << 25; // JIT_RUN_WIN_LOG2 — the cooperative run window
     const PROBE: u64 = WIN + 16;
     const SLOT: u64 = 32768 + 2048; // clear of the #1094 NULL guard and the args region
@@ -80,8 +71,11 @@ fn grow_past_window() -> String {
             k = 3 + (i as u64 % 7),
         ));
     }
+    const NAMES: u64 = 40960; // "stdout" then "memory", 8 bytes apart
+    let mem_name = NAMES + 8;
     format!(
         r#"memory 16
+data ro {NAMES} "stdout\x00\x00memory"
 func () -> (i64) {{
 block 0 () {{
   vz = i64.const 0
@@ -92,7 +86,9 @@ block 0 () {{
   vtot = i64.add vr vj
   vsl = i64.const {SLOT}
   i64.store vsl vtot
-  vout = i32.const {stdout}
+  vnp = i64.const {NAMES}
+  vnl = i64.const 6
+  vout = self.resolve vnp vnl
   vlen8 = i64.const 8
   vw = call.cap 0 1 (i64, i64) -> (i64) vout (vsl, vlen8)
   return vtot
@@ -109,7 +105,9 @@ block 0 (vacc0: i64) {{
 }}
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
-  vas = i32.const {memory}
+  vnp = i64.const {mem_name}
+  vnl = i64.const 6
+  vas = self.resolve vnp vnl
   voff = i64.const {WIN}
   vlen = i64.const 16384
   vprot = i32.const 3

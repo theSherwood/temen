@@ -1225,8 +1225,7 @@ fn named_child_host(
         }
         None => {
             let mut ch = Host::new();
-            let cinst = ch.grant_instantiator(0, child_size);
-            let cas = ch.grant_address_space(0, child_size);
+            let (cinst, cas) = ch.grant_starter_caps(child_size);
             (ch, cinst, cas)
         }
     };
@@ -1420,8 +1419,7 @@ fn admit_detached_child(
     let mut child_host = Host::new();
     child_host.set_attestation(host.detached_child_attestation());
     let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
-    let cinst = child_host.grant_instantiator(0, reservation);
-    let cas = child_host.grant_address_space(0, reservation);
+    let (cinst, cas) = child_host.grant_starter_caps(reservation);
     for (name, gh) in &glist {
         if let Some(cg) = host.regrant_into_child(*gh, &mut child_host) {
             child_host.register_cap_name(name, cg);
@@ -2385,13 +2383,16 @@ pub fn compile_and_run_seeded_with_host(
     // `DomainTable::new(funcs, jit_table_log2)`), so guest-driven `install` returns the same slots.
     let dom = Domain::new(c, host.jit_table_log2());
     let mut mem = build_mem(m, init_mem);
+    super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = None);
     let r = run(dom, func, args, fuel, &mut mem, host);
     // #1714: the faulting address of a `MemoryFault`, in the same per-run slot the tree-walker's
     // run funnel fills (`last_capture_fault_addr`) — this path dropped the window with it, so an
     // embedder of a plain run could not say *where* a segfault was. Cleared on any other outcome,
-    // so a later clean run never reports an earlier run's fault.
+    // so a later clean run never reports an earlier run's fault. The scheduler records the
+    // trap-origin task's address as it traps (#1720: a joined child's, not the joiner's window).
+    let origin = super::last_capture_fault_addr();
     let fault = match &r {
-        Err(Trap::MemoryFault) => mem.as_ref().and_then(|m| m.peek_fault_rel()),
+        Err(Trap::MemoryFault) => origin.or_else(|| mem.as_ref().and_then(|m| m.peek_fault_rel())),
         _ => None,
     };
     super::LAST_CAPTURE_FAULT.with(|c| *c.borrow_mut() = fault);
@@ -3939,8 +3940,7 @@ impl<'p> Vcpu<'p> {
         // `host` may already carry re-granted caps (op-13, via `new_confined_child_over_host`); the
         // starter `Instantiator`+`AddressSpace` are granted on top. `install_grants` is the closure form
         // (op-13 via `new_confined_child_granted`), run after the starter caps.
-        let cinst = host.grant_instantiator(0, carve_size);
-        let cas = host.grant_address_space(0, carve_size);
+        let (cinst, cas) = host.grant_starter_caps(carve_size);
         // Install any re-granted caps (op-13 grant list) into the child powerbox under their names. The
         // starter entry args stay `[Instantiator, AddressSpace]`; re-granted caps are name-resolved.
         install_grants(&mut host);
@@ -7501,8 +7501,7 @@ fn dbg_instantiate(
     // Attenuated powerbox over the child's *own* `[0, child_size)`: an `Instantiator` (so it can nest —
     // confinement composes) and an `AddressSpace`; these are its entry arguments.
     let mut child_host = Host::new();
-    let cinst = child_host.grant_instantiator(0, child_size);
-    let cas = child_host.grant_address_space(0, child_size);
+    let (cinst, cas) = child_host.grant_starter_caps(child_size);
     let child_args = child_entry_args(arity, cinst, cas);
     let child_fuel = if quota <= 0 {
         pfuel
@@ -7645,8 +7644,7 @@ fn dbg_instantiate_module(
         pm.map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()))
     };
     let mut child_host = Host::new();
-    let cinst = child_host.grant_instantiator(0, child_size);
-    let cas = child_host.grant_address_space(0, child_size);
+    let (cinst, cas) = child_host.grant_starter_caps(child_size);
     let child_args = child_entry_args(arity, cinst, cas);
     let child_fuel = if quota <= 0 {
         pfuel
@@ -12705,7 +12703,18 @@ impl CoopSched {
                 preemptible, // #1157: yield at the op-count quantum when ≥2 tasks are runnable
             );
             match stop {
-                Err(trap) => complete(tasks, ti, Err(trap)),
+                Err(trap) => {
+                    // #1720 — the **trap-origin** fault address (the tree-walker's rule): a child's
+                    // trap re-raises at its joiner, whose window is not the one that faulted, so the
+                    // run's `last_capture_fault_addr` must be read here, from the trapping task's own.
+                    // The first fault recorded wins; the run entry clears the slot beforehand.
+                    if trap == Trap::MemoryFault {
+                        if let Some(a) = ctx.mem.as_ref().and_then(|m| m.peek_fault_rel()) {
+                            super::LAST_CAPTURE_FAULT.with(|c| _ = c.borrow_mut().get_or_insert(a));
+                        }
+                    }
+                    complete(tasks, ti, Err(trap))
+                }
                 // #1157 — the quantum expired: the task is still `Runnable` (its cursor persisted), so
                 // just loop. The round-robin `last_pick` advance picks a sibling next, giving it the
                 // thread; this task resumes on a later turn.
@@ -13531,8 +13540,7 @@ impl CoopSched {
                         }
                     } else {
                         let mut ch = Host::new();
-                        let cinst = ch.grant_instantiator(0, child_size);
-                        let cas = ch.grant_address_space(0, child_size);
+                        let (cinst, cas) = ch.grant_starter_caps(child_size);
                         (ch, cinst, cas)
                     };
                     // §3.6: a same-module child serves over the shared program — its serve machinery
@@ -15983,8 +15991,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                     .as_ref()
                     .map(|m| m.nested_view(abs_base, size_log2 as u8, m.shadow_arena()));
                 let mut child_host = Host::new();
-                let cinst = child_host.grant_instantiator(0, child_size);
-                let cas = child_host.grant_address_space(0, child_size);
+                let (cinst, cas) = child_host.grant_starter_caps(child_size);
                 let child_args = child_entry_args(arity, cinst, cas);
                 let child_fuel = if quota <= 0 {
                     fuel
