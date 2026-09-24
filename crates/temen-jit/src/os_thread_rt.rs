@@ -594,6 +594,12 @@ impl Domain {
         true
     }
 
+    /// §15 concurrently-live vCPUs, the root included: `1` once every spawned vCPU and async §14
+    /// child has finished.
+    pub(crate) fn live_vcpus(&self) -> usize {
+        lock(&self.threads).live
+    }
+
     /// The §14 child finished — drop it from the live count (see [`Self::child_started`]) and wake
     /// the futex waiters so a parked infinite waiter re-evaluates `peers_live` promptly (not only
     /// on the `KILL_RECHECK` cadence, which an unarmed run doesn't have), exactly as when a spawned

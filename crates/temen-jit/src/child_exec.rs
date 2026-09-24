@@ -114,7 +114,7 @@ unsafe impl Send for ChildTask {}
 
 impl ChildTask {
     /// Build a task around a compiled detached child. `init` seeds the fresh window (data segments,
-    /// payload); `premap` aliases the op-15 pre-mapped region onto it (`false` ⇒ the child never
+    /// payload) and may protect its pages (a detached child's readonly segments); `premap` aliases the op-15 pre-mapped region onto it (`false` ⇒ the child never
     /// runs: a `CapFault` outcome, as on the OS-thread path it replaces).
     ///
     /// # Safety
@@ -125,7 +125,7 @@ impl ChildTask {
         code: Arc<CompiledModule>,
         mapped_log2: u8,
         reserved_log2: u8,
-        init: impl FnOnce(&mut [u8]),
+        init: impl FnOnce(&mut mem::GuestWindow),
         premap: impl FnOnce(*mut u8, u64, u64) -> bool,
         args: Vec<i64>,
         n_results: usize,
@@ -136,7 +136,7 @@ impl ChildTask {
     ) -> Result<ChildTask, Teardown> {
         let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
         let base = window.base();
-        init(window.rw_mut());
+        init(&mut window);
         if !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
             window.restore_rw();
             return Err(teardown);

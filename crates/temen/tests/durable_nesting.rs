@@ -914,7 +914,7 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
     );
     assert_eq!(
         completed[0].completed_result,
-        Some(33),
+        Some(Ok(33)),
         "B's join result rides the residue"
     );
 
@@ -956,6 +956,84 @@ fn freeze_with_completed_unjoined_child_rides_and_reloads() {
         "thaw reproduces the total (B reloaded, not re-run)"
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// #1674: a completed-but-unjoined child that finished with a **trap** rides the freeze too. Its join
+/// outcome is the trap, which crosses the codec as a stable code, and the thawed parent's `join`
+/// re-raises it exactly as the uninterrupted run's does. Before, the freeze could not represent it
+/// and declined.
+#[test]
+fn freeze_with_trapped_unjoined_child_rides_and_the_thawed_join_re_raises_it() {
+    let parent = instrument(
+        &PARENT_TWO_CHILDREN.replace("  v2 = i64.const 33\n  return v2", "  unreachable"),
+    );
+    let run = |host: &mut Host, win: &[u8], ih: i32| {
+        let mut fuel = 50_000_000u64;
+        run_capture_reserved_with_host(
+            &parent,
+            0,
+            &[Value::I32(ih)],
+            &mut fuel,
+            win,
+            SIZE_LOG2,
+            host,
+        )
+    };
+
+    let mut host = Host::new();
+    host.set_durable(true);
+    let ih = host.grant_instantiator(0, WINDOW as u64);
+    let (base, _) = run(&mut host, &init_durable_window(WINDOW, TEST_ARENA), ih);
+    assert_eq!(
+        base,
+        Err(Trap::Unreachable),
+        "uninterrupted, joining B re-raises its trap"
+    );
+
+    let mut fhost = Host::new();
+    fhost.set_durable(true);
+    let fih = fhost.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    arm_freeze_after(&mut win, 2);
+    let (fr, fsnap) = run(&mut fhost, &win, fih);
+    assert!(fr.is_ok(), "freeze placeholder: {fr:?}");
+    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "the freeze completed");
+    assert_eq!(fhost.take_freeze_declined(), None, "nothing declined");
+    let trapped: Vec<_> = fhost
+        .frozen_nested()
+        .iter()
+        .filter_map(|n| n.completed_result)
+        .collect();
+    assert_eq!(
+        trapped,
+        [Err(Trap::Unreachable)],
+        "B's trap rides the residue"
+    );
+
+    let artifact = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serializes");
+    let mut thost = Host::new();
+    thost.set_durable(true);
+    let window = temen_snapshot::restore(&artifact, &parent, &mut thost).expect("restores");
+    assert_eq!(
+        thost.frozen_nested(),
+        fhost.frozen_nested(),
+        "residue round-trips"
+    );
+    assert_eq!(
+        temen_snapshot::freeze(&parent, &window, &thost).expect("re-freeze"),
+        artifact,
+        "canonical re-freeze byte-identical"
+    );
+
+    let mut twin = window;
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let caps = thost.capture_durable_handles().expect("durable");
+    let tih = ((caps[0].generation << 8) | caps[0].slot) as i32;
+    let (tr, _) = run(&mut thost, &twin, tih);
+    assert_eq!(
+        tr, base,
+        "the thawed join re-raises B's trap, as uninterrupted"
+    );
 }
 
 // ---- Depth-2 durable nesting (DURABILITY.md §4 — "STW quiesces the subtree as a unit", extended
@@ -1416,6 +1494,7 @@ fn a_grandchild_reattaches_to_its_recorded_parent_when_a_joined_sibling_shifted_
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
+            completed_result: n.completed_result.map(|r| r.map_err(Trap::code)),
         })
         .collect();
     let mut jwin = fsnap.clone();

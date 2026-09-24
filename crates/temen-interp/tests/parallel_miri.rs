@@ -149,6 +149,53 @@ fn parallel_futex_race_free_under_miri() {
     assert_eq!(run_parallel(FUTEX), Ok(vec![Value::I64(987654)]));
 }
 
+// #1761 — the run-shared fiber registry across real threads: a fiber created and parked on the
+// root is resumed (and parked again) on a spawned vCPU, then resumed once more by the root after the
+// join. Its parked `Vm` crosses threads through the registry's lock both ways — Miri's checker is
+// the point. `5 + 8 + (7*100 + 9) = 722` (`crates/temen/tests/fiber_migrate.rs`'s `MIGRATE_BACK`).
+const FIBER_MIGRATE: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 2
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  v6 = thread.spawn 1 v2 v2
+  v7 = thread.join v6
+  v8 = i64.const 9
+  v9, v10 = cont.resume v2 v8
+  v11 = i64.add v5 v7
+  v12 = i64.add v11 v10
+  return v12
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 7
+  v1, v2 = cont.resume varg v0
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = suspend varg
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.mul v0 v4
+  v6 = i64.add v5 v3
+  return v6
+  }
+}
+"#;
+
+#[test]
+fn parallel_fiber_migration_race_free_under_miri() {
+    assert_eq!(run_parallel(FIBER_MIGRATE), Ok(vec![Value::I64(722)]));
+}
+
 // 2 worker vCPUs each write "hi\n" to stdout via `call.cap` (handle threaded through block args) + bump
 // a shared counter — exercises the shared `Mutex<Host>` and per-call.cap locking across real threads.
 const CAPS: &str = r#"memory 16

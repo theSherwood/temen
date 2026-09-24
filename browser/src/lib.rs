@@ -1101,6 +1101,13 @@ unsafe fn prog_ref(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::VcpuP
     &*prog
 }
 
+/// The run's shared fiber registry (#1761), owned by its program: attached to the root and every
+/// `thread.spawn` child of a run — never to a §14 confined or detached child, each its own process.
+fn par_fibers(prog: *mut bytecode::VcpuProgram) -> &'static bytecode::SharedFibers {
+    // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
+    unsafe { prog_ref(prog) }.fibers()
+}
+
 // ---- §22 guest-JIT across Workers: a Rust-side shared powerbox (THREADS.md 4c-domain C2) ---------
 // The powerbox (a `Host` with the `Jit` cap + the host-compiled unit) is built once and **leaked** into
 // the shared linear memory; its pointer is published in a process-wide `static` which — under
@@ -2117,7 +2124,7 @@ pub extern "C" fn temen_par_root(
         ) {
             // #816 item 5: a §14 orchestration root's compute leaves tier up too (module-0 root
             // over the full run window — the same shape as the plain root below).
-            Ok(inner) => par_box(with_tierup(inner)),
+            Ok(inner) => par_box(with_tierup(inner.with_shared_fibers(par_fibers(prog)))),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -2138,7 +2145,11 @@ pub extern "C" fn temen_par_root(
         ) {
             // #816 item 5: the §22 runtime-compile root's compute leaves tier up too (the JACL
             // shape — its `Jit.compile`d units already ran emitted; now so do its own hot leaves).
-            Ok(inner) => par_box(with_tierup(inner.with_shared_host(&cfg.host))),
+            Ok(inner) => par_box(with_tierup(
+                inner
+                    .with_shared_host(&cfg.host)
+                    .with_shared_fibers(par_fibers(prog)),
+            )),
             Err(_) => {
                 par_vcpu_retire();
                 core::ptr::null_mut()
@@ -2179,7 +2190,7 @@ pub extern "C" fn temen_par_root(
                 Some(io) => inner.with_shared_host(&io.host),
                 None => inner,
             };
-            par_box(with_tierup(inner))
+            par_box(with_tierup(inner.with_shared_fibers(prog.fibers())))
         }
         Err(_) => {
             par_vcpu_retire();
@@ -2191,7 +2202,9 @@ pub extern "C" fn temen_par_root(
 /// Build a `thread.spawn`ed **child** vCPU (`func(sp, arg)`) over the **same** shared window — it does
 /// not re-seed (the window is already live). Called on the child's Worker. Null on a bad func.
 /// `module` is the spawning frame's module from the `PAR_SPAWN` event (`ev_a >> 32`) — `func`
-/// resolves there and the child's root frame starts there (module-0 for plain guests).
+/// resolves there and the child's root frame starts there (module-0 for plain guests). `vcpu` is
+/// the event's `ev_d`: the child's dense vCPU id, which seeds its `vcpu.tls` (a language runtime's
+/// worker index — JACL's pool reads it to find its own queue).
 #[no_mangle]
 pub extern "C" fn temen_par_child(
     prog: *mut bytecode::VcpuProgram,
@@ -2201,6 +2214,7 @@ pub extern "C" fn temen_par_child(
     func: u32,
     sp: i64,
     arg: i64,
+    vcpu: i64,
 ) -> *mut ParVcpu {
     if !par_vcpu_admit() {
         return core::ptr::null_mut();
@@ -2222,6 +2236,11 @@ pub extern "C" fn temen_par_child(
     match bytecode::Vcpu::new_child_sized(unsafe { prog_ref(prog) }, module, func, &args, back, sl)
     {
         Ok(inner) => {
+            // #1761: a thread shares its run's fiber registry, so a fiber created on one Worker
+            // can be resumed on another (a runtime's worker pool pins jobs to workers).
+            let inner = inner
+                .with_shared_fibers(par_fibers(prog))
+                .with_vcpu_id(vcpu as u64);
             // A §22 **runtime-compile** run shares the JIT `Mutex<Host>` across every vCPU (mirroring
             // the root, `temen_par_root`), so a worker `thread.spawn`ed onto this Worker can `compile` /
             // `invoke` against the *same* domain: a unit compiled on any Worker is invokable here, and
@@ -2509,6 +2528,7 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 sp,
                 arg,
                 module,
+                vcpu,
             } => {
                 // A detached vCPU's window is not in the shared engine memory the sibling Worker would
                 // alias at `win` (see [`ParVcpu::detached`]): fail closed rather than alias garbage.
@@ -2521,6 +2541,8 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 v.a = ((module as i64) << 32) | func as i64;
                 v.b = sp;
                 v.c = arg;
+                // The child's dense vCPU id, for `temen_par_child` to seed its `vcpu.tls` with.
+                v.d = vcpu as i64;
                 return PAR_SPAWN;
             }
             bytecode::VcpuEvent::Join { handle } => {
@@ -3805,7 +3827,7 @@ pub fn onramp_exec_with_tee(
         };
     let framebuffer = frame.lock().unwrap().take();
     PbOutcome {
-        trap: trap.clone(),
+        trap,
         fault_addr: match trap {
             Some(Trap::MemoryFault) => temen_interp::last_capture_fault_addr(),
             _ => None,
@@ -11678,8 +11700,8 @@ struct Op13JitDriver {
     child: std::sync::Arc<temen_ir::Module>,
     mem_base: *mut u8,
     layout: Layout,
-    /// Joined child results, indexed by the handle `instantiate` returns (the `join` reads them).
-    children: Vec<Result<Vec<Value>, Trap>>,
+    /// Joined child results, indexed by the handle `instantiate` returns (the `join` takes them).
+    children: Vec<Option<Result<Vec<Value>, Trap>>>,
     /// The driver's final return value (set on `Done`).
     result: i64,
     /// The shared memfs a phase child reads/writes, and the key its output lands at (`nimcache/…p.nif`) —
@@ -12639,7 +12661,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                                 Err(t) => Err(t),
                             };
                             let handle = d.children.len() as i32;
-                            d.children.push(r);
+                            d.children.push(Some(r));
                             d.root.deliver_handle(handle);
                             continue; // the driver's `join` on this handle is serviced inline below
                         }
@@ -12786,7 +12808,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                             Err(t) => Err(t),
                         };
                         let handle = d.children.len() as i32;
-                        d.children.push(r);
+                        d.children.push(Some(r));
                         d.root.deliver_handle(handle);
                         continue;
                     }
@@ -12850,11 +12872,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
             #[cfg(not(all(target_arch = "wasm32", target_feature = "atomics")))]
             bytecode::VcpuEvent::InstantiateDetached { .. } => return OP13JIT_TRAP,
             bytecode::VcpuEvent::Join { handle } => {
-                let banked = d
-                    .children
-                    .get(handle as usize)
-                    .cloned()
-                    .unwrap_or(Err(Trap::Malformed));
+                let banked = temen_interp::take_child(&mut d.children, handle).and_then(|r| r);
                 d.root.deliver_join(banked);
                 // continue: the driver's own join is serviced without yielding to JS
             }
@@ -12950,7 +12968,7 @@ pub extern "C" fn temen_op13jit_deliver() -> i32 {
         }
     }
     let handle = d.children.len() as i32;
-    d.children.push(Ok(vec![Value::I64(value)]));
+    d.children.push(Some(Ok(vec![Value::I64(value)])));
     d.root.deliver_handle(handle);
     STATUS_OK
 }

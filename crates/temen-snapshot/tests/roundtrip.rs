@@ -1802,12 +1802,23 @@ fn a_completed_detached_child_rides_the_control_section() {
         FrozenDetached {
             parent_task: 0,
             slot: 0,
-            completed_result: 33,
+            completed_result: Ok(33),
         },
         FrozenDetached {
             parent_task: 0,
             slot: 2,
-            completed_result: -7,
+            completed_result: Ok(-7),
+        },
+        // #1674: a trap rides as its code, `Exit`'s own code in the high half included.
+        FrozenDetached {
+            parent_task: 0,
+            slot: 3,
+            completed_result: Err(temen_interp::Trap::Exit(-2)),
+        },
+        FrozenDetached {
+            parent_task: 0,
+            slot: 4,
+            completed_result: Err(temen_interp::Trap::MemoryFault),
         },
     ]);
     let artifact = freeze(&inst, &win, &host).expect("a detached residue is freezable");
@@ -1818,7 +1829,7 @@ fn a_completed_detached_child_rides_the_control_section() {
     assert_eq!(
         thost.frozen_detached(),
         host.frozen_detached(),
-        "the detached residue round-trips exactly: (parent_task, slot, result), negative included",
+        "the detached residue round-trips exactly: (parent_task, slot, outcome), negative and trapped included",
     );
 
     let win2 = init_durable_window(WINDOW, TEST_ARENA);

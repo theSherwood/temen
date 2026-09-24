@@ -389,3 +389,117 @@ fn parallel_futex_barrier_matches_oracle() {
         assert_eq!(got_r, want_r, "parallel barrier != oracle (run {i})");
     }
 }
+
+// ---- A thread's trap ends its domain (DESIGN.md §12, I37) -------------------------------------------
+// A member's trap is terminal for its whole domain — the root and its `thread.spawn` threads — and a
+// sibling's trap becomes the run's result: the tree-walker and the cooperative driver's
+// `teardown_domains` have always done this. The parallel driver used to hand a child's trap only to a
+// `thread.join` of it, so a root that never joined (a runtime's worker pool) waited forever, and a
+// root's own trap left `thread::scope` waiting on still-running siblings.
+
+/// A child divides by zero while the root polls a flag it never sets, with 1 ms timed waits.
+const CHILD_TRAPS_ROOT_WAITS: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  va = i64.const 16384
+  vz = i32.const 0
+  vw = i64.const 1000000
+  vr = i32.atomic.wait va vz vw
+  br 1()
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 1
+  v1 = i64.const 0
+  v2 = i64.div_s v0 v1
+  return v2
+  }
+}
+"#;
+
+/// The same child trap while the root spins on the flag without ever blocking — the root observes the
+/// death at its next safepoint, not a wakeup.
+const CHILD_TRAPS_ROOT_SPINS: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  va = i64.const 16384
+  vf = i32.atomic.load va
+  br 1()
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 1
+  v1 = i64.const 0
+  v2 = i64.div_s v0 v1
+  return v2
+  }
+}
+"#;
+
+/// The root traps while its child spins forever.
+const ROOT_TRAPS_CHILD_SPINS: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  v0 = i64.const 1
+  v2 = i64.div_s v0 vz
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  br 1()
+}
+block 1 () {
+  va = i64.const 16384
+  vf = i32.atomic.load va
+  br 1()
+}
+}
+"#;
+
+#[test]
+fn a_thread_trap_ends_the_run_on_every_driver() {
+    for (name, src) in [
+        ("child traps, root waits", CHILD_TRAPS_ROOT_WAITS),
+        ("child traps, root spins", CHILD_TRAPS_ROOT_SPINS),
+        ("root traps, child spins", ROOT_TRAPS_CHILD_SPINS),
+    ] {
+        // The tree-walker ends a *spinning* root only when its fuel runs out (#1767), so it is
+        // the oracle for the two shapes where the survivor blocks or is the one that trapped.
+        if src != CHILD_TRAPS_ROOT_SPINS {
+            let m = parse_module(src).unwrap();
+            let mut fuel = 100_000_000u64;
+            assert_eq!(
+                temen_interp::run(&m, 0, &[], &mut fuel),
+                Err(temen_interp::Trap::DivByZero),
+                "{name}: tree-walker"
+            );
+        }
+        assert_eq!(
+            run_cooperative(src).0,
+            Err(temen_interp::Trap::DivByZero),
+            "{name}: cooperative"
+        );
+        for i in 0..reps(10) {
+            assert_eq!(
+                run_parallel(src).0,
+                Err(temen_interp::Trap::DivByZero),
+                "{name}: parallel (run {i})"
+            );
+        }
+    }
+}

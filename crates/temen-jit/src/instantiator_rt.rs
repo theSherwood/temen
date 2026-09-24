@@ -17,7 +17,7 @@ use crate::{CapThunk, TrapKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry, ValType};
+use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
 /// a compiled child ([`crate::CompiledModule`]) depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
@@ -100,6 +100,9 @@ struct Child {
     /// reachable after its thread exits (the interp's `child_hosts` retention, JIT twin).
     /// Released exactly once, at [`Nursery::join_children`], via the grant hooks' releaser.
     retained: usize,
+    /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
+    /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
+    nested: Option<(crate::FrozenNested, bool)>,
 }
 
 impl Child {
@@ -114,6 +117,7 @@ impl Child {
             }),
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 
@@ -124,6 +128,7 @@ impl Child {
             done,
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 }
@@ -156,7 +161,7 @@ unsafe fn file_task(
     code: std::sync::Arc<crate::CompiledModule>,
     mapped_log2: u8,
     reserved_log2: u8,
-    init: impl FnOnce(&mut [u8]),
+    init: impl FnOnce(&mut crate::mem::GuestWindow),
     premap: impl FnOnce(*mut u8, u64, u64) -> bool,
     copy_back: Option<crate::child_exec::CopyBack>,
     args: Vec<i64>,
@@ -269,11 +274,11 @@ unsafe fn file_carve_task(
         code,
         size_log2,
         size_log2,
-        move |rw| {
+        move |w| {
             let src = src;
             // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = `size`.
             let carve = unsafe { std::slice::from_raw_parts(src.0.add(sub_base as usize), size) };
-            rw[..size].copy_from_slice(carve);
+            w.rw_mut()[..size].copy_from_slice(carve);
         },
         |_, _, _| true,
         Some(Box::new(move |image: &[u8]| {
@@ -726,13 +731,33 @@ impl Nursery {
         std::sync::Arc::clone(&self.task_counter)
     }
 
-    /// Push a captured §14 nested-child re-attach record into the **shared** subtree sink (coalesces at
-    /// the root). `instantiate` calls this when a child left its carve `UNWINDING`.
-    pub(crate) fn push_frozen_nested(&self, rec: crate::FrozenNested) {
-        self.frozen_nested_sink
+    /// §4 — this nursery's owner is unwinding for a freeze: record each of its still-unjoined durable
+    /// §14 children into the **shared** subtree sink (coalesces at the root). A child that unwound
+    /// into its carve is re-attached on thaw; one that finished first carries its result, which the
+    /// thaw delivers to the owner's rewound `join` without re-running it (#1692), as the interpreter
+    /// does: its value, or the trap its `join` re-raises (#1674).
+    pub(crate) fn freeze_unjoined(&self) {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sink = self
+            .frozen_nested_sink
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(rec);
+            .unwrap_or_else(|e| e.into_inner());
+        for c in children.iter().filter(|c| !c.joined) {
+            let Some((rec, unwound)) = &c.nested else {
+                continue;
+            };
+            let mut rec = rec.clone();
+            if !unwound {
+                let (result, trap) = c
+                    .done
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("a durable child runs synchronously, so it has finished");
+                rec.completed_result = Some(if trap == 0 { Ok(result) } else { Err(trap) });
+            }
+            sink.push(rec);
+        }
     }
 
     /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
@@ -918,7 +943,8 @@ impl Nursery {
             code,
             mapped_log2,
             reserved_log2,
-            move |rw| {
+            move |w| {
+                let rw = w.rw_mut();
                 let n = image.len().min(rw.len());
                 rw[..n].copy_from_slice(&image[..n]);
                 let s = temen_ir::durable_abi::STATE_OFF as usize;
@@ -1173,7 +1199,11 @@ pub(crate) unsafe extern "C" fn instantiate(
         && off.checked_add(child_size).is_some_and(|e| e <= size)
         // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
         && base + off >= rt.null_guard.load(Ordering::Acquire)
-        && (entry as usize) < child_funcs.len();
+        // The one entry-shape rule every tier shares (#911, #1720) — this arm used to check only the
+        // index, so it ran an entry the oracle refuses.
+        && child_funcs
+            .get(entry as usize)
+            .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     if !fits || !mod_ok {
         return EINVAL as i32;
     }
@@ -1183,8 +1213,8 @@ pub(crate) unsafe extern "C" fn instantiate(
     // writes at spawn.
     write_data_segments(child_data, mem_base, base + off, child_size);
 
-    // The child entry takes its starter caps as `i64` args; with an empty powerbox today they are
-    // unused, so pass zeros of the right arity (the entry is a fixed `(i64[, i64]) -> i64`).
+    // The child entry takes its starter caps as `i64` args (none for a powerbox `_start`); with an
+    // empty powerbox today they are unused, so pass zeros of the entry's arity.
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
@@ -1231,20 +1261,22 @@ pub(crate) unsafe extern "C" fn instantiate(
         };
         let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
         let slot = children.len();
-        children.push(Child::finished(result, trap));
-        drop(children);
-        // §4 freeze export: the child left its carve `UNWINDING` — record its re-attach residue into the
-        // shared subtree sink tagged with this nursery's task, so a thaw re-creates the child domain.
-        if unwound {
-            rt.push_frozen_nested(crate::FrozenNested {
+        let mut child = Child::finished(result, trap);
+        // §4 freeze export: what a freeze records for this child if it is still unjoined when this
+        // nursery's owner unwinds ([`Nursery::freeze_unjoined`]).
+        child.nested = Some((
+            crate::FrozenNested {
                 parent_task: rt.my_task(),
                 task: child_task,
                 slot,
                 carve_off: base + off,
                 size_log2: size_log2 as u8,
                 entry: entry as u32,
-            });
-        }
+                completed_result: None,
+            },
+            unwound,
+        ));
+        children.push(child);
         return slot as i32;
     }
 
@@ -1391,15 +1423,16 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     };
     let off = off as u64;
     // A named child receives no positional grant, so its entry is the 1- or 2-arg form (`Instantiator`
-    // [, `AddressSpace`]) returning `i64` — it discovers its granted caps by name.
-    let want_as = child_funcs
+    // [, `AddressSpace`]) returning `i64`, or a powerbox `_start` taking nothing (#1720) — either way it
+    // discovers its granted caps by name.
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
@@ -1483,10 +1516,8 @@ pub(crate) unsafe extern "C" fn instantiate_named(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // Async (S1c): the child runs on its own OS thread — two named-grant children can pipeline
     // through a granted `SharedRegion` — and its powerbox host is released from that thread.
@@ -1738,15 +1769,16 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     };
     let off = off as u64;
     // A named child receives no positional grant, so its entry is the 1- or 2-arg form (a compiled
-    // command's `--child-entry` `_start` is the 1-arg starter form; it finds granted caps by name).
-    let want_as = child_funcs
+    // command's `--child-entry` `_start` is the 1-arg starter form) or a powerbox `_start` taking
+    // nothing (#1720); either way it finds granted caps by name.
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 /
     // #773 — the interpreter twin at `instantiate_rec`'s `mod_ok`): a larger window is a safe
     // superset (confinement, invariant 2, still masks every access to the actual carve), and a
@@ -1839,10 +1871,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // Async (S1c): a spawned command runs on its own OS thread — the shell-exec primitive can
     // pipeline (`cmd1 | cmd2` over a granted region ring or pipe) instead of serializing.
@@ -1882,7 +1912,7 @@ unsafe fn spawn_detached_child(
     code: crate::CompiledModule,
     mapped_log2: u8,
     reserved_log2: u8,
-    seeds: Vec<(u64, Vec<u8>)>,
+    seeds: Vec<Seed>,
     premap_apply: Option<crate::PremapApply>,
     args: Vec<i64>,
     n_results: usize,
@@ -1908,18 +1938,29 @@ unsafe fn spawn_detached_child(
         mapped_log2,
         reserved_log2,
         // The window image: the module's data segments, then the payload at the args base; a durable
-        // child's window also starts durable (`temen_durable::init_durable_window`'s one word).
-        |rw| {
-            for (off, bytes) in &seeds {
-                let off = *off as usize;
-                if let Some(end) = off.checked_add(bytes.len()) {
-                    if end <= rw.len() {
-                        rw[off..end].copy_from_slice(bytes);
-                    }
-                }
+        // child's window also starts durable (`temen_durable::init_durable_window`'s one word). Then
+        // the `readonly` segments go RO, as in a root's window (#1730): a detached child is
+        // root-shaped, so a write to its const data faults.
+        |w| {
+            let len = w.rw_mut().len();
+            let seeds: Vec<&Seed> = seeds
+                .iter()
+                .filter(|s| {
+                    (s.offset as usize)
+                        .checked_add(s.bytes.len())
+                        .is_some_and(|end| end <= len)
+                })
+                .collect();
+            let rw = w.rw_mut();
+            for s in &seeds {
+                let off = s.offset as usize;
+                rw[off..off + s.bytes.len()].copy_from_slice(&s.bytes);
             }
             if let Some(a) = durable {
                 init_durable_words(rw, a);
+            }
+            for s in seeds.iter().filter(|s| s.readonly) {
+                w.protect_ro(s.offset, s.bytes.len() as u64);
             }
         },
         // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the child
@@ -1957,6 +1998,14 @@ unsafe fn spawn_detached_child(
             EINVAL as i32
         }
     }
+}
+
+/// One run of bytes a detached child's fresh window starts with: a data segment, or the args
+/// payload.
+struct Seed {
+    offset: u64,
+    bytes: Vec<u8>,
+    readonly: bool,
 }
 
 /// A fresh durable window's control words, as `temen_durable::init_durable_window` writes them: the
@@ -2046,14 +2095,14 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     } else {
         0
     };
-    let want_as = child_funcs
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // §14 transparency: the detached window equals the module's declared memory (the interpreter's
     // op-15 `mod_ok`); it grows into its own reservation, so no superset room is needed.
     let mod_ok = mod_mem == Some(size_log2 as i32);
@@ -2186,18 +2235,24 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // The window image: the module's data segments, then the payload at the args base.
-    let mut seeds: Vec<(u64, Vec<u8>)> = child_data
+    let mut seeds: Vec<Seed> = child_data
         .iter()
-        .map(|d| (d.offset, d.bytes.clone()))
+        .map(|d| Seed {
+            offset: d.offset,
+            bytes: d.bytes.clone(),
+            readonly: d.readonly,
+        })
         .collect();
     if !payload.is_empty() {
-        seeds.push((temen_ir::module_args_base(), payload));
+        seeds.push(Seed {
+            offset: temen_ir::module_args_base(),
+            bytes: payload,
+            readonly: false,
+        });
     }
     spawn_detached_child(
         rt,
@@ -2226,15 +2281,21 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
 /// until the 5c.1 transport lands; minting is the 5c.0 slice.)
 ///
 /// # Safety
-/// `rt` is the run's live nursery; `trap_out` the live trap cell (untouched — no trap paths).
+/// `rt` is the run's live nursery; `mem_base` its live window base; `trap_out` the live trap cell
+/// (written only for a forged `Instantiator`).
 pub(crate) unsafe extern "C" fn child_offer(
     rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
     child: i32,
     export: i64,
-    _trap_out: *mut i64,
+    trap_out: *mut i64,
 ) -> i32 {
     const EINVAL: i32 = -22;
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mint_addr = rt.grant_mint.load(Ordering::Acquire);
     if mint_addr == 0 {
         return EINVAL;
@@ -2257,8 +2318,17 @@ pub(crate) unsafe extern "C" fn child_offer(
     mint(rt.grant_ctx(), retained as *mut core::ffi::c_void, export)
 }
 
-pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i64 {
+pub(crate) unsafe extern "C" fn join(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i64 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     let slot = handle as usize;
     let done = match children.get_mut(slot) {
@@ -2359,8 +2429,17 @@ pub(crate) unsafe extern "C" fn join(rt: *const Nursery, handle: i32, trap_out: 
 ///
 /// # Safety
 /// As [`join`]: `rt`/`trap_out` are the baked nursery + run trap cell, valid for the call.
-pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn poll(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get(handle as usize) {
         Some(c) if !c.joined => {
@@ -2384,8 +2463,17 @@ pub(crate) unsafe extern "C" fn poll(rt: *const Nursery, handle: i32, trap_out: 
 ///
 /// # Safety
 /// As [`join`].
-pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn detach(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get_mut(handle as usize) {
         Some(c) if !c.joined => {
@@ -2407,8 +2495,17 @@ pub(crate) unsafe extern "C" fn detach(rt: *const Nursery, handle: i32, trap_out
 ///
 /// # Safety
 /// As [`join`].
-pub(crate) unsafe extern "C" fn kill(rt: *const Nursery, handle: i32, trap_out: *mut i64) -> i32 {
+pub(crate) unsafe extern "C" fn kill(
+    rt: *const Nursery,
+    mem_base: u64,
+    inst: i32,
+    handle: i32,
+    trap_out: *mut i64,
+) -> i32 {
     let rt = &*rt;
+    if rt.resolve(mem_base, inst, trap_out).is_none() {
+        return 0; // a forged `Instantiator` — `*trap_out` holds the CapFault (#1729)
+    }
     let children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
     match children.get(handle as usize) {
         Some(_) => 0,

@@ -1630,8 +1630,8 @@ fibers only, so a frozen thread or nested child never reached the artifact. They
 vcpus, nested, root_sp }` — the interpreter's residue, piece for piece — and `jit_durable_enter`/`_leave`
 carry all of it through the `Host` both ways. An async freeze controller now always engages the
 concurrent path, so a child spawned while `NORMAL` has its own shadow context rather than unwinding into
-the root's (#1691). Residue the JIT cannot re-create yet (a separate-module or completed nested child,
-a nested child's host state, a detached child that completed before the cut, a live detached child
+the root's (#1691). Residue the JIT cannot re-create yet (a separate-module nested child, a nested
+child's host state, a detached child that completed before the cut, a live detached child
 whose program the thawing host no longer grants — #1692) is refused whole as `Unsupported` and
 left on the `Host` for an interpreter thaw, never dropped. Pinned by `durable_multivcpu_jit.rs`
 (`the_embedder_jit_path_carries_the_vcpu_residue_both_ways`, `…_refuses_residue_it_cannot_recreate_and_keeps_it`).
@@ -1643,8 +1643,7 @@ trigger fires (`durable_tick_countdown` promotes `ARMED` → `UNWINDING`, at a f
 parked) and asks whether the cut can complete. If not, the freeze word goes straight back to `NORMAL` — no poll
 has read it, so nothing unwound — the run finishes exactly as if it had never been armed, and the run root's
 powerbox records a `FreezeDeclined { cause, task, slot }` for the embedder (`Host::take_freeze_declined`). The
-causes (`DeclineCause`) are the shapes the unwind would refuse: a §14 child completed with a trap
-(`ChildTrapped`), a child domain holding a non-durable handle, a live nested child beside a `thread.spawn`
+causes (`DeclineCause`) are the shapes the unwind would refuse: a child domain holding a non-durable handle, a live nested child beside a `thread.spawn`
 thread, a nested child owning fibers, a live detached child with no doorbell, a parked serve handler, a fiber
 parked on a call/ticket/pipe, and a detached window with a §13 region mapped. The **root's** own non-durable
 handles are not a cause: the codec answers those as a `FreezeError` value and its embedder can still drain them.
@@ -1653,9 +1652,8 @@ stay as the fail-closed backstop for a cause that arises *after* the census — 
 landed freeze (4A.7, below) is the one named. The owner's standing rule is that freezes should basically never
 fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap filed to be closed
 (#1703). On the oracle only for now; freeze-from-start (a window that begins `UNWINDING`) and freeze-on-quiesce
-are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a trapped completed child and a
-nested child beside a thread each decline, and the run's result equals the unarmed run's; with the census
-disabled both end `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the
+are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a nested child beside a thread
+declines, and the run's result equals the unarmed run's; with the census disabled it ends `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the
 root's handles are the codec's").
 
 **[~] 4A.7 — parked-vCPU / `Blocking.work` latency — done (fail-closed cut).** A durable stop-the-world freeze
@@ -1851,6 +1849,41 @@ multi-worker quiesce + active-SP swap sync (LOOM)**; 4A.5 concurrent multi-vCPU 
 below) (LOOM); 4A.6 recycled-context async freeze (sparse-residue payoff); 4A.7 parked-vCPU /
 `Blocking.work` latency
 (narrows R6/R2 — freeze refuses on an in-flight `Blocking` call; full offload-cancellation deferred).
+
+**A finished, unjoined §14 child on the JIT (#1692).** A durable JIT child runs synchronously inside
+`instantiate`, and the JIT used to record it only if it unwound. A child that finished before the cut
+but was not yet joined left nothing behind, so the thawed parent's `join` read 0. Records are now
+taken when the parent unwinds (`Nursery::freeze_unjoined`), for every unjoined durable child: one that
+unwound is re-attached as before, and one that finished carries `completed_result`, which the thaw
+seeds into the parent's join slot without re-running the child, as the interpreter does. The field
+crosses `temen-run`'s embedder path both ways, so such residue is no longer refused there. A child that
+traps under an inherited freeze no longer counts as unwound: it finished, with its trap. Pinned by
+`durable_nesting_jit.rs::jit_freeze_carries_a_finished_unjoined_childs_result`.
+
+**A trapped child's outcome rides the artifact (#1674, v31).** A child's `join` outcome is its value
+*or its trap*: `join` re-raises a finished child's trap in the parent. `completed_result` on
+`FrozenNested` and `FrozenDetached` now carries either, so a child that finished with a trap before the
+cut rides the freeze like one that finished cleanly, and the thawed parent's `join` re-raises the same
+trap. On the wire the outcome is `0` none | `1` + value | `2` + the trap's code. `Trap::code` is the one
+stable numbering, shared with the JIT's trap cell (`TrapKind`, `Exit` as `7 | code << 32`). This retires
+the interpreter's `ChildTrapped` decline cause and the JIT's fail-closed `ThreadFault` for the same shape.
+(A `thread.spawn` thread has no such state: its trap tears down the whole domain on both engines.) Pinned
+by `durable_nesting.rs::freeze_with_trapped_unjoined_child_rides_and_the_thawed_join_re_raises_it`
+(through the codec, byte-identical re-freeze), `durable_nesting_jit.rs::{jit_freeze_carries_a_trapped_unjoined_childs_trap,
+jit_freeze_carries_a_trapped_unjoined_grandchilds_trap}`, the detached round trip in
+`temen-snapshot/tests/roundtrip.rs`, and `trap_code_tests`.
+
+**A request that races the run's end (4A.3, #1748).** `request_freeze` and the run's `retire` exclude
+each other through the controller's `base` word (a request holds `STORING` across its store; retire
+waits it out), so the store only ever lands in a live window, and a request after the run ended is a
+no-op. A request can still land after the root's **last poll** but before retire. The root then returned
+or trapped without unwinding, so nothing froze, yet the window's state word reads `UNWINDING`. Retire
+detects this: the request landed, and the root's shadow-SP never left its frame base (an unwinding
+root spills at least its entry frame). In that case it resets the word to `NORMAL`, so the run reads
+as the uninterrupted one it was. It does this only when the root is the last live vCPU: a concurrent
+child may have seen the mark and be mid-unwind, and flipping the word under it would resume it on
+placeholder values. Pinned by `durable_backedge_jit.rs::a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen`
+and `temen-jit`'s `freeze_controller_tests`.
 
 **Status:** 4A.1–4A.5 + follow-ups **A** and **B.1** + the **blocked-in-`thread.join` freeze** + **B.2**
 (full nested concurrent spawns) + the **blocked-in-`thread.wait` freeze** (bounded + fail-closed) +

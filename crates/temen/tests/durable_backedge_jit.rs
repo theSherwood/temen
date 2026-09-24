@@ -351,3 +351,53 @@ fn interp_mid_loop_freeze_thaws_on_the_jit() {
         "JIT thaw flips back to NORMAL"
     );
 }
+
+/// The root calls a host function that requests a freeze and then fails, so the `call.cap` traps
+/// before its trailing poll: the request lands, but the root never unwinds.
+const REQUEST_THEN_TRAP: &str = "func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i32.const 0
+  v2 = call.cap 13 0 (i32) -> (i64) v0 (v1)
+  return v2
+  }
+}
+";
+
+/// #1748: a freeze request that lands after the root's last poll freezes nothing, and the run says so.
+/// The run traps without unwinding, so its window must read `NORMAL`: the trap is the whole outcome,
+/// not a freeze whose artifact holds a finished run.
+#[test]
+fn a_freeze_request_the_root_never_polled_leaves_the_run_unfrozen() {
+    let inst = module(REQUEST_THEN_TRAP);
+    let freeze = FreezeController::new();
+    let fc = Arc::clone(&freeze);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let hf = h.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
+        fc.request_freeze();
+        Err(temen_interp::Trap::CapFault)
+    }));
+    let (out, snap, DurableResidue { .. }) = compile_and_run_durable(
+        &inst,
+        0,
+        &[hf as i64],
+        &window_with(STATE_NORMAL),
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+        DurableRun {
+            freeze: Some(freeze),
+            ..Default::default()
+        },
+    )
+    .expect("compiles");
+    assert!(
+        matches!(out, JitOutcome::Trapped(_)),
+        "the host fn's failure traps: {out:?}"
+    );
+    assert_eq!(
+        read_state(&snap),
+        STATE_NORMAL,
+        "a request nothing unwound for is undone"
+    );
+}

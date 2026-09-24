@@ -3515,6 +3515,28 @@ pub fn spawns_detached(module: &Module) -> bool {
     module.funcs.iter().any(Func::spawns_detached)
 }
 
+/// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle),
+/// `(i64, i64) -> (i64)` (also an address-space handle, so the child manages its own pages), or —
+/// #1720 — a **powerbox entry**: no params, returning nothing or an integer status. That is how every
+/// program is built to start (`_start`, [`is_named_powerbox_entry`]), so a module nests exactly as
+/// built: it finds its capabilities by name, as exec's #1668 rule already lets it. The single
+/// definition every tier's spawn arms share — the interpreters and the Cranelift JIT (#911);
+/// [`child_entry_handles`] is what each shape takes.
+pub fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
+    (results == [ValType::I64]
+        && (params == [ValType::I64] || params == [ValType::I64, ValType::I64]))
+        || (params.is_empty() && matches!(results, [] | [ValType::I32] | [ValType::I64]))
+}
+
+/// The handles an admitted child entry takes, one per param in order: its starter `Instantiator`,
+/// then its `AddressSpace`. A powerbox entry (arity 0) takes none — it binds its manifest and resolves
+/// names against the same powerbox. A join reads the entry's result as an interpreter `Reg` holds it,
+/// so an `i32` status sign-extends and an empty result reads `0` — on every tier (the Cranelift
+/// trampoline stores an `i32` result the same way).
+pub fn child_entry_handles(arity: usize, inst: i32, space: i32) -> impl Iterator<Item = i64> {
+    [inst, space].into_iter().take(arity).map(i64::from)
+}
+
 pub fn is_named_powerbox_entry(module: &Module) -> bool {
     module.funcs.first().is_some_and(|f| f.params.is_empty())
         && module
