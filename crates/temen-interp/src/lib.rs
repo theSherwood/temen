@@ -2809,14 +2809,9 @@ fn seed_domain(
                 };
                 bytecode::child_entry_args(arity, 0, 0)
             } else {
-                let cinst = ch.grant_instantiator(0, csize);
-                // A one-arg entry manages no pages of its own; a two-arg entry takes its
-                // AddressSpace, and a powerbox entry (#1720) binds its manifest's `vm_map` to it.
-                let cas = if arity == 1 {
-                    0
-                } else {
-                    ch.grant_address_space(0, csize)
-                };
+                // The starter caps every spawn arm grants (#1720) — so a re-launched child holds the
+                // powerbox its first launch did.
+                let (cinst, cas) = ch.grant_starter_caps(csize);
                 bytecode::child_entry_args(arity, cinst, cas)
             };
             let cid = claim(s, fnr.task);
@@ -5246,6 +5241,32 @@ enum Step {
 /// `crates/temen-run/demos/posix_libc/exec.c`.
 const EXEC_ARGS_BASE: u64 = 128;
 const EXEC_ARGS_END: u64 = 16384;
+
+/// FORK.md §8.6 / #1768 — an **admitted** `execve` image-replace, as [`Host::exec_image`] builds it
+/// for every engine: the command's ready powerbox (process state already carried into it) and what
+/// the engine needs to start the command. Holding one means the caller's image is committed to
+/// being replaced.
+pub struct ExecImage {
+    /// The command's powerbox: inherited caps regranted by name, its own imports bound, its module
+    /// registered as the self module, the personality carried over.
+    pub host: Host,
+    /// The command module.
+    pub module: Arc<Module>,
+    /// The entry function the command starts at.
+    pub entry: u64,
+    /// The entry's arguments: the starter handles its shape takes (none for a powerbox `_start`).
+    pub entry_args: Vec<i64>,
+    /// The window the command runs in: the caller's backed prefix (the image-replace reuses it).
+    pub child_size: u64,
+    /// `1 << memory_log2` of the command: the extent an in-place replace freshens.
+    pub image_len: u64,
+    pub(crate) funcs: Arc<[Func]>,
+    pub(crate) types: Arc<[temen_ir::TypeEntry]>,
+    pub(crate) data: Arc<[Data]>,
+    /// The pipes the old image's released ends left with no writers / no readers: a scheduler
+    /// wakes their readers (EOF) / writers (`-EPIPE`).
+    pub(crate) zeroed_pipes: (Vec<u32>, Vec<u32>),
+}
 
 struct ExecReq {
     funcs: Arc<[Func]>,
@@ -11735,11 +11756,17 @@ fn decide(
         // drive loop's insert translates it to the per-parent key.
         ParkEvent::TaskExitAny if t.sig_intr => Decision::Eintr,
         ParkEvent::TaskExitAny => Decision::Reap(REAP_ANY_CHILD),
-        // The op resolved the path against the command registry and packed argv/envp into the
-        // powerbox args region, so only the resolved command handle rides the request.
+        // The op resolved the path against the command registry and staged argv/envp; only the
+        // resolved command handle rides the request. The staged args are collected at the commit
+        // point and nowhere else (#1768): a refused exec returns to an untouched caller.
         ParkEvent::ExecSelf { cmd } => {
             match build_exec_req(host, mem, sched, cmd, 0, 0, 0, 0, durable, clean_root) {
-                Some(req) => Decision::Exec(req),
+                Some(req) => {
+                    if let (Some(blob), Some(m)) = (req.host.exec_commit_args(), mem) {
+                        m.write_exec_args(&blob);
+                    }
+                    Decision::Exec(req)
+                }
                 None => Decision::ExecRefused,
             }
         }
@@ -11759,129 +11786,41 @@ fn build_exec_req(
     durable: bool,
     clean_root: bool,
 ) -> Option<Box<ExecReq>> {
-    // Resolve the command module (forged handle → fail closed) into an owned `ChildMod`.
-    let cmod = {
-        let hg = host.lock_unpoisoned();
-        hg.resolve_module(mh).ok().map(|g| ChildMod {
-            funcs: g.funcs.clone(),
-            shadow: g.shadow,
-            memory_log2: g.memory_log2,
-            data: g.data.clone(),
-            durable: g.durable,
-            digest: g.digest,
-            imports: g.imports.clone(),
-            types: g.types.clone(),
-            module: Arc::clone(&g.module),
-        })
-    };
-    // Read + authority-check the inherited-cap grant list (same 16-byte record shape as
-    // op 13's named grants). Any bad record / non-regrantable handle fails the whole
-    // exec closed, before we mutate anything.
-    let grants: Option<Vec<(String, i32)>> = (|| {
-        let m = mem.as_ref()?;
-        let list = read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).ok()?;
-        let hg = host.lock_unpoisoned();
-        list.iter().all(|(_, h)| hg.can_regrant(*h)).then_some(list)
-    })();
-    // Admissibility: a resolvable non-durable command whose declared window **fits the
-    // caller's inherited window** (FORK.md §8.6 / #773: `exec_module` reuses the caller's
-    // window in place, so the command runs there iff its declared memory ≤ that window —
-    // a larger window is a safe superset, still masked to the actual size by invariant 2).
-    // The guest-passed `size_log2` is now advisory: the real bound is the caller's own
-    // window (`mem.window_size()`), so a shell whose window is bigger than the shim's
-    // hardcoded hint can exec a command that declares more memory than that hint. A real
-    // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
-    // fully-regrantable grant list are also required. Anything else is a probeable
-    // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
-    // The real capacity bound is the caller's **backed prefix**
-    // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
-    // runs the command in the caller's window, and pages beyond the backed prefix
-    // have no physical backing — committing prot entries there admits accesses
-    // the backing cannot serve (observed: an ml-17 command in an ml-16 caller ran
-    // with its upper half silently absent and died on garbage pointers). A grown
-    // Rw tail is deliberately not counted (its backing depth is embedder-specific
-    // — fail closed, invariant 9); a non-power-of-two prefix likewise refuses.
-    let win_bytes = mem.as_ref().map(|m| m.window.mapped()).unwrap_or(0);
-    let win_log2 = win_bytes
-        .is_power_of_two()
-        .then(|| win_bytes.trailing_zeros() as u8);
-    // #1668 / #1720 — a command enters any way a §14 child may (`bytecode::child_entry_ok`, the one
-    // rule): the chibicc `--child-entry` ABI takes its starter caps as arguments, and a powerbox
-    // `_start` — how every nimony program enters — takes none and finds what it needs by name, reading
-    // its argv from the args region the exec already wrote.
-    let entry_params = cmod.as_ref().and_then(|cm| {
-        let f = cm.funcs.get(entry as usize)?;
-        bytecode::child_entry_ok(&f.params, &f.results).then_some(f.params.len())
-    });
-    let admissible = !durable
-        && clean_root
-        && grants.is_some()
-        && (0..64).contains(&size_log2)
-        && entry_params.is_some()
-        && win_log2.is_some_and(|wl| {
-            cmod.as_ref()
-                .is_some_and(|cm| cm.memory_log2.is_some_and(|ml| ml <= wl))
-        });
-    // Build the command's powerbox now (where a failure is still a clean `-EINVAL`):
-    // inherited caps regranted by name + fresh instantiator/AddressSpace, its own import
-    // manifest bound, its module registered as the self module. Only then commit to the
-    // image-replace (the returned [`ExecReq`]), which `dispatch` completes infallibly. The command's
-    // window (its Instantiator/AddressSpace authority + the data-materialization bound) is
-    // the **caller's** window, not the guest's `size_log2` hint — it runs where the shell did.
-    let built = if admissible {
-        let child_size = 1u64 << win_log2.expect("admissible");
-        let cm = cmod.as_ref().expect("admissible");
-        let grants = grants.as_ref().expect("admissible");
-        let mut hg = host.lock_unpoisoned();
-        hg.spawn_named_child(grants, child_size)
-            .and_then(|(mut ch, ci, ca)| {
-                let mut starters = [ci, ca];
-                // #1080 — the personality carry (self_module, exit/signal/stop/park
-                // cells, host_procs, pipe-end re-install + exec-remap) is shared with
-                // the bytecode engine's exec arm via `Host::exec_carry`, so this
-                // TCB-sensitive logic lives once. On a manifest-bind failure it unwinds
-                // and returns `Err` → the exec refuses cleanly (caller keeps running).
-                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types, &mut starters)
-                    .ok()
-                    .map(|_remap| (ch, starters[0], starters[1], child_size))
-            })
-    } else {
-        None
-    };
-    match built {
-        Some((ch, cinst, cas, child_size)) => {
-            let cm = cmod.expect("built");
-            let entry_args = bytecode::child_entry_args(entry_params.unwrap_or(1), cinst, cas);
-            // FORK.md §8.6 — the old powerbox is about to be dropped by the image
-            // -replace: release its pipe write *and* read ends (the fork-inherited ones
-            // this exec did not carry into the new image) and wake any pipe that thereby
-            // reached 0 writers (→ EOF for its readers) or 0 readers (→ `-EPIPE` for its
-            // writers). The new image's grants already bumped their own ends
-            // (`install_pipe_end`), so the shared counts never dip through this.
-            let (zeroed_w, zeroed_r) = {
-                let hg = host.lock_unpoisoned();
-                (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
-            };
-            for pipe in zeroed_w {
-                sched.wake_pipe_readers(pipe);
-            }
-            for pipe in zeroed_r {
-                sched.wake_pipe_writers(pipe);
-            }
-            Some(Box::new(ExecReq {
-                null_guard: temen_ir::module_null_guard(),
-                funcs: cm.funcs,
-                types: cm.types,
-                data: cm.data,
-                entry,
-                child_size,
-                image_len: 1u64 << cm.memory_log2.unwrap_or(0),
-                host: ch,
-                entry_args,
-            }))
-        }
-        None => None,
+    // The tree-walker's own gates: a durable domain's subtree must stay snapshottable, and only a
+    // clean root context (no serve handler / fibers) can be replaced. Everything else — the command,
+    // its entry, the window fit (the caller's backed prefix), the grants — is the one rule every
+    // engine admits by, `Host::exec_image`. Anything refused is a probeable `-EINVAL` that leaves the
+    // caller running (POSIX `execve` returns only on failure).
+    if durable || !clean_root {
+        return None;
     }
+    let m = mem?;
+    // The inherited-cap grant list (same 16-byte record shape as op 13's named grants); a bad record
+    // fails the whole exec closed, before anything is mutated.
+    let grants = read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l)).ok()?;
+    let img =
+        host.lock_unpoisoned()
+            .exec_image(mh, &grants, entry, size_log2, m.window.mapped())?;
+    // FORK.md §8.6 — wake any pipe the old image's released ends left with 0 writers (→ EOF for its
+    // readers) or 0 readers (→ `-EPIPE` for its writers).
+    let (zeroed_w, zeroed_r) = img.zeroed_pipes;
+    for pipe in zeroed_w {
+        sched.wake_pipe_readers(pipe);
+    }
+    for pipe in zeroed_r {
+        sched.wake_pipe_writers(pipe);
+    }
+    Some(Box::new(ExecReq {
+        null_guard: temen_ir::module_null_guard(),
+        funcs: img.funcs,
+        types: img.types,
+        data: img.data,
+        entry,
+        child_size: img.child_size,
+        image_len: img.image_len,
+        host: img.host,
+        entry_args: img.entry_args.into_iter().map(Value::I64).collect(),
+    }))
 }
 
 fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
@@ -13472,8 +13411,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     hg.child_attestation(durable, Some(carve))
                                 };
                                 ch.set_attestation(catt);
-                                let cinst = ch.grant_instantiator(0, child_size);
-                                let cas = ch.grant_address_space(0, child_size);
+                                let (cinst, cas) = ch.grant_starter_caps(child_size);
                                 // S2 named grant list (op 11): install each re-granted cap into the child
                                 // **under its name** (so the child resolves it by `self.resolve`).
                                 // Empty for every other op.
@@ -14080,8 +14018,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // for). The minter quota governs *minting*; growth is bounded by the
                                 // reservation (and, on wasm, the minted memory's `maximum`).
                                 let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
-                                let cinst = ch.grant_instantiator(0, reservation);
-                                let cas = ch.grant_address_space(0, reservation);
+                                let (cinst, cas) = ch.grant_starter_caps(reservation);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -19395,6 +19332,17 @@ pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
 /// page through it.
 pub type StdoutTee = Box<dyn FnMut(&[u8]) + Send>;
 
+/// §7c **stdin inheritance** (#1720): a `Stream(In)` promoted to shared the first time it is re-granted
+/// into a §14 child — the unread bytes, the cursor and the lazy refill move here, so the granter and
+/// every child it re-granted stdin to read **one** stream from **one** position, the way stdout's shared
+/// sink makes their writes land in one buffer. (A blocking stdin is never promoted: its re-grant is
+/// refused, see [`Host::can_regrant`].)
+struct SharedStdin {
+    bytes: Vec<u8>,
+    pos: usize,
+    source: Option<StdinSource>,
+}
+
 /// A **lazy stdin source** ([`Host::set_stdin_source`]): called when a `Stream(In)` `read` finds the
 /// stdin buffer exhausted, to fetch more bytes — a CLI reads the next line of the real stdin here, so
 /// an interactive guest sees input as it is typed. An empty return is end of input (the read returns
@@ -20265,6 +20213,17 @@ pub trait SignalSource: Send + Sync {
     /// polls, as every caller did before this door existed). Default no-op — a source with no
     /// blocking ops need not store it.
     fn set_park_request(&self, _req: Arc<dyn Fn(ParkEvent) + Send + Sync>) {}
+
+    /// #1768 — an engine is **committing** the image-replace this source's [`ParkEvent::ExecSelf`]
+    /// asked for (admission passed, the new image's powerbox is built): apply what the exec replaces
+    /// on the personality's side (its argv) and hand back the args blob the new image reads at
+    /// `module_args_base`. Nothing an exec replaces may change before this — a refused exec, or one no
+    /// engine serves, returns to a caller that is exactly as it was (POSIX: `execve` returns only on
+    /// failure, and then the calling image is unchanged). Called only for an `ExecSelf`-requested
+    /// exec, never for a guest's own `exec_module` (op 14). Default `None`: a source with no exec op.
+    fn exec_commit(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// One interned interface's identity key: its `(op names, op signatures)` pair (#1109 — names
@@ -20352,8 +20311,10 @@ pub struct Host {
     /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
     /// playground sets it to relay each chunk to the page as the guest produces it (live streaming);
     /// every other host leaves it `None` (zero cost — one `Option` check per write). Not carried into
-    /// forked/twin child hosts (a child's output routes through its own powerbox / shared sink).
-    out_tee: Option<StdoutTee>,
+    /// forked/twin child hosts; a §14 child re-granted stdout shares it (see below).
+    /// Shared (#1720) so a §14 child re-granted this host's stdout streams live too: the child host
+    /// carries the same tee its inherited sink's bytes go through.
+    out_tee: Option<Arc<Mutex<StdoutTee>>>,
     /// The lazy stdin refill ([`Host::set_stdin_source`]): consulted only when a `read` finds the
     /// buffer empty and the run is not [`Self::stdin_block`]ing. `None` (every host but an interactive
     /// CLI) costs one `Option` check per exhausted read and keeps EOF semantics byte-identical. Not
@@ -20362,6 +20323,11 @@ pub struct Host {
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
     sinks: Vec<Arc<Mutex<Vec<u8>>>>,
+    /// §7c stdin inheritance (#1720): once promoted, this host's own stdin (see [`SharedStdin`]).
+    in_shared: Option<Arc<Mutex<SharedStdin>>>,
+    /// The shared stdins carried by re-granted `Stream(In)`s, indexed by the id their `sink` holds —
+    /// each aliases the granting parent's promoted stdin, as [`Self::sinks`] do its stdout.
+    sources: Vec<Arc<Mutex<SharedStdin>>>,
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
@@ -20635,6 +20601,11 @@ pub struct Host {
     /// `feed_terminal` — from another OS thread, or another wasm-thread instantiation in the
     /// browser — unblocks the pump. `None` (the default) leaves deadlock detection untouched.
     external_wake: Option<Arc<(Mutex<u64>, Condvar)>>,
+    /// #1768 — the hand-off an engine that serves a personality `execve` by **unwinding its run**
+    /// (the JIT) uses: `None` — this run does not serve exec that way; `Some(None)` — armed
+    /// ([`Host::arm_exec_replace`]); `Some(Some(img))` — an admitted image waiting for the unwound
+    /// run's driver to start it ([`Host::take_exec_image`]).
+    exec_replace: Option<Option<Box<ExecImage>>>,
     /// §4/§7 the **JIT cap-path window page map**, keyed by window base. The JIT's `cap_thunk` rebuilds
     /// its window view per `call.cap`, so without a persistent home a guest-*grown* heap page (committed
     /// via the Memory cap in an earlier call) would read back as unmapped and a cap-buffer borrow of it
@@ -21109,6 +21080,8 @@ impl Host {
             out_tee: None,
             stdin_source: None,
             sinks: Vec::new(),
+            in_shared: None,
+            sources: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
             region_hook: None,
@@ -21160,6 +21133,7 @@ impl Host {
             term_flag: Arc::new(AtomicBool::new(false)),
             park_request: Arc::new(AtomicU64::new(0)),
             external_wake: None,
+            exec_replace: None,
             cap_pages: None,
             quota: Quota::default(),
             jit_tables: Vec::new(),
@@ -21419,8 +21393,7 @@ impl Host {
         twin.attestation = self.attestation;
         twin.durable = self.durable;
         // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
-        twin.stdin = self.stdin.clone();
-        twin.stdin_pos = self.stdin_pos;
+        (twin.stdin, twin.stdin_pos) = self.stdin_copy();
         twin.stdin_block = self.stdin_block;
         twin.mem_map_limit = self.mem_map_limit;
         twin.mem_mapped_bytes = self.mem_mapped_bytes;
@@ -21962,7 +21935,7 @@ impl Host {
     /// never leak into a later call's park decision (the `take_stdin_parked` precedent).
     /// Cell encoding: `0` = none, [`u64::MAX`] = [`ParkEvent::ForkSelf`], `u64::MAX - 1` =
     /// [`ParkEvent::TaskExitAny`], else the [`ParkEvent::TaskExit`] task id.
-    fn take_park_request(&self) -> Option<ParkEvent> {
+    pub fn take_park_request(&self) -> Option<ParkEvent> {
         ParkEvent::decode(self.park_request.swap(0, Ordering::SeqCst))
     }
 
@@ -22526,7 +22499,10 @@ impl Host {
     /// past that end needs.
     pub(crate) fn journal_invertible(&self) -> bool {
         let (queue, results, _) = self.svc_state();
-        queue.is_empty()
+        // A promoted stdin (#1720) keeps its cursor in the shared cell a child also advances, which a
+        // host-local journal record cannot invert.
+        self.in_shared.is_none()
+            && queue.is_empty()
             && results.is_empty()
             && (self.cap_record.is_some() || self.host_procs.iter().all(|e| e.state.is_none()))
     }
@@ -22688,6 +22664,22 @@ impl Host {
                 restore(bytes);
             }
         }
+    }
+
+    /// A §14 child's **starter** capabilities over its own window `[0, size)`: its `Instantiator` and
+    /// `AddressSpace`, each registered under its canonical name (`"instantiator"`, `"addrspace"`) — so a
+    /// child finds them by name exactly as a root program finds its own (#1720). The `AddressSpace` is
+    /// `"memory"` too: `size` is all the window the child can ever have, so it is the root's
+    /// whole-window grant as well. A child-entry passes them as its entry args too; a powerbox `_start`
+    /// takes none and can only find them this way. The one place every tier's child builders mint them.
+    /// Registered first, so they own those names.
+    pub fn grant_starter_caps(&mut self, size: u64) -> (i32, i32) {
+        let inst = self.grant_instantiator(0, size);
+        let space = self.grant_address_space(0, size);
+        self.register_cap_name("instantiator", inst);
+        self.register_cap_name("addrspace", space);
+        self.register_cap_name("memory", space);
+        (inst, space)
     }
 
     /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
@@ -23841,7 +23833,35 @@ impl Host {
     /// write's bytes as the guest produces them, *in addition to* the normal buffering. The browser
     /// playground uses it to stream output to the page mid-run; it does not affect the captured bytes.
     pub fn set_stdout_tee(&mut self, tee: StdoutTee) {
-        self.out_tee = Some(tee);
+        self.out_tee = Some(Arc::new(Mutex::new(tee)));
+    }
+
+    /// This host's stdin as a `(bytes, cursor)` copy, wherever it lives — its own buffer, or the shared
+    /// cell a promotion moved it into (#1720). A fork twin copies it: POSIX fork copies the buffer and
+    /// the offset.
+    fn stdin_copy(&self) -> (Vec<u8>, usize) {
+        match &self.in_shared {
+            Some(c) => {
+                let c = c.lock_unpoisoned();
+                (c.bytes.clone(), c.pos)
+            }
+            None => (self.stdin.clone(), self.stdin_pos),
+        }
+    }
+
+    /// §7c stdin inheritance (#1720) — promote this host's stdin to a shared cell and return it, so a
+    /// child re-granted stdin reads the same stream from the same position. Idempotent. The unread
+    /// bytes, cursor and lazy refill move into the cell, which serves every later read of this host's
+    /// own stdin too.
+    fn shared_stdin(&mut self) -> Arc<Mutex<SharedStdin>> {
+        if self.in_shared.is_none() {
+            self.in_shared = Some(Arc::new(Mutex::new(SharedStdin {
+                bytes: std::mem::take(&mut self.stdin),
+                pos: std::mem::take(&mut self.stdin_pos),
+                source: self.stdin_source.take(),
+            })));
+        }
+        Arc::clone(self.in_shared.as_ref().unwrap())
     }
 
     /// Install a **lazy stdin source** (see [`Host::stdin_source`]): `src` is asked for more bytes
@@ -26092,8 +26112,7 @@ impl Host {
         ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false, None));
-        let cinst = ch.grant_instantiator(0, child_size);
-        let cas = ch.grant_address_space(0, child_size);
+        let (cinst, cas) = ch.grant_starter_caps(child_size);
         let cg = self.regrant_into_child(grant_handle, &mut ch)?;
         Some((ch, cinst, cas, cg))
     }
@@ -26106,7 +26125,20 @@ impl Host {
             || self.resolve_live_impl(handle).is_some()
             || self.resolve_region(handle).is_ok()
             || self.resolve_offer(handle).is_ok()
-            || self.resolve_copyable(handle).is_ok()
+            // A **blocking** stdin (a driver-parked interactive session) is not re-grantable: its
+            // driver pushes input into this host's buffer and parks this host's reader, neither of
+            // which reaches a child's inherited read (#1720). Fail closed rather than hand the child
+            // an EOF the session never sent.
+            || self.resolve_copyable(handle).is_ok_and(|(_, b)| {
+                !(self.stdin_block
+                    && matches!(
+                        b,
+                        Binding::Stream {
+                            role: StreamRole::In,
+                            ..
+                        }
+                    ))
+            })
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
             || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
@@ -26262,6 +26294,27 @@ impl Host {
             return Some(child.grant(cap_id::MODULE, Binding::Module(cid)));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
+        // §7c stdin inheritance (#1720): alias the stdin THIS handle reads — its own carried cell if it
+        // was itself inherited, else this host's promoted stdin — into the child's source table.
+        if let Binding::Stream {
+            role: StreamRole::In,
+            sink,
+        } = binding
+        {
+            let shared = match sink {
+                Some(i) => Arc::clone(self.sources.get(i as usize)?),
+                None => self.shared_stdin(),
+            };
+            let idx = child.sources.len() as u32;
+            child.sources.push(shared);
+            return Some(child.grant(
+                tid,
+                Binding::Stream {
+                    role: StreamRole::In,
+                    sink: Some(idx),
+                },
+            ));
+        }
         if let Binding::Stream {
             role: r @ (StreamRole::Out | StreamRole::Err),
             sink,
@@ -26278,6 +26331,10 @@ impl Host {
             };
             let idx = child.sinks.len() as u32;
             child.sinks.push(shared);
+            // The live tee follows stdout into the child (#1720), so nested output streams too.
+            if r == StreamRole::Out {
+                child.out_tee = self.out_tee.clone();
+            }
             return Some(child.grant(
                 tid,
                 Binding::Stream {
@@ -26355,8 +26412,7 @@ impl Host {
                                                  // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
         ch.self_module = self.self_module.clone();
         ch.set_attestation(attestation);
-        let cinst = ch.grant_instantiator(0, child_size);
-        let cas = ch.grant_address_space(0, child_size);
+        let (cinst, cas) = ch.grant_starter_caps(child_size);
         for (name, handle) in grants {
             // Pre-checked above, so this cannot fail; each cap (coordinate-free or pipe end) is
             // re-granted into the child under its name.
@@ -26423,6 +26479,32 @@ impl Host {
     /// is a deadlock and faults, exactly as before.
     pub fn arm_external_wake(&mut self) {
         self.external_wake = Some(Arc::new((Mutex::new(0), Condvar::new())));
+    }
+
+    /// #1768 — opt this host's run into serving a personality `execve` by **unwinding** it (the JIT,
+    /// whose caller is a live native stack the exec discards): wire the caller-request door, so the
+    /// personality's `execve` raises [`ParkEvent::ExecSelf`] instead of answering `-ENOSYS`, and arm
+    /// the slot an admitted [`ExecImage`] waits in while the run unwinds.
+    pub fn arm_exec_replace(&mut self) {
+        self.wire_park_door();
+        self.exec_replace = Some(None);
+    }
+
+    /// Whether [`Self::arm_exec_replace`] armed this host.
+    pub fn exec_replace_armed(&self) -> bool {
+        self.exec_replace.is_some()
+    }
+
+    /// Park an admitted image for the unwinding run's driver (a no-op on an unarmed host).
+    pub fn stash_exec_image(&mut self, img: ExecImage) {
+        if let Some(slot) = &mut self.exec_replace {
+            *slot = Some(Box::new(img));
+        }
+    }
+
+    /// The image a run unwound to start, if one is waiting.
+    pub fn take_exec_image(&mut self) -> Option<ExecImage> {
+        self.exec_replace.as_mut()?.take().map(|b| *b)
     }
 
     /// The armed external-wake doorbell, if any (see [`Host::arm_external_wake`]).
@@ -26576,6 +26658,84 @@ impl Host {
                 Err(())
             }
         }
+    }
+
+    /// FORK.md §8.6 / #1768 — **admit and build** an `execve` image-replace: the one rule every engine
+    /// admits an exec by, and the one place its new powerbox is built. The command `mh` must resolve
+    /// to a granted module; its `entry` must be a shape a §14 child may enter by
+    /// ([`bytecode::child_entry_ok`]); its declared memory must fit `window_mapped`, the caller's
+    /// **backed prefix** (the image-replace runs where the caller did, and pages past the backed prefix
+    /// have no backing); and every inherited grant must be regrantable. Then the fresh powerbox is
+    /// built ([`Self::spawn_named_child`]) and the process state carried into it
+    /// ([`Self::exec_carry`]).
+    ///
+    /// `None` is a refusal that changed nothing — the caller keeps running and gets `-EINVAL`. `Some`
+    /// is the commit point: the caller's powerbox has handed its personality to the new image, so the
+    /// engine must now replace the image. The engine-specific gates (a durable domain, a context that
+    /// cannot be replaced — a fiber, a serve handler, sibling threads) are the caller's to check
+    /// first. The tree-walker, the bytecode engine and the JIT all build through here.
+    pub fn exec_image(
+        &mut self,
+        mh: i32,
+        grants: &[(String, i32)],
+        entry: u64,
+        size_log2: i64,
+        window_mapped: u64,
+    ) -> Option<ExecImage> {
+        let g = self.resolve_module(mh).ok()?;
+        let (funcs, types, data, memory_log2, module) = (
+            Arc::clone(&g.funcs),
+            Arc::clone(&g.types),
+            Arc::clone(&g.data),
+            g.memory_log2,
+            Arc::clone(&g.module),
+        );
+        let f = funcs.get(entry as usize)?;
+        let arity = bytecode::child_entry_ok(&f.params, &f.results).then_some(f.params.len())?;
+        let win_log2 = window_mapped
+            .is_power_of_two()
+            .then(|| window_mapped.trailing_zeros() as u8)?;
+        let fits = (0..64).contains(&size_log2) && memory_log2.is_some_and(|ml| ml <= win_log2);
+        if !fits || !grants.iter().all(|(_, h)| self.can_regrant(*h)) {
+            return None;
+        }
+        let child_size = 1u64 << win_log2;
+        let (mut host, ci, ca) = self.spawn_named_child(grants, child_size)?;
+        let mut starters = [ci, ca];
+        self.exec_carry(
+            &mut host,
+            &module,
+            &module.imports,
+            &module.types,
+            &mut starters,
+        )
+        .ok()?;
+        // FORK.md §8.6 — the old powerbox is dropped by the image-replace: release its pipe write
+        // *and* read ends (the fork-inherited ones this exec did not carry into the new image). The
+        // new image's grants already bumped their own ends (`install_pipe_end`), so the shared
+        // counts never dip through this.
+        let zeroed_pipes = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+        Some(ExecImage {
+            zeroed_pipes,
+            host,
+            entry_args: bytecode::child_entry_handles(arity, starters[0], starters[1]).collect(),
+            entry,
+            child_size,
+            image_len: 1u64 << memory_log2.expect("fits"),
+            module,
+            funcs,
+            types,
+            data,
+        })
+    }
+
+    /// #1768 — the committing half of a personality exec: the args blob the new image reads at
+    /// `module_args_base`, handed over (with the personality's argv replaced) by the signal source
+    /// carried into this — the NEW image's — powerbox. `None` when there is no source or no pending
+    /// exec (a guest's own `exec_module`). See [`SignalSource::exec_commit`].
+    pub fn exec_commit_args(&self) -> Option<Vec<u8>> {
+        self.signal_poll()
+            .and_then(|(_, source)| source.exec_commit())
     }
 
     /// **D45 allocation-free fast path for `Clock.now()`** (ISSUES.md I12). The generic
@@ -27887,6 +28047,34 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                // §7c stdin inheritance (#1720): a re-granted stdin (its entry carries the granter's
+                // cell) or this host's own promoted stdin reads the shared stream — same refill, same
+                // cursor. Never blocking: a blocking stdin is never promoted.
+                let shared = match sink {
+                    Some(i) => Some(Arc::clone(
+                        self.sources.get(i as usize).ok_or(Trap::Malformed)?,
+                    )),
+                    None => self.in_shared.clone(),
+                };
+                if let Some(cell) = shared {
+                    let mut st = cell.lock_unpoisoned();
+                    if st.pos >= st.bytes.len() {
+                        if let Some(src) = st.source.as_mut() {
+                            let more = src();
+                            st.bytes.extend_from_slice(&more);
+                        }
+                    }
+                    let start = st.pos.min(st.bytes.len());
+                    let n = (len as usize).min(st.bytes.len() - start);
+                    let Some(m) = mem else {
+                        return ret(EFAULT);
+                    };
+                    if m.write_bytes(ptr, &st.bytes[start..start + n]).is_none() {
+                        return ret(EFAULT);
+                    }
+                    st.pos = start + n;
+                    return ret(n as i64);
+                }
                 // Lazy refill (an interactive CLI): an exhausted buffer asks the source for more before
                 // it means EOF. Orthogonal to the blocking park below (a driver that parks pushes its
                 // own bytes), so a parking host never consults it.
@@ -27935,8 +28123,8 @@ impl Host {
                 // is produced, *before* the normal buffering below — a tee, not a replacement, so the
                 // captured-at-end bytes are identical.
                 if role == StreamRole::Out {
-                    if let Some(tee) = self.out_tee.as_mut() {
-                        tee(&bytes);
+                    if let Some(tee) = self.out_tee.as_ref() {
+                        (tee.lock_unpoisoned())(&bytes);
                     }
                 }
                 if let Some(i) = sink {
@@ -29098,6 +29286,16 @@ impl Mem {
         }
         for off in args_end.min(len)..len {
             self.set_byte(base + off, 0);
+        }
+    }
+
+    /// #1768 — write a committed personality exec's args blob at `module_args_base`, the region
+    /// [`Self::commit_fresh_image`] preserves, so the new image's `_start` reads its own argv there.
+    /// Only ever called once the exec is committed; the personality bounded the blob to the region.
+    fn write_exec_args(&self, blob: &[u8]) {
+        let base = self.window.base() + temen_ir::module_args_base();
+        for (k, &b) in blob.iter().enumerate() {
+            self.set_byte(base + k as u64, b);
         }
     }
 

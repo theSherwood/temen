@@ -42,6 +42,8 @@ pub struct Node {
     pub window_log2: u8,
     /// Carried as the spawn-time args payload, seeded at the child's `module_args_base()`.
     pub argv: Vec<String>,
+    /// The node's §3e environment (`KEY=VALUE` entries), in the same payload after `argv`.
+    pub env: Vec<Vec<u8>>,
     /// The root capabilities this node is granted, by name: its whole powerbox.
     pub grants: Vec<String>,
 }
@@ -55,6 +57,7 @@ impl Plan {
             nodes: vec![Node {
                 window_log2,
                 argv: owned(argv),
+                env: Vec::new(),
                 grants: owned(caps),
             }],
         }
@@ -93,17 +96,13 @@ impl Plan {
                 NAME_BASE + i as u64 * SLOT
             ));
         }
-        // Each node's argv payload: `[argc: u32][envc: u32]` then the NUL-terminated args.
+        // Each node's §3e args payload: `[argc: u32][envc: u32]`, then its NUL-terminated args and env.
         let mut argv_at = Vec::with_capacity(n);
         let mut off = ARGV_BASE;
         for node in &self.nodes {
-            let mut blob = Vec::new();
-            blob.extend_from_slice(&(node.argv.len() as u32).to_le_bytes());
-            blob.extend_from_slice(&0u32.to_le_bytes());
-            for s in &node.argv {
-                blob.extend_from_slice(s.as_bytes());
-                blob.push(0);
-            }
+            let args: Vec<&[u8]> = node.argv.iter().map(|a| a.as_bytes()).collect();
+            let env: Vec<&[u8]> = node.env.iter().map(Vec::as_slice).collect();
+            let blob = temen_ir::write_args_blob(&args, &env);
             let esc: String = blob.iter().map(|b| format!("\\x{b:02x}")).collect();
             data.push_str(&format!("data {off} \"{esc}\"\n"));
             argv_at.push((off, blob.len()));

@@ -91,6 +91,7 @@ fn run_two(grants_a: &[&str], grants_b: &[&str]) -> (i64, Vec<i64>) {
     let node = |grants: &[&str]| Node {
         window_log2: 16,
         argv: vec![],
+        env: vec![],
         grants: grants.iter().map(|g| g.to_string()).collect(),
     };
     let plan = Plan {
@@ -148,6 +149,7 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     let node = |grants: &[&str]| Node {
         window_log2: 16,
         argv: vec![],
+        env: vec![],
         grants: grants.iter().map(|g| g.to_string()).collect(),
     };
     let plan = |caps: &[&str], nodes: Vec<Node>| Plan {

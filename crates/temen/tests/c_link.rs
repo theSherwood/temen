@@ -486,6 +486,72 @@ fn unresolved_cross_unit_data_fails_closed() {
     assert_eq!(err, temen_ir::LinkError::Unresolved("nowhere_data".into()));
 }
 
+/// **`_Thread_local` across units** (#1715): the library unit defines the thread-locals — an exported
+/// `t_lib = 5` and a file-local `static` one — and the entry unit, which has none of its own, creates
+/// the threads and reads `t_lib` through `extern _Thread_local`. The linker merges the per-thread
+/// blocks; `pthread_create` sizes each new thread's block from the linker's symbols.
+///
+/// Each call to `bump(by)` adds `by` to `t_lib` and 1 to `hidden` (11), returning `t_lib*100 + hidden`.
+/// Thread `i` bumps twice by `i` → `(5+2i)*100 + 13`: 713 and 913. The root bumps by 1000 before
+/// the threads start and by 0 after they finish → 100513, then adds its own `t_lib` (1005) — the
+/// threads' bumps never reach the root's copy.
+#[test]
+fn thread_locals_link_across_units_and_threads() {
+    use temen_run::{instantiate, Outcome, RunConfig, Value};
+
+    let main_unit = object_unit(
+        "tlsmain",
+        "#include <pthread.h>\n\
+         extern _Thread_local long t_lib;\n\
+         long bump(long by);\n\
+         static void *work(void *a) { bump((long)a); return (void *)bump((long)a); }\n\
+         int main(void) {\n\
+         \x20 bump(1000);\n\
+         \x20 pthread_t t[2];\n\
+         \x20 for (long i = 0; i < 2; i++) pthread_create(&t[i], 0, work, (void *)(i + 1));\n\
+         \x20 long s = 0;\n\
+         \x20 for (int i = 0; i < 2; i++) { void *r; pthread_join(t[i], &r); s += (long)r; }\n\
+         \x20 return s + bump(0) + t_lib;\n\
+         }\n",
+    );
+    let lib = object_unit(
+        "tlslib",
+        "_Thread_local long t_lib = 5;\n\
+         static _Thread_local long hidden = 11;\n\
+         long bump(long by) { t_lib += by; hidden += 1; return t_lib * 100 + hidden; }\n",
+    );
+    assert!(
+        lib.data_exports.iter().all(|e| e.name != "hidden"),
+        "a static thread-local stays internal"
+    );
+    // `<pthread.h>`'s `malloc` maps heap pages through `vm_map`, which stays an import the powerbox binds.
+    let linked = temen_ir::link_with_manifest(&[main_unit, lib]).expect("link entry + library");
+    temen_verify::verify_module(&linked).expect("verify");
+    let inst = instantiate(linked).expect("instantiate");
+    let run = inst.run_diff(&RunConfig::default()).expect("run _start");
+    assert_eq!(
+        run.outcome,
+        Outcome::Returned(vec![Value::I32(713 + 913 + 100_513 + 1005)])
+    );
+}
+
+/// A plain `extern long t` against a `_Thread_local` definition names two different things (one
+/// shared address vs a per-thread offset), so the link fails rather than mixing them.
+#[test]
+fn a_plain_extern_against_a_thread_local_fails_to_link() {
+    let user = object_unit(
+        "tlsuser",
+        "extern long t;\n\
+         long read(void) { return t; }\n",
+    );
+    let def = object_unit("tlsdef", "_Thread_local long t = 1;\n");
+    let err = link(&[user, def]).expect_err("kind mismatch");
+    assert!(
+        matches!(err, temen_ir::LinkError::TlsMismatch(ref n) if n == "t"),
+        "got {err:?}"
+    );
+}
+
 /// A file-local `static` global is **internal**: it is not published as a data symbol, so a
 /// same-named `static` in another TU never collides — the data-side twin of the `static` function
 /// property, and what lets chibicc's per-TU statics link without renaming.

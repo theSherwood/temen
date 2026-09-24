@@ -12,8 +12,10 @@
 //
 // Scope (MVP): create/join, mutex (init/destroy/lock/trylock/unlock), cond (init/destroy/wait/
 // signal/broadcast), barrier (init/destroy/wait — a generation counter over the futex). POSIX
-// semaphores live in <semaphore.h> (same construction, same primitives). Out of scope for now:
-// pthread_self/exit/once/cancel, attributes, rwlocks, TLS keys — add as programs demand them.
+// semaphores live in <semaphore.h> (same construction, same primitives). `_Thread_local` variables
+// work across threads (#1715): each new thread gets its own copy, initialized from the program's
+// initial values. Out of scope for now: pthread_self/exit/once/cancel, attributes, rwlocks, TLS keys
+// (pthread_key_*) — add as programs demand them.
 #ifndef __TEMEN_PTHREAD_H
 #define __TEMEN_PTHREAD_H
 
@@ -29,6 +31,10 @@ void __vm_atomic_store32(void *p, int v);
 int __vm_atomic_add32(void *p, int v);
 int __vm_wait32(void *p, int expected, long timeout_ns);
 int __vm_notify(void *p, int count);
+// `_Thread_local` blocks (#1715) — the same builtins chibicc and the LLVM on-ramp both lower.
+long __vm_tls_size(void);         // bytes in a thread's block (0: the program has no thread-locals)
+void *__vm_tls_template(void);    // the program's initial values, which a new block is copied from
+void __vm_vcpu_tls_set(long blk); // make blk this thread's block
 
 // ---- threads (1:1) -------------------------------------------------------------------------
 typedef int pthread_t;
@@ -44,14 +50,30 @@ typedef struct {
 struct __pthread_rec {
   void *(*fn)(void *);
   void *arg;
+  void *tls; // this thread's `_Thread_local` block, or NULL when the program has none
 };
 
 // The fixed entry `thread.spawn` launches. `thread.spawn` resolves a *static* function index, so it
 // needs a direct function name — but the real `start_routine` is a runtime pointer, so this
 // trampoline reaches it via an ordinary indirect call (a funcref dispatch, §3c). The thread's i64
 // result is `start_routine`'s return value, delivered back through `thread.join`.
+//
+// The thread installs its `_Thread_local` block before running any user code: until then its
+// thread-locals would resolve through its `vcpu.tls` word, which starts as the vCPU's id. A program
+// with no thread-locals allocates no block and never touches `vcpu.tls`. The install is its own
+// function so that `vcpu.tls` stays out of this entry: the browser's wasm-JIT tier does not compile
+// it, and would otherwise run every thread's entry on the interpreter.
+static void __pthread_tls_install(char *blk) {
+  const char *img = (const char *)__vm_tls_template();
+  long n = __vm_tls_size();
+  for (long i = 0; i < n; i++)
+    blk[i] = img[i];
+  __vm_vcpu_tls_set((long)blk);
+}
 static long __pthread_entry(long rec) {
   struct __pthread_rec *r = (struct __pthread_rec *)rec;
+  if (r->tls)
+    __pthread_tls_install((char *)r->tls);
   return (long)r->fn(r->arg);
 }
 
@@ -63,6 +85,10 @@ static int pthread_create(pthread_t *t, const pthread_attr_t *attr,
     return 11; // EAGAIN
   r->fn = start_routine;
   r->arg = arg;
+  long tls = __vm_tls_size();
+  r->tls = tls ? malloc(tls) : NULL;
+  if (tls && !r->tls)
+    return 11;
   void *stack = malloc(__PTHREAD_STACK);
   if (!stack)
     return 11;

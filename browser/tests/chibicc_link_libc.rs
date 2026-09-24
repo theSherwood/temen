@@ -489,3 +489,59 @@ fn every_main_spelling_links_against_the_prebuilt_libc() {
         );
     }
 }
+
+/// **`_Thread_local` through the playground path** (#1715): the committed `chibicc.temen` compiles a
+/// threaded program decls-only, and it links against the prebuilt libc and runs. Each thread reads
+/// the thread-local before writing its own id into it, so every thread, and `main` afterwards, must
+/// see the initial 0. The bug this closes printed the previous thread's write instead: `T2 sees 1`
+/// and `main sees 2`.
+#[test]
+fn a_thread_local_is_per_thread_in_a_linked_playground_program() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        false,
+    );
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+    let src = "#include <stdio.h>\n\
+               #include <pthread.h>\n\
+               _Thread_local int my_val = 0;\n\
+               static void *work(void *arg) {\n\
+               \x20 printf(\"T%ld sees %d\\n\", (long)arg, my_val);\n\
+               \x20 my_val = (int)(long)arg;\n\
+               \x20 return 0;\n\
+               }\n\
+               int main(void) {\n\
+               \x20 pthread_t t;\n\
+               \x20 pthread_create(&t, 0, work, (void *)1);\n\
+               \x20 pthread_join(t, 0);\n\
+               \x20 pthread_create(&t, 0, work, (void *)2);\n\
+               \x20 pthread_join(t, 0);\n\
+               \x20 printf(\"main sees %d\\n\", my_val);\n\
+               \x20 return 0;\n\
+               }\n";
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "tls.c",
+        &[("tls.c", src)],
+        false,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+    let prog = temen_text::parse_module(&prog_ir).expect("program unit parses");
+    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    assert!(
+        out.status == STATUS_OK || out.status == STATUS_EXIT,
+        "link+run status {} — stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "T1 sees 0\nT2 sees 0\nmain sees 0\n"
+    );
+}

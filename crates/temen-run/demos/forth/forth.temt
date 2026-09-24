@@ -44,7 +44,7 @@
 ;   --- per-unit scratch (rebuilt every prompt, may be clobbered between them) ---
 ;   0x40000 closed-block arena   0x50000 assembled unit blob   0x60000 input buffer (64 KiB)
 ;   0x70000 `sandbox` spawn scratch (two 16-byte grant records at +0x00/+0x10, the 56-byte §3d spawn
-;           record at +0x40)   0x80000 `sandbox` child carve (512 KiB)
+;           record at +0x40; +0x100 SANDBOXED, set by `child_start`)   0x80000 `sandbox` child carve (512 KiB)
 ;
 ; The map therefore tops out at 0x70000 (448 KiB), which is what makes `sandbox` (76) possible: a §14
 ; child is a power-of-two sub-carve of our own window, so nesting a copy of *this* kernel needs the
@@ -4217,9 +4217,13 @@ block 2 (p2: i64, n2: i64) {
 ; its window — `sandbox` seeded the prompt-staging region below, `{len: i64}` then the text — so the
 ; child just hands the buffer to `prompt` (74), which runs the prelude on its first call exactly as
 ; `_start` does. Signature is the §14 child-entry shape; the arg is the child's own `Instantiator`,
-; which this kernel deliberately ignores (a sandbox does not nest a sandbox).
+; which this kernel deliberately ignores: a sandbox does not nest a sandbox. It marks itself SANDBOXED
+; (0x70100) so `sandbox` refuses — the kernel map needs a whole 2^20 window, and this one is half that.
 func (i64) -> (i64) {
 block 0 (x: i64) {
+  sbp = i64.const 459008
+  one = i64.const 1
+  i64.store sbp one
   lp = i64.const 245760
   n = i64.load lp
   p = i64.const 245768
@@ -4239,8 +4243,9 @@ block 0 (x: i64) {
 ; sub-allocate, which is why the kernel map has to fit in half a window (see the map above).
 ;
 ; It is born with only what we hand it, by name, in the spawn record's grant list: `stdout` and
-; `jit`. No stdin. No `instantiator` — the child's auto-granted one is its entry arg, never
-; registered under a name, so `sandbox` inside a sandbox finds nothing and says so. `jit` is there
+; `jit`. No stdin. It also holds its own starter `Instantiator` (its entry arg), but `sandbox` inside
+; a sandbox is refused anyway: `child_start` marks the child SANDBOXED, and a sandboxed kernel says
+; "no sandbox capability" rather than seed a carve past its half-size window. `jit` is there
 ; because a Forth that cannot define a word is not a Forth; the child's `vm_jit_*` imports bind to
 ; that grant (`Host::bind_child_manifest`, through the record's `-1 = self` module selector).
 ;
@@ -4258,9 +4263,15 @@ block 0 (x: i64) {
 ; `-EINVAL` if the carve was refused.
 func (i64, i64) -> (i64) {
 block 0 (addr: i64, len: i64) {
+  sbp = i64.const 459008
+  sb = i64.load sbp
   ip = i64.const 33152
   il = i64.const 12
-  hinst = self.resolve ip il
+  hinst0 = self.resolve ip il
+  ; SANDBOXED reads as a miss: all-ones OR'd in below sets the sign bit.
+  sbz = i64.eqz sb
+  sbm = i32.const -1
+  hinst = select sbz hinst0 sbm
   np = i64.const 33136
   nl = i64.const 6
   hout = self.resolve np nl

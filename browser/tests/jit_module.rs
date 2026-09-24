@@ -2,13 +2,14 @@
 //! on-ramp module's whole program is func 0 (`_start`); [`JitOnrampRun`] emits it and runs
 //! `f0(win, env, ...slots)` once on `wasmi` (playing the browser's JS host), with the cross-tier
 //! helpers relaying to the interpreter over the shared window through `env.call_interp`. The captured
-//! stdout + exit must match [`onramp_exec`] (the interpreter oracle) byte-for-byte — the JIT
-//! correctness contract for the module run path (Lua / SQLite / hello). Timing is printed (informational).
+//! stdout + exit must match [`onramp_exec_root`] (the interpreter oracle, at the root like this tier)
+//! byte-for-byte — the JIT correctness contract for the module run path (Lua / SQLite / hello). Timing
+//! is printed (informational).
 
 use std::path::Path;
 use std::time::Instant;
 
-use temen_browser::{onramp_exec, JitOnrampRun};
+use temen_browser::{onramp_exec_root, JitOnrampRun};
 use wasmi::{Caller, Engine, Linker, Memory, MemoryType, Module as WModule, Store, Val};
 
 const WIN_LOG2: u8 = 25; // 32 MiB window (holds Lua/SQLite's heap; the emitted run can't grow it)
@@ -27,7 +28,7 @@ struct Out {
 /// Interpreter oracle via `onramp_exec`.
 fn interp(m: &temen_ir::Module, stdin: &[u8]) -> (Out, u128) {
     let t0 = Instant::now();
-    let o = onramp_exec(m, stdin);
+    let o = onramp_exec_root(m, stdin);
     let us = t0.elapsed().as_micros();
     (
         Out {

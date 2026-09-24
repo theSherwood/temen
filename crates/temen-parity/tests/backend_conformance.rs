@@ -140,6 +140,10 @@ fn cranelift(
         Ok(temen_jit::JitOutcome::Exited(code)) => Verdict::Exited(code),
         Ok(temen_jit::JitOutcome::Trapped(temen_jit::TrapKind::CapFault)) => Verdict::Miscalled,
         Ok(temen_jit::JitOutcome::Trapped(t)) => Verdict::Trapped(format!("{t:?}")),
+        // Only an exec-armed powerbox (`temen_run`'s `jit_run`) unwinds a run; this host is not one.
+        Ok(temen_jit::JitOutcome::HostUnwound) => {
+            panic!("an unarmed host unwound the run")
+        }
     }
 }
 

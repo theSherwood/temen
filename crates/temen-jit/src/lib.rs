@@ -418,6 +418,10 @@ pub enum JitOutcome {
     /// The guest invoked the `Exit` capability with this code (§3e) — terminal, but not
     /// an error.
     Exited(i32),
+    /// #1768 — the host thunk unwound the run on the host's behalf ([`HOST_UNWIND_CODE`]): the
+    /// guest's continuation is discarded, and the host's own state says what it asked for and what
+    /// runs next (an `execve` image-replace is the one user). Only a host that stores the code sees it.
+    HostUnwound,
 }
 
 /// Per-page protection to re-establish on a guest window before a run — the durable-restore
@@ -562,6 +566,12 @@ pub enum TrapKind {
 /// Trap-cell code the host thunk stores for an `Exit` (the exit code rides in the high
 /// 32 bits of the `i64` cell). Distinct from every [`TrapKind`].
 pub const EXIT_CODE: u32 = 7;
+
+/// #1768 — trap-cell code a host thunk stores to **unwind the whole run on the host's behalf**, with
+/// the guest's continuation discarded: an `execve` image-replace, which never returns to its caller.
+/// The run unwinds exactly as it does for an `Exit` and ends [`JitOutcome::HostUnwound`]. Distinct
+/// from every [`TrapKind`], from [`EXIT_CODE`] and from the internal `DOMAIN_DONE_CODE`.
+pub const HOST_UNWIND_CODE: u32 = 15;
 
 /// Trap-cell code `run_inner` stores at **domain teardown** when the root vCPU completed cleanly
 /// (owner decision 2026-07-24: "root completion ends the activation; the owner's departure ends the
@@ -4387,6 +4397,8 @@ impl CompiledModule {
             JitOutcome::Returned(results)
         } else if code == EXIT_CODE {
             JitOutcome::Exited((cell >> 32) as i32)
+        } else if code == HOST_UNWIND_CODE {
+            JitOutcome::HostUnwound
         } else {
             JitOutcome::Trapped(TrapKind::from_code(code).ok_or(JitError::Malformed)?)
         };

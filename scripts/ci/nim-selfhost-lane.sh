@@ -11,7 +11,7 @@
 #   link     temen-leng, and the program runs
 #
 # On the engines: the bytecode engine runs everything; the JIT then runs hexer and the program again
-# (it serves no fork/exec yet, #1768, so not the frontend). The tree-walker — the oracle, 4x slower here — is
+# (it serves no fork yet, #1768, so not the frontend). The tree-walker — the oracle, 4x slower here — is
 # `--engine tree`, for a local run; nim_e2e's `nim_shells_out_through_the_posix_sh` differentials the
 # spawning mechanism across both interpreters on every PR.
 #

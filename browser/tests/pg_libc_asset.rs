@@ -461,3 +461,27 @@ fn the_multi_handle_entries_link_and_fail_closed() {
 
     temen_browser::temen_link_lib_close(h);
 }
+
+/// The playground's C `detached` card, down the page's own path: compiled as a program unit, linked
+/// against the committed libc, run by `link_run_units` (→ `onramp_exec`). It spawns detached, whose
+/// `"budget"` allowance cannot cross into a §14 child yet, so the on-ramp runs it at the root (#1720).
+#[test]
+fn the_c_detached_card_links_and_squares_through_its_region() {
+    const PLAY_JS: &str = include_str!("../web/play.js");
+    let key = "'detached child over a pre-mapped region (chibicc → Temen)'";
+    let i = PLAY_JS.find(key).expect("card in play.js");
+    let j = PLAY_JS[i..].find("src: `").expect("card src") + i + 6;
+    let k = PLAY_JS[j..].find("`,\n  },").expect("card src end") + j;
+    let src = PLAY_JS[j..k].replace("\\\\", "\\");
+    let (Some(lib), Some(prog)) = (pg_libc(), program_unit(&src)) else {
+        eprintln!("SKIP: chibicc.temen / pg_libc.temeno not built");
+        return;
+    };
+    let out = temen_browser::link_run_units(&lib, &prog, "main", b"");
+    assert_eq!(out.status, STATUS_OK, "trap: {:?}", out.trap);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("child returned 8; the region now holds: 1 4 9 16 25 36 49 64"),
+        "{stdout}"
+    );
+}
