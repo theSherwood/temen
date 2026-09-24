@@ -502,9 +502,10 @@ pub struct FrozenNested {
     pub size_log2: u8,
     /// The child's entry function index into the parent's own table (same-module).
     pub entry: u32,
-    /// `Some(result)` for a child that finished before the freeze but was not yet joined: the thaw
-    /// hands it to the parent's rewound `join` without re-running the child (#1692).
-    pub completed_result: Option<i64>,
+    /// `Some(outcome)` for a child that finished before the freeze but was not yet joined: its value,
+    /// or its trap-cell code (#1674). The thaw hands it to the parent's rewound `join` without
+    /// re-running the child (#1692).
+    pub completed_result: Option<Result<i64, i64>>,
 }
 
 /// The durable snapshot's window-image page granularity (must match `temen-snapshot`'s `PAGE` /
@@ -4022,7 +4023,8 @@ impl CompiledModule {
                 roots.sort_by_key(|s| s.slot);
                 for rec in roots {
                     if let Some(r) = rec.completed_result {
-                        n.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                        // Finished before the cut (#1692), with a value or a trap (#1674).
+                        n.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
                         continue;
                     }
                     let my_task = rec.task;
@@ -4235,17 +4237,7 @@ impl CompiledModule {
             // `FrozenNested` residue into the run's `Nursery`; drain it now that the root has unwound,
             // read back by the durable-nested entry point.
             if let Some(n) = &(*this)._nursery {
-                if !n.freeze_unjoined() {
-                    // A §14 child finished with a trap before the freeze: fail closed (#1692).
-                    (*(trap_cell.as_ptr() as *const AtomicI64))
-                        .compare_exchange(
-                            0,
-                            TrapKind::ThreadFault as i64,
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        )
-                        .ok();
-                }
+                n.freeze_unjoined();
                 (*this).frozen_nested_out = n.take_frozen_nested();
                 // #1361 step 4 — and reach its detached children, which own windows the freeze word
                 // above is not in: ring each one's own; they unwind and are harvested at teardown.
@@ -5111,7 +5103,8 @@ pub(crate) unsafe fn compile_child_and_run(
             gkids.sort_by_key(|s| s.slot);
             for rec in gkids {
                 if let Some(r) = rec.completed_result {
-                    cn.seed_child_result(rec.slot, r, 0); // finished before the cut (#1692)
+                    // Finished before the cut (#1692), with a value or a trap (#1674).
+                    cn.seed_child_result(rec.slot, r.unwrap_or(0), r.err().unwrap_or(0));
                     continue;
                 }
                 let gc_task = rec.task;
@@ -5186,14 +5179,13 @@ pub(crate) unsafe fn compile_child_and_run(
     // it from the carve's state word before the copy-back carries the carve into the parent window.
     // The caller (`instantiate`) turns this into a `FrozenNested` re-attach record.
     // A child that trapped did not unwind, even under a freeze: it finished, with that trap.
-    let mut unwound =
+    let unwound =
         durable && !faulted && trap_cell == 0 && fiber_rt::window_is_unwinding(child_base as u64);
-    // Its own unjoined children ride too (depth-2+). One that finished with a trap fails this child:
-    // reported as finished with `ThreadFault`, not as unwound, so its parent refuses in turn, up to
-    // the root.
-    if unwound && child_nursery.as_ref().is_some_and(|n| !n.freeze_unjoined()) {
-        trap_cell = TrapKind::ThreadFault as i64;
-        unwound = false;
+    // Its own unjoined children ride too (depth-2+).
+    if unwound {
+        if let Some(n) = &child_nursery {
+            n.freeze_unjoined();
+        }
     }
     child_window.restore_rw();
     {

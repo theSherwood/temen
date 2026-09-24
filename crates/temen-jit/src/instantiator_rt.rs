@@ -735,9 +735,8 @@ impl Nursery {
     /// §14 children into the **shared** subtree sink (coalesces at the root). A child that unwound
     /// into its carve is re-attached on thaw; one that finished first carries its result, which the
     /// thaw delivers to the owner's rewound `join` without re-running it (#1692), as the interpreter
-    /// does. `false` if one finished with a trap: a trap cannot ride the artifact, so the freeze must
-    /// fail closed rather than hand the owner's thaw a join result of 0.
-    pub(crate) fn freeze_unjoined(&self) -> bool {
+    /// does: its value, or the trap its `join` re-raises (#1674).
+    pub(crate) fn freeze_unjoined(&self) {
         let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
         let mut sink = self
             .frozen_nested_sink
@@ -755,14 +754,10 @@ impl Nursery {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .expect("a durable child runs synchronously, so it has finished");
-                if trap != 0 {
-                    return false;
-                }
-                rec.completed_result = Some(result);
+                rec.completed_result = Some(if trap == 0 { Ok(result) } else { Err(trap) });
             }
             sink.push(rec);
         }
-        true
     }
 
     /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
