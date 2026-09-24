@@ -3772,9 +3772,9 @@ const ONRAMP_NESTED_CAPS: [&str; 10] = [
 /// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds; `env` is seeded as the
 /// child's §3e environment, in its own window. Returns the root module and its args (the root's
 /// Instantiator, `m`'s `Module` and the budget are granted on `host` here).
-/// `None` for a module that cannot be a child — one with no window, or whose func 0 is not an admitted
-/// child entry (`temen-llvm`'s bare `main(sp)` for an import-free C program, #1779): it runs at the
-/// root.
+/// `None` for a module that cannot be a child yet — it runs at the root: one with no window, one whose
+/// func 0 is not an admitted child entry (`temen-llvm`'s bare `main(sp)` for an import-free C program,
+/// #1779), or one that spawns detached (its `"budget"` allowance cannot cross into a child).
 fn nest_onramp(
     m: &temen_ir::Module,
     env: &[Vec<u8>],
@@ -3782,7 +3782,7 @@ fn nest_onramp(
 ) -> Option<(temen_ir::Module, Vec<Value>)> {
     let window = m.memory.as_ref()?.size_log2;
     let entry = m.funcs.first()?;
-    if !temen_ir::child_entry_ok(&entry.params, &entry.results) {
+    if !temen_ir::child_entry_ok(&entry.params, &entry.results) || temen_ir::spawns_detached(m) {
         return None;
     }
     let held: Vec<(&str, i32)> = ONRAMP_NESTED_CAPS
