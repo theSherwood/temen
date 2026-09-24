@@ -928,7 +928,8 @@ impl Nursery {
             &self.serve_handlers,
             gc.jit_table_log2,
             shadow,
-            true, // a thawed child runs as an executor task (its own fiber runtime, #1469)
+            // A thawed child runs as a durable executor task: fibers, no thread domain (#1469).
+            crate::ChildRun::DurableTask,
         ) else {
             release(gc.ctx);
             release(gc.retained_ctx);
@@ -1511,7 +1512,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
         &rt.serve_handlers,
         gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
         rt.shadow,
-        true, // runs as an executor task (its own fiber runtime, #1469)
+        crate::ChildRun::Task, // an executor task: its own fiber runtime and thread domain (#1469)
     );
     let code = match compiled {
         Ok(code) => code,
@@ -1867,7 +1868,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
         &rt.serve_handlers,
         gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,,
         child_shadow,
-        true, // runs as an executor task (its own fiber runtime, #1469)
+        crate::ChildRun::Task, // an executor task: its own fiber runtime and thread domain (#1469)
     );
     let code = match compiled {
         Ok(code) => code,
@@ -2246,7 +2247,13 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         &rt.serve_handlers,
         gc.jit_table_log2, // #1296: slots for the units a `Jit`-holding child installs,
         child_shadow,
-        true, // runs as an executor task (its own fiber runtime, #1469)
+        // An executor task (#1469); a durable one hosts no `thread.spawn` (its vCPUs would escape the
+        // freeze that captures the child).
+        if durable {
+            crate::ChildRun::DurableTask
+        } else {
+            crate::ChildRun::Task
+        },
     );
     let code = match compiled {
         Ok(code) => code,
