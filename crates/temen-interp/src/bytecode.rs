@@ -1063,7 +1063,8 @@ fn scan_seams(funcs: &[Func]) -> Seams {
             for inst in &b.insts {
                 match inst {
                     // ops 0/1 = instantiate/join, op 5 = instantiate_module, op 13 =
-                    // instantiate_module_named, op 17 = instantiate_rec (all executor children,
+                    // instantiate_module_named, op 15 = instantiate_detached, op 17 = instantiate_rec
+                    // (all executor children,
                     // scheduler-driven — the grant-carrying spawns re-grant caps but spawn the same
                     // kind of confined task); everything else on INSTANTIATOR is the legacy coroutine
                     // residue. Classifying the named spawns as `has_instantiate` (not `has_coro`) is
@@ -1072,7 +1073,7 @@ fn scan_seams(funcs: &[Func]) -> Seams {
                     // whole module back to the tree-walker.
                     Inst::CapCall {
                         type_id: super::cap_id::INSTANTIATOR,
-                        op: 0 | 1 | 5 | 13 | 14 | 17,
+                        op: 0 | 1 | 5 | 13 | 14 | 15 | 17,
                         ..
                     } => s.has_instantiate = true,
                     Inst::CapCall {
@@ -1490,10 +1491,11 @@ fn compile_module_with(
     // in the tree-walker), which the inline coroutine driver here doesn't service — so reject the
     // combination (→ tree-walker fallback). §14 **executor children** (`instantiate`/`join`, ops 0/1)
     // are different: they run on the scheduler like threads, not inline — so they classify as
-    // scheduler-driven, not as coroutines. The one combination they can't yet service is `cont.*`
-    // fibers (a confined child would share the run-shared fiber registry — a divergence), so reject
-    // instantiate+fiber. Plain coroutine / fiber / thread / instantiate modules are each fine, as are
-    // instantiate+thread and instantiate+coroutine.
+    // scheduler-driven, not as coroutines — and they combine with `cont.*` fibers too: every driver
+    // gives each confined child domain its own fiber registry (the cooperative `ChildEnv::fibers`,
+    // the debugger's `DbgEnv::fibers`, the parallel `ParDomain`), as the oracle does. Plain coroutine /
+    // fiber / thread / instantiate modules are each fine, as are instantiate+thread,
+    // instantiate+coroutine and instantiate+fiber.
     let s = scan_seams(funcs);
     // `gc.roots` (§GC) is per-vCPU **conservative root enumeration**: on this engine it scans the
     // calling vCPU's continuation (`vt.active` + `vt.chain` + `vt.coroutines`) **plus the run-shared
@@ -1517,7 +1519,6 @@ fn compile_module_with(
     // FORK.md §9.2 — the bytecode fork-serving escape: a fork-shaped module (`bytecode_serves_fork`)
     // is admitted natively even though `svc_park_veto` folds it for Cranelift (the per-backend split).
     if (s.has_coro && (s.has_fiber || s.has_thread))
-        || (s.has_instantiate && s.has_fiber)
         || (s.svc_park_veto() && !s.bytecode_serves_fork())
     {
         return None;
@@ -5655,6 +5656,7 @@ fn env_snapshot(e: &DbgEnv, module: usize) -> EnvSnapshot {
         host: e.host.replay_substate(),
         fuel: e.fuel,
         prot: e.mem.as_ref().map_or_else(Vec::new, |m| m.prot_snapshot()),
+        fibers: e.fibers.clone(),
     }
 }
 
@@ -5683,6 +5685,7 @@ fn rebuild_env(es: &EnvSnapshot, shared_mem: Option<&Mem>, source: &ModuleSource
         host,
         table: build_table_for(progs_len, table_log2, es.module as u32),
         fuel: es.fuel,
+        fibers: es.fibers.clone(),
     }
 }
 
@@ -6763,6 +6766,9 @@ struct DbgEnv {
     host: Host,
     table: SharedSlots,
     fuel: u64,
+    /// The child domain's own §12 fiber registry: each domain numbers its fibers from 0 and cannot
+    /// reach another's, as on the oracle (the root's is [`ScheduledDebugRun::fibers`]).
+    fibers: Vec<FiberState>,
 }
 
 /// One scheduled vCPU's captured state inside a [`ScheduledSnapshot`] — its full `VTask` continuation
@@ -6853,6 +6859,8 @@ struct EnvSnapshot {
     /// The child's own page-protection map ([`Mem::prot_snapshot`]), reinstalled with
     /// [`Mem::install_prot`] on restore (its bytes ride in the shared snapshot). Empty for a pristine child.
     prot: Vec<(u64, super::PageProt)>,
+    /// The child's fiber registry (its `Vm`s' bytes ride in the shared snapshot, like the root's).
+    fibers: Vec<FiberState>,
 }
 
 /// A **multi-vCPU** debug session on the bytecode engine (DEBUGGING.md Milestone B, bytecode side): a
@@ -6883,8 +6891,9 @@ pub struct ScheduledDebugRun {
     /// `Some(k)` into this). Grown as children spawn; rebuilt deterministically on a reverse-`seek`
     /// replay. Not torn down mid-run (a finished child's env is inert — revocation semantics deferred).
     extra_envs: Vec<DbgEnv>,
-    /// The **run-shared** §12 fiber registry (one handle namespace across all vCPUs; a fiber created on
-    /// one can be resumed on another — D57). Rebuilt deterministically on a reverse `seek` replay.
+    /// The root domain's §12 fiber registry (one handle namespace across its vCPUs; a fiber created on
+    /// one can be resumed on another — D57). Each §14 child has its own ([`DbgEnv::fibers`]). Rebuilt
+    /// deterministically on a reverse `seek` replay.
     fibers: Vec<FiberState>,
     fn_block_base: Vec<Vec<u32>>,
     fn_block_types: Vec<Vec<Vec<ValType>>>,
@@ -7157,7 +7166,7 @@ fn dbg_advance_task(
             let e = &mut extra_envs[k];
             debug_advance_fiber(
                 &mut tasks[ti].vt,
-                fibers,
+                &mut e.fibers,
                 source,
                 &e.table,
                 &mut e.fuel,
@@ -7393,7 +7402,11 @@ fn service_advance(
                 dst,
             } => {
                 *turn += 1;
-                let roots = gc_scan(&tasks[ti].vt, fibers, source, lo, hi, mask);
+                let reg = match tasks[ti].env {
+                    None => &*fibers,
+                    Some(k) => &extra_envs[k].fibers,
+                };
+                let roots = gc_scan(&tasks[ti].vt, reg, source, lo, hi, mask);
                 let m: &mut Option<Mem> = match tasks[ti].env {
                     None => mem,
                     Some(k) => &mut extra_envs[k].mem,
@@ -7508,6 +7521,7 @@ fn dbg_instantiate(
         host: child_host,
         table: child_table,
         fuel: child_fuel,
+        fibers: Vec::new(),
     });
     let cidx = tasks.len();
     tasks.push(DbgTask {
@@ -7654,6 +7668,7 @@ fn dbg_instantiate_module(
         host: child_host,
         table: child_table,
         fuel: child_fuel,
+        fibers: Vec::new(),
     });
     let cidx = tasks.len();
     tasks.push(DbgTask {
@@ -7736,6 +7751,7 @@ fn dbg_instantiate_detached(
         host: child_host,
         table: child_table,
         fuel: child_fuel,
+        fibers: Vec::new(),
     });
     let cidx = tasks.len();
     tasks.push(DbgTask {
@@ -8962,12 +8978,16 @@ impl ScheduledDebugRun {
             && self.mem.as_ref().is_none_or(|m| m.layout_snapshot_safe())
             // A task mid-§22-invoke is out-of-subset (CONSOLIDATION.md §11 debug boundary).
             && self.tasks.iter().all(|t| t.vt.active_invoke.is_none())
-            && !self.fibers.iter().any(|f| {
-                matches!(
-                    f,
-                    FiberState::WaitParked { .. } | FiberState::CapParked { .. }
-                )
-            })
+            && !self
+                .fibers
+                .iter()
+                .chain(self.extra_envs.iter().flat_map(|e| e.fibers.iter()))
+                .any(|f| {
+                    matches!(
+                        f,
+                        FiberState::WaitParked { .. } | FiberState::CapParked { .. }
+                    )
+                })
             && self.extra_envs.iter().all(|e| {
                 e.host.checkpoint_safe() && child_checkpointable(e.mem.as_ref(), self.mem.as_ref())
             })
@@ -9799,8 +9819,9 @@ enum FiberState {
         vm: Vm,
         /// The wait's status register in `vm`; the waking resume writes the `WAIT_*` result here.
         wait_dst: u32,
-        /// The confined wait address (the same key `TaskState::BlockedWait` parks on).
-        key: u64,
+        /// The wait's rendezvous key, backing-identity canonical (the same key `TaskState::BlockedWait`
+        /// parks on), so a notify from another domain's window on the same `SharedRegion` wakes it.
+        key: super::FutexKey,
         /// Logical-clock deadline (`clock + timeout`), fired when no task is runnable;
         /// `None` for an infinite wait, which is never a clock-advance candidate (#1638).
         deadline: Option<u64>,
@@ -11673,6 +11694,10 @@ struct ChildEnv {
     host: std::sync::Arc<std::sync::Mutex<Host>>,
     table: SharedSlots,
     fuel: u64,
+    /// The child domain's own §12 fiber registry (with its durable halves): each domain numbers its
+    /// fibers from 0 and cannot reach another's, as on the tree-walk oracle — the parallel driver's
+    /// per-domain [`ParDomain`] registry, here. The root domain's is [`CoopSched::fibers`].
+    fibers: FiberTables,
 }
 
 /// #1727 — the powerbox a task's own handles live in: its §14 [`ChildEnv`]'s, or the domain's for the
@@ -11861,8 +11886,9 @@ struct CoopSched {
     /// §14 `instantiate` children's confined environments (handle = `env` index). The root and its
     /// `thread.spawn` siblings share `mem`/`host`/`dom.table` instead (`env == None`).
     extra_envs: Vec<ChildEnv>,
-    /// The §12 fiber registry is **run-shared** (one handle namespace per domain) so a fiber created
-    /// or suspended on one vCPU can be resumed on another (D57 migration).
+    /// The root domain's §12 fiber registry, shared by its vCPUs so a fiber created or suspended on
+    /// one can be resumed on another (D57 migration). Each §14 child domain has its own
+    /// ([`ChildEnv::fibers`]).
     fibers: Vec<FiberState>,
     /// DURABILITY.md §12.8: each fiber's saved durable shadow-SP (run-shared, parallel to `fibers`;
     /// slot `s` is shadow context `s + 1`). Inert on a non-durable run.
@@ -12168,6 +12194,16 @@ impl CoopSched {
                         durable: true,
                         host: HostCell::Excl(&mut *host),
                     };
+                    // Only the root domain's registry is flattened: a child's live fibers would be
+                    // lost, so they refuse the freeze (fail closed) rather than vanish.
+                    if extra_envs.iter().any(|e| {
+                        e.fibers
+                            .fibers
+                            .iter()
+                            .any(|f| !matches!(f, FiberState::Done))
+                    }) {
+                        return Err(Trap::FiberFault);
+                    }
                     host.frozen_fibers =
                         freeze_drive(fibers, fiber_sp, fiber_meta, dom, &mut ctx, budget)?;
                 }
@@ -12366,8 +12402,12 @@ impl CoopSched {
             // woken during the previous step is seen this iteration.
             for t in tasks.iter_mut() {
                 if let TaskState::BlockedOnFiber { fiber } = t.state {
+                    let reg = match t.env {
+                        None => &*fibers,
+                        Some(k) => &extra_envs[k].fibers.fibers,
+                    };
                     if matches!(
-                        fibers.get(fiber),
+                        reg.get(fiber),
                         Some(FiberState::WaitParked { woken: Some(_), .. })
                             | Some(FiberState::CapParked { woken: Some(_), .. })
                     ) {
@@ -12444,14 +12484,19 @@ impl CoopSched {
                         TaskState::BlockedWait { deadline, .. } => deadline,
                         _ => None,
                     })
-                    .chain(fibers.iter().filter_map(|f| match f {
-                        FiberState::WaitParked {
-                            deadline,
-                            woken: None,
-                            ..
-                        } => *deadline,
-                        _ => None,
-                    }))
+                    .chain(
+                        fibers
+                            .iter()
+                            .chain(extra_envs.iter().flat_map(|e| e.fibers.fibers.iter()))
+                            .filter_map(|f| match f {
+                                FiberState::WaitParked {
+                                    deadline,
+                                    woken: None,
+                                    ..
+                                } => *deadline,
+                                _ => None,
+                            }),
+                    )
                     .min();
                 match next {
                     Some(d) => {
@@ -12471,8 +12516,13 @@ impl CoopSched {
                         }
                         // §3.6 slice 5a: a due fiber wait completes with `WAIT_TIMED_OUT` — the
                         // fiber becomes claimable (leaving the pending set, so this loop makes
-                        // progress); its resumer's next `cont.resume` delivers the status.
-                        for f in fibers.iter_mut() {
+                        // progress); its resumer's next `cont.resume` delivers the status. Every
+                        // domain's registry: a child's fibers wait on the same clock.
+                        for f in fibers.iter_mut().chain(
+                            extra_envs
+                                .iter_mut()
+                                .flat_map(|e| e.fibers.fibers.iter_mut()),
+                        ) {
                             if let FiberState::WaitParked {
                                 deadline: Some(deadline),
                                 woken: w @ None,
@@ -12628,17 +12678,25 @@ impl CoopSched {
                 (budget, false)
             };
 
-            // Select this vCPU's environment: the shared one (root + thread siblings), or its own
-            // confined `instantiate` env. `tasks[ti].vt` and the chosen env borrow disjoint storage
-            // (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the split borrow is sound.
-            let mut ctx = match tasks[ti].env {
-                None => RunCtx {
-                    table: &dom.table,
-                    fuel: &mut *fuel,
-                    mem: &mut *mem,
-                    durable: host.is_durable(),
-                    host: HostCell::Excl(&mut *host),
-                },
+            // Select this vCPU's environment and fiber registry: the shared ones (root + thread
+            // siblings), or its own confined `instantiate` env's. `tasks[ti].vt` and the chosen env
+            // borrow disjoint storage (`tasks` vs `extra_envs` / the `mem`/`host`/`fuel` params), so the
+            // split borrow is sound.
+            let (mut ctx, mut fcell) = match tasks[ti].env {
+                None => (
+                    RunCtx {
+                        table: &dom.table,
+                        fuel: &mut *fuel,
+                        mem: &mut *mem,
+                        durable: host.is_durable(),
+                        host: HostCell::Excl(&mut *host),
+                    },
+                    FiberCell::Excl {
+                        fibers: &mut *fibers,
+                        sp: &mut *fiber_sp,
+                        meta: &mut *fiber_meta,
+                    },
+                ),
                 Some(k) => {
                     let e = &mut extra_envs[k];
                     let durable = e
@@ -12646,22 +12704,25 @@ impl CoopSched {
                         .lock()
                         .unwrap_or_else(|er| er.into_inner())
                         .is_durable();
-                    RunCtx {
-                        table: &e.table,
-                        fuel: &mut e.fuel,
-                        mem: &mut e.mem,
-                        durable,
-                        host: HostCell::Shared(&e.host),
-                    }
+                    (
+                        RunCtx {
+                            table: &e.table,
+                            fuel: &mut e.fuel,
+                            mem: &mut e.mem,
+                            durable,
+                            host: HostCell::Shared(&e.host),
+                        },
+                        FiberCell::Excl {
+                            fibers: &mut e.fibers.fibers,
+                            sp: &mut e.fibers.sp,
+                            meta: &mut e.fibers.meta,
+                        },
+                    )
                 }
             };
             let stop = step_vcpu(
                 &mut tasks[ti].vt,
-                &mut FiberCell::Excl {
-                    fibers: &mut *fibers,
-                    sp: &mut *fiber_sp,
-                    meta: &mut *fiber_meta,
-                },
+                &mut fcell,
                 dom,
                 &mut ctx,
                 quantum,
@@ -12957,6 +13018,7 @@ impl CoopSched {
                             host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
                             table: twin_table,
                             fuel: extra_envs[ck].fuel,
+                            fibers: FiberTables::default(),
                         });
                         let twin_ti = tasks.len();
                         tasks.push(TaskSlot {
@@ -13111,6 +13173,7 @@ impl CoopSched {
                                         )),
                                         table: child_table,
                                         fuel: *fuel,
+                                        fibers: FiberTables::default(),
                                     });
                                     tasks[ti].env = Some(eidx);
                                 }
@@ -13250,6 +13313,7 @@ impl CoopSched {
                                 host: std::sync::Arc::new(std::sync::Mutex::new(twin_host)),
                                 table: twin_table,
                                 fuel: twin_fuel,
+                                fibers: FiberTables::default(),
                             });
                             debug_assert_eq!(
                                 tasks.len(),
@@ -13581,6 +13645,7 @@ impl CoopSched {
                         host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
                         table: child_table,
                         fuel: child_fuel,
+                        fibers: FiberTables::default(),
                     });
                     let cidx = tasks.len();
                     tasks.push(TaskSlot {
@@ -13669,6 +13734,7 @@ impl CoopSched {
                         host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
                         table: child_table,
                         fuel: child_fuel,
+                        fibers: FiberTables::default(),
                     });
                     let cidx = tasks.len();
                     tasks.push(TaskSlot {
@@ -13878,6 +13944,7 @@ impl CoopSched {
                         host: std::sync::Arc::new(std::sync::Mutex::new(child_host)),
                         table: child_table,
                         fuel: child_fuel,
+                        fibers: FiberTables::default(),
                     });
                     let cidx = tasks.len();
                     tasks.push(TaskSlot {
@@ -13933,6 +14000,15 @@ impl CoopSched {
                     if tasks[ti].vt.active_id != ROOT_FIBER {
                         let durable = host.is_durable();
                         let k = tasks[ti].vt.active_id;
+                        // The fiber lives in its task's domain: the root's registry and window, or its
+                        // confined `instantiate` env's.
+                        let (fibers, fiber_sp, mem) = match tasks[ti].env {
+                            None => (&mut *fibers, &mut *fiber_sp, &mut *mem),
+                            Some(e) => {
+                                let e = &mut extra_envs[e];
+                                (&mut e.fibers.fibers, &mut e.fibers.sp, &mut e.mem)
+                            }
+                        };
                         // I48: read the blocking-resume marker off the parking fiber's `Running` state
                         // (set at the claim) before it is overwritten with `WaitParked` below.
                         let blocking_ip = match fibers.get(k) {
@@ -13952,7 +14028,10 @@ impl CoopSched {
                         fibers[k] = FiberState::WaitParked {
                             vm: fvm,
                             wait_dst: dst,
-                            key: base,
+                            key: mem
+                                .as_ref()
+                                .map(|m| m.futex_key(base))
+                                .unwrap_or(super::FutexKey::Anon(0, base)),
                             // #1638: an infinite wait arms neither clock. It ends by `notify`,
                             // by the park-time recheck, or not at all — and "not at all" is the
                             // driver's deadlock exit, not a fabricated `WAIT_TIMED_OUT`.
@@ -14042,11 +14121,15 @@ impl CoopSched {
                             }
                         }
                     }
-                    // §3.6 slice 5a: also wake event-parked FIBER waiters (lowest slot next, deterministic
-                    // like the task scan). Fibers can't coexist with `instantiate` (the module-level veto),
-                    // so a fibered wait is always single-window — it keys on the raw confined address,
-                    // unchanged. The status is delivered when a `cont.resume` claims the fiber.
-                    for f in fibers.iter_mut() {
+                    // §3.6 slice 5a: also wake event-parked FIBER waiters, in every domain (the root's
+                    // registry, then each child env's, lowest slot first — deterministic like the task
+                    // scan), on the same canonical key. The status is delivered when a `cont.resume`
+                    // claims the fiber.
+                    for f in fibers.iter_mut().chain(
+                        extra_envs
+                            .iter_mut()
+                            .flat_map(|e| e.fibers.fibers.iter_mut()),
+                    ) {
                         if woken >= want {
                             break;
                         }
@@ -14056,7 +14139,7 @@ impl CoopSched {
                             ..
                         } = f
                         {
-                            if *fkey == base {
+                            if *fkey == key {
                                 *w = Some(super::WAIT_WOKEN);
                                 woken += 1;
                             }
@@ -14252,6 +14335,7 @@ impl CoopSched {
                                 mem: cmem,
                                 host: chost,
                                 table: ctable,
+                                fibers: cfibers,
                                 ..
                             } = &mut extra_envs[k];
                             run_invoke(
@@ -14262,7 +14346,10 @@ impl CoopSched {
                                 fuel,
                                 cmem,
                                 &mut HostCell::Shared(chost),
-                                Some(&Beneath::task(&tasks[ti].vt, FiberRegRef::Owned(fibers))),
+                                Some(&Beneath::task(
+                                    &tasks[ti].vt,
+                                    FiberRegRef::Owned(&cfibers.fibers),
+                                )),
                             )
                         }
                     };
