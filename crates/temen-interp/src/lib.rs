@@ -3623,7 +3623,10 @@ pub fn run_capture_reserved_with_host_prots(
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
-        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .map(|mm| {
+            let span = mm.capture_extent(SNAP_CAP) as usize;
+            (mm.snapshot_window(span), mm.snapshot_prots(span))
+        })
         .unwrap_or_default();
     (r, snap, prots)
 }
@@ -30320,9 +30323,10 @@ impl Mem {
         high.min(self.window.reserved())
     }
 
-    /// What a [`snapshot_window`](Mem::snapshot_window) / [`snapshot_prots`](Mem::snapshot_prots)
-    /// capture spans: at least `snap_cap` (the escape-oracle span the JIT captures too), and always
-    /// through the high-water mark, so a page grown past `snap_cap` rides a freeze (#1700).
+    /// A durable capture's span: at least `snap_cap` (the escape-oracle span the JIT captures too),
+    /// and always through the high-water mark, so a page grown past `snap_cap` rides a freeze
+    /// (#1700). Only the freeze capture wants it — a run that reads just its low window must not
+    /// copy a grown heap (a compiler guest's is hundreds of MiB).
     fn capture_extent(&self, snap_cap: usize) -> u64 {
         let high = self.high_water(&self.space_read());
         self.window.reserved().min(high.max(snap_cap as u64))
@@ -30443,7 +30447,10 @@ impl Mem {
     /// JIT's freshly-committed tail). Page-wise (one map lookup per committed page, not per byte) so
     /// widening past the backed prefix stays cheap.
     fn snapshot_window(&self, snap_cap: usize) -> Vec<u8> {
-        let snap = self.capture_extent(snap_cap) as usize;
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64)) as usize;
         let mut out = vec![0u8; snap];
         self.back.read_into(0, &mut out); // anonymous bytes (untouched / grown-tail read as zero)
                                           // §13 aliased pages live in their region backing, not in `back` — fill them from there.
@@ -30474,7 +30481,10 @@ impl Mem {
     /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
     /// access path and the JIT's page tables use.
     fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
-        let snap = self.capture_extent(snap_cap);
+        let snap = self
+            .window
+            .reserved()
+            .min(self.window.mapped().max(snap_cap as u64));
         let space = self.space_read();
         dense_prots(&space.prot, self.page, self.window.mapped(), snap)
     }
