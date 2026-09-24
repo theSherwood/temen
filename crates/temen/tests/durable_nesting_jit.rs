@@ -746,3 +746,195 @@ fn jit_pure_child_freeze_thaw_round_trips() {
     );
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
+
+/// #1692: a parent instantiates a same-module child (func 1), calls a host function (handle `v1`),
+/// then joins the child and returns its result plus the host function's. The JIT runs a durable child
+/// synchronously, so it has finished by the time the host function runs.
+fn parent_join_after_call(child_body: &str) -> String {
+    format!(
+        "memory 18 shadow 16448 65536
+func (i32, i32) -> (i64) {{
+block 0 (v0: i32, v1: i32) {{
+  v2 = i64.const 1
+  v3 = i64.const 131072
+  v4 = i64.const 17
+  v5 = i64.const 0
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5)
+  v7 = i32.const 0
+  v8 = call.cap 13 0 (i32) -> (i64) v1 (v7)
+  v9 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  v10 = i64.add v8 v9
+  return v10
+  }}
+}}
+func (i64) -> (i64) {{
+block 0 (v0: i64) {{
+{child_body}
+  }}
+}}
+"
+    )
+}
+
+/// Run `inst` on the JIT with an Instantiator and a host function returning 0. With `freeze`, the
+/// host function requests the freeze itself, so it lands after the child finished and before the
+/// parent's join, at the host call's trailing poll.
+fn run_join_after_call(
+    inst: &temen_ir::Module,
+    win: &[u8],
+    freeze: bool,
+    seed: DurableResidue,
+) -> (JitOutcome, Vec<u8>, DurableResidue) {
+    let mut h = Host::new();
+    h.set_durable(true);
+    let ih = h.grant_instantiator(0, WINDOW as u64);
+    let fc = freeze.then(temen_jit::FreezeController::new);
+    let at_call = fc.clone();
+    let hf = h.grant_host_proc(Box::new(move |_op, _args, _mem, _| {
+        if let Some(fc) = &at_call {
+            fc.request_freeze();
+        }
+        Ok(vec![0])
+    }));
+    compile_and_run_durable(
+        inst,
+        0,
+        &[ih as i64, hf as i64],
+        win,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+        DurableRun {
+            seed,
+            freeze: fc,
+            ..Default::default()
+        },
+    )
+    .expect("compiles")
+}
+
+/// #1692: a child that finished before the freeze but was not yet joined rides the residue with its
+/// result, and the thaw hands that result to the parent's rewound `join` without re-running the child.
+/// Before, the JIT recorded nothing for it and the thawed join read 0.
+#[test]
+fn jit_freeze_carries_a_finished_unjoined_childs_result() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(&parent_join_after_call(
+        "  v1 = i64.const 4321\n  return v1",
+    ));
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (base, _, _) = run_join_after_call(&inst, &fresh, false, DurableResidue::default());
+    assert!(
+        matches!(base, JitOutcome::Returned(ref r) if r == &[4321]),
+        "uninterrupted: {base:?}"
+    );
+
+    let (fo, snap, residue) = run_join_after_call(&inst, &fresh, true, DurableResidue::default());
+    assert!(
+        matches!(fo, JitOutcome::Returned(_)),
+        "freeze placeholder: {fo:?}"
+    );
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(residue.nested.len(), 1, "the finished child rides");
+    assert_eq!(residue.nested[0].completed_result, Some(4321));
+
+    let mut twin = snap.clone();
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let seed = DurableResidue {
+        nested: residue.nested,
+        ..Default::default()
+    };
+    let (to, tsnap, _) = run_join_after_call(&inst, &twin, false, seed);
+    assert!(
+        matches!(to, JitOutcome::Returned(ref r) if r == &[4321]),
+        "thaw ≡ uninterrupted: {to:?}"
+    );
+    assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
+}
+
+/// #1692: a child that finished with a trap before the freeze cannot ride (a trap is not a join
+/// result the artifact can carry), so the freeze fails closed with `ThreadFault` rather than hand the
+/// parent's thaw a join result of 0.
+#[test]
+fn jit_freeze_with_a_trapped_unjoined_child_fails_closed() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(&parent_join_after_call("  unreachable"));
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (fo, _, residue) = run_join_after_call(&inst, &fresh, true, DurableResidue::default());
+    assert!(
+        matches!(fo, JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault)),
+        "fails closed: {fo:?}"
+    );
+    assert!(
+        residue.nested.is_empty(),
+        "nothing rides: {:?}",
+        residue.nested
+    );
+}
+
+/// #1692 depth-2: under a freeze from the start, the child (func 1) instantiates a grandchild (func 2)
+/// that traps at once, then unwinds with that grandchild unjoined. The child's freeze refuses, which
+/// fails the child; the root then refuses its failed child in turn.
+const FREEZE_TRAPPED_GRANDCHILD: &str = "memory 18 shadow 16448 65536
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  v1 = i64.const 1
+  v2 = i64.const 131072
+  v3 = i64.const 17
+  v4 = i64.const 0
+  v5 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (v1, v2, v3, v4)
+  v6 = call.cap 6 1 (i32) -> (i64) v0 (v5)
+  return v6
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i32.const 256
+  v2 = i64.const 2
+  v3 = i64.const 65536
+  v4 = i64.const 16
+  v5 = i64.const 0
+  v6 = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v1 (v2, v3, v4, v5)
+  v7 = call.cap 6 1 (i32) -> (i64) v1 (v6)
+  return v7
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  unreachable
+  }
+}
+";
+
+#[test]
+fn jit_freeze_with_a_trapped_unjoined_grandchild_fails_closed_at_the_root() {
+    if !temen_jit::fiber_supported() {
+        return;
+    }
+    let inst = instrument(FREEZE_TRAPPED_GRANDCHILD);
+    let mut h = Host::new();
+    h.set_durable(true);
+    let ih = h.grant_instantiator(0, WINDOW as u64);
+    let mut win = init_durable_window(WINDOW, TEST_ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let (fo, _, residue) = compile_and_run_durable(
+        &inst,
+        0,
+        &[ih as i64],
+        &win,
+        SIZE_LOG2,
+        temen_run::cap_thunk,
+        &mut h as *mut Host as *mut c_void,
+        DurableRun::default(),
+    )
+    .expect("compiles");
+    assert!(
+        matches!(fo, JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault)),
+        "fails closed at the root: {fo:?} (residue {:?})",
+        residue.nested
+    );
+}

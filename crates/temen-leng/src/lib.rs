@@ -1913,6 +1913,24 @@ pub fn nim_posix_runtime(
     Ok(out)
 }
 
+/// Link a nim program's `.x.nif` units into one **POSIX-personality** module: the
+/// [`link_nim_powerbox`] of a program that opens files, forks and execs. It is
+/// [`nim_posix_runtime`], plus the prebuilt guest libc's units when `libc` is given (`snprintf`,
+/// `strtod`, libm, which no hand-written shim carries: without them those stay unbound manifest
+/// imports), linked by [`link_whole_powerbox_manifest`]. Every caller links through this, so a
+/// phase built on the host and a program built in-guest by the self-hosted lane are one link.
+pub fn link_nim_posix(
+    units: &[WholeModule],
+    personality: PersonalityVtable,
+    libc: Option<&[u8]>,
+) -> Result<Module, LengError> {
+    let mut runtime = nim_posix_runtime(units, personality)?;
+    if let Some(libc) = libc {
+        runtime.extend(nim_libc_units(libc, units)?);
+    }
+    link_whole_powerbox_manifest(units, runtime)
+}
+
 /// The personality's published op vocabulary — what `temen_posix::cap_vtable()` returns: each op's
 /// import name (`__px_<op>`) and its exact signature, op number = position.
 ///

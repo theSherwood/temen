@@ -314,6 +314,14 @@ property, so in practice:
   the browser vCPU-bomb **backstop**: a shared live-vCPU counter in the `temen_par_*` constructors
   (admit/retire around `temen_par_free`), capped at 256 — cruder than the native drivers' spawner
   `ThreadFault` (a refused construction fails the run via the JS host), but it bounds Worker creation.
+  **The on-ramp recipe** (`temen_par_powerbox_onramp`, #152) publishes the same shared `Mutex<Host>`
+  holding the full on-ramp powerbox (`grant_onramp_caps`: the §3e prefix, by-name caps and manifest
+  import bindings), so a `.temen` off the on-ramp toolchain whose runtime spawns threads runs them on
+  real Workers. Its root takes no args (the manifest `_start`) and reserves exactly the window, as
+  children do; an `exit` from any vCPU ends the run. Proven: `browser/tests/par_onramp.rs` (real OS
+  threads, against the cooperative `onramp_exec`) and the `#capio` item in Chromium. **Not yet for
+  fiber runtimes:** each `Vcpu` keeps its own fiber registry, so a fiber can't migrate between
+  Workers (#1761), and JACL's pool needs that.
 - [x] **4e — the playground (`browser/web/play.html`) — the motivating demo, live.** The "web
   interpreter playground" this whole plan cites as its motivation now exists: Temen text typed into an
   editor is parsed → verified → encoded **inside the wasm sandbox** (`temen_parse` — `temen-text`/

@@ -753,7 +753,6 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // to bind by name below, so this deliberately does not take `nim_powerbox_runtime`'s stdout-only
     // adapter. It is the same runtime the file-I/O and nifler2 routes take — one route through this
     // bottom edge, whether the program prints or also opens files.
-    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
     // Link with a synthesized **powerbox `_start`** at function 0: it reads the post-link data-stack
     // base (`data.top` → `powerbox_entry_sp`, page-aligned above the globals) and calls the C-shaped
     // `main($sp, argc, argv, envp)` with `argc/argv/envp = 0` — a real powerbox entry, not a
@@ -761,7 +760,7 @@ fn run_io_program(mods: &[(String, String)]) -> Vec<u8> {
     // the link) keeps the program's `data.funcref` gvar initializers valid — the funcref-carrying
     // at-exit flush this very program registers would otherwise dispatch through a stale, off-by-one
     // index.
-    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
         .unwrap_or_else(|e| panic!("powerbox manifest link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     // The merged module carries the §3e powerbox entry shape: a paramless `_start` at function 0
@@ -2155,8 +2154,7 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
-    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -2176,7 +2174,7 @@ fn nim_memory_maps_a_file_through_the_posix_personality() {
 mod chibicc_mod;
 
 /// The POSIX build of `demos/shell` — the `/bin/sh` a nim program's `execShellCmd` execs (#1662) —
-/// compiled by the in-tree chibicc exactly as `nim_noc_semcheck --sh` expects it.
+/// compiled by the in-tree chibicc exactly as `nim_selfhost_lane --sh` expects it.
 fn posix_sh() -> temen_ir::Module {
     let demo = concat!(env!("CARGO_MANIFEST_DIR"), "/../temen-run/demos/shell/");
     let src = ["shim.c", "ring.c", "shell_main.c"]
@@ -2216,8 +2214,7 @@ fn link_posix_program(path: &str, src: &str) -> temen_ir::Module {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("posix runtime");
-    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime).expect("link");
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None).expect("link");
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     assert!(
         m.imports
@@ -2321,8 +2318,7 @@ fn nim_forks_and_execs_a_nim_program() {
             .iter()
             .map(|(stem, src)| temen_leng::WholeModule { stem, src })
             .collect();
-        let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("posix runtime");
-        let m = temen_leng::link_whole_powerbox_manifest(&units, runtime).expect("link");
+        let m = temen_leng::link_nim_posix(&units, px_vtable(), None).expect("link");
         temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
         assert!(
             m.imports
@@ -2395,8 +2391,7 @@ fn nim_reads_and_writes_files_through_the_posix_personality() {
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    let runtime = temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
-    let m = temen_leng::link_whole_powerbox_manifest(&units, runtime)
+    let m = temen_leng::link_nim_posix(&units, px_vtable(), None)
         .unwrap_or_else(|e| panic!("posix-route link: {e}"));
     temen_verify::verify_module(&m).unwrap_or_else(|e| panic!("verify: {e:?}"));
     let posix = run_io_capture(
@@ -2599,12 +2594,7 @@ fn nifler2_links_through_leng() {
     // cannot work on it at all. The POSIX runtime forwards the true syscalls to the personality's own
     // op names, which `run_io_capture` binds to `temen_posix`'s real fd ops over an in-memory
     // filesystem — the same route `run_io_program` already uses for stdout, with files.
-    let mut runtime =
-        temen_leng::nim_posix_runtime(&units, px_vtable()).expect("nim posix runtime");
-    if let Some(libc) = guest_libc() {
-        runtime.extend(temen_leng::nim_libc_units(&libc, &units).expect("guest libc units"));
-    }
-    match temen_leng::link_whole_powerbox_manifest(&units, runtime) {
+    match temen_leng::link_nim_posix(&units, px_vtable(), guest_libc().as_deref()) {
         Ok(m) => {
             dump_module("nifler2", &m);
             let v = temen_verify::verify_module(&m);

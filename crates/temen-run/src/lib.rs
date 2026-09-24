@@ -1637,8 +1637,7 @@ fn hg_restore(host: &mut Host, host_mutex: Mutex<Host>) {
 /// leaves the run byte-identical.
 ///
 /// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): a
-/// separate-module or completed nested child, a nested child's host state, a detached child (#1692,
-/// #1361). The embedder then thaws on the interpreter, which carries all of it.
+/// separate-module nested child, a nested child's host state, a detached child (#1692, #1361). The embedder then thaws on the interpreter, which carries all of it.
 fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
@@ -1646,7 +1645,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
     let jit_unrepresentable = host
         .frozen_nested()
         .iter()
-        .any(|n| n.module_digest.is_some() || n.completed_result.is_some())
+        .any(|n| n.module_digest.is_some())
         || !host.frozen_child_state().is_empty()
         || !host.frozen_detached().is_empty();
     if jit_unrepresentable {
@@ -1688,6 +1687,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
+            completed_result: n.completed_result,
         })
         .collect();
     let detached = detached_seeds(host)?;
@@ -1911,7 +1911,7 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                     size_log2: n.size_log2,
                     entry: n.entry,
                     module_digest: None,
-                    completed_result: None,
+                    completed_result: n.completed_result,
                 })
                 .collect(),
         );
