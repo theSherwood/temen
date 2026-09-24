@@ -12,6 +12,7 @@ publish = false
 
 [dependencies]
 temen-ir = { path = "../temen-ir" }
+temen-posix-abi = { path = "../temen-posix-abi" }
 temen-interp = { path = "../temen-interp" }
 
 [dev-dependencies]

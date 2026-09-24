@@ -279,6 +279,31 @@ is a parser over attacker-controlled frames in the host.
   detached child's — in-flight plumbing (the run driver must reach the detached child's
   `Mem`+`Host` at quiesce), which is why a durable op-15 detached spawn refuses today.
 
+**The cut and its boundary (owner direction, 2026-09-24).** *Everything inside the cut is data;
+only the cut's boundary is an interface, and a boundary edge is recorded and re-bound, never
+refused.* The cut is the frozen domain tree. What decides whether a piece of state can be frozen is
+where it sits, not what kind it is:
+
+- **Inside the cut, it rides as data.** This covers state the tree's own domains own: window
+  images, continuations, handle tables, and host-served objects whose every user is in the tree
+  (a pipe between two children, a reap of a child, a `SIGSTOP`'d job). A wait parked inside the cut
+  whose operation has not taken effect is abandoned and re-issued on thaw, as the futex wait
+  already is (`WAIT_FROZEN`). A wait whose operation has *partly* taken effect records its progress
+  instead, so the thaw does not repeat it.
+- **Across the boundary, it rides as a named edge.** This covers anything with an end outside the
+  tree: the embedder's streams, a pipe to the host or to an unfrozen domain, a named host
+  capability. The artifact records the edge, and the thawing embedder re-binds it, as `Stream(role)`
+  and `Named` already do (§12.5). An edge the thaw does not re-bind reaches the guest as the ordinary
+  failure it must already handle (EOF, `EPIPE`, a closed handle), never as a trap.
+- **An operation in flight across the boundary** (a capability call, a ticket, `Blocking.work`)
+  either completes before the cut or is cancelled and re-issued on thaw (R2/R6). This is the one
+  case that needs per-operation semantics.
+
+So a freeze fails only while one of these rules is unimplemented. Each `DeclineCause` (#1671) and
+each `NonDurableKind` (§12.5) is a gap against this rule, tracked in #1703, not a permanent carve-out.
+The exceptions are the by-design ones #1703 lists, such as an un-attested `Module` grant: those
+lack the *authority* to rebuild, not a representation.
+
 **Enforcement (one flag check at instantiate/install):** *a durable domain admits
 only freezable modules and may only spawn durable children.* STW quiesces the subtree
 as a unit.
@@ -1119,6 +1144,7 @@ Per **live** slot (`Slot.entry.is_some()`, `temen-interp` `:4427`), sparse:
 | `Named { idx }` (#1455) | idx | name + provider state ride Section 7 (`capture_durable_named`); the thaw's **registrar** re-grants by name |
 | `Module { digest }` (#1361, v27) | the module's 32-byte §4 content digest | resolved against the **restoring** host's durable module grants (`module_id_by_digest`); the bytes are D-scope and never ride. Durable only for an attested-freezable grant |
 | `FreezeAuthority(scope)` (#1440, v25/v26) | a carve's `base`/`size`, or the all-or-nothing detached-progeny scope | `grant_freeze_authority` — a thawed parent holds the same authority over its thawed children it held at freeze |
+| `PipeEnd { pipe, write }` (#1680, v32) | the pipe's artifact number (first appearance: the root's table by slot, then each nested child's in record order) and which end | Section 9 carries each pipe's bytes; `Host::restore_durable_pipes` rebuilds it with the cut's end counts and a fresh id, and the end re-opens on it. Durable only for a pipe the tree minted with every end inside the cut: an embedder-fed pipe refuses (`NonDurableKind::Pipe`), one with an end outside the cut refuses `FreezeError::PipeCrossesCut` (the boundary, #1680 slice 2) |
 | `Budget(BudgetState)` (#1502, v22; `lane` D66, v28) | fuel, mem, spawn, channel — the **remaining** quotas (`-1` = unbounded) — plus `lane`, the parallelism lane a child spawned with the budget receives: a **ceiling** the thaw may attenuate like the rest, never a stock (INVARIANTS #3 ruling 2026-09-21) | re-minted into `Host::budgets` at its captured slot; the thaw's **budget hook** (`set_budget_thaw_hook`) may attenuate, never raise; no hook ⇒ verbatim |
 
 **Not durable in v1** — carry out-of-line host state or native pointers; their
@@ -1371,6 +1397,21 @@ offsets, `shadow_SP −= frame_size(rid)`, then:
   state word to `NORMAL` and continue forward from the resume point;
 - else: re-issue the in-flight call (which re-enters the callee, whose own prologue
   sees `REWINDING` and pops the next frame).
+
+**Host calls re-issue when abandoned (#1672).** A host call (`call.cap`, `call.import`,
+`call.import.dyn`, `call.sym`) is the deepest frame, and its thaw normally *reloads* its
+result: the host performed it before the cut. A call that would **park** while a freeze is
+landing (an empty pipe read, a full pipe write, a reap bench) has not taken effect, and parking
+would hold the freeze on an event that may never come. So the runtime abandons it: it sets the
+context's **re-issue word** (`REISSUE_IN_REGION_OFF`, the spare 4 bytes of the region header
+after the thaw word) and returns the op's placeholder results. The call's unwind moves that word
+into its frame (a 4-byte slot just below `resume_id`) and clears it. On thaw the arm branches
+on the reloaded flag: set, it re-issues the call with its reloaded operands (every host call's
+operands are therefore spilled); clear, it reloads the result as before. This generalizes the
+`atomic.wait` `WAIT_FROZEN` rule to calls whose result has no spare sentinel value. Only the
+interpreter oracle abandons today; the JIT and bytecode engines never set the word, so their
+host calls keep reloading. Pinned by `temen-durable/tests/quiesce_parks.rs::
+a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw`.
 
 **State word** (`NORMAL | UNWINDING | REWINDING`): per-vCPU, in-window (§2); every
 poll/prologue reads it. Freeze sets all to `UNWINDING` and drives each fiber to drain
@@ -1650,7 +1691,7 @@ handles are not a cause: the codec answers those as a `FreezeError` value and it
 The unwind-time refusals (`nested_refused`, `child_state_refused`, `detached_live_refused`, `freeze_drive`)
 stay as the fail-closed backstop for a cause that arises *after* the census — `Blocking.work` entered under a
 landed freeze (4A.7, below) is the one named. The owner's standing rule is that freezes should basically never
-fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap filed to be closed
+fail, so a decline is the fallback, not the design point: each `DeclineCause` is a gap against §4's cut rule, filed to be closed
 (#1703). On the oracle only for now; freeze-from-start (a window that begins `UNWINDING`) and freeze-on-quiesce
 are not census points yet. Pinned by `temen-interp/tests/freeze_declined.rs` (a nested child beside a thread
 declines, and the run's result equals the unarmed run's; with the census disabled it ends `ThreadFault`) and `temen-interp/src/freeze_census_tests.rs` (every other cause, plus "the

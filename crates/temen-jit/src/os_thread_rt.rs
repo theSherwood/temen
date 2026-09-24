@@ -173,9 +173,14 @@ impl Done {
     /// it — #1625's "a woken waiter still counted", on a join. Lock order: this cell, then
     /// `threads`; nothing takes a cell's lock while holding `threads`.
     fn publish(&self, dom: &Domain, result: i64, trap: i64) {
+        let hub = dom.hub();
         let mut st = lock(&self.state);
-        cell_unpark(&self.joiner_parked, &dom.parked);
+        cell_unpark(&self.joiner_parked, &hub.parked);
         lock(&dom.threads).live -= 1;
+        // A §14 child's vCPU also held a slot of the run-wide count (see `thread_spawn`).
+        if !std::ptr::eq(hub, dom) {
+            lock(&hub.threads).live -= 1;
+        }
         *st = Some((result, trap));
         self.cv.notify_all();
     }
@@ -270,10 +275,16 @@ pub(crate) struct Domain {
     lane_cv: Condvar,
     /// D66 — the lane chain **this domain's own vCPUs** run under: `[(domain id, cap)]`, or empty
     /// when the run set no cap (then every gate below is skipped and the hot path is untouched).
-    /// Installed at run entry from the host's `(domain_id, lane_cap)`; a §14 JIT child cannot
-    /// `thread.spawn` (`compile_child_windowed` rejects it), so the only vCPUs gated here are the
-    /// root domain's, and the chain is one entry long.
+    /// Installed at run entry from the host's `(domain_id, lane_cap)` for a run's domain (one entry
+    /// long), and from the task's chain for a §14 child's (root down to the child).
     lane_chain: Mutex<Vec<(usize, i64)>>,
+    /// #1469 — the domain this one shares its futex, park count, lanes, child executor and
+    /// run-wide live count with: `0` for a run's own domain (its own hub), else the address of the
+    /// run's domain, which outlives it. A §14 child task that uses `thread.spawn` gets a domain of
+    /// its own for what the oracle keeps per domain — the thread table, its vCPUs' window, table and
+    /// fiber registry, its lane chain — and shares the rest, because the oracle runs every vCPU of
+    /// the run under one scheduler: one live cap, one futex, one deadlock count.
+    hub: usize,
 }
 
 /// One vCPU's join table on the durable single-worker path (slice 3.4): its spawned children's
@@ -544,7 +555,37 @@ impl Domain {
             lanes: Mutex::new(BTreeMap::new()),
             lane_cv: Condvar::new(),
             lane_chain: Mutex::new(Vec::new()),
+            hub: 0,
         }
+    }
+
+    /// #1469 — the domain of a §14 child task's own vCPUs, sharing `hub` (see [`Domain::hub`]).
+    /// Its `live` counts only the child's spawned vCPUs, from 0: the task itself is counted on the
+    /// hub when it is filed ([`Domain::try_child_start`]), and each vCPU spawned here is counted on
+    /// both. [`Domain::set_env`] supplies the child's window before any of its vCPUs can spawn.
+    pub(crate) fn new_child(hub: &Domain, lane_chain: Vec<(usize, i64)>) -> Domain {
+        let mut d = Domain::new(hub.max_vcpus);
+        d.threads = Mutex::new(Threads::default());
+        d.lane_chain = Mutex::new(lane_chain);
+        d.hub = hub as *const Domain as usize;
+        d
+    }
+
+    /// The domain holding the futex, park count, lanes and run-wide live count this one uses:
+    /// itself for a run's domain, the run's domain for a §14 child's.
+    pub(crate) fn hub(&self) -> &Domain {
+        if self.hub == 0 {
+            self
+        } else {
+            // SAFETY: a nonzero `hub` is the run's live `Domain`, which outlives every child
+            // domain (the child executor, which owns them, is joined before the run's domain drops).
+            unsafe { &*(self.hub as *const Domain) }
+        }
+    }
+
+    /// How many vCPUs this domain spawned are still running.
+    pub(crate) fn live_threads(&self) -> usize {
+        lock(&self.threads).live
     }
 
     /// Publish a **spawned** vCPU's raw trap-time backtrace capture (§5 W3 Stage 3), last-wins. Called
@@ -665,7 +706,7 @@ impl Domain {
     /// lane lock, so a caller may hold its own scheduler lock across it (the child-domain executor
     /// does, while picking); nothing in this file takes a scheduler lock while holding this one.
     pub(crate) fn lane_try_enter(&self, chain: &[(usize, i64)]) -> bool {
-        temen_ir::lanes::enter(&mut lock(&self.lanes), chain)
+        temen_ir::lanes::enter(&mut lock(&self.hub().lanes), chain)
     }
 
     /// D66 — give every lane in `chain` back (the vCPU parked, or finished) and wake **both** kinds
@@ -682,12 +723,13 @@ impl Domain {
         if chain.is_empty() {
             return;
         }
+        let hub = self.hub();
         {
-            let mut g = lock(&self.lanes);
+            let mut g = lock(&hub.lanes);
             temen_ir::lanes::leave(&mut g, chain);
         }
-        self.lane_cv.notify_all();
-        let exec = lock(&self.child_exec).clone();
+        hub.lane_cv.notify_all();
+        let exec = lock(&hub.child_exec).clone();
         if let Some(e) = exec {
             e.notify_workers();
         }
@@ -714,7 +756,8 @@ impl Domain {
         if chain.iter().any(|&(_, cap)| cap == 0) {
             return false; // unsatisfiable by construction
         }
-        let mut g = lock(&self.lanes);
+        let hub = self.hub();
+        let mut g = lock(&hub.lanes);
         loop {
             if temen_ir::lanes::enter(&mut g, chain) {
                 return true;
@@ -724,7 +767,7 @@ impl Domain {
             }
             #[cfg(not(loom))]
             {
-                g = self
+                g = hub
                     .lane_cv
                     .wait_timeout(g, KILL_RECHECK)
                     .unwrap_or_else(|e| e.into_inner())
@@ -732,7 +775,7 @@ impl Domain {
             }
             #[cfg(loom)]
             {
-                g = self.lane_cv.wait(g).unwrap_or_else(|e| e.into_inner());
+                g = hub.lane_cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
         }
     }
@@ -751,7 +794,7 @@ impl Domain {
     /// futex broadcast at every wake site: a `notify`, a vCPU exit, the §5 kill path and domain
     /// teardown all reach parked tasks through here.
     pub(crate) fn wake_child_tasks(&self) {
-        let exec = lock(&self.child_exec).clone();
+        let exec = lock(&self.hub().child_exec).clone();
         if let Some(e) = exec {
             e.wake_all_parked_locked();
         }
@@ -905,9 +948,21 @@ impl Domain {
     /// trap/exit begins teardown (owner decision 2026-07-24), and either way the parked must
     /// re-check, not sleep until `KILL_RECHECK` (or forever, when no kill-path is armed).
     pub(crate) fn wake_all_parked(&self) {
+        self.wake_own_parked();
+        // D66 — and every parked child task, for the same reason: a completion changed `live`, or
+        // teardown began, and a parked task must re-check rather than sleep to the cadence.
+        self.wake_child_tasks();
+    }
+
+    /// [`Self::wake_all_parked`] without the child tasks: this domain's own parked vCPUs only. The
+    /// child executor calls it for a task's domain while holding its own lock, which
+    /// [`Self::wake_child_tasks`] would take again.
+    pub(crate) fn wake_own_parked(&self) {
+        // A §14 child's waiters park on its hub's futex; its joiners on its own cells, below.
         {
-            let _g = lock(&self.futex);
-            self.futex_cv.notify_all();
+            let hub = self.hub();
+            let _g = lock(&hub.futex);
+            hub.futex_cv.notify_all();
         }
         // Snapshot the completion cells out of their table locks, then notify each under its own
         // state lock (never hold a table lock while taking a cell lock).
@@ -921,9 +976,6 @@ impl Domain {
             let _g = lock(&c.state);
             c.cv.notify_all();
         }
-        // D66 — and every parked child task, for the same reason: a completion changed `live`, or
-        // teardown began, and a parked task must re-check rather than sleep to the cadence.
-        self.wake_child_tasks();
     }
 
     /// Join every spawned OS thread (run teardown). After this returns no vCPU is still touching the
@@ -937,7 +989,7 @@ impl Domain {
         // joins — else a vCPU left parked in a genuine deadlock (e.g. a sibling that unwound, propagating
         // a trap, before the parked one's own deadlock check fired) would see this joiner as a live,
         // not-parked "potential notifier" (`live > parked`) and wait forever, hanging `join_all` too.
-        let _pg = ParkGuard::new(&self.parked);
+        let _pg = ParkGuard::new(&self.hub().parked);
         for j in joins {
             let _ = j.join();
         }
@@ -1086,8 +1138,36 @@ std::thread_local! {
     static CONCURRENT_SPAWN_TASK: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
+std::thread_local! {
+    /// #1469 — the domain the code on this thread spawns into and joins from when it is not the
+    /// one baked into its thunks: a §14 child task's. Seeded on each of the child's vCPU threads
+    /// ([`run_child`]) and around each residency of the task on an executor worker (`child_exec`);
+    /// null elsewhere, where the baked `sched` is the domain. Child code is shared across spawns
+    /// (`instantiator_rt`'s code cache), so the domain cannot be baked into it.
+    static CURRENT_DOMAIN: std::cell::Cell<*const Domain> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
+/// Publish `dom` as this thread's current domain (see [`CURRENT_DOMAIN`]); returns the previous one.
+pub(crate) fn set_current_domain(dom: *const Domain) -> *const Domain {
+    CURRENT_DOMAIN.with(|c| c.replace(dom))
+}
+
+/// The domain a thread thunk acts in: this thread's current one, else the baked `sched`. Not
+/// inlined: a task can move to another worker across a park, so the thread-local is re-read on the
+/// thread that asks (R2, #1466).
+///
+/// # Safety
+/// `sched` is the run's live `Domain`; a current domain, when set, outlives the code running it.
+#[inline(never)]
+unsafe fn current_domain<'a>(sched: *const Domain) -> &'a Domain {
+    let cur = CURRENT_DOMAIN.with(|c| c.get());
+    &*(if cur.is_null() { sched } else { cur })
+}
+
 fn run_child(a: SpawnArgs) {
     let env = a.env;
+    // #1469 — this vCPU's thunks act in the domain that spawned it (a §14 child's, or the run's).
+    set_current_domain(a.dom);
     // §12 seed this vCPU's per-vCPU TLS register to its dense id before any guest code runs.
     crate::vcpu_tls::seed(a.vcpu_id);
     // §12.8 4A.5 stage (ii): a concurrent durable child points its durable shadow-base register at its
@@ -1276,12 +1356,12 @@ fn run_child(a: SpawnArgs) {
     // a trap that originated here. SAFETY: `a.dom` is the run's live `Domain` (joined at run end).
     if trap != 0 {
         if let Some(cap) = mem::take_trap_frame() {
-            unsafe { (*a.dom).publish_trap_capture(cap) };
+            unsafe { (*a.dom).hub().publish_trap_capture(cap) };
         }
     }
-    // §15: free this vCPU's concurrent-live slot and publish its result. The domain outlives all
-    // spawned threads, so the pointer is live. SAFETY: `a.dom` is the run's `Domain` (joined at run
-    // end).
+    // §15: free this vCPU's concurrent-live slot (and a §14 child's run-wide one) and publish its
+    // result. The domain outlives all spawned threads, so the pointer is live. SAFETY: `a.dom` is the
+    // run's `Domain` (joined at run end).
     a.done.publish(unsafe { &*a.dom }, result, trap);
     // A finished vCPU re-wakes the whole domain (owner decision 2026-07-24; DESIGN.md §12): parked
     // futex waiters re-evaluate the deadlock predicate against the dropped `live`, and — when this
@@ -1308,7 +1388,8 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     sp: u64,
     arg: u64,
 ) -> i32 {
-    let dom = &*sched;
+    let dom = current_domain(sched);
+    let hub = dom.hub();
     let env = dom.env();
     let entry = (env.fn_table_base as *const FnEntry).add(func_idx as usize);
     let code = (*entry).code();
@@ -1367,8 +1448,15 @@ pub(crate) unsafe extern "C" fn thread_spawn(
     let handle = {
         let mut t = lock(&dom.threads);
         // §15: bound *concurrent* live vCPUs (root + unfinished spawns), not the cumulative handle
-        // table — so a spawn-join loop never trips, matching the interpreter.
-        if t.live >= dom.max_vcpus {
+        // table — so a spawn-join loop never trips, matching the interpreter. A §14 child's vCPU is
+        // bounded by the run-wide count, as the oracle's one scheduler bounds every vCPU of the run
+        // (its own `live` is then only this domain's share, for its teardown).
+        let at_ceiling = if std::ptr::eq(hub, dom) {
+            t.live >= dom.max_vcpus
+        } else {
+            !hub.try_child_start()
+        };
+        if at_ceiling {
             if let Some(dc) = &durable_child {
                 if let Some(table) = dom.fiber_table() {
                     table.free_vcpu_context(dc.ctx);
@@ -1392,7 +1480,7 @@ pub(crate) unsafe extern "C" fn thread_spawn(
             vcpu_id,
             durable_child,
             done,
-            dom: sched,
+            dom,
         };
         let jh = std::thread::Builder::new()
             .name(format!("temen-vcpu-{idx}"))
@@ -1410,6 +1498,9 @@ pub(crate) unsafe extern "C" fn thread_spawn(
                 // reserved shadow context (if any) leaks for this run — a spawn failure aborts the run.
                 t.cells.pop();
                 t.joined.pop();
+                if !std::ptr::eq(hub, dom) {
+                    lock(&hub.threads).live -= 1; // the slot `try_child_start` took
+                }
                 store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
                 -1
             }
@@ -1822,7 +1913,7 @@ pub(crate) unsafe extern "C" fn thread_join(
     handle: i32,
     trap_out: u64,
 ) -> i64 {
-    let dom = &*sched;
+    let dom = current_domain(sched);
     // Durable single-worker (slice 3.4): resolve the handle in the **current** vCPU's per-vCPU table —
     // nested spawns give each spawning vCPU its own handle namespace. `dchildren` is populated only on
     // that path (freeze defer / thaw re-attach); when it's empty this is the global OS-thread table.
@@ -1869,6 +1960,19 @@ pub(crate) unsafe extern "C" fn thread_join(
             std::sync::Arc::clone(&t.cells[slot])
         }
     };
+    // #1469 — inside a child-domain task the thread that would block is an executor worker, not a
+    // vCPU: the task root parks the *task* instead (as `fiber_resume_block` does). A guest fiber
+    // inside the task cannot park the task from its own stack, so it fails closed rather than hold
+    // a worker the joined vCPU may need.
+    if fiber_rt::in_task() {
+        return match fiber_rt::current_fiber_slot() {
+            Some(s) if s.is_platform() => task_join(dom, &s, &done, trap_out),
+            _ => {
+                store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                0
+            }
+        };
+    }
     // §5 kill-path: a joiner blocked on a sibling must also unwind when the host kills the domain
     // (else `join_all` hangs on a vCPU that will never finish). When armed, re-check the interrupt
     // cell periodically; on a kill, return so the caller's next epoch poll traps `OutOfFuel`.
@@ -1906,11 +2010,12 @@ pub(crate) unsafe extern "C" fn thread_join(
         // §12.8 concurrent-thaw stage 3: count this joiner as blocked while it parks, so a sibling waiter's
         // `peers_live` (and the deadlock detector) see a join↔wait mutual block as full quiescence.
         // Set under the cell's lock, so the child's [`Done::publish`] settles it before dropping `live`.
-        dom.parked.fetch_add(1, Ordering::AcqRel);
+        let parked = &dom.hub().parked;
+        parked.fetch_add(1, Ordering::AcqRel);
         done.joiner_parked.store(true, Ordering::Release);
         let _pg = CellParkGuard {
             flag: &done.joiner_parked,
-            parked: &dom.parked,
+            parked,
         };
         loop {
             if let Some((result, trap)) = *st {
@@ -1960,6 +2065,35 @@ pub(crate) unsafe extern "C" fn thread_join(
     result
 }
 
+/// #1469 — `thread.join` at a child task's root: park the task on the one event park until the
+/// joined vCPU publishes. The executor counts the park as blocked for the deadlock predicate, gives
+/// back the task's lanes while it is parked, and re-offers it at the joined vCPU's exit broadcast
+/// (`run_child` → [`Domain::wake_all_parked`]) or its cadence sweep, poisoning it at teardown.
+///
+/// # Safety
+/// Called on the task's own stack (`slot` is its platform slot); `trap_out` is its live trap cell.
+unsafe fn task_join(
+    dom: &Domain,
+    slot: &std::sync::Arc<fiber_rt::FiberSlot>,
+    done: &Done,
+    trap_out: u64,
+) -> i64 {
+    let epoch_addr = dom.env().epoch_addr;
+    loop {
+        if let Some((result, trap)) = *lock(&done.state) {
+            if trap != 0 {
+                store_trap(trap_out as *mut i64, trap);
+            }
+            return result;
+        }
+        // Killed, or the child's domain is over: return; the join's trailing guards unwind.
+        if epoch_fired(epoch_addr) || load_trap(trap_out as *mut i64) != 0 {
+            return 0;
+        }
+        fiber_rt::fiber_event_park(slot, false, None);
+    }
+}
+
 /// The low `width`-byte mask (`width` ∈ {1,2,4,8}).
 fn width_mask(width: u32) -> u64 {
     if width >= 8 {
@@ -2007,7 +2141,8 @@ pub(crate) unsafe extern "C" fn thread_wait(
     timeout: i64,
     trap_out: u64,
 ) -> i32 {
-    let dom = &*sched;
+    let dom = current_domain(sched);
+    let hub = dom.hub();
     let mask = width_mask(width);
     let deadline = if timeout < 0 {
         None
@@ -2049,19 +2184,19 @@ pub(crate) unsafe extern "C" fn thread_wait(
     // value re-check below still reads the real `phys` — queue on the canonical key, compare on the
     // address (mirrors the interpreter's split key/addr park).
     let status = futex_wait(
-        &dom.futex,
-        &dom.futex_cv,
+        &hub.futex,
+        &hub.futex_cv,
         futex_key_of(phys),
         || read_phys(phys, width) & mask == expected & mask,
         deadline,
         dom.env().epoch_addr,
         unwind_base,
-        &dom.parked,
+        &hub.parked,
         // §12.8 concurrent-thaw stage 3: a notifier must be a live vCPU that is **not** itself parked.
         // `live` counts the root + unfinished spawns (incl. this waiter); `parked` counts those blocked in
         // wait/join (incl. this waiter). `live > parked` ⇒ some live vCPU is still runnable and could
         // notify; `live == parked` ⇒ every live vCPU is blocked (a lone or **mutual** deadlock).
-        || lock(&dom.threads).live > dom.parked.load(Ordering::Acquire),
+        || lock(&hub.threads).live > hub.parked.load(Ordering::Acquire),
         // Owner decision 2026-07-24 (domain teardown): return on a non-zero trap cell — the
         // **caller's own** cell (`trap_out`), i.e. the one this waiter's trailing guard checks, so
         // the wake always unwinds the right thread (a §14 child parked on the shared futex has its
@@ -2117,7 +2252,7 @@ unsafe fn fiber_futex_wait(
     let key = futex_key_of(phys);
     let cell = wait_cell_new(false);
     {
-        let mut g = lock(&dom.futex);
+        let mut g = lock(&dom.hub().futex);
         if read_phys(phys, width) & mask != expected & mask {
             // Insta-wake (the park-vs-store race, closed): deliver `WAIT_NOT_EQUAL` without
             // queueing — but still park once below, so the resumer sees the one transient
@@ -2166,7 +2301,7 @@ unsafe fn fiber_futex_wait_loop(
         // propagation, the durable re-issue safepoint) unwind before the guest observes it.
         let frozen = unwind_base != 0 && fiber_rt::window_is_unwinding(unwind_base);
         if epoch_fired(dom.env().epoch_addr) || load_trap(trap_out as *mut i64) != 0 || frozen {
-            wait_deregister(&mut lock(&dom.futex), key, cell);
+            wait_deregister(&mut lock(&dom.hub().futex), key, cell);
             // A freeze ended this wait, not its event: the thaw re-issues it (#1769).
             return if frozen {
                 temen_ir::durable_abi::WAIT_FROZEN
@@ -2178,7 +2313,7 @@ unsafe fn fiber_futex_wait_loop(
             if Instant::now() >= dl {
                 // The deadline passed: fire the timeout at this poll. A notify that raced us
                 // and already consumed the cell wins with its own status.
-                if wait_deregister(&mut lock(&dom.futex), key, cell) {
+                if wait_deregister(&mut lock(&dom.hub().futex), key, cell) {
                     return WAIT_TIMED_OUT;
                 }
                 return cell.status.load(Ordering::Acquire);
@@ -2246,7 +2381,8 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
     status_out: *mut i64,
     trap_out: u64,
 ) -> i64 {
-    let dom = &*sched;
+    let dom = current_domain(sched);
+    let hub = dom.hub();
     // #1639 — set when the previous pass read the run as quiescent; a deadlock verdict needs the
     // reading to survive the re-poll at the top of this loop (see the test below).
     #[cfg(not(loom))]
@@ -2299,7 +2435,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // one park this vCPU is actually waiting on.
                 let self_resolving = fiber_rt::park_is_self_resolving(handle);
                 let cell = fiber_rt::park_cell(handle);
-                let g = lock(&dom.futex);
+                let g = lock(&hub.futex);
                 // A `notify` that claimed the fiber's wait since the poll above: re-poll at once
                 // rather than idle on a wake already delivered.
                 let claimed = cell
@@ -2314,11 +2450,11 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 let local = AtomicBool::new(false);
                 let flag = cell.as_deref().map_or(&local, |c| &c.parked);
                 let _pg = (!self_resolving && !claimed).then(|| {
-                    dom.parked.fetch_add(1, Ordering::AcqRel);
+                    hub.parked.fetch_add(1, Ordering::AcqRel);
                     flag.store(true, Ordering::Release);
                     CellParkGuard {
                         flag,
-                        parked: &dom.parked,
+                        parked: &hub.parked,
                     }
                 });
                 // #1639 — an indefinite fiber wait that no live vCPU can ever notify is
@@ -2344,7 +2480,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 // to change the answer — still reads quiescent and fails closed, 20 ms later.
                 let quiescent = !self_resolving
                     && !claimed
-                    && lock(&dom.threads).live <= dom.parked.load(Ordering::Acquire);
+                    && lock(&hub.threads).live <= hub.parked.load(Ordering::Acquire);
                 if quiescent && confirming {
                     drop(g);
                     store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
@@ -2352,7 +2488,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
                 }
                 confirming = quiescent;
                 if !claimed {
-                    let _ = dom.futex_cv.wait_timeout(g, KILL_RECHECK);
+                    let _ = hub.futex_cv.wait_timeout(g, KILL_RECHECK);
                 }
             }
             if !dom.lane_acquire(&lane, || {
@@ -2365,7 +2501,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         }
         #[cfg(loom)]
         {
-            let _ = &dom.futex; // touch the field so it isn't flagged unused under loom
+            let _ = &hub.futex; // touch the field so it isn't flagged unused under loom
             return value;
         }
     }
@@ -2377,7 +2513,7 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
 /// # Safety
 /// `sched` is the run's live `Domain`.
 pub(crate) unsafe extern "C" fn thread_notify(sched: *const Domain, phys: u64, count: i32) -> i32 {
-    let dom = &*sched;
+    let dom = current_domain(sched).hub();
     // The count is **unsigned** "wake up to N" (wasm's notify count is u32; `-1` = wake all);
     // `futex_notify` caps at the real waiter count, so reinterpret the i32 bits as u32.
     let woken = futex_notify(

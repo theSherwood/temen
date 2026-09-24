@@ -31,7 +31,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `Stream` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Exit` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Clock` | ✅ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
-| `PipeEnd` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
+| `PipeEnd` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | ⛔ | 🔶 |
@@ -48,7 +48,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 ## Notes
 
 **`PipeEnd`**
-- *durability* ⛔ — the live FIFO backing cannot be serialized (NonDurableKind::Pipe)
+- *durability* 🔶 — a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an end outside the cut, is the boundary, not yet carried
 
 **`SharedRegion`**
 - *durability* ⛔ — a snapshot cannot reproduce a live alias into shared backing (#14 exception)
