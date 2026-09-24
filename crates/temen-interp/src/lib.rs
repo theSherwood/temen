@@ -3626,7 +3626,10 @@ pub fn run_capture_reserved_with_host_prots(
     let (r, ..) = drive(&m.funcs, &m.types, func, args, fuel, &mut mem, host);
     let (snap, prots) = mem
         .as_ref()
-        .map(|mm| (mm.snapshot_window(SNAP_CAP), mm.snapshot_prots(SNAP_CAP)))
+        .map(|mm| {
+            let span = mm.capture_extent(SNAP_CAP) as usize;
+            (mm.snapshot_window(span), mm.snapshot_prots(span))
+        })
         .unwrap_or_default();
     (r, snap, prots)
 }
@@ -30518,6 +30521,24 @@ impl Mem {
             .min(self.back.len().saturating_sub(self.window.base()))
     }
 
+    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
+    fn high_water(&self, space: &AddrSpace) -> u64 {
+        let mut high = self.window.mapped();
+        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
+            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
+        }
+        high.min(self.window.reserved())
+    }
+
+    /// A durable capture's span: at least `snap_cap` (the escape-oracle span the JIT captures too),
+    /// and always through the high-water mark, so a page grown past `snap_cap` rides a freeze
+    /// (#1700). Only the freeze capture wants it — a run that reads just its low window must not
+    /// copy a grown heap (a compiler guest's is hundreds of MiB).
+    fn capture_extent(&self, snap_cap: usize) -> u64 {
+        let high = self.high_water(&self.space_read());
+        self.window.reserved().min(high.max(snap_cap as u64))
+    }
+
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
     /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
     /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)
@@ -30528,11 +30549,7 @@ impl Mem {
     /// children ride in the root capture.
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
-        let mut high = self.window.mapped();
-        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
-            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
-        }
-        high = high.min(self.window.reserved());
+        let high = self.high_water(&space);
         // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
         // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
         // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
