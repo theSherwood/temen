@@ -30311,6 +30311,23 @@ impl Mem {
             .min(self.back.len().saturating_sub(self.window.base()))
     }
 
+    /// The high-water mark: the mapped prefix, extended over any grown reserved-tail page in the map.
+    fn high_water(&self, space: &AddrSpace) -> u64 {
+        let mut high = self.window.mapped();
+        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
+            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
+        }
+        high.min(self.window.reserved())
+    }
+
+    /// What a [`snapshot_window`](Mem::snapshot_window) / [`snapshot_prots`](Mem::snapshot_prots)
+    /// capture spans: at least `snap_cap` (the escape-oracle span the JIT captures too), and always
+    /// through the high-water mark, so a page grown past `snap_cap` rides a freeze (#1700).
+    fn capture_extent(&self, snap_cap: usize) -> u64 {
+        let high = self.high_water(&self.space_read());
+        self.window.reserved().min(high.max(snap_cap as u64))
+    }
+
     /// Capture the window's full guest-visible memory state — the committed byte range plus the
     /// page-protection map — for a time-travel checkpoint of a page-mapping window, restored with
     /// [`restore_layout`](Mem::restore_layout). Precondition: [`layout_snapshot_safe`](Mem::layout_snapshot_safe)
@@ -30321,11 +30338,7 @@ impl Mem {
     /// children ride in the root capture.
     fn layout_snapshot(&self) -> MemLayout {
         let space = self.space.read_unpoisoned();
-        let mut high = self.window.mapped();
-        if let Some((&max_pg, _)) = space.prot.iter().next_back() {
-            high = high.max(max_pg.saturating_add(1).saturating_mul(self.page));
-        }
-        high = high.min(self.window.reserved());
+        let high = self.high_water(&space);
         // Bulk fast path (the mirror of [`snapshot`](Mem::snapshot)/[`seed`](Mem::seed)): with no §13
         // region mapped no page is `Backed`, so the whole extent reads straight out of `back` in one
         // pass — a `memcpy` (flat backing) or a single-lock page walk (`Paged`) instead of a dispatch
@@ -30430,10 +30443,7 @@ impl Mem {
     /// JIT's freshly-committed tail). Page-wise (one map lookup per committed page, not per byte) so
     /// widening past the backed prefix stays cheap.
     fn snapshot_window(&self, snap_cap: usize) -> Vec<u8> {
-        let snap = self
-            .window
-            .reserved()
-            .min(self.window.mapped().max(snap_cap as u64)) as usize;
+        let snap = self.capture_extent(snap_cap) as usize;
         let mut out = vec![0u8; snap];
         self.back.read_into(0, &mut out); // anonymous bytes (untouched / grown-tail read as zero)
                                           // §13 aliased pages live in their region backing, not in `back` — fill them from there.
@@ -30464,10 +30474,7 @@ impl Mem {
     /// `Rw` in the committed prefix and `Unmapped` in the reserved tail — the same default the
     /// access path and the JIT's page tables use.
     fn snapshot_prots(&self, snap_cap: usize) -> Vec<CapturedProt> {
-        let snap = self
-            .window
-            .reserved()
-            .min(self.window.mapped().max(snap_cap as u64));
+        let snap = self.capture_extent(snap_cap);
         let space = self.space_read();
         dense_prots(&space.prot, self.page, self.window.mapped(), snap)
     }

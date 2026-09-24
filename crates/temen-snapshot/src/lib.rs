@@ -395,6 +395,35 @@ pub enum RestoreError {
 /// reservation's uncommitted tail faults inside the window (the domain the masking lowering confines
 /// guest addresses to). An artifact may carry exactly what a live run can hold; bounding by the image
 /// instead refused every detached child, whose caps always span past it.
+/// The window geometry an artifact may carry — the one rule freeze and restore both apply, so a freeze
+/// never emits an artifact restore rejects (#1700). v18 (#1154): the committed extent `mapped` may
+/// exceed the declared window (a `vm_map` grow), so the three quantities are a nested chain,
+/// `1 << size_log2 <= mapped <= 1 << reserved_log2`, with `mapped` a nonzero page multiple. A flat
+/// window (`mapped == 1 << reserved_log2 == 1 << size_log2`) satisfies it exactly.
+///
+/// The chain is arithmetic in `u64`: `reserved_log2` and `size_log2` are guest address-space
+/// quantities, and a 4 GiB reservation (`reserved_log2 == 32`) is ordinary even on a 32-bit host
+/// (wasm32, the browser engine). Only `mapped` — the image itself — has to fit a `usize`.
+fn geometry_ok(module: &Module, mapped: u64, reserved_log2: u8) -> bool {
+    if reserved_log2 as u32 >= u64::BITS {
+        return false;
+    }
+    if mapped == 0 || !mapped.is_multiple_of(PAGE as u64) || mapped > 1u64 << reserved_log2 {
+        return false;
+    }
+    module
+        .memory
+        .is_none_or(|mem| (mem.size_log2 as u32) < u64::BITS && 1u64 << mem.size_log2 <= mapped)
+}
+
+/// The first handle whose binding falls outside a window of `size` bytes, as the restore gate reads
+/// it ([`binding_in_window`]).
+fn first_out_of_window(handles: &[DurableHandle], size: u64) -> Option<&DurableHandle> {
+    handles
+        .iter()
+        .find(|h| !binding_in_window(&h.binding, size))
+}
+
 fn binding_in_window(binding: &DurableBinding, mapped: u64) -> bool {
     let (base, size) = match *binding {
         // The whole-window `AddressSpace` form (`{0, u64::MAX}` — the retired `Memory` kind,
@@ -516,19 +545,9 @@ fn freeze_at(
             slot: p.slot,
         });
     }
-    // The committed extent is page-granular (a `vm_map` grows whole pages) and must fit the mask
-    // domain it grew within. Unlike v17 it need not be a power of two — a grown high-water rarely is.
-    //
-    // The reservation is a **guest** address-space quantity, so it is bounded by `u64`, not by the
-    // host's pointer width: a guest reserving the usual 4 GiB mask domain has `reserved_log2 == 32`,
-    // which a `usize::BITS` bound would reject on a 32-bit host (wasm32 — the browser engine) while
-    // accepting it on a 64-bit one. Only the *committed* extent has to fit the host's `usize`, and
-    // `window.len()` already is one.
-    if window.len() < PAGE
-        || !window.len().is_multiple_of(PAGE)
-        || reserved_log2 as u32 >= u64::BITS
-        || (window.len() as u64) > 1u64 << reserved_log2
-    {
+    // The committed extent is page-granular (a `vm_map` grows whole pages), covers the declared
+    // window, and fits the mask domain it grew within — restore's own rule ([`geometry_ok`]).
+    if !geometry_ok(module, window.len() as u64, reserved_log2) {
         return Err(FreezeError::WindowGeometry(window.len()));
     }
     let npages = window.len() / PAGE;
@@ -544,11 +563,23 @@ fn freeze_at(
     // Freeze-side twin of the restore boundary's `binding_in_window` gate: refuse to emit an
     // artifact restore would reject, so out-of-window authority fails at freeze with a clear
     // error instead of surfacing as a Malformed artifact later.
-    if let Some(h) = handles
-        .iter()
-        .find(|h| !binding_in_window(&h.binding, 1u64 << reserved_log2))
-    {
+    if let Some(h) = first_out_of_window(&handles, 1u64 << reserved_log2) {
         return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+    }
+    // ... and on each nested child's handles against the child's own window, as restore reads them
+    // (#1700). A child's host state rides only beside its nested record, so that names the window.
+    for c in host.frozen_child_state() {
+        let Some(n) = host
+            .frozen_nested()
+            .iter()
+            .find(|n| n.parent_task == c.parent_task && n.slot == c.slot)
+        else {
+            continue;
+        };
+        let size = 1u64.checked_shl(n.size_log2 as u32).unwrap_or(0);
+        if let Some(h) = first_out_of_window(&c.handles, size) {
+            return Err(FreezeError::BindingOutOfWindow { slot: h.slot });
+        }
     }
     // The freeze/thaw fiber residue (§12.4 / slice 3.1.5), canonical = ascending slot.
     let mut fibers = host.frozen_fibers().to_vec();
@@ -1077,34 +1108,11 @@ fn restore_at(
     if digest != digest256(&encode_module(module)) {
         return Err(RestoreError::ModuleMismatch);
     }
-    // v18 geometry (#1154): the committed extent `mapped` may exceed the declared window (a `vm_map`
-    // grow), so the three quantities the codec once locked together — declared `size_log2`, the mask
-    // domain `reserved_log2`, and the committed `mapped` — are now checked as a nested chain:
-    //   `1 << size_log2  <=  mapped  <=  1 << reserved_log2`,   `mapped` page-aligned.
-    // The reservation must cover at least the declared window (a smaller one is corrupt), and the
-    // committed extent sits between the declared window and the reservation. A flat v17-shaped window
-    // (`mapped == 1 << reserved_log2 == 1 << size_log2`) still satisfies it exactly.
-    //
-    // The chain is arithmetic in `u64` for the same reason the freeze side is: `reserved_log2` and
-    // `size_log2` are guest address-space quantities, and a 4 GiB reservation (`reserved_log2 == 32`)
-    // is ordinary. Only `mapped` — the image this host is about to allocate — must fit a `usize`, and
-    // it is read as one.
-    if page_size != PAGE || reserved_log2 as u32 >= u64::BITS {
+    // v18 geometry (#1154), the rule freeze applies too ([`geometry_ok`]).
+    if page_size != PAGE || !geometry_ok(module, mapped as u64, reserved_log2) {
         return Err(RestoreError::GeometryMismatch);
     }
     let reserved = 1u64 << reserved_log2;
-    if mapped == 0 || !mapped.is_multiple_of(PAGE) || mapped as u64 > reserved {
-        return Err(RestoreError::GeometryMismatch);
-    }
-    if let Some(mem) = &module.memory {
-        if (mem.size_log2 as u32) >= u64::BITS {
-            return Err(RestoreError::GeometryMismatch);
-        }
-        let declared = 1u64 << mem.size_log2;
-        if declared > mapped as u64 {
-            return Err(RestoreError::GeometryMismatch);
-        }
-    }
 
     // ---- Window image: zeroed window (default `Rw`); splat each stored page + its prot. ----
     let mut window = vec![0u8; mapped];
