@@ -41,7 +41,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
+    smod, entry, slog, fuel, vcpu, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -220,7 +220,7 @@ async function worker() {
     ? ex.temen_par_root(prog, win, winSize, func)
     : role === 'confined'
       ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
-      : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
+      : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { parentPort.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -256,6 +256,7 @@ async function worker() {
       const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       parentPort.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        vcpu: ex.temen_par_ev_d(v).toString(), // the child's dense vCPU id (seeds its `vcpu.tls`)
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });

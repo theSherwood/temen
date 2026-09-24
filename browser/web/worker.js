@@ -32,7 +32,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    smod, entry, slog, fuel, vcpu, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged, childMem } = e.data;
   // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
@@ -389,7 +389,7 @@ self.onmessage = async (e) => {
       ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
       : role === 'detached'
         ? ex.temen_par_child_detached(prog, registerForeign(childMem, fbase), slog, smod, entry, BigInt(fuel))
-        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
+        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -459,6 +459,7 @@ self.onmessage = async (e) => {
       const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        vcpu: ex.temen_par_ev_d(v).toString(), // the child's dense vCPU id (seeds its `vcpu.tls`)
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });

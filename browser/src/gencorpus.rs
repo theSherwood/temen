@@ -2307,6 +2307,12 @@ fn main() {
         "threads_onramp",
         include_str!("../tests/fixtures/threads_onramp.temt"),
     );
+    // #1761 a fiber migrating between Workers under one run-shared registry, reading `vcpu.tls` —
+    // ground truth (13) asserted in JS; the native twin is `tests/par_onramp.rs` over the fixture.
+    emit(
+        "threads_fibers",
+        include_str!("../tests/fixtures/threads_fibers.temt"),
+    );
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);
