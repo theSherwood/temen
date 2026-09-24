@@ -1,0 +1,275 @@
+nifmake builds with nimony (and still with classic Nim), so the self-hosted lane can run it on Temen.
+
+Why: nimony's build driver (`nimony c` / `check`) hands the dependency graph to nifmake, and the
+self-hosted lane (#1609) runs every phase as a Temen module compiled by nimony with no C. Upstream
+nifmake is a classic-Nim-only program: it uses stdlib conveniences nimony's stdlib does not have
+(`setLastModificationTime`, `tables.withValue`, `align`/`alignLeft`, `os.sleep`, multi-argument
+`writeLine`, `except ValueError`, a capturing `sort` comparator, a nil `ptr`, raising table and OS
+calls outside `try`). It also fixes a latent bug:
+`countProcessors()` is 0 when the count cannot be detected, and `-j` then scheduled nothing and
+reported the unbuilt graph as a success. Not fixed upstream as of nim-lang/nimony master b2c2df77 (2026-09-23).
+
+What: every change is either `when defined(nimony)` or shared code valid under both compilers,
+using upstream's own dual-compile idioms (`lib/compat2.nim`'s `onRaiseQuit` / `getOrQuit`).
+Behaviour is unchanged: the patched file builds with classic Nim 2.2.10 and with nimony, and
+either binary drives `nimony c` to the same result.
+
+Applied to a COPY of the pinned sources at build time (`scripts/ci/nim-selfhost-lane.sh`); the
+vendored `nimony/` submodule is never modified. Against the submodule pin (v0.6.2, 851fe262).
+Drop it when upstream nifmake builds with nimony.
+--- a/src/nifmake/nifmake.nim
++++ b/src/nifmake/nifmake.nim
+@@ -11,6 +11,25 @@
+ import std/[assertions, os, strutils, sequtils, tables, hashes, times, monotimes, sets, parseopt, syncio, osproc, algorithm, terminal]
+ import ".." / lib / [bitabs, lineinfos, nifreader, tooldirs, argsfinder, vfs, nifpools, nimversion]
+ 
++include ".." / lib / compat2
++
++when defined(nimony):
++  # Built by nimony too (Temen's self-hosted toolchain, #1609), whose stdlib lacks a few of
++  # classic Nim's conveniences. Each shim is exactly what the call site needs.
++  import std/cpuinfo
++  import std/posix/posix
++
++  proc sleep(ms: int) =
++    var req = Timespec(tv_sec: posix.Time(ms div 1000), tv_nsec: (ms mod 1000) * 1_000_000)
++    var rem = Timespec()
++    discard nanosleep(req, rem)
++
++  proc align(s: string; width: int): string =
++    result = repeat(' ', max(0, width - s.len)) & s
++
++  proc alignLeft(s: string; width: int): string =
++    result = s & repeat(' ', max(0, width - s.len))
++
+ # Inspired by https://gittup.org/tup/build_system_rules_and_algorithms.pdf
+ #[
+ build_partial_DAG(DAG, change_list)
+@@ -209,7 +228,7 @@
+     let name = dag.commands[node.cmdIdx].name
+     if name notin byCommand: byCommand[name] = @[]
+     for output in node.outputs:
+-      byCommand[name].add output
++      byCommand.getOrQuit(name).add output
+   for nodeId in 0 ..< dag.nodes.len:
+     if dag.nodes[nodeId].inputsOf.len == 0: continue
+     var seen = initHashSet[string]()
+@@ -217,7 +236,7 @@
+     for cmdName in dag.nodes[nodeId].inputsOf:
+       if cmdName notin byCommand:
+         quit "`inputsof` names a command with no nodes: " & cmdName
+-      for output in byCommand[cmdName]:
++      for output in byCommand.getOrQuit(cmdName):
+         if not seen.containsOrIncl(output):
+           dag.nodes[nodeId].inputs.add output
+ 
+@@ -227,7 +246,7 @@
+ 
+   for input in node.inputs:
+     if input in dag.nameToId:
+-      let depId = dag.nameToId[input]
++      let depId = dag.nameToId.getOrQuit(input)
+       if depId != nodeId and depId notin node.deps:
+         node.deps.add(depId)
+ 
+@@ -237,14 +256,19 @@
+   ## deleting the outputs first: a const-eval or plugin sub-compile shares the
+   ## nimcache and may be reading them right now (writes are atomic renames,
+   ## so replacing a file under a reader is fine; removing it is not).
+-  let now = getTime()
++  when not defined(nimony):
++    let now = getTime()
+   for output in node.outputs:
+     if vfsExists(output):
+       try:
+-        setLastModificationTime(output, now)
++        when defined(nimony):
++          # No `setLastModificationTime`: rewriting the bytes is an atomic rename, a fresh mtime.
++          vfsWrite(output, vfsRead(output))
++        else:
++          setLastModificationTime(output, now)
+       except:
+         if Verbose in opt:
+-          stderr.writeLine "Warning: Could not touch artifact: ", output
++          stderr.writeLine "Warning: Could not touch artifact: " & output
+ 
+ type
+   StatEntry = tuple[exists: bool, mtime: int64]
+@@ -258,8 +282,8 @@
+     entries: Table[string, StatEntry]
+ 
+ proc stat(sc: var StatCache; path: string): StatEntry =
+-  sc.entries.withValue(path, e):
+-    return e[]
++  if sc.entries.hasKey(path):
++    return sc.entries.getOrQuit(path)
+   let exists = vfsExists(path)
+   result = (exists, if exists: vfsMtime(path) else: low(int64))
+   sc.entries[path] = result
+@@ -333,8 +357,12 @@
+       if not visit(dag.nodes, i, result, dag.maxDepth):
+         quit "Circular dependency detected in build graph"
+ 
+-  let nodes = addr dag.nodes
+-  result.sort proc(a, b: int): int = cmp(nodes[a].depth, nodes[b].depth)
++  # Sorted as `(depth, id)` pairs by depth alone — the same stable order as comparing the nodes'
++  # depths in place, but with a comparator that captures nothing (nimony's `sort` takes no closure).
++  var keyed = newSeq[(int, int)](result.len)
++  for i, id in result: keyed[i] = (dag.nodes[id].depth, id)
++  keyed.sort proc(a, b: (int, int)): int = cmp(a[0], b[0])
++  for i, k in keyed: result[i] = k[1]
+ 
+ proc executeCommand(command: string): int =
+   ## Execute a shell command and return its exit code, -1 if it could not be
+@@ -363,7 +391,7 @@
+ proc recordCmdTime(profile: var ProfileData; cmdName: string; sec: float) =
+   if cmdName notin profile.cmdTime:
+     profile.cmdTime[cmdName] = (0.0, 0)
+-  var e = profile.cmdTime[cmdName]
++  var e = profile.cmdTime.getOrQuit(cmdName)
+   e.sec += sec
+   e.count += 1
+   profile.cmdTime[cmdName] = e
+@@ -485,7 +513,7 @@
+   ## is ~2.5ms).
+   while true:
+     for idx in 0 ..< pool.len:
+-      if not osproc.running(pool[idx].process):
++      if not onRaiseQuit(osproc.running(pool[idx].process)):
+         return idx
+     sleep 1
+ 
+@@ -523,7 +551,9 @@
+     # not import. Staleness is still evaluated at dispatch time, after the
+     # dependencies have actually been written, so `OnlyIfChanged` outputs keep
+     # pruning their dependents exactly as before.
+-    let jobs = if gMaxJobs > 0: gMaxJobs else: countProcessors()
++    # `countProcessors` is 0 when the count cannot be detected; zero slots would dispatch nothing
++    # and report the unbuilt DAG as a success.
++    let jobs = if gMaxJobs > 0: gMaxJobs else: max(1, countProcessors())
+     var sched = initScheduler(dag, sortedNodes)
+     var pool: seq[RunningJob] = @[]
+     var aborted = false
+@@ -542,8 +572,8 @@
+           if Verbose in opt:
+             echo "Command: ", expandedCmd
+           pool.add RunningJob(
+-            process: startProcess(expandedCmd,
+-                                  options = {poStdErrToStdOut, poParentStreams, poEvalCommand}),
++            process: onRaiseQuit(startProcess(expandedCmd,
++                                  options = {poStdErrToStdOut, poParentStreams, poEvalCommand})),
+             nodeId: nodeId,
+             command: expandedCmd,
+             cmdName: dag.commands[node.cmdIdx].name,
+@@ -562,8 +592,8 @@
+       let k = waitForAnyJob(pool)
+       let job = pool[k]
+       pool.del k
+-      let exitCode = try: peekExitCode(job.process) except CatchableError: -1
+-      close job.process
++      let exitCode = try: peekExitCode(job.process) except: -1
++      onRaiseQuit(close job.process)
+       if profile != nil:
+         profile[].recordCmdTime(job.cmdName, toSeconds(getMonoTime() - job.start))
+       inc prog.done
+@@ -668,7 +698,7 @@
+       content.add " " & mescape(output)
+   content.add "\n"
+ 
+-  writeFile(filename, content)
++  onRaiseQuit(writeFile(filename, content))
+ 
+ proc parseCommandDefinition(n: var Cursor; dag: var Dag) =
+   if n.kind == SymbolDef:
+@@ -867,10 +897,13 @@
+   stdout.write $total
+   stdout.write "\n"
+ 
++proc secs(x: float): string = x.formatFloat(ffDecimal, 3)
++
+ proc printProfile(profile: ProfileData) =
++  # One string per `writeLine`: nimony's takes a single argument.
+   stderr.writeLine "\n--- nifmake profile ---"
+-  stderr.writeLine "  parse .nif:     ", profile.parseTime.formatFloat(ffDecimal, 3), "s"
+-  stderr.writeLine "  DAG setup:      ", profile.dagSetupTime.formatFloat(ffDecimal, 3), "s"
++  stderr.writeLine "  parse .nif:     " & secs(profile.parseTime) & "s"
++  stderr.writeLine "  DAG setup:      " & secs(profile.dagSetupTime) & "s"
+   stderr.writeLine "  executed commands:"
+   var entries = newSeq[(string, float, int)](profile.cmdTime.len)
+   var i = 0
+@@ -878,11 +911,13 @@
+     entries[i] = (cmd, data.sec, data.count)
+     inc i
+   entries.sort(proc(a, b: (string, float, int)): int = cmp(b[1], a[1]))
++  var execTotal = 0.0
+   for (cmd, sec, count) in entries:
+-    stderr.writeLine "    ", cmd.alignLeft(12), " ", sec.formatFloat(ffDecimal, 3).align(8), "s  (", count, " invocations)"
+-  let execTotal = profile.cmdTime.values.toSeq.foldl(a + b.sec, 0.0)
+-  stderr.writeLine "  exec total:     ", execTotal.formatFloat(ffDecimal, 3), "s"
+-  stderr.writeLine "  wall time:      ", profile.execWallTime.formatFloat(ffDecimal, 3), "s"
++    stderr.writeLine "    " & cmd.alignLeft(12) & " " & secs(sec).align(8) & "s  (" & $count &
++      " invocations)"
++    execTotal += sec
++  stderr.writeLine "  exec total:     " & secs(execTotal) & "s"
++  stderr.writeLine "  wall time:      " & secs(profile.execWallTime) & "s"
+   stderr.writeLine "---"
+ 
+ proc main() =
+@@ -895,7 +930,8 @@
+     progressLo = 0
+     progressHi = 100
+ 
+-  var p = initOptParser(allowWhitespaceAfterColon = false)
++  var p = when defined(nimony): initOptParser()
++          else: initOptParser(allowWhitespaceAfterColon = false)
+   for kind, key, val in p.getopt():
+     case kind
+     of cmdArgument:
+@@ -923,7 +959,7 @@
+         if val.len > 0:
+           try:
+             gMaxJobs = parseInt(val)
+-          except ValueError:
++          except:
+             quit "invalid value for --parallel: " & val
+           if gMaxJobs < 1: quit "--parallel value must be >= 1"
+       of "makefile": outputMakefile = val
+@@ -943,7 +979,7 @@
+             try:
+               progressLo = parseInt(parts[0])
+               progressHi = parseInt(parts[1])
+-            except ValueError:
++            except:
+               quit "invalid --progress range: " & val
+           else:
+             quit "invalid --progress range: " & val
+@@ -960,19 +996,16 @@
+     if inputFile == "":
+       quit "Input file required for 'run' command"
+ 
+-    if Profile in opt or Report in opt:
+-      var profile = ProfileData(cmdTime: initTable[string, tuple[sec: float, count: int]]())
+-      let parseStart = getMonoTime()
+-      var dag = parseNifFile(inputFile, baseDir)
+-      profile.parseTime = toSeconds(getMonoTime() - parseStart)
+-      let ok = runDag(dag, opt, addr profile, progressLo, progressHi)
+-      if Profile in opt: printProfile(profile)
+-      if Report in opt: printReport(profile)
+-      if not ok: quit 1
+-    else:
+-      var dag = parseNifFile(inputFile, baseDir)
+-      if not runDag(dag, opt, nil, progressLo, progressHi):
+-        quit 1
++    # Always a profile, printed only when asked for: no nil `ptr`, which nimony (whose pointers
++    # are not-nil by default) would need spelled differently than classic Nim.
++    var profile = ProfileData(cmdTime: initTable[string, tuple[sec: float, count: int]]())
++    let parseStart = getMonoTime()
++    var dag = parseNifFile(inputFile, baseDir)
++    profile.parseTime = toSeconds(getMonoTime() - parseStart)
++    let ok = runDag(dag, opt, addr profile, progressLo, progressHi)
++    if Profile in opt: printProfile(profile)
++    if Report in opt: printReport(profile)
++    if not ok: quit 1
+ 
+   of cmdMakefile:
+     if inputFile == "":

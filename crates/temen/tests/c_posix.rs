@@ -1453,7 +1453,7 @@ int main(void) {
 /// it; the parent `SIGTSTP`s the child (as a terminal `^Z` does to the foreground job) and
 /// `waitpid(WUNTRACED)` reports the **stop** (`(20 << 8) | 0x7f`, `WIFSTOPPED`) — once. A signal sent
 /// **while the child is stopped** is HELD, proven by a long busy-wait: a still-running child would
-/// consume its token and exit, but `waitpid(WNOHANG)` keeps returning `-ECHILD` (alive, not exited).
+/// consume its token and exit, but `waitpid(WNOHANG)` keeps returning `0` (alive, not exited).
 /// `SIGCONT` resumes it, the held 10 delivers (`sigcheck → 7`), the child exits `7`, and the parent
 /// reaps `WEXITSTATUS == 7`. This is the `ctrl_z_stops_a_forked_child_and_fg_resumes_it` oracle
 /// (`c_fork.rs`, VM-cap band) carried onto the `__px_*` personality band and **differentialled across
@@ -1493,7 +1493,7 @@ int main(void) {
   if (((status >> 8) & 0xff) != 20) return 5;       /* the stop signal = SIGTSTP(20) */
   if (__px_kill(0, pid, 10) != 0) return 6;         /* the 10 lands while stopped: HELD */
   for (i = 0; i < 200000; i = i + 1) sink = i;      /* every chance to run, were it runnable */
-  if (__px_waitpid(0, pid, (long)&status, 1) != -10) return 7;  /* WNOHANG: still alive (-ECHILD), truly stopped */
+  if (__px_waitpid(0, pid, (long)&status, 1) != 0) return 7;  /* WNOHANG: alive, nothing to report — truly stopped */
   if (__px_kill(0, pid, 18) != 0) return 8;         /* SIGCONT: resume, the held 10 delivers */
   h = __px_waitpid(0, pid, (long)&status, 0);       /* reap the resumed child's real exit */
   if (h != pid) return 9;
@@ -3219,6 +3219,220 @@ int main(void) {
     assert!(
         temen_interp::last_capture_backtrace().is_empty(),
         "the parent finished cleanly, so the run has no trap origin — the child's is its own"
+    );
+}
+
+/// `waitpid(pid, …, WNOHANG)` over a child that has not exited yet is **0**, as POSIX specifies,
+/// not `-ECHILD`. `-ECHILD` means "no such child", and a poller believes it: nimony's
+/// `osproc.running` raises on it, so nifmake's job loop (which polls with `WNOHANG` between jobs)
+/// died on its first dispatched child. nifmake's shape: the child `execve`s a command, still running
+/// when the parent polls; the parent then signals it and the blocking wait reaps its status.
+#[test]
+fn c_waitpid_wnohang_on_a_running_child_is_zero() {
+    // The command cannot exit until the parent signals it, so it is alive at the poll however the
+    // scheduler interleaves the two. It announces its handler by creating `/ready`, and the parent
+    // waits for that before signalling: `execve` resets a caught signal to its default, and the
+    // default for 10 terminates.
+    const CMD: &str = r#"
+long __px_signal(int cap, long signum, long handler);
+long __px_sigcheck(int cap, long a);
+long __px_open(int cap, long path, long len, long flags);
+int main(void) {
+  __px_signal(0, 10, 7);
+  if (__px_open(0, (long)"/ready", 6, 66) < 0) return 3;   /* O_CREAT|O_RDWR */
+  while (__px_sigcheck(0, 0) != 7);
+  return 7;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __px_stat(int cap, long path, long len, long buf);\n\
+static char *av[] = {{ \"rc\", 0 }};\n\
+static long st[2];\n\
+static int status;\n\
+static long pid; static long polled;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/rc\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  while (__px_stat(0, (long)\"/ready\", 6, (long)st) != 0);\n\
+  polled = __px_waitpid(0, pid, (long)&status, 1 /* WNOHANG */);\n\
+  if (polled != 0) return 100 + (int)polled;   /* -ECHILD (-10) came back as 90 */\n\
+  if (__px_kill(0, pid, 10) != 0) return 3;\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;\n\
+  return 40 + ((status >> 8) & 0xff);\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/rc", CMD);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(47)],
+        "WNOHANG polled 0 over the live exec'd child, then it was signalled and reaped (exit 7)"
+    );
+}
+
+/// A **fork of an exec'd image** sees the image's own memory. Nothing else covered a fork of an exec'd
+/// image, which is nifmake's whole life under nimony's driver (the driver execs it; it forks per
+/// job). The failure that sent us here turned out to be the dropped module grant
+/// ([`c_an_execd_image_can_exec_the_first_registered_command`]), not memory — this pins the memory
+/// half. The root execs `/bin/mid`; `mid` writes one value to its heap and keeps one in a static,
+/// forks, and its child exits with their sum.
+#[test]
+fn c_a_fork_of_an_execd_image_sees_its_memory() {
+    const MID: &str = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_malloc(int cap, long size);
+static int status;
+static int s = 11;
+int main(void) {
+  char *p = (char *)__px_malloc(0, 64);
+  p[0] = 33;
+  long pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) return p[0] + s;          /* 44: the heap byte and the static, both seen */
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;
+  return (status >> 8) & 0xff;
+}
+"#;
+    let src = format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"mid\", 0 }};\n\
+static int status;\n\
+static long pid;\n\
+int main(void) {{\n\
+  pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/mid\", av, 0);\n\
+    return 99;\n\
+  }}\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;\n\
+  return (status >> 8) & 0xff;\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/mid", MID);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(44)],
+        "the exec'd image's fork child read the heap byte (33) and the static (11)"
+    );
+}
+
+/// An exec'd image can exec the **first** command its embedder registered. The fresh powerbox an
+/// exec builds mints its own starter caps first, into the lowest slots — and the first module an
+/// embedder grants sits there too. `exec_carry` used to let the fresh cap keep the slot and drop the
+/// module grant, so the personality's registry named a handle the new image did not hold: an exec'd
+/// image (and any fork of one) could never run `/bin/sh`, the command every embedder registers first.
+/// nimony's nifmake, exec'd by the driver, spawns each job through exactly that. Here `/bin/rc` is
+/// registered first; the root execs `/bin/mid`, whose fork child execs `/bin/rc`.
+#[test]
+fn c_an_execd_image_can_exec_the_first_registered_command() {
+    const RC: &str = r#"
+int main(void) { return 7; }
+"#;
+    let mid = format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"rc\", 0 }};\n\
+static int status;\n\
+int main(void) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/rc\", av, 0);\n\
+    return 99;                        /* the exec was refused */\n\
+  }}\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;\n\
+  return (status >> 8) & 0xff;\n\
+}}\n"
+    );
+    let src = format!(
+        "{WIN_PAD_17}{EXEC_C}\n\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+static char *av[] = {{ \"mid\", 0 }};\n\
+static int status;\n\
+int main(void) {{\n\
+  long pid = __px_fork(0, 0);\n\
+  if (pid < 0) return 1;\n\
+  if (pid == 0) {{\n\
+    execve(\"/bin/mid\", av, 0);\n\
+    return 98;\n\
+  }}\n\
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;\n\
+  return 40 + ((status >> 8) & 0xff);\n\
+}}\n"
+    );
+    let e = run_interp_setup(&src, |host, posix| {
+        stage_executable(host, posix, "/bin/rc", RC); // first: the lowest module slot
+        stage_executable(host, posix, "/bin/mid", &mid);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(47)],
+        "root -> /bin/mid -> fork -> /bin/rc: rc's 7 came back up (99 = mid's exec refused)"
+    );
+}
+
+/// An exec'd image gets its **own function table**. The table was the caller's, sized for the
+/// caller's functions, so an image with more of them trapped (`IndirectCallType`) on its first
+/// indirect call past that size — a small program exec'ing a big one (nimony's driver exec'ing
+/// nifmake, from a probe smaller than nifmake). Here the exec'd image has 300 functions and calls
+/// the last through a function-pointer table; the root has far fewer.
+#[test]
+fn c_an_execd_image_calls_through_its_own_function_table() {
+    let mut big = String::new();
+    for i in 0..300 {
+        big.push_str(&format!(
+            "static int f{i}(void) {{ return {}; }}\n",
+            i % 100
+        ));
+    }
+    big.push_str("static int (*tab[])(void) = {");
+    for i in 0..300 {
+        big.push_str(&format!("f{i},"));
+    }
+    big.push_str("};\nint main(void) { return tab[299](); }\n"); // 99
+                                                                 // The root stays tiny — the personality's `execve` directly, not `exec.c` — so its table is far
+                                                                 // smaller than the image it becomes.
+    const SRC: &str = r#"
+long __px_fork(int cap, long a);
+long __px_waitpid(int cap, long pid, long status, long opts);
+long __px_execve(int cap, long path, long argv, long envp);
+static char *av[] = { "big", 0 };
+static int status;
+int main(void) {
+  long pid = __px_fork(0, 0);
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    __px_execve(0, (long)"/bin/big", (long)av, 0);
+    return 98;
+  }
+  if (__px_waitpid(0, pid, (long)&status, 0) != pid) return 2;
+  return (status >> 8) & 0xff;
+}
+"#;
+    let e = run_interp_setup(SRC, |host, posix| {
+        stage_executable(host, posix, "/bin/big", &big);
+    });
+    assert_eq!(
+        e.result,
+        vec![Value::I32(99)],
+        "the exec'd image reached its 300th function through a pointer (128 = it trapped)"
     );
 }
 

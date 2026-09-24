@@ -81,8 +81,17 @@ fn bc_run(
 }
 
 fn check(src: &str) {
+    check_with(src, transform_module)
+}
+
+/// [`check`], instrumented by `transform` — the confined transform for a module that touches guest
+/// memory (the strict one refuses every guest memory op).
+fn check_with(
+    src: &str,
+    transform: fn(&temen_ir::Module) -> Result<temen_ir::Module, temen_durable::TransformError>,
+) {
     let m = parse_module(src).expect("parse");
-    let inst = transform_module(&m).expect("module must be in transform scope");
+    let inst = transform(&m).expect("module must be in transform scope");
     verify_module(&inst).expect("instrumented IR verifies");
 
     // (1) NORMAL: the bytecode durable run agrees with the tree-walker (the baseline result).
@@ -366,4 +375,163 @@ fn a_consumed_park_redelivers_after_thaw_on_the_bytecode_engine() {
         r_tw, want,
         "tree-walker thaw of the bytecode snapshot delivers too"
     );
+}
+
+/// #1694 — a fiber **event-parked** on `memory.wait` when the freeze lands (unwoken: the value is still
+/// 0) is flattened like a suspend-parked one, and matches the tree-walker byte for byte. The root
+/// resumes the fiber (it parks in the wait), then — after the freeze point, on an uninterrupted run —
+/// stores 1, notifies, and resumes it again; the fiber returns 100. On thaw the fiber's `MemoryWait`
+/// arm re-issues the wait, which re-checks the restored value. Before, the bytecode freeze driver
+/// skipped the fiber: no residue, an incomplete artifact.
+const WAIT_PARKED_SRC: &str = "memory 17 shadow 16448 65536\n\
+    func () -> (i64) {\n\
+    block 0 () {\n\
+    \x20 v0 = ref.func 1\n\
+    \x20 v1 = i64.const 4096\n\
+    \x20 v2 = cont.new v0 v1\n\
+    \x20 v3 = i64.const 0\n\
+    \x20 v4, v5 = cont.resume v2 v3\n\
+    \x20 v6 = i64.const 70000\n\
+    \x20 v7 = i32.const 1\n\
+    \x20 i32.atomic.store v6 v7\n\
+    \x20 v8 = atomic.notify v6 v7\n\
+    \x20 v9, v10 = cont.resume v2 v3\n\
+    \x20 return v10\n\
+      }\n\
+    }\n\
+    func (i64, i64) -> (i64) {\n\
+    block 0 (v0: i64, v1: i64) {\n\
+    \x20 v2 = i64.const 70000\n\
+    \x20 v3 = i32.const 0\n\
+    \x20 v4 = i64.const -1\n\
+    \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+    \x20 v6 = i64.const 100\n\
+    \x20 return v6\n\
+      }\n\
+    }\n";
+
+#[test]
+fn a_wait_parked_fiber_freezes_and_thaws_on_the_bytecode_engine() {
+    check_with(
+        WAIT_PARKED_SRC,
+        temen_durable::transform_module_assume_confined,
+    );
+}
+
+/// Run `inst` on the tree-walker and the bytecode engine with a host proc (handle arg 0) that flips
+/// the state word to `UNWINDING` when called, so the freeze lands at that call. Both engines run
+/// uninterrupted to `want`; the two freezes must agree (residue, window bytes), and the snapshot
+/// thaws to `want` on both engines.
+fn freeze_at_host_call(inst: &temen_ir::Module, want: Result<Vec<Value>, Trap>) {
+    let run = |bytecode_engine: bool, win: &[u8], freeze: bool, frozen: Vec<FrozenFiber>| {
+        let mut h = durable_host(frozen);
+        let hf = h.grant_host_proc(Box::new(move |_op, _args, mem, _| {
+            if freeze {
+                if let Some(m) = mem {
+                    m.write_bytes(temen_durable::STATE_OFF, &STATE_UNWINDING.to_le_bytes())
+                        .expect("the state word is in the window");
+                }
+            }
+            Ok(vec![0])
+        }));
+        let mut fuel = 1_000_000u64;
+        let (r, w) = if bytecode_engine {
+            bytecode::compile_and_run_capture_reserved_with_host(
+                inst,
+                0,
+                &[Value::I32(hf)],
+                &mut fuel,
+                win,
+                SIZE_LOG2,
+                &mut h,
+            )
+            .expect("bytecode drives the module")
+        } else {
+            run_capture_reserved_with_host(
+                inst,
+                0,
+                &[Value::I32(hf)],
+                &mut fuel,
+                win,
+                SIZE_LOG2,
+                &mut h,
+            )
+        };
+        (r, w, h)
+    };
+    for engine in [false, true] {
+        let (base, _, _) = run(engine, &window_with(STATE_NORMAL), false, vec![]);
+        assert_eq!(base, want, "uninterrupted (bytecode: {engine})");
+    }
+    let (rt, snap_tw, ht) = run(false, &window_with(STATE_NORMAL), true, vec![]);
+    let (rb, snap_bc, hb) = run(true, &window_with(STATE_NORMAL), true, vec![]);
+    assert!(
+        rt.is_ok() && rb.is_ok(),
+        "freeze placeholders: {rt:?} {rb:?}"
+    );
+    assert!(
+        !hb.frozen_fibers().is_empty(),
+        "the parked fiber was flattened"
+    );
+    assert_eq!(
+        hb.frozen_fibers(),
+        ht.frozen_fibers(),
+        "residue: bytecode != tree-walker"
+    );
+    assert_eq!(snap_bc, snap_tw, "freeze snapshot: bytecode != tree-walker");
+    let mut thaw = snap_bc;
+    begin_thaw(&mut thaw, TEST_ARENA, 0);
+    let frozen = hb.frozen_fibers().to_vec();
+    for engine in [false, true] {
+        let (r, _, _) = run(engine, &thaw, false, frozen.clone());
+        assert_eq!(r, want, "thaw ≡ uninterrupted (bytecode: {engine})");
+    }
+}
+
+/// #1694 — a fiber whose `memory.wait` was already **woken** (the root stored and notified) when the
+/// freeze lands at the root's host call: flattened with its delivered status, byte-identical to the
+/// tree-walker. The root collects the fiber in a resume loop (the cooperative-poll contract: a thawed
+/// park may re-park transiently, since the thaw re-issues the wait and re-checks the value), and
+/// each engine's thaw reaches the fiber's 100.
+#[test]
+fn a_woken_wait_parked_fiber_freezes_and_thaws_on_the_bytecode_engine() {
+    const SRC: &str = "memory 17 shadow 16448 65536\n\
+        func (i32) -> (i64) {\n\
+        block 0 (v0: i32) {\n\
+        \x20 v1 = ref.func 1\n\
+        \x20 v2 = i64.const 4096\n\
+        \x20 v3 = cont.new v1 v2\n\
+        \x20 v4 = i64.const 0\n\
+        \x20 v5, v6 = cont.resume v3 v4\n\
+        \x20 v7 = i64.const 70000\n\
+        \x20 v8 = i32.const 1\n\
+        \x20 i32.atomic.store v7 v8\n\
+        \x20 v9 = atomic.notify v7 v8\n\
+        \x20 v10 = call.cap 13 0 () -> (i64) v0 ()\n\
+        \x20 br 1(v3, v4)\n\
+          }\n\
+        block 1 (v11: i64, v12: i64) {\n\
+        \x20 v13, v14 = cont.resume v11 v12\n\
+        \x20 v15 = i32.const 3\n\
+        \x20 v16 = i32.eq v13 v15\n\
+        \x20 br_if v16 1(v11, v12) 2(v14)\n\
+          }\n\
+        block 2 (v17: i64) {\n\
+        \x20 return v17\n\
+          }\n\
+        }\n\
+        func (i64, i64) -> (i64) {\n\
+        block 0 (v0: i64, v1: i64) {\n\
+        \x20 v2 = i64.const 70000\n\
+        \x20 v3 = i32.const 0\n\
+        \x20 v4 = i64.const -1\n\
+        \x20 v5 = i32.atomic.wait v2 v3 v4\n\
+        \x20 v6 = i64.const 100\n\
+        \x20 return v6\n\
+          }\n\
+        }\n";
+    let m = parse_module(SRC).expect("parse");
+    let inst = temen_durable::transform_module_assume_confined(&m).expect("transform");
+    verify_module(&inst).expect("verify");
+    freeze_at_host_call(&inst, Ok(vec![Value::I64(100)]));
 }
