@@ -1577,6 +1577,35 @@ block 0 (v0: i64) {
 }
 "#;
 
+// ---- DESIGN.md §12 / I37: a spawned thread's trap ends the run ---------------------------------
+// The child divides by zero while the root polls a flag it never sets with 1 ms timed waits (a
+// runtime's idle worker loop). The run must end with the child's trap — it used to hang, the trap
+// reaching only a `thread.join` the root never makes. Ground truth asserted in the JS host.
+const THREADS_CHILD_TRAP: &str = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  vz = i64.const 0
+  vt = thread.spawn 1 vz vz
+  br 1()
+}
+block 1 () {
+  va = i64.const 16384
+  vz = i32.const 0
+  vw = i64.const 1000000
+  vr = i32.atomic.wait va vz vw
+  br 1()
+}
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 1
+  v1 = i64.const 0
+  v2 = i64.div_s v0 v1
+  return v2
+  }
+}
+"#;
+
 // ---- 4d: host I/O across Workers (the shared powerbox) ------------------------------------------
 // The proven schedule-independent 4c-host kernel: root (param = stdout handle) spawns 8 workers, each
 // `call.cap`-writes the SAME 5-byte line and bumps a shared counter — so result (8) AND stdout
@@ -2307,6 +2336,14 @@ fn main() {
         "threads_onramp",
         include_str!("../tests/fixtures/threads_onramp.temt"),
     );
+    // #1761 a fiber migrating between Workers under one run-shared registry, reading `vcpu.tls` —
+    // ground truth (13) asserted in JS; the native twin is `tests/par_onramp.rs` over the fixture.
+    emit(
+        "threads_fibers",
+        include_str!("../tests/fixtures/threads_fibers.temt"),
+    );
+    // A spawned thread's trap ends the run (DESIGN.md §12 / I37) — asserted in JS.
+    emit("threads_child_trap", THREADS_CHILD_TRAP);
     // wasm-JIT **tier-up** across Workers (BROWSER.md § "wasm-JIT tier", per-Worker JIT) — the 4000
     // kernel whose worker compute leaf tiers up onto emitted wasm. Ground truth (4000) asserted in JS.
     emit("threads_tierup", THREADS_TIERUP);

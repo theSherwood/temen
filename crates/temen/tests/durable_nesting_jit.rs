@@ -261,7 +261,9 @@ fn jit_durable_depth2_grandchild_matches_interp() {
 /// **frozen** — born `UNWINDING` it spills at that first poll (loop not yet entered), the live child a
 /// freeze must capture — *and* (b) **thaws + runs uninterrupted cleanly** to 4950 (the dead branch is
 /// never reached, so no `CapFault`). A *pure-compute* loop like `PARENT_SELF_LOOP`'s child has no poll
-/// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model").
+/// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model"). Its entry
+/// is the child-entry shape `(i64) -> (i64)`: an `(i32)` entry is one the oracle's op 0 refuses, and
+/// it only ran here because the JIT's op 0 skipped the shape check (#1720 closed that).
 const FREEZE_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -274,8 +276,9 @@ block 0 (v0: i32) {
   return v6
   }
 }
-func (i32) -> (i64) {
-block 0 (v0: i32) {
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  v0 = i32.wrap_i64 va
   v1 = i64.const 0
   br 1(v1, v1, v0)
 }
@@ -838,7 +841,7 @@ fn jit_freeze_carries_a_finished_unjoined_childs_result() {
     );
     assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
     assert_eq!(residue.nested.len(), 1, "the finished child rides");
-    assert_eq!(residue.nested[0].completed_result, Some(4321));
+    assert_eq!(residue.nested[0].completed_result, Some(Ok(4321)));
 
     let mut twin = snap.clone();
     begin_thaw(&mut twin, TEST_ARENA, 0);
@@ -854,31 +857,50 @@ fn jit_freeze_carries_a_finished_unjoined_childs_result() {
     assert_eq!(read_state(&tsnap), STATE_NORMAL, "thaw back to NORMAL");
 }
 
-/// #1692: a child that finished with a trap before the freeze cannot ride (a trap is not a join
-/// result the artifact can carry), so the freeze fails closed with `ThreadFault` rather than hand the
-/// parent's thaw a join result of 0.
+/// #1674: a child that finished with a trap before the freeze rides it: the residue carries the
+/// trap's code, and the thawed parent's `join` re-raises it, as the uninterrupted run's join does.
 #[test]
-fn jit_freeze_with_a_trapped_unjoined_child_fails_closed() {
+fn jit_freeze_carries_a_trapped_unjoined_childs_trap() {
     if !temen_jit::fiber_supported() {
         return;
     }
     let inst = instrument(&parent_join_after_call("  unreachable"));
     let fresh = init_durable_window(WINDOW, TEST_ARENA);
-    let (fo, _, residue) = run_join_after_call(&inst, &fresh, true, DurableResidue::default());
+    let (base, _, _) = run_join_after_call(&inst, &fresh, false, DurableResidue::default());
     assert!(
-        matches!(fo, JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault)),
-        "fails closed: {fo:?}"
+        matches!(base, JitOutcome::Trapped(temen_jit::TrapKind::Unreachable)),
+        "uninterrupted, the join re-raises the child's trap: {base:?}"
     );
+
+    let (fo, snap, residue) = run_join_after_call(&inst, &fresh, true, DurableResidue::default());
     assert!(
-        residue.nested.is_empty(),
-        "nothing rides: {:?}",
-        residue.nested
+        matches!(fo, JitOutcome::Returned(_)),
+        "freeze placeholder: {fo:?}"
     );
+    assert_eq!(read_state(&snap), STATE_UNWINDING, "frozen");
+    assert_eq!(
+        residue
+            .nested
+            .iter()
+            .map(|n| n.completed_result)
+            .collect::<Vec<_>>(),
+        [Some(Err(temen_jit::TrapKind::Unreachable as i64))],
+        "the trap rides"
+    );
+
+    let mut twin = snap.clone();
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let seed = DurableResidue {
+        nested: residue.nested,
+        ..Default::default()
+    };
+    let (to, _, _) = run_join_after_call(&inst, &twin, false, seed);
+    assert_eq!(to, base, "thaw ≡ uninterrupted");
 }
 
-/// #1692 depth-2: under a freeze from the start, the child (func 1) instantiates a grandchild (func 2)
-/// that traps at once, then unwinds with that grandchild unjoined. The child's freeze refuses, which
-/// fails the child; the root then refuses its failed child in turn.
+/// #1674 depth-2: under a freeze from the start, the child (func 1) instantiates a grandchild (func 2)
+/// that traps at once, then unwinds with that grandchild unjoined. The grandchild's trap rides, and on
+/// thaw both joins re-raise it, as uninterrupted.
 const FREEZE_TRAPPED_GRANDCHILD: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -911,30 +933,60 @@ block 0 (v0: i64) {
 ";
 
 #[test]
-fn jit_freeze_with_a_trapped_unjoined_grandchild_fails_closed_at_the_root() {
+fn jit_freeze_carries_a_trapped_unjoined_grandchilds_trap() {
     if !temen_jit::fiber_supported() {
         return;
     }
     let inst = instrument(FREEZE_TRAPPED_GRANDCHILD);
-    let mut h = Host::new();
-    h.set_durable(true);
-    let ih = h.grant_instantiator(0, WINDOW as u64);
-    let mut win = init_durable_window(WINDOW, TEST_ARENA);
-    write_state(&mut win, STATE_UNWINDING);
-    let (fo, _, residue) = compile_and_run_durable(
-        &inst,
-        0,
-        &[ih as i64],
-        &win,
-        SIZE_LOG2,
-        temen_run::cap_thunk,
-        &mut h as *mut Host as *mut c_void,
-        DurableRun::default(),
-    )
-    .expect("compiles");
+    let run = |win: &[u8], seed: DurableResidue| {
+        let mut h = Host::new();
+        h.set_durable(true);
+        let ih = h.grant_instantiator(0, WINDOW as u64);
+        compile_and_run_durable(
+            &inst,
+            0,
+            &[ih as i64],
+            win,
+            SIZE_LOG2,
+            temen_run::cap_thunk,
+            &mut h as *mut Host as *mut c_void,
+            DurableRun {
+                seed,
+                ..Default::default()
+            },
+        )
+        .expect("compiles")
+    };
+    let fresh = init_durable_window(WINDOW, TEST_ARENA);
+    let (base, _, _) = run(&fresh, DurableResidue::default());
     assert!(
-        matches!(fo, JitOutcome::Trapped(temen_jit::TrapKind::ThreadFault)),
-        "fails closed at the root: {fo:?} (residue {:?})",
-        residue.nested
+        matches!(base, JitOutcome::Trapped(temen_jit::TrapKind::Unreachable)),
+        "uninterrupted, both joins re-raise the grandchild's trap: {base:?}"
     );
+
+    let mut win = fresh.clone();
+    write_state(&mut win, STATE_UNWINDING);
+    let (fo, snap, residue) = run(&win, DurableResidue::default());
+    assert!(
+        matches!(fo, JitOutcome::Returned(_)),
+        "freeze placeholder: {fo:?}"
+    );
+    let grandchild = residue
+        .nested
+        .iter()
+        .find(|n| n.parent_task != 0)
+        .expect("the grandchild rides");
+    assert_eq!(
+        grandchild.completed_result,
+        Some(Err(temen_jit::TrapKind::Unreachable as i64))
+    );
+
+    let mut twin = snap.clone();
+    begin_thaw(&mut twin, TEST_ARENA, 0);
+    let seed = DurableResidue {
+        nested: residue.nested,
+        ..Default::default()
+    };
+    let (to, _, _) = run(&twin, seed);
+    assert_eq!(to, base, "thaw ≡ uninterrupted");
 }

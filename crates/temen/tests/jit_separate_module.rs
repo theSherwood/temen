@@ -39,9 +39,14 @@ block 0 (v0: i64) {
 /// Run `parent_src` on both backends with identical grants: an `Instantiator` over the whole 128 KiB
 /// window and a `Module` capability for `child_src` (their handles passed as the entry's two args).
 fn both(parent_src: &str) -> BothOut {
+    both_with(parent_src, child_src())
+}
+
+/// [`both`] over a given child module.
+fn both_with(parent_src: &str, child_src: &str) -> BothOut {
     let parent = parse_module(parent_src).expect("parse parent");
     verify_module(&parent).expect("verify parent");
-    let child = parse_module(child_src()).expect("parse child");
+    let child = parse_module(child_src).expect("parse child");
     verify_module(&child).expect("verify child");
     let init: Vec<u8> = (0..(128u64 << 10))
         .map(|i| (i as u8).wrapping_mul(31) ^ 0xa5)
@@ -235,6 +240,60 @@ block 0 (v0: i32, v1: i32) {
         assert_eq!(
             jmem[i as usize], init[i as usize],
             "module child escaped to parent byte {i}"
+        );
+    }
+}
+
+/// #1720 — a module nests **as built**: a powerbox `_start` (no params — how every program is built
+/// to start) is a module child on the JIT exactly as on the interpreter. An `i32` status joins
+/// sign-extended (the JIT's trampoline stores it as an interpreter `Reg` holds it), and an empty
+/// result joins as `0`.
+#[test]
+fn jit_powerbox_entry_child_matches_interp() {
+    if !temen_jit::fiber_supported() {
+        return; // no JIT nesting runtime on this target
+    }
+    // instantiate_module(module, entry 0, off 64 KiB, size 2^16, fuel 0) → join → child's result.
+    let parent = "memory 17
+func (i32, i32) -> (i64) {
+block 0 (v0: i32, v1: i32) {
+  v2 = i64.extend_i32_s v1
+  v3 = i64.const 0
+  v4 = i64.const 65536
+  v5 = i64.const 16
+  v6 = call.cap 6 5 (i64, i64, i64, i64, i64) -> (i32) v0 (v2, v3, v4, v5, v3)
+  v7 = call.cap 6 1 (i32) -> (i64) v0 (v6)
+  return v7
+  }
+}
+";
+    let status = "memory 16
+export 0 func \"_start\" 0
+func () -> (i32) {
+block 0 () {
+  v0 = i32.const -7
+  return v0
+  }
+}
+";
+    let nothing = "memory 16
+export 0 func \"_start\" 0
+func () -> () {
+block 0 () {
+  return
+  }
+}
+";
+    for (child, want) in [(status, -7i64), (nothing, 0)] {
+        let (ir, imem, jo, jmem) = both_with(parent, child);
+        assert_eq!(ir, Ok(vec![Value::I64(want)]), "interp, child:\n{child}");
+        assert!(
+            matches!(jo, JitOutcome::Returned(ref s) if s == &[want]),
+            "jit: {jo:?}, child:\n{child}"
+        );
+        assert_eq!(
+            imem, jmem,
+            "interp/JIT parent windows diverge, child:\n{child}"
         );
     }
 }

@@ -1687,7 +1687,9 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
-            completed_result: n.completed_result,
+            completed_result: n
+                .completed_result
+                .map(|r| r.map_err(temen_interp::Trap::code)),
         })
         .collect();
     let detached = detached_seeds(host)?;
@@ -1807,7 +1809,13 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
             max_vcpus: usize::MAX,
             same_module,
         };
-        match (h.image, h.outcome) {
+        // A finished child's `join` outcome — its value, or its trap (#1674); `None` for a trap cell
+        // that names no trap, which stays unreached.
+        let outcome = h.outcome.and_then(|(result, trap)| match trap {
+            0 => Some(Ok(result)),
+            t => temen_interp::Trap::from_code(t).map(Err),
+        });
+        match (h.image, outcome) {
             (Some(image), _) => {
                 let pages = image.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
                 let window = temen_interp::MemLayout::from_dense(
@@ -1835,10 +1843,10 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
                     },
                 });
             }
-            (None, Some((result, 0))) => completed.push(temen_interp::FrozenDetached {
+            (None, Some(outcome)) => completed.push(temen_interp::FrozenDetached {
                 parent_task: 0,
                 slot: h.slot,
-                completed_result: result,
+                completed_result: outcome,
             }),
             _ => unreached.push(temen_interp::PendingDetached {
                 parent_task: 0,
@@ -1911,7 +1919,12 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                     size_log2: n.size_log2,
                     entry: n.entry,
                     module_digest: None,
-                    completed_result: n.completed_result,
+                    completed_result: n.completed_result.map(|r| {
+                        r.map_err(|c| {
+                            temen_interp::Trap::from_code(c)
+                                .unwrap_or(temen_interp::Trap::Malformed)
+                        })
+                    }),
                 })
                 .collect(),
         );
@@ -3362,13 +3375,12 @@ pub unsafe extern "C" fn budget_mem_give(ctx: *mut c_void, budget: i32, bytes: u
     parent.budget_mem_give(budget, bytes);
 }
 
-/// Read `grants_n` 16-byte grant records `{name_off, name_len, handle, flags}` at window-relative
-/// `grants_ptr` (bounded to `[0, mem_size)`) into `(name, handle)` pairs — the shared parse of the
-/// by-name builders. `None` with `*trap_out` set: `MemoryFault` for an out-of-window record/name,
-/// `CapFault` for a non-UTF-8 name.
+/// The by-name builders' grant list: [`temen_interp::read_grant_records`] over the parent's window
+/// `[mem_base, mem_base + mem_size)`. `None` with `*trap_out` set to the parse's trap.
 ///
 /// # Safety
-/// `[mem_base, mem_base + mem_size)` is the parent's readable window.
+/// `[mem_base, mem_base + mem_size)` is the parent's window (its reserved span: a read of an
+/// uncommitted page faults through the SIGSEGV guard, like a guest access).
 unsafe fn read_grant_records(
     mem_base: *mut u8,
     mem_size: u64,
@@ -3376,43 +3388,24 @@ unsafe fn read_grant_records(
     grants_n: u64,
     trap_out: *mut i64,
 ) -> Option<Vec<(String, i32)>> {
-    // Bounded read of `[off, off+len)` within the parent's mapped window, or `None` (out of window).
-    let read = |off: u64, len: u64| -> Option<Vec<u8>> {
-        let end = off.checked_add(len)?;
-        if end > mem_size {
-            return None;
+    let read = |off: u64, len: usize| -> Result<Vec<u8>, Trap> {
+        match off.checked_add(len as u64) {
+            // SAFETY: `[off, off + len)` lies inside the window, per the bound just checked.
+            Some(end) if end <= mem_size => {
+                Ok(unsafe { std::slice::from_raw_parts(mem_base.add(off as usize), len) }.to_vec())
+            }
+            _ => Err(Trap::MemoryFault),
         }
-        // SAFETY: `[0, mem_size)` is the parent's mapped, readable window; the bounds check above keeps
-        // the slice inside it.
-        Some(
-            unsafe { std::slice::from_raw_parts(mem_base.add(off as usize), len as usize) }
-                .to_vec(),
-        )
     };
-    let mut grants: Vec<(String, i32)> = Vec::with_capacity(grants_n as usize);
-    for i in 0..grants_n {
-        let Some(rec_off) = grants_ptr.checked_add(i.wrapping_mul(16)) else {
-            *trap_out = TrapKind::MemoryFault as i64;
-            return None;
-        };
-        let Some(rec) = read(rec_off, 16) else {
-            *trap_out = TrapKind::MemoryFault as i64;
-            return None;
-        };
-        let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-        let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as u64;
-        let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-        let Some(name_bytes) = read(name_off, name_len) else {
-            *trap_out = TrapKind::MemoryFault as i64;
-            return None;
-        };
-        let Ok(name) = String::from_utf8(name_bytes) else {
-            *trap_out = TrapKind::CapFault as i64;
-            return None;
-        };
-        grants.push((name, handle));
-    }
-    Some(grants)
+    temen_interp::read_grant_records(grants_ptr, grants_n, read)
+        .map_err(|t| {
+            let kind = match t {
+                Trap::MemoryFault => TrapKind::MemoryFault,
+                _ => TrapKind::CapFault,
+            };
+            *trap_out = kind as i64;
+        })
+        .ok()
 }
 
 /// Wrap a built child powerbox as the two counted shared refs the JIT expects (see

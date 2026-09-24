@@ -246,6 +246,7 @@ fn drive<'s, 'e>(
                 sp,
                 arg,
                 module,
+                vcpu: vid,
             } => {
                 let id = host.fresh_id();
                 let child = bytecode::Vcpu::new_child_in(
@@ -255,7 +256,8 @@ fn drive<'s, 'e>(
                     &[Value::I64(sp), Value::I64(arg)],
                     Arc::clone(&back),
                 )
-                .expect("child vcpu");
+                .expect("child vcpu")
+                .with_vcpu_id(vid);
                 let cback = Arc::clone(&back);
                 scope.spawn(move || {
                     let r = drive(scope, prog, cback, host, child);

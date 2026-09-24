@@ -401,3 +401,61 @@ fn parallel_instantiate_module_fanout_matches_oracle() {
         );
     }
 }
+
+/// DESIGN.md §12 / I37: a trap is terminal for its **domain**, and a §14 confined child is its own
+/// domain — the owner observes the trap only if it joins (or polls). Here the root instantiates a child
+/// that divides by zero, never joins it, waits out a few 1 ms timeouts and returns 42: the child's
+/// trap must not take the root's domain down with it. (A trap in one of the root's own `thread.spawn`
+/// threads does end the run — `bytecode_parallel.rs`'s `a_thread_trap_ends_the_run_on_every_driver`.)
+const CONFINED_TRAP_UNJOINED: &str = r#"memory 17
+func (i32) -> (i64) {
+block 0 (v0: i32) {
+  ventry = i64.const 1
+  voff = i64.const 65536
+  vslog = i64.const 12
+  vquota = i64.const 0
+  vh = call.cap 6 0 (i64, i64, i64, i64) -> (i32) v0 (ventry, voff, vslog, vquota)
+  vi = i64.const 0
+  br 1(vi)
+}
+block 1 (vi1: i64) {
+  vn = i64.const 5
+  vlt = i64.lt_u vi1 vn
+  br_if vlt 2(vi1) 3()
+}
+block 2 (vi2: i64) {
+  va = i64.const 16384
+  vz = i32.const 0
+  vw = i64.const 1000000
+  vr = i32.atomic.wait va vz vw
+  v1 = i64.const 1
+  vn2 = i64.add vi2 v1
+  br 1(vn2)
+}
+block 3 () {
+  v42 = i64.const 42
+  return v42
+  }
+}
+func (i64) -> (i64) {
+block 0 (v0: i64) {
+  v1 = i64.const 1
+  vz = i64.const 0
+  v2 = i64.div_s v1 vz
+  return v2
+  }
+}
+"#;
+
+#[test]
+fn a_confined_childs_trap_ends_only_its_own_domain() {
+    let want = Ok(vec![Value::I64(42)]);
+    assert_eq!(run_cooperative(CONFINED_TRAP_UNJOINED), want, "cooperative");
+    for i in 0..if cfg!(miri) { 1 } else { 10 } {
+        assert_eq!(
+            run_parallel(CONFINED_TRAP_UNJOINED),
+            want,
+            "parallel (run {i})"
+        );
+    }
+}
