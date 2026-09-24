@@ -79,7 +79,9 @@ export async function loadEngine() {
 //   `onramp`  ⇒ publish the **on-ramp** powerbox the same way (#152): the grants a single-threaded
 //               on-ramp run gets, manifest imports included, shared by every vCPU — so an on-ramp
 //               `.temen` whose runtime spawns threads runs them on real Workers. `stdin` (bytes)
-//               seeds its stdin; an `exit(code)` from any vCPU ends the run with `exit` = code;
+//               seeds its stdin, and `env` (an array of `KEY=VALUE` strings, #1777) its §3e
+//               environment — how a runtime learns per-run settings such as JACL's worker count;
+//               an `exit(code)` from any vCPU ends the run with `exit` = code;
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
@@ -91,7 +93,7 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, env = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
@@ -124,6 +126,11 @@ export function makeRunner({ module, memory, ex }) {
       const sin = stdin || new Uint8Array(0);
       const sptr = sin.length ? ex.temen_par_alloc(sin.length) : 0;
       if (sin.length) u8().set(sin, sptr);
+      // Always set — an empty list clears — so one run's environment never reaches the next.
+      const envb = new TextEncoder().encode((env || []).map((e) => `${e}\0`).join(''));
+      const eptr = envb.length ? ex.temen_par_alloc(envb.length) : 0;
+      if (envb.length) u8().set(envb, eptr);
+      if (ex.temen_set_run_env(eptr, envb.length) !== 0) throw new Error('temen_set_run_env refused the environment (an entry without `=`, or too large)');
       if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length) !== 1) throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module)');
     }
     if (!jit && !jitCodegen && !io && !onramp && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
