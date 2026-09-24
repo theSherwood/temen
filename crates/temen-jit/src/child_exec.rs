@@ -16,15 +16,17 @@
 //!
 //! What this does **not** do (the JIT frontier, tracked on #1600): preempt. A task that never parks
 //! holds its lane until it returns; the interpreter's quantum round-robin has no JIT twin. And a
-//! domain's *own* `thread.spawn` vCPUs stay 1:1 OS threads, counted by `max_vcpus`, not by lanes.
+//! domain's *own* `thread.spawn` vCPUs — a child task's included (#1469) — stay 1:1 OS threads,
+//! counted by `max_vcpus`; they are not tasks.
 //!
 //! **Env-swap rules** (the D66 checklist R1–R5): each resume is its own `run_guarded_range` bracket
 //! over the *task's* fault range (R1); the per-thread state the child reads through TLS — its fiber
-//! runtime (`CURRENT_RT`), `vcpu.tls`, the in-task flag — is seeded on entry and saved/reset on
-//! exit of every resume, and every reader on a fiber stack is `#[inline(never)]` (R2, #1466); a
-//! finished or faulted task is never resumed (R3: the slot's `finish` closes the claim); a trap is
-//! attributed to the task's own cell, never the run's (R4); the window base is baked at first entry
-//! and the window moves with the task (R5 — `GuestWindow: Send`).
+//! runtime (`CURRENT_RT`), its thread domain (`CURRENT_DOMAIN`), `vcpu.tls`, the in-task flag — is
+//! seeded on entry and saved/reset on exit of every resume, and every reader on a fiber stack is
+//! `#[inline(never)]` (R2, #1466); a finished or faulted task is never resumed (R3: the slot's
+//! `finish` closes the claim); a trap is attributed to the task's own cell, never the run's (R4);
+//! the window base is baked at first entry and the window moves with the task (R5 —
+//! `GuestWindow: Send`).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -35,7 +37,7 @@ use temen_fiber::{Fiber, State};
 
 use crate::fiber_rt::{self, FiberRuntime, FiberSlot, SharedFiberTable};
 use crate::instantiator_rt::ChildDone;
-use crate::os_thread_rt::Domain;
+use crate::os_thread_rt::{self, Domain};
 use crate::{mem, vcpu_tls, CompiledModule, TrapKind};
 
 /// A task's native control stack: the fiber arena's slot size (`temen-fiber` hands out fixed
@@ -105,6 +107,15 @@ pub(crate) struct ChildTask {
     /// Runs exactly once, after the last resume, while the window is still alive: releases the
     /// child powerbox and returns the child's lane to the parent.
     teardown: Option<Teardown>,
+    /// #1469 — the domain the child's own `thread.spawn` vCPUs run in (their handle table, window,
+    /// fiber registry and lane chain), sharing the run's futex, park count, lanes and live count.
+    /// Built when the task is filed ([`ChildExec::spawn`]), for a child compiled with thread ops.
+    dom: Option<Arc<Domain>>,
+    /// #1469 — the child's root has returned (its outcome is published) while vCPUs it spawned
+    /// still run. As on the oracle, a root's return does not end its domain; the task stays filed,
+    /// never resumed again, until the last of them ends, and only then frees its window and
+    /// powerbox ([`ChildExec::finish`]).
+    retiring: bool,
 }
 
 // SAFETY: a task moves between workers only through the executor's queue, and is touched only by
@@ -210,6 +221,8 @@ impl ChildTask {
             done,
             copy_back,
             teardown: Some(teardown),
+            dom: None,
+            retiring: false,
         })
     }
 }
@@ -218,6 +231,11 @@ impl ChildTask {
     /// The task's window base (its own window's byte 0) — published for a durable child's doorbell.
     pub(crate) fn window_base(&self) -> usize {
         self.window.base() as usize
+    }
+
+    /// Whether vCPUs this task's child spawned are still running.
+    fn threads_live(&self) -> bool {
+        self.dom.as_ref().is_some_and(|d| d.live_threads() > 0)
     }
 }
 
@@ -263,6 +281,9 @@ struct Entry {
     /// and a running task is reachable only through this — its `task` is on a worker. `None` for a
     /// detached child, which a parent's completion does not end.
     stop: Option<Arc<AtomicI64>>,
+    /// #1469 — the task's own domain, reachable while a worker holds the task: a poisoned task's
+    /// parked vCPUs must be woken to observe it.
+    dom: Option<Arc<Domain>>,
 }
 
 struct ExecState {
@@ -318,7 +339,26 @@ impl ChildExec {
     }
 
     /// File a task and make it runnable. Its `done` cell is filled when it finishes.
-    pub(crate) fn spawn(self: &Arc<Self>, task: ChildTask) {
+    pub(crate) fn spawn(self: &Arc<Self>, mut task: ChildTask) {
+        // #1469 — a child compiled with thread ops gets its own domain over its window (the thread
+        // thunks find it through `os_thread_rt::CURRENT_DOMAIN`, set for each residency below).
+        if task._code.thread.spawn_thunk != 0 {
+            if let Some(hub) = self.domain() {
+                let d = Arc::new(Domain::new_child(hub, task.chain.clone()));
+                d.set_env(
+                    task.window.base() as u64,
+                    task._code.fn_table.as_ptr() as u64,
+                    Arc::as_ptr(&task.trap) as *mut i64,
+                    task._code.call_tramp,
+                    task.fault,
+                    task._code.fiber_cfg,
+                    Some(task.rt.table()),
+                    task._code.epoch_addr as usize,
+                    false,
+                );
+                task.dom = Some(d);
+            }
+        }
         let mut g = lock(&self.state);
         let id = g.next_id;
         g.next_id += 1;
@@ -335,6 +375,7 @@ impl ChildExec {
             .min()
             .unwrap_or(g.tasks.len() + 1);
         let stop = task.copy_back.is_some().then(|| Arc::clone(&task.trap));
+        let dom = task.dom.clone();
         g.tasks.insert(
             id,
             Entry {
@@ -343,6 +384,7 @@ impl ChildExec {
                 counted: false,
                 woken: false,
                 stop,
+                dom,
             },
         );
         g.runnable.push_back(id);
@@ -470,13 +512,28 @@ impl ChildExec {
                     .expect("picked task is present");
                 (id, task)
             };
-            let outcome = self.run_once(&mut task, worker);
+            // A retiring task is never resumed: it is offered only to re-check its vCPUs.
+            let outcome = if task.retiring {
+                Outcome::Retiring
+            } else {
+                self.run_once(&mut task, worker)
+            };
             // The lane goes back before anything else: a peer 1:1 vCPU or sibling task may be
             // queued behind it. `lane_give_back` touches only the domain's lane lock, so it is safe
             // to call before taking this executor's.
             if let Some(d) = self.domain() {
                 d.lane_give_back(&task.chain);
             }
+            // #1469 — a root that returns while its vCPUs run publishes its outcome now and
+            // retires; a retiring task finishes once they have all ended.
+            let outcome = match outcome {
+                Outcome::Finished if task.threads_live() => {
+                    self.settle(&mut task);
+                    Outcome::Retiring
+                }
+                Outcome::Retiring if !task.threads_live() => Outcome::Finished,
+                o => o,
+            };
             let mut task = Some(task);
             let mut g = lock(&self.state);
             match outcome {
@@ -489,6 +546,9 @@ impl ChildExec {
                         let t = task.as_ref().expect("held");
                         t.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                        if let Some(d) = &t.dom {
+                            d.wake_own_parked(); // its vCPUs share the cell
+                        }
                         e.woken = true;
                     }
                     e.task = task.take();
@@ -505,6 +565,29 @@ impl ChildExec {
                                 d.task_parked();
                             }
                         }
+                    }
+                }
+                Outcome::Retiring => {
+                    let shutdown = g.shutdown;
+                    let e = g.tasks.get_mut(&id).expect("running task is filed");
+                    let t = task.take().expect("held");
+                    if shutdown {
+                        // Run teardown ends the domain its vCPUs outlived its root in, as the
+                        // oracle's teardown sweep reaps them: poison the cell they share and wake
+                        // the parked ones.
+                        t.trap
+                            .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
+                        if let Some(d) = &t.dom {
+                            d.wake_own_parked();
+                        }
+                    }
+                    e.task = Some(t);
+                    if e.woken {
+                        g.runnable.push_back(id);
+                    } else {
+                        // Parked for the wakes and the cadence sweep, never counted: the task's
+                        // root is no longer a vCPU (`settle` dropped it from `live`).
+                        e.parked = true;
                     }
                 }
                 Outcome::Finished => {
@@ -539,6 +622,10 @@ impl ChildExec {
         });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
+        // #1469 — the child's thread thunks act in its own domain for this residency.
+        let prev_dom = os_thread_rt::set_current_domain(
+            task.dom.as_ref().map_or(std::ptr::null(), Arc::as_ptr),
+        );
         task.rt.push_active(Arc::clone(&task.slot));
         let fib = task
             .slot
@@ -561,6 +648,7 @@ impl ChildExec {
             )
         };
         task.rt.pop_active();
+        os_thread_rt::set_current_domain(prev_dom);
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
         if let Some(s) = prev_shadow {
@@ -598,6 +686,19 @@ impl ChildExec {
     /// After the last residency: free the window, run the teardown (powerbox release + lane
     /// give-back), publish the outcome, drop the domain's live count.
     fn finish(&self, mut task: Box<ChildTask>) {
+        // #1469 — every vCPU the child spawned has ended (a retiring task waited for that): join
+        // their OS threads before the window they ran on is freed.
+        if let Some(d) = &task.dom {
+            d.join_all();
+        }
+        if task.retiring {
+            // `settle` published the outcome and dropped the live count; free what remains.
+            task.window.restore_rw();
+            if let Some(t) = task.teardown.take() {
+                t();
+            }
+            return;
+        }
         let trap = task.trap.load(Ordering::Relaxed);
         let result = task.results.first().copied().unwrap_or(0);
         task.window.restore_rw();
@@ -632,6 +733,35 @@ impl ChildExec {
         }
     }
 
+    /// #1469 — the root of a task whose vCPUs still run has returned: publish its outcome now, as
+    /// the oracle does at the root's completion (a `join` of the child returns), and drop it from
+    /// the run's live count. Its window and powerbox stay until the vCPUs end ([`Self::finish`]).
+    /// A carve child's copy-back happens here, so the parent's join sees the child's writes; what
+    /// the vCPUs write after it stays in the child's image.
+    fn settle(&self, task: &mut ChildTask) {
+        task.retiring = true;
+        let trap = task.trap.load(Ordering::Relaxed);
+        let result = task.results.first().copied().unwrap_or(0);
+        // A trap ends the child's domain: its parked vCPUs observe the shared cell and unwind.
+        if trap != 0 {
+            if let Some(d) = &task.dom {
+                d.wake_own_parked();
+            }
+        }
+        if let Some(c) = task.copy_back.take() {
+            task.window.restore_rw();
+            c(task.window.rw_mut());
+        }
+        {
+            let mut st = task.done.state.lock().unwrap_or_else(|e| e.into_inner());
+            *st = Some((result, trap));
+            task.done.cv.notify_all();
+        }
+        if let Some(d) = self.domain() {
+            d.child_finished();
+        }
+    }
+
     /// Run teardown (`Nursery::join_children`): poison every parked task so it unwinds, let the
     /// runnable ones finish, wait for quiescence, join the workers. One parked forever would have
     /// hung the join, and unwinds through its trailing guard instead — the interpreter's teardown
@@ -646,11 +776,12 @@ impl ChildExec {
             let mut g = lock(&self.state);
             g.shutdown = true;
             for e in g.tasks.values_mut() {
-                if e.parked {
+                let poisoned = if e.parked {
                     if let Some(t) = &e.task {
                         t.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                     }
+                    true
                 } else if let Some(stop) = e.stop.as_ref().filter(|_| end_domain) {
                     // Never clobber a trap the child already recorded.
                     let _ = stop.compare_exchange(
@@ -659,6 +790,15 @@ impl ChildExec {
                         Ordering::Relaxed,
                         Ordering::Relaxed,
                     );
+                    true
+                } else {
+                    false
+                };
+                // #1469 — the child's own parked vCPUs share the poisoned cell.
+                if poisoned {
+                    if let Some(d) = &e.dom {
+                        d.wake_own_parked();
+                    }
                 }
             }
             self.wake_all_parked(&mut g);
@@ -690,5 +830,7 @@ enum Outcome {
     Parked {
         self_resolving: bool,
     },
+    /// #1469 — the root has returned; vCPUs it spawned still run ([`ChildTask::retiring`]).
+    Retiring,
     Finished,
 }

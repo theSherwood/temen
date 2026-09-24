@@ -736,6 +736,11 @@ impl FiberRuntime {
     }
 
     /// Record the finalized call-trampoline address (must be set before any fiber runs).
+    /// The fiber table this runtime runs over — its domain's one handle namespace.
+    pub(crate) fn table(&self) -> Arc<SharedFiberTable> {
+        Arc::clone(&self.table)
+    }
+
     pub(crate) fn set_call_tramp(&mut self, t: FiberCallTramp) {
         self.call_tramp = Some(t);
     }

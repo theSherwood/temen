@@ -9,34 +9,20 @@
 
 use temen_run::{Backend, RunConfig};
 
-/// The two tiers that can run a nested copy of this kernel. The **Cranelift** tier cannot, and says
-/// so: `compile_child` runs a §14 child's fibers (#1469) but refuses one that uses §12 threads ("a
-/// §14 JIT child using thread.spawn/join is not supported yet"), and the Forth kernel has
-/// `spawn`/`join` — so it cannot be its own JIT child. That frontier is pinned by
-/// [`the_jit_tier_declines_a_fiber_bearing_child`] rather than papered over.
-const TIERS: [Backend; 2] = [Backend::TreeWalk, Backend::Bytecode];
+/// Every tier nests this kernel. On **Cranelift** its child is a task with a fiber runtime and a
+/// thread domain of its own (#1469) — the kernel has `task`/`yield`/`resume` and `spawn`/`join`.
+///
+/// The JIT run also pins the **locked-ctx child hooks**: this kernel uses concurrency, so its JIT
+/// run bakes a `*const Mutex<Host>` cap ctx, and the spawn builds the child powerbox and binds its
+/// manifest through that ctx. Against the raw (`*mut Host`) hooks that path read the mutex header as
+/// a `Host` — a SIGSEGV.
+const TIERS: [Backend; 3] = [Backend::TreeWalk, Backend::Bytecode, Backend::Jit];
 
 fn kernel() -> temen_ir::Module {
     let m = temen_text::parse_module(include_str!("../demos/forth/forth.temt"))
         .expect("forth.temt parses");
     temen_verify::verify_module(&m).expect("forth.temt verifies");
     m
-}
-
-fn try_run(backend: Backend, program: &str) -> Result<(String, i64), String> {
-    let inst = temen_run::instantiate(kernel()).expect("instance");
-    let cfg = RunConfig {
-        stdin: program.as_bytes().to_vec(),
-        ..Default::default()
-    };
-    let r = inst.run(backend, &cfg)?;
-    Ok((
-        String::from_utf8_lossy(&r.stdout).into_owned(),
-        match r.outcome {
-            temen_run::Outcome::Exited(c) => c as i64,
-            temen_run::Outcome::Returned(_) => 0,
-        },
-    ))
 }
 
 fn run(backend: Backend, program: &str) -> (String, i64) {
@@ -95,22 +81,6 @@ fn a_sandbox_cannot_sandbox() {
         out.contains("no sandbox capability"),
         "inner sandbox must be refused: {out:?}"
     );
-}
-
-/// The declared frontier: the Cranelift tier refuses to compile a §14 child that uses threads, and
-/// this kernel does — so `sandbox` there is a refusal, not a silent success. Loud by
-/// design (`instantiator_rt`: "a child we cannot compile … is a CapFault, not a silent success").
-/// If this starts passing, per-child thread runtimes landed: move `Backend::Jit` into `TIERS`.
-///
-/// It is also the pin for the **locked-ctx child hooks**: this kernel uses concurrency, so its JIT
-/// run bakes a `*const Mutex<Host>` cap ctx, and the spawn gets far enough to build the child
-/// powerbox and bind its manifest through that ctx before the compile refuses. Against the raw
-/// (`*mut Host`) hooks that path read the mutex header as a `Host` — a SIGSEGV, not a refusal.
-#[test]
-fn the_jit_tier_declines_a_fiber_bearing_child() {
-    let r = try_run(Backend::Jit, "s\" 1 2 + . cr\" sandbox drop\n");
-    let e = r.expect_err("the JIT tier cannot nest this kernel");
-    assert!(e.contains("CapFault"), "expected a refusal, got: {e}");
 }
 
 /// The issue's first gate: the child redefines a word the parent already has, prints with *its*

@@ -3557,6 +3557,25 @@ A carve child has no lane of its own to be granted, so it runs in its parent's: 
 carries the parent's `(domain, lane cap)`, read once when the family is built. What was three
 propagation sites for every future scheduling change (invariant 14's burden) is one.
 
+*A child task's own fibers and threads* (#1469): a task carries a fiber runtime of its own — its own
+`SharedFiberTable` and call trampoline — so a child's `cont.*` handles number from 0 and never reach
+another domain's fibers, as in the oracle's per-domain registry. A non-durable task whose child uses
+`thread.spawn`/`join` also gets a `Domain` of its own for what the oracle keeps per domain — the handle
+table, its vCPUs' window, table and fiber registry, the lane chain — while the futex, the park count,
+the lanes and the run-wide live count stay the run's (the child's domain names the run's as its
+*hub*): the oracle runs every vCPU of a run under one scheduler, so one live cap, one futex, one
+deadlock predicate. Child code is shared across spawns, so the thread thunks find the task's domain
+through a thread-local seeded for each residency and on each of its vCPU threads, never a baked
+address. A `thread.join` or `cont.resume.block` at a task's root parks the *task* on its one event
+park rather than block a worker; from a guest fiber inside the task, which cannot park the task from
+its own stack, it fails closed (`ThreadFault`). A root that returns while its vCPUs run publishes its
+outcome at once — the oracle's rule: a child domain ends on a member's trap or with the run, not at its
+root's return — and the task *retires*, keeping its window and powerbox until its last vCPU ends; run
+teardown poisons a retiring task as it poisons a parked one. A durable task still refuses
+`thread.spawn`: its vCPUs would run outside the freeze that captures it. Pins:
+`temen-run/tests/jit_child_fibers.rs`, `jit_child_threads.rs`, and the Forth `sandbox` on all three
+tiers (`forth_sandbox.rs`).
+
 ## 24. Security & correctness audit — record  [CLOSED — all findings fixed]
 
 Audit date **2026-06-10** (register formerly `AUDIT.md`; deleted when every finding
