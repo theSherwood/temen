@@ -789,6 +789,7 @@ pub fn specialize_with_config(
             data: module.data.clone(),
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             imports: Vec::new(),
             exports: Vec::new(),
             data_exports: Vec::new(),
@@ -883,6 +884,7 @@ pub fn specialize_with_config(
     Ok(Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         funcs,
         memory: module.memory,
         data: module.data.clone(),

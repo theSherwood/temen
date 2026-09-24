@@ -82,6 +82,7 @@ fn dispatch_module() -> Module {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,
@@ -260,6 +261,7 @@ fn branchy_module() -> Module {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,
@@ -331,6 +333,7 @@ fn wide_span_uses_chain_fallback_and_stays_faithful() {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(hty)], // #922: call.dyn sig, index 0
         debug_info: None,
@@ -405,6 +408,7 @@ fn high_index_cluster_uses_offset_table() {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(hty)], // #922: call.dyn sig, index 0
         debug_info: None,
@@ -468,6 +472,7 @@ fn large_tail_uses_shared_continuation() {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(ty)], // #922: call.dyn sig, index 0
         debug_info: None,

@@ -781,6 +781,7 @@ pub fn transpile(wasm: &[u8]) -> Result<Transpiled, Error> {
         module: Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             funcs,
             memory,
             data,
@@ -879,6 +880,7 @@ fn build_debug_info(
         vars,
         blobs,
         func_names,
+        tls_root: None,
     })
 }
 

@@ -399,7 +399,7 @@ pub(crate) fn drive_op13<'p>(
     mut vcpu: bytecode::Vcpu<'p>,
     child: Option<&Module>,
 ) -> Result<Vec<Value>, Trap> {
-    let mut children: Vec<Result<Vec<Value>, Trap>> = Vec::new();
+    let mut children: Vec<Option<Result<Vec<Value>, Trap>>> = Vec::new();
     loop {
         match vcpu.run() {
             bytecode::VcpuEvent::Done(v) => return Ok(v),
@@ -436,7 +436,7 @@ pub(crate) fn drive_op13<'p>(
                     Err(t) => Err(t),
                 };
                 let handle = children.len() as i32;
-                children.push(r);
+                children.push(Some(r));
                 vcpu.deliver_handle(handle);
             }
             bytecode::VcpuEvent::Instantiate {
@@ -473,17 +473,14 @@ pub(crate) fn drive_op13<'p>(
                     Err(t) => Err(t),
                 };
                 let handle = children.len() as i32;
-                children.push(r);
+                children.push(Some(r));
                 vcpu.deliver_handle(handle);
             }
-            // A handle this driver never delivered (a refused spawn's `-errno`, or a forged value) is
-            // answered exactly as the op13jit driver answers it — never an out-of-bounds host panic.
+            // A handle this driver never delivered (a refused spawn's `-errno`, or a forged value), or
+            // one already joined, traps by the oracle's child-table rule — never an out-of-bounds host
+            // panic, and the same answer the op13jit driver gives.
             bytecode::VcpuEvent::Join { handle } => {
-                let banked = children
-                    .get(handle as usize)
-                    .cloned()
-                    .unwrap_or(Err(Trap::Malformed));
-                vcpu.deliver_join(banked);
+                vcpu.deliver_join(temen_interp::take_child(&mut children, handle).and_then(|r| r));
             }
             // #1296 — a child holding a re-granted `Jit`: `install` fills a slot of the child's OWN
             // dispatch table (its `own_dom`); `invoke` runs the unit interpreted over the child's own

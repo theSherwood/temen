@@ -1340,6 +1340,7 @@ fn translate_impl(
             data_exports: vec![],
             data_ptrs: vec![],
             data_funcrefs: vec![],
+            tls: Vec::new(),
             funcs,
             memory,
             data,

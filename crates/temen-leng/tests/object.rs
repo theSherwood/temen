@@ -14,11 +14,7 @@ use temen_leng::{LengModule, WholeModule};
 /// `temen-run --link` does.
 fn unit_of(m: Module) -> LinkUnit {
     let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
-    let data_exports = m
-        .data_exports
-        .iter()
-        .map(|e| (e.name.clone(), e.offset))
-        .collect();
+    let data_exports = m.data_exports.clone();
     LinkUnit {
         module: m,
         exports,

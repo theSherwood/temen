@@ -1776,10 +1776,12 @@ impl Inspector {
                         let slot = loclist_value(locs, frame.block, frame.inst)? as usize;
                         (ValueSite::List(locs.clone()), slot)
                     }
-                    // Memory-located (or a fixed global): watchable by address, not by value.
-                    VarLoc::Window { .. } | VarLoc::WindowVia { .. } | VarLoc::Fixed { .. } => {
-                        return None
-                    }
+                    // Memory-located (a fixed global or a thread-local too): watchable by address,
+                    // not by value.
+                    VarLoc::Window { .. }
+                    | VarLoc::WindowVia { .. }
+                    | VarLoc::Fixed { .. }
+                    | VarLoc::Tls { .. } => return None,
                 };
                 Some((frame.func, site, frame.vals.get(slot).copied()))
             })
@@ -2037,6 +2039,8 @@ impl Inspector {
                 }
                 // A module-scoped global at a fixed absolute window address (frame-independent).
                 VarLoc::Fixed { addr } => window_read(*addr, 0),
+                // A thread-local: the focused thread's own block (#1715).
+                VarLoc::Tls { off } => window_read(di.tls_addr(v.tls, *off)?, 0),
             }
         })
         .flatten()
@@ -2062,6 +2066,7 @@ impl Inspector {
                     frame.vals.get(idx as usize)?.i64() as u64 + *off as u64
                 }
                 VarLoc::Fixed { addr } => *addr,
+                VarLoc::Tls { off } => di.tls_addr(v.tls, *off)?,
                 VarLoc::Ssa { .. } | VarLoc::SsaList(_) => return None,
             };
             Some(base)
@@ -8859,7 +8864,8 @@ impl DetState {
         if let Some(v) = self.runnable.iter().find(|v| v.id == id) {
             return Some(v);
         }
-        if let Some(v) = self.join_waiters.get(&id) {
+        // Keyed by the thread being joined, so find the waiter among the values.
+        if let Some(v) = self.join_waiters.values().find(|v| v.id == id) {
             return Some(v);
         }
         if let Some(w) = self.wait_waiters.iter().find(|w| w.vcpu.id == id) {
@@ -8877,7 +8883,8 @@ impl DetState {
             .runnable
             .iter()
             .map(|v| v.id)
-            .chain(self.join_waiters.keys().copied())
+            // Keyed by the thread being joined; the value is the (live) thread doing the joining.
+            .chain(self.join_waiters.values().map(|v| v.id))
             .chain(self.wait_waiters.iter().map(|w| w.vcpu.id))
             .chain(self.spin_waiters.iter().map(|w| w.vcpu.id))
             .collect();
@@ -10561,6 +10568,41 @@ fn resolve_thread<T>(threads: &[Option<T>], handle: i32) -> Result<usize, Trap> 
         return Err(Trap::ThreadFault);
     }
     Ok(slot)
+}
+
+/// Join child `handle`: take its entry out of `children` and retire the slot, by the
+/// [`resolve_thread`] rule: a negative handle, or one whose masked slot is spent or was never issued,
+/// is `ThreadFault`. For drivers that
+/// keep their own child table (the browser's op-13 loops) so they answer a join as the oracle does
+/// (#1728).
+pub fn take_child<T>(children: &mut [Option<T>], handle: i32) -> Result<T, Trap> {
+    let slot = resolve_thread(children, handle)?;
+    Ok(children[slot]
+        .take()
+        .expect("resolve_thread checked liveness"))
+}
+
+#[cfg(test)]
+mod take_child_tests {
+    //! #1728 — the join rule an embedder's child table gets from [`take_child`].
+    use super::*;
+
+    #[test]
+    fn a_join_takes_the_entry_once() {
+        let mut children = vec![Some('a'), Some('b')];
+        assert_eq!(take_child(&mut children, 1), Ok('b'));
+        assert_eq!(take_child(&mut children, 1), Err(Trap::ThreadFault));
+        assert_eq!(take_child(&mut children, 0), Ok('a'));
+    }
+
+    #[test]
+    fn a_negative_out_of_range_or_empty_handle_is_a_thread_fault() {
+        let mut children = vec![Some('a'), Some('b'), Some('c')];
+        for bad in [-1, i32::MIN, 3, 7] {
+            assert_eq!(take_child(&mut children, bad), Err(Trap::ThreadFault));
+        }
+        assert_eq!(take_child::<char>(&mut [], 0), Err(Trap::ThreadFault));
+    }
 }
 
 /// Run one vCPU. `funcs` is an `Arc<[Func]>` the vCPU **owns** (a child gets its own cheap clone), so
@@ -20991,6 +21033,7 @@ pub fn module_digest(m: &Module) -> [u8; 32] {
     let canon = Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         funcs: m.funcs.clone(),
         memory: m.memory,
         data: m.data.clone(),

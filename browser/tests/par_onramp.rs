@@ -152,7 +152,7 @@ fn drive(run: Run, v: *mut ParVcpu) -> End {
             PAR_SPAWN => {
                 let am = temen_par_ev_a(v);
                 let (module, func) = ((am >> 32) as u32, am as u32);
-                let (sp, arg) = (temen_par_ev_b(v), temen_par_ev_c(v));
+                let (sp, arg, vcpu) = (temen_par_ev_b(v), temen_par_ev_c(v), temen_par_ev_d(v));
                 let h = std::thread::spawn(move || {
                     let c = temen_par_child(
                         run.prog as *mut _,
@@ -162,6 +162,7 @@ fn drive(run: Run, v: *mut ParVcpu) -> End {
                         func,
                         sp,
                         arg,
+                        vcpu,
                     );
                     assert!(!c.is_null(), "child vCPU build failed");
                     drive(run, c)
@@ -308,4 +309,72 @@ fn onramp_recipe_refuses_a_non_onramp_module() {
         temen_par_powerbox_onramp(b"junk".as_ptr(), 4, core::ptr::null(), 0),
         0
     );
+}
+
+/// #1761 — a fiber crosses Workers both ways: the root creates it and runs it to its first `suspend`,
+/// a spawned thread resumes it to its second, and the root resumes it again after the join — the
+/// fiber last parked on the *thread's* vCPU. `5 + 8 + (7*100 + 9) = 722`, the tree-walker's and the
+/// cooperative driver's answer (`crates/temen/tests/fiber_migrate.rs`). Each vCPU here is its own OS
+/// thread, so without the run's shared registry the thread's resume is a `FiberFault`.
+#[test]
+fn a_fiber_migrates_between_worker_vcpus() {
+    let _g = RECIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = r#"memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 2
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 5
+  v4, v5 = cont.resume v2 v3
+  v6 = thread.spawn 1 v2 v2
+  v7 = thread.join v6
+  v8 = i64.const 9
+  v9, v10 = cont.resume v2 v8
+  v11 = i64.add v5 v7
+  v12 = i64.add v11 v10
+  return v12
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 7
+  v1, v2 = cont.resume varg v0
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = suspend varg
+  v1 = i64.const 1
+  v2 = i64.add v0 v1
+  v3 = suspend v2
+  v4 = i64.const 100
+  v5 = i64.mul v0 v4
+  v6 = i64.add v5 v3
+  return v6
+  }
+}
+export 0 func "_start" 0
+"#;
+    let m = temen_text::parse_module(src).expect("parses");
+    temen_verify::verify_module(&m).expect("verifies");
+    for i in 0..20 {
+        let (end, _) = par_onramp_run(&m, 1 << 16);
+        assert_eq!(end, End::Done(722), "run {i}");
+    }
+}
+
+/// #1761 — `vcpu.tls` on the Worker driver: a `thread.spawn` child is seeded with its dense vCPU id
+/// (the `PAR_SPAWN` event's `ev_d`, passed to `temen_par_child`), and a migrated fiber reads the vCPU
+/// it now runs on. The fiber reads 0 on the root, 1 after the spawned thread resumes it, and returns
+/// `1*10 + 3`; the root adds its own 0 — 13, as on every other driver (`fiber_migrate.rs`).
+#[test]
+fn vcpu_tls_follows_the_executing_worker() {
+    let _g = RECIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let src = include_str!("fixtures/threads_fibers.temt");
+    let m = temen_text::parse_module(src).expect("parses");
+    temen_verify::verify_module(&m).expect("verifies");
+    let (end, _) = par_onramp_run(&m, 1 << 16);
+    assert_eq!(end, End::Done(13));
 }
