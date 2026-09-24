@@ -151,6 +151,7 @@ fn carry_funcs(module: &Module, funcs: Vec<Func>) -> Module {
         exports: Vec::new(),
         data_exports: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         impl_exports: Vec::new(),
         // FuncType interning (#922): the residual's `call.dyn`/`call.cap` carry an interned
         // `types` index, so the type section must survive — but **string-free** (this crate can't

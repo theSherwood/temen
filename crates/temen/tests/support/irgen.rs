@@ -1113,6 +1113,7 @@ pub fn gen_module(g: &mut Gen) -> Module {
     Module {
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         funcs,
         memory,
         data,

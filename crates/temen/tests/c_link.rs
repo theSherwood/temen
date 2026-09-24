@@ -64,11 +64,7 @@ fn unit_via_temeno(m: temen_ir::Module, tag: &str) -> LinkUnit {
         .iter()
         .map(|e| (e.name.clone(), e.func))
         .collect();
-    let data_exports = re
-        .data_exports
-        .iter()
-        .map(|e| (e.name.clone(), e.offset))
-        .collect();
+    let data_exports = re.data_exports.clone();
     LinkUnit {
         module: re,
         exports,
@@ -380,7 +376,7 @@ fn cross_tu_data_symbol() {
 
     // The provider exports `counter` as *data*; the consumer keeps no storage for the `extern`.
     assert!(
-        provider.data_exports.iter().any(|(n, _)| n == "counter"),
+        provider.data_exports.iter().any(|e| e.name == "counter"),
         "counter exported as data: {:?}",
         provider.data_exports
     );
@@ -501,7 +497,7 @@ fn static_global_stays_internal() {
          int visible = 9;\n\
          int get_secret(void) { return secret; }\n",
     );
-    let names: Vec<&str> = unit.data_exports.iter().map(|(n, _)| n.as_str()).collect();
+    let names: Vec<&str> = unit.data_exports.iter().map(|e| e.name.as_str()).collect();
     assert!(names.contains(&"visible"), "visible exported: {names:?}");
     assert!(
         !names.contains(&"secret"),
@@ -694,7 +690,7 @@ fn real_chibicc_type_tu_emits_and_links() {
     let data_names: Vec<&str> = type_tu
         .data_exports
         .iter()
-        .map(|(n, _)| n.as_str())
+        .map(|e| e.name.as_str())
         .collect();
     for g in ["ty_int", "ty_void", "ty_long", "ty_char", "ty_bool"] {
         assert!(
@@ -746,7 +742,7 @@ fn links_multiple_real_chibicc_tus() {
     let type_data: Vec<&str> = units[0]
         .data_exports
         .iter()
-        .map(|(n, _)| n.as_str())
+        .map(|e| e.name.as_str())
         .collect();
     assert!(
         type_data.contains(&"ty_int"),
@@ -906,7 +902,7 @@ fn emit_object_libc_core_compiles_and_is_intrinsic_free() {
     // The real stdio streams (fd 0/1/2), defined here rather than stubbed as in the 2a link.
     for g in ["stdin", "stdout", "stderr"] {
         assert!(
-            libc.data_exports.iter().any(|(n, _)| n == g),
+            libc.data_exports.iter().any(|e| e.name == g),
             "emit-object libc defines the `{g}` global"
         );
     }

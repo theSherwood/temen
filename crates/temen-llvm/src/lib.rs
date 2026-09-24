@@ -1340,6 +1340,7 @@ fn translate_impl(
             data_exports: vec![],
             data_ptrs: vec![],
             data_funcrefs: vec![],
+            tls: Vec::new(),
             funcs,
             memory,
             data,
@@ -1470,6 +1471,7 @@ struct DebugAcc {
     /// Source function names (`DISubprogram` `DW_AT_name` → IR function index): the §6 function-name
     /// table, so an LLVM-frontend backtrace reads `compute` instead of `fn{N}`.
     func_names: Vec<FuncName>,
+    tls_root: None,
 }
 
 impl DebugAcc {

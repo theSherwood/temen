@@ -84,6 +84,12 @@ pub enum VerifyError {
     /// index) would be loaded and `call.dyn`'d unpatched, so it is fail-closed here. `link`
     /// resolves and clears these; a survivor was never linked.
     UnlinkedDataFuncref { at: u64 },
+    /// A runnable module still carries a thread-local template ([`Module::tls`], #1715): only
+    /// [`temen_ir::link`] places one in the window, so it was never linked.
+    UnlinkedTls,
+    /// A runnable module exports a thread-local symbol ([`temen_ir::DataExport::tls`]): a linked
+    /// module carries none, since a thread-local has no one window address.
+    UnlinkedTlsExport { export: usize },
     /// A `call` referenced a function index that does not exist.
     CallFuncOutOfRange { func: u32, block: u32, callee: u32 },
     /// A `call`'s argument count did not match the callee's parameter count.
@@ -245,6 +251,14 @@ pub fn verify_module(m: &Module) -> Result<(), VerifyError> {
     // would be loaded and dispatched unpatched.
     if let Some(r) = m.data_funcrefs.first() {
         return Err(VerifyError::UnlinkedDataFuncref { at: r.at });
+    }
+    // Likewise a thread-local template (#1715): `link` places it in the window as plain data, and a
+    // runnable module carries no thread-local export.
+    if !m.tls.is_empty() {
+        return Err(VerifyError::UnlinkedTls);
+    }
+    if let Some(i) = m.data_exports.iter().position(|e| e.tls) {
+        return Err(VerifyError::UnlinkedTlsExport { export: i });
     }
     // Validate the import manifest (§7 / IMPORTS.md phase 1) in one pass, before `verify_func`
     // checks any call against it. Two properties per entry:
@@ -1749,6 +1763,7 @@ mod shadow_arena_tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: Some(Memory { size_log2, shadow }),

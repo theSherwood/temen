@@ -156,16 +156,11 @@ fn the_linked_program_carries_both_units_debug_info() {
         .iter()
         .map(|e| (e.name.clone(), e.func))
         .collect();
-    let lib_data: Vec<(String, u64)> = lib
-        .data_exports
-        .iter()
-        .map(|d| (d.name.clone(), d.offset))
-        .collect();
     let linked = temen_browser::link_program(
         temen_ir::LinkUnitRef {
             module: &lib,
             exports: &lib_exports,
-            data_exports: &lib_data,
+            data_exports: &lib.data_exports,
         },
         &prog,
         "main",
@@ -301,15 +296,10 @@ fn the_linked_program_drops_what_it_cannot_reach() {
         .iter()
         .map(|e| (e.name.clone(), e.func))
         .collect();
-    let lib_data: Vec<(String, u64)> = lib
-        .data_exports
-        .iter()
-        .map(|d| (d.name.clone(), d.offset))
-        .collect();
     let unit = temen_ir::LinkUnitRef {
         module: &lib,
         exports: &lib_exports,
-        data_exports: &lib_data,
+        data_exports: &lib.data_exports,
     };
     let linked = temen_browser::link_program(unit, &prog, "main").expect("links");
 

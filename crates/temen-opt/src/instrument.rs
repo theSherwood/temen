@@ -360,6 +360,7 @@ mod tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![],

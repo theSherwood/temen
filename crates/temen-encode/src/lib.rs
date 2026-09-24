@@ -330,6 +330,10 @@ pub mod wire {
         matches!(sniff_kind(bytes), Some(KIND_MODULE | KIND_OBJECT))
     }
 }
+// v12 (#1715) adds **thread-local templates** to the object dialect: a section of the unit's
+// `_Thread_local` initial bytes (after `data.funcref`), and a `tls` flag byte on `data.ptr` entries,
+// data exports, and the `data.self`/`data.sym` opcodes. The runnable dialect is unchanged byte for
+// byte after the version; the bump retires v11 readers, and every committed asset is regenerated.
 // v10 (CALLS.md 7.4) adds the impl-export **`threaded` policy byte** — the provider's own
 // concurrency-policy declaration (`0` = single, `1` = threaded), one uleb after each offer's op
 // list. Any other value is a decode error (fail-closed, like every reserved encoding). v10 briefly
@@ -370,7 +374,7 @@ pub mod wire {
 // separately-compiled unit can be serialized with its symbols **still unresolved** — the precondition
 // for host-assisted dynamic linking (DESIGN.md §22: the loader resolves a guest-shipped blob's imports
 // against a symbol table, then re-verifies). v1 was always import-free (imports resolved pre-encode).
-const VERSION: u16 = 11;
+const VERSION: u16 = 12;
 
 // The object dialect is its own header `kind` (`wire::KIND_OBJECT`), not a flag bit.
 
@@ -520,6 +524,8 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
     if object {
         write_uleb(&mut out, m.data_ptrs.len() as u64);
         for p in &m.data_ptrs {
+            // v12: whether `at` is in the thread-local template rather than the data image (#1715).
+            out.push(p.tls as u8);
             write_uleb(&mut out, p.at);
             match &p.target {
                 DataPtrTarget::SelfOff(off) => {
@@ -552,6 +558,22 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         assert!(
             m.data_funcrefs.is_empty(),
             "data.funcref relocations are object-dialect; resolve via link before encode_module"
+        );
+    }
+    // Object-only thread-local template section (v12, #1715), next to the data image it parallels:
+    // count, then each segment's `offset` in the unit's per-thread block and length-prefixed bytes.
+    // `link` places it in the window as plain data, so the runnable dialect never carries it.
+    if object {
+        write_uleb(&mut out, m.tls.len() as u64);
+        for d in &m.tls {
+            write_uleb(&mut out, d.offset);
+            write_uleb(&mut out, d.bytes.len() as u64);
+            out.extend_from_slice(&d.bytes);
+        }
+    } else {
+        assert!(
+            m.tls.is_empty(),
+            "a thread-local template is object-dialect; place it via link before encode_module"
         );
     }
     // §7 import section (v2): count, then each import's `name` and op `sig`. Usually empty — an
@@ -595,6 +617,7 @@ fn encode_impl(m: &Module, object: bool) -> Vec<u8> {
         for e in &m.data_exports {
             write_str(&mut out, &e.name);
             write_uleb(&mut out, e.offset);
+            out.push(e.tls as u8); // v12: a thread-local export (#1715)
         }
     }
     // Type section (v6, OQ3): count, then each entry tagged — 0 = a function signature
@@ -749,6 +772,10 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
                 out.push(4);
                 write_uleb(out, *addr);
             }
+            VarLoc::Tls { off } => {
+                out.push(5); // v12 (#1715)
+                write_uleb(out, *off);
+            }
         }
         match v.type_id {
             None => out.push(0),
@@ -779,6 +806,14 @@ fn encode_debug_info(out: &mut Vec<u8>, di: &DebugInfo) {
     for fname in &di.func_names {
         write_uleb(out, fname.func as u64);
         write_str(out, &fname.name);
+    }
+    // v12: the root thread's thread-local block (#1715), an optional address.
+    match di.tls_root {
+        None => out.push(0),
+        Some(root) => {
+            out.push(1);
+            write_uleb(out, root);
+        }
     }
 }
 
@@ -834,15 +869,16 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
         // a producer bug (link scaffolding that `link` rewrites to `ConstI64` before a module is
         // finalized) — the panic keeps the old `unreachable!` contract; the "never panic"
         // discipline governs *decode*.
-        Inst::DataSelf { offset } => {
+        Inst::DataSelf { offset, tls } => {
             assert!(
                 object,
                 "data.self is link-form; resolve via link before encode_module"
             );
             out.push(self::op::DATA_SELF);
             write_uleb(out, *offset);
+            out.push(*tls as u8); // v12 (#1715)
         }
-        Inst::DataSym { name, addend } => {
+        Inst::DataSym { name, addend, tls } => {
             assert!(
                 object,
                 "data.sym is link-form; resolve via link before encode_module"
@@ -851,6 +887,7 @@ fn encode_inst(out: &mut Vec<u8>, inst: &Inst, object: bool) {
             write_uleb(out, name.len() as u64);
             out.extend_from_slice(name);
             write_sleb(out, *addend);
+            out.push(*tls as u8); // v12 (#1715)
         }
         Inst::DataTop => {
             assert!(
@@ -1899,11 +1936,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     let ndata = c.count()?;
     let mut data = Vec::new();
     for _ in 0..ndata {
-        let readonly = match c.byte()? {
-            0 => false,
-            1 => true,
-            other => return Err(DecodeError::BadDataFlag(other)),
-        };
+        let readonly = c.flag()?;
         let offset = c.uleb()?;
         let len = c.count()?;
         let bytes = c.take(len)?.to_vec();
@@ -1920,6 +1953,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     if object {
         let nptrs = c.count()?;
         for _ in 0..nptrs {
+            let tls = c.flag()?;
             let at = c.uleb()?;
             let target = match c.byte()? {
                 0 => DataPtrTarget::SelfOff(c.uleb()?),
@@ -1929,7 +1963,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
                 },
                 b => return Err(DecodeError::BadDataPtrTag(b)),
             };
-            data_ptrs.push(DataPtr { at, target });
+            data_ptrs.push(DataPtr { at, target, tls });
         }
     }
     // Object-only `data.funcref` relocation section, mirroring the encoder. Byte shape only — the
@@ -1941,6 +1975,21 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
             let at = c.uleb()?;
             let name = c.str()?;
             data_funcrefs.push(temen_ir::DataFuncref { at, name });
+        }
+    }
+    // Object-only thread-local template section (v12, #1715), mirroring the encoder. Grows on demand.
+    let mut tls = Vec::new();
+    if object {
+        let nseg = c.count()?;
+        for _ in 0..nseg {
+            let offset = c.uleb()?;
+            let len = c.count()?;
+            let bytes = c.take(len)?.to_vec();
+            tls.push(Data {
+                offset,
+                readonly: false,
+                bytes,
+            });
         }
     }
     // §7 import section (v2): mirrors the encoder. Grows on demand (the count is attacker-influenced).
@@ -1980,7 +2029,8 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
         for _ in 0..ndexports {
             let name = c.str()?;
             let offset = c.uleb()?;
-            data_exports.push(DataExport { name, offset });
+            let tls = c.flag()?;
+            data_exports.push(DataExport { name, offset, tls });
         }
     }
     // Type section (v6): mirrors the encoder. Grows on demand (attacker-influenced
@@ -2062,6 +2112,7 @@ fn decode_impl(bytes: &[u8], allow_object: bool) -> Result<Module, DecodeError> 
     Ok(Module {
         data_ptrs,
         data_funcrefs,
+        tls,
         funcs,
         memory,
         data,
@@ -2182,6 +2233,7 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
                 }
             }
             4 => VarLoc::Fixed { addr: c.uleb()? },
+            5 => VarLoc::Tls { off: c.uleb()? },
             b => return Err(DecodeError::BadVarLoc(b)),
         };
         let type_id = match c.byte()? {
@@ -2215,6 +2267,7 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
     // Function names (§6) — a trailing section: an artifact from before they existed ends right after
     // the blobs, so `at_end` ⇒ none (the field was appended last, after `blobs`, for this compat).
     let mut func_names = Vec::new();
+    let mut tls_root = None;
     if !c.at_end() {
         let n = c.count()?;
         for _ in 0..n {
@@ -2223,6 +2276,11 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
                 name: c.str()?,
             });
         }
+        tls_root = match c.byte()? {
+            0 => None,
+            1 => Some(c.uleb()?),
+            b => return Err(DecodeError::BadOptionFlag(b)),
+        };
     }
     Ok(DebugInfo {
         files,
@@ -2231,6 +2289,7 @@ fn decode_debug_info(c: &mut Cursor) -> Result<DebugInfo, DecodeError> {
         vars,
         blobs,
         func_names,
+        tls_root,
     })
 }
 
@@ -2356,14 +2415,21 @@ fn decode_inst(c: &mut Cursor, object: bool) -> Result<Inst, DecodeError> {
         },
         // v9 link-form data addresses: object-dialect only — in a runnable module these bytes
         // fall through to the BadOpcode arm (the guard fails), exactly as under v8.
-        op::DATA_SELF if object => Inst::DataSelf { offset: c.uleb()? },
+        op::DATA_SELF if object => Inst::DataSelf {
+            offset: c.uleb()?,
+            tls: c.flag()?,
+        },
         op::DATA_SYM if object => {
             // The name is raw length-prefixed bytes (`Vec<u8>`, matching the IR — not UTF-8
             // checked, unlike section name strings; the linker compares bytes).
             let len = c.count()?;
             let name = c.take(len)?.to_vec();
             let addend = c.sleb()?;
-            Inst::DataSym { name, addend }
+            Inst::DataSym {
+                name,
+                addend,
+                tls: c.flag()?,
+            }
         }
         op::DATA_TOP if object => Inst::DataTop,
         op::CALL_IMPORT_DYN => Inst::CallImportDyn {
@@ -2675,6 +2741,15 @@ impl<'a> Cursor<'a> {
         self.bytes.len().saturating_sub(self.pos)
     }
 
+    /// A 0/1 flag byte (a data segment's `readonly`, a link form's `tls`); anything else fails closed.
+    fn flag(&mut self) -> Result<bool, DecodeError> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => Err(DecodeError::BadDataFlag(other)),
+        }
+    }
+
     fn byte(&mut self) -> Result<u8, DecodeError> {
         let b = *self.bytes.get(self.pos).ok_or(DecodeError::UnexpectedEof)?;
         self.pos += 1;
@@ -2809,6 +2884,7 @@ mod object_tests {
                 DataPtr {
                     at: 0,
                     target: DataPtrTarget::SelfOff(16),
+                    tls: false,
                 },
                 DataPtr {
                     at: 8,
@@ -2816,25 +2892,58 @@ mod object_tests {
                         name: "g_table".into(),
                         addend: -4,
                     },
+                    tls: false,
+                },
+                // #1715: a pointer in a thread-local's initializer patches the template.
+                DataPtr {
+                    at: 8,
+                    target: DataPtrTarget::SelfOff(0),
+                    tls: true,
                 },
             ],
             data_funcrefs: Vec::new(),
-            data_exports: vec![DataExport {
-                name: "g_mine".into(),
-                offset: 16,
+            tls: vec![Data {
+                offset: 0,
+                readonly: false,
+                bytes: vec![7u8; 16],
             }],
+            data_exports: vec![
+                DataExport {
+                    name: "g_mine".into(),
+                    offset: 16,
+                    tls: false,
+                },
+                DataExport {
+                    name: "t_mine".into(),
+                    offset: 4,
+                    tls: true,
+                },
+            ],
             funcs: vec![Func {
                 params: vec![],
                 results: vec![ValType::I64],
                 blocks: vec![Block {
                     params: vec![],
                     insts: vec![
-                        Inst::DataSelf { offset: 8 },
+                        Inst::DataSelf {
+                            offset: 8,
+                            tls: false,
+                        },
                         Inst::DataSym {
                             name: b"g_table".to_vec(),
                             addend: 12,
+                            tls: false,
                         },
                         Inst::DataTop,
+                        Inst::DataSelf {
+                            offset: 4,
+                            tls: true,
+                        },
+                        Inst::DataSym {
+                            name: b"t_other".to_vec(),
+                            addend: 0,
+                            tls: true,
+                        },
                     ],
                     term: Terminator::Return(vec![2]),
                 }],
@@ -2865,6 +2974,7 @@ mod object_tests {
         let base = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,
@@ -2909,6 +3019,7 @@ mod object_tests {
         let m = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,
@@ -2955,7 +3066,8 @@ mod object_tests {
     #[should_panic(expected = "link-form")]
     fn encode_module_panics_on_link_forms() {
         let mut m = unit();
-        m.data_ptrs.clear(); // reach the instruction assert, not the section assert
+        m.data_ptrs.clear(); // reach the instruction assert, not the section asserts
+        m.tls.clear();
         m.data_exports.clear();
         let _ = encode_module(&m);
     }
@@ -3108,6 +3220,15 @@ mod debug_tests {
                     type_id: Some(0),
                     scope: None,
                 },
+                // A thread-local (#1715): an offset in the per-thread block.
+                VarInfo {
+                    func: temen_ir::GLOBAL_SCOPE,
+                    name: "my_val".into(),
+                    ty: "int".into(),
+                    loc: VarLoc::Tls { off: 8 },
+                    type_id: Some(0),
+                    scope: None,
+                },
             ],
             // An opaque per-producer rich blob (incl. non-UTF-8 / NUL bytes — verbatim DWARF).
             blobs: vec![ProducerBlob {
@@ -3124,6 +3245,7 @@ mod debug_tests {
                     name: "main".into(),
                 },
             ],
+            tls_root: Some(0x2_0000),
         }
     }
 
@@ -3131,6 +3253,7 @@ mod debug_tests {
         Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![],
             memory: None,

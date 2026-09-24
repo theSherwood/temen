@@ -155,6 +155,7 @@ fn build_module(win_log2: u8) -> Module {
         data_exports: Vec::new(),
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        tls: Vec::new(),
         impl_exports: Vec::new(),
         debug_info: None,
     }

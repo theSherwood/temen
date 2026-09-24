@@ -72,16 +72,22 @@ pub fn print_module(m: &Module) -> String {
             escape_bytes(&d.bytes)
         );
     }
+    // Thread-local template segments (#1715), in the unit's per-thread block: `data tls <off> "…"`.
+    for d in &m.tls {
+        let _ = writeln!(s, "data tls {} \"{}\"", d.offset, escape_bytes(&d.bytes));
+    }
     // Data-image pointer relocations (the data→data case): `data.ptr <at> self <off>` for a pointer
     // into this unit's own data, `data.ptr <at> sym "<name>" <addend>` for a cross-unit one. `link`
     // resolves and clears these, so they print only on a pre-link object.
+    // `data.ptr tls …` patches the thread-local template instead of the data image (#1715).
     for p in &m.data_ptrs {
+        let tls = if p.tls { "tls " } else { "" };
         match &p.target {
             temen_ir::DataPtrTarget::SelfOff(off) => {
-                let _ = writeln!(s, "data.ptr {} self {off}", p.at);
+                let _ = writeln!(s, "data.ptr {tls}{} self {off}", p.at);
             }
             temen_ir::DataPtrTarget::Sym { name, addend } => {
-                let _ = writeln!(s, "data.ptr {} sym {} {addend}", p.at, quote_str(name));
+                let _ = writeln!(s, "data.ptr {tls}{} sym {} {addend}", p.at, quote_str(name));
             }
         }
     }
@@ -143,10 +149,17 @@ pub fn print_module(m: &Module) -> String {
         }
         s.push('\n');
     }
-    // Data exports (their own dense index sequence): `export <idx> data "<name>" <offset>`.
+    // Data exports (their own dense index sequence): `export <idx> data "<name>" [tls] <offset>`
+    // — `tls` for a thread-local, whose offset is in the unit's thread-local template (#1715).
     if !m.data_exports.is_empty() {
         for (i, e) in m.data_exports.iter().enumerate() {
-            let _ = writeln!(s, "export {i} data {} {}", quote_str(&e.name), e.offset);
+            let tls = if e.tls { "tls " } else { "" };
+            let _ = writeln!(
+                s,
+                "export {i} data {} {tls}{}",
+                quote_str(&e.name),
+                e.offset
+            );
         }
         s.push('\n');
     }
@@ -207,6 +220,10 @@ fn print_debug_info(s: &mut String, m: &Module) {
     }
     for fname in &di.func_names {
         let _ = writeln!(s, "debug.fname {} {}", fname.func, quote_str(&fname.name));
+    }
+    // `debug.tls_root <addr>` — the root thread's thread-local block (#1715).
+    if let Some(root) = di.tls_root {
+        let _ = writeln!(s, "debug.tls_root {root}");
     }
     for l in &di.locs {
         let _ = writeln!(
@@ -271,8 +288,9 @@ fn print_debug_info(s: &mut String, m: &Module) {
         // `debug.var <fn> "<name>" <loc> "<ty>" [<type_id>]`, where `<fn>` is a function index or
         // `global` (a module-scoped global, visible in every frame) and `<loc>` is `win <off>`,
         // `ssa <value>`, `ssalist <n> <b0> <i0> <v0> …` (the location list, S2),
-        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset), or
-        // `fixed <addr>` (a global's absolute window address).
+        // `winvia <n> <b0> <i0> <v0> … <off>` (window via a per-pc base value + offset),
+        // `fixed <addr>` (a global's absolute window address), or `tls <off>` (a thread-local's
+        // offset in the per-thread block, #1715).
         if v.func == temen_ir::GLOBAL_SCOPE {
             let _ = write!(s, "debug.var global {} ", quote_str(&v.name));
         } else {
@@ -300,6 +318,9 @@ fn print_debug_info(s: &mut String, m: &Module) {
             }
             VarLoc::Fixed { addr } => {
                 let _ = write!(s, "fixed {addr}");
+            }
+            VarLoc::Tls { off } => {
+                let _ = write!(s, "tls {off}");
             }
         }
         let _ = write!(s, " {}", quote_str(&v.ty));
@@ -458,10 +479,13 @@ fn print_inst(inst: &Inst, m: &Module, prev_const0: Option<u32>) -> String {
         Inst::ConstI64(c) => format!("i64.const {c}"),
         // Link-form data addresses (resolved to `i64.const` by `link`): `data.sym "<name>" <addend>`
         // for a cross-unit symbol, `data.self <offset>` for this unit's own data.
-        Inst::DataSym { name, addend } => {
-            format!("data.sym \"{}\" {addend}", escape_bytes(name))
+        Inst::DataSym { name, addend, tls } => {
+            let tls = if *tls { "tls " } else { "" };
+            format!("data.sym {tls}\"{}\" {addend}", escape_bytes(name))
         }
-        Inst::DataSelf { offset } => format!("data.self {offset}"),
+        Inst::DataSelf { offset, tls } => {
+            format!("data.self {}{offset}", if *tls { "tls " } else { "" })
+        }
         Inst::DataTop => "data.top".to_string(),
         Inst::IntBin { ty, op, a, b } => format!("{}.{} v{a} v{b}", ty.prefix(), op.name()),
         Inst::IntUn { ty, op, a } => format!("{}.{} v{a}", ty.prefix(), op.name()),
@@ -1233,6 +1257,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut memory = None;
     let mut data: Vec<Data> = Vec::new();
     let mut data_ptrs: Vec<temen_ir::DataPtr> = Vec::new();
+    let mut tls_data: Vec<Data> = Vec::new();
     let mut exports: Vec<Export> = Vec::new();
     let mut data_exports: Vec<temen_ir::DataExport> = Vec::new();
     let mut impl_exports: Vec<ImplExport> = Vec::new();
@@ -1242,6 +1267,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
     let mut dbg_vars: Vec<VarInfo> = Vec::new();
     let mut dbg_blobs: Vec<ProducerBlob> = Vec::new();
     let mut dbg_func_names: Vec<FuncName> = Vec::new();
+    let mut dbg_tls_root: Option<u64> = None;
     while !p.at_end() {
         match p.peek() {
             // Debug-info waist (DEBUGGING.md §6) — strippable tooling, parsed into `Module::
@@ -1264,6 +1290,11 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 let name = String::from_utf8(p.parse_str()?)
                     .map_err(|_| ParseError("debug.fname name is not valid UTF-8".into()))?;
                 dbg_func_names.push(FuncName { func, name });
+            }
+            // `debug.tls_root <addr>` — the root thread's thread-local block (#1715).
+            Some(Tok::Ident(s)) if s == "debug.tls_root" => {
+                p.next()?;
+                dbg_tls_root = Some(p.parse_u64()?);
             }
             Some(Tok::Ident(s)) if s == "debug.loc" => {
                 p.next()?;
@@ -1390,9 +1421,12 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     "fixed" => VarLoc::Fixed {
                         addr: p.parse_u64()?,
                     },
+                    "tls" => VarLoc::Tls {
+                        off: p.parse_u64()?,
+                    },
                     k => {
                         return err(format!(
-                            "debug.var location kind must be win, ssa, ssalist, winvia, or fixed, got {k}"
+                            "debug.var location kind must be win, ssa, ssalist, winvia, fixed, or tls, got {k}"
                         ))
                     }
                 };
@@ -1505,22 +1539,26 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                 };
                 p.imports.push(Import { name, shape, mode });
             }
-            // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40).
+            // Module-level `data [ro] <offset> "<bytes>"` segment (§3a / D40), or `data tls <offset>
+            // "<bytes>"`: a segment of the unit's thread-local template (#1715).
             Some(Tok::Ident(s)) if s == "data" => {
                 p.next()?;
-                let readonly = matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro");
-                if readonly {
-                    p.next()?;
-                }
+                let tls = p.eat_ident("tls")?;
+                let readonly = !tls && p.eat_ident("ro")?;
                 let n = p.parse_int()?;
                 let offset = u64::try_from(n)
                     .map_err(|_| ParseError(format!("negative data offset: {n}")))?;
                 let bytes = p.parse_str()?;
-                data.push(Data {
+                let seg = Data {
                     offset,
                     readonly,
                     bytes,
-                });
+                };
+                if tls {
+                    tls_data.push(seg);
+                } else {
+                    data.push(seg);
+                }
             }
             // Data-image pointer relocation (the data→data case, D-LINK): `data.ptr <at> self
             // <off>` writes this unit's own data address `dbase+off` at slot `at`; `data.ptr <at>
@@ -1529,6 +1567,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             // `debug.*` directives, so it never collides with the `data` segment arm above.)
             Some(Tok::Ident(s)) if s == "data.ptr" => {
                 p.next()?;
+                let tls = p.eat_ident("tls")?;
                 let at = p.parse_u64()?;
                 let kind = p.parse_ident()?;
                 let target = match kind.as_str() {
@@ -1542,7 +1581,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                     }
                     k => return err(format!("data.ptr target must be self or sym: {k}")),
                 };
-                data_ptrs.push(temen_ir::DataPtr { at, target });
+                data_ptrs.push(temen_ir::DataPtr { at, target, tls });
             }
             // The type section (OQ3; §3.5 surface): `type <idx> func (params) -> (results)`
             // declares a signature entry; `type <idx> interface { name: ty, ... }` declares an
@@ -1627,8 +1666,9 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
                                 "data export indices must be dense and in declaration order",
                             );
                         }
+                        let tls = p.eat_ident("tls")?;
                         let offset = p.parse_u64()?;
-                        data_exports.push(temen_ir::DataExport { name, offset });
+                        data_exports.push(temen_ir::DataExport { name, offset, tls });
                     }
                     k => return err(format!("export kind must be func, interface, or data: {k}")),
                 }
@@ -1651,6 +1691,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             vars: dbg_vars,
             blobs: dbg_blobs,
             func_names: dbg_func_names,
+            tls_root: dbg_tls_root,
         })
     } else if auto_debug && !p.auto_locs.is_empty() {
         // No explicit section, and the caller asked to synthesize one from the source.
@@ -1661,6 +1702,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
             vars: std::mem::take(&mut p.auto_vars),
             blobs: Vec::new(),
             func_names: Vec::new(),
+            tls_root: None,
         })
     } else {
         None
@@ -1673,6 +1715,7 @@ fn parse_module_inner(src: &str, auto_debug: bool) -> Result<Module, ParseError>
         // `data.funcref` relocations have no text opcode — the nimony frontend attaches them to the
         // parsed object module directly (they need the module stem, which the text layer lacks).
         data_funcrefs: Vec::new(),
+        tls: tls_data,
         imports: std::mem::take(&mut p.imports),
         exports,
         data_exports,
@@ -1733,9 +1776,9 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 }
             }
             Some(Tok::Ident(s)) if s == "data" => {
-                // `data [ro] <offset> "<bytes>"` — skip past it in the header prescan.
+                // `data [ro|tls] <offset> "<bytes>"` — skip past it in the header prescan.
                 p.next()?;
-                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro") {
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "ro" || k == "tls") {
                     p.next()?;
                 }
                 p.parse_int()?;
@@ -1745,6 +1788,7 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
             // header prescan (carries no function; lexes as its own ident, distinct from `data`).
             Some(Tok::Ident(s)) if s == "data.ptr" => {
                 p.next()?;
+                p.eat_ident("tls")?;
                 p.parse_int()?; // at
                 let kind = p.parse_ident()?;
                 if kind == "sym" {
@@ -1791,8 +1835,9 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.parse_int()?;
                 let kind = p.parse_ident()?;
                 p.parse_str()?;
-                // 7.4 — skip the optional `threaded` policy keyword in the prescan.
-                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "threaded") {
+                // 7.4 — skip the optional `threaded` policy keyword (an interface offer) or `tls`
+                // (a thread-local data export, #1715) in the prescan.
+                if matches!(p.peek(), Some(Tok::Ident(k)) if k == "threaded" || k == "tls") {
                     p.next()?;
                 }
                 p.parse_int()?;
@@ -1833,6 +1878,10 @@ fn prescan_fn_results(toks: &[Tok]) -> Result<Vec<usize>, ParseError> {
                 p.next()?;
                 p.parse_int()?; // func index
                 p.parse_str()?; // name
+            }
+            Some(Tok::Ident(s)) if s == "debug.tls_root" => {
+                p.next()?;
+                p.parse_int()?;
             }
             Some(Tok::Ident(s)) if s == "debug.loc" => {
                 p.next()?;
@@ -2727,16 +2776,20 @@ impl<'a> Parser<'a> {
         // Link-form data addresses: `data.sym "<name>" <addend>` (a cross-unit data symbol) and
         // `data.self <offset>` (this unit's own data). Both yield an `i64` address; `link` rewrites
         // them to `i64.const`. The name rides inline — there is no separate relocation table.
+        // A `tls` keyword makes either a thread-local reference: an offset within the per-thread
+        // block rather than a window address (#1715).
         if op == "data.sym" {
+            let tls = self.eat_ident("tls")?;
             let name = self.parse_str()?; // raw bytes (Copy-clone friendly Inst field)
             let addend = self.parse_int()?;
-            return Ok(Inst::DataSym { name, addend });
+            return Ok(Inst::DataSym { name, addend, tls });
         }
         if op == "data.self" {
+            let tls = self.eat_ident("tls")?;
             let n = self.parse_int()?;
             let offset = u64::try_from(n)
                 .map_err(|_| ParseError(format!("data.self offset out of range: {n}")))?;
-            return Ok(Inst::DataSelf { offset });
+            return Ok(Inst::DataSelf { offset, tls });
         }
         if op == "data.top" {
             return Ok(Inst::DataTop);
@@ -3565,6 +3618,15 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume the keyword `kw` if it is the next token; report whether it was there.
+    fn eat_ident(&mut self, kw: &str) -> Result<bool, ParseError> {
+        let here = matches!(self.peek(), Some(Tok::Ident(k)) if k == kw);
+        if here {
+            self.next()?;
+        }
+        Ok(here)
+    }
+
     /// Parse a byte-string literal (data-segment bytes).
     fn parse_str(&mut self) -> Result<Vec<u8>, ParseError> {
         match self.next()? {
@@ -4026,6 +4088,7 @@ block 0 (v0: i32) {
                 func: 0,
                 name: nasty.into(),
             }],
+            tls_root: None,
         });
         let printed = print_module(&m);
         assert!(
@@ -4058,6 +4121,7 @@ block 0 (v0: i32) {
                 }],
                 blobs: vec![],
                 func_names: vec![],
+                tls_root: None,
             }),
             ..Default::default()
         };

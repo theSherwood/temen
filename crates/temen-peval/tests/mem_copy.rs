@@ -77,6 +77,7 @@ fn tvalue_copy_module() -> Module {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![],
         debug_info: None,
