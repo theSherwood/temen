@@ -7222,18 +7222,33 @@ fn freeze_in_flight(s: &Sched) -> bool {
             .values()
             .flatten()
             .any(|(_, w)| matches!(w, Waiter::VCpu(v) if unwinding(v)))
+        || s.pipe_waiters
+            .values()
+            .chain(s.pipe_write_waiters.values())
+            .flatten()
+            .any(|w| matches!(w, Waiter::VCpu(v) if unwinding(v)))
+        || s.posix_reap_waiters
+            .values()
+            .flatten()
+            .any(|v| unwinding(v))
 }
 
-/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait` and futex **vCPU**
-/// parks are re-admitted; a joiner or lane waiter is woken by something else, and a fiber park is
-/// its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left would spin
-/// the worker loop instead of falling through to the deadlock check.
+/// #1584 — would [`admit_parks_for_freeze`] re-admit anything? Only `svc.wait`, futex, pipe and
+/// reap **vCPU** parks are re-admitted; a joiner or lane waiter is woken by something else, and a
+/// fiber park is its owner's `freeze_drive`'s. Without this an in-flight freeze with only those left
+/// would spin the worker loop instead of falling through to the deadlock check.
 fn freeze_can_admit(s: &Sched) -> bool {
     !s.svc_waiters.is_empty()
+        || !s.posix_reap_waiters.is_empty()
         || s.wait_waiters
             .values()
             .flatten()
             .any(|(_, w)| matches!(w, Waiter::VCpu(_)))
+        || s.pipe_waiters
+            .values()
+            .chain(s.pipe_write_waiters.values())
+            .flatten()
+            .any(|w| matches!(w, Waiter::VCpu(_)))
 }
 
 /// #1584 / §13.4 4c-bis — bring every park the scheduler owns through a freeze, for either trigger
@@ -7250,7 +7265,9 @@ fn freeze_can_admit(s: &Sched) -> bool {
 /// re-executed suspend point observes `UNWINDING` and unwinds. The transform instruments both as
 /// re-issue suspend points (`SuspendKind::MemoryWait` for `atomic.wait`), so a futex waiter gets the
 /// same `WAIT_WOKEN` the JIT's own freeze arm delivers: discarded by the safepoint that unwinds
-/// before the guest can observe it, and the thaw re-issues the wait.
+/// before the guest can observe it, and the thaw re-issues the wait. A pipe read/write or reap bench
+/// is re-admitted too (#1672): its rewound op re-executes under the freeze and is abandoned
+/// ([`Decision::Abandon`]), and the thaw re-issues the call.
 ///
 /// A joiner or lane waiter *will* be woken by something else — its child completing (here, by
 /// unwinding), a lane coming free — so it takes the phase without re-admission. Without the phase
@@ -7269,6 +7286,29 @@ fn admit_parks_for_freeze(s: &mut Sched) {
     }
     for v in s.lane_waiters.iter_mut() {
         v.dstate = STATE_UNWINDING;
+    }
+    // #1672 — a pipe read/write or a reap bench parked with its op rewound and unperformed. The
+    // re-admitted vCPU re-executes it under the freeze, which abandons it ([`Decision::Abandon`]) for
+    // the thaw to re-issue. A parked fiber stays, as for a futex wait (#1676).
+    for waiters in [&mut s.pipe_waiters, &mut s.pipe_write_waiters] {
+        for q in waiters.values_mut() {
+            for w in std::mem::take(q) {
+                match w {
+                    Waiter::VCpu(mut v) => {
+                        v.dstate = STATE_UNWINDING;
+                        s.runnable.push_back(v);
+                    }
+                    fiber => q.push(fiber),
+                }
+            }
+        }
+        waiters.retain(|_, q| !q.is_empty());
+    }
+    for (_, q) in std::mem::take(&mut s.posix_reap_waiters) {
+        for mut v in q {
+            v.dstate = STATE_UNWINDING;
+            s.runnable.push_back(v);
+        }
     }
     for (key, q) in std::mem::take(&mut s.wait_waiters) {
         for (tag, w) in q {
@@ -8009,7 +8049,11 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // hit 0 writers; wake their parked readers once the scheduler lock is held below. It
                 // *also* releases its read ends — a consumer that exits (e.g. `head`) drops the reader
                 // count, so a parked upstream producer wakes to `-EPIPE` rather than hang forever.
-                let (pipe_eofs, pipe_epipes) = {
+                // A vCPU that unwound for a freeze has not exited (#1672): its ends stay open for the
+                // cut, or a reader elsewhere in the tree would see a false EOF mid-freeze.
+                let (pipe_eofs, pipe_epipes) = if froze {
+                    (Vec::new(), Vec::new())
+                } else {
                     let hg = v.host.lock_unpoisoned();
                     (hg.drop_all_pipe_writers(), hg.drop_all_pipe_readers())
                 };
@@ -9533,6 +9577,7 @@ pub use temen_ir::durable_abi::{ShadowArena, DURABLE_CONTROL_END};
 /// plus the 4-byte thaw word, padded to 8 to keep frames 8-aligned. Must equal
 /// `temen_durable::REGION_HEADER_LEN`.
 pub use temen_ir::durable_abi::REGION_HEADER_LEN;
+use temen_ir::durable_abi::REISSUE_IN_REGION_OFF;
 /// Bytes reserved at each region's base for its **per-context shadow-SP word** (§12.8 4A.5): the SP
 /// word lives at `shadow_region_base(ctx)`; frames grow upward from [`shadow_frame_base`]. So a vCPU
 /// addresses *its own* SP word (via `durable.shadow_base`) with no shared location.
@@ -11688,6 +11733,12 @@ enum Decision {
     /// The exec was refused: the op's `-ENOSYS` placeholder becomes a probeable `-EINVAL`, caller
     /// still running (POSIX: `execve` returns only on failure).
     ExecRefused,
+    /// #1672 — the op would park (a pipe read/write, a reap bench) but a freeze is landing on a
+    /// durable domain. The op took no effect, so it is **abandoned**: the caller sets its context's
+    /// re-issue word and continues with the op's placeholder results. The call's trailing poll
+    /// unwinds, and the thaw re-issues the call against the restored state (DURABILITY §4, "the cut
+    /// and its boundary"). Parking instead would hold the freeze on an event that may never come.
+    Abandon,
 }
 
 /// #799/#1609/#1621/#1635/#1647 — the **one decision** every call form shares, over the transients
@@ -11720,19 +11771,22 @@ fn decide(
     // A fiber or the deterministic explorer cannot be parked or handed to the fork engine; it
     // keeps whatever the op answered.
     let parkable = cur == ROOT_FIBER && matches!(sched, SchedRef::Real(_));
+    // #1672 — under a landing freeze a durable domain never parks: the park is abandoned instead.
+    let freezing = durable && mem.is_some_and(|m| m.durable_state() == STATE_UNWINDING);
+    let park = |d: Decision| if freezing { Decision::Abandon } else { d };
     if t.pipes && parkable {
         if let Some(pipe) = t.read_park {
             return if t.sig_intr {
                 Decision::Eintr
             } else {
-                Decision::PipeRead(pipe)
+                park(Decision::PipeRead(pipe))
             };
         }
         if let Some(pipe) = t.write_park {
             return if t.sig_intr {
                 Decision::Eintr
             } else {
-                Decision::PipeWrite(pipe)
+                park(Decision::PipeWrite(pipe))
             };
         }
     }
@@ -11751,11 +11805,11 @@ fn decide(
             let _ = id;
             Decision::Eintr
         }
-        ParkEvent::TaskExit(id) => Decision::Reap(id),
+        ParkEvent::TaskExit(id) => park(Decision::Reap(id)),
         // #802 rung 3 — the any-child bench: the sentinel flows through the same rewind+park; the
         // drive loop's insert translates it to the per-parent key.
         ParkEvent::TaskExitAny if t.sig_intr => Decision::Eintr,
-        ParkEvent::TaskExitAny => Decision::Reap(REAP_ANY_CHILD),
+        ParkEvent::TaskExitAny => park(Decision::Reap(REAP_ANY_CHILD)),
         // The op resolved the path against the command registry and staged argv/envp; only the
         // resolved command handle rides the request. The staged args are collected at the commit
         // point and nowhere else (#1768): a refused exec returns to an untouched caller.
@@ -11770,6 +11824,14 @@ fn decide(
                 None => Decision::ExecRefused,
             }
         }
+    }
+}
+
+/// #1672 — mark the running context's host call abandoned ([`Decision::Abandon`]): its unwind
+/// spills the re-issue word into the call's frame, and the thaw re-issues the call.
+fn abandon_for_freeze(mem: &mut Option<Mem>, ctx: usize) {
+    if let Some(m) = mem.as_mut() {
+        m.durable_set_reissue(ctx);
     }
 }
 
@@ -14996,6 +15058,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15202,6 +15265,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15371,6 +15435,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -15460,6 +15525,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             frames[top].vals.push(Reg::from_i64(EINTR));
                             eintr_done = true;
                         }
+                        Decision::Abandon => abandon_for_freeze(mem, *durable_sp_ctx),
                         Decision::None => {}
                     }
                     if !eintr_done {
@@ -29949,6 +30015,13 @@ impl Mem {
     /// Set context `ctx`'s per-context **thaw** state word.
     fn durable_set_thaw_state(&mut self, ctx: usize, state: i32) {
         let _ = self.write_bytes_impl(self.thaw_state_off(ctx), &state.to_le_bytes());
+    }
+
+    /// #1672: set context `ctx`'s re-issue word ([`REISSUE_IN_REGION_OFF`]), marking the host call
+    /// it is in as abandoned under a landing freeze.
+    fn durable_set_reissue(&mut self, ctx: usize) {
+        let off = self.shadow.region_base(ctx) + REISSUE_IN_REGION_OFF;
+        let _ = self.write_bytes_impl(off, &1i32.to_le_bytes());
     }
 
     /// Load a vCPU's unified durable phase from the two words it is split across (§12.8 concurrent-thaw

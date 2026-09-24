@@ -1397,6 +1397,21 @@ offsets, `shadow_SP −= frame_size(rid)`, then:
 - else: re-issue the in-flight call (which re-enters the callee, whose own prologue
   sees `REWINDING` and pops the next frame).
 
+**Host calls re-issue when abandoned (#1672).** A host call (`call.cap`, `call.import`,
+`call.import.dyn`, `call.sym`) is the deepest frame, and its thaw normally *reloads* its
+result: the host performed it before the cut. A call that would **park** while a freeze is
+landing (an empty pipe read, a full pipe write, a reap bench) has not taken effect, and parking
+would hold the freeze on an event that may never come. So the runtime abandons it: it sets the
+context's **re-issue word** (`REISSUE_IN_REGION_OFF`, the spare 4 bytes of the region header
+after the thaw word) and returns the op's placeholder results. The call's unwind moves that word
+into its frame (a 4-byte slot just below `resume_id`) and clears it. On thaw the arm branches
+on the reloaded flag: set, it re-issues the call with its reloaded operands (every host call's
+operands are therefore spilled); clear, it reloads the result as before. This generalizes the
+`atomic.wait` `WAIT_FROZEN` rule to calls whose result has no spare sentinel value. Only the
+interpreter oracle abandons today; the JIT and bytecode engines never set the word, so their
+host calls keep reloading. Pinned by `temen-durable/tests/quiesce_parks.rs::
+a_pipe_parked_root_is_abandoned_and_its_read_reissued_on_thaw`.
+
 **State word** (`NORMAL | UNWINDING | REWINDING`): per-vCPU, in-window (§2); every
 poll/prologue reads it. Freeze sets all to `UNWINDING` and drives each fiber to drain
 its native stack into its shadow stack; thaw sets `REWINDING` and re-enters.
