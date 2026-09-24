@@ -1453,7 +1453,7 @@ int main(void) {
 /// it; the parent `SIGTSTP`s the child (as a terminal `^Z` does to the foreground job) and
 /// `waitpid(WUNTRACED)` reports the **stop** (`(20 << 8) | 0x7f`, `WIFSTOPPED`) — once. A signal sent
 /// **while the child is stopped** is HELD, proven by a long busy-wait: a still-running child would
-/// consume its token and exit, but `waitpid(WNOHANG)` keeps returning `-ECHILD` (alive, not exited).
+/// consume its token and exit, but `waitpid(WNOHANG)` keeps returning `0` (alive, not exited).
 /// `SIGCONT` resumes it, the held 10 delivers (`sigcheck → 7`), the child exits `7`, and the parent
 /// reaps `WEXITSTATUS == 7`. This is the `ctrl_z_stops_a_forked_child_and_fg_resumes_it` oracle
 /// (`c_fork.rs`, VM-cap band) carried onto the `__px_*` personality band and **differentialled across

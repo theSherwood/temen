@@ -80,7 +80,7 @@ fn phase(path: &str, what: &str) -> temen_ir::Module {
 /// failure path means the answer is already on disk when the question comes up, rather than costing
 /// another full run of tree-walked compilers.
 fn dump_cache(posix: &temen_posix::Posix, dir: &str) {
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("note: cannot create {dir}: {e}");
         return;
     }
