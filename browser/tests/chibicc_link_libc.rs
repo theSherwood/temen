@@ -423,6 +423,102 @@ int main(void) {
     );
 }
 
+/// **A resident library's globals stay out of the program's debug view** (#1806). The playground libc
+/// is linked into every lesson, and its module-scoped globals (`__pg_std`, `__pg_brk`, …) used to
+/// merge into the linked program's debug vars, so every frame's Locals listed them beside the
+/// learner's own. Opening a library resident drops them. The program's global and local, and the
+/// library's own function locals and line table (a step into `printf` still resolves), all stay.
+#[test]
+fn a_resident_librarys_globals_stay_out_of_the_programs_debug_vars() {
+    let Some(chibicc) = chibicc_temen() else {
+        eprintln!("SKIP: chibicc.temen not built");
+        return;
+    };
+    const USER: &str = r#"#include <stdio.h>
+int counter = 3;
+int main(void) {
+  int x = counter + 1;
+  printf("%d\n", x);
+  return 0;
+}
+"#;
+    let lib_ir = emit_object(
+        &chibicc,
+        "__pg_libc.c",
+        &[("__pg_libc.c", temen_browser::playground_libc_tu())],
+        true,
+    );
+    let lib = temen_text::parse_module(&lib_ir).expect("libc unit parses");
+    let lib_debug = lib
+        .debug_info
+        .as_ref()
+        .expect("-g libc unit carries debug info");
+    assert!(
+        lib_debug
+            .vars
+            .iter()
+            .any(|v| v.func == temen_ir::GLOBAL_SCOPE && v.name.starts_with("__pg_")),
+        "the libc unit itself describes its globals (what used to leak)"
+    );
+    assert!(
+        lib_debug
+            .vars
+            .iter()
+            .any(|v| v.func != temen_ir::GLOBAL_SCOPE),
+        "the libc unit describes its functions' locals"
+    );
+
+    let prog_ir = emit_object_flags(
+        &chibicc,
+        "in.c",
+        &[("in.c", USER)],
+        true,
+        temen_browser::PG_DECLS_ONLY_ARGV,
+    );
+    let h = temen_browser::temen_link_lib_open(lib_ir.as_ptr(), lib_ir.len());
+    assert!(h >= 0, "the libc unit goes resident");
+    assert_eq!(
+        temen_browser::temen_link_text_lib(h, prog_ir.as_ptr(), prog_ir.len(), b"main".as_ptr(), 4),
+        0,
+        "link-to-text against the resident libc"
+    );
+    temen_browser::temen_link_lib_close(h);
+    let text = String::from_utf8(read_out()).expect("IR text is utf8");
+    let linked = temen_text::parse_module(&text).expect("linked text parses");
+    let debug = linked.debug_info.as_ref().expect("merged debug info");
+
+    let globals: Vec<&str> = debug
+        .vars
+        .iter()
+        .filter(|v| v.func == temen_ir::GLOBAL_SCOPE)
+        .map(|v| v.name.as_str())
+        .collect();
+    assert_eq!(globals, ["counter"], "only the program's own global");
+    let main = debug
+        .func_names
+        .iter()
+        .find(|n| n.name == "main")
+        .expect("main is named")
+        .func;
+    assert!(
+        debug.vars.iter().any(|v| v.name == "x" && v.func == main),
+        "the program's local survives"
+    );
+    // The link stubs out the library functions nothing reaches, so fewer than `lib_locals` remain;
+    // the ones `printf` reaches keep theirs.
+    assert!(
+        debug
+            .vars
+            .iter()
+            .any(|v| v.func != temen_ir::GLOBAL_SCOPE && v.func != main),
+        "the library's function locals survive beside the program's"
+    );
+    assert!(
+        debug.files.iter().any(|f| f.contains("__pg_stdio_impl.h")),
+        "the library's line table survives"
+    );
+}
+
 /// The bytes the cdylib accessors currently hold (`temen_stdout_ptr`/`_len`).
 fn read_out() -> Vec<u8> {
     let n = temen_browser::temen_stdout_len();

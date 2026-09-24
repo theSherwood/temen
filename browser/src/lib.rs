@@ -9627,13 +9627,22 @@ static mut LINK_LIBS: Vec<Option<LinkLib>> = Vec::new();
 /// resident for [`temen_link_run_lib`]. Returns its handle (`>= 0`; the lowest free slot) or `-1` on a
 /// decode failure ([`STATUS_DECODE_ERR`] in [`temen_status`], nothing resident). The bytes are copied
 /// out (decoded), so the host may `temen_dealloc` them right after this returns.
+///
+/// A resident library is linked *into* the program being debugged, never debugged as one, so its
+/// module-scoped globals are implementation internals: their debug vars are dropped here (#1806).
+/// Otherwise every frame's Locals and the shared-state `globals` list would carry them beside the
+/// program's own (a playground libc's `__pg_std`, `__pg_brk`, …). The library's line table and its
+/// functions' locals stay, so a step into it still shows where it is.
 #[no_mangle]
 pub extern "C" fn temen_link_lib_open(lib_ptr: *const u8, lib_len: usize) -> i32 {
     let set = |s: i32| unsafe { LAST_STATUS = s };
-    let Some(module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
+    let Some(mut module) = link_load_unit(link_slice(lib_ptr, lib_len)) else {
         set(STATUS_DECODE_ERR);
         return -1;
     };
+    if let Some(debug) = module.debug_info.as_mut() {
+        debug.vars.retain(|v| v.func != temen_ir::GLOBAL_SCOPE);
+    }
     let exports = link_lib_exports(&module);
     // SAFETY: single-threaded wasm; exclusive access to the resident table.
     let libs = unsafe { &mut *core::ptr::addr_of_mut!(LINK_LIBS) };
