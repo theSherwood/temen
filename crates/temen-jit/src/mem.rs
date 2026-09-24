@@ -897,7 +897,158 @@ mod pal {
                 !h.is_null(),
                 "temen-jit: AddVectoredExceptionHandler failed"
             );
+            // TEMP(#1793): last in the chain, so it sees only what nothing before it resolved.
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                AddVectoredExceptionHandler(0, Some(diag::report))
+            };
         });
+    }
+
+    /// TEMP(#1793) diagnostics, to be removed with the fix: report an error-severity exception that
+    /// no earlier handler resolved — registers, module + RVA, code bytes, stack words, TEB fields,
+    /// guard state — straight to stderr (no allocation, no locks), then a backtrace.
+    #[cfg(target_arch = "x86_64")]
+    mod diag {
+        use super::{EXCEPTION_CONTINUE_SEARCH, GUARD, TRIPPED};
+        use core::ffi::c_void;
+        use core::fmt::Write as _;
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use windows_sys::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetStdHandle(n: u32) -> *mut c_void;
+            fn WriteFile(h: *mut c_void, b: *const u8, n: u32, w: *mut u32, o: *mut c_void) -> i32;
+            fn GetModuleHandleExA(flags: u32, addr: *const u8, m: *mut *mut c_void) -> i32;
+            fn GetModuleFileNameA(m: *mut c_void, b: *mut u8, n: u32) -> u32;
+            fn GetCurrentThreadId() -> u32;
+        }
+
+        struct Buf {
+            b: [u8; 8192],
+            n: usize,
+        }
+        impl core::fmt::Write for Buf {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let k = s.len().min(self.b.len() - self.n);
+                self.b[self.n..self.n + k].copy_from_slice(&s.as_bytes()[..k]);
+                self.n += k;
+                Ok(())
+            }
+        }
+        unsafe fn out(b: &[u8]) {
+            let mut w = 0u32;
+            WriteFile(
+                GetStdHandle(0xFFFF_FFF4),
+                b.as_ptr(),
+                b.len() as u32,
+                &mut w,
+                core::ptr::null_mut(),
+            );
+        }
+        /// `(module base, module path)` for the image containing `a`, if any.
+        unsafe fn module_of(a: usize, name: &mut [u8; 260]) -> Option<(usize, usize)> {
+            let mut m = core::ptr::null_mut();
+            // FROM_ADDRESS | UNCHANGED_REFCOUNT
+            if GetModuleHandleExA(0x4 | 0x2, a as *const u8, &mut m) == 0 {
+                return None;
+            }
+            let n = GetModuleFileNameA(m, name.as_mut_ptr(), 260) as usize;
+            Some((m as usize, n))
+        }
+
+        pub(super) unsafe extern "system" fn report(ep: *mut EXCEPTION_POINTERS) -> i32 {
+            static N: AtomicU32 = AtomicU32::new(0);
+            let ep = &*ep;
+            let rec = &*ep.ExceptionRecord;
+            let code = rec.ExceptionCode as u32;
+            if code < 0xC000_0000 || code == 0xE06D_7363 || N.fetch_add(1, Ordering::Relaxed) >= 4 {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let c = &*ep.ContextRecord;
+            let mut b = Buf { b: [0; 8192], n: 0 };
+            let (sb, sl, ds) = super::teb_stack_fields();
+            let _ = writeln!(
+                b,
+                "\n#1793-DIAG tid={} code={code:#x} flags={:#x} at={:p} nparams={} info=[{:#x}, {:#x}]",
+                GetCurrentThreadId(),
+                rec.ExceptionFlags,
+                rec.ExceptionAddress,
+                rec.NumberParameters,
+                rec.ExceptionInformation[0],
+                rec.ExceptionInformation[1],
+            );
+            let _ = writeln!(
+                b,
+                "  rip={:#x} rsp={:#x} rbp={:#x} eflags={:#x} ctxflags={:#x} mxcsr={:#x}",
+                c.Rip, c.Rsp, c.Rbp, c.EFlags, c.ContextFlags, c.MxCsr
+            );
+            let _ = writeln!(
+                b,
+                "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x}",
+                c.Rax, c.Rbx, c.Rcx, c.Rdx, c.Rsi, c.Rdi
+            );
+            let _ = writeln!(
+                b,
+                "  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15
+            );
+            let _ = writeln!(
+                b,
+                "  teb: StackBase={sb:#x} StackLimit={sl:#x} DeallocationStack={ds:#x}"
+            );
+            let g = GUARD.with(|g| g.get());
+            let _ = writeln!(
+                b,
+                "  guard: armed={} ctx={:?} lo={:#x} hi={:#x} tripped={}",
+                g.is_some(),
+                g.map(|f| f.ctx),
+                g.map_or(0, |f| f.lo),
+                g.map_or(0, |f| f.hi),
+                TRIPPED.with(|t| t.get()),
+            );
+            let mut name = [0u8; 260];
+            let rip = c.Rip as usize;
+            match module_of(rip, &mut name) {
+                Some((base, n)) => {
+                    let _ = writeln!(
+                        b,
+                        "  rip module={} base={base:#x} rva={:#x}",
+                        core::str::from_utf8(&name[..n]).unwrap_or("?"),
+                        rip - base
+                    );
+                    let _ = write!(b, "  code[rip-16..rip+32]:");
+                    for i in 0..48usize {
+                        let _ = write!(b, " {:02x}", *((rip - 16 + i) as *const u8));
+                    }
+                    let _ = writeln!(b);
+                }
+                None => {
+                    let _ = writeln!(b, "  rip is in no module");
+                }
+            }
+            let rsp = c.Rsp as usize;
+            if rsp >= sl as usize && rsp + 8 * 32 <= sb as usize {
+                let _ = writeln!(b, "  stack words at rsp:");
+                for i in 0..32usize {
+                    let v = *((rsp + 8 * i) as *const usize);
+                    let _ = write!(b, "    [rsp+{:#05x}] {v:#018x}", 8 * i);
+                    if let Some((base, _)) = module_of(v, &mut name) {
+                        let _ = write!(b, "  (module {base:#x} + {:#x})", v - base);
+                    }
+                    let _ = writeln!(b);
+                }
+            } else {
+                let _ = writeln!(b, "  rsp outside [StackLimit, StackBase)");
+            }
+            out(&b.b[..b.n]);
+            let bt = std::backtrace::Backtrace::force_capture();
+            let mut s = Buf { b: [0; 8192], n: 0 };
+            let _ = writeln!(s, "  backtrace from the handler:\n{bt}");
+            out(&s.b[..s.n]);
+            EXCEPTION_CONTINUE_SEARCH
+        }
     }
 
     /// Read and clear the most recent caught trap's stack (§5/W3): the faulting `pc` + the
@@ -1072,7 +1223,19 @@ mod tests {
     // two hold overlapping-lifetime reservations across that walk. (Harmless on unix.)
     static PAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn pal_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        pal::install_guard(); // TEMP(#1793): the diagnostic reporter rides on this
         PAL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// TEMP(#1793): a progress marker straight to stderr (bypasses libtest's capture, which a crashed
+    /// process never flushes).
+    fn mark(s: &str) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "#1793-MARK {:?} {s}",
+            std::thread::current().id()
+        );
     }
 
     // Entry-shaped probes (the trampoline ABI). They do a single volatile read at a fixed window
@@ -1125,16 +1288,22 @@ mod tests {
     #[test]
     fn pal_guard_catches_tail_fault_not_in_window() {
         let _serial = pal_test_guard();
+        mark("pal_guard: start");
         // 64 KiB committed inside a 1 MiB reservation: offset 0 is live, 512 KiB is in the tail.
         let win = GuestWindow::new(64 << 10, 1 << 20);
+        mark("pal_guard: window made");
         assert!(
             !guarded(&win, read_at_0),
             "an in-window read must complete without a guard fault"
         );
+        mark("pal_guard: read_at_0 done");
         assert!(
             guarded(&win, read_in_tail),
             "a read in the reserved-but-inaccessible tail must be caught by the guard"
         );
+        mark("pal_guard: read_in_tail caught");
+        drop(win);
+        mark("pal_guard: window released");
     }
 
     /// Where `read_in_tail_with_a_wild_rbp` points `rbp`: inaccessible memory *outside* the guarded
