@@ -41,7 +41,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret)
 // ---- a single vCPU on this Worker ---------------------------------------------------------------
 async function worker() {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, vcpu, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
+    smod, entry, slog, fuel, vcpu, rootDomain, tierup, tierupPaged, gptr, glen, tierupCell, jitCodegen, instCodegen, jitService } = workerData;
   const { exports: ex } = await WebAssembly.instantiate(module, engineImports(memory));
   ex.__stack_pointer.value = stackTop; // this Worker's private stack...
   if (ex.__tls_size.value > 0) ex.__wasm_init_tls(tlsBase); // ...and TLS block (per 4b)
@@ -168,6 +168,7 @@ async function worker() {
           const ttlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
           parentPort.postMessage({
             kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
+            rootDomain, // a thread joins its spawner's domain
             win, winSize, fuel,
             slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
           });
@@ -239,7 +240,8 @@ async function worker() {
     if (ev === TRAP) {
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
-      if (role === 'root') parentPort.postMessage({ kind: 'trap' });
+      // A root-domain member's trap ends the run (DESIGN.md §12, I37); see web/worker.js.
+      if (rootDomain) parentPort.postMessage({ kind: 'trap' });
       ex.temen_par_free(v);
       return;
     }
@@ -257,6 +259,7 @@ async function worker() {
       parentPort.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
         vcpu: ex.temen_par_ev_d(v).toString(), // the child's dense vCPU id (seeds its `vcpu.tls`)
+        rootDomain, // a thread joins its spawner's domain
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });
@@ -506,7 +509,7 @@ async function main() {
   const rootSlot = ex.temen_par_alloc(SLOT);
   const rootStackTop = ex.temen_par_alloc(STACK) + STACK;
   const rootTlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-  startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
+  startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
 }
 
 if (isMainThread) main(); else worker();

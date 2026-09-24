@@ -187,7 +187,7 @@ export function makeRunner({ module, memory, ex }) {
         const rootSlot = ex.temen_par_alloc(SLOT);
         const rootStackTop = ex.temen_par_alloc(STACK) + STACK;
         const rootTlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
-        startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
+        startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase, rootDomain: true });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
       return { value, exit, started, tierups };

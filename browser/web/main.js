@@ -129,16 +129,20 @@ async function main() {
     // #1761 — a fiber created on the root Worker, resumed on a spawned one (one run-shared fiber
     // registry), reading `vcpu.tls` on each: 0 on the root, 1 on the thread → 13.
     const fb = await runPath('/corpus/threads_fibers.temenc', {});
+    // DESIGN.md §12 / I37 — a spawned thread's trap ends the run (it used to hang: the trap only
+    // reached a `thread.join` the root, polling forever, never makes).
+    const ct = await runPath('/corpus/threads_child_trap.temenc', {}).then(() => 'no trap', (e) => e.message);
     const letters = new TextDecoder().decode(ob.slice(0, 4)).split('').sort().join('');
     const total = ob.length === 12 ? new DataView(ob.buffer).getBigInt64(4, true) : null;
     const ms = (performance.now() - t0).toFixed(0);
     const ok = value === 8n && out === 'tick\n'.repeat(8) &&
-      r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n;
+      r.exit === 7 && letters === 'abcd' && total === 8060n && fb.value === 13n &&
+      ct.includes('DivByZero');
     set('capio', ok ? 'pass' : 'fail',
       `capio: ${started} Workers → counter ${value} (want 8), stdout ${JSON.stringify(out)} ` +
       `(want 8 × "tick\\n") · on-ramp ×${r.started} Workers → exit ${r.exit} (want 7), ` +
       `letters ${letters} (want abcd), total ${total} (want 8060) · migrated fiber → ${fb.value} ` +
-      `(want 13) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+      `(want 13) · thread trap → ${JSON.stringify(ct)} (want DivByZero) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
     log(`capio → ${value}, stdout ${out.length}B across ${started} Workers; on-ramp exit ${r.exit} in ${ms}ms`);
   } catch (e) {
     set('capio', 'fail', `capio: error ${e}`);

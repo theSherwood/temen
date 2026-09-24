@@ -14843,6 +14843,8 @@ struct Futex {
 struct Waiter {
     woken: std::sync::Mutex<bool>,
     cv: std::sync::Condvar,
+    /// The waiter's domain ([`ParDomain`], by address), so a domain's death wakes only its members.
+    domain: usize,
 }
 
 impl Futex {
@@ -14860,7 +14862,15 @@ impl Futex {
     /// and an unsatisfiable one returns `WAIT_TIMED_OUT` at 10 s where the oracle faults. It stays
     /// only because this driver runs each vCPU on its own OS thread with no cross-thread park
     /// census, so dropping the backstop outright would turn the second case into a hang.
-    fn wait(&self, mem: &Mem, base: u64, expected: u64, width: u32, timeout: Option<u64>) -> i32 {
+    fn wait(
+        &self,
+        domain: &ParDomain,
+        mem: &Mem,
+        base: u64,
+        expected: u64,
+        width: u32,
+        timeout: Option<u64>,
+    ) -> i32 {
         let waiter = {
             let mut buckets = self.buckets.lock().unwrap();
             // Compare-under-lock: the futex word lives in the shared backing (`atomic_value` reads it).
@@ -14870,6 +14880,7 @@ impl Futex {
             let w = std::sync::Arc::new(Waiter {
                 woken: std::sync::Mutex::new(false),
                 cv: std::sync::Condvar::new(),
+                domain: domain as *const ParDomain as usize,
             });
             buckets
                 .entry(base)
@@ -14913,6 +14924,57 @@ impl Futex {
             }
         }
         woken as i32
+    }
+
+    /// Wake every waiter of `domain` (it died — see [`ParDomain::kill`]); each returns `WAIT_WOKEN`
+    /// and its vCPU observes the death at its next safepoint.
+    fn wake_domain(&self, domain: &ParDomain) {
+        let id = domain as *const ParDomain as usize;
+        let mut buckets = self.buckets.lock().unwrap();
+        for q in buckets.values_mut() {
+            q.retain(|w| {
+                if w.domain != id {
+                    return true;
+                }
+                *w.woken.lock().unwrap() = true;
+                w.cv.notify_one();
+                false
+            });
+        }
+    }
+}
+
+/// One **domain** of the parallel driver (DESIGN.md §12): the root and its `thread.spawn` threads,
+/// or a §14 confined child or fork twin and its threads — the world that shares one window and
+/// powerbox. It holds the domain's fiber registry (#1761) and its death: a member's trap is
+/// terminal for the whole domain (I37, the cooperative `teardown_domains` rule), so the first trap
+/// is recorded here and every other member dies with it at its next safepoint — the per-quantum
+/// check, or a futex wait / join this kill wakes. A sibling's trap thereby becomes the root's result.
+#[derive(Default)]
+struct ParDomain {
+    fibers: SharedFibers,
+    dead: std::sync::Mutex<Option<Trap>>,
+}
+
+impl ParDomain {
+    /// This domain's trap, once a member has died.
+    fn dead(&self) -> Option<Trap> {
+        self.dead.lock_unpoisoned().clone()
+    }
+
+    /// A member trapped with `t`: record it (the first trap wins) and wake every member blocked in a
+    /// futex wait or a join, so each observes the death.
+    fn kill(&self, t: &Trap, reg: &ThreadRegistry) {
+        {
+            let mut d = self.dead.lock_unpoisoned();
+            if d.is_some() {
+                return;
+            }
+            *d = Some(t.clone());
+        }
+        reg.futex.wake_domain(self);
+        let _g = reg.done.lock().unwrap_or_else(|e| e.into_inner());
+        reg.woken.notify_all();
     }
 }
 
@@ -14994,11 +15056,15 @@ impl ThreadRegistry {
 
     /// Block until vCPU `id` has published, then take (consume) its result — the parallel analogue of
     /// the cooperative `BlockedJoin` wakeup. A child trap is returned to propagate to the joiner.
-    fn join(&self, id: u64) -> Result<Vec<Value>, Trap> {
+    /// A joiner whose own `domain` dies while it waits completes with the domain's trap.
+    fn join(&self, id: u64, domain: &ParDomain) -> Result<Vec<Value>, Trap> {
         let mut g = self.done.lock().unwrap();
         loop {
             if let Some(r) = g.remove(&id) {
                 return r;
+            }
+            if let Some(t) = domain.dead() {
+                return Err(t);
             }
             g = self.woken.wait(g).unwrap();
         }
@@ -15062,7 +15128,7 @@ fn drive_parallel(
             &dom,
             &reg,
             std::sync::Arc::clone(&shared),
-            std::sync::Arc::new(SharedFibers::new()),
+            std::sync::Arc::new(ParDomain::default()),
             None,
             root_vt,
             mem,
@@ -15087,14 +15153,37 @@ fn run_vcpu_parallel<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
     dom: &'env Domain,
     reg: &'env ThreadRegistry,
+    host: std::sync::Arc<std::sync::Mutex<Host>>,
+    domain: std::sync::Arc<ParDomain>,
+    tbl: Option<std::sync::Arc<SharedSlots>>,
+    vt: VTask,
+    mem: Option<Mem>,
+    fuel: u64,
+) -> (Result<Vec<Value>, Trap>, Option<Mem>) {
+    let d = std::sync::Arc::clone(&domain);
+    let out = run_vcpu_parallel_body(scope, dom, reg, host, domain, tbl, vt, mem, fuel);
+    // A member's trap is terminal for its domain (I37): the others die with it, so the scope that
+    // joins them — and the run — ends instead of waiting on vCPUs that would never finish.
+    if let Err(t) = &out.0 {
+        d.kill(t, reg);
+    }
+    out
+}
+
+/// [`run_vcpu_parallel`]'s loop, without the domain kill on a trap.
+#[allow(clippy::too_many_arguments)] // an internal driver entry: the args ARE the vCPU's identity
+fn run_vcpu_parallel_body<'scope, 'env>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    dom: &'env Domain,
+    reg: &'env ThreadRegistry,
     // This vCPU's powerbox cell: the run's shared host for the root and its `thread.spawn` siblings
     // (4c-host), or a fork twin's OWN forked powerbox (#748) — its own spawned threads then share
     // *that*. Owned `Arc` so a twin's runtime-minted cell moves into its scoped thread cleanly.
     host: std::sync::Arc<std::sync::Mutex<Host>>,
-    // The run's fiber registry (#1761), shared like the powerbox: by the root and its `thread.spawn`
-    // siblings, so a fiber created on one vCPU resumes on another. A fork twin or a §14 confined
-    // child is its own process and starts a fresh one.
-    fibers: std::sync::Arc<SharedFibers>,
+    // This vCPU's domain (its fiber registry, #1761, and its death), shared like the powerbox: by
+    // the root and its `thread.spawn` siblings. A fork twin or a §14 confined child is its own
+    // process and starts a fresh one.
+    domain: std::sync::Arc<ParDomain>,
     // This vCPU's dispatch table when it is not the domain's shared `dom.table`: an `exec_module`
     // image-replace (#748 rung 2) installs the command's natural table here, and a fork twin (same
     // image as its parent) or `thread.spawn` child (same image as its spawner) inherits its
@@ -15110,6 +15199,10 @@ fn run_vcpu_parallel<'scope, 'env>(
     // [`ThreadRegistry::wait_fork_exit`]).
     let mut fork_gen: u64 = 0;
     loop {
+        // A sibling's trap killed this domain (I37): die with it.
+        if let Some(t) = domain.dead() {
+            return (Err(t), mem);
+        }
         let mut ctx = RunCtx {
             table: tbl.as_deref().unwrap_or(&dom.table),
             fuel: &mut fuel,
@@ -15122,12 +15215,14 @@ fn run_vcpu_parallel<'scope, 'env>(
         // NLL ends `ctx`'s borrows of `mem`/`fuel` at this call, so the arms below may touch them.
         let stop = step_vcpu(
             &mut vt,
-            &mut FiberCell::Shared(&fibers),
+            &mut FiberCell::Shared(&domain.fibers),
             dom,
             &mut ctx,
-            u64::MAX,
+            COOP_QUANTUM,
             false, // OS-thread parallel driver: blocking `cont.resume.block` idle is a follow-up (I48)
-            false, // #1157: the OS preempts real threads — no in-engine quantum needed here
+            // The OS preempts real threads; the quantum is only this vCPU's safepoint for observing a
+            // sibling's trap (the loop-top check) when it never blocks.
+            true,
         );
         match stop {
             // §3.6 (I36 slice 2): the serve/call pair runs only on the cooperative driver
@@ -15157,10 +15252,9 @@ fn run_vcpu_parallel<'scope, 'env>(
             | Ok(VcpuStop::SvcWait)
             | Ok(VcpuStop::CloneCaller { .. })
             | Ok(VcpuStop::Reap { .. })
-            | Ok(VcpuStop::BlockOnFiber { .. })
-            // #1157: this driver passes `preemptible: false` (the OS preempts real threads), so the
-            // in-engine quantum never yields here — fail closed if it somehow does.
-            | Ok(VcpuStop::Preempted) => return (Err(Trap::ThreadFault), mem),
+            | Ok(VcpuStop::BlockOnFiber { .. }) => return (Err(Trap::ThreadFault), mem),
+            // The safepoint quantum elapsed: back to the loop top's domain check, then resume.
+            Ok(VcpuStop::Preempted) => {}
             Err(trap) => return (Err(trap), mem),
             Ok(VcpuStop::Done(vals)) => return (Ok(vals), mem),
             // Tier-up is only enabled on the browser `Vcpu::run` path (`with_jit_eligible`).
@@ -15174,7 +15268,11 @@ fn run_vcpu_parallel<'scope, 'env>(
             Ok(VcpuStop::StdinPark) => {
                 let term_flag = host.lock_unpoisoned().term_flag.clone();
                 while !host.lock_unpoisoned().stdin_ready() {
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
+                    // rewound op re-runs into the safepoint that ends this vCPU.
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        || domain.dead().is_some()
+                    {
                         break;
                     }
                     if host.lock_unpoisoned().park_interrupted() {
@@ -15225,14 +15323,14 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let child_mem = mem.as_ref().map(|m| m.fork_for_thread());
                 let child_host = std::sync::Arc::clone(&host);
                 let child_tbl = tbl.clone();
-                let child_fibers = std::sync::Arc::clone(&fibers);
+                let child_domain = std::sync::Arc::clone(&domain);
                 scope.spawn(move || {
                     let (r, _m) = run_vcpu_parallel(
                         scope,
                         dom,
                         reg,
                         child_host,
-                        child_fibers,
+                        child_domain,
                         child_tbl,
                         child_vt,
                         child_mem,
@@ -15251,7 +15349,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 };
                 let id = threads[slot].expect("resolve_thread checked liveness");
                 threads[slot] = None; // single join — the handle is now spent
-                match reg.join(id) {
+                match reg.join(id, &domain) {
                     // A joined child's first result value lands in the joiner's `dst`.
                     Ok(vals) => {
                         let v = vals.first().copied().unwrap_or(Value::I64(0));
@@ -15306,7 +15404,8 @@ fn run_vcpu_parallel<'scope, 'env>(
                         twin_host.wire_park_door();
                         let mut twin_active = vt.active.clone();
                         twin_active.set(dst, Reg::from_i64(0));
-                        let twin_root_sp = twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
+                        let twin_root_sp =
+                            twin_active.durable_region_base + super::REGION_HEADER_LEN; // its context's empty frame base
                         let twin_vt = VTask {
                             active: twin_active,
                             active_id: ROOT_FIBER,
@@ -15330,7 +15429,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                                 dom,
                                 reg,
                                 twin_host,
-                                std::sync::Arc::new(SharedFibers::new()),
+                                std::sync::Arc::new(ParDomain::default()),
                                 twin_tbl,
                                 twin_vt,
                                 twin_mem,
@@ -15428,7 +15527,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // `^C`'d slept forever and the shell's reap never woke. Cheap to clone the flag once.
                 let term_flag = host.lock_unpoisoned().term_flag.clone();
                 while !host.lock_unpoisoned().pipe_read_ready(pipe) {
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
+                    // rewound op re-runs into the safepoint that ends this vCPU.
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        || domain.dead().is_some()
+                    {
                         break;
                     }
                     // #1146 slice 2 (parallel) — a signal reaching this OS thread while it blocks on
@@ -15453,7 +15556,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // #1262 (parallel) — same terminate break as the read poll below.
                 let term_flag = host.lock_unpoisoned().term_flag.clone();
                 while !host.lock_unpoisoned().pipe_write_ready(pipe) {
-                    if term_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    // A default-action TERMINATE, or a sibling's trap killing this domain (I37): the
+                    // rewound op re-runs into the safepoint that ends this vCPU.
+                    if term_flag.load(std::sync::atomic::Ordering::SeqCst)
+                        || domain.dead().is_some()
+                    {
                         break;
                     }
                     // #1146 slice 2 (parallel) — same interruptible break as the read poll above.
@@ -15486,7 +15593,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // Genuine cross-thread futex: park on the shared address until another vCPU `notify`s
                 // (or the timeout fires). No memory ⇒ can't park ⇒ vacuously not-equal.
                 let r = match mem.as_ref() {
-                    Some(m) => reg.futex.wait(m, base, expected, width, timeout),
+                    Some(m) => reg.futex.wait(&domain, m, base, expected, width, timeout),
                     None => super::WAIT_NOT_EQUAL,
                 };
                 vt.active.set(dst, Reg::from_i32(r));
@@ -15606,7 +15713,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     &mut fuel,
                     &mut mem,
                     &mut HostCell::Shared(&host),
-                    Some(&Beneath::task(&vt, FiberRegRef::Shared(&fibers))),
+                    Some(&Beneath::task(&vt, FiberRegRef::Shared(&domain.fibers))),
                 ) {
                     Ok(vals) => {
                         for (i, (v, ty)) in vals.iter().zip(results.iter()).enumerate() {
@@ -15727,7 +15834,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             &child_dom,
                             &child_reg,
                             std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(SharedFibers::new()),
+                            std::sync::Arc::new(ParDomain::default()),
                             None,
                             child_vt,
                             child_mem,
@@ -15758,8 +15865,17 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let admitted = {
                     let mut hg = host.lock_unpoisoned();
                     admit_detached_child(
-                        &mut hg, mem.as_ref(), fuel, budget, mh, entry, size_log2, quota, grants,
-                        args, premap,
+                        &mut hg,
+                        mem.as_ref(),
+                        fuel,
+                        budget,
+                        mh,
+                        entry,
+                        size_log2,
+                        quota,
+                        grants,
+                        args,
+                        premap,
                     )
                 };
                 let child = match admitted {
@@ -15810,7 +15926,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             &child_dom,
                             &child_reg,
                             std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(SharedFibers::new()),
+                            std::sync::Arc::new(ParDomain::default()),
                             None,
                             child_vt,
                             Some(fm),
@@ -15951,7 +16067,11 @@ fn run_vcpu_parallel<'scope, 'env>(
                 // — the same `take_spawn_budget` the cooperative arm charges, so the two drivers
                 // spend the same quota for the same spawn.
                 let chan_cap = (budget != 0)
-                    .then(|| host.lock_unpoisoned().peek_budget(budget).map(|b| b.channel))
+                    .then(|| {
+                        host.lock_unpoisoned()
+                            .peek_budget(budget)
+                            .map(|b| b.channel)
+                    })
                     .flatten();
                 let child_fuel = if budget != 0 {
                     let taken = {
@@ -16005,7 +16125,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                             &child_dom,
                             &child_reg,
                             std::sync::Arc::clone(&child_host),
-                            std::sync::Arc::new(SharedFibers::new()),
+                            std::sync::Arc::new(ParDomain::default()),
                             None,
                             child_vt,
                             child_mem,
