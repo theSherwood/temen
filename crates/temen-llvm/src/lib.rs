@@ -1471,7 +1471,6 @@ struct DebugAcc {
     /// Source function names (`DISubprogram` `DW_AT_name` → IR function index): the §6 function-name
     /// table, so an LLVM-frontend backtrace reads `compute` instead of `fn{N}`.
     func_names: Vec<FuncName>,
-    tls_root: None,
 }
 
 impl DebugAcc {
