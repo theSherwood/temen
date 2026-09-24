@@ -328,6 +328,13 @@ pub mod durable_abi {
     /// The run is armed to begin a freeze once a countdown / quiesce trigger fires.
     pub const STATE_ARMED: i32 = 3;
 
+    /// The status a `memory.wait` returns when a **freeze**, not the wait's own event, ended it
+    /// (#1769). Distinct from every status a guest can observe (`0` woken, `1` not-equal, `2` timed
+    /// out), and never observed itself: the wait's trailing poll unwinds first. The durable
+    /// transform spills the status, and its thaw re-issues only a wait that ended so; any other
+    /// status completed before the cut and is delivered as it was.
+    pub const WAIT_FROZEN: i32 = -1;
+
     /// `svc.poll` / `svc.wait` op indices on the durable service interface (§13.4) — the two the
     /// quiesce-freeze arming (`ARM_QUIESCE_OFF`) keys on.
     pub const SVC_POLL_OP: u32 = 9;

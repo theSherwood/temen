@@ -7254,7 +7254,8 @@ fn admit_parks_for_freeze(s: &mut Sched) {
                 Waiter::VCpu(mut v) => {
                     v.wait_indefinite = false;
                     v.dstate = STATE_UNWINDING;
-                    v.pending = Some(Pending::Wait(WAIT_WOKEN));
+                    // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                    v.pending = Some(Pending::Wait(temen_ir::durable_abi::WAIT_FROZEN));
                     s.runnable.push_back(v);
                 }
                 fiber @ Waiter::Fiber { .. } => {
@@ -11388,16 +11389,17 @@ impl VCpu {
         }
         // §13.4 step 2 — flatten the event-parked fibers (classified above): a woken park's
         // frames already carry its delivered result (no placeholder — the point's spill reloads
-        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and an
-        // inert status is delivered — the `MemoryWait` point spills `out − nres` (the status is
-        // never captured) and its thaw arm re-issues the wait, which re-checks the restored
-        // guest value (the O10 re-issue rule turned inward).
+        // the real value at thaw); an unwoken futex park's waiter entry is consumed here and the
+        // freeze's `WAIT_FROZEN` is delivered — the `MemoryWait` point spills it, and its thaw arm
+        // re-issues exactly such a wait, which re-checks the restored guest value (the O10
+        // re-issue rule turned inward; #1769).
         while let Some((slot, frames, woken)) = self.registry.take_blocked_for_freeze() {
             let placeholder = if woken {
                 None
             } else {
                 self.sched.purge_fiber_wait_park(&self.registry, slot);
-                Some(Reg::from_i32(0))
+                // The freeze ended this wait, not its event: the thaw re-issues it (#1769).
+                Some(Reg::from_i32(temen_ir::durable_abi::WAIT_FROZEN))
             };
             self.flatten_fiber_for_freeze(slot, frames, placeholder)?;
         }
