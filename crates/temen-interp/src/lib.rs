@@ -12335,33 +12335,16 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 OutOfFuel,
                             }
                             let adm_ = {
-                                let mut guard_ = match state_.try_lock() {
-                                    Ok(g) => g,
-                                    Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-                                    // Held only by the 3a fallback (durable providers) or a
-                                    // wiring/introspection API; the animated path releases it and
-                                    // guards with `busy`.
-                                    Err(std::sync::TryLockError::WouldBlock) => {
-                                        // CALLS.md increment 7 (§10.1) — a `Threaded` provider
-                                        // promises **no admission gate**, so contention on this
-                                        // brief snapshot lock must NOT read as busy. The threaded
-                                        // critical section holds `state_` only to fork the window
-                                        // and clone the powerbox cell, and drops it before the
-                                        // handler runs (it never spans a sub-run — a threaded offer
-                                        // is never durable, so the long-holding 3a fallback cannot
-                                        // apply). Blocking to acquire it is therefore bounded, and
-                                        // it closes I69's lost-caller window: two concurrent callers
-                                        // colliding here used to hand the loser a spurious `-EAGAIN`,
-                                        // silently dropping its dispatch. Every other tier keeps the
-                                        // 3a semantics — a held lock reads as busy: `-EAGAIN`.
-                                        if entry_.policy == OfferPolicy::Threaded {
-                                            state_.lock_unpoisoned()
-                                        } else {
-                                            frames[top].vals.push(Reg::from_i64(EAGAIN));
-                                            continue;
-                                        }
-                                    }
-                                };
+                                // The instance's brief snapshot lock — held only for short critical
+                                // sections: another caller's admission, a settle, a waiter's
+                                // `admit_parked` bookkeeping, the host-side tier's checkout and
+                                // check-in (6c released it across that tier's sub-run). So waiting
+                                // for it is bounded, and a held lock must NOT read as busy: that
+                                // handed the loser of two colliding callers a spurious `-EAGAIN`
+                                // instead of the park-and-retry below (I69 for `Threaded`; #1606
+                                // for `single`, whose 3a-era `try_lock` outlived the long holder
+                                // it guarded against). Admission is decided by `busy`, under it.
+                                let mut guard_ = state_.lock_unpoisoned();
                                 let st_ = &mut *guard_;
                                 if entry_.policy == OfferPolicy::Threaded {
                                     // CALLS.md increment 7 (§10.1) — **no admission gate**: the
@@ -19890,9 +19873,10 @@ pub struct ProviderState {
     /// instance's world checked out (its `mem`/`host` swapped onto the animating vCPU). A
     /// concurrent caller observing it answers a probeable `-EAGAIN`, exactly as 3a's held
     /// `try_lock` did — the animated path cannot hold the state guard across the handler's many
-    /// loop iterations, so this flag serializes admission in its place. The 3a `drive_arc`
-    /// fallback (durable providers) still admits under the held guard and never sets this. (The
-    /// full §10.3 closed bit — freeze/teardown — rides 4b.)
+    /// loop iterations, so this flag serializes admission in its place. Since 6c the host-side
+    /// `drive_arc` tier sets it too (owner `0`) and releases the guard across its sub-run, so the
+    /// guard itself is only ever held briefly. (The full §10.3 closed bit — freeze/teardown —
+    /// rides 4b.)
     busy: bool,
     /// CALLS.md 4c.1 — count of **admission-waiters** parked on this busy instance
     /// ([`Sched::admit_waiters`]). Incremented under the state lock when a distinct-vCPU caller
@@ -24808,9 +24792,11 @@ impl Host {
     /// **Lock invariant (CALLS.md increment 3, slice 1; narrowed by 6b):** this is now the one
     /// blocking `state.lock()` accessor (the provider-pays metering pair left with 6b). It takes
     /// the provider `state` mutex *while the caller holds `&mut Host`* — an `hg → state`
-    /// acquisition order; every dispatch-path acquisition is a non-blocking `state.try_lock()`,
-    /// so no cycle can form **during a live run**. Pre-run wiring only (as today); the caveat
-    /// dissolves entirely when `ProviderState` retires (the 6d binding-merge residue).
+    /// acquisition order, the reverse of the dispatch paths' `state → hg`. Safe because it runs
+    /// **pre-run only**: during a live run the eval-loop admission blocks on `state` (#1606 — every
+    /// holder is brief, and the admitter holds no other lock while it waits) and the host-side
+    /// tier `try_lock`s it. The caveat dissolves entirely when `ProviderState` retires (the 6d
+    /// binding-merge residue).
     pub fn grant_impl_cap(&mut self, offer: i32, cap: i32, name: &str) -> Option<i32> {
         let state = self.resolve_offer(offer).ok()?.state.clone()?;
         let st = state.lock_unpoisoned();
