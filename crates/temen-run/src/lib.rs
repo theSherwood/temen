@@ -486,6 +486,13 @@ unsafe fn cap_thunk_impl(
         }
         return;
     }
+    // #1768 — a run armed to serve a personality `execve` by unwinding (`jit_run`'s single-threaded
+    // root): clear the caller-request cell first, so the only request acted on below is one THIS
+    // dispatch raised.
+    let serves_exec = host.exec_replace_armed();
+    if serves_exec {
+        let _ = host.take_park_request();
+    }
     let r = match pending {
         Some(slot) => host.cap_dispatch_slots_pending(type_id, op, handle, arg_slots, gm, slot),
         None => host.cap_dispatch_slots(type_id, op, handle, arg_slots, gm),
@@ -499,9 +506,52 @@ unsafe fn cap_thunk_impl(
                 }
             }
             *trap_out = 0;
+            if serves_exec {
+                jit_serve_exec(host, mem_size, results, n_results, trap_out);
+            }
         }
         Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
         Err(_) => *trap_out = TrapKind::CapFault as i64,
+    }
+}
+
+/// #1768 — the JIT's half of a personality `execve` (FORK.md §8.6). The op staged the new argv and
+/// raised [`temen_interp::ParkEvent::ExecSelf`]; admit and build the image through the one rule every
+/// engine shares ([`Host::exec_image`]). Admitted: park it for [`jit_run`] and unwind the whole run
+/// ([`temen_jit::HOST_UNWIND_CODE`]) — an image-replace never returns to its caller, so the caller's
+/// native stack is simply discarded. Refused: `-EINVAL`, with nothing changed, exactly as both
+/// interpreters answer. Any other request (a `fork`, a blocking `waitpid`) is dropped and the op's
+/// placeholder stands, as on every engine that cannot serve it (fork on the JIT: #1768).
+///
+/// # Safety
+/// `results` is valid for `n_results` slots and `trap_out` is writable (the [`cap_thunk`] contract).
+unsafe fn jit_serve_exec(
+    host: &mut Host,
+    window_mapped: u64,
+    results: *mut i64,
+    n_results: u64,
+    trap_out: *mut i64,
+) {
+    let Some(temen_interp::ParkEvent::ExecSelf { cmd }) = host.take_park_request() else {
+        return;
+    };
+    // The JIT's own gates — the interpreters' `durable` + clean-root checks: a durable domain's
+    // subtree must stay snapshottable, and a fiber is not the process's image to replace. (Only a
+    // non-serving, single-threaded root is ever armed; see `jit_run`.)
+    let admissible = !host.is_durable() && !temen_jit::fiber_active();
+    match admissible
+        .then(|| host.exec_image(cmd, &[], 0, 0, window_mapped))
+        .flatten()
+    {
+        Some(img) => {
+            host.stash_exec_image(img);
+            *trap_out = temen_jit::HOST_UNWIND_CODE as i64;
+        }
+        None => {
+            if n_results != 0 {
+                *results = EINVAL;
+            }
+        }
     }
 }
 
@@ -3778,6 +3828,12 @@ impl MprotectWindow {
 
 #[cfg(any(unix, windows))]
 impl GuestMem for MprotectWindow {
+    /// The reserved mask domain — what the interpreter's `Mem` answers (`window.reserved()`), and the
+    /// bound an `execve`'s window check reads. #1768: without it the JIT's window reported the trait
+    /// default `0` ("no window"), and every `execve` on the JIT was refused `-E2BIG`.
+    fn window_size(&self) -> u64 {
+        self.reserved
+    }
     fn read_bytes(&self, ptr: u64, len: u64) -> Option<Vec<u8>> {
         if !self.range_committed(ptr, len, false) {
             return None;
@@ -5112,6 +5168,8 @@ pub fn run_kernel(module: &Module, args: &[i64]) -> Result<Vec<Value>, String> {
         }
         JitOutcome::Exited(code) => Err(format!("kernel called Exit({code})")),
         JitOutcome::Trapped(kind) => Err(format!("kernel trapped ({kind:?})")),
+        // Only an exec-armed powerbox unwinds a run; a kernel's host never is.
+        JitOutcome::HostUnwound => Err("kernel run unwound by its host".into()),
     }
 }
 
@@ -5416,8 +5474,8 @@ pub fn nim_posix_imports(
 /// back to the tree-walker for a module outside its subset, which would turn an engine
 /// differential into the oracle checked against itself. So a module the bytecode engine does not
 /// admit is an error here. (Its exec'd images need no such check: the engine compiles each one, and
-/// refuses the exec rather than fall back.) [`Backend::Jit`] serves no fork/exec yet (#1768): a
-/// program that spawns gets the failure back as its own. Which programs spawn is not decidable from
+/// refuses the exec rather than fall back.) [`Backend::Jit`] serves `execve` but not `fork` yet (#1768): a
+/// program that forks gets the failure back as its own. Which programs spawn is not decidable from
 /// imports — every linked nim program imports the whole personality — so the caller decides.
 ///
 /// Errors carry the guest's own stderr when it wrote any: a phase that rejected its input says so,
@@ -5822,6 +5880,8 @@ fn outcome_from_jit(results: &[ValType], jit: JitOutcome) -> Result<Outcome, Str
         )),
         JitOutcome::Exited(code) => Ok(Outcome::Exited(code)),
         JitOutcome::Trapped(kind) => Err(format!("guest trapped ({kind:?})")),
+        // `jit_run` starts the image an unwind parks, so an unwind never reaches here.
+        JitOutcome::HostUnwound => Err("the JIT run unwound with no image to start".into()),
     }
 }
 
@@ -5973,6 +6033,7 @@ fn with_deadline<T>(
 /// concurrent guest serializes the cap-thunk over a `Mutex<Host>`; a single-threaded guest keeps the
 /// unlocked fast path. Backs both the run-once [`run_jit`] (`func` 0, no snapshot) and the reactor
 /// per-call capture ([`run_capture_on`]'s `Jit` arm: an export `func`, `REACTOR_SNAP_CAP` snapshot).
+#[allow(clippy::too_many_arguments)]
 fn jit_run(
     m: &Module,
     func: FuncIdx,
@@ -5981,13 +6042,14 @@ fn jit_run(
     limits: &Limits,
     init_mem: Option<&[u8]>,
     snapshot_cap: Option<usize>,
-) -> Result<(JitOutcome, Vec<u8>), String> {
+    serve_exec: bool,
+) -> Result<(JitOutcome, Vec<u8>, Vec<ValType>), String> {
     // One shared `Quota` type now (F6) — no interp→JIT facade conversion; reuse `Limits`' quota directly.
     let quota = limits.quota();
     let concurrent = m.funcs.iter().any(|f| f.uses_concurrency());
     // SAFETY: `host` outlives the run; the watchdog interrupt (if armed) outlives it too (joined inside
     // `with_deadline`); `init_mem` (when `Some`) outlives the call; the thunk/ctx contracts hold.
-    let run = with_deadline(limits.deadline, |interrupt| {
+    let (run, results) = with_deadline(limits.deadline, |interrupt| {
         if concurrent {
             let locked = Mutex::new(std::mem::take(host));
             let r = unsafe {
@@ -6004,24 +6066,24 @@ fn jit_run(
                 )
             };
             *host = locked.into_inner().unwrap_or_else(|e| e.into_inner());
-            r
+            (r, m.funcs[func as usize].results.clone())
         } else {
             unsafe {
-                powerbox_compile_run(
+                jit_run_images(
                     m,
                     func,
-                    None,
-                    host,
                     slots,
+                    host,
                     interrupt,
                     quota,
                     init_mem,
                     snapshot_cap,
+                    serve_exec,
                 )
             }
         }
-    })
-    .map_err(|e| format!("JIT compile failed: {e:?}"))?;
+    });
+    let run = run.map_err(|e| format!("JIT compile failed: {e:?}"))?;
     if let JitOutcome::Trapped(kind) = run.outcome {
         let who = match run.trap_fiber {
             Some(h) if h >= 0 => format!(" [fiber {h}]"),
@@ -6032,7 +6094,101 @@ fn jit_run(
             format_backtrace(&run.backtrace)
         ));
     }
-    Ok((run.outcome, run.snapshot))
+    Ok((run.outcome, run.snapshot, results))
+}
+
+/// #1768 — the single-threaded JIT run, serving a personality `execve` (FORK.md §8.6) when
+/// `serve_exec`: the root is armed ([`Host::arm_exec_replace`]), an admitted exec unwinds its run
+/// ([`jit_serve_exec`]), and the parked image then runs here, in a fresh run over the powerbox the exec
+/// built — and so on down a chain of execs, all under the caller's one watchdog. Returns the last
+/// run and the result types of the entry that produced it (an exec'd command's, not the caller's).
+///
+/// The command runs in a window the size of the caller's backed prefix, as on both interpreters,
+/// whose image-replace reuses the caller's window in place (a larger window than the command declares
+/// is a safe superset, masked to its actual size). The embedder's `host` stays the powerbox it
+/// granted, as there too: the image-replace swaps the running image's powerbox, not the caller's.
+///
+/// A serving module is never armed: a serve handler is not the process image to replace.
+///
+/// # Safety
+/// The [`powerbox_compile_run`] contract for the non-locked shape.
+#[allow(clippy::too_many_arguments)]
+unsafe fn jit_run_images(
+    m: &Module,
+    func: FuncIdx,
+    slots: &[i64],
+    host: &mut Host,
+    interrupt: Option<&std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    quota: temen_jit::Quota,
+    init_mem: Option<&[u8]>,
+    snapshot_cap: Option<usize>,
+    serve_exec: bool,
+) -> (Result<JitRun, temen_jit::JitError>, Vec<ValType>) {
+    if serve_exec && !module_serves(m) {
+        host.arm_exec_replace();
+    }
+    let mut r = powerbox_compile_run(
+        m,
+        func,
+        None,
+        host,
+        slots,
+        interrupt,
+        quota,
+        init_mem,
+        snapshot_cap,
+    );
+    let mut results = m.funcs[func as usize].results.clone();
+    // The running image's powerbox once an exec has replaced the caller's.
+    let mut image_host: Option<Host> = None;
+    while matches!(
+        r,
+        Ok(JitRun {
+            outcome: JitOutcome::HostUnwound,
+            ..
+        })
+    ) {
+        let cur = match image_host.as_mut() {
+            Some(h) => h,
+            None => &mut *host,
+        };
+        // Only an armed root stores the unwind code, and only with an image parked.
+        let Some(img) = cur.take_exec_image() else {
+            r = Err(temen_jit::JitError::Malformed);
+            break;
+        };
+        // The commit: the personality hands over the argv it staged, and the new image finds it in
+        // its args region.
+        let init = img.host.exec_commit_args().map(|blob| {
+            let mut buf = vec![0u8; temen_ir::module_args_base() as usize];
+            buf.extend_from_slice(&blob);
+            buf
+        });
+        let mut module = (*img.module).clone();
+        module.memory = module.memory.map(|mc| temen_ir::Memory {
+            size_log2: img.child_size.trailing_zeros() as u8,
+            ..mc
+        });
+        let mut next = img.host;
+        if !module_serves(&module) {
+            next.arm_exec_replace();
+        }
+        let entry = img.entry as FuncIdx;
+        results = module.funcs[entry as usize].results.clone();
+        let next = image_host.insert(next);
+        r = powerbox_compile_run(
+            &module,
+            entry,
+            None,
+            next,
+            &img.entry_args,
+            interrupt,
+            quota,
+            init.as_deref(),
+            snapshot_cap,
+        );
+    }
+    (r, results)
 }
 
 /// Compile + run function 0 on the JIT under `limits` (the run-once powerbox entry, no snapshot),
@@ -6044,8 +6200,9 @@ fn run_jit(
     host: &mut Host,
     limits: &Limits,
     init_mem: Option<&[u8]>,
-) -> Result<JitOutcome, String> {
-    jit_run(m, 0, slots, host, limits, init_mem, None).map(|(outcome, _snap)| outcome)
+) -> Result<(JitOutcome, Vec<ValType>), String> {
+    jit_run(m, 0, slots, host, limits, init_mem, None, true)
+        .map(|(outcome, _snap, results)| (outcome, results))
 }
 
 /// Run an interpreter `backend` (`TreeWalk`/`Bytecode`) on `func`, seeding the window with `init_mem`
@@ -7193,7 +7350,7 @@ impl Instance {
                 outcome_from_interp(r)
             }
             Backend::Jit => match run_jit(m, &[], &mut host, &config.limits, init_mem.as_deref()) {
-                Ok(jit) => outcome_from_jit(&m.funcs[0].results, jit),
+                Ok((jit, results)) => outcome_from_jit(&results, jit),
                 Err(e) => Err(e),
             },
         };
@@ -7370,9 +7527,9 @@ impl Instance {
             &mut hi,
         );
 
-        let jit = run_jit(m, &[], &mut hj, &config.limits, init_mem.as_deref())?;
+        let (jit, results) = run_jit(m, &[], &mut hj, &config.limits, init_mem.as_deref())?;
 
-        let outcome = diff_outcome(&m.funcs[0].results, interp, jit)?;
+        let outcome = diff_outcome(&results, interp, jit)?;
         if hi.stdout_bytes() != hj.stdout_bytes() {
             return Err("interp/JIT stdout diverge".into());
         }
@@ -7675,7 +7832,9 @@ fn run_capture_on(
             // Snapshot the low `REACTOR_SNAP_CAP` window so the next call resumes this state. The
             // reactor is single-threaded (`start` rejects concurrent guests), so `jit_run` takes its
             // unlocked fast path.
-            let (jo, snap) = jit_run(
+            // No exec here: a reactor's image persists across calls by design, so it is never armed
+            // to replace it.
+            let (jo, snap, _) = jit_run(
                 m,
                 fidx,
                 &slots,
@@ -7683,6 +7842,7 @@ fn run_capture_on(
                 limits,
                 Some(init_mem),
                 Some(REACTOR_SNAP_CAP),
+                false,
             )?;
             Ok((outcome_from_jit(&m.funcs[fidx as usize].results, jo)?, snap))
         }

@@ -28,7 +28,8 @@
 //! **Engines** (`--engine E1,E2,…`): E1 runs the frontend — the driver and every process it spawns;
 //! then **each** engine runs hexer and the program. Every engine is held to the same bytes, so the
 //! lane is an engine differential over a real compiler with native nimony as the oracle. The JIT
-//! serves no fork/exec yet (#1768), so it covers the phases that do not spawn (and cannot be E1).
+//! serves `execve` but not `fork` yet (#1768), so it covers the phases that do not spawn (and cannot
+//! be E1).
 //!
 //! `--expect` makes the run a **test**: every artifact of every phase must be native nimony's,
 //! byte for byte, when native runs the same phases built by the same compiler (see
@@ -313,7 +314,7 @@ fn main() {
     let expect = flag("--expect");
     // `--engine E1,E2,…` (`tree`, `bytecode`, `jit`; default `tree`): E1 runs the frontend — the
     // driver and every process it spawns — and **each** engine then runs hexer and the program,
-    // every one held to the same bytes. The JIT serves no fork/exec, so it cannot be E1.
+    // every one held to the same bytes. The JIT serves no fork yet, so it cannot be E1.
     let engines: Vec<temen_run::Backend> = flag("--engine")
         .unwrap_or_else(|| "tree".to_string())
         .split(',')
@@ -326,10 +327,10 @@ fn main() {
         .collect();
     let engine = engines[0];
     // The frontend is the stage that spawns (driver → nifmake → every phase), and the JIT serves
-    // no fork/exec yet: refuse it here rather than let the driver report its first spawn failed.
+    // no fork yet: refuse it here rather than let the driver report its first spawn failed.
     assert!(
         engine != temen_run::Backend::Jit,
-        "--engine: the JIT cannot run the frontend (no fork/exec, #1768); put it after an interpreter"
+        "--engine: the JIT cannot run the frontend (no fork yet, #1768); put it after an interpreter"
     );
     let [libdir, prog, dump] = &a[..] else {
         panic!(

@@ -54,6 +54,28 @@ block 0 (v0: i64) {\n\
   }\n\
 }\n";
 
+/// #1768 — a command exec cannot start: its entry `(i32) -> (i32)` is no shape a §14 child enters by
+/// (`child_entry_ok`), so the ENGINE refuses it after the personality has already resolved the path
+/// and raised the request — the refusal only the engine can make.
+const UNSTARTABLE: &str = "memory 17\n\
+func (i32) -> (i32) {\n\
+block 0 (v0: i32) {\n\
+  return v0\n\
+  }\n\
+}\n";
+
+/// #1768 — a command that reports the argv it was exec'd with: its entry returns the `argc` word at
+/// `module_args_base` (`16512`), where the exec's commit puts the new image's args blob.
+const ARGC_COMMAND: &str = "memory 17\n\
+func (i64) -> (i64) {\n\
+block 0 (v0: i64) {\n\
+  v1 = i64.const 16512\n\
+  v2 = i32.load v1\n\
+  v3 = i64.extend_i32_u v2\n\
+  return v3\n\
+  }\n\
+}\n";
+
 /// How the guest spells a personality call. The two forms produce byte-identical modules apart from
 /// the spelling — `vdummy` is emitted in both so even the value numbering matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +121,14 @@ enum Body {
     /// `execve("/bin/c", NULL, NULL)` then `exit(9)`. Reaching `exit` means the request did not
     /// replace the image.
     Exec,
+    /// #1768 — `execve("/bin/c", ["x"], NULL)` against a command the engine refuses, then check the
+    /// caller is untouched: the op answered `-EINVAL`, and neither the args region the new image would
+    /// have read nor the personality's argv changed. `exit(9)` iff all three hold; `exit(1..3)` names
+    /// the first that did not.
+    ExecRefusedUntouched,
+    /// #1768 — `execve("/bin/c", ["x", "x", "x"], NULL)` into [`ARGC_COMMAND`]: the image-replace must
+    /// deliver the argv the op staged, so the command returns `3`.
+    ExecDeliversArgv,
     /// `fork()`; the child `execve`s and falls back to `exit(9)`; the parent `wait4`s and exits
     /// with the reaped `WEXITSTATUS`. Nim's `execShellCmd` is exactly this shape.
     ForkExecReap,
@@ -109,7 +139,8 @@ enum Body {
 const IMPORTS: &str = "import 0 \"execve\" (i64, i64, i64) -> (i64)\n\
 import 1 \"exit\" (i32) -> ()\n\
 import 2 \"fork\" () -> (i64)\n\
-import 3 \"wait4\" (i64, i64, i64, i64) -> (i64)\n";
+import 3 \"wait4\" (i64, i64, i64, i64) -> (i64)\n\
+import 4 \"argc\" () -> (i64)\n";
 
 fn guest(form: Form, body: Body) -> String {
     let head = format!(
@@ -130,6 +161,91 @@ fn guest(form: Form, body: Body) -> String {
         form.call(1, "vnine"),
     );
     match body {
+        // `43000` is argv `["x", NULL]` (`42000` is "x"); `16512` is `module_args_base`, where the
+        // blob an exec commits lands — its first word is the new image's argc.
+        Body::ExecRefusedUntouched => format!(
+            "{head}data 42000 \"x\\x00\"\n\
+             data 43000 \"\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\n\
+             func () -> () {{\n\
+             block 0 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vab = i64.const 16512\n\
+             \x20 va0 = i32.load vab\n\
+             \x20 vn0 = {}\n\
+             \x20 vp = i64.const 40000\n\
+             \x20 vargv = i64.const 43000\n\
+             \x20 vz = i64.const 0\n\
+             \x20 vr = {}\n\
+             \x20 va1 = i32.load vab\n\
+             \x20 vn1 = {}\n\
+             \x20 vinval = i64.const -22\n\
+             \x20 vok = i64.eq vr vinval\n\
+             \x20 br_if vok 1(va0, va1, vn0, vn1) 4()\n\
+             \x20 }}\n\
+             block 1 (wa0: i32, wa1: i32, wn0: i64, wn1: i64) {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vok = i32.eq wa0 wa1\n\
+             \x20 br_if vok 2(wn0, wn1) 5()\n\
+             \x20 }}\n\
+             block 2 (xn0: i64, xn1: i64) {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vok = i64.eq xn0 xn1\n\
+             \x20 br_if vok 3() 6()\n\
+             \x20 }}\n\
+             block 3 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vc = i32.const 9\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             block 4 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vc = i32.const 1\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             block 5 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vc = i32.const 2\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             block 6 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vc = i32.const 3\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             }}\n\
+             export 0 func \"_start\" 0\n",
+            form.call(4, ""),
+            form.call(0, "vp, vargv, vz"),
+            form.call(4, ""),
+            form.call(1, "vc"),
+            form.call(1, "vc"),
+            form.call(1, "vc"),
+            form.call(1, "vc"),
+        ),
+        // `43000` is argv `["x", "x", "x", NULL]` (`42000` is "x").
+        Body::ExecDeliversArgv => format!(
+            "{head}data 42000 \"x\\x00\"\n\
+             data 43000 \"\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x10\\xa4\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\"\n\n\
+             func () -> () {{\n\
+             block 0 () {{\n\
+             \x20 vdummy = i32.const 0\n\
+             \x20 vp = i64.const 40000\n\
+             \x20 vargv = i64.const 43000\n\
+             \x20 vz = i64.const 0\n\
+             \x20 vr = {}\n\
+             \x20 vnine = i32.const 9\n\
+             \x20 {}\n\
+             \x20 unreachable\n\
+             \x20 }}\n\
+             }}\n\
+             export 0 func \"_start\" 0\n",
+            form.call(0, "vp, vargv, vz"),
+            form.call(1, "vnine"),
+        ),
         Body::Exec => format!(
             "{head}func () -> () {{\n\
              block 0 () {{\n\
@@ -173,7 +289,12 @@ fn guest(form: Form, body: Body) -> String {
 /// between an exec that replaces the image and one that is refused.
 fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool) -> Outcome {
     let caller = parse_module(&guest(form, body)).expect("parse caller");
-    let command = parse_module(COMMAND).expect("parse command");
+    let command = parse_module(match body {
+        Body::ExecRefusedUntouched => UNSTARTABLE,
+        Body::ExecDeliversArgv => ARGC_COMMAND,
+        _ => COMMAND,
+    })
+    .expect("parse command");
     let cmd_wl = command.memory.expect("command window").size_log2;
 
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
@@ -197,7 +318,8 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
         .provide("execve", cap(temen_posix::OP_EXECVE))
         .provide("exit", HostCap::exit())
         .provide("fork", cap(temen_posix::OP_FORK))
-        .provide("wait4", cap(temen_posix::OP_WAIT4));
+        .provide("wait4", cap(temen_posix::OP_WAIT4))
+        .provide("argc", cap(temen_posix::OP_ARGC));
     let inst = instantiate_with_imports(caller, imports).expect("instantiate");
 
     // The process doors, as every process-shaped lane installs them: without the signal source
@@ -224,7 +346,12 @@ fn run(form: Form, grant: Grant, body: Body, backend: Backend, registered: bool)
 /// Every (form, grant, engine) cell of one behaviour must produce `want`. The message names the
 /// cell, because "which row disagreed" is the whole diagnostic.
 fn assert_parity(body: Body, registered: bool, want: Outcome) {
-    for backend in [Backend::TreeWalk, Backend::Bytecode] {
+    // The JIT serves `execve` (#1768) but not yet `fork`, so the fork row runs on the interpreters.
+    let backends: &[Backend] = match body {
+        Body::ForkExecReap => &[Backend::TreeWalk, Backend::Bytecode],
+        _ => &[Backend::TreeWalk, Backend::Bytecode, Backend::Jit],
+    };
+    for &backend in backends {
         for grant in Grant::all() {
             for form in Form::all() {
                 let got = run(form, grant, body, backend, registered);
@@ -251,6 +378,28 @@ fn execve_replaces_the_image_identically_on_every_route() {
 #[test]
 fn a_refused_execve_leaves_the_caller_running_on_every_route() {
     assert_parity(Body::Exec, false, Outcome::Exited(9));
+}
+
+/// #1768 — the refusal only the engine can make (the command's entry is no shape exec can start),
+/// reached after the personality resolved the path and raised the request. POSIX: a failed `execve`
+/// returns to an unchanged caller — the argv the op staged must not have reached the caller's args
+/// region or the personality's argv. Before the fix both were overwritten by the time the engine
+/// refused (`exit(2)`: the args region's argc had become 1).
+#[test]
+fn an_execve_the_engine_refuses_leaves_the_caller_untouched_on_every_route() {
+    assert_parity(Body::ExecRefusedUntouched, true, Outcome::Exited(9));
+}
+
+/// #1768 — the new image reads the argv its `execve` passed. On the JIT this is a different road
+/// from the interpreters' (the image runs in a fresh window seeded from the commit, not the caller's
+/// window reused in place), so it is a row of its own.
+#[test]
+fn an_execd_image_reads_the_argv_it_was_given_on_every_route() {
+    assert_parity(
+        Body::ExecDeliversArgv,
+        true,
+        Outcome::Returned(vec![Value::I64(3)]),
+    );
 }
 
 /// #1635 — nim's `execShellCmd` shape. The twin must get its own process and its own door (so its

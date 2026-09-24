@@ -9302,15 +9302,12 @@ fn exec_image_build(
     grants_n: u64,
     entry: u64,
     size_log2: i64,
+    personality: bool,
 ) -> Result<(Host, SharedSlots, VTask), ()> {
-    // Resolve + compile the command module from the caller's powerbox.
-    let (cfuncs, cmem_log2, cdata, cmodule) = match cur_host.resolve_module(mh) {
-        Ok(g) => (
-            g.funcs.clone(),
-            g.memory_log2,
-            g.data.clone(),
-            std::sync::Arc::clone(&g.module),
-        ),
+    // Compile the command first: `Host::exec_image` is the commit point (it hands the caller's
+    // personality to the new powerbox), so everything that can still refuse must come before it.
+    let (cfuncs, cmodule) = match cur_host.resolve_module(mh) {
+        Ok(g) => (g.funcs.clone(), std::sync::Arc::clone(&g.module)),
         Err(_) => return Err(()),
     };
     let child_compiled = compile_module(
@@ -9319,74 +9316,44 @@ fn exec_image_build(
         cmodule.memory.and_then(|x| x.shadow),
     )
     .ok_or(())?;
-    // Entry sig + window fit: the command reuses the caller's window in place, so its declared memory
-    // must be `<=` the caller's backed-prefix window (a larger window is a safe §2-masked superset).
-    let arity = child_compiled
-        .sigs
-        .get(entry as usize)
-        .map_or(0, |(p, _)| p.len());
-    let ok_entry = child_compiled
-        .sigs
-        .get(entry as usize)
-        .is_some_and(|(p, r)| child_entry_ok(p, r));
-    let win_bytes = cur_mem.map_or(0, |m| m.window.mapped());
-    let win_log2 = win_bytes
-        .is_power_of_two()
-        .then(|| win_bytes.trailing_zeros() as u8);
-    let size_ok = (0..64).contains(&size_log2);
-    let mod_ok = win_log2.zip(cmem_log2).is_some_and(|(wl, ml)| ml <= wl);
-    if !ok_entry || !size_ok || !mod_ok {
-        return Err(());
-    }
-    let child_size = 1u64 << win_log2.expect("mod_ok implies a power-of-two window");
-    // Read + authority-check the by-name grant list (16-byte `{name_off, name_len, handle, flags}`
-    // records, the op-13 layout) from the caller window.
+    // Read the by-name grant list (16-byte `{name_off, name_len, handle, flags}` records, the op-13
+    // layout) from the caller window, then admit + build through the one rule every engine shares:
+    // the command's entry, its fit in the caller's backed prefix, the grants' regrantability, the
+    // fresh powerbox and the personality carry.
     let m = cur_mem.ok_or(())?;
     let grants = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))
         .map_err(|_| ())?;
-    if !grants.iter().all(|(_, h)| cur_host.can_regrant(*h)) {
-        return Err(());
-    }
-    // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
-    // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
-    let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
-    let mut starters = [cinst, cas];
-    cur_host.exec_carry(
-        &mut child_host,
-        &cmodule,
-        &cmodule.imports,
-        &cmodule.types,
-        &mut starters,
-    )?;
-    let [cinst, cas] = starters;
-    let child_args = child_entry_args(arity, cinst, cas);
+    let img = cur_host
+        .exec_image(mh, &grants, entry, size_log2, m.window.mapped())
+        .ok_or(())?;
+    let child_args: Vec<Value> = img.entry_args.iter().map(|&h| Value::I64(h)).collect();
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
-    if let Some(m) = cur_mem {
+    {
         let base = m.window.base();
         // #1059: preserve the command's guard-shifted args region across the image-replace (legacy
         // `[128, 16384)` for an unmarked command); mirrors the tree-walker exec path.
         let null_guard = temen_ir::module_null_guard();
-        m.commit_fresh_image(
-            (1u64 << cmem_log2.expect("mod_ok")).min(child_size),
-            null_guard,
-        );
-        for d in cdata.iter() {
-            if d.offset.saturating_add(d.bytes.len() as u64) <= child_size {
+        m.commit_fresh_image(img.image_len.min(img.child_size), null_guard);
+        for d in img.data.iter() {
+            if d.offset.saturating_add(d.bytes.len() as u64) <= img.child_size {
                 for (k, &b) in d.bytes.iter().enumerate() {
                     m.set_byte(base + d.offset + k as u64, b);
                 }
             }
         }
+        // #1768 — a personality exec's staged argv lands only now, at the commit.
+        if personality {
+            if let Some(blob) = img.host.exec_commit_args() {
+                m.write_exec_args(&blob);
+            }
+        }
     }
-    // Release the old image's own pipe ends (the fork-inherited ones the exec did not carry). Empty for
-    // a command that inherited no CorePipe ends (the rung-1/2a case); non-empty ends need the pipe-EOF
-    // wake the cooperative engine does not yet drive — a later rung.
-    let _ = (
-        cur_host.drop_all_pipe_writers(),
-        cur_host.drop_all_pipe_readers(),
-    );
+    // `exec_image` released the old image's own pipe ends (the fork-inherited ones the exec did not
+    // carry). Empty for a command that inherited no CorePipe ends (the rung-1/2a case); non-empty
+    // ends need the pipe-EOF wake the cooperative engine does not yet drive — a later rung.
     // Push the command as a new domain unit + build its natural table + activation.
+    let child_host = img.host;
     let progs_len = child_compiled.progs.len();
     let cm = dom.source.push(child_compiled);
     let child_table = build_table_for(progs_len, child_host.jit_table_log2(), cm as u32);
@@ -9563,6 +9530,9 @@ enum Outcome {
         entry: u64,
         size_log2: i64,
         dst: u32,
+        /// #1768 — a personality `execve` (`ParkEvent::ExecSelf`), whose staged argv the commit
+        /// collects; `false` for the guest's own `exec_module` (op 14).
+        personality: bool,
     },
     /// #799/#1080 — a personality **`fork()`** caller-request (`ParkEvent::ForkSelf`): the running vCPU
     /// asks the driver to duplicate it (private window copy + forked powerbox) into a twin task. The
@@ -10864,6 +10834,9 @@ enum VcpuStop {
         entry: u64,
         size_log2: i64,
         dst: u32,
+        /// #1768 — a personality `execve` (`ParkEvent::ExecSelf`), whose staged argv the commit
+        /// collects; `false` for the guest's own `exec_module` (op 14).
+        personality: bool,
     },
     /// #799/#1080 — personality `fork()` caller-request surfaced to the cooperative driver (which owns
     /// the task/env set). Cooperative-driver-only ([`Outcome::ForkSelf`]).
@@ -11446,6 +11419,7 @@ fn step_vcpu(
                 entry,
                 size_log2,
                 dst,
+                personality,
             } => {
                 return Ok(VcpuStop::Exec {
                     mh,
@@ -11454,6 +11428,7 @@ fn step_vcpu(
                     entry,
                     size_log2,
                     dst,
+                    personality,
                 })
             }
             Outcome::ForkSelf { dst } => return Ok(VcpuStop::ForkSelf { dst }),
@@ -13024,6 +12999,7 @@ impl CoopSched {
                     entry,
                     size_log2,
                     dst,
+                    personality,
                 }) => {
                     // FORK.md §8.6 — `execve` image-replace (#1080). Every refusal writes a probeable
                     // `-EINVAL` to `dst` and lets the caller run on (POSIX: `execve` returns only on
@@ -13065,6 +13041,7 @@ impl CoopSched {
                                 grants_n,
                                 entry,
                                 size_log2,
+                                personality,
                             );
                             match built {
                                 Err(()) => refuse!(),
@@ -13099,6 +13076,7 @@ impl CoopSched {
                                     grants_n,
                                     entry,
                                     size_log2,
+                                    personality,
                                 )
                             };
                             match built {
@@ -15561,6 +15539,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                 entry,
                 size_log2,
                 dst,
+                personality,
             }) => {
                 // #748 rung 2 — FORK.md §8.6 `execve` image-replace on the parallel driver. Every
                 // refusal writes a probeable `-EINVAL` to `dst` and lets the caller run on (POSIX:
@@ -15582,6 +15561,7 @@ fn run_vcpu_parallel_body<'scope, 'env>(
                         grants_n,
                         entry,
                         size_log2,
+                        personality,
                     )
                 } else {
                     Err(())
@@ -17480,6 +17460,7 @@ impl Vm {
                                     entry: 0,
                                     size_log2: 0,
                                     dst: *dst,
+                                    personality: true,
                                 });
                             }
                         }
@@ -17815,6 +17796,7 @@ impl Vm {
                         entry,
                         size_log2,
                         dst,
+                        personality: false,
                     });
                 }
                 Op::Instantiate {

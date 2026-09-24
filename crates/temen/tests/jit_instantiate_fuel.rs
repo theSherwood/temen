@@ -103,6 +103,7 @@ fn jit_shape(o: &JitOutcome) -> Shape {
         JitOutcome::Trapped(TrapKind::OutOfFuel) => Shape::OutOfFuel,
         JitOutcome::Trapped(_) => Shape::OtherTrap,
         JitOutcome::Exited(_) => Shape::OtherTrap, // guest `exit` — these programs never do
+        JitOutcome::HostUnwound => Shape::OtherTrap, // no exec-serving host here
         JitOutcome::Returned(vs) => Shape::Returned(vs.clone()),
     }
 }
