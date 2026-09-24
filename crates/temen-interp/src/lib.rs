@@ -6919,7 +6919,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     if s.dead.contains_key(&key) {
         return; // already down (a second member's trap raced the sweep)
     }
-    s.dead.insert(key, reason.clone());
+    s.dead.insert(key, *reason);
     // I40: any orphaned reply destined *for* this domain (as a callee) will never arrive now —
     // its handler is being torn down — so its recorded orphan entry can never be consumed. Drop it.
     s.orphan_tickets.retain(|(callee, _)| *callee != key);
@@ -6979,7 +6979,7 @@ fn teardown_domain(s: &mut Sched, key: usize, reason: &Trap, dying: &Arc<Mutex<H
     s.admit_waiters.retain(|_, q| !q.is_empty());
     let mut tickets: Vec<u64> = Vec::new();
     for v in victims {
-        tickets.extend(reap(s, v, reason.clone()));
+        tickets.extend(reap(s, v, *reason));
     }
     // The dying domain's *queued* (never-admitted) dispatches: their callers wake too.
     tickets.extend(
@@ -8033,7 +8033,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         if !matches!(trap, Trap::Exit(_)) {
                             s.twin_traps.push(TwinTrap {
                                 task: id,
-                                trap: trap.clone(),
+                                trap: *trap,
                                 backtrace: outcome.trap_bt.clone(),
                                 fault: outcome.trap_fault,
                             });
@@ -8087,7 +8087,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // completes vCPUs early on purpose.)
                 if !froze && outcome.result.is_ok() {
                     if let Some(t) = s.dead.get(&key) {
-                        outcome.result = Err(t.clone());
+                        outcome.result = Err(*t);
                     }
                 }
                 let died: Option<Trap> = outcome.result.as_ref().err().cloned();
@@ -8932,7 +8932,7 @@ impl DetState {
 /// [`reap`] there is no running member to gate, no fiber waiters, and no durable contexts.
 fn det_reap(s: &mut DetState, mut v: Box<VCpu>, reason: &Trap) {
     let outcome = Outcome {
-        result: Err(reason.clone()),
+        result: Err(*reason),
         mem: v.mem.take(),
         fuel: v.fuel,
         trap_bt: Vec::new(), // the origin's own Done recorded the true backtrace

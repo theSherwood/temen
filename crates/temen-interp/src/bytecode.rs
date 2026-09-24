@@ -6968,7 +6968,7 @@ fn dbg_complete(tasks: &mut [DbgTask], ti: usize, res: Result<Vec<Value>, Trap>)
                     t.vt.active.set(dst, Reg::from_value(v));
                     t.state = DbgTaskState::Runnable;
                 }
-                Err(trap) => work.push((j, Err(trap.clone()))),
+                Err(trap) => work.push((j, Err(*trap))),
             }
         }
     }
@@ -15854,7 +15854,7 @@ fn complete(tasks: &mut [TaskSlot], ti: usize, res: Result<Vec<Value>, Trap>) {
                     t.vt.active.set(dst, Reg::from_value(v));
                     t.state = TaskState::Runnable;
                 }
-                Err(trap) => work.push((j, Err(trap.clone()))),
+                Err(trap) => work.push((j, Err(*trap))),
             }
         }
     }
@@ -15884,7 +15884,7 @@ fn teardown_domains(
                     // when the trapping member was its only vCPU — a later call through it must
                     // still find it dead (errno, not a deadlock).
                     Some(k) if !dead_envs.contains(&k) => {
-                        return Some((Some(k), trap.clone()));
+                        return Some((Some(k), *trap));
                     }
                     // The root domain: a live member left means the sweep hasn't run yet (once
                     // every member is Done the caller's root check ends the run).
@@ -15892,7 +15892,7 @@ fn teardown_domains(
                         .iter()
                         .any(|u| u.env.is_none() && !matches!(u.state, TaskState::Done(_))) =>
                     {
-                        return Some((None, trap.clone()));
+                        return Some((None, *trap));
                     }
                     _ => {}
                 }
@@ -15905,7 +15905,7 @@ fn teardown_domains(
         }
         for i in 0..tasks.len() {
             if tasks[i].env == env && !matches!(tasks[i].state, TaskState::Done(_)) {
-                complete(tasks, i, Err(trap.clone()));
+                complete(tasks, i, Err(trap));
             }
         }
         // The dying child's undelivered dispatches: wake every caller parked on a ticket
