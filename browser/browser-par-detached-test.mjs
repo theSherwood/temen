@@ -96,7 +96,7 @@ const CHILD_LOG2 = 16, MINTER_QUOTA = 3 * (1 << CHILD_LOG2);
 
 const res = await page.evaluate(async ({ rootSrc, childSrc, minter }) => {
   const { loadEngine, makeRunner } = await import('./par.js');
-  const eng = await loadEngine();
+  const once = async (eng) => {
   const ex = eng.ex, memory = eng.memory;
   const u8 = () => new Uint8Array(memory.buffer);
   const parse = (src) => {
@@ -117,6 +117,16 @@ const res = await page.evaluate(async ({ rootSrc, childSrc, minter }) => {
   } catch (e) {
     return { err: String(e && e.message ? e.message : e) };
   }
+  };
+  const eng = await loadEngine();
+  const first = await once(eng);
+  // A second run on a fresh engine from `loadEngine(prev)` — how a host runs many guests without the
+  // shared memory accumulating each run's allocations: the compiled module is reused, the memory is
+  // new (none of the first run's window/stacks), and the run is the same.
+  const fresh = await loadEngine(eng);
+  const usedBytes = eng.memory.buffer.byteLength, freshBytes = fresh.memory.buffer.byteLength;
+  const second = await once(fresh);
+  return { ...first, second, reused: fresh.module === eng.module, freshMemory: fresh.memory !== eng.memory && freshBytes < usedBytes };
 }, { rootSrc: ROOT_SRC, childSrc: CHILD_SRC, minter: MINTER_QUOTA });
 
 await browser.close();
@@ -124,7 +134,9 @@ await new Promise((r) => server.close(r));
 console.log('RESULT', JSON.stringify(res));
 if (errors.length) console.log('ERRORS', errors.slice(0, 5));
 const EXPECT = String(1001 + 2001 + 3001 - 22);
-const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4;
+const again = res.second && !res.second.err && res.second.value === EXPECT && res.second.started === 4;
+const ok = errors.length === 0 && !res.err && res.value === EXPECT && res.started === 4 && again && res.reused && res.freshMemory;
 console.log(`  detached children across Workers: value ${res.value}/${EXPECT} workers ${res.started}/4${res.err ? ` · ERR ${res.err}` : ''}`);
+console.log(`  again on loadEngine(prev): value ${res.second?.value}/${EXPECT} · compiled module reused ${res.reused} · fresh memory ${res.freshMemory}`);
 console.log(ok ? 'PASS — three detached children ran concurrently, each on its own Worker in its own WebAssembly.Memory, grew it on vm_map, and the exhausted minter refused a fourth' : 'FAIL');
 process.exit(ok ? 0 : 1);
