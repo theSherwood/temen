@@ -268,6 +268,14 @@ pub struct TranslateOptions {
     /// program keeps its paramless entry. Only meaningful when a `_start` is synthesized at all (a
     /// program that uses the powerbox); an argv-taking `main` under this mode is not yet supported.
     pub child_entry: bool,
+    /// Lay a module with no `main` out as a powerbox program: its globals start at `stack_page`,
+    /// above the reserved low scratch, as a program with a synthesized `_start`'s do. **Off by
+    /// default**, which keeps an entry-less kernel's globals at the guarded `DATA_BASE`. Set it for a
+    /// library that becomes a powerbox program later, through `temen_ir::synth_manifest_start` or
+    /// `synth_manifest_child_start` (a separately linked runtime): its host seeds the argument blob at
+    /// `module_args_base()` (a top-level run's argv, op 15's payload), which the default layout
+    /// puts inside the library's own globals.
+    pub powerbox_layout: bool,
     /// Reserve a **durable shadow arena** of this many per-context regions and declare it in the
     /// memory descriptor (`memory N shadow BASE END`), making the guest freezable (#1534).
     ///
@@ -294,6 +302,7 @@ impl Default for TranslateOptions {
             stub_unresolved_externs: false,
             stack_page: DEFAULT_STACK_PAGE,
             child_entry: false,
+            powerbox_layout: false,
             shadow_contexts: None,
         }
     }
@@ -749,7 +758,7 @@ fn translate_impl(
     // too (`scratch + DATA_BASE`), so `[0, guard)` stays empty and a marker-aware host can seed it
     // unmapped — the same NULL-trap the synthesized-`_start` path already gets. `scratch == 0` leaves
     // the legacy `DATA_BASE` byte-identical.
-    let globals_base = if synth {
+    let globals_base = if synth || opts.powerbox_layout {
         stack_page
     } else {
         scratch + DATA_BASE
