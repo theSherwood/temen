@@ -1774,7 +1774,7 @@ impl Domain {
                     func_idx: r.func_idx,
                     thaw_extent: Some(r.shadow_sp), // rewind from the restored extent
                 }),
-                done: r.done,
+                done: std::sync::Arc::clone(&r.done),
                 dom: self as *const Domain,
             };
             match std::thread::Builder::new()
@@ -1783,13 +1783,16 @@ impl Domain {
             {
                 Ok(jh) => lock(&self.threads).joins.push(jh),
                 Err(_) => {
-                    // Thread creation failed: undo the §15 live count (taken above) and free the context.
-                    // A thaw that can't re-spawn its children is already fatal (the root's join will hang),
-                    // but keep the accounting consistent.
+                    // Thread creation failed: undo the §15 live count (taken above), free the context,
+                    // and answer the child's join with the trap a live spawn that can't get a thread
+                    // raises (#1693) — else its spawner's rewound `join` waits forever on a cell no
+                    // thread will fill.
                     lock(&self.threads).live -= 1;
                     if let Some(table) = self.fiber_table() {
                         table.free_vcpu_context(r.ctx);
                     }
+                    *lock(&r.done.state) = Some((0, TrapKind::ThreadFault as i64));
+                    r.done.cv.notify_all();
                 }
             }
         }

@@ -10,11 +10,11 @@ use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 use temen_browser::{
-    onramp_exec, temen_par_alloc, temen_par_child, temen_par_compile, temen_par_deliver_code,
-    temen_par_deliver_handle, temen_par_deliver_join, temen_par_ev_a, temen_par_ev_b,
-    temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_onramp, temen_par_root,
-    temen_par_run, temen_par_stdout_len, temen_par_stdout_ptr, ParVcpu, PAR_DONE, PAR_JOIN,
-    PAR_NOTIFY, PAR_SPAWN, PAR_TRAP, PAR_WAIT, STATUS_EXIT,
+    onramp_exec, onramp_exec_with_tee, temen_par_alloc, temen_par_child, temen_par_compile,
+    temen_par_deliver_code, temen_par_deliver_handle, temen_par_deliver_join, temen_par_ev_a,
+    temen_par_ev_b, temen_par_ev_c, temen_par_ev_d, temen_par_free, temen_par_powerbox_onramp,
+    temen_par_root, temen_par_run, temen_par_stdout_len, temen_par_stdout_ptr, temen_set_run_env,
+    ParVcpu, PAR_DONE, PAR_JOIN, PAR_NOTIFY, PAR_SPAWN, PAR_TRAP, PAR_WAIT, STATUS_EXIT, STATUS_OK,
 };
 
 /// The `temen_par_*` recipes are process-global statics (one page runs one program); serialize the
@@ -377,4 +377,52 @@ fn vcpu_tls_follows_the_executing_worker() {
     temen_verify::verify_module(&m).expect("verifies");
     let (end, _) = par_onramp_run(&m, 1 << 16);
     assert_eq!(end, End::Done(13));
+}
+
+/// #1777 / jacl #152: the host's §3e environment reaches an on-ramp guest on **both** drivers — the
+/// single-threaded on-ramp (`onramp_exec_with_tee`'s `env`) and the parallel one (the FFI's
+/// `temen_set_run_env`, which `temen_par_powerbox_onramp` seeds into the root window). This is how a
+/// language runtime learns per-run configuration (JACL: how many workers to start). The guest reads
+/// the blob's `envc` and the first value byte: `envc * 1000 + byte`, `0` with no environment.
+#[test]
+fn onramp_environment_reaches_the_guest_on_both_drivers() {
+    let _g = RECIPE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let base = temen_ir::module_args_base();
+    let src = format!(
+        "memory 16\nfunc () -> (i64) {{\nblock 0 () {{\n  va = i64.const {envc}\n  ve = i64.load8_u va\n  \
+         vb = i64.const {val}\n  vv = i64.load8_u vb\n  vk = i64.const 1000\n  vm = i64.mul ve vk\n  \
+         vr = i64.add vm vv\n  return vr\n  }}\n}}\nexport 0 func \"_start\" 0\n",
+        envc = base + 4,
+        val = base + 8 + 2, // argc = 0, so the env strings start at +8; "N=7" -> the '7'
+    );
+    let m = temen_text::parse_module(&src).expect("parses");
+    temen_verify::verify_module(&m).expect("verifies");
+    let with_n7 = 1000 + i64::from(b'7');
+
+    // Single-threaded on-ramp: the environment is a parameter.
+    let out = onramp_exec_with_tee(&m, b"", &[b"N=7".to_vec()], None);
+    assert_eq!((out.status, out.value), (STATUS_OK, with_n7));
+    let out = onramp_exec_with_tee(&m, b"", &[], None);
+    assert_eq!(
+        (out.status, out.value),
+        (STATUS_OK, 0),
+        "no environment seeds nothing"
+    );
+
+    // Parallel Worker driver: the FFI's environment, seeded into the root window.
+    let set = |env: &[u8]| temen_set_run_env(env.as_ptr(), env.len());
+    assert_eq!(set(c"N=7".to_bytes_with_nul()), 0);
+    let (end, _) = par_onramp_run(&m, 1 << 16);
+    assert_eq!(end, End::Done(with_n7));
+
+    // A malformed environment is refused and leaves the current one in place.
+    assert_eq!(set(c"N7".to_bytes_with_nul()), -1, "an entry needs `=`");
+    assert_eq!(set(b"N=7"), -1, "an entry must be NUL-terminated");
+    let (end, _) = par_onramp_run(&m, 1 << 16);
+    assert_eq!(end, End::Done(with_n7));
+
+    // Cleared, the next run is given none.
+    assert_eq!(set(b""), 0);
+    let (end, _) = par_onramp_run(&m, 1 << 16);
+    assert_eq!(end, End::Done(0));
 }
