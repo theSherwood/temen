@@ -48,17 +48,26 @@ echo "[1/4] the toolchain, through the POSIX edge"
 # driver and nifmake only sequence work; their native copies stay as they are.
 cargo build --release -q -p temen-run --example build_nim_hello_temen --example nim_selfhost_lane
 B=target/release/examples
-for p in nifler2/nifler2 nimony/nimsem hexer/hexer; do
-  n="$(basename "$p")"
-  "$B/build_nim_hello_temen" --posix --root nimony --native "$N/bin/$n" "src/$p.nim" "$W/$n.temen"
-done
-"$B/build_nim_hello_temen" --posix --root nimony src/nimony/nimony.nim "$W/nimony.temen"
 # nifmake is a classic-Nim-only program upstream; build it from a patched COPY of the pinned sources
 # (the submodule is never modified). See the patch's own preamble.
 mkdir -p "$W/patched"
 cp -r "$ROOT/nimony/src" "$ROOT/nimony/doc" "$W/patched/"
 (cd "$W/patched" && git apply "$ROOT/patches/nimony/nifmake-builds-with-nimony.patch")
-"$B/build_nim_hello_temen" --posix --root "$W/patched" src/nifmake/nifmake.nim "$W/nifmake.temen"
+# The five builds are independent, so they run at once; one after another they were ~2 min of this
+# step. Each gets its own nimcache, because the in-tree builds would otherwise all write
+# `nimony/nimcache`.
+build() { "$B/build_nim_hello_temen" --posix --nimcache "$W/nimcache-$1" "${@:2}"; }
+pids=()
+for p in nifler2/nifler2 nimony/nimsem hexer/hexer; do
+  n="$(basename "$p")"
+  build "$n" --root nimony --native "$N/bin/$n" "src/$p.nim" "$W/$n.temen" &
+  pids+=($!)
+done
+build nimony --root nimony src/nimony/nimony.nim "$W/nimony.temen" &
+pids+=($!)
+build nifmake --root "$W/patched" src/nifmake/nifmake.nim "$W/nifmake.temen" &
+pids+=($!)
+for pid in "${pids[@]}"; do wait "$pid"; done
 
 echo "[2/4] the native reference: nimony builds and runs the program"
 cat >"$N/prog.nim" <<'NIM'
