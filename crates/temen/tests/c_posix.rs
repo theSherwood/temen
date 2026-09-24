@@ -6532,6 +6532,90 @@ fn c_terminate_a_twin_parked_in_waitpid() {
     );
 }
 
+/// [`reapkill_src`] with the kill as the only way out: root releases the grandchild only *after*
+/// reaping the subshell, so nothing but the kill itself can wake the subshell's `waitpid` park.
+fn reapkill_only_src() -> String {
+    format!(
+        "{WIN_PAD_17}\
+long __px_fork(int cap, long a);\n\
+long __px_waitpid(int cap, long pid, long status, long opts);\n\
+long __px_kill(int cap, long pid, long sig);\n\
+long __vm_pipe(int *fds);\n\
+long __vm_read(int fd, void *buf, long len);\n\
+long __vm_write(int fd, void *buf, long len);\n\
+long __px_pipe_adopt(int cap, long rh, long wh, long fdp);\n\
+long __px_read(int cap, long fd, long buf, long len);\n\
+long __px_write(int cap, long fd, long buf, long len);\n\
+static int status;\n\
+static long s, g;\n\
+static int fb[2];  /* the grandchild's block pipe (write end held by root) */\n\
+static int fs[2];  /* subshell -> root sync pipe */\n\
+static char buf[8];\n\
+static long ph_(long r){{ return r <= -1048576 ? -(r+1048576) : -1; }}\n\
+static long rd1(int fd){{ long r=__px_read(0,fd,(long)buf,1); long h=ph_(r); if(h>=0) return __vm_read((int)h,buf,1); return r; }}\n\
+static void wr1(int fd){{ char c='x'; long r=__px_write(0,fd,(long)&c,1); long h=ph_(r); if(h>=0) __vm_write((int)h,&c,1); }}\n\
+int main(void){{\n\
+  int hb[2]; __vm_pipe(hb); __px_pipe_adopt(0, hb[0], hb[1], (long)fb);\n\
+  int hz[2]; __vm_pipe(hz); __px_pipe_adopt(0, hz[0], hz[1], (long)fs);\n\
+  s = __px_fork(0,0);\n\
+  if (s < 0) return 1;\n\
+  if (s == 0){{\n\
+    g = __px_fork(0,0);\n\
+    if (g < 0) return 80;\n\
+    if (g == 0){{ if (rd1(fb[0]) <= 0) return 81; return 5; }}\n\
+    wr1(fs[1]);  /* tell root we are about to park in waitpid */\n\
+    long h; while ((h = __px_waitpid(0, g, (long)&status, 0)) == -4){{}}\n\
+    return 7;    /* unreachable: g is released only after we are reaped */\n\
+  }}\n\
+  rd1(fs[0]);\n\
+  __px_kill(0, s, 9);          /* SIGKILL the subshell parked in waitpid — the only wake there is */\n\
+  long h; while ((h = __px_waitpid(0, s, (long)&status, 0)) == -4){{}}\n\
+  if (h != s) return 100;\n\
+  if ((status & 0x7f) != 9) return 2000 + (status & 0xffff);  /* subshell WIFSIGNALED(SIGKILL) */\n\
+  wr1(fb[1]);                  /* only now release the grandchild, so its thread returns */\n\
+  return 42;\n\
+}}\n"
+    )
+}
+
+/// A twin parked in `waitpid` on a child that cannot exit first dies to a kill — on every driver.
+/// The parallel driver's reap park woke only on a child's exit, so here it slept forever, and root
+/// with it. [`c_terminate_a_twin_parked_in_waitpid`] missed it: its root releases the grandchild
+/// before reaping, and that exit woke the park.
+#[test]
+fn c_a_kill_alone_wakes_a_twin_parked_in_waitpid() {
+    fn within(what: &'static str, f: fn() -> Effects) -> Vec<Value> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f().result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("{what}: the killed subshell slept in its waitpid"))
+    }
+    let want = vec![Value::I32(42)];
+    assert_eq!(
+        within("tree-walker", || run_interp_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("coop bytecode", || run_bytecode_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
+    );
+    assert_eq!(
+        within("parallel", || run_bytecode_parallel_only(
+            &reapkill_only_src(),
+            |_| {}
+        )),
+        want
+    );
+}
+
 // #798 pipeline-as-a-job — a foreground pipeline (`a | b`) is ONE job whose stages share ONE process
 // group, so a job-control signal (^Z/SIGTSTP, ^C, SIGCONT via `fg`/`bg`) must fan out to EVERY member
 // of the group, not just the leader. Two twins are forked, the second `setpgid`'d into the FIRST's
