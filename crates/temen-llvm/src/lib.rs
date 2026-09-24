@@ -3967,6 +3967,19 @@ fn cap_spec(name: &str) -> Option<CapSpec> {
 /// `Stream.write` capability — they differ only in how the on-ramp marshals their args (a single
 /// char, a NUL-terminated string + newline, a `size×nmemb` slice). `fflush` is recognized by the
 /// lowering but needs *no* import (an unbuffered `Stream` makes it a no-op), so it is not listed here.
+/// #1609 — the POSIX personality's signature for a `__px_<op>` import, from its own vocabulary
+/// ([`temen_posix_abi`]), or `None` if `name` is not one of its ops. A declaration-only `__px_*`
+/// function lowers to that named import (the vocabulary nim programs and chibicc guests already speak,
+/// #1668), so an on-ramp guest reaches the personality the way they do — bound at instantiation, and
+/// carried across an `execve` like theirs.
+fn px_import_sig(name: &str) -> Option<temen_ir::FuncType> {
+    let (names, sigs) = temen_posix_abi::vtable();
+    names
+        .iter()
+        .position(|n| n == name)
+        .map(|i| sigs[i].clone())
+}
+
 fn cap_import_name(name: &str) -> Option<&'static str> {
     Some(match name {
         "write" | "puts" | "putc" | "putchar" | "fputc" | "fwrite" | "fputs" | "printf" => "write",
@@ -3999,6 +4012,9 @@ fn intern_sig(types: &RefCell<Vec<temen_ir::TypeEntry>>, ft: temen_ir::FuncType)
 fn import_sig(import: &str) -> temen_ir::FuncType {
     use ValType::{I32, I64};
     let ft = |params: Vec<ValType>, results: Vec<ValType>| temen_ir::FuncType { params, results };
+    if let Some(sig) = px_import_sig(import) {
+        return sig;
+    }
     match import {
         "exit" => ft(vec![I32], vec![]),
         // `Memory.map(offset, len, prot)` (§3e op 0) — the allocator's page-commit primitive.
@@ -4047,17 +4063,20 @@ fn collect_cap_imports(
                 if defined.contains_key(&name) {
                     continue;
                 }
-                if let Some(import) = cap_import_name(&name) {
-                    import_of.entry(import.to_string()).or_insert_with(|| {
-                        let i = imports.len() as u32;
-                        imports.push(temen_ir::Import {
-                            name: import.to_string(),
-                            shape: temen_ir::ImportShape::Func(u32::MAX),
-                            mode: temen_ir::ImportMode::Required,
-                        });
-                        i
+                let import = match cap_import_name(&name) {
+                    Some(import) => import.to_string(),
+                    None if name.starts_with("__px_") && px_import_sig(&name).is_some() => name,
+                    None => continue,
+                };
+                import_of.entry(import.clone()).or_insert_with(|| {
+                    let i = imports.len() as u32;
+                    imports.push(temen_ir::Import {
+                        name: import,
+                        shape: temen_ir::ImportShape::Func(u32::MAX),
+                        mode: temen_ir::ImportMode::Required,
                     });
-                }
+                    i
+                });
             }
         }
     }
@@ -13011,6 +13030,38 @@ fn lower_vm_builtin(
 }
 
 fn lower_io_call(ctx: &mut BlockCtx, c: &crate::ll::ast::Call, name: &str) -> Result<bool, Error> {
+    // #1609 — a POSIX personality op (`__px_<op>`, see [`px_import_sig`]): every argument is an
+    // `i64` in the vocabulary, so each operand is taken as one, and the call's arity must be the op's
+    // (a mismatch is the guest declaring the op wrong — refused here, not bound wrong).
+    if let Some(sig) = px_import_sig(name) {
+        if c.arguments.len() != sig.params.len() {
+            return unsup(format!(
+                "`{name}` takes {} arguments in the POSIX vocabulary, called with {}",
+                sig.params.len(),
+                c.arguments.len()
+            ));
+        }
+        let import = ctx.import_of(name)?;
+        let mut args = Vec::new();
+        for (a, _attrs) in c.arguments.iter() {
+            args.push(ctx.operand_i64(a)?);
+        }
+        let returns = !sig.results.is_empty();
+        let sig = ctx.intern_sig(sig);
+        let inst = Inst::CallImport {
+            import,
+            op: 0,
+            sig,
+            args,
+        };
+        if returns {
+            let r = ctx.push(inst);
+            ctx.bind_dest(&c.dest, r);
+        } else {
+            ctx.push_effect(inst);
+        }
+        return Ok(true);
+    }
     // The primitive capability mapping (write/read/exit): drop the dropped args, map the rest.
     if let Some(spec) = cap_spec(name) {
         let import = ctx.import_of(spec.name)?;

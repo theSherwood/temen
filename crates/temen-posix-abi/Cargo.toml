@@ -1,0 +1,13 @@
+[package]
+name = "temen-posix-abi"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# The POSIX personality's **import vocabulary** (#1668): each op's `__px_<name>` and signature, in op
+# order — nothing else. Split from `temen-posix` so a program that must speak the vocabulary without
+# embedding the personality can: `temen-link`, the self-hosted lane's in-guest linker (a Temen guest
+# cannot carry `temen-posix`, which pulls in the interpreter), links nim programs against it.
+
+[dependencies]
+temen-ir = { path = "../temen-ir" }

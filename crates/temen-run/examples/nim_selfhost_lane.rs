@@ -6,34 +6,30 @@
 //!
 //! ```text
 //! nim_selfhost_lane --sh <sh.ir> --nimony <nimony.temen> --nifmake <nifmake.temen>
-//!                   --nimsem <nimsem.temen> --nifler <nifler2.temen> [--hexer <hexer.temen>]
+//!                   --nimsem <nimsem.temen> --nifler <nifler2.temen> --hexer <hexer.temen>
+//!                   --temen-link <temen-link.temen> [--libc <libc.temeno>]
 //!                   [--expect <native-nimcache>] [--engine E1,E2,…]
 //!                   <libdir> <prog.nim> <dump-dir>
 //! ```
 //!
-//! 1. **The frontend is nimony's own.** `nimony check --isMain prog.nim` runs in-guest: the driver
-//!    parses the program's dependency graph and writes its build plan, then runs **nifmake** over
-//!    it, which forks and execs **nifler** and **nimsem** for every node, in dependency order,
-//!    through the POSIX `/bin/sh` (`startProcess` → fork → `execve("/bin/sh", ["-c", cmd])`).
-//!    nimsem spawns nifler itself for the files a module includes. The host orders nothing.
-//!    nifmake is built from `patches/nimony/nifmake-builds-with-nimony.patch`: upstream it is a
-//!    classic-Nim-only program.
-//! 2. **hexer** (`--hexer`) lowers every semchecked module to Leng (`hexer c` → `.x.nif`). This
-//!    is the one phase the host still sequences: `nimony c` would run it, then its C backend
-//!    (dce → lengc → cc → link), and a Temen target has no use for that.
-//! 3. **temen-leng** links the `.x.nif`s ([`temen_leng::link_nim_posix`], the same link every
-//!    tool here is built with), and the program runs on a fresh personality. Its stdout goes to
-//!    *our* stdout, so the caller can diff it against the native binary's.
+//! 1. **The whole build is nimony's own, in-guest.** `nimony t --isMain prog.nim` — the driver with
+//!    its Temen backend (`patches/nimony/temen-backend.patch`) — parses the dependency graph,
+//!    writes the build plan and runs **nifmake** over it. nifmake forks and execs every step in
+//!    dependency order through the POSIX `/bin/sh`: **nifler** and **nimsem** per module, **hexer**
+//!    (`.x.nif`) and its dead-code elimination (`.c.nif`), then **temen-link**
+//!    (`demos/temen_link`), which links the whole program into `nimcache/<main>.temen/<prog>.temen`.
+//!    The host seeds the sources and reads the result; it orders nothing.
+//! 2. The linked module runs on a fresh personality. Its stdout goes to *our* stdout, so the caller
+//!    can diff it against the native binary's.
 //!
-//! **Engines** (`--engine E1,E2,…`): E1 runs the frontend — the driver and every process it spawns;
-//! then **each** engine runs hexer and the program. Every engine is held to the same bytes, so the
-//! lane is an engine differential over a real compiler with native nimony as the oracle. The JIT
-//! serves `execve` but not `fork` yet (#1768), so it covers the phases that do not spawn (and cannot
-//! be E1).
+//! **Engines** (`--engine E1,E2,…`): E1 runs the build — the driver and every process it spawns.
+//! Each later engine runs hexer over every module again, held to E1's bytes, and **every** engine
+//! runs the program. The JIT serves `execve` but not `fork` yet (#1768), so it cannot be E1.
 //!
 //! `--expect` makes the run a **test**: every artifact of every phase must be native nimony's,
 //! byte for byte, when native runs the same phases built by the same compiler (see
-//! [`expect_native`]). Everything the run wrote under `nimcache/` is dumped to `<dump-dir>`.
+//! [`expect_native`]) — and the module linked in-guest must be the one the host links from the same
+//! `.c.nif`s. Everything the run wrote under `nimcache/` is dumped to `<dump-dir>`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -121,14 +117,14 @@ fn command_module(path: &str, what: &str) -> temen_ir::Module {
     m
 }
 
-/// **hexer**: lower every semchecked module to Leng — `hexer c` once per module, as native nimony's
-/// plan runs it (`<main>.final.build.nif`), with the same flags so each `.x.nif` is comparable to
-/// native's. The main module's goes under `nimcache/<main>/`, where native puts it.
-fn lower(
+/// **hexer** again, on `engine`: lower every semchecked module to Leng as the driver's plan did
+/// (`hexer c`, the same flags), host-sequenced — the JIT cannot run the plan (no fork yet, #1768),
+/// but it can run each phase. Every `.x.nif` must be the one the in-guest build wrote.
+fn relower(
     hexer: &temen_ir::Module,
     posix: &temen_posix::Posix,
     make: &Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync>,
-    main: Option<&String>,
+    main: &str,
     engine: temen_run::Backend,
 ) {
     let mut stems: Vec<String> = posix
@@ -151,85 +147,100 @@ fn lower(
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let x = if Some(stem) == main {
+        let x = if stem == main {
             argv.extend([
                 "--isMain".to_string(),
                 "--app:console".to_string(),
-                format!("--outdir:nimcache/{stem}"),
+                format!("--outdir:nimcache/{stem}.temen"),
             ]);
-            format!("nimcache/{stem}/{stem}.x.nif")
+            format!("nimcache/{stem}.temen/{stem}.x.nif")
         } else {
             format!("nimcache/{stem}.x.nif")
         };
+        let built = posix
+            .read_file(&x)
+            .unwrap_or_else(|| panic!("the in-guest build wrote no {x}"));
         argv.push(format!("nimcache/{stem}.s.nif"));
         temen_run::nim_noc_run(hexer.clone(), posix, Arc::clone(make), &argv, &[], engine)
             .unwrap_or_else(|e| panic!("hexer on {stem}: {e}"));
         assert!(
-            posix.read_file(&x).is_some(),
-            "hexer returned cleanly but wrote no {x}"
+            posix.read_file(&x).as_ref() == Some(&built),
+            "hexer on {engine:?} wrote a different {x} than the in-guest build"
         );
     }
     eprintln!(
-        "✅ hexer lowered {} modules to Leng on {engine:?}",
+        "✅ hexer on {engine:?} relowered {} modules to the in-guest build's bytes",
         stems.len()
     );
 }
 
-/// **Link and run**: the `.x.nif`s hexer wrote, linked by [`temen_leng::link_nim_posix`] — the one
-/// link every nim phase is itself built with — then run on a fresh personality. Returns its stdout.
-fn link_and_run(posix: &temen_posix::Posix, engine: temen_run::Backend) -> Vec<u8> {
+/// The whole program's DCE'd Leng — what the plan hands `temen-link` — in the order it links them.
+fn program_units(posix: &temen_posix::Posix, main: &str) -> Vec<(String, String)> {
+    let dir = format!("/nimcache/{main}.temen/");
     let mut mods: Vec<(String, String)> = posix
         .file_names()
         .iter()
-        .filter(|n| n.starts_with("/nimcache/"))
         .filter_map(|n| {
-            let stem = Path::new(n).file_name()?.to_str()?.strip_suffix(".x.nif")?;
+            let stem = n.strip_prefix(&dir)?.strip_suffix(".c.nif")?;
             Some((
                 stem.to_string(),
                 String::from_utf8_lossy(&posix.read_file(n)?).into_owned(),
             ))
         })
         .collect();
-    // Program first, `system` last: the order the nim e2e tests link I/O programs in.
-    mods.sort_by_key(|(stem, _)| stem.starts_with("sysv"));
+    // `temen-link`'s order: the main module first, the rest by stem.
+    mods.sort_by(|a, b| (a.0 != main, &a.0).cmp(&(b.0 != main, &b.0)));
+    mods
+}
+
+/// The module `temen-link` wrote in-guest must be the one the host links from the same `.c.nif`s
+/// with the same call ([`temen_leng::link_nim_posix`]) — byte for byte, encoded.
+fn expect_host_link(posix: &temen_posix::Posix, main: &str, libc: Option<&[u8]>, linked: &[u8]) {
+    let mods = program_units(posix, main);
     let units: Vec<temen_leng::WholeModule> = mods
         .iter()
         .map(|(stem, src)| temen_leng::WholeModule { stem, src })
         .collect();
-    // The prebuilt guest libc, found where `build_nim_hello_temen` finds it.
-    let libc = std::fs::read(
-        std::env::var("TEMEN_PG_LIBC")
-            .unwrap_or_else(|_| "browser/web/assets/pg_libc.temeno".to_string()),
-    )
-    .ok();
-    let (px_names, px_sigs) = temen_posix::cap_vtable();
-    let module = temen_leng::link_nim_posix(&units, (&px_names, &px_sigs), libc.as_deref())
-        .unwrap_or_else(|e| panic!("link the program: {e}"));
-    temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify the program: {e:?}"));
-    eprintln!(
-        "linked the program: {} modules, {} funcs",
-        units.len(),
-        module.funcs.len()
+    let (names, sigs) = temen_posix::cap_vtable();
+    let host = temen_leng::link_nim_posix(&units, (&names, &sigs), libc)
+        .unwrap_or_else(|e| panic!("the host link: {e}"));
+    assert!(
+        temen_encode::encode_module(&host) == linked,
+        "temen-link's module differs from the host's link of the same {} modules",
+        units.len()
     );
+    eprintln!(
+        "✅ temen-link's module is the host's link of the same {} modules, byte for byte",
+        units.len()
+    );
+}
+
+/// Run the linked program on a fresh personality; its stdout.
+fn run_program(module: &temen_ir::Module, engine: temen_run::Backend) -> Vec<u8> {
     let (run, make) = temen_posix::cap(0, 0, Vec::new());
     temen_run::nim_noc_run(
-        module,
+        module.clone(),
         &run,
         Arc::new(make),
         &["prog".to_string()],
         &[],
         engine,
     )
-    .unwrap_or_else(|e| panic!("the program failed: {e}"));
+    .unwrap_or_else(|e| panic!("the program failed on {engine:?}: {e}"));
     run.stdout()
 }
 
 /// `--expect`: the run's artifacts must be native nimony's, **byte for byte** — nothing is
 /// normalized and nothing is tolerated.
 ///
-/// * every `.s.nif` native wrote (and, when hexer ran, every `.x.nif`) must be here and the same;
+/// * every `.s.nif`, `.x.nif` and `.c.nif` native wrote must be here and the same;
 /// * every `.p.nif` *this run* wrote must be native's. Native's driver also parses files nothing
 ///   ends up including, so its set is the larger one.
+///
+/// Native builds with the C backend (`nimony c`), whose pipeline the Temen backend shares up to the
+/// `.c.nif`: the same target, the same flags. The one difference is where the main module's
+/// backend artifacts go — `nimcache/<main>/` there, `nimcache/<main>.temen/` here — so that directory
+/// is compared across.
 ///
 /// Two conditions make exactness the right bar. The lane script runs native nimony from a tree laid
 /// out as this memfs is (`lib/` at its cwd), so both record the same paths. And its phases are the
@@ -237,13 +248,23 @@ fn link_and_run(posix: &temen_posix::Posix, engine: temen_run::Backend) -> Vec<u
 /// (`build_nim_hello_temen --native`): the same compiler, only the target differs. `nimony/bin`'s
 /// own phases are built by classic Nim, a different compiler whose hash tables iterate in a
 /// different order, and hexer's output shows it (#1753).
-fn expect_native(posix: &temen_posix::Posix, native: &str, lowered: bool) {
+fn expect_native(posix: &temen_posix::Posix, native: &str, main: &str) {
     let mut theirs: Vec<(String, Vec<u8>)> = Vec::new();
     collect(Path::new(native), "", &mut theirs);
-    let theirs: std::collections::HashMap<String, Vec<u8>> = theirs.into_iter().collect();
+    let native_dir = format!("{main}/");
+    let ours = |rel: &str| match rel.strip_prefix(&native_dir) {
+        Some(file) => format!("{main}.temen/{file}"),
+        None => rel.to_string(),
+    };
+    let theirs: std::collections::HashMap<String, Vec<u8>> =
+        theirs.into_iter().map(|(rel, b)| (ours(&rel), b)).collect();
     let mut compared: Vec<String> = theirs
         .keys()
-        .filter(|rel| rel.ends_with(".s.nif") || (lowered && rel.ends_with(".x.nif")))
+        .filter(|rel| {
+            [".s.nif", ".x.nif", ".c.nif"]
+                .iter()
+                .any(|e| rel.ends_with(e))
+        })
         .cloned()
         .collect();
     compared.extend(
@@ -256,8 +277,8 @@ fn expect_native(posix: &temen_posix::Posix, native: &str, lowered: bool) {
     );
     compared.sort();
     assert!(
-        compared.iter().any(|rel| rel.ends_with(".s.nif")),
-        "{native} holds no .s.nif — not a nimcache?"
+        compared.iter().any(|rel| rel.ends_with(".c.nif")),
+        "{native} holds no .c.nif — not a `nimony c` nimcache?"
     );
     for rel in &compared {
         let want = theirs
@@ -286,10 +307,11 @@ fn expect_native(posix: &temen_posix::Posix, native: &str, lowered: bool) {
     }
     let count = |ext: &str| compared.iter().filter(|r| r.ends_with(ext)).count();
     eprintln!(
-        "✅ matches native nimony byte for byte: {} .p.nif, {} .s.nif, {} .x.nif",
+        "✅ matches native nimony byte for byte: {} .p.nif, {} .s.nif, {} .x.nif, {} .c.nif",
         count(".p.nif"),
         count(".s.nif"),
-        count(".x.nif")
+        count(".x.nif"),
+        count(".c.nif")
     );
 }
 
@@ -310,11 +332,17 @@ fn main() {
     let nifmake_p = need(flag("--nifmake"), "--nifmake");
     let nimsem_p = need(flag("--nimsem"), "--nimsem");
     let nifler_p = need(flag("--nifler"), "--nifler");
-    let hexer_p = flag("--hexer");
+    let hexer_p = need(flag("--hexer"), "--hexer");
+    let link_p = need(flag("--temen-link"), "--temen-link");
+    // The prebuilt guest libc (`snprintf`, `strtod`, libm): what `temen-link` links a program
+    // against, found where `build_nim_hello_temen` finds it.
+    let libc_p = flag("--libc")
+        .or_else(|| std::env::var("TEMEN_PG_LIBC").ok())
+        .unwrap_or_else(|| "browser/web/assets/pg_libc.temeno".to_string());
     let expect = flag("--expect");
-    // `--engine E1,E2,…` (`tree`, `bytecode`, `jit`; default `tree`): E1 runs the frontend — the
-    // driver and every process it spawns — and **each** engine then runs hexer and the program,
-    // every one held to the same bytes. The JIT serves no fork yet, so it cannot be E1.
+    // `--engine E1,E2,…` (`tree`, `bytecode`, `jit`; default `tree`): E1 runs the build — the driver
+    // and every process it spawns; each later engine reruns hexer, and every engine runs the
+    // program. The JIT serves no fork yet, so it cannot be E1.
     let engines: Vec<temen_run::Backend> = flag("--engine")
         .unwrap_or_else(|| "tree".to_string())
         .split(',')
@@ -326,32 +354,34 @@ fn main() {
         })
         .collect();
     let engine = engines[0];
-    // The frontend is the stage that spawns (driver → nifmake → every phase), and the JIT serves
-    // no fork yet: refuse it here rather than let the driver report its first spawn failed.
+    // The build is the stage that spawns (driver → nifmake → every phase), and the JIT serves no
+    // fork yet: refuse it here rather than let the driver report its first spawn failed.
     assert!(
         engine != temen_run::Backend::Jit,
-        "--engine: the JIT cannot run the frontend (no fork yet, #1768); put it after an interpreter"
+        "--engine: the JIT cannot run the build (no fork yet, #1768); put it after an interpreter"
     );
     let [libdir, prog, dump] = &a[..] else {
         panic!(
             "usage: nim_selfhost_lane --sh <sh.ir> --nimony <nimony.temen> --nifmake \
-             <nifmake.temen> --nimsem <nimsem.temen> --nifler <nifler2.temen> \
-             [--hexer <hexer.temen>] [--expect <native-nimcache>] [--engine E1,E2,…] \
-             <libdir> <prog.nim> <dump-dir>"
+             <nifmake.temen> --nimsem <nimsem.temen> --nifler <nifler2.temen> --hexer \
+             <hexer.temen> --temen-link <temen-link.temen> [--libc <libc.temeno>] \
+             [--expect <native-nimcache>] [--engine E1,E2,…] <libdir> <prog.nim> <dump-dir>"
         );
     };
 
     // The command registry: `/bin/sh`, and each tool at `bin/<name>` — where the driver's
     // `findTool` looks, beside its own `bin/nimony` — and at `/bin/<name>`, where the shell's PATH
-    // walk finds a bare `nifmake`.
+    // walk finds a bare name.
+    let hexer = phase(&hexer_p, "hexer");
     let mut commands: Vec<(String, temen_ir::Module)> =
         vec![("/bin/sh".to_string(), command_module(&sh_ir, "/bin/sh"))];
-    for (name, path) in [
-        ("nifmake", &nifmake_p),
-        ("nimsem", &nimsem_p),
-        ("nifler2", &nifler_p),
+    for (name, m) in [
+        ("nifmake", phase(&nifmake_p, "nifmake")),
+        ("nimsem", phase(&nimsem_p, "nimsem")),
+        ("nifler2", phase(&nifler_p, "nifler2")),
+        ("hexer", hexer.clone()),
+        ("temen-link", phase(&link_p, "temen-link")),
     ] {
-        let m = phase(path, name);
         commands.push((format!("bin/{name}"), m.clone()));
         commands.push((format!("/bin/{name}"), m));
     }
@@ -361,12 +391,15 @@ fn main() {
     let make: Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> = Arc::new(make);
     posix.set_env("PATH", "/bin");
 
-    // Seed the stdlib under `lib/`, where native nimony has it beside its cwd, and the program at
-    // the root: every artifact is derived in-guest. Sources go in first so everything a phase
-    // derives from them is genuinely newer — the memfs stamps write order into `st_mtim`, which is
-    // what the freshness checks in `deps.nim` and nifmake read.
+    // Seed the stdlib under `lib/`, where native nimony has it beside its cwd, the guest libc where
+    // `temen-link` looks for it (`/lib/temen/libc.temeno`), and the program at the root: every
+    // artifact is derived in-guest. Sources go in first so everything a phase derives from them is
+    // genuinely newer — the memfs stamps write order into `st_mtim`, which is what the freshness
+    // checks in `deps.nim` and nifmake read.
     let mut seed: Vec<(String, Vec<u8>)> = Vec::new();
     collect(Path::new(libdir), "lib/", &mut seed);
+    let libc = std::fs::read(&libc_p).unwrap_or_else(|e| panic!("read {libc_p}: {e}"));
+    seed.push(("/lib/temen/libc.temeno".to_string(), libc.clone()));
     let prog_name = Path::new(prog)
         .file_name()
         .and_then(|n| n.to_str())
@@ -381,8 +414,8 @@ fn main() {
     }
     eprintln!("seeded {} files", seed.len());
 
-    // 1. The frontend, run by nimony's own driver.
-    let argv: Vec<String> = ["bin/nimony", "check", "--isMain", &prog_name]
+    // 1. The build, run by nimony's own driver with its Temen backend.
+    let argv: Vec<String> = ["bin/nimony", "t", "--isMain", &prog_name]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -403,10 +436,15 @@ fn main() {
             .filter(|s| !s.contains('.') && !s.contains('/'))
             .map(|s| s.to_string())
     });
-    let built = main_stem
+    let out_name = Path::new(&prog_name)
+        .with_extension("temen")
+        .to_string_lossy()
+        .into_owned();
+    let linked = main_stem
         .as_ref()
-        .is_some_and(|m| posix.read_file(&format!("nimcache/{m}.s.nif")).is_some());
-    if outcome.is_err() || !built {
+        .and_then(|m| posix.read_file(&format!("nimcache/{m}.temen/{out_name}")));
+    dump_cache(&posix, dump);
+    let (Ok(()), Some(main_stem), Some(linked)) = (&outcome, main_stem, linked) else {
         eprint!(
             "--- stdout ---\n{}--- stderr ---\n{}",
             String::from_utf8_lossy(&posix.stdout()),
@@ -416,38 +454,29 @@ fn main() {
         for t in temen_interp::last_twin_traps() {
             eprintln!("--- a command crashed ---\n{t}");
         }
-        dump_cache(&posix, dump);
-        panic!("`nimony check` did not semcheck {prog_name}: {outcome:?}");
-    }
-    let main_stem = main_stem.expect("built");
-    let semchecked = posix
-        .file_names()
-        .iter()
-        .filter(|n| n.starts_with("/nimcache/") && n.ends_with(".s.nif"))
-        .count();
+        panic!("`nimony t` did not build {prog_name}: {outcome:?}");
+    };
+    let modules = program_units(&posix, &main_stem).len();
     eprintln!(
-        "✅ nimony's driver semchecked {semchecked} modules in-guest in {:.0?} on {engine:?} \
-         (main: {main_stem})",
+        "✅ nimony's driver built {prog_name} in-guest in {:.0?} on {engine:?}: {modules} modules \
+         linked by temen-link (main: {main_stem})",
         t0.elapsed()
     );
+    if let Some(native) = &expect {
+        expect_native(&posix, native, &main_stem);
+        expect_host_link(&posix, &main_stem, Some(&libc), &linked);
+    }
+    let module =
+        temen_encode::decode_module(&linked).unwrap_or_else(|e| panic!("decode {out_name}: {e:?}"));
+    temen_verify::verify_module(&module).unwrap_or_else(|e| panic!("verify {out_name}: {e:?}"));
 
-    // 2–3. hexer, then link and run — once per engine, each held to native.
-    let Some(hp) = &hexer_p else {
-        dump_cache(&posix, dump);
-        if let Some(native) = &expect {
-            expect_native(&posix, native, false);
-        }
-        return;
-    };
-    let hexer = phase(hp, "hexer");
+    // 2. The program, on every engine; each later engine reruns hexer first.
     let mut first: Option<Vec<u8>> = None;
-    for &e in &engines {
-        lower(&hexer, &posix, &make, Some(&main_stem), e);
-        dump_cache(&posix, dump);
-        if let Some(native) = &expect {
-            expect_native(&posix, native, true);
+    for (i, &e) in engines.iter().enumerate() {
+        if i > 0 {
+            relower(&hexer, &posix, &make, &main_stem, e);
         }
-        let stdout = link_and_run(&posix, e);
+        let stdout = run_program(&module, e);
         eprintln!(
             "✅ on {e:?}, the program ran: {} bytes of stdout",
             stdout.len()
@@ -457,7 +486,7 @@ fn main() {
             Some(f) => assert_eq!(
                 String::from_utf8_lossy(f),
                 String::from_utf8_lossy(&stdout),
-                "the program built on {e:?} prints something other than on {:?}",
+                "the program prints something else on {e:?} than on {:?}",
                 engines[0]
             ),
         }

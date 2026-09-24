@@ -12,6 +12,7 @@
 # It covers the checks that are cheap, deterministic and host-independent:
 #
 #   * `cargo fmt --all --check`                             (check job)
+#   * the same in `crates/temen-llvm` (excluded crate)      (temen-llvm job)
 #   * `cargo clippy --workspace --all-targets`              (check job)
 #   * `cargo clippy -p temen-jit --features stack-check`    (fiber-scaling job — a SEPARATE lane; the
 #                                                            gating check job builds without the
@@ -104,6 +105,8 @@ cargo_pinned() { run rustup run "$toolchain" cargo "$@"; }
 
 # --- host gates -------------------------------------------------------------------------------
 cargo_pinned fmt --all --check
+# `--all` stops at the workspace; the temen-llvm job fmt-checks that excluded crate on its own.
+cargo_pinned fmt --all --check --manifest-path crates/temen-llvm/Cargo.toml
 cargo_pinned clippy --workspace --all-targets -- -D warnings
 # The `stack-check` feature has its own CI lane because the gating check job builds WITHOUT it, so
 # this is the only place its feature-gated code is compiled at all. It went red once for a lint the

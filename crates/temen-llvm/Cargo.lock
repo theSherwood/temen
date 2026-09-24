@@ -667,6 +667,7 @@ dependencies = [
  "temen-leng",
  "temen-peval",
  "temen-posix",
+ "temen-posix-abi",
  "temen-run",
  "temen-snapshot",
  "temen-text",
@@ -707,6 +708,14 @@ name = "temen-posix"
 version = "0.0.0"
 dependencies = [
  "temen-interp",
+ "temen-ir",
+ "temen-posix-abi",
+]
+
+[[package]]
+name = "temen-posix-abi"
+version = "0.0.0"
+dependencies = [
  "temen-ir",
 ]
 

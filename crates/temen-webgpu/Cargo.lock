@@ -1333,6 +1333,7 @@ version = "0.0.0"
 dependencies = [
  "temen-encode",
  "temen-ir",
+ "temen-posix-abi",
  "temen-text",
 ]
 
@@ -1370,6 +1371,14 @@ name = "temen-posix"
 version = "0.0.0"
 dependencies = [
  "temen-interp",
+ "temen-ir",
+ "temen-posix-abi",
+]
+
+[[package]]
+name = "temen-posix-abi"
+version = "0.0.0"
+dependencies = [
  "temen-ir",
 ]
 
