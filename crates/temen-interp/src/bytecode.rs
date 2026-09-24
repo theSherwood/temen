@@ -2887,6 +2887,12 @@ pub fn compile_and_run_capture_over_parallel_with_host(
     back: std::sync::Arc<super::Region>,
     host: &mut Host,
 ) -> Option<Capture> {
+    // #1694 — the parallel driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a
+    // durable host is outside it: `None`, and the caller runs it where durability is kept, rather
+    // than here silently non-durable.
+    if host.is_durable() {
+        return None;
+    }
     let c = compile_module_for(m)?;
     if func as usize >= c.progs.len() {
         return Some((Err(Trap::Malformed), Vec::new()));
@@ -4062,7 +4068,19 @@ impl<'p> Vcpu<'p> {
 
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
     /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
+    ///
+    /// A **durable** host is refused (`Trapped(Malformed)`) rather than run non-durable (#1694): this
+    /// driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a freeze would leave its
+    /// parked fibers out of the artifact. A durable run belongs on the cooperative scheduler
+    /// ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`]).
     pub fn run(&mut self) -> VcpuEvent {
+        let durable = match self.shared_host {
+            Some(m) => m.lock_unpoisoned().is_durable(),
+            None => self.host.is_durable(),
+        };
+        if durable {
+            return VcpuEvent::Trapped(Trap::Malformed);
+        }
         // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
         // punts on its host. A cheap flag store per resume.
         match self.shared_host {
@@ -9802,8 +9820,8 @@ fn shadow_switch(
     }
     let Some(m) = mem.as_mut() else { return };
     // §12.8 4A.5: each context's SP word lives in its own region (root = context 0, fiber slot `s` =
-    // context `s + 1`). (This bytecode durable path is unreachable today — durable hosts always run on
-    // the tree-walker — but kept correct and compiling.)
+    // context `s + 1`). Reached by every durable run on the cooperative scheduler; the drivers that
+    // cannot keep it refuse durable hosts (#1694).
     let arena = m.shadow_arena();
     let region_of = |ctx: usize| arena.region_base(if ctx == ROOT_FIBER { 0 } else { ctx + 1 });
     let sp = m.durable_get_sp(region_of(out_ctx));
@@ -9857,33 +9875,66 @@ fn freeze_drive(
         .as_ref()
         .map(|m| m.durable_get_sp(root_word))
         .unwrap_or(arena.frame_base(0));
+    // The tree-walker's classification, before anything is consumed: an unwoken **cap** park would
+    // spill the freeze placeholder as the call's result, which its thaw cannot re-derive, so it
+    // fails the whole freeze closed.
+    if fibers
+        .iter()
+        .any(|f| matches!(f, FiberState::CapParked { woken: None, .. }))
+    {
+        return Err(Trap::FiberFault);
+    }
     let mut frozen = Vec::new();
     // Flatten parked fibers in ascending slot order, so the residue's handle namespace is dense from 0
     // (matching the tree-walker's `take_parked_for_freeze`, which always takes the lowest parked slot).
+    // Each park's resume value is delivered first, as the tree-walker's flatten does (#1694): a
+    // suspend park gets the inert placeholder (the thaw redelivers); a woken event park gets its
+    // delivered status or result, which the point's spill reloads at thaw; an unwoken futex park gets
+    // an inert status (the point spills without it, and its thaw arm re-issues the wait, which
+    // re-checks the restored value). Taking the state also takes the waiter: a notify finds waiters
+    // by scanning these states.
     for slot in 0..fibers.len() {
-        let (vm, suspend_dst, consumed) =
-            match std::mem::replace(&mut fibers[slot], FiberState::Done) {
-                FiberState::Parked {
-                    vm,
-                    suspend_dst,
-                    consumed,
-                } => (vm, suspend_dst, consumed),
-                other => {
-                    fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
-                    continue;
-                }
-            };
+        let (vm, consumed) = match std::mem::replace(&mut fibers[slot], FiberState::Done) {
+            FiberState::Parked {
+                mut vm,
+                suspend_dst,
+                consumed,
+            } => {
+                vm.set(suspend_dst, Reg::from_i64(0));
+                (vm, consumed)
+            }
+            FiberState::WaitParked {
+                mut vm,
+                wait_dst,
+                woken,
+                ..
+            } => {
+                vm.set(wait_dst, Reg::from_i32(woken.unwrap_or(0)));
+                (vm, false)
+            }
+            FiberState::CapParked {
+                mut vm,
+                dst,
+                woken: Some(r),
+                ..
+            } => {
+                vm.set(dst, Reg::from_i64(r));
+                (vm, false)
+            }
+            other => {
+                fibers[slot] = other; // not parked (Pending / Running / Done): nothing to flatten
+                continue;
+            }
+        };
         let (func, sp) = fiber_meta.get(slot).copied().unwrap_or((0, 0));
         // Point the active shadow-SP at this fiber's region base (an empty shadow stack to unwind into).
         if let Some(m) = ctx.mem.as_mut() {
             m.durable_set_sp(arena.region_base(slot + 1), arena.frame_base(slot + 1));
         }
-        // Deliver a placeholder resume value (inert; the thaw redelivers), then drive the fiber to its
-        // base return under `UNWINDING` (zero forward progress: the poll fires immediately after the
-        // suspend). `step_vcpu` runs the active `Vm` to completion in one call, and the unwind does no
-        // fiber/thread ops, so the run-shared registries are untouched and the only stop is `Done`.
-        let mut vm = vm;
-        vm.set(suspend_dst, Reg::from_i64(0));
+        // Drive the fiber to its base return under `UNWINDING` (zero forward progress: the poll fires
+        // immediately after the park). `step_vcpu` runs the active `Vm` to completion in one call, and
+        // the unwind does no fiber/thread ops, so the run-shared registries are untouched and the only
+        // stop is `Done`.
         let mut sub = VTask {
             active: vm,
             active_id: ROOT_FIBER,

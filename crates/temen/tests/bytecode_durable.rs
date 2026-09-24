@@ -198,3 +198,52 @@ block 0 (v0: i32) {
 fn single_fiber_multi_live_freeze_thaw() {
     check(MULTI_LIVE);
 }
+
+/// #1694 — the bytecode drivers that keep no per-fiber shadow-SP swap and have no freeze driver refuse
+/// a durable host rather than run it silently non-durable: the resumable `Vcpu` traps `Malformed` at
+/// its first `run`, and the parallel entry answers `None` (outside it), so the caller falls back to
+/// the cooperative scheduler, which keeps durability.
+#[test]
+fn drivers_that_cannot_freeze_refuse_a_durable_host() {
+    let m = parse_module(
+        "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n",
+    )
+    .expect("parse");
+    let durable = || {
+        let mut h = Host::new();
+        h.set_durable(true);
+        h
+    };
+    let back =
+        || std::sync::Arc::new(temen_interp::Region::owned_zeroed(1 << 20, 4096).expect("backing"));
+
+    let prog = bytecode::VcpuProgram::compile(&m).expect("compiles");
+    let mut plain = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[], back(), &[], Host::new())
+        .expect("builds");
+    assert!(
+        matches!(plain.run(), bytecode::VcpuEvent::Done(ref v) if v == &[Value::I64(7)]),
+        "a plain host runs"
+    );
+    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[], back(), &[], durable())
+        .expect("builds");
+    assert!(
+        matches!(vcpu.run(), bytecode::VcpuEvent::Trapped(Trap::Malformed)),
+        "the resumable driver refuses a durable host"
+    );
+
+    let mut fuel = 1_000_000u64;
+    let mut h = durable();
+    assert!(
+        bytecode::compile_and_run_capture_over_parallel_with_host(
+            &m,
+            0,
+            &[],
+            &mut fuel,
+            &[],
+            back(),
+            &mut h,
+        )
+        .is_none(),
+        "the parallel entry declines a durable host"
+    );
+}
