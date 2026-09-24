@@ -137,6 +137,13 @@ impl ChildTask {
         let mut window = mem::GuestWindow::new(1usize << mapped_log2, 1usize << reserved_log2);
         let base = window.base();
         init(&mut window);
+        // #964/#1733: every child window reserves its own `[0, guard)`, as the interpreter's windows
+        // do — last, after the host's seeding above; a window smaller than the guard skips, as the
+        // interpreter's `seed_null_guard` does. `finish` re-asserts RW before the host reads it back.
+        let guard = temen_ir::module_null_guard();
+        if guard <= 1u64 << mapped_log2 {
+            window.seed_null_guard(0, guard);
+        }
         if !premap(base, 1u64 << mapped_log2, 1u64 << reserved_log2) {
             window.restore_rw();
             return Err(teardown);

@@ -3004,9 +3004,10 @@ fn relaunch_detached(
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host)?;
-    // The window: a fresh reservation (a root's shape, as op 15 mints it) holding the child's image,
-    // its freeze word cleared and its context-0 thaw word set — `begin_thaw`, on the child's own window.
-    let mut mem = Mem::with_reservation(reserved_log2, memory_log2, shadow);
+    // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
+    // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
+    // `begin_thaw`, on the child's own window.
+    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data);
     mem.restore_layout(&window);
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
@@ -14049,13 +14050,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
-                                let mut fm = Mem::with_reservation(
+                                let mut fm = Mem::detached(
                                     DEFAULT_RESERVED_LOG2,
                                     size_log2 as u8,
                                     cm.shadow,
+                                    &cm.data,
                                 );
-                                fm.init_data(&cm.data);
-                                fm.seed_null_guard(temen_ir::module_null_guard()); // #964
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
@@ -28316,6 +28316,23 @@ impl MemLayout {
         }
     }
 
+    /// #1733 — a detached child's captured `image` under the page map its window was built with
+    /// ([`Mem::detached`]: the NULL guard, the `readonly` data segments), for a capture that cannot
+    /// read the live map (the JIT's harvest). Protections its guest changed through the Memory
+    /// capability are not recorded.
+    pub fn detached_image(module: &Module, image: Vec<u8>, mapped_log2: u8) -> MemLayout {
+        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data);
+        let space = m.space.read_unpoisoned();
+        MemLayout {
+            bytes: image,
+            map: PageMap {
+                prot: space.prot.clone(),
+                page: m.page,
+                mapped: m.window.mapped(),
+            },
+        }
+    }
+
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
     /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole
@@ -28462,6 +28479,21 @@ struct AddrSpace {
 }
 
 impl Mem {
+    /// A detached (op 15) child's window as it starts: a fresh reservation holding its module's data
+    /// segments (the `readonly` ones RO) under the #964 NULL guard. The one build for a spawn and for
+    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift.
+    fn detached(
+        reserved_log2: u8,
+        mapped_log2: u8,
+        shadow: Option<ShadowArena>,
+        data: &[Data],
+    ) -> Mem {
+        let mut m = Mem::with_reservation(reserved_log2, mapped_log2, shadow);
+        m.init_data(data);
+        m.seed_null_guard(temen_ir::module_null_guard());
+        m
+    }
+
     /// A window whose mask domain is `1 << reserved_log2` bytes but whose backed region is the
     /// declared `1 << mapped_log2` prefix; an access into the reserved-but-unmapped tail faults
     /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,

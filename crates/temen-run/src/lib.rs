@@ -1764,6 +1764,18 @@ fn detached_seeds(host: &mut Host) -> Result<Vec<temen_jit::DetachedSeed>, temen
                 .shadow
                 .unwrap_or(temen_ir::durable_abi::ShadowArena::EMPTY),
             image: window.bytes().to_vec(),
+            prots: window
+                .dense_prots()
+                .into_iter()
+                .map(|p| match p {
+                    temen_interp::CapturedProt::Ro => temen_jit::WindowProt::Ro,
+                    temen_interp::CapturedProt::Unmapped => temen_jit::WindowProt::Unmapped,
+                    // A §13 alias is not restorable (the codec refuses it); `Rw` is the default.
+                    temen_interp::CapturedProt::Rw | temen_interp::CapturedProt::Backed => {
+                        temen_jit::WindowProt::Rw
+                    }
+                })
+                .collect(),
             // SAFETY: `finish_child_build` returned 1, so it filled `gc`.
             child: unsafe { gc.assume_init() },
         });
@@ -1817,12 +1829,7 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
         });
         match (h.image, outcome) {
             (Some(image), _) => {
-                let pages = image.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
-                let window = temen_interp::MemLayout::from_dense(
-                    image,
-                    &vec![temen_interp::CapturedProt::Rw; pages],
-                    1u64 << h.mapped_log2,
-                );
+                let window = temen_interp::MemLayout::detached_image(&module, image, h.mapped_log2);
                 captured.push(temen_interp::CapturedDetached {
                     parent_task: 0,
                     slot: h.slot,
