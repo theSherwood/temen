@@ -22139,6 +22139,13 @@ impl Host {
     /// returning the pipe ids whose count reached `0` (readers of those must be woken → EOF). Called
     /// when a domain execs (its old powerbox is dropped) or tears down, so a producer that exits — even
     /// by crashing — releases its write ends and never wedges a downstream consumer.
+    /// FORK.md §8.6 — a domain finishing releases every pipe end it holds, so a peer reader sees EOF
+    /// and a peer writer `-EPIPE`. For a driver whose parked peers poll, so the zeroed pipes need no
+    /// wake. Call it once per domain: each call decrements the shared end counts again.
+    pub(crate) fn release_pipe_ends(&self) {
+        let _ = (self.drop_all_pipe_writers(), self.drop_all_pipe_readers());
+    }
+
     fn drop_all_pipe_writers(&self) -> Vec<u32> {
         let mut zeroed = Vec::new();
         for s in &self.table {
