@@ -331,6 +331,17 @@ static bool needs_envp;
 // path.
 static int data_end = POWERBOX_NULL_GUARD + RESERVED_BYTES;
 
+// Thread-locals (#1715) live in their own offset space: this unit's **per-thread block**, `tls_size`
+// bytes, each `_Thread_local`'s `offset` is within it. A thread's block is its `vcpu.tls` word, or
+// the root block while that word is 0 (the root vCPU's seed), so a program without thread-locals never
+// touches `vcpu.tls`. Separate compilation (`--emit-object`) emits the block as the unit's `data tls`
+// template and lets `temen_ir::link` place it. Whole-program (`--emit-ir`) places it here, exactly as
+// the linker would: a read-only pristine image at `tls_image` (a new thread's block is copied from
+// it), then the root thread's writable block at `tls_root`, each on its own page(s).
+static int tls_size;
+static int tls_image;
+static int tls_root;
+
 static int func_index(Obj *fn) {
   for (int i = 0; i < nfuncs; i++)
     if (funcs[i] == fn)
@@ -703,6 +714,34 @@ static void gen_memcpy(int dst, int src, int size) {
   }
 }
 
+// A thread-local's address (#1715): this thread's block plus the variable's offset in it. The block
+// is the vCPU's `vcpu.tls` word, or the root block while that word is 0 — the root vCPU's seed, so the
+// root thread needs no setup. A spawned thread installs its own block first (`<pthread.h>`). The offset is a link form under `--emit-object` (`data.self tls` for a thread-local
+// defined here, `data.sym tls` for one another unit exports), and a constant whole-program.
+static int gen_tls_addr(Obj *var) {
+  int w = nv++;
+  cg("  v%d = vcpu.tls.get\n", w);
+  int root = nv++;
+  if (opt_emit_object)
+    cg("  v%d = data.sym \"__tls_root\" 0\n", root);
+  else
+    cg("  v%d = i64.const %d\n", root, tls_root);
+  int z = nv++;
+  cg("  v%d = i64.eqz v%d\n", z, w);
+  int blk = nv++;
+  cg("  v%d = select v%d v%d v%d\n", blk, z, root, w);
+  int off = nv++;
+  if (!opt_emit_object)
+    cg("  v%d = i64.const %d\n", off, var->offset);
+  else if (var->is_definition)
+    cg("  v%d = data.self tls %d\n", off, var->offset);
+  else
+    cg("  v%d = data.sym tls \"%s\" 0\n", off, var->name);
+  int r = nv++;
+  cg("  v%d = i64.add v%d v%d\n", r, blk, off);
+  return r;
+}
+
 // The address of an lvalue, as an SSA i64.
 static int gen_addr(Node *node) {
   switch (node->kind) {
@@ -734,6 +773,8 @@ static int gen_addr(Node *node) {
     // block), `data.sym "name"` for one defined in another TU (resolved to the exporter's window
     // address, fail-closed if unexported). Never a raw `i64.const` here: the linker would not
     // relocate it, so it would point into whatever unit happened to land at that base offset.
+    if (node->var->is_tls)
+      return gen_tls_addr(node->var);
     int r = nv++;
     if (opt_emit_object) {
       if (node->var->is_definition)
@@ -1680,6 +1721,53 @@ static int gen_builtin_thread_spawn(Node *node) {
   return r; // i32 thread handle
 }
 
+// Thread-local setup for a new thread (#1715), used by `<pthread.h>`. The same three builtins the
+// LLVM on-ramp lowers (temen-llvm, NIM.md §3d), so one `<pthread.h>` serves both compilers:
+//
+//   long  __vm_tls_size(void);          // bytes in a thread's block (0: the program has no thread-locals)
+//   void *__vm_tls_template(void);      // the pristine image a new thread's block is copied from
+//   void  __vm_vcpu_tls_set(long blk);  // make blk this vCPU's block (`vcpu.tls.set`)
+//
+// The first two read the linker's `__tls_image`/`__tls_end` (constants whole-program), so a unit that
+// only creates threads needs no thread-locals of its own.
+static void gen_tls_image_end(int *img, int *end) {
+  *img = nv++;
+  *end = nv++;
+  if (opt_emit_object) {
+    cg("  v%d = data.sym \"__tls_image\" 0\n", *img);
+    cg("  v%d = data.sym \"__tls_end\" 0\n", *end);
+  } else {
+    cg("  v%d = i64.const %d\n", *img, tls_image);
+    cg("  v%d = i64.const %d\n", *end, tls_image + tls_size);
+  }
+}
+
+static int gen_builtin_tls_size(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_tls_size() takes no arguments");
+  int img, end;
+  gen_tls_image_end(&img, &end);
+  int r = nv++;
+  cg("  v%d = i64.sub v%d v%d\n", r, end, img);
+  return r;
+}
+
+static int gen_builtin_tls_template(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_tls_template() takes no arguments");
+  int img, end;
+  gen_tls_image_end(&img, &end);
+  return img;
+}
+
+static int gen_builtin_vcpu_tls_set(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_vcpu_tls_set(blk) expects 1 argument");
+  int blk = widen_i64(gen_expr(node->args), node->args->ty);
+  cg("  vcpu.tls.set v%d\n", blk);
+  return 0; // void
+}
+
 static int gen_builtin_thread_join(Node *node) {
   if (!node->args || node->args->next)
     error_tok(node->tok, "codegen_ir: __vm_thread_join(handle) expects 1 argument");
@@ -2091,6 +2179,12 @@ static int gen_expr(Node *node) {
           return gen_builtin_thread_spawn(node);
         if (!strcmp(fname, "__vm_thread_join"))
           return gen_builtin_thread_join(node);
+        if (!strcmp(fname, "__vm_tls_size"))
+          return gen_builtin_tls_size(node);
+        if (!strcmp(fname, "__vm_tls_template"))
+          return gen_builtin_tls_template(node);
+        if (!strcmp(fname, "__vm_vcpu_tls_set"))
+          return gen_builtin_vcpu_tls_set(node);
         if (!strcmp(fname, "__vm_atomic_add"))
           return gen_builtin_atomic_add(node);
         if (!strcmp(fname, "__vm_atomic_load"))
@@ -2990,7 +3084,7 @@ static bool layout_globals(Obj *prog) {
   // Pass 1: writable globals (and BSS) packed from `off` (guard + the reserved handle region, or
   // guard + the args buffer for an argv program).
   for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function || is_rodata(g))
+    if (g->is_function || g->is_tls || is_rodata(g))
       continue;
     // `--emit-object`: an `extern` global (declared here, defined in another TU) gets **no** local
     // storage — its references lower to `data.sym` and the linker resolves them to the exporter's
@@ -3020,6 +3114,27 @@ static bool layout_globals(Obj *prog) {
   // End the RO region on a page boundary too, so the data stack never shares its page.
   if (any_ro)
     off = align_to(off, DATA_PAGE);
+  // Pass 3: thread-locals, in the per-thread block's own offset space (see `tls_size`). The linker
+  // gives each unit's block a 16-byte-aligned slice of the program's, so a stricter alignment could
+  // not be honored in a thread's block — refuse it rather than misalign it.
+  tls_size = 0;
+  for (Obj *g = prog; g; g = g->next) {
+    if (g->is_function || !g->is_tls || (opt_emit_object && !g->is_definition))
+      continue;
+    if (g->align > 16)
+      error("codegen_ir: thread-local `%s` asks for %d-byte alignment; at most 16 is supported",
+            g->name, g->align);
+    tls_size = align_to(tls_size, g->align);
+    g->offset = tls_size;
+    tls_size += g->ty->size;
+  }
+  // Whole-program: place the image and the root block above the rest of the data, as the linker does.
+  if (tls_size && !opt_emit_object) {
+    tls_image = align_to(off, DATA_PAGE);
+    tls_root = align_to(tls_image + tls_size, DATA_PAGE);
+    off = align_to(tls_root + tls_size, DATA_PAGE);
+    any = true;
+  }
   data_end = align_to(off, 16);
   return any;
 }
@@ -3045,6 +3160,82 @@ static Obj *find_symbol(Obj *prog, char *name) {
   return NULL;
 }
 
+// The quoted byte string of a `data` segment: printable ASCII verbatim, `\\`/`"` escaped, the rest `\\xNN`.
+static void emit_data_bytes(unsigned char *buf, int size) {
+  cg("\"");
+  for (int i = 0; i < size; i++) {
+    unsigned char c = buf[i];
+    if (c == '\\')
+      cg("\\\\");
+    else if (c == '"')
+      cg("\\\"");
+    else if (c >= 0x20 && c <= 0x7e)
+      fputc(c, o);
+    else
+      cg("\\x%02x", c);
+  }
+  cg("\"\n");
+}
+
+// A pointer initializer (`&x`) whose target is a thread-local names no single address — each thread
+// has its own copy — so, as in C, it is not a constant. Refuse it rather than bake one thread's copy.
+static void check_reloc_target(Obj *prog, Relocation *r) {
+  Obj *t = find_symbol(prog, *r->label);
+  if (t && t->is_tls)
+    error("codegen_ir: the address of thread-local `%s` is not a constant initializer", *r->label);
+}
+
+// The per-thread block (#1715): every thread-local's initial bytes at its `offset` (see `tls_size`),
+// zeros included — the block is one segment, since the linker treats a gap as outside it. Pointer
+// initializers are relocated as for plain data: whole-program bakes the target's address;
+// `--emit-object` emits a zero placeholder and a `data.ptr tls` slot the linker patches.
+// Whole-program writes the block twice, as the linker would: the read-only image and the root block.
+static void emit_tls_block(Obj *prog) {
+  if (!tls_size)
+    return;
+  unsigned char *buf = calloc(tls_size, 1);
+  for (Obj *g = prog; g; g = g->next) {
+    if (g->is_function || !g->is_tls || !g->init_data || (opt_emit_object && !g->is_definition))
+      continue;
+    int size = g->ty->size;
+    memcpy(buf + g->offset, g->init_data, size);
+    for (Relocation *r = g->rel; r; r = r->next) {
+      check_reloc_target(prog, r);
+      Obj *t = find_symbol(prog, *r->label);
+      if (opt_emit_object && t && t->is_function)
+        error("codegen_ir: `--emit-object` cannot relocate a function pointer in static data "
+              "(`%s`); it needs a cross-TU funcref relocation the link model does not carry",
+              *r->label);
+      unsigned long val =
+          opt_emit_object ? 0 : (unsigned long)(symbol_value(prog, *r->label) + r->addend);
+      for (int i = 0; i < 8 && r->offset + i < size; i++)
+        buf[g->offset + r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
+    }
+  }
+  if (opt_emit_object) {
+    cg("data tls 0 ");
+    emit_data_bytes(buf, tls_size);
+    for (Obj *g = prog; g; g = g->next) {
+      if (g->is_function || !g->is_tls || !g->init_data || !g->is_definition)
+        continue;
+      for (Relocation *r = g->rel; r; r = r->next) {
+        Obj *t = find_symbol(prog, *r->label);
+        long at = (long)g->offset + r->offset;
+        if (t && t->is_definition)
+          cg("data.ptr tls %ld self %ld\n", at, (long)t->offset + r->addend);
+        else
+          cg("data.ptr tls %ld sym \"%s\" %ld\n", at, *r->label, r->addend);
+      }
+    }
+  } else {
+    cg("data ro %d ", tls_image);
+    emit_data_bytes(buf, tls_size);
+    cg("data %d ", tls_root);
+    emit_data_bytes(buf, tls_size);
+  }
+  free(buf);
+}
+
 // Emit a module-level `data` segment (§3a) for each initialized global: the runtime copies
 // the bytes into the window at instantiation, replacing the old per-byte `_start` init stores.
 // Pointer initializers (`char *p = "..."`, `&global`, `&arr[k]`, function pointers, and
@@ -3055,8 +3246,8 @@ static void emit_data_segments(Obj *prog) {
   long span_top = 0;    // high-water of every defined global's window extent (`--emit-object` span)
   long covered_top = 0; // high-water of the bytes an actual `data` segment writes
   for (Obj *g = prog; g; g = g->next) {
-    if (g->is_function)
-      continue;
+    if (g->is_function || g->is_tls)
+      continue; // thread-locals are emitted as one block below
     // `--emit-object`: an `extern` has no storage in this unit (see `layout_globals`) — skip it.
     // Otherwise every defined global counts toward the span the linker must reserve so the next
     // unit's window never overlaps this one's data (including BSS, which emits no segment below).
@@ -3077,6 +3268,7 @@ static void emit_data_segments(Obj *prog) {
     // (`--emit-object`): leave a zero placeholder and emit a link-form `data.ptr` slot the linker
     // patches once the window layout is known (below), the data→data twin of `data.self`/`data.sym`.
     for (Relocation *r = g->rel; r; r = r->next) {
+      check_reloc_target(prog, r);
       if (opt_emit_object) {
         Obj *t = find_symbol(prog, *r->label);
         if (t && t->is_function)
@@ -3094,19 +3286,8 @@ static void emit_data_segments(Obj *prog) {
           buf[r->offset + i] = (unsigned char)(val >> (8 * i)); // little-endian (§3b)
       }
     }
-    cg("data %s%d \"", is_rodata(g) ? "ro " : "", g->offset);
-    for (int i = 0; i < size; i++) {
-      unsigned char c = buf[i];
-      if (c == '\\')
-        cg("\\\\");
-      else if (c == '"')
-        cg("\\\"");
-      else if (c >= 0x20 && c <= 0x7e)
-        fputc(c, o);
-      else
-        cg("\\x%02x", c);
-    }
-    cg("\"\n");
+    cg("data %s%d ", is_rodata(g) ? "ro " : "", g->offset);
+    emit_data_bytes(buf, size);
     free(buf);
     if (opt_emit_object) {
       long ct = (long)g->offset + size;
@@ -3130,6 +3311,7 @@ static void emit_data_segments(Obj *prog) {
   // nothing is placed after its data.
   if (opt_emit_object && span_top > covered_top)
     cg("data %ld \"\\x00\"\n", span_top - 1);
+  emit_tls_block(prog);
 }
 
 // Which fixed powerbox caps (by `VM_CAP_*`/slot index) does `n`'s subtree actually reach? Sets bit
@@ -3725,16 +3907,21 @@ static void intern_global_types(Obj *prog) {
       intern_type(g->ty);
 }
 
-// Emit a module-scoped `debug.var ... global ... fixed <addr>` for each source global: it lives at
-// the fixed window offset `g->offset` (assigned by `layout_globals`), visible in every frame.
+// Emit a module-scoped `debug.var ... global` for each source global, visible in every frame: `fixed
+// <addr>` at its window offset, or `tls <off>` within the selected thread's block for a thread-local.
 static void emit_debug_globals(Obj *prog) {
   for (Obj *g = prog; g; g = g->next) {
     if (!is_debuggable_global(g))
       continue;
     const char *ty = dbg_typename(g->ty);
     int tid = intern_type(g->ty); // cached from `intern_global_types`
-    cg("debug.var global \"%s\" fixed %d \"%s\" %d\n", g->name, g->offset, ty, tid);
+    cg("debug.var global \"%s\" %s %d \"%s\" %d\n", g->name, g->is_tls ? "tls" : "fixed",
+       g->offset, ty, tid);
   }
+  // Whole-program: the root thread's block, where a thread-local lives while `vcpu.tls` is 0. The
+  // linker records it for a linked program.
+  if (tls_size && !opt_emit_object)
+    cg("debug.tls_root %d\n", tls_root);
 }
 
 void codegen_ir(Obj *prog, FILE *out) {
@@ -3842,7 +4029,7 @@ void codegen_ir(Obj *prog, FILE *out) {
         continue;
       if (!g->name || g->name[0] == '\0' || g->name[0] == '.')
         continue;
-      cg("export %d data \"%s\" %d\n", d++, g->name, g->offset);
+      cg("export %d data \"%s\" %s%d\n", d++, g->name, g->is_tls ? "tls " : "", g->offset);
     }
   }
 

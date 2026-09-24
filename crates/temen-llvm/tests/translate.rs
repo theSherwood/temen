@@ -5542,6 +5542,19 @@ fn demo_malloc_threads_vs_chibicc() {
     check_guest_concurrency_demo("malloc_threads", "malloc_threads/malloc_threads.c", b"0\n");
 }
 
+/// The chibicc `thread_local` demo through the LLVM on-ramp (#1715): clang's `_Thread_local` and the
+/// shared `<pthread.h>` (whose new-thread block setup is the `__vm_tls_*` builtins both compilers
+/// lower). Must print exactly what chibicc's build does (`c_frontend::c_guest_thread_local`).
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn demo_thread_local_vs_chibicc() {
+    check_guest_concurrency_demo(
+        "thread_local",
+        "thread_local/thread_local.c",
+        b"10010007\n110010008\n210010009\n5\nroot\n",
+    );
+}
+
 #[test]
 fn demo_hexdump_vs_native() {
     // A `hexdump -C`-style tool: read stdin in 16-byte rows, print `%08lx  HH×16  |ascii|` via the
