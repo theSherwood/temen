@@ -12901,6 +12901,35 @@ fn lower_vm_builtin(
             ctx.bind_dest(&c.dest, r);
             Ok(true)
         }
+        // §14 detached spawn: `long __vm_instantiate_detached(int inst, long budget, long module,
+        // long grants_ptr, long grants_n, long entry, long size_log2, long quota, long args_ptr,
+        // long args_len)` → `call.cap INSTANTIATOR 15 inst (budget, module, grants_ptr, grants_n,
+        // entry, size_log2, quota, args_ptr, args_len)` — `instantiate_detached` (PROCESS.md §5): the
+        // child runs the host-granted `module` in a window **of its own** (`size_log2` must equal the
+        // module's declared memory), not a carve of the spawner's, with the same named-grant records as
+        // `__vm_instantiate` and a spawn-time args payload copied to its `module_args_base()` (length 0
+        // seeds nothing). `budget` is a `Budget` handle the child's resources are drawn from. Returns
+        // the child handle, joined with `__vm_join` (`-EINVAL` on a refused spawn).
+        "__vm_instantiate_detached" => {
+            let handle = ctx.operand_i32(vm_arg(c, 0)?)?; // the Instantiator handle
+            let args = (1..10)
+                .map(|i| ctx.operand_i64(vm_arg(c, i)?))
+                .collect::<Result<Vec<_>, _>>()?;
+            let sig = temen_ir::FuncType {
+                params: vec![ValType::I64; 9],
+                results: vec![ValType::I64],
+            };
+            let sig = ctx.intern_sig(sig); // #922
+            let r = ctx.push(Inst::CapCall {
+                type_id: INSTANTIATOR_TYPE_ID,
+                op: 15,
+                sig,
+                handle,
+                args,
+            });
+            ctx.bind_dest(&c.dest, r);
+            Ok(true)
+        }
         // §14 run-in-guest: `long __vm_module_from_bytes(int loader, long ptr, long len)` →
         // `call.cap MODULE_LOADER 0 loader (ptr, len)` — the `from_bytes` primitive that has the host
         // decode+verify a wire-encoded module from `[ptr, ptr+len)` in the guest window and mints a
