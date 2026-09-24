@@ -804,9 +804,9 @@ impl Nursery {
     /// running **detached** child blocks here exactly as a detached `thread.spawn` vCPU does at
     /// `Domain::join_all` — the run's contract is that every vCPU/child is joined before the window dies.
     pub(crate) fn join_children(&self, froze: bool) {
-        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind,
-        // runnable ones finish, then the workers are joined.
-        self.child_exec.shutdown_and_join();
+        // D66 — drive the executor to quiescence: parked tasks are poisoned so they unwind, and
+        // unless this is a freeze the carve children end with the domain; then the workers are joined.
+        self.child_exec.shutdown_and_join(!froze);
         // CALLS.md 5c.0 — release each child's nursery-retained shared-powerbox ref (minted
         // live-impls hold their own counted refs, so a parent-held offer handle stays valid at the
         // host layer; the run is over regardless). After the joins above, so no child thread still

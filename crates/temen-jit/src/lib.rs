@@ -3202,6 +3202,7 @@ impl CompiledModule {
                 guard_offset_of(win_reserved as u64),
                 epoch_addr,
                 fuel_addr,
+                !thread.is_null(), // spawned vCPUs run this code beside the root
                 (table_len as u64) - 1, // the (possibly B2-reserved) table mask, baked per call site
                 None,                   // top-level: `ref.func N` = module-0 slot N (no remap)
                 fi as u32,
@@ -4510,6 +4511,7 @@ impl CompiledModule {
                 guard_offset_of(self.win_reserved as u64),
                 self.epoch_addr,
                 self.fuel_addr, // same counted-fuel cell as the parent module's functions
+                !self.thread.is_null(), // as the parent module's functions
                 self.fn_table_mask, // the parent's table mask, NOT derived from this unit's size
                 ref_slots.as_deref(), // remap `ref.func N` -> the unit's auto-installed slot
                 0,
@@ -5513,6 +5515,7 @@ fn compile_child_windowed(
             guard_offset_of(reserved), // its own window's trailing guard
             epoch_addr as i64, // §5 kill-path: the child polls the parent's interrupt cell
             fuel_addr as i64, // counted fuel: the child decrements its own budget cell (0 ⇒ un-metered)
+            true,             // a §14 child always runs beside its parent, which may tear it down
             fn_table_mask,    // the child's own (reserved) table mask
             None,             // §14 child: own window/table, `ref.func N` = slot N (no remap)
             0,
@@ -6284,6 +6287,12 @@ struct Lower<'a> {
     /// by the host mid-run, so the load/decrement/store is plain (non-atomic); the store⇒load dependency
     /// on the same address keeps Cranelift from hoisting the check out of a loop.
     fuel_addr: i64,
+    /// DESIGN §12 domain teardown for **running** vCPUs: poll this vCPU's own trap cell at every loop
+    /// back-edge (and the entry of a function that tail-calls), and unwind when it is non-zero — a sibling's trap, the root's
+    /// completion sentinel ([`DOMAIN_DONE_CODE`]), or a parent's teardown of a §14 child. On for code
+    /// that can run beside other vCPUs (a threaded module, every §14 child); a single-vCPU compile
+    /// emits nothing.
+    domain_poll: bool,
     /// Every function's `FuncId`, so `call`/`return_call` can reference callees.
     ids: &'a [FuncId],
     /// The functions of this compilation unit, indexed like [`Self::ids`], so a **direct** `call`
@@ -6367,6 +6376,7 @@ fn build_clif(
     guard_offset: u64,
     epoch_addr: i64,
     fuel_addr: i64,
+    domain_poll: bool,
     fn_table_mask: u64,
     ref_slots: Option<&[u32]>,
     func_idx: u32,
@@ -6465,6 +6475,7 @@ fn build_clif(
         sig,
         epoch_addr,
         fuel_addr,
+        domain_poll,
         ids,
         distinct,
         type_section,
@@ -6485,6 +6496,16 @@ fn build_clif(
         .map(|v| BlockArg::from(*v))
         .collect();
     emit_epoch_check(&mut b, &lower);
+    // A cycle of tail calls passes no back-edge and no call return, so a function that tail-calls
+    // polls on entry; any other re-entry comes back through a caller's post-call trap guard.
+    if f.blocks.iter().any(|blk| {
+        matches!(
+            blk.term,
+            Terminator::ReturnCall { .. } | Terminator::ReturnCallIndirect { .. }
+        )
+    }) {
+        emit_domain_poll(&mut b, &lower);
+    }
     emit_signal_check(module, &mut b, &lower); // #932 async signal delivery (no-op when disarmed)
     emit_fuel_check(&mut b, &lower);
     emit_stack_check(&mut b, &lower);
@@ -8160,6 +8181,9 @@ fn lower_block(
             // §5 kill-path: poll the interrupt cell before taking any branch — every loop body ends
             // in one of these terminators, so this bounds a non-terminating intra-function loop.
             emit_epoch_check(b, lower);
+            if *target as usize <= block_idx {
+                emit_domain_poll(b, lower);
+            }
             emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
                                                  // Fuel unification: an unconditional branch charges one fuel iff it is a back-edge — the
                                                  // target block index is at-or-before this block's, matching the interpreters' `backedge!`
@@ -8182,6 +8206,9 @@ fn lower_block(
             let tb = *blocks.get(*then_blk as usize).ok_or(JitError::Malformed)?;
             let eb = *blocks.get(*else_blk as usize).ok_or(JitError::Malformed)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
+            if *then_blk as usize <= block_idx || *else_blk as usize <= block_idx {
+                emit_domain_poll(b, lower); // (see `Br`)
+            }
             emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
                                                  // Fuel unification: charge one fuel iff the *taken* edge is a back-edge (target block index
                                                  // <= this block's), matching the interpreters' per-edge `backedge!`. Back-edge-ness is
@@ -8227,6 +8254,11 @@ fn lower_block(
         } => {
             let index = get(&vals, *idx)?;
             emit_epoch_check(b, lower); // §5 kill-path (see `Br`)
+            if default.0 as usize <= block_idx
+                || targets.iter().any(|(t, _)| *t as usize <= block_idx)
+            {
+                emit_domain_poll(b, lower); // (see `Br`)
+            }
             emit_signal_check(module, b, lower); // #932 async signal delivery (no-op when disarmed)
                                                  // Fuel unification: charge one fuel iff the *selected* target is a back-edge (target block
                                                  // index <= this block's), matching the interpreters' `backedge!` on the arm actually taken.
@@ -8484,6 +8516,31 @@ fn emit_epoch_check(b: &mut FunctionBuilder, lower: &Lower) {
     emit_trap(b, lower, TrapKind::OutOfFuel);
     b.switch_to_block(cont);
     // `cont`/`trap_blk` are sealed by the caller's `seal_all_blocks`.
+}
+
+/// Emit the domain-teardown poll ([`Lower::domain_poll`]) — at loop back-edges and at the entry of
+/// a function that tail-calls: if this vCPU's trap cell is non-zero —
+/// set by a sibling's trap, the root's completion, or a parent tearing down a §14 child — return
+/// straight up the stack, as a call's trap-propagation guard does. The cell is only read, so the
+/// value that ended the domain is the one reported. The load is atomic for the reason
+/// [`emit_epoch_check`]'s is: another thread writes the cell, and a plain load could be hoisted out
+/// of the loop it bounds. A no-op when `domain_poll` is off.
+///
+/// On return the builder is positioned at the continuation block.
+fn emit_domain_poll(b: &mut FunctionBuilder, lower: &Lower) {
+    if !lower.domain_poll {
+        return;
+    }
+    let trap_out = b.use_var(lower.trap_var);
+    let tc = b.ins().atomic_load(I64, atomic_flags(), trap_out);
+    let stop = b.create_block();
+    let cont = b.create_block();
+    b.set_cold_block(stop); // taken once per vCPU lifetime: keep it off the loop's fall-through path
+    b.ins().brif(tc, stop, &[], cont, &[]);
+    b.switch_to_block(stop);
+    emit_trap_return(b, lower);
+    b.switch_to_block(cont);
+    // `stop`/`cont` are sealed by the caller's `seal_all_blocks`.
 }
 
 /// #932 — emit the async-signal **delivery safepoint**: poll the host `armed` flag (`Host::sig_armed`)
