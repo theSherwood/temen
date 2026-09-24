@@ -318,7 +318,10 @@ property, so in practice:
   holding the full on-ramp powerbox (`grant_onramp_caps`: the §3e prefix, by-name caps and manifest
   import bindings), so a `.temen` off the on-ramp toolchain whose runtime spawns threads runs them on
   real Workers. Its root takes no args (the manifest `_start`) and reserves exactly the window, as
-  children do; an `exit` from any vCPU ends the run. Proven: `browser/tests/par_onramp.rs` (real OS
+  children do; an `exit` from any vCPU ends the run. The run's environment (`temen_set_run_env`,
+  #1777 — `KEY=VALUE` entries) is seeded into the root window as the §3e env blob, exactly as the
+  cooperative on-ramp seeds it, so a runtime can tell the two drivers apart by what its host says
+  (JACL's worker-pool size, jacl #152). Proven: `browser/tests/par_onramp.rs` (real OS
   threads, against the cooperative `onramp_exec`) and the `#capio` item in Chromium. **Fiber
   runtimes too (#1761):** a run's vCPUs share one fiber registry (`bytecode::SharedFibers`, owned by
   the run's `VcpuProgram` and attached to the root and every `thread.spawn` child), so a fiber

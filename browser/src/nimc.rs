@@ -935,7 +935,7 @@ fn nim_libc() -> Option<&'static [u8]> {
 /// Run the linked module under the on-ramp powerbox (tree-walker), streaming its stdout live (#1143):
 /// the tee fires the `stdout_chunk` host import, relayed to the page only while a streaming Run is active.
 fn run_linked(m: &Module) -> Result<String, String> {
-    let out = crate::onramp_exec_with_tee(m, &[], crate::stream_tee());
+    let out = crate::onramp_exec_with_tee(m, &[], &[], crate::stream_tee());
     if out.status != crate::STATUS_OK && out.status != crate::STATUS_EXIT {
         return Err(format!("run failed (status {})", out.status));
     }

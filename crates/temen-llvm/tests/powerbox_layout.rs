@@ -1,8 +1,9 @@
-//! `TranslateOptions::powerbox_layout`: a library (no `main`) that becomes a powerbox program only
-//! after translation — a separately linked runtime given an entry by `synth_manifest_child_start` —
-//! keeps its globals clear of the argument area. Without it they start at the guarded `DATA_BASE`,
-//! inside `[module_args_base(), module_args_end())`, and a detached spawn's payload (op 15) lands on
-//! them.
+//! A library (no `main`) that becomes a powerbox program only after translation — a separately
+//! linked runtime given an entry by `synth_manifest_child_start` — keeps its globals clear of the
+//! argument area, so a detached spawn's payload (op 15) never lands on them. Every translation lays
+//! its globals out from `stack_page` (#1777); #1776 first made this an opt-in
+//! `TranslateOptions::powerbox_layout`, and these were its tests. The translator cannot know a unit
+//! will be wrapped, so the opt-in's off state was only ever the bug.
 
 use temen_interp::{run_capture_reserved_with_host, Host, Value};
 
@@ -41,12 +42,8 @@ define i64 @spawn(i32 %inst, i64 %budget, i64 %module) {{
     )
 }
 
-fn child(powerbox_layout: bool) -> temen_llvm::Translated {
-    let opts = temen_llvm::TranslateOptions {
-        powerbox_layout,
-        ..Default::default()
-    };
-    temen_llvm::translate_ll_str_with_options(CHILD, opts).expect("translate the child")
+fn child() -> temen_llvm::Translated {
+    temen_llvm::translate_ll_str(CHILD).expect("translate the child")
 }
 
 fn g_addr(t: &temen_llvm::Translated) -> u64 {
@@ -101,20 +98,11 @@ fn spawn(t: temen_llvm::Translated) -> i64 {
 }
 
 #[test]
-fn it_moves_a_librarys_globals_above_the_argument_area() {
-    assert!(
-        g_addr(&child(false)) < temen_ir::module_args_end(),
-        "the default layout this option exists for"
-    );
-    assert!(g_addr(&child(true)) >= temen_ir::module_args_end());
+fn a_librarys_globals_sit_above_the_argument_area() {
+    assert!(g_addr(&child()) >= temen_ir::module_args_end());
 }
 
 #[test]
 fn a_detached_payload_leaves_the_globals_intact() {
-    assert_eq!(spawn(child(true)), 35 + 7);
-    assert_ne!(
-        spawn(child(false)),
-        35 + 7,
-        "without it, the payload lands on @g"
-    );
+    assert_eq!(spawn(child()), 35 + 7, "the payload must not land on @g");
 }

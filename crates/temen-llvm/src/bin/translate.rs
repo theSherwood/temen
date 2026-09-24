@@ -31,7 +31,7 @@ fn try_main() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() || args.iter().any(|a| a == "-h" || a == "--help") {
         eprintln!(
-            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--powerbox-layout] [--null-guard]\n\
+            "usage: temen-llvm-translate <input.ll|input.bc> -o <out> [--binary] [--host-page <bytes>] [--stub-externs] [--null-guard]\n\
              \n  Translates legalized LLVM IR (textual .ll, or .bc via llvm-dis) to an TEMEN-IR module written to <out>:\n\
              \n    text (.temt) by default, binary (.temen) when -o ends in .temen or --binary,\n\
              \n    or a binary object/link unit (.temeno, v9 object dialect). Exports ride in-band\n\
@@ -42,8 +42,6 @@ fn try_main() -> Result<(), String> {
              \n  the writable data stack (which would fault under D40).\n\
              \n  --stub-externs lowers undefined externals to trap-if-called stubs instead of\n\
              \n  failing translation (large-program bring-up, e.g. Postgres).\n\
-             \n  --powerbox-layout lays a library (no main) out as a powerbox program, its globals\n\
-             \n  clear of the argument blob, for one that synth_manifest_start makes runnable later.\n\
              \n  --null-guard (#964) is a redundant no-op: the powerbox low scratch is always laid out\n\
              \n  one 16 KiB guard above zero so a host seeds [0, 16384) unmapped and NULL dereferences\n\
              \n  trap (#1094 — the one canonical layout). The flag is kept only for compatibility.\n\
@@ -61,7 +59,6 @@ fn try_main() -> Result<(), String> {
     let mut host_page: u64 = temen_ir::POWERBOX_STACK_PAGE;
     let mut stub_externs = false;
     let mut child_entry = false;
-    let mut powerbox_layout = false;
     let mut shadow_contexts: Option<u32> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -85,9 +82,6 @@ fn try_main() -> Result<(), String> {
             // §14 child-entry mode (#1011 slice 3c): synthesize the powerbox entry with the
             // `instantiate_module` child ABI, so a guest driver can spawn this module as a phase child.
             "--child-entry" => child_entry = true,
-            // A library that becomes a powerbox program after linking (`synth_manifest_start`):
-            // keep its globals clear of the argument blob its host seeds.
-            "--powerbox-layout" => powerbox_layout = true,
             // #1534: reserve + declare the durable shadow arena, so the durable transform accepts
             // this guest (it fails closed on a module that declares none — INVARIANTS.md #16).
             "--shadow-arena" => {
@@ -121,7 +115,6 @@ fn try_main() -> Result<(), String> {
         stub_unresolved_externs: stub_externs,
         stack_page: host_page,
         child_entry,
-        powerbox_layout,
         shadow_contexts,
     };
     let is_ll = Path::new(&input).extension().is_some_and(|e| e == "ll");
