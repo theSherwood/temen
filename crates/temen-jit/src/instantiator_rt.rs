@@ -17,7 +17,7 @@ use crate::{CapThunk, TrapKind};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry, ValType};
+use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry};
 
 /// PROCESS.md S1: per-carve compile-cache key for a **non-durable** child — the identity the compiled
 /// a compiled child ([`crate::CompiledModule`]) depends on. `funcs_ptr`/`n_funcs` name the module's function slice (stable
@@ -1198,7 +1198,11 @@ pub(crate) unsafe extern "C" fn instantiate(
         && off.checked_add(child_size).is_some_and(|e| e <= size)
         // #964: a carve may not dip into the reserved NULL region `[0, guard)` (interp twin).
         && base + off >= rt.null_guard.load(Ordering::Acquire)
-        && (entry as usize) < child_funcs.len();
+        // The one entry-shape rule every tier shares (#911, #1720) — this arm used to check only the
+        // index, so it ran an entry the oracle refuses.
+        && child_funcs
+            .get(entry as usize)
+            .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     if !fits || !mod_ok {
         return EINVAL as i32;
     }
@@ -1208,8 +1212,8 @@ pub(crate) unsafe extern "C" fn instantiate(
     // writes at spawn.
     write_data_segments(child_data, mem_base, base + off, child_size);
 
-    // The child entry takes its starter caps as `i64` args; with an empty powerbox today they are
-    // unused, so pass zeros of the right arity (the entry is a fixed `(i64[, i64]) -> i64`).
+    // The child entry takes its starter caps as `i64` args (none for a powerbox `_start`); with an
+    // empty powerbox today they are unused, so pass zeros of the entry's arity.
     let nargs = child_funcs[entry as usize].params.len();
     let args = vec![0i64; nargs];
 
@@ -1418,15 +1422,16 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     };
     let off = off as u64;
     // A named child receives no positional grant, so its entry is the 1- or 2-arg form (`Instantiator`
-    // [, `AddressSpace`]) returning `i64` — it discovers its granted caps by name.
-    let want_as = child_funcs
+    // [, `AddressSpace`]) returning `i64`, or a powerbox `_start` taking nothing (#1720) — either way it
+    // discovers its granted caps by name.
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     let fits = child_size != 0
         && child_size <= size
         && off & (child_size - 1) == 0
@@ -1510,10 +1515,8 @@ pub(crate) unsafe extern "C" fn instantiate_named(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // Async (S1c): the child runs on its own OS thread — two named-grant children can pipeline
     // through a granted `SharedRegion` — and its powerbox host is released from that thread.
@@ -1765,15 +1768,16 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     };
     let off = off as u64;
     // A named child receives no positional grant, so its entry is the 1- or 2-arg form (a compiled
-    // command's `--child-entry` `_start` is the 1-arg starter form; it finds granted caps by name).
-    let want_as = child_funcs
+    // command's `--child-entry` `_start` is the 1-arg starter form) or a powerbox `_start` taking
+    // nothing (#1720); either way it finds granted caps by name.
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // A separate-module child's carve must be **at least** its declared memory (FORK.md §8.6 /
     // #773 — the interpreter twin at `instantiate_rec`'s `mod_ok`): a larger window is a safe
     // superset (confinement, invariant 2, still masks every access to the actual carve), and a
@@ -1866,10 +1870,8 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // Async (S1c): a spawned command runs on its own OS thread — the shell-exec primitive can
     // pipeline (`cmd1 | cmd2` over a granted region ring or pipe) instead of serializing.
@@ -2073,14 +2075,14 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
     } else {
         0
     };
-    let want_as = child_funcs
+    let arity = child_funcs
         .get(entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let ok_entry = child_funcs.get(entry as usize).is_some_and(|f| {
-        f.results.as_slice() == [ValType::I64]
-            && (f.params.len() == 1 || f.params.len() == 2)
-            && f.params.iter().all(|p| *p == ValType::I64)
-    });
+        .map_or(0, |f| f.params.len());
+    // The one entry-shape rule every tier shares (#911, #1720): the child-entry ABI or a powerbox
+    // `_start` — never a private copy that could admit what the oracle refuses, or refuse what it runs.
+    let ok_entry = child_funcs
+        .get(entry as usize)
+        .is_some_and(|f| temen_ir::child_entry_ok(&f.params, &f.results));
     // §14 transparency: the detached window equals the module's declared memory (the interpreter's
     // op-15 `mod_ok`); it grows into its own reservation, so no superset room is needed.
     let mod_ok = mod_mem == Some(size_log2 as i32);
@@ -2213,10 +2215,8 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
             return 0;
         }
     };
-    let mut args = vec![gc.inst_handle as i64];
-    if want_as {
-        args.push(gc.as_handle as i64);
-    }
+    let args: Vec<i64> =
+        temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // The window image: the module's data segments, then the payload at the args base.
     let mut seeds: Vec<(u64, Vec<u8>)> = child_data

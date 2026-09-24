@@ -9,13 +9,17 @@
 //! (`Mem::with_reservation`, its own guard — not a carve), admitted and powerboxed exactly as the
 //! executor's child, and `join`ed through the shared seam.
 //!
-//! One guest, one powerbox, three drivers, one answer. The guest **joins** the child and returns
-//! its result, so a driver that only minted a handle (or declined) cannot pass — the child has to
-//! run to completion under that driver.
+//! One guest, one powerbox, three drivers — and the tree-walk oracle — one answer. The guest
+//! **joins** the child and returns its result, so a driver that only minted a handle (or declined)
+//! cannot pass — the child has to run to completion under that driver.
+//!
+//! #1720 — and every **entry shape** a spawn admits gets the same answer everywhere: the child-entry
+//! ABI, and a powerbox `_start` (no params) returning an `i32` status (read back sign-extended) or
+//! nothing (read back as `0`). A card module nests as built through exactly these arms.
 
 use std::sync::Arc;
 use temen_interp::bytecode::{self, SchedStop, ScheduledDebugRun};
-use temen_interp::{Host, Region, Trap, Value};
+use temen_interp::{run_with_host, Host, Region, Trap, Value};
 
 /// The parent: `v0` Instantiator, `v1` a granted `Module`, `v2` a detached-spawn `Budget`. Issues
 /// op 15 (the 7-arg form) and `join`s the child, returning what the child returned.
@@ -35,10 +39,13 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 }
 "#;
 
-/// The child (a child-entry module over its own `memory 15` window): stores and reloads a word in
-/// its fresh window (above the null guard, below `1 << 15`) — proof the window is real and
-/// writable — and returns the sentinel.
-const CHILD: &str = r#"memory 15
+/// The children, one per admitted entry shape, each over its own `memory 15` window, with what the
+/// parent's `join` reads back. The child-entry one stores and reloads a word in its fresh window
+/// (above the null guard, below `1 << 15`) — proof the window is real and writable.
+const CHILDREN: [(&str, &str, i64); 3] = [
+    (
+        "child entry `(i64) -> (i64)`",
+        r#"memory 15
 func (i64) -> (i64) {
 block 0 (v0: i64) {
   va = i64.const 24576
@@ -48,10 +55,48 @@ block 0 (v0: i64) {
   return vw
   }
 }
-"#;
+"#,
+        42,
+    ),
+    (
+        "powerbox `_start: () -> (i32)`",
+        r#"memory 15
+export 0 func "_start" 0
+func () -> (i32) {
+block 0 () {
+  vs = i32.const -7
+  return vs
+  }
+}
+"#,
+        -7,
+    ),
+    (
+        "powerbox `_start: () -> ()`",
+        r#"memory 15
+export 0 func "_start" 0
+func () -> () {
+block 0 () {
+  return
+  }
+}
+"#,
+        0,
+    ),
+];
 
-fn want() -> Result<Vec<Value>, Trap> {
-    Ok(vec![Value::I64(42)])
+/// Run `check` once per child shape, with the parsed parent, the child, and the answer to expect.
+fn for_each_child(
+    check: impl Fn(&str, &temen_ir::Module, &temen_ir::Module, Result<Vec<Value>, Trap>),
+) {
+    for (shape, text, answer) in CHILDREN {
+        check(
+            shape,
+            &module(PARENT),
+            &module(text),
+            Ok(vec![Value::I64(answer)]),
+        );
+    }
 }
 
 fn module(text: &str) -> temen_ir::Module {
@@ -82,16 +127,26 @@ fn shared_window(size: u64) -> (Arc<Region>, *mut u8, std::alloc::Layout) {
 }
 
 #[test]
-fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
-    let parent = module(PARENT);
-    let child = module(CHILD);
-    let mut host = Host::new();
-    let args = powerbox(&mut host, &child, 1 << 16);
-    let mut fuel = u64::MAX;
+fn the_tree_walk_oracle_spawns_and_joins_a_detached_child() {
+    for_each_child(|shape, parent, child, want| {
+        let mut host = Host::new();
+        let args = powerbox(&mut host, child, 1 << 16);
+        let mut fuel = u64::MAX;
+        let result = run_with_host(parent, 0, &args, &mut fuel, &mut host);
+        assert_eq!(result, want, "{shape}");
+    });
+}
 
-    let result = bytecode::compile_and_run_with_host(&parent, 0, &args, &mut fuel, &mut host)
-        .expect("the cooperative executor runs this module");
-    assert_eq!(result, want());
+#[test]
+fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
+    for_each_child(|shape, parent, child, want| {
+        let mut host = Host::new();
+        let args = powerbox(&mut host, child, 1 << 16);
+        let mut fuel = u64::MAX;
+        let result = bytecode::compile_and_run_with_host(parent, 0, &args, &mut fuel, &mut host)
+            .expect("the cooperative executor runs this module");
+        assert_eq!(result, want, "{shape}");
+    });
 }
 
 /// The OS-thread parallel driver: the child runs on its own OS thread over its own `Mem` and is
@@ -99,29 +154,30 @@ fn the_cooperative_executor_spawns_and_joins_a_detached_child() {
 /// returned `Err(Trap::Malformed)`, abandoning the run).
 #[test]
 fn the_parallel_driver_spawns_and_joins_a_detached_child() {
-    let parent = module(PARENT);
-    let child = module(CHILD);
-    let mut host = Host::new();
-    let args = powerbox(&mut host, &child, 1 << 16);
-    let (back, base, layout) = shared_window(1 << 16);
-    let mut fuel = u64::MAX;
+    for_each_child(|shape, parent, child, want| {
+        let mut host = Host::new();
+        let args = powerbox(&mut host, child, 1 << 16);
+        let (back, base, layout) = shared_window(1 << 16);
+        let mut fuel = u64::MAX;
 
-    let (result, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
-        &parent,
-        0,
-        &args,
-        &mut fuel,
-        &[],
-        Arc::clone(&back),
-        &mut host,
-    )
-    .expect("the parallel driver runs this module");
+        let (result, _image) = bytecode::compile_and_run_capture_over_parallel_with_host(
+            parent,
+            0,
+            &args,
+            &mut fuel,
+            &[],
+            Arc::clone(&back),
+            &mut host,
+        )
+        .expect("the parallel driver runs this module");
 
-    drop(back);
-    // SAFETY: same layout; the region and every borrow of `base` are gone (the run joined its vCPUs).
-    unsafe { std::alloc::dealloc(base, layout) };
+        drop(back);
+        // SAFETY: same layout; the region and every borrow of `base` are gone (the run joined its
+        // vCPUs).
+        unsafe { std::alloc::dealloc(base, layout) };
 
-    assert_eq!(result, want());
+        assert_eq!(result, want, "{shape}");
+    });
 }
 
 /// The debug scheduler: the child is a `DbgTask` over its own `DbgEnv` (fresh `Mem`, child
@@ -129,19 +185,19 @@ fn the_parallel_driver_spawns_and_joins_a_detached_child() {
 /// through its detached child. Before #1528 this arm landed `-EINVAL`.
 #[test]
 fn the_debug_scheduler_spawns_and_joins_a_detached_child() {
-    let parent = module(PARENT);
-    let child = module(CHILD);
-    let mut host = Host::new();
-    let args = powerbox(&mut host, &child, 1 << 16);
-    let mut run = ScheduledDebugRun::new_with_host(&parent, 0, &args, host).expect("in subset");
-    let mut fuel = u64::MAX;
+    for_each_child(|shape, parent, child, want| {
+        let mut host = Host::new();
+        let args = powerbox(&mut host, child, 1 << 16);
+        let mut run = ScheduledDebugRun::new_with_host(parent, 0, &args, host).expect("in subset");
+        let mut fuel = u64::MAX;
 
-    let result = loop {
-        match run.run_until_stop(&mut fuel) {
-            SchedStop::Finished(r) => break r,
-            SchedStop::Break { .. } => continue,
-            other => panic!("the debug scheduler must drive op 15 to completion, got {other:?}"),
-        }
-    };
-    assert_eq!(result, want());
+        let result = loop {
+            match run.run_until_stop(&mut fuel) {
+                SchedStop::Finished(r) => break r,
+                SchedStop::Break { .. } => continue,
+                other => panic!("{shape}: the debug scheduler must drive op 15, got {other:?}"),
+            }
+        };
+        assert_eq!(result, want, "{shape}");
+    });
 }

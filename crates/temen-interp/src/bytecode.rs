@@ -1297,12 +1297,15 @@ pub(crate) fn carve_fits(
         && ibase.checked_add(off).is_some_and(|b| b >= null_guard)
 }
 
-/// A §14 child module's **entry signature** must be `(i64) -> (i64)` (an instantiator handle) or
-/// `(i64, i64) -> (i64)` (also an address-space handle, so the child manages its own pages). The
-/// single definition the drivers and tree-walk arms share (#911).
-pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
-    results == [ValType::I64]
-        && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
+/// The §14 entry-shape rule and the starter handles each shape takes live in `temen-ir`, the one
+/// crate every tier shares — the Cranelift JIT's spawn arms read the same definition (#911, #1720).
+pub use temen_ir::{child_entry_handles, child_entry_ok};
+
+/// [`child_entry_handles`] as the interpreters' entry args.
+pub(crate) fn child_entry_args(arity: usize, inst: i32, space: i32) -> Vec<Value> {
+    child_entry_handles(arity, inst, space)
+        .map(Value::I64)
+        .collect()
 }
 
 /// A §5 `instantiate_detached` (op 15) child as every bytecode driver builds it — the **one
@@ -1362,7 +1365,7 @@ fn admit_detached_child(
         .ok_or(Trap::Malformed)?
         .with_manifest(cimports, ctypes);
     let sig = compiled.sigs.get(entry as usize);
-    let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -1441,11 +1444,7 @@ fn admit_detached_child(
     if bound.is_err() {
         return Ok(None);
     }
-    let args = if want_as {
-        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-    } else {
-        vec![Value::I64(cinst as i64)]
-    };
+    let args = child_entry_args(arity, cinst, cas);
     let fuel = if quota <= 0 {
         parent_fuel
     } else {
@@ -3877,10 +3876,7 @@ impl<'p> Vcpu<'p> {
             .get(module as usize)
             .ok_or(Trap::Malformed)?;
         // One or two entry args, per the signature the parent already validated (its starter caps).
-        let want_as = cunit
-            .sigs
-            .get(entry as usize)
-            .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+        let arity = cunit.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
         // The starter caps span the parent-granted **carve** (`1<<carve_log2`), not the smaller declared
         // window — so a growing child's `vm_map` into `[1<<size_log2, 1<<carve_log2)` is authorized (the
         // parent granted that range). The committed `mapped` still starts at the declared window below.
@@ -3902,11 +3898,7 @@ impl<'p> Vcpu<'p> {
         // fail-closed refusal.
         host.bind_child_manifest(&cunit.imports, &cunit.types)
             .map_err(|_| Trap::Malformed)?;
-        let args = if want_as {
-            vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-        } else {
-            vec![Value::I64(cinst as i64)]
-        };
+        let args = child_entry_args(arity, cinst, cas);
         let mut mm =
             Mem::with_reservation_over(DEFAULT_RESERVED_LOG2, size_log2, back, cunit.shadow);
         // #964/#1094/#1206: the NULL guard is the one canonical layout — a confined child's carve
@@ -7289,7 +7281,7 @@ fn dbg_instantiate(
     // A confined child's entry is `(i64 instantiator) -> (i64)` or `(i64 instantiator, i64 address_space)
     // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
     let sig = c0.sigs.get(entry as u64 as usize);
-    let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -7345,11 +7337,7 @@ fn dbg_instantiate(
     let mut child_host = Host::new();
     let cinst = child_host.grant_instantiator(0, child_size);
     let cas = child_host.grant_address_space(0, child_size);
-    let child_args = if want_as {
-        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-    } else {
-        vec![Value::I64(cinst as i64)]
-    };
+    let child_args = child_entry_args(arity, cinst, cas);
     let child_fuel = if quota <= 0 {
         pfuel
     } else {
@@ -7429,7 +7417,7 @@ fn dbg_instantiate_module(
     // Entry sig is validated against the *child module*; a separate-module child's carve must equal its
     // declared memory (§14 transparency — it runs exactly as it would standalone).
     let sig = child_compiled.sigs.get(entry as u64 as usize);
-    let want_as = sig.is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+    let arity = sig.map_or(0, |(p, _)| p.len());
     let ok_entry = sig.is_some_and(|(p, r)| child_entry_ok(p, r));
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -7492,11 +7480,7 @@ fn dbg_instantiate_module(
     let mut child_host = Host::new();
     let cinst = child_host.grant_instantiator(0, child_size);
     let cas = child_host.grant_address_space(0, child_size);
-    let child_args = if want_as {
-        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-    } else {
-        vec![Value::I64(cinst as i64)]
-    };
+    let child_args = child_entry_args(arity, cinst, cas);
     let child_fuel = if quota <= 0 {
         pfuel
     } else {
@@ -9172,10 +9156,10 @@ fn exec_image_build(
     .ok_or(())?;
     // Entry sig + window fit: the command reuses the caller's window in place, so its declared memory
     // must be `<=` the caller's backed-prefix window (a larger window is a safe §2-masked superset).
-    let want_as = child_compiled
+    let arity = child_compiled
         .sigs
         .get(entry as usize)
-        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+        .map_or(0, |(p, _)| p.len());
     let ok_entry = child_compiled
         .sigs
         .get(entry as usize)
@@ -9202,11 +9186,7 @@ fn exec_image_build(
     // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
     let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
     cur_host.exec_carry(&mut child_host, &cmodule, &cmodule.imports, &cmodule.types)?;
-    let child_args = if want_as {
-        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-    } else {
-        vec![Value::I64(cinst as i64)]
-    };
+    let child_args = child_entry_args(arity, cinst, cas);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     if let Some(m) = cur_mem {
@@ -13052,10 +13032,7 @@ impl CoopSched {
                     // starter caps over its own window.
                     let (cmod, c0) =
                         spawner_module(&dom.source, &tasks[ti].vt.active).ok_or(Trap::Malformed)?;
-                    let want_as = c0
-                        .sigs
-                        .get(entry as usize)
-                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                    let arity = c0.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
                     let ok_entry = c0
                         .sigs
                         .get(entry as usize)
@@ -13181,11 +13158,7 @@ impl CoopSched {
                             }
                         }
                     }
-                    let child_args = if want_as {
-                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                    } else {
-                        vec![Value::I64(cinst as i64)]
-                    };
+                    let child_args = child_entry_args(arity, cinst, cas);
                     // §3d: a record's budget funds the child here — the commit site, after every
                     // other refusal (geometry, grants), so a refused spawn leaves it intact.
                     // #989 slice 1b — peek the budget's `channel` cap BEFORE `take_spawn_budget`
@@ -13399,10 +13372,10 @@ impl CoopSched {
                     // The child entry sig is validated against the *child module*. A separate-module
                     // child's carve must equal its declared memory (§14 transparency: it runs exactly as
                     // it would standalone — same window size, same wrap behaviour).
-                    let want_as = child_compiled
+                    let arity = child_compiled
                         .sigs
                         .get(entry as usize)
-                        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                        .map_or(0, |(p, _)| p.len());
                     let ok_entry = child_compiled
                         .sigs
                         .get(entry as usize)
@@ -13494,11 +13467,7 @@ impl CoopSched {
                             continue;
                         }
                     };
-                    let child_args = if want_as {
-                        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                    } else {
-                        vec![Value::I64(cinst as i64)]
-                    };
+                    let child_args = child_entry_args(arity, cinst, cas);
                     // §3d: a record's budget funds the child here — the commit site, after every
                     // other refusal (module resolve, geometry, grants, manifest binding).
                     // #989 slice 1b — peek the channel cap before `take_spawn_budget` drains it.
@@ -15413,10 +15382,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let Some((cmod, c0)) = spawner_module(&dom.source, &vt.active) else {
                     return (Err(Trap::Malformed), mem);
                 };
-                let want_as = c0
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let arity = c0.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
                 let ok_entry = c0
                     .sigs
                     .get(entry as usize)
@@ -15456,11 +15422,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 let mut child_host = Host::new();
                 let cinst = child_host.grant_instantiator(0, child_size);
                 let cas = child_host.grant_address_space(0, child_size);
-                let child_args = if want_as {
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                } else {
-                    vec![Value::I64(cinst as i64)]
-                };
+                let child_args = child_entry_args(arity, cinst, cas);
                 let child_fuel = if quota <= 0 {
                     fuel
                 } else {
@@ -15632,10 +15594,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                 };
                 // Validate the entry against the *child module* and the carve; a separate-module
                 // child's carve must equal its declared memory (§14 transparency).
-                let want_as = child_compiled
-                    .sigs
-                    .get(entry as usize)
-                    .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
+                let arity = child_compiled.sigs.get(entry as usize).map_or(0, |(p, _)| p.len());
                 let ok_entry = child_compiled
                     .sigs
                     .get(entry as usize)
@@ -15705,11 +15664,7 @@ fn run_vcpu_parallel<'scope, 'env>(
                     }
                     Err(t) => return (Err(t), mem),
                 };
-                let child_args = if want_as {
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-                } else {
-                    vec![Value::I64(cinst as i64)]
-                };
+                let child_args = child_entry_args(arity, cinst, cas);
                 // A §3d budget record funds the spawn from a `Budget` rather than the `quota` scalar
                 // — the same `take_spawn_budget` the cooperative arm charges, so the two drivers
                 // spend the same quota for the same spawn.

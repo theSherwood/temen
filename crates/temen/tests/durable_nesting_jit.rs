@@ -261,7 +261,9 @@ fn jit_durable_depth2_grandchild_matches_interp() {
 /// **frozen** — born `UNWINDING` it spills at that first poll (loop not yet entered), the live child a
 /// freeze must capture — *and* (b) **thaws + runs uninterrupted cleanly** to 4950 (the dead branch is
 /// never reached, so no `CapFault`). A *pure-compute* loop like `PARENT_SELF_LOOP`'s child has no poll
-/// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model").
+/// site, so the synchronous JIT would run it to completion (DURABILITY.md §4 "Freeze model"). Its entry
+/// is the child-entry shape `(i64) -> (i64)`: an `(i32)` entry is one the oracle's op 0 refuses, and
+/// it only ran here because the JIT's op 0 skipped the shape check (#1720 closed that).
 const FREEZE_PARENT: &str = "memory 18 shadow 16448 65536
 func (i32) -> (i64) {
 block 0 (v0: i32) {
@@ -274,8 +276,9 @@ block 0 (v0: i32) {
   return v6
   }
 }
-func (i32) -> (i64) {
-block 0 (v0: i32) {
+func (i64) -> (i64) {
+block 0 (va: i64) {
+  v0 = i32.wrap_i64 va
   v1 = i64.const 0
   br 1(v1, v1, v0)
 }

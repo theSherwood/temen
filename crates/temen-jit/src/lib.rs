@@ -6567,7 +6567,14 @@ fn build_trampoline(
     if !sret {
         let rets: Vec<Value> = b.inst_results(call).to_vec();
         for (i, r) in rets.iter().enumerate() {
-            let slot = encode_slot(&mut b, *r);
+            // A result slot holds what the interpreter's `Reg` would (#1720): an `i32` sign-extends,
+            // so a §14 child's `_start` status reaches its joiner identically on every tier. Every
+            // other reader decodes the slot by the declared type, where the extension is invisible.
+            let slot = if b.func.dfg.value_type(*r) == I32 {
+                b.ins().sextend(I64, *r)
+            } else {
+                encode_slot(&mut b, *r)
+            };
             b.ins()
                 .store(MemFlags::trusted(), slot, results_ptr, (i * 8) as i32);
         }
