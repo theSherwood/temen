@@ -2134,8 +2134,9 @@ unsafe fn fiber_futex_wait_loop(
     loop {
         // D66 — a **child-domain task** has no resumer to poll it, so an already-resolved wait
         // must not spend a park: it would then sit until an idle worker's cadence sweep. A guest
-        // fiber keeps the register-then-park order its resumer observes (`fiber_parks.rs`).
-        if crate::child_exec::in_task() {
+        // fiber, a task's included (#1469), keeps the register-then-park order its resumer
+        // observes (`fiber_parks.rs`).
+        if slot.is_platform() {
             let st = cell.status.load(Ordering::Acquire);
             if st != PENDING_WAIT {
                 return st;
@@ -2246,6 +2247,23 @@ pub(crate) unsafe extern "C" fn fiber_resume_block(
         // guest exactly as `cont.resume` would (its `status_out`/value are already set).
         if *status_out != FIBER_PARKED_STATUS || load_trap(trap_out as *mut i64) != 0 {
             return value;
+        }
+        // #1469 — inside a child-domain task the thread that would idle is an executor worker, not
+        // a vCPU of this Domain: its lanes and deadlock count are the task's, which the executor
+        // keeps. So the task root parks the *task* on the one event park (counted, woken by every
+        // notify, poisoned at teardown) and re-polls when woken. A guest fiber inside the task
+        // cannot park the task from its own stack, so it fails closed rather than block a worker.
+        if fiber_rt::in_task() {
+            match fiber_rt::current_fiber_slot() {
+                Some(s) if s.is_platform() => {
+                    fiber_rt::fiber_event_park(&s, fiber_rt::park_is_self_resolving(handle));
+                    continue;
+                }
+                _ => {
+                    store_trap(trap_out as *mut i64, TrapKind::ThreadFault as i64);
+                    return value;
+                }
+            }
         }
         // Still event-parked: idle on the domain condvar until an event might wake the fiber, then
         // re-poll. `ParkGuard` counts this vCPU blocked for the deadlock detector; the bounded wait

@@ -5076,6 +5076,7 @@ pub(crate) unsafe fn compile_child_and_run(
         &[], // the durable/sync nested child is never an offer target — no serve trampolines
         0,   // an empty powerbox holds no `Jit` — the natural table,,
         child_shadow,
+        false, // the synchronous durable child runs on its parent's thread: no fiber runtime of its own
     )?;
     let n_results = funcs[child_entry as usize].results.len();
     let code = child.tramp_code;
@@ -5408,6 +5409,9 @@ fn compile_child(
     // #1296 — the child's `call.dyn` table reservation (`0` ⇒ natural), see [`GrantChild`].
     table_reserve_log2: u8,
     shadow: temen_ir::durable_abi::ShadowArena,
+    // Whether the child runs as a child-executor task (`child_exec`), which gives it its own fiber
+    // runtime (#1469); see [`compile_child_windowed`].
+    in_task: bool,
 ) -> Result<CompiledModule, JitError> {
     compile_child_windowed(
         funcs,
@@ -5424,6 +5428,7 @@ fn compile_child(
         serve_handlers,
         table_reserve_log2,
         shadow,
+        in_task,
     )
 }
 
@@ -5435,8 +5440,11 @@ fn compile_child(
 ///
 /// The result is a [`CompiledModule`] — **the same shape a root compiles to** (#1296: a domain is a
 /// domain however it came into being). What differs is only what is baked: the child's own `call.cap`
-/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no fiber /
-/// setjmp / nursery runtime of its own (those ops are rejected below). Being the root's shape is what
+/// thunk + powerbox ctx, its window geometry, the parent's kill/fuel cells and futex, and no thread /
+/// setjmp / nursery runtime of its own (those ops are rejected below). A child that runs as an
+/// executor task (`in_task`) may use `cont.*` fibers and `gc.roots` (#1469): the fiber thunks are
+/// static and find the running runtime through a thread-local, and each task brings its own fiber
+/// table and runtime (`child_exec::ChildTask::new`), so the code stays shareable across spawns. Being the root's shape is what
 /// lets a child hold a re-granted `Jit` capability: `define_extra` / `invoke_extra` / `install` lower a
 /// submitted unit against exactly these baked constants, into the child's own table.
 #[allow(clippy::too_many_arguments)]
@@ -5456,6 +5464,10 @@ fn compile_child_windowed(
     table_reserve_log2: u8,
     // The child module's declared shadow arena (its ctx-0 words + regions live in its own window).
     shadow: temen_ir::durable_abi::ShadowArena,
+    // Whether the child runs as a child-executor task: only a task has a fiber runtime of its own. A
+    // synchronous (durable) child runs on its parent's thread, where the running runtime is the
+    // parent's, so its `cont.*` stays rejected.
+    in_task: bool,
 ) -> Result<CompiledModule, JitError> {
     // Audit #3: reject an oversize child window explicitly rather than silently clamping with
     // `.min(MAX_JIT_WINDOW_LOG2)`, so the window built here always equals the size the Instantiator
@@ -5476,11 +5488,18 @@ fn compile_child_windowed(
         .clone();
     for f in funcs {
         ensure_supported(f, types)?;
-        // A child using §12 fibers/threads would compile against null fiber/thread thunks (no
-        // per-child runtime yet) — reject rather than emit a call through a null pointer.
-        if f.uses_fibers_or_threads() {
+        // `thread.spawn`/`join` would compile against null thread thunks (no per-child thread domain
+        // yet) — reject rather than emit a call through a null pointer. Likewise `cont.*` in a child
+        // that has no fiber runtime of its own (not a task), or no domain for `cont.resume.block`
+        // to bake.
+        if f.uses_threads() {
             return Err(JitError::Unsupported(
-                "a §14 JIT child using fibers/threads is not supported yet",
+                "a §14 JIT child using thread.spawn/join is not supported yet",
+            ));
+        }
+        if !(in_task && cfg!(fiber_rt) && futex_sched != 0) && f.uses_fibers_or_threads() {
+            return Err(JitError::Unsupported(
+                "a §14 JIT child using fibers needs a task and its parent's domain",
             ));
         }
         // `atomic.wait`/`notify` compile against the parent domain's shared futex when one was
@@ -5516,7 +5535,28 @@ fn compile_child_windowed(
     // equality across the child's program and its units (DESIGN.md §22).
     let mut distinct = distinct_types(funcs);
     intern_unit_sigs(&mut distinct, funcs, types)?;
+    // A task child using `cont.*` or `gc.roots` gets the fiber thunks, as a root does
+    // (`compile_with_signal`); the fiber-entry signature is interned the same way.
+    let uses_fibers = in_task && funcs.iter().any(|f| f.uses_fibers() || f.uses_gc_roots());
+    #[cfg(fiber_rt)]
+    if uses_fibers {
+        intern_type(&mut distinct, &fiber_func_type())?;
+    }
     let distinct = distinct;
+    #[cfg(fiber_rt)]
+    let fiber = if uses_fibers {
+        FiberEnv {
+            new_thunk: fiber_rt::fiber_new as *const () as i64,
+            resume_thunk: fiber_rt::fiber_resume as *const () as i64,
+            block_resume_thunk: os_thread_rt::fiber_resume_block as *const () as i64,
+            suspend_thunk: fiber_rt::fiber_suspend as *const () as i64,
+            roots_thunk: fiber_rt::temen_gc_roots_flush as *const () as i64,
+        }
+    } else {
+        FiberEnv::null()
+    };
+    #[cfg(not(fiber_rt))]
+    let fiber = FiberEnv::null();
 
     let cap = CapEnv {
         thunk_addr: cap_thunk as *const () as i64,
@@ -5546,7 +5586,7 @@ fn compile_child_windowed(
             &distinct,
             types,
             cap,
-            FiberEnv::null(),
+            fiber,
             thread_env,
             inst_env, // §4: a durable child's baked nested-nursery `InstEnv` (else null — no nesting)
             SetjmpEnv::null(), // a child using setjmp is rejected below (no per-child runtime yet)
@@ -5637,9 +5677,40 @@ fn compile_child_windowed(
             }
         }
     }
+    // The fiber call-trampoline (a fiber's first resume calls its entry through it), as a root's.
+    #[cfg(fiber_rt)]
+    let fiber_tramp = if uses_fibers {
+        build_fiber_call_trampoline(&mut module, &mut ctx.func);
+        let id = module
+            .declare_function("fiber_call_tramp", Linkage::Export, &ctx.func.signature)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module
+            .define_function(id, &mut ctx)
+            .map_err(|e| JitError::Backend(e.to_string()))?;
+        module.clear_context(&mut ctx);
+        Some(id)
+    } else {
+        None
+    };
     module
         .finalize_definitions()
         .map_err(|e| JitError::Backend(e.to_string()))?;
+    // What a task's own fiber runtime needs (`child_exec`): the trampoline, and the fiber-entry
+    // type id + the funcref mask (the reserved table's, as a root's `fiber_mask`).
+    #[cfg(fiber_rt)]
+    let (call_tramp, fiber_cfg): (Option<fiber_rt::FiberCallTramp>, Option<(u32, u64)>) =
+        match fiber_tramp {
+            Some(id) => {
+                let addr = module.get_finalized_function(id);
+                // SAFETY: `addr` is the finalized `fiber_call_tramp` with exactly this ABI.
+                let t: fiber_rt::FiberCallTramp = unsafe { std::mem::transmute(addr) };
+                (
+                    Some(t),
+                    Some((type_id_of(&distinct, &fiber_func_type()), fn_table_mask)),
+                )
+            }
+            None => (None, None),
+        };
 
     let fn_table: Box<[FnEntry]> = (0..table_len)
         .map(|slot| match funcs.get(slot) {
@@ -5684,7 +5755,7 @@ fn compile_child_windowed(
         n_real_funcs: funcs.len(),
         distinct,
         cap,
-        fiber: FiberEnv::null(),
+        fiber,
         thread: thread_env,
         inst: inst_env,
         setjmp: SetjmpEnv::null(),
@@ -5728,8 +5799,8 @@ fn compile_child_windowed(
         _unit_progs: Vec::new(),
         #[cfg(setjmp_rt)]
         _setjmp_rt: None,
-        call_tramp: None,
-        fiber_cfg: None,
+        call_tramp,
+        fiber_cfg,
         fiber_table: None,
         src_ranges: Vec::new(),
         src_files: Vec::new(),
@@ -5797,6 +5868,7 @@ pub(crate) fn compile_nondurable_child(
         &[], // a plain (ungranted) child is never an offer target — no serve trampolines
         0,   // an empty powerbox holds no `Jit` — the natural table,
         shadow,
+        true, // a plain child runs as an executor task (its own fiber runtime, #1469)
     )
 }
 
