@@ -80,7 +80,7 @@ static void emit_header(char *buf) {
   eb(buf, 'T'); eb(buf, 'E'); eb(buf, 'M'); eb(buf, 'E'); eb(buf, 'N');
   eb(buf, 0); eb(buf, 0); eb(buf, 0);
   eb(buf, 0); eb(buf, 0);                 // kind = module
-  eb(buf, (11) & 0xff); eb(buf, (11) >> 8); // version (u16)
+  eb(buf, (12) & 0xff); eb(buf, (12) >> 8); // version (u16)
   eb(buf, 0); eb(buf, 0); eb(buf, 0); eb(buf, 0); // flags
   eb(buf, 1);
   eb(buf, 17);
