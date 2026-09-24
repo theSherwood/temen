@@ -482,9 +482,9 @@ mod pal {
 
 // ================================= PAL: windows ===============================================
 // `VirtualAlloc2(MEM_RESERVE_PLACEHOLDER)` reservation + `VirtualProtect` (PAGE_NOACCESS tail/guard)
-// + a **Vectored Exception Handler** that, on an in-window access violation, restores a captured
-// context to unwind out of the fault — the windows analogue of unix's signal + siglongjmp. A
-// **placeholder** reservation (rather than a plain `MEM_RESERVE`) is what lets `temen-run`'s §13
+// + a **Vectored Exception Handler** that, on an in-window access violation, resumes at the guarded
+// call's landing pad to unwind out of the fault — the windows analogue of unix's signal +
+// siglongjmp. A **placeholder** reservation (rather than a plain `MEM_RESERVE`) is what lets `temen-run`'s §13
 // `SharedRegion` path alias a shared section into a fixed window sub-range via
 // `MapViewOfFile3(MEM_REPLACE_PLACEHOLDER)` (issue #1). Pure Rust via `windows-sys` (no C shim), so
 // the path stays `cargo check/clippy --target *-windows-*`-able on a non-windows host.
@@ -500,7 +500,7 @@ mod pal {
     use std::sync::Once;
     use windows_sys::Win32::Foundation::{GetLastError, HANDLE};
     use windows_sys::Win32::System::Diagnostics::Debug::{
-        AddVectoredExceptionHandler, RtlCaptureContext, CONTEXT, EXCEPTION_POINTERS,
+        AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS,
     };
     use windows_sys::Win32::System::Memory::{
         UnmapViewOfFile2, VirtualAlloc2, VirtualFree, VirtualProtect, VirtualQuery,
@@ -754,27 +754,141 @@ mod pal {
         }
     }
 
-    // ---- the guard: AddVectoredExceptionHandler + RtlCaptureContext (longjmp-equivalent) --------
-    // `CONTEXT` must be **16-byte aligned** on x86-64: it embeds XMM (`M128A`) save area that
-    // `RtlCaptureContext` writes with *aligned* SSE stores (`movaps`). The real Win32 header declares
-    // it `__declspec(align(16))`, but windows-sys types it `#[repr(C)]` only — so a bare stack local
-    // is merely 8-byte aligned, and when it lands at an 8-mod-16 address `RtlCaptureContext` faults
-    // (`STATUS_ACCESS_VIOLATION`) *inside the capture itself*, before the guest runs. Wrap it to
-    // restore the ABI-required alignment.
-    #[repr(C, align(16))]
-    struct AlignedContext(CONTEXT);
+    // ---- the guard: AddVectoredExceptionHandler + an asm guarded-call trampoline ---------------
+    //
+    // #1792 — the recovery point is the **trampoline's own return**, never a point inside a Rust
+    // function. `run_guarded` used to capture a `CONTEXT` with `RtlCaptureContext` and have the VEH
+    // restore it, resuming *inside* `run_guarded` a second time: a call returning twice, which LLVM
+    // was never told (C's `setjmp` is `returns_twice`; `RtlCaptureContext` is not). What the resumed
+    // code found in its registers and stack slots then depended on the build's register allocation
+    // and frame layout, so some builds crashed on every guarded fault and others never did.
+    //
+    // `temen_win_guarded_call(f, a, r, m, t, tc, jb)` saves the Win64 non-volatile registers (`rbx`,
+    // `rbp`, `rdi`, `rsi`, `r12`–`r15`, `xmm6`–`xmm15`) and its entry `rsp` into `jb`, calls
+    // `f(a, r, m, t, tc)` and returns 0. On a guarded fault the VEH loads those registers from `jb`
+    // into the faulting context and resumes at `temen_win_guarded_landing`, which returns 1 from the
+    // trampoline's frame. Either way Rust sees one ordinary call that returns once, with its
+    // non-volatile registers intact. The trampoline carries SEH unwind info, so a stack walk through
+    // it (an exception dispatched from inside `f`) unwinds correctly; the landing pad is a leaf.
+    core::arch::global_asm!(
+        ".globl temen_win_guarded_call",
+        ".def temen_win_guarded_call",
+        ".scl 2",
+        ".type 32",
+        ".endef",
+        ".seh_proc temen_win_guarded_call",
+        "temen_win_guarded_call:",
+        "sub rsp, 0x38",
+        ".seh_stackalloc 0x38",
+        ".seh_endprologue",
+        // `jb`, the 7th argument, sits at entry `rsp + 0x38` — `rsp + 0x70` after the prologue.
+        "mov rax, [rsp + 0x70]",
+        "mov [rax + 0x00], rbx",
+        "mov [rax + 0x08], rbp",
+        "mov [rax + 0x10], rdi",
+        "mov [rax + 0x18], rsi",
+        "mov [rax + 0x20], r12",
+        "mov [rax + 0x28], r13",
+        "mov [rax + 0x30], r14",
+        "mov [rax + 0x38], r15",
+        "lea r10, [rsp + 0x38]", // entry `rsp`: it points at our return address
+        "mov [rax + 0x40], r10",
+        "movdqu [rax + 0x50], xmm6",
+        "movdqu [rax + 0x60], xmm7",
+        "movdqu [rax + 0x70], xmm8",
+        "movdqu [rax + 0x80], xmm9",
+        "movdqu [rax + 0x90], xmm10",
+        "movdqu [rax + 0xa0], xmm11",
+        "movdqu [rax + 0xb0], xmm12",
+        "movdqu [rax + 0xc0], xmm13",
+        "movdqu [rax + 0xd0], xmm14",
+        "movdqu [rax + 0xe0], xmm15",
+        // f(a, r, m, t, tc): four register arguments, the fifth above the 32-byte home area.
+        "mov r10, rcx",
+        "mov rcx, rdx",
+        "mov rdx, r8",
+        "mov r8, r9",
+        "mov r9, [rsp + 0x60]",  // `t`, entry `rsp + 0x28`
+        "mov rax, [rsp + 0x68]", // `tc`, entry `rsp + 0x30`
+        "mov [rsp + 0x20], rax",
+        "call r10",
+        "xor eax, eax",
+        "add rsp, 0x38",
+        "ret",
+        ".seh_endproc",
+        ".globl temen_win_guarded_landing",
+        "temen_win_guarded_landing:",
+        "mov eax, 1",
+        "ret",
+    );
+
+    /// The registers [`temen_win_guarded_call`] saves at entry, in the layout its asm writes.
+    #[repr(C)]
+    struct JmpBuf {
+        /// `rbx`, `rbp`, `rdi`, `rsi`, `r12`, `r13`, `r14`, `r15`, then the entry `rsp`.
+        gpr: [u64; 9],
+        _pad: u64,
+        /// `xmm6`–`xmm15`, low then high quadword.
+        xmm: [[u64; 2]; 10],
+    }
+
+    extern "C" {
+        /// See the asm above: `1` if a guarded fault resumed at the landing pad, else `0`.
+        fn temen_win_guarded_call(
+            f: Entry,
+            a: *const i64,
+            r: *mut i64,
+            m: *mut u8,
+            t: *const c_void,
+            tc: *mut i64,
+            jb: *mut JmpBuf,
+        ) -> u32;
+        fn temen_win_guarded_landing();
+    }
+
+    /// Point the faulting `ctx` at the landing pad with the registers `jb` saved: execution resumes
+    /// as `temen_win_guarded_call` returning 1, in its caller's frame.
+    fn resume_at_landing(ctx: &mut CONTEXT, jb: &JmpBuf) {
+        let [rbx, rbp, rdi, rsi, r12, r13, r14, r15, rsp] = jb.gpr;
+        ctx.Rbx = rbx;
+        ctx.Rbp = rbp;
+        ctx.Rdi = rdi;
+        ctx.Rsi = rsi;
+        ctx.R12 = r12;
+        ctx.R13 = r13;
+        ctx.R14 = r14;
+        ctx.R15 = r15;
+        ctx.Rsp = rsp;
+        ctx.Rip = temen_win_guarded_landing as *const () as usize as u64;
+        let m = |i: usize| windows_sys::Win32::System::Diagnostics::Debug::M128A {
+            Low: jb.xmm[i][0],
+            High: jb.xmm[i][1] as i64,
+        };
+        // SAFETY: the x64 `CONTEXT`'s float area is always the legacy/XMM view on this arch; the
+        // union's two members alias the same bytes.
+        let x = unsafe { &mut ctx.Anonymous.Anonymous };
+        x.Xmm6 = m(0);
+        x.Xmm7 = m(1);
+        x.Xmm8 = m(2);
+        x.Xmm9 = m(3);
+        x.Xmm10 = m(4);
+        x.Xmm11 = m(5);
+        x.Xmm12 = m(6);
+        x.Xmm13 = m(7);
+        x.Xmm14 = m(8);
+        x.Xmm15 = m(9);
+    }
 
     #[derive(Clone, Copy)]
     struct Frame {
-        ctx: *const CONTEXT, // captured recovery context (a stack local of `run_guarded`)
+        /// The active trampoline's saved registers (a stack local of `run_guarded`).
+        jb: *const JmpBuf,
         lo: usize,
         hi: usize,
     }
     thread_local! {
-        // The active guarded call's window range + recovery context (None ⇒ no guarded call).
+        // The active guarded call's window range + saved registers (None ⇒ no guarded call).
         static GUARD: Cell<Option<Frame>> = const { Cell::new(None) };
-        // Set by the VEH before it restores the context, read after RtlCaptureContext returns.
-        static TRIPPED: Cell<bool> = const { Cell::new(false) };
         // §5 W3 trap-time backtrace: the faulting `(pc, frame-pointer-chain return addresses)` the VEH
         // captures from the access-violation `CONTEXT` *before* it overwrites that context with the
         // recovery one. Read + cleared by `take_trap_frame`. A fixed buffer (no allocation in the VEH).
@@ -832,7 +946,8 @@ mod pal {
 
     /// Capture the trap-time backtrace from the faulting `CONTEXT` (§5/W3): the faulting `Rip` is the
     /// innermost frame (symbolized directly by the host), and the `Rbp` chain gives the callers. Called
-    /// from the VEH while the guest stack is still intact, before the recovery context is restored.
+    /// from the VEH while the guest stack is still intact, before the context is pointed at the landing
+    /// pad.
     ///
     /// # Safety
     /// `ctx` is the live faulting context for an in-window access violation in guest JIT code.
@@ -861,14 +976,12 @@ mod pal {
             let addr = rec.ExceptionInformation[1];
             if let Some(f) = GUARD.with(|g| g.get()) {
                 if addr >= f.lo && addr < f.hi {
-                    TRIPPED.with(|t| t.set(true));
-                    // §5 W3: capture the trap-time backtrace from the faulting context *before* the
-                    // `copy_nonoverlapping` below overwrites it with the recovery context.
+                    // §5 W3: capture the trap-time backtrace from the faulting context *before*
+                    // `resume_at_landing` below rewrites it.
                     capture_trap_frame(&*ep.ContextRecord);
-                    // Restore the captured context → resume right after RtlCaptureContext in
-                    // `run_guarded` (the unix siglongjmp analogue). The abandoned JIT frames hold no
-                    // Rust destructors.
-                    core::ptr::copy_nonoverlapping(f.ctx, ep.ContextRecord, 1);
+                    // Resume as the trampoline returning 1 (the unix siglongjmp analogue). The
+                    // abandoned JIT frames hold no Rust destructors.
+                    resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
@@ -879,9 +992,8 @@ mod pal {
             // an illegal instruction inside an armed guarded guest call is our emitted memory-fault
             // trap. Recover exactly like a guarded access violation (unwind to `run_guarded`).
             if let Some(f) = GUARD.with(|g| g.get()) {
-                TRIPPED.with(|t| t.set(true));
                 capture_trap_frame(&*ep.ContextRecord);
-                core::ptr::copy_nonoverlapping(f.ctx, ep.ContextRecord, 1);
+                resume_at_landing(&mut *ep.ContextRecord, &*f.jb);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
@@ -983,31 +1095,27 @@ mod pal {
     ) -> bool {
         // Save the caller's (possibly-armed parent) guard frame to restore on exit — re-entrant so a
         // §14 child guest can run (in its own window) inside the parent's guarded call. A child fault
-        // resumes at the child's `saved` context; the parent's frame is restored afterwards intact.
+        // resumes at the child's landing pad; the parent's frame is restored afterwards intact.
         let prev = GUARD.with(|g| g.replace(None));
-        // Snapshot the TEB stack fields with the recovery point: a fiber-side fault unwinds here
-        // without the fiber switch-back, and the `CONTEXT` restore leaves the fiber's TEB values in
-        // place (see `teb_stack_fields`) — restore them on the tripped path.
+        // Snapshot the TEB stack fields: a fiber-side fault resumes at the landing pad without the
+        // fiber switch-back, and the context rewrite leaves the fiber's TEB values in place (see
+        // `teb_stack_fields`) — restore them on the tripped path.
         let teb = teb_stack_fields();
-        let mut saved = AlignedContext(core::mem::zeroed());
-        // Capture the recovery point. On a guard fault the VEH copies `saved` over the fault context,
-        // so execution resumes *here* with TRIPPED set — the longjmp-equivalent return.
-        RtlCaptureContext(&mut saved.0);
-        if TRIPPED.with(|x| x.replace(false)) {
+        let mut jb = JmpBuf {
+            gpr: [0; 9],
+            _pad: 0,
+            xmm: [[0; 2]; 10],
+        };
+        let jb_ptr: *mut JmpBuf = &mut jb;
+        GUARD.with(|g| g.set(Some(Frame { jb: jb_ptr, lo, hi })));
+        // SAFETY: `f` honours the `Entry` ABI (the caller's contract); `jb` outlives the call, and
+        // the VEH reads it only while this frame is armed.
+        let tripped = temen_win_guarded_call(f, a, r, m, t, tc, jb_ptr) != 0;
+        if tripped {
             restore_teb_stack_fields(teb); // undo a fiber-side fault's leftover TEB stack fields
-            GUARD.with(|g| g.set(prev)); // restore the parent's frame; report the caught fault
-            return true;
         }
-        GUARD.with(|g| {
-            g.set(Some(Frame {
-                ctx: &saved.0,
-                lo,
-                hi,
-            }))
-        });
-        f(a, r, m, t, tc);
-        GUARD.with(|g| g.set(prev)); // ran to completion; restore the parent's frame
-        false
+        GUARD.with(|g| g.set(prev)); // restore the parent's frame
+        tripped
     }
 }
 
@@ -1154,8 +1262,9 @@ mod tests {
         _t: *const c_void,
         _tc: *mut i64,
     ) {
-        // SAFETY: the read is expected to fault in-window; the guard restores the recovery context
-        // (with the caller's `rbp`), so the `pop` never runs and the stack is not left unbalanced.
+        // SAFETY: the read is expected to fault in-window; the guard resumes at its landing pad with
+        // the caller's registers (`rbp` included), so the `pop` never runs and the stack is not left
+        // unbalanced.
         unsafe {
             core::arch::asm!(
                 "push rbp",
@@ -1186,6 +1295,144 @@ mod tests {
             guarded(&win, read_in_tail_with_a_wild_rbp),
             "the tail fault is caught although rbp names no frame"
         );
+    }
+
+    /// As `read_in_tail`, but first overwrites every Win64 non-volatile register — `rbx`, `rbp`,
+    /// `rsi`, `rdi`, `r12`–`r15`, `xmm6`–`xmm15` — so only the guard's landing can give the caller
+    /// its values back.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    extern "C" fn clobber_then_fault(
+        _a: *const i64,
+        _r: *mut i64,
+        mem: *mut u8,
+        _t: *const c_void,
+        _tc: *mut i64,
+    ) {
+        // SAFETY: the read faults in-window and the guard resumes at its landing pad, so the pops
+        // never run; the declared outputs cover every register the asm writes.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "push rbp",
+                "mov rbx, {junk}",
+                "mov rbp, {junk}",
+                "mov rsi, {junk}",
+                "mov rdi, {junk}",
+                "mov r12, {junk}",
+                "mov r13, {junk}",
+                "mov r14, {junk}",
+                "mov r15, {junk}",
+                "movq xmm6, {junk}",
+                "movq xmm7, {junk}",
+                "movq xmm8, {junk}",
+                "movq xmm9, {junk}",
+                "movq xmm10, {junk}",
+                "movq xmm11, {junk}",
+                "movq xmm12, {junk}",
+                "movq xmm13, {junk}",
+                "movq xmm14, {junk}",
+                "movq xmm15, {junk}",
+                "mov {tmp}, byte ptr [{addr}]",
+                "pop rbp",
+                "pop rbx",
+                junk = in(reg) 0xdead_beef_dead_beef_u64,
+                addr = in(reg) mem.add(512 << 10),
+                tmp = out(reg_byte) _,
+                out("rsi") _, out("rdi") _,
+                out("r12") _, out("r13") _, out("r14") _, out("r15") _,
+                out("xmm6") _, out("xmm7") _, out("xmm8") _, out("xmm9") _, out("xmm10") _,
+                out("xmm11") _, out("xmm12") _, out("xmm13") _, out("xmm14") _, out("xmm15") _,
+            );
+        }
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    static CLOBBER_CAUGHT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A plain Rust caller of a guarded call, entered from the test's asm below.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    extern "C" fn guarded_clobber() {
+        let win = GuestWindow::new(64 << 10, 1 << 20);
+        CLOBBER_CAUGHT.store(
+            guarded(&win, clobber_then_fault),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// #1792 — a caught guard fault returns to the guarded call's caller with every Win64
+    /// non-volatile register it had, although the faulting code overwrote all of them. The caller is
+    /// asm, so the values sit in the registers themselves rather than wherever a Rust frame might
+    /// spill them: only the guard's landing (restoring what the trampoline saved) can put them back.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn a_guarded_fault_returns_the_callers_nonvolatile_registers() {
+        let _serial = pal_test_guard();
+        const S: u64 = 0x5a5a_0000_0000_0000;
+        let (mut r12, mut r13, mut r14, mut r15, mut rsi, mut rdi) =
+            (S | 12, S | 13, S | 14, S | 15, S | 6, S | 7);
+        let mut x: [f64; 10] = core::array::from_fn(|i| f64::from_bits(S | (0x60 + i as u64)));
+        let rbx_kept: u8;
+        let rbp_kept: u8;
+        // SAFETY: `guarded_clobber` is an `extern "C"` fn of no arguments; the call runs on a
+        // 16-byte-aligned stack with its 32-byte home area, and `rsp`, `rbx` and `rbp` are restored
+        // before the asm ends. Every volatile register is declared clobbered (`clobber_abi`).
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "push rbp",
+                "mov rbx, rax",
+                "mov rbp, rsp", // `rbp` must still hold this after the call
+                "and rsp, -16",
+                "sub rsp, 48",
+                "mov [rsp + 40], rbp", // …so keep a copy above the callee's home area
+                "call {f}",
+                "mov rax, [rsp + 40]",
+                "cmp rbp, rax",
+                "sete dl",
+                "mov rsp, rax",
+                "mov rax, {sentinel}",
+                "cmp rbx, rax",
+                "sete cl",
+                "pop rbp",
+                "pop rbx",
+                f = sym guarded_clobber,
+                sentinel = const 0x5a5a_0000_0000_00bb_u64,
+                inout("rax") 0x5a5a_0000_0000_00bb_u64 => _,
+                out("cl") rbx_kept,
+                out("dl") rbp_kept,
+                inout("r12") r12,
+                inout("r13") r13,
+                inout("r14") r14,
+                inout("r15") r15,
+                inout("rsi") rsi,
+                inout("rdi") rdi,
+                inout("xmm6") x[0],
+                inout("xmm7") x[1],
+                inout("xmm8") x[2],
+                inout("xmm9") x[3],
+                inout("xmm10") x[4],
+                inout("xmm11") x[5],
+                inout("xmm12") x[6],
+                inout("xmm13") x[7],
+                inout("xmm14") x[8],
+                inout("xmm15") x[9],
+                clobber_abi("C"),
+            );
+        }
+        assert!(
+            CLOBBER_CAUGHT.load(std::sync::atomic::Ordering::Relaxed),
+            "the fault was caught"
+        );
+        assert_eq!(rbx_kept, 1, "rbx");
+        assert_eq!(rbp_kept, 1, "rbp");
+        assert_eq!(
+            [r12, r13, r14, r15, rsi, rdi],
+            [S | 12, S | 13, S | 14, S | 15, S | 6, S | 7]
+        );
+        for (i, v) in x.iter().enumerate() {
+            assert_eq!(v.to_bits(), S | (0x60 + i as u64), "xmm{}", i + 6);
+        }
     }
 
     #[test]
