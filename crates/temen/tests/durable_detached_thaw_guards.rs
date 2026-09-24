@@ -41,8 +41,8 @@ block 0 (v0: i32, v1: i32, v2: i32) {
 
 /// The child (128 KiB; a readonly segment at 81920, its own 16 KiB page clear of the shadow arena):
 /// a zero-length `unmap` (refused, and there only to make the function may-suspend, so its loop header
-/// polls), then a polled loop long enough that a freeze always cuts it, then `probe`, which may use
-/// `vsp` (its `AddressSpace`) and binds `pr`, the value it returns.
+/// polls), then a polled loop a freeze cuts, then `probe`, which may use `vsp` (its `AddressSpace`)
+/// and binds `pr`, the value it returns.
 fn child(probe: &str) -> String {
     format!(
         "memory 17 shadow 16448 65536
@@ -55,7 +55,7 @@ block 0 (v0: i64, v1: i64) {{
   br 1(vz, v1)
 }}
 block 1 (vi: i64, vs: i64) {{
-  vn = i64.const 10000000
+  vn = i64.const 1000000
   vc = i64.lt_s vi vn
   br_if vc 2(vi, vs) 3(vs)
 }}
@@ -191,15 +191,21 @@ fn fresh(engine: Engine, probe: &str) -> Option<Out> {
 fn thawed(froze: Engine, thaws: Engine, probe: &str) -> Option<Out> {
     let parent = parent();
     let child = child_module(probe);
-    let (mut fhost, args) = powerbox(&child);
     let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
     write_state(&mut win, STATE_UNWINDING);
-    let (_, fsnap) = run(froze, &parent, &args, &win, &mut fhost)?;
-    assert_eq!(
-        fhost.captured_detached().len(),
-        1,
-        "{froze:?} captured the live child"
-    );
+    // The JIT runs the child on its own thread, so on a loaded runner it can finish its loop (and
+    // run the probe) before the freeze reaches it; that run is not the case under test — retry it
+    // (#1760).
+    let mut attempts = 0;
+    let (fhost, args, fsnap) = loop {
+        let (mut fhost, args) = powerbox(&child);
+        let (_, fsnap) = run(froze, &parent, &args, &win, &mut fhost)?;
+        if fhost.captured_detached().len() == 1 {
+            break (fhost, args, fsnap);
+        }
+        attempts += 1;
+        assert!(attempts < 50, "{froze:?} never froze the child live");
+    };
     let art = temen_snapshot::freeze(&parent, &fsnap, &fhost).expect("serialize");
     let mut thost = Host::new();
     thost.set_durable(true);
