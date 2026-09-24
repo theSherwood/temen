@@ -3,8 +3,24 @@
 //! INVARIANTS #14's fourth axis asks whether a capability is "usable from a §22 guest-JIT unit as
 //! from the base module". Both halves are drivable, so — like `concurrency` and unlike `target` —
 //! the column can be *run* rather than asserted: mint the capability, make the identical
-//! `call.cap`, once from a host-translated base module and once from inside a unit reached through
-//! `Jit.invoke`, and compare the answers.
+//! `call.cap`, once from a host-translated base module and once from inside a unit, and compare the
+//! answers.
+//!
+//! ## Both routes into a unit
+//!
+//! DESIGN §22 gives a unit two routes, and they carry different contracts, so the unit side is a
+//! [`Route`] parameter rather than one fixed path:
+//!
+//! - **Install** + `call.dyn` runs the unit in the caller's own frames. There it must answer exactly
+//!   as the base module does — any difference is a gap.
+//! - **Invoke** runs it as a seam-free leaf, where the whole `Instantiator` is unavailable by
+//!   contract (#1578): a spawn would outlive the synchronous call over code nothing keeps. That one
+//!   refusal — an `Instantiator` op that `CapFault`s — is a recorded decline, scored `Declines`;
+//!   any other difference on this route is still a gap.
+//!
+//! The column first drove the invoke route alone, which is how it found the spawn family diverging
+//! there and missed the install route diverging worse (#1726: each engine failed a same-module spawn
+//! from an installed unit differently).
 //!
 //! ## Everything except the caller is held fixed
 //!
@@ -30,7 +46,8 @@
 //!
 //! What the column does compare is whether the guest gets an **answer**: a serviced value (a handle
 //! or a `-errno`) on one side and a domain-killing trap on the other is the divergence this axis
-//! exists to surface, and it is what the `Instantiator` row shows.
+//! exists to surface — the shape of what the column's first rendering found on the `Instantiator`
+//! row.
 //!
 //! ## The audit rule
 //!
@@ -60,6 +77,28 @@ block 0 (vjit: i32, vcode: i32, vcap: i32) {
   }
 }
 "#;
+
+/// The `Jit.install` + `call.dyn` twin of [`INVOKE_TRAMPOLINE`]: install the unit, dispatch its slot
+/// with the capability handle.
+const INSTALL_TRAMPOLINE: &str = r#"memory 16
+func (i32, i32, i32) -> (i64) {
+block 0 (vjit: i32, vcode: i32, vcap: i32) {
+  vc = i64.extend_i32_u vcode
+  vslot = call.cap 11 3 (i64) -> (i64) vjit (vc)
+  vs32 = i32.wrap_i64 vslot
+  vh = i64.extend_i32_u vcap
+  vr = call.dyn (i64) -> (i64) vs32 (vh)
+  return vr
+  }
+}
+"#;
+
+/// Which DESIGN §22 route the unit side takes — see the module docs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Route {
+    Invoke,
+    Install,
+}
 
 /// What one side did with one call shape.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -114,7 +153,9 @@ fn install_unit(
 ) -> Option<(i32, i32)> {
     let unit = unit_module_with(iface, op, argc, res, real);
     let blob = temen_encode::encode_module(&unit);
-    let jit = host.grant_jit(Some(16));
+    // Reserve install slots (a `2^4` table) so the install route has somewhere to put the unit;
+    // granted identically on both sides, so it moves no handle number.
+    let jit = host.grant_jit_with_table(Some(16), 4);
     host.set_jit_validator(validate_unit);
     match host.jit_compile(jit, &blob) {
         Ok(Ok(code)) => Some((jit, code.handle)),
@@ -147,8 +188,10 @@ fn from_base(
     ))
 }
 
-/// The unit makes the cap call, reached through `Jit.invoke` from the trampoline.
+/// The unit makes the cap call, reached by `route` from the matching trampoline.
+#[allow(clippy::too_many_arguments)]
 fn from_unit(
+    route: Route,
     mut host: Host,
     handle: i32,
     iface: u32,
@@ -159,7 +202,11 @@ fn from_unit(
 ) -> Verdict {
     let (jit, code) =
         install_unit(&mut host, iface, op, argc, res, real).expect("the unit compiles");
-    let base = temen_text::parse_module(INVOKE_TRAMPOLINE).expect("the trampoline parses");
+    let tramp = match route {
+        Route::Invoke => INVOKE_TRAMPOLINE,
+        Route::Install => INSTALL_TRAMPOLINE,
+    };
+    let base = temen_text::parse_module(tramp).expect("the trampoline parses");
     temen_verify::verify_module(&base).expect("the trampoline verifies");
     let mut fuel = 1_000_000u64;
     verdict(bytecode::compile_and_run_with_host(
@@ -176,8 +223,9 @@ fn shapes() -> impl Iterator<Item = (usize, &'static str)> {
     (0..MAX_ARGC).flat_map(|a| ["i64", "i32"].map(move |r| (a, r)))
 }
 
-/// The call shapes of `op` on which the two origins disagree, as `(shape, base, unit)`.
-fn divergences(row: &Row, op: u32) -> Vec<(String, Verdict, Verdict)> {
+/// The call shapes of `op` on which the base module and a unit reached by `route` disagree, as
+/// `(shape, base, unit)`.
+fn divergences(row: &Row, op: u32, route: Route) -> Vec<(String, Verdict, Verdict)> {
     let mut out = Vec::new();
     for (argc, res) in shapes() {
         let (h, x, real) = (row.mint)();
@@ -188,7 +236,7 @@ fn divergences(row: &Row, op: u32) -> Vec<(String, Verdict, Verdict)> {
             .collect();
         let b = from_base(h, x, row.iface, op, argc, res, &real);
         let (h, x, _) = (row.mint)();
-        let u = from_unit(h, x, row.iface, op, argc, res, &real);
+        let u = from_unit(route, h, x, row.iface, op, argc, res, &real);
         // Neither side found an arm: the harness miscalled this shape, so there is nothing to
         // compare. A cap fault on exactly one side *is* a divergence and is kept.
         if b == Verdict::CapFault && u == Verdict::CapFault {
@@ -205,8 +253,17 @@ fn col(a: Axis) -> usize {
     Axis::ALL.iter().position(|x| *x == a).expect("axis listed")
 }
 
-/// **The pin.** For every drivable capability, the manifest's `code origin` cell must match whether
-/// a unit and the base module actually get the same answers out of that capability's ops.
+/// The §22 invoke contract (#1578): inside a `Jit.invoke` the `Instantiator` is unavailable, so its
+/// ops `CapFault` there whatever the base module answers. The one invoke-route difference that is a
+/// recorded decline rather than a gap.
+fn invoke_contract(row: &Row, unit: &Verdict) -> bool {
+    row.iface == temen_ir::cap_id::INSTANTIATOR && *unit == Verdict::CapFault
+}
+
+/// **The pin.** For every drivable capability, the manifest's `code origin` cell must match what a
+/// unit actually gets out of that capability's ops, compared with the base module, on both routes:
+/// `Full` when both agree everywhere, `Declines` when the only difference is the invoke contract,
+/// `NotYet` for anything else.
 #[test]
 fn the_code_origin_column_matches_what_a_unit_and_the_base_module_actually_get() {
     let k = col(Axis::CodeOrigin);
@@ -218,12 +275,28 @@ fn the_code_origin_column_matches_what_a_unit_and_the_base_module_actually_get()
         } else {
             row.ops.to_vec()
         };
-        let found: Vec<(String, Verdict, Verdict)> =
-            ops.iter().flat_map(|op| divergences(&row, *op)).collect();
-        let observed = if found.is_empty() {
-            Status::Full
-        } else {
+        let mut found: Vec<(String, Verdict, Verdict)> = Vec::new();
+        let mut declined = false;
+        for op in &ops {
+            found.extend(
+                divergences(&row, *op, Route::Install)
+                    .into_iter()
+                    .map(|(s, b, u)| (format!("install: {s}"), b, u)),
+            );
+            for (s, b, u) in divergences(&row, *op, Route::Invoke) {
+                if invoke_contract(&row, &u) {
+                    declined = true;
+                } else {
+                    found.push((format!("invoke: {s}"), b, u));
+                }
+            }
+        }
+        let observed = if !found.is_empty() {
             Status::NotYet
+        } else if declined {
+            Status::Declines
+        } else {
+            Status::Full
         };
         let cell = capability_axes(row.cap)[k];
         assert_eq!(
@@ -246,21 +319,17 @@ fn the_code_origin_column_matches_what_a_unit_and_the_base_module_actually_get()
     }
 }
 
-/// The gap the column's first rendering found, pinned as the *specific* fact so that closing it
-/// names itself instead of just greening a cell (#1578).
+/// The `Instantiator` row's two routes, pinned as specific facts so a change names itself instead of
+/// just moving a cell (#1578, #1726).
 ///
-/// `drive_nested` — the synchronous `Jit.invoke` seam — has no arm for any of the spawn family, so
-/// they all reach its catch-all `CapFault`. From the base module, on the same host with the same
-/// handle, three of them are **serviced**: `instantiate` (0), `instantiate_module_named` (13) and
-/// `child_offer` (14) each answer `-EINVAL` probeably. `join` (1) refuses on both sides but with
-/// different traps — `ThreadFault` for the forged child handle from the base module, `CapFault`
-/// from the unit, which never reaches the resolve.
-///
-/// Whether a *completed* spawn belongs at an invoke seam at all is a design question (a synchronous
-/// invoke has no scheduler to hand a task to, and nobody to park for), but the decline shape is not:
-/// INVARIANTS #9 wants an absent seam declined probeably, and `CapFault` kills the domain.
+/// From the base module, on the same host with the same handle, `instantiate` (0),
+/// `instantiate_module_named` (13) and `child_offer` (14) each answer `-EINVAL` probeably, and
+/// `join` (1) gives the forgery trap for its forged child handle. An **installed** unit gets exactly
+/// those answers — it runs in the caller's frames. An **invoked** unit gets a `CapFault` for every
+/// one: the §22 seam-free leaf has no `Instantiator` (the cross-engine differential for a real spawn
+/// is `crates/temen/tests/unit_instantiator.rs`).
 #[test]
-fn the_spawn_family_gap_at_the_invoke_seam_stays_exactly_this() {
+fn the_instantiator_row_by_route() {
     let row = rows()
         .into_iter()
         .find(|r| r.cap == Capability::Instantiator)
@@ -289,9 +358,15 @@ fn the_spawn_family_gap_at_the_invoke_seam_stays_exactly_this() {
         );
         let (h, x, _) = (row.mint)();
         assert_eq!(
-            from_unit(h, x, row.iface, op, argc, "i32", &args),
+            from_unit(Route::Install, h, x, row.iface, op, argc, "i32", &args),
+            base_says,
+            "op {op} from an installed §22 unit — the caller's own frames"
+        );
+        let (h, x, _) = (row.mint)();
+        assert_eq!(
+            from_unit(Route::Invoke, h, x, row.iface, op, argc, "i32", &args),
             Verdict::CapFault,
-            "op {op} from a §22 unit — `drive_nested`'s catch-all"
+            "op {op} from an invoked §22 unit — no Instantiator inside a seam-free leaf"
         );
     }
 }

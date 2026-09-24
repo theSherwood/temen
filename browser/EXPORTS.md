@@ -2,7 +2,7 @@
 
 **Generated — do not edit by hand.** Regenerate with `cargo run --bin genexports` (in `browser/`). Every `#[no_mangle] extern "C"` export of the `temen-browser` cdylib, by driver family, against what the page's JS actually calls by name. `tests/exports_abi.rs` pins that every name the JS touches is exported, and that this file is fresh (#1414).
 
-**355 exports** in 34 families — 307 referenced from JS, 48 referenced by nothing, 9 behind a `cfg`.
+**361 exports** in 36 families — 310 referenced from JS, 51 referenced by nothing, 9 behind a `cfg`.
 
 | family | exports | referenced from JS | `cfg`-gated |
 |---|---:|---:|---:|
@@ -18,6 +18,7 @@
 | `detached` | 5 | 5 | 1 |
 | `durable` | 4 | 4 | 0 |
 | `exit` | 1 | 1 | 0 |
+| `fault` | 1 | 0 | 0 |
 | `foreign` | 3 | 3 | 3 |
 | `framebuffer` | 4 | 4 | 0 |
 | `jspb` | 7 | 7 | 0 |
@@ -27,7 +28,7 @@
 | `nim` | 9 | 9 | 0 |
 | `onramp` | 67 | 56 | 0 |
 | `op13jit` | 18 | 17 | 0 |
-| `par` | 69 | 69 | 1 |
+| `par` | 72 | 72 | 1 |
 | `parse` | 3 | 3 | 0 |
 | `pg` | 6 | 6 | 0 |
 | `prep` | 1 | 1 | 0 |
@@ -38,6 +39,7 @@
 | `status` | 1 | 1 | 0 |
 | `stderr` | 2 | 2 | 0 |
 | `stdout` | 2 | 2 | 0 |
+| `trap` | 2 | 0 | 0 |
 | `warm` | 16 | 16 | 0 |
 | `wasmjit` | 9 | 9 | 0 |
 
@@ -173,6 +175,10 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 ### `exit`
 
 - `temen_exit_code`
+
+### `fault`
+
+- `temen_fault_addr` — *unreferenced*
 
 ### `foreign`
 
@@ -385,11 +391,14 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 - `temen_par_powerbox_jit_codegen`
 - `temen_par_powerbox_jit_runtime`
 - `temen_par_powerbox_none`
+- `temen_par_powerbox_onramp`
 - `temen_par_root`
 - `temen_par_root_call_interp`
 - `temen_par_run`
 - `temen_par_shim_wasm_len`
 - `temen_par_shim_wasm_ptr`
+- `temen_par_stderr_len`
+- `temen_par_stderr_ptr`
 - `temen_par_stdout_len`
 - `temen_par_stdout_ptr`
 - `temen_par_tierup_argv_len`
@@ -470,6 +479,11 @@ An export marked *unreferenced* is called by no JS or HTML in `browser/`; one ma
 
 - `temen_stdout_len`
 - `temen_stdout_ptr`
+
+### `trap`
+
+- `temen_trap_len` — *unreferenced*
+- `temen_trap_ptr` — *unreferenced*
 
 ### `warm`
 

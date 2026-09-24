@@ -67,14 +67,18 @@
 //! because otherwise every handle-minting op "diverges" by returning a different (equally correct)
 //! handle number.
 //!
-//! Its first rendering found one gap, on the `Instantiator` row again. `drive_nested` — the
-//! synchronous `Jit.invoke` seam — has no arm for any of the spawn family, so they all land on its
-//! catch-all `CapFault`, while `instantiate`, `instantiate_module_named` and `child_offer` each
-//! answer `-EINVAL` *probeably* from the base module on the same host with the same handle. Whether
-//! a completed spawn belongs at an invoke seam is a design question (there is no scheduler to hand a
-//! task to, and nobody to park for); the decline *shape* is not — #9 wants an absent seam declined
-//! probeably, and a `CapFault` kills the domain. #1578 tracks it. Note what the column deliberately
-//! does **not** count: a call shape the bytecode subset has no arm for is refused at compile on one
+//! A unit has two §22 routes with different contracts, so the column drives both. **Installed**
+//! (`call.dyn`), a unit runs in the caller's frames and must answer exactly as the base module does.
+//! **Invoked**, it is a seam-free leaf with no `Instantiator` at all — a spawn there would outlive
+//! the synchronous call over code nothing keeps (the unit is never installed), and nobody could join
+//! it — so an `Instantiator` op `CapFault`s by contract (#1578), a recorded decline.
+//!
+//! The first rendering drove the invoke route alone and found the spawn family diverging there:
+//! bytecode `CapFault`ed while the base module answered. Chasing it showed the oracle and Cranelift
+//! *spawning* from an invoked unit — against §22 — and the install route, the supported one, failing
+//! on every engine in a different way, because each built a same-module child from module 0 rather
+//! than the spawning unit's module (#1726). Both are fixed; the row now `Declines` on this axis by
+//! the invoke contract alone. Note what the column deliberately does **not** count: a call shape the bytecode subset has no arm for is refused at compile on one
 //! side and as `Trap::Malformed` out of the invoke on the other, which is one decision reported at
 //! the only point each path has — and which shapes the subset covers is `OPS_PARITY.md`'s question,
 //! not this column's.
@@ -328,15 +332,6 @@ const fn declines(note: &'static str) -> Cell {
     }
 }
 
-/// A **known** gap on this axis, with an issue tracking it. Distinct from [`U`]: this cell has been
-/// driven and found wanting, rather than never asked.
-const fn not_yet(note: &'static str) -> Cell {
-    Cell {
-        status: Status::NotYet,
-        note,
-    }
-}
-
 const fn conditional(note: &'static str) -> Cell {
     Cell {
         status: Status::Conditional,
@@ -405,10 +400,9 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
             JOIN_TRAP_DIVERGES,
             U,
             K,
-            not_yet(
-                "the spawn family reaches `drive_nested`'s catch-all `CapFault` inside a \
-                 `Jit.invoke`: instantiate/instantiate_module_named/child_offer each answer -EINVAL \
-                 probeably from the base module, and join's forgery trap differs too (#1578)",
+            declines(
+                "an installed unit answers as the base module does (#1726); an invoked unit is a \
+                 seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)",
             ),
             conditional(
                 "instantiate/join/instantiate_module_named/instantiate_detached compile; the \

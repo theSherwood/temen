@@ -28,6 +28,16 @@ use temen_ir::{Data, Func, FuncIdx, SpawnRec, TypeEntry, ValType};
 /// absent — it is a runtime arg, so one entry serves every offset.
 type ChildCodeKey = (usize, usize, u32, u8);
 
+/// #1726 — the program an **installed §22 unit** runs, kept alive by the `CompiledModule` that
+/// defined it, so the unit's `Instantiator` call sites can bake its address as `self_prog`. A
+/// same-module (**self**) child spawned from unit code runs the *unit's* functions — the spawning
+/// frame's module, as on both interpreters — not module 0's. `self_prog == 0` names the nursery's own
+/// program (module 0), which is every call site outside a unit.
+pub(crate) struct UnitProg {
+    pub(crate) funcs: std::sync::Arc<[Func]>,
+    pub(crate) types: std::sync::Arc<[TypeEntry]>,
+}
+
 /// Negative-errno an out-of-range carve returns (§3e D42) — the one shared table.
 use temen_ir::errno::EINVAL;
 
@@ -90,6 +100,9 @@ struct Child {
     /// reachable after its thread exits (the interp's `child_hosts` retention, JIT twin).
     /// Released exactly once, at [`Nursery::join_children`], via the grant hooks' releaser.
     retained: usize,
+    /// §4 — a durable §14 child's freeze record, and whether it unwound into its carve. Recorded when
+    /// its parent unwinds with the child still unjoined ([`Nursery::freeze_unjoined`]).
+    nested: Option<(crate::FrozenNested, bool)>,
 }
 
 impl Child {
@@ -104,6 +117,7 @@ impl Child {
             }),
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 
@@ -114,6 +128,7 @@ impl Child {
             done,
             joined: false,
             retained: 0,
+            nested: None,
         }
     }
 }
@@ -716,13 +731,38 @@ impl Nursery {
         std::sync::Arc::clone(&self.task_counter)
     }
 
-    /// Push a captured §14 nested-child re-attach record into the **shared** subtree sink (coalesces at
-    /// the root). `instantiate` calls this when a child left its carve `UNWINDING`.
-    pub(crate) fn push_frozen_nested(&self, rec: crate::FrozenNested) {
-        self.frozen_nested_sink
+    /// §4 — this nursery's owner is unwinding for a freeze: record each of its still-unjoined durable
+    /// §14 children into the **shared** subtree sink (coalesces at the root). A child that unwound
+    /// into its carve is re-attached on thaw; one that finished first carries its result, which the
+    /// thaw delivers to the owner's rewound `join` without re-running it (#1692), as the interpreter
+    /// does. `false` if one finished with a trap: a trap cannot ride the artifact, so the freeze must
+    /// fail closed rather than hand the owner's thaw a join result of 0.
+    pub(crate) fn freeze_unjoined(&self) -> bool {
+        let children = self.children.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sink = self
+            .frozen_nested_sink
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(rec);
+            .unwrap_or_else(|e| e.into_inner());
+        for c in children.iter().filter(|c| !c.joined) {
+            let Some((rec, unwound)) = &c.nested else {
+                continue;
+            };
+            let mut rec = rec.clone();
+            if !unwound {
+                let (result, trap) = c
+                    .done
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .expect("a durable child runs synchronously, so it has finished");
+                if trap != 0 {
+                    return false;
+                }
+                rec.completed_result = Some(result);
+            }
+            sink.push(rec);
+        }
+        true
     }
 
     /// Drain the §14 nested-child freeze residue captured during a durable freeze (see
@@ -939,6 +979,21 @@ impl Nursery {
         self.durable.store(durable, Ordering::Release);
     }
 
+    /// The program a **self** child runs (#1726): the spawning code's own — `self_prog`, an installed
+    /// unit's [`UnitProg`], or `0` for this nursery's module-0 program.
+    ///
+    /// # Safety
+    /// A nonzero `self_prog` is the address of a [`UnitProg`] the defining `CompiledModule` keeps
+    /// alive for the whole run (it is baked into that unit's code by `define_extra`).
+    unsafe fn self_program(&self, self_prog: i64) -> (&[Func], &[TypeEntry]) {
+        if self_prog == 0 {
+            (&self.funcs, &self.types)
+        } else {
+            let u = &*(self_prog as *const UnitProg);
+            (&u.funcs, &u.types)
+        }
+    }
+
     /// Resolve a spawn's child source (§14): `module < 0` ⇒ a **self** child (the parent's own
     /// functions, no data segments, no declared-memory constraint); otherwise a host-granted
     /// **`Module` handle** resolved via [`Nursery::resolve_module`] — the child runs *that* verified
@@ -953,6 +1008,7 @@ impl Nursery {
     unsafe fn resolve_child(
         &self,
         module: i64,
+        self_prog: i64,
         trap_out: *mut i64,
     ) -> Option<(
         &[Func],
@@ -962,7 +1018,8 @@ impl Nursery {
         temen_ir::durable_abi::ShadowArena,
     )> {
         if module < 0 {
-            return Some((&self.funcs, &self.types, None, &[], self.shadow));
+            let (funcs, types) = self.self_program(self_prog);
+            return Some((funcs, types, None, &[], self.shadow));
         }
         let Some(resolver) = self.resolve_module else {
             *trap_out = TrapKind::CapFault as i64;
@@ -1072,6 +1129,7 @@ unsafe fn write_data_segments(data: &[Data], mem_base: u64, abs_base: u64, child
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate(
     rt: *const Nursery,
+    self_prog: i64,
     mem_base: u64,
     handle: i32,
     module: i64,
@@ -1102,7 +1160,7 @@ pub(crate) unsafe extern "C" fn instantiate(
     // absent builder.
     if module >= 0 && rt.grant_build_named.load(Ordering::Acquire) != 0 {
         return instantiate_module_named(
-            rt_ptr, mem_base, /*mem_size (unused: 0 grants)*/ 0, handle, module,
+            rt_ptr, self_prog, mem_base, /*mem_size (unused: 0 grants)*/ 0, handle, module,
             /*grants_ptr*/ 0, /*grants_n*/ 0, entry, off, size_log2, fuel, trap_out,
         );
     }
@@ -1110,7 +1168,7 @@ pub(crate) unsafe extern "C" fn instantiate(
         return 0; // `*trap_out` already holds the CapFault
     };
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, trap_out)
+        rt.resolve_child(module, self_prog, trap_out)
     else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
@@ -1203,20 +1261,22 @@ pub(crate) unsafe extern "C" fn instantiate(
         };
         let mut children = rt.children.lock().unwrap_or_else(|e| e.into_inner());
         let slot = children.len();
-        children.push(Child::finished(result, trap));
-        drop(children);
-        // §4 freeze export: the child left its carve `UNWINDING` — record its re-attach residue into the
-        // shared subtree sink tagged with this nursery's task, so a thaw re-creates the child domain.
-        if unwound {
-            rt.push_frozen_nested(crate::FrozenNested {
+        let mut child = Child::finished(result, trap);
+        // §4 freeze export: what a freeze records for this child if it is still unjoined when this
+        // nursery's owner unwinds ([`Nursery::freeze_unjoined`]).
+        child.nested = Some((
+            crate::FrozenNested {
                 parent_task: rt.my_task(),
                 task: child_task,
                 slot,
                 carve_off: base + off,
                 size_log2: size_log2 as u8,
                 entry: entry as u32,
-            });
-        }
+                completed_result: None,
+            },
+            unwound,
+        ));
+        children.push(child);
         return slot as i32;
     }
 
@@ -1315,6 +1375,7 @@ pub(crate) unsafe extern "C" fn instantiate(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_named(
     rt: *const Nursery,
+    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -1351,8 +1412,9 @@ pub(crate) unsafe extern "C" fn instantiate_named(
     let Some((base, size)) = rt.resolve(mem_base, handle, trap_out) else {
         return 0; // `*trap_out` already holds the CapFault
     };
-    let child_funcs = &rt.funcs;
-    let child_types = &rt.types; // #922: same-module named child resolves against the parent types
+    // #922/#1726: a same-module named child runs (and resolves types against) the spawning code's own
+    // program — an installed unit's, or module 0's.
+    let (child_funcs, child_types) = rt.self_program(self_prog);
     let entry = entry as u64;
     let child_size = if (0..64).contains(&size_log2) {
         1u64 << size_log2
@@ -1494,6 +1556,7 @@ pub(crate) unsafe extern "C" fn instantiate_named(
 /// vCPU's thread with the run's live nursery, window base/size, and a writable `trap_out`.
 pub(crate) unsafe extern "C" fn instantiate_rec(
     rt: *const Nursery,
+    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -1601,10 +1664,11 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
         && (*rt).grant_release.load(Ordering::Acquire) != 0;
     match (modh >= 0, grants_n > 0 || hooked) {
         (false, false) => instantiate(
-            rt, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
+            rt, self_prog, mem_base, handle, -1, entry, off, size_log2, quota, trap_out,
         ),
         (true, false) => instantiate(
             rt,
+            self_prog,
             mem_base,
             handle,
             modh as i64,
@@ -1615,11 +1679,12 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
             trap_out,
         ),
         (false, true) => instantiate_named(
-            rt, mem_base, mem_size, handle, grants_ptr, grants_n, entry, off, size_log2, quota,
-            trap_out,
+            rt, self_prog, mem_base, mem_size, handle, grants_ptr, grants_n, entry, off, size_log2,
+            quota, trap_out,
         ),
         (true, true) => instantiate_module_named(
             rt,
+            self_prog,
             mem_base,
             mem_size,
             handle,
@@ -1651,6 +1716,7 @@ pub(crate) unsafe extern "C" fn instantiate_rec(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_module_named(
     rt: *const Nursery,
+    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -1692,7 +1758,7 @@ pub(crate) unsafe extern "C" fn instantiate_module_named(
     };
     // Resolve the granted separate module (op 5): its funcs, declared memory, and data segments.
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, trap_out)
+        rt.resolve_child(module, self_prog, trap_out)
     else {
         return 0; // forged Module handle / no resolver — CapFault set
     };
@@ -1957,6 +2023,7 @@ fn init_durable_words(rw: &mut [u8], a: temen_ir::durable_abi::ShadowArena) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe extern "C" fn instantiate_detached(
     rt: *const Nursery,
+    self_prog: i64,
     mem_base: u64,
     mem_size: u64,
     handle: i32,
@@ -2001,7 +2068,7 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         return 0;
     }
     let Some((child_funcs, child_types, mod_mem, child_data, child_shadow)) =
-        rt.resolve_child(module, trap_out)
+        rt.resolve_child(module, self_prog, trap_out)
     else {
         return 0;
     };

@@ -684,10 +684,9 @@ unsafe fn jit_invoke_locked(
             if args.len() - 1 != entry.params.len() || n_results as usize != entry.results.len() {
                 return None;
             }
-            // Seam-free-leaf gate (CONSOLIDATION.md §11): a threaded/futex unit cannot be invoked
-            // (the interp's `run_invoke` CapFaults any scheduler event) — `None` here ⇒ `cap_fault`
-            // below, mirroring [`jit_native_op`]'s op-1 arm. Install + dispatch is its path.
-            if funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
+            // Seam-free-leaf gate (CONSOLIDATION.md §11): see [`invoke_refuses`] — `None` here ⇒
+            // `cap_fault` below, mirroring [`jit_native_op`]'s op-1 arm. Install + dispatch is its path.
+            if invoke_refuses(&funcs) {
                 return None;
             }
             Some((code, cm))
@@ -800,6 +799,34 @@ unsafe fn serve_native(
         return;
     }
     put(count, trap_out);
+}
+
+/// The §22 **seam-free leaf** gate for `Jit.invoke` on the native tier: whether a unit uses something
+/// only a scheduler seam can serve, so invoking it must `CapFault` (CONSOLIDATION.md §11). The
+/// interpreters `CapFault` at the op itself — `run_invoke` for §12 threads/futex, the tree-walker's
+/// and the nested drive's `Instantiator` refusal (#1578) — and the native tier matches by refusing
+/// before it trampolines. Such a unit's supported path is **install** + dispatch, where it runs in the
+/// caller's frames: its `thread.*` are ordinary module-aware ops there, and an `instantiate` spawns
+/// the unit's own function (#1726). One predicate for both invoke entries (INVARIANTS #15).
+///
+/// Refusing up front is coarser than the interpreters by one case, shared by all three kinds: a unit
+/// whose scheduler op sits on a path that never runs is refused here and runs there.
+fn invoke_refuses(funcs: &[temen_ir::Func]) -> bool {
+    funcs.iter().any(|f| {
+        f.uses_threads()
+            || f.uses_futex()
+            || f.blocks.iter().any(|b| {
+                b.insts.iter().any(|i| {
+                    matches!(
+                        i,
+                        temen_ir::Inst::CapCall {
+                            type_id: temen_ir::cap_id::INSTANTIATOR,
+                            ..
+                        }
+                    )
+                })
+            })
+    })
 }
 
 /// The native (Cranelift) half of the guest-driven `Jit` capability (DESIGN.md §22), reached
@@ -929,7 +956,7 @@ unsafe fn jit_native_op(
             // the caller's own frames on the scheduler seam, where its `thread.*` are ordinary
             // module-aware ops. (The unit still *compiles* — `define_extra` admits it — so it can be
             // installed; only the seam-free invoke entry is refused.)
-            if funcs.iter().any(|f| f.uses_threads() || f.uses_futex()) {
+            if invoke_refuses(&funcs) {
                 return cap_fault(trap_out);
             }
             let out: &mut [i64] = if n_results == 0 {
@@ -1610,8 +1637,7 @@ fn hg_restore(host: &mut Host, host_mutex: Mutex<Host>) {
 /// leaves the run byte-identical.
 ///
 /// Residue the JIT cannot yet re-create is refused whole (`Unsupported`), never dropped (#1690): a
-/// separate-module or completed nested child, a nested child's host state, a detached child (#1692,
-/// #1361). The embedder then thaws on the interpreter, which carries all of it.
+/// separate-module nested child, a nested child's host state, a detached child (#1692, #1361). The embedder then thaws on the interpreter, which carries all of it.
 fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), temen_jit::JitError> {
     if !host.is_durable() {
         return Ok(());
@@ -1619,7 +1645,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
     let jit_unrepresentable = host
         .frozen_nested()
         .iter()
-        .any(|n| n.module_digest.is_some() || n.completed_result.is_some())
+        .any(|n| n.module_digest.is_some())
         || !host.frozen_child_state().is_empty()
         || !host.frozen_detached().is_empty();
     if jit_unrepresentable {
@@ -1661,6 +1687,7 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
+            completed_result: n.completed_result,
         })
         .collect();
     let detached = detached_seeds(host)?;
@@ -1884,7 +1911,7 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                     size_log2: n.size_log2,
                     entry: n.entry,
                     module_digest: None,
-                    completed_result: None,
+                    completed_result: n.completed_result,
                 })
                 .collect(),
         );
