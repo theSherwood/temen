@@ -1690,6 +1690,8 @@ pub struct DetachedSeed {
     pub shadow: temen_ir::durable_abi::ShadowArena,
     /// Its restored window image.
     pub image: Vec<u8>,
+    /// Its restored page map, one entry per [`DURABLE_SNAPSHOT_PAGE`] (#1733).
+    pub prots: Vec<WindowProt>,
     /// Its restored powerbox, as a builder fills it: two counted refs (`ctx`, `retained_ctx`).
     pub child: GrantChild,
 }
@@ -3875,21 +3877,7 @@ impl CompiledModule {
             // on the freshly-seeded window so a thawed guest faults on an `Ro`/`Unmapped` page
             // exactly as the frozen one would — matching `temen-interp`'s `apply_prots`. Applied
             // after the init copy + data segments; `Rw` and tail pages keep the default.
-            for (i, &p) in t.restore_prots.iter().enumerate() {
-                let off = (i * DURABLE_SNAPSHOT_PAGE) as u64;
-                if off >= t.win_mapped as u64 {
-                    break;
-                }
-                match p {
-                    WindowProt::Ro => {
-                        window.protect_ro(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
-                    }
-                    WindowProt::Unmapped => {
-                        window.protect_none(t.sub_base + off, DURABLE_SNAPSHOT_PAGE as u64)
-                    }
-                    WindowProt::Rw => {}
-                }
-            }
+            window.apply_prots(t.sub_base, &t.restore_prots, t.win_mapped as u64);
             // #964: reserve the marked module's NULL region last, after every host write above
             // (init seed, data segments, durable prots) has landed — the marked layout keeps all
             // live data at or above the guard, so nothing legitimate is covered. Window-relative

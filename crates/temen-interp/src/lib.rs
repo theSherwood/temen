@@ -3004,9 +3004,10 @@ fn relaunch_detached(
     } = grants
         .lock_unpoisoned()
         .prepare_detached_relaunch(&launch, host)?;
-    // The window: a fresh reservation (a root's shape, as op 15 mints it) holding the child's image,
-    // its freeze word cleared and its context-0 thaw word set — `begin_thaw`, on the child's own window.
-    let mut mem = Mem::with_reservation(reserved_log2, memory_log2, shadow);
+    // The window: built as op 15 builds it (its NULL guard included, #1733), then the child's image
+    // and page map laid over it, its freeze word cleared and its context-0 thaw word set —
+    // `begin_thaw`, on the child's own window.
+    let mut mem = Mem::detached(reserved_log2, memory_log2, shadow, &module.data);
     mem.restore_layout(&window);
     mem.durable_set_state(STATE_NORMAL);
     let thaw_off = mem.thaw_state_off(0);
@@ -8601,14 +8602,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     entry_args,
                     null_guard,
                 } = *req;
-                let (fuel, depth, id, sched_ref, quota, dt) = (
-                    v.fuel,
-                    v.depth,
-                    v.id,
-                    v.sched.clone(),
-                    v.quota,
-                    Arc::clone(&v.dt),
-                );
+                // The replaced image gets its own function table: `execve` replaces the whole image,
+                // and the caller's table is sized for the CALLER's functions — an image with more of
+                // them trapped on its first indirect call past that size (a small shell exec'ing a
+                // big program: `IndirectCallType` from a table slot that was only ever padding).
+                let dt = Arc::new(DomainTable::new(&funcs, 0));
+                let (fuel, depth, id, sched_ref, quota) =
+                    (v.fuel, v.depth, v.id, v.sched.clone(), v.quota);
                 // Materialize the command's data segments into the caller's window — the command runs
                 // where the shell did (image-replace). First freshen the command's declared image
                 // extent: commit its pages read-write and zero them (`commit_fresh_image`) — C's
@@ -11833,14 +11833,15 @@ fn build_exec_req(
         let mut hg = host.lock_unpoisoned();
         hg.spawn_named_child(grants, child_size)
             .and_then(|(mut ch, ci, ca)| {
+                let mut starters = [ci, ca];
                 // #1080 — the personality carry (self_module, exit/signal/stop/park
                 // cells, host_procs, pipe-end re-install + exec-remap) is shared with
                 // the bytecode engine's exec arm via `Host::exec_carry`, so this
                 // TCB-sensitive logic lives once. On a manifest-bind failure it unwinds
                 // and returns `Err` → the exec refuses cleanly (caller keeps running).
-                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types)
+                hg.exec_carry(&mut ch, &cm.module, &cm.imports, &cm.types, &mut starters)
                     .ok()
-                    .map(|_remap| (ch, ci, ca, child_size))
+                    .map(|_remap| (ch, starters[0], starters[1], child_size))
             })
     } else {
         None
@@ -14049,13 +14050,12 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 let child_lane_val = admitted.unwrap_or(-1);
                                 // The fresh platform window: its own reservation + guard,
                                 // exactly a root run's — nothing of it in this domain's VA.
-                                let mut fm = Mem::with_reservation(
+                                let mut fm = Mem::detached(
                                     DEFAULT_RESERVED_LOG2,
                                     size_log2 as u8,
                                     cm.shadow,
+                                    &cm.data,
                                 );
-                                fm.init_data(&cm.data);
-                                fm.seed_null_guard(temen_ir::module_null_guard()); // #964
                                 if let Some(p) = &payload {
                                     let _ = fm.write_bytes(temen_ir::module_args_base(), p);
                                 }
@@ -26430,12 +26430,15 @@ impl Host {
         }
     }
 
+    /// `starters` are the handles of the caps the fresh powerbox minted for the new image (its
+    /// Instantiator/AddressSpace), rewritten in place if a carried module grant needed their slot.
     pub(crate) fn exec_carry(
         &mut self,
         child: &mut Host,
         cmodule: &Arc<temen_ir::Module>,
         imports: &[temen_ir::Import],
         types: &[temen_ir::TypeEntry],
+        starters: &mut [i32],
     ) -> Result<Vec<(i32, i32)>, ()> {
         // The command serves its OWN offers / resolves `cap.self` against its module.
         child.self_module = Some(Arc::clone(cmodule));
@@ -26448,19 +26451,46 @@ impl Host {
         // refused `-EINVAL`. Done first, before this carry's own grants take free slots.
         //
         // No widening: the new image is the same process, holding the modules it held an instant
-        // ago. A slot the fresh powerbox already filled (its own Instantiator/AddressSpace) cannot
-        // keep its number; that grant stays behind, and an exec of it later fails closed.
+        // ago. The module grant keeps its number, because the registry names it; a cap the fresh
+        // powerbox minted into that slot a moment ago (its own Instantiator/AddressSpace, or a
+        // by-name grant) is what moves, to a slot no module grant claims. That used to be the
+        // other way round, and the grant left behind was the first command an embedder registers:
+        // `/bin/sh` shared slot 1 with the fresh AddressSpace, so no exec'd image — and no fork of
+        // one — could ever run a shell (nimony's nifmake, exec'd by the driver, spawns every job
+        // through one). Only if the table is full does a grant stay behind and fail closed.
+        let is_module = |t: &[Slot], j: usize| matches!(t[j].entry, Some(Binding::Module(_)));
         let base = child.modules.len() as u32;
         child.modules.extend(self.modules.iter().cloned());
         for (i, st) in self.table.iter().enumerate() {
-            if let Some(Binding::Module(m)) = st.entry {
-                if child.table[i].entry.is_none() {
-                    child.table[i] = Slot {
-                        entry: Some(Binding::Module(m + base)),
-                        ..*st
-                    };
+            let Some(Binding::Module(m)) = st.entry else {
+                continue;
+            };
+            if child.table[i].entry.is_some() {
+                let Some(j) = (0..CAP)
+                    .find(|&j| child.table[j].entry.is_none() && !is_module(&self.table, j))
+                else {
+                    continue;
+                };
+                let handle = |t: &[Slot], k: usize| {
+                    ((t[k].generation & GEN_MASK) << CAP_LOG2 | k as u32) as i32
+                };
+                let old = handle(&child.table, i);
+                child.table[j].entry = child.table[i].entry.take();
+                child.table[j].type_id = child.table[i].type_id;
+                let new = handle(&child.table, j);
+                for h in starters
+                    .iter_mut()
+                    .chain(child.cap_names.iter_mut().map(|(_, h)| h))
+                {
+                    if *h == old {
+                        *h = new;
+                    }
                 }
             }
+            child.table[i] = Slot {
+                entry: Some(Binding::Module(m + base)),
+                ..*st
+            };
         }
         // The task-lifecycle wiring: exit hooks (a personality fork twin's retire-to-Zombie — without
         // it an exec'd twin's exit never retires and a blocking `waitpid` hangs) and the signal
@@ -28286,6 +28316,23 @@ impl MemLayout {
         }
     }
 
+    /// #1733 — a detached child's captured `image` under the page map its window was built with
+    /// ([`Mem::detached`]: the NULL guard, the `readonly` data segments), for a capture that cannot
+    /// read the live map (the JIT's harvest). Protections its guest changed through the Memory
+    /// capability are not recorded.
+    pub fn detached_image(module: &Module, image: Vec<u8>, mapped_log2: u8) -> MemLayout {
+        let m = Mem::detached(mapped_log2, mapped_log2, None, &module.data);
+        let space = m.space.read_unpoisoned();
+        MemLayout {
+            bytes: image,
+            map: PageMap {
+                prot: space.prot.clone(),
+                page: m.page,
+                mapped: m.window.mapped(),
+            },
+        }
+    }
+
     /// The protection map in the §12 codec's **dense** form: one [`CapturedProt`] per
     /// [`DURABLE_SNAPSHOT_PAGE`] over the captured bytes — the same rule [`Mem::snapshot_prots`]
     /// uses, so an absent page is `Rw` below `mapped` and `Unmapped` above (an uncommitted hole
@@ -28432,6 +28479,21 @@ struct AddrSpace {
 }
 
 impl Mem {
+    /// A detached (op 15) child's window as it starts: a fresh reservation holding its module's data
+    /// segments (the `readonly` ones RO) under the #964 NULL guard. The one build for a spawn and for
+    /// a thaw, which lays its captured image over it (#1733), so the two cannot drift.
+    fn detached(
+        reserved_log2: u8,
+        mapped_log2: u8,
+        shadow: Option<ShadowArena>,
+        data: &[Data],
+    ) -> Mem {
+        let mut m = Mem::with_reservation(reserved_log2, mapped_log2, shadow);
+        m.init_data(data);
+        m.seed_null_guard(temen_ir::module_null_guard());
+        m
+    }
+
     /// A window whose mask domain is `1 << reserved_log2` bytes but whose backed region is the
     /// declared `1 << mapped_log2` prefix; an access into the reserved-but-unmapped tail faults
     /// (the §4 "guard-when-bounded" model). `reserved_log2` is raised to at least `mapped_log2`,

@@ -2265,35 +2265,43 @@ fn nim_shells_out_through_the_posix_sh() {
          except:\n\
          \x20 write(stdout, \"parent:\" & $rc & \"|no file\")\n",
     );
-    let (posix, make) = temen_posix::cap(0, 0, Vec::new());
-    let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
-        std::sync::Arc::new(make);
-    let run = temen_run::nim_noc_run_with_commands(
-        parent,
-        &posix,
-        make,
-        &["parent".to_string()],
-        &[
-            ("/bin/sh".to_string(), posix_sh()),
-            ("bin/child".to_string(), child),
-        ],
-    );
-    let crashed = temen_interp::last_twin_traps();
-    assert!(
-        crashed.is_empty(),
-        "a command crashed:\n{}",
-        crashed
-            .iter()
-            .map(|t| t.to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-    assert_eq!(run, Ok(()), "the parent ran to completion");
-    assert_eq!(
-        String::from_utf8_lossy(&posix.stdout()),
-        "child:hi|parent:3|from hi",
-        "the shell became the child; the parent reaped the child's own status and read its file"
-    );
+    // Both interpreters: the tree-walker is the oracle, and the bytecode engine must agree — its
+    // exec path used to refuse a nim `_start` the tree-walker admitted (one rule now, #1668).
+    let sh = posix_sh();
+    for engine in [temen_run::Backend::TreeWalk, temen_run::Backend::Bytecode] {
+        let (posix, make) = temen_posix::cap(0, 0, Vec::new());
+        let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
+            std::sync::Arc::new(make);
+        let run = temen_run::nim_noc_run(
+            parent.clone(),
+            &posix,
+            make,
+            &["parent".to_string()],
+            &[
+                ("/bin/sh".to_string(), sh.clone()),
+                ("bin/child".to_string(), child.clone()),
+            ],
+            engine,
+        );
+        // The twin-trap record is the tree-walker's (#1665); a bytecode crash shows in the output.
+        let crashed = temen_interp::last_twin_traps();
+        assert!(
+            engine != temen_run::Backend::TreeWalk || crashed.is_empty(),
+            "{engine:?}: a command crashed:\n{}",
+            crashed
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(run, Ok(()), "{engine:?}: the parent ran to completion");
+        assert_eq!(
+            String::from_utf8_lossy(&posix.stdout()),
+            "child:hi|parent:3|from hi",
+            "{engine:?}: the shell became the child; the parent reaped the child's own status and \
+             read its file"
+        );
+    }
 }
 
 /// #1668 — **a nim program forks and execs a nim program**, the shape every nimony compiler phase
@@ -2356,12 +2364,13 @@ fn nim_forks_and_execs_a_nim_program() {
     let (posix, make) = temen_posix::cap(0, 0, Vec::new());
     let make: std::sync::Arc<dyn Fn() -> temen_interp::HostProc + Send + Sync> =
         std::sync::Arc::new(make);
-    let run = temen_run::nim_noc_run_with_commands(
+    let run = temen_run::nim_noc_run(
         parent,
         &posix,
         make,
         &["parent".to_string()],
         &[("/bin/child".to_string(), child)],
+        temen_run::Backend::TreeWalk,
     );
     assert_eq!(run, Ok(()), "the parent ran to completion");
     assert_eq!(
