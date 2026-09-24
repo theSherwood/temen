@@ -2809,14 +2809,9 @@ fn seed_domain(
                 };
                 bytecode::child_entry_args(arity, 0, 0)
             } else {
-                let cinst = ch.grant_instantiator(0, csize);
-                // A one-arg entry manages no pages of its own; a two-arg entry takes its
-                // AddressSpace, and a powerbox entry (#1720) binds its manifest's `vm_map` to it.
-                let cas = if arity == 1 {
-                    0
-                } else {
-                    ch.grant_address_space(0, csize)
-                };
+                // The starter caps every spawn arm grants (#1720) — so a re-launched child holds the
+                // powerbox its first launch did.
+                let (cinst, cas) = ch.grant_starter_caps(csize);
                 bytecode::child_entry_args(arity, cinst, cas)
             };
             let cid = claim(s, fnr.task);
@@ -13469,8 +13464,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     hg.child_attestation(durable, Some(carve))
                                 };
                                 ch.set_attestation(catt);
-                                let cinst = ch.grant_instantiator(0, child_size);
-                                let cas = ch.grant_address_space(0, child_size);
+                                let (cinst, cas) = ch.grant_starter_caps(child_size);
                                 // S2 named grant list (op 11): install each re-granted cap into the child
                                 // **under its name** (so the child resolves it by `self.resolve`).
                                 // Empty for every other op.
@@ -14078,8 +14072,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 // for). The minter quota governs *minting*; growth is bounded by the
                                 // reservation (and, on wasm, the minted memory's `maximum`).
                                 let reservation = 1u64 << DEFAULT_RESERVED_LOG2;
-                                let cinst = ch.grant_instantiator(0, reservation);
-                                let cas = ch.grant_address_space(0, reservation);
+                                let (cinst, cas) = ch.grant_starter_caps(reservation);
                                 for (name, gh) in &glist {
                                     let cg = {
                                         let mut hg = host.lock_unpoisoned();
@@ -19393,6 +19386,17 @@ pub type OffloadHostProc = Box<dyn FnMut(u32, &[i64]) -> OffloadOutcome + Send>;
 /// page through it.
 pub type StdoutTee = Box<dyn FnMut(&[u8]) + Send>;
 
+/// §7c **stdin inheritance** (#1720): a `Stream(In)` promoted to shared the first time it is re-granted
+/// into a §14 child — the unread bytes, the cursor and the lazy refill move here, so the granter and
+/// every child it re-granted stdin to read **one** stream from **one** position, the way stdout's shared
+/// sink makes their writes land in one buffer. (A blocking stdin is never promoted: its re-grant is
+/// refused, see [`Host::can_regrant`].)
+struct SharedStdin {
+    bytes: Vec<u8>,
+    pos: usize,
+    source: Option<StdinSource>,
+}
+
 /// A **lazy stdin source** ([`Host::set_stdin_source`]): called when a `Stream(In)` `read` finds the
 /// stdin buffer exhausted, to fetch more bytes — a CLI reads the next line of the real stdin here, so
 /// an interactive guest sees input as it is typed. An empty return is end of input (the read returns
@@ -20350,8 +20354,10 @@ pub struct Host {
     /// captured-at-end readers and the interp≡JIT stdout differential are unaffected). The browser
     /// playground sets it to relay each chunk to the page as the guest produces it (live streaming);
     /// every other host leaves it `None` (zero cost — one `Option` check per write). Not carried into
-    /// forked/twin child hosts (a child's output routes through its own powerbox / shared sink).
-    out_tee: Option<StdoutTee>,
+    /// forked/twin child hosts; a §14 child re-granted stdout shares it (see below).
+    /// Shared (#1720) so a §14 child re-granted this host's stdout streams live too: the child host
+    /// carries the same tee its inherited sink's bytes go through.
+    out_tee: Option<Arc<Mutex<StdoutTee>>>,
     /// The lazy stdin refill ([`Host::set_stdin_source`]): consulted only when a `read` finds the
     /// buffer empty and the run is not [`Self::stdin_block`]ing. `None` (every host but an interactive
     /// CLI) costs one `Option` check per exhausted read and keeps EOF semantics byte-identical. Not
@@ -20360,6 +20366,11 @@ pub struct Host {
     /// §7c sink backings carried by re-granted stdout/stderr streams, indexed by the id a
     /// [`Binding::Stream`] `sink` holds — each entry aliases the granting parent's shared sink.
     sinks: Vec<Arc<Mutex<Vec<u8>>>>,
+    /// §7c stdin inheritance (#1720): once promoted, this host's own stdin (see [`SharedStdin`]).
+    in_shared: Option<Arc<Mutex<SharedStdin>>>,
+    /// The shared stdins carried by re-granted `Stream(In)`s, indexed by the id their `sink` holds —
+    /// each aliases the granting parent's promoted stdin, as [`Self::sinks`] do its stdout.
+    sources: Vec<Arc<Mutex<SharedStdin>>>,
     /// Monotonic nanosecond counter; each `Clock.now` returns it then advances by one,
     /// so reads are deterministic and strictly increasing.
     pub clock_ns: i64,
@@ -21107,6 +21118,8 @@ impl Host {
             out_tee: None,
             stdin_source: None,
             sinks: Vec::new(),
+            in_shared: None,
+            sources: Vec::new(),
             clock_ns: 0,
             regions: Vec::new(),
             region_hook: None,
@@ -21417,8 +21430,7 @@ impl Host {
         twin.attestation = self.attestation;
         twin.durable = self.durable;
         // Copied I/O scalars (POSIX fork copies the stdin buffer/offset; a shared fd is the sink case).
-        twin.stdin = self.stdin.clone();
-        twin.stdin_pos = self.stdin_pos;
+        (twin.stdin, twin.stdin_pos) = self.stdin_copy();
         twin.stdin_block = self.stdin_block;
         twin.mem_map_limit = self.mem_map_limit;
         twin.mem_mapped_bytes = self.mem_mapped_bytes;
@@ -22517,7 +22529,10 @@ impl Host {
     /// past that end needs.
     pub(crate) fn journal_invertible(&self) -> bool {
         let (queue, results, _) = self.svc_state();
-        queue.is_empty()
+        // A promoted stdin (#1720) keeps its cursor in the shared cell a child also advances, which a
+        // host-local journal record cannot invert.
+        self.in_shared.is_none()
+            && queue.is_empty()
             && results.is_empty()
             && (self.cap_record.is_some() || self.host_procs.iter().all(|e| e.state.is_none()))
     }
@@ -22679,6 +22694,22 @@ impl Host {
                 restore(bytes);
             }
         }
+    }
+
+    /// A §14 child's **starter** capabilities over its own window `[0, size)`: its `Instantiator` and
+    /// `AddressSpace`, each registered under its canonical name (`"instantiator"`, `"addrspace"`) — so a
+    /// child finds them by name exactly as a root program finds its own (#1720). The `AddressSpace` is
+    /// `"memory"` too: `size` is all the window the child can ever have, so it is the root's
+    /// whole-window grant as well. A child-entry passes them as its entry args too; a powerbox `_start`
+    /// takes none and can only find them this way. The one place every tier's child builders mint them.
+    /// Registered first, so they own those names.
+    pub fn grant_starter_caps(&mut self, size: u64) -> (i32, i32) {
+        let inst = self.grant_instantiator(0, size);
+        let space = self.grant_address_space(0, size);
+        self.register_cap_name("instantiator", inst);
+        self.register_cap_name("addrspace", space);
+        self.register_cap_name("memory", space);
+        (inst, space)
     }
 
     /// §7 register `name -> handle` in the capability-name directory (Followup F7), so a guest can
@@ -23832,7 +23863,35 @@ impl Host {
     /// write's bytes as the guest produces them, *in addition to* the normal buffering. The browser
     /// playground uses it to stream output to the page mid-run; it does not affect the captured bytes.
     pub fn set_stdout_tee(&mut self, tee: StdoutTee) {
-        self.out_tee = Some(tee);
+        self.out_tee = Some(Arc::new(Mutex::new(tee)));
+    }
+
+    /// This host's stdin as a `(bytes, cursor)` copy, wherever it lives — its own buffer, or the shared
+    /// cell a promotion moved it into (#1720). A fork twin copies it: POSIX fork copies the buffer and
+    /// the offset.
+    fn stdin_copy(&self) -> (Vec<u8>, usize) {
+        match &self.in_shared {
+            Some(c) => {
+                let c = c.lock_unpoisoned();
+                (c.bytes.clone(), c.pos)
+            }
+            None => (self.stdin.clone(), self.stdin_pos),
+        }
+    }
+
+    /// §7c stdin inheritance (#1720) — promote this host's stdin to a shared cell and return it, so a
+    /// child re-granted stdin reads the same stream from the same position. Idempotent. The unread
+    /// bytes, cursor and lazy refill move into the cell, which serves every later read of this host's
+    /// own stdin too.
+    fn shared_stdin(&mut self) -> Arc<Mutex<SharedStdin>> {
+        if self.in_shared.is_none() {
+            self.in_shared = Some(Arc::new(Mutex::new(SharedStdin {
+                bytes: std::mem::take(&mut self.stdin),
+                pos: std::mem::take(&mut self.stdin_pos),
+                source: self.stdin_source.take(),
+            })));
+        }
+        Arc::clone(self.in_shared.as_ref().unwrap())
     }
 
     /// Install a **lazy stdin source** (see [`Host::stdin_source`]): `src` is asked for more bytes
@@ -26083,8 +26142,7 @@ impl Host {
         ch.self_module = self.self_module.clone();
         // §6: a granted child is nested (window-exposed) and non-durable (not ancestor-freezable).
         ch.set_attestation(self.child_attestation(false, None));
-        let cinst = ch.grant_instantiator(0, child_size);
-        let cas = ch.grant_address_space(0, child_size);
+        let (cinst, cas) = ch.grant_starter_caps(child_size);
         let cg = self.regrant_into_child(grant_handle, &mut ch)?;
         Some((ch, cinst, cas, cg))
     }
@@ -26097,7 +26155,20 @@ impl Host {
             || self.resolve_live_impl(handle).is_some()
             || self.resolve_region(handle).is_ok()
             || self.resolve_offer(handle).is_ok()
-            || self.resolve_copyable(handle).is_ok()
+            // A **blocking** stdin (a driver-parked interactive session) is not re-grantable: its
+            // driver pushes input into this host's buffer and parks this host's reader, neither of
+            // which reaches a child's inherited read (#1720). Fail closed rather than hand the child
+            // an EOF the session never sent.
+            || self.resolve_copyable(handle).is_ok_and(|(_, b)| {
+                !(self.stdin_block
+                    && matches!(
+                        b,
+                        Binding::Stream {
+                            role: StreamRole::In,
+                            ..
+                        }
+                    ))
+            })
             || self.forkable_host_proc(handle)
             || matches!(self.resolve(handle, cap_id::MODULE), Ok(Binding::Module(_)))
             || matches!(self.resolve(handle, cap_id::JIT), Ok(Binding::JitTable(_)))
@@ -26253,6 +26324,27 @@ impl Host {
             return Some(child.grant(cap_id::MODULE, Binding::Module(cid)));
         }
         let (tid, binding) = self.resolve_copyable(handle).ok()?;
+        // §7c stdin inheritance (#1720): alias the stdin THIS handle reads — its own carried cell if it
+        // was itself inherited, else this host's promoted stdin — into the child's source table.
+        if let Binding::Stream {
+            role: StreamRole::In,
+            sink,
+        } = binding
+        {
+            let shared = match sink {
+                Some(i) => Arc::clone(self.sources.get(i as usize)?),
+                None => self.shared_stdin(),
+            };
+            let idx = child.sources.len() as u32;
+            child.sources.push(shared);
+            return Some(child.grant(
+                tid,
+                Binding::Stream {
+                    role: StreamRole::In,
+                    sink: Some(idx),
+                },
+            ));
+        }
         if let Binding::Stream {
             role: r @ (StreamRole::Out | StreamRole::Err),
             sink,
@@ -26269,6 +26361,10 @@ impl Host {
             };
             let idx = child.sinks.len() as u32;
             child.sinks.push(shared);
+            // The live tee follows stdout into the child (#1720), so nested output streams too.
+            if r == StreamRole::Out {
+                child.out_tee = self.out_tee.clone();
+            }
             return Some(child.grant(
                 tid,
                 Binding::Stream {
@@ -26346,8 +26442,7 @@ impl Host {
                                                  // builder path (which has no eval-loop arm) resolve `child_offer` shapes identically.
         ch.self_module = self.self_module.clone();
         ch.set_attestation(attestation);
-        let cinst = ch.grant_instantiator(0, child_size);
-        let cas = ch.grant_address_space(0, child_size);
+        let (cinst, cas) = ch.grant_starter_caps(child_size);
         for (name, handle) in grants {
             // Pre-checked above, so this cannot fail; each cap (coordinate-free or pipe end) is
             // re-granted into the child under its name.
@@ -27848,6 +27943,34 @@ impl Host {
                 }
                 let ptr = *args.first().ok_or(Trap::Malformed)? as u64;
                 let len = *args.get(1).ok_or(Trap::Malformed)? as u64;
+                // §7c stdin inheritance (#1720): a re-granted stdin (its entry carries the granter's
+                // cell) or this host's own promoted stdin reads the shared stream — same refill, same
+                // cursor. Never blocking: a blocking stdin is never promoted.
+                let shared = match sink {
+                    Some(i) => Some(Arc::clone(
+                        self.sources.get(i as usize).ok_or(Trap::Malformed)?,
+                    )),
+                    None => self.in_shared.clone(),
+                };
+                if let Some(cell) = shared {
+                    let mut st = cell.lock_unpoisoned();
+                    if st.pos >= st.bytes.len() {
+                        if let Some(src) = st.source.as_mut() {
+                            let more = src();
+                            st.bytes.extend_from_slice(&more);
+                        }
+                    }
+                    let start = st.pos.min(st.bytes.len());
+                    let n = (len as usize).min(st.bytes.len() - start);
+                    let Some(m) = mem else {
+                        return ret(EFAULT);
+                    };
+                    if m.write_bytes(ptr, &st.bytes[start..start + n]).is_none() {
+                        return ret(EFAULT);
+                    }
+                    st.pos = start + n;
+                    return ret(n as i64);
+                }
                 // Lazy refill (an interactive CLI): an exhausted buffer asks the source for more before
                 // it means EOF. Orthogonal to the blocking park below (a driver that parks pushes its
                 // own bytes), so a parking host never consults it.
@@ -27896,8 +28019,8 @@ impl Host {
                 // is produced, *before* the normal buffering below — a tee, not a replacement, so the
                 // captured-at-end bytes are identical.
                 if role == StreamRole::Out {
-                    if let Some(tee) = self.out_tee.as_mut() {
-                        tee(&bytes);
+                    if let Some(tee) = self.out_tee.as_ref() {
+                        (tee.lock_unpoisoned())(&bytes);
                     }
                 }
                 if let Some(i) = sink {

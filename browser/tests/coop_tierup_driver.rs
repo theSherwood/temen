@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use temen_browser::{
-    onramp_exec, temen_coop_argv_len, temen_coop_argv_ptr, temen_coop_call_interp,
+    onramp_exec_root, temen_coop_argv_len, temen_coop_argv_ptr, temen_coop_call_interp,
     temen_coop_close, temen_coop_deliver, temen_coop_deliver_jit, temen_coop_deliver_jit_trap,
     temen_coop_deliver_trap, temen_coop_func, temen_coop_jit_code, temen_coop_jit_param_types_ptr,
     temen_coop_jit_result_types_len, temen_coop_jit_result_types_ptr,
@@ -453,7 +453,7 @@ fn coop_jit_invoke_pump_matches_the_bytecode_oracle() {
     let bytes = temen_encode::encode_module(&m);
 
     // The oracle services the invoke interpreted; the pump runs the unit on emitted wasm.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -522,7 +522,7 @@ fn coop_tierup_pump_matches_the_bytecode_oracle() {
 
     // The oracle: the plain bytecode path the page falls back to today (multiplexes the threads
     // cooperatively on the interpreter — INVARIANTS.md #9).
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 38, "oracle: f(3) + f(5) = 16 + 22 = 38");
     assert_eq!(
@@ -609,7 +609,7 @@ fn leaf_tierup_size_floor_gates_tiny_and_admits_heavy() {
         temen_wasm_jit::MIN_TIERUP_EMITTED_FN_BYTES
     );
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 38, "oracle: f(3) + f(5) = 16 + 22 = 38");
 
@@ -1287,7 +1287,7 @@ fn assert_grow_case(name: &str, off: u64, len: u64, declared: u8, ro: bool, want
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
 
     let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
     assert_eq!(opened, 0, "[{name}] coop open (status {})", temen_status());
@@ -1399,7 +1399,7 @@ export 0 func "_start" 0
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "the oracle probes the refusal");
     assert!(want.value < 0, "the oracle refuses with a negative errno");
 
@@ -1444,7 +1444,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
         let m = temen_text::parse_module(&src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let bytes = temen_encode::encode_module(&m);
-        let want = onramp_exec(&m, b"");
+        let want = onramp_exec_root(&m, b"");
         assert_eq!(
             want.status,
             if want_trap { STATUS_TRAP } else { STATUS_OK },
@@ -1482,7 +1482,7 @@ fn coop_rodata_and_midinvoke_grow_match_the_oracle() {
     let m = temen_text::parse_module(&src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity (mid-invoke grow)");
     assert_eq!(want.value, X, "oracle value");
     let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
@@ -1534,7 +1534,7 @@ fn coop_unmap_protect_guest_without_rodata_opens_paged() {
         let m = temen_text::parse_module(&src).expect("parse");
         temen_verify::verify_module(&m).expect("verify");
         let bytes = temen_encode::encode_module(&m);
-        let want = onramp_exec(&m, b"");
+        let want = onramp_exec_root(&m, b"");
         assert_eq!(
             want.status,
             if want_trap { STATUS_TRAP } else { STATUS_OK },
@@ -1638,7 +1638,7 @@ fn coop_indirect_leaf_tiers_up_natively() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: the plain bytecode path. `f1(probe) = f2(probe) + 1 = (probe + LEAF_K) + 1`; worker 0.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -1777,7 +1777,7 @@ fn coop_leaf_reaches_installed_unit_natively() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: `f1(slot, X) = unit(X) + 100 = (X + 7) + 100`; worker 0. (X = 4000.)
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -1937,7 +1937,7 @@ fn coop_invoked_unit_bounces_and_native_edges_match_the_oracle() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: bounce (+K, grow), grown-page store/load, native ×3; worker 0.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -2115,7 +2115,7 @@ export 0 func "_start" 0
     let m = temen_text::parse_module(src).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
 
     let opened = temen_coop_open(bytes.as_ptr(), bytes.len(), core::ptr::null(), 0, 0);
@@ -2176,7 +2176,7 @@ block 0 (vsp: i64, varg: i64) {{
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(
         want.status, STATUS_OK,
         "the fiber-hosting unit compiles + invokes interpreted"
@@ -2224,7 +2224,7 @@ block 0 (v0: i64) {
     let blob = temen_encode::encode_module(&unit);
     let m = temen_text::parse_module(&coop_jit_guest_text_with(&blob, "")).expect("parse");
     temen_verify::verify_module(&m).expect("verify");
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_ne!(
         want.status, STATUS_OK,
         "a futex unit must fail compile (-EINVAL) → the invoke of the bogus handle traps"
@@ -2343,7 +2343,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, X + 7 + 100, "oracle: B → installed A → +100");
 
@@ -2424,7 +2424,7 @@ block 0 (v0: i64) {{
     );
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -2522,7 +2522,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 2 * X + BOUNCE_K, "oracle value");
 
@@ -2611,7 +2611,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,
@@ -2693,7 +2693,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, 7 + PLEAF_K + XT_K, "oracle value");
 
@@ -2781,7 +2781,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, PROBE + PLEAF_K, "oracle value");
 
@@ -2846,7 +2846,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(
         want.status, STATUS_OK,
         "oracle sanity (notify with no waiters returns 0)"
@@ -2917,7 +2917,7 @@ export 0 func "_start" 0
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     let expect = HOT_K * (1..=HOT_N).sum::<i64>();
     assert_eq!(want.value, expect, "oracle value");
@@ -2973,7 +2973,7 @@ fn coop_jacl_compiler_runs_through_the_driver() {
     const MACRO_SRC: &[u8] = b"defmacro unless {cond body} { syntax-quote [if ~cond {} ~body] }\n\
                                mut hit 0\nunless [== 1 2] { set hit 5 }\nhit\n";
 
-    let want = onramp_exec(&compiler, MACRO_SRC);
+    let want = onramp_exec_root(&compiler, MACRO_SRC);
     let opened = temen_coop_open(
         bytes.as_ptr(),
         bytes.len(),
@@ -3059,7 +3059,7 @@ fn coop_forth_kernel_tiers_up_and_matches_the_oracle() {
                              : sumsq ( n -- s ) 0 swap 0 do i sq + loop ;\n\
                              100 sumsq . cr\n";
 
-    let want = onramp_exec(&kernel, PROGRAM);
+    let want = onramp_exec_root(&kernel, PROGRAM);
     assert_eq!(want.status, STATUS_OK, "the oracle must run the program");
     let opened = temen_coop_open(
         bytes.as_ptr(),
@@ -3141,7 +3141,7 @@ fn coop_forth_thread_words_decline_to_the_oracle() {
     };
     let kernel = temen_encode::decode_module(&bytes).expect("decode forth.temen");
     const PROGRAM: &[u8] = b": work ( x -- y ) 1000 * ;\n' work 7 spawn join . cr\n";
-    let want = onramp_exec(&kernel, PROGRAM);
+    let want = onramp_exec_root(&kernel, PROGRAM);
     assert_eq!(want.status, STATUS_OK, "the oracle must run the program");
     let opened = temen_coop_open(
         bytes.as_ptr(),
@@ -3270,7 +3270,7 @@ fn coop_tierup_serves_a_confined_child_over_its_own_carve() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: the plain bytecode path with the identical (knob-granted) powerbox.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value, 80,
@@ -3402,7 +3402,7 @@ fn coop_tierup_child_paged_traps_over_carve() {
 
     // Oracle: the plain bytecode path with the identical powerbox — the child unmaps its carve then
     // loads it, so the run traps `MemoryFault`.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(
         want.status, STATUS_TRAP,
         "oracle: the child's load of its own unmapped page traps"
@@ -3916,7 +3916,7 @@ fn coop_compile_linked_invoke_matches_the_oracle() {
         temen_verify::verify_module(&m).expect("verify");
         let bytes = temen_encode::encode_module(&m);
 
-        let want = onramp_exec(&m, b"");
+        let want = onramp_exec_root(&m, b"");
         assert_eq!(
             want.status, STATUS_OK,
             "oracle sanity (interp_callee={interp_callee} paged={paged})"
@@ -4075,7 +4075,7 @@ fn coop_jit_invoke_inside_a_bounce_matches_the_oracle() {
     temen_verify::verify_module(&m).expect("verify");
     let bytes = temen_encode::encode_module(&m);
 
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
 
@@ -4197,7 +4197,7 @@ fn coop_jit_install_and_uninstall_inside_a_bounce_match_the_oracle() {
     let bytes = temen_encode::encode_module(&m);
 
     // Oracle: `unit(PROBE) + uninstall's 0 + 1`; worker 0.
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(want.value, NEST_PROBE + UNIT_K + 1, "oracle value");
 
@@ -4305,7 +4305,7 @@ fn open_gc_spill_guest() -> temen_ir::Module {
 fn a_collecting_guest_tiers_up_and_its_spilled_roots_are_scanned() {
     let _g = ffi_guard();
     let m = temen_text::parse_module(&gc_spill_guest_text()).expect("parse");
-    let want = onramp_exec(&m, b"");
+    let want = onramp_exec_root(&m, b"");
     assert_eq!(want.status, STATUS_OK, "oracle sanity");
     assert_eq!(
         want.value,

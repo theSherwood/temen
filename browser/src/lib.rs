@@ -3756,6 +3756,37 @@ pub extern "C" fn temen_onramp_set_grant_instantiator(on: i32) {
     ONRAMP_GRANT_INSTANTIATOR.store(on != 0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The on-ramp capabilities a card can be re-granted as a §14 child (#1720), by the names the
+/// powerbox registers them under. The rest stay with the root: `memory`/`addrspace`/`instantiator` are
+/// minted fresh for the child over its own window (a parent's names coordinates the child cannot use).
+const ONRAMP_NESTED_CAPS: [&str; 10] = [
+    "stdout", "stdin", "exit", "display", "keyboard", "mouse", "webgpu", "fs", "vm_fs", "jit",
+];
+
+/// Wrap `m` for a nested on-ramp run (#1720): the one-node plan that spawns it as a §14 child of a
+/// generated root, granting every [`ONRAMP_NESTED_CAPS`] entry `host` holds. Returns the root module
+/// and its args (the root's Instantiator, `m`'s `Module` and the budget are granted on `host` here).
+/// `None` for a module that cannot be a child — one with no window, or whose func 0 is not an admitted
+/// child entry (`temen-llvm`'s bare `main(sp)` for an import-free C program, #1779): it runs at the
+/// root.
+fn nest_onramp(m: &temen_ir::Module, host: &mut Host) -> Option<(temen_ir::Module, Vec<Value>)> {
+    let window = m.memory.as_ref()?.size_log2;
+    let entry = m.funcs.first()?;
+    if !temen_ir::child_entry_ok(&entry.params, &entry.results) {
+        return None;
+    }
+    let held: Vec<(&str, i32)> = ONRAMP_NESTED_CAPS
+        .iter()
+        .filter_map(|n| host.resolve_cap_name(n).map(|h| (*n, h)))
+        .collect();
+    let names: Vec<&str> = held.iter().map(|(n, _)| *n).collect();
+    let handles: Vec<i32> = held.iter().map(|(_, h)| *h).collect();
+    let plan = plan::Plan::single(window, &[], &names);
+    let root = temen_text::parse_module(&plan.root_src().ok()?).ok()?;
+    let args = plan.root_args(host, &[m], &handles);
+    Some((root, args))
+}
+
 /// Run `m`'s function 0 under the **on-ramp powerbox** — the ABI `temen-llvm`'s synthesized `_start`
 /// expects, so a `.temen` straight off `temen-llvm-translate` (Lua, SQLite, …) runs unchanged. This is
 /// the twin of [`powerbox_exec`] with the fixed §3e `VM_CAP_*` grant prefix instead of the browser
@@ -3781,6 +3812,25 @@ pub fn onramp_exec_with_tee(
     stdin: &[u8],
     tee: Option<temen_interp::StdoutTee>,
 ) -> PbOutcome {
+    onramp_run(m, stdin, tee, true)
+}
+
+/// [`onramp_exec`] at the **root** position — the oracle for a tier that still runs a card at the root
+/// (the cooperative/warm drivers), until that tier nests too (#1720). A guest that finds its
+/// capabilities by name runs identically either way; one that hardcodes the §3e prefix's handle
+/// numbers (a driver fixture) only at the root.
+pub fn onramp_exec_root(m: &temen_ir::Module, stdin: &[u8]) -> PbOutcome {
+    onramp_run(m, stdin, None, false)
+}
+
+/// The on-ramp run behind [`onramp_exec_with_tee`] and [`onramp_exec_root`]: `nested` runs `m` as a
+/// one-node plan's child where it can be one ([`nest_onramp`]), else at the root.
+fn onramp_run(
+    m: &temen_ir::Module,
+    stdin: &[u8],
+    tee: Option<temen_interp::StdoutTee>,
+    nested: bool,
+) -> PbOutcome {
     let unsupported = || PbOutcome {
         trap: None,
         fault_addr: None,
@@ -3803,6 +3853,18 @@ pub fn onramp_exec_with_tee(
     // single-shot run drains no keys, and `frame` captures the last frame the guest presented (if any).
     // No `fs` file: a single-shot on-ramp guest reads its input from stdin, not a served file.
     let frame = grant_onramp_caps(&mut host, m, None).frame;
+    // #1720: the card runs **nested** where it can — a §14 child of a generated root (a one-node
+    // [`plan::Plan`]), re-granted by name every on-ramp capability this powerbox holds that can cross
+    // into a child. The module runs exactly as built (a powerbox `_start` is an admitted child entry),
+    // over its own window, finding its capabilities by name and through its manifest as at the root.
+    let nest = if nested {
+        nest_onramp(m, &mut host)
+    } else {
+        None
+    };
+    let (entry, args) = nest
+        .as_ref()
+        .map_or((m, &[][..]), |(r, a)| (r, a.as_slice()));
     let mut fuel = u64::MAX;
     // The bytecode engine services a `vm_jit_*`-importing guest (the JACL self-hosted compiler) too:
     // it lowers the guest's `call.import` §22 ops to the driver's `Op::JitInvoke`/`install`/`uninstall`
@@ -3812,7 +3874,7 @@ pub fn onramp_exec_with_tee(
     // software page size is 4 KiB on wasm (see `host_page_size`) — no per-guest window bump needed.
     let mut trap = None;
     let (status, value, exit_code) =
-        match bytecode::compile_and_run_with_host(m, 0, &[], &mut fuel, &mut host) {
+        match bytecode::compile_and_run_with_host(entry, 0, args, &mut fuel, &mut host) {
             None => (STATUS_UNSUPPORTED, 0, 0),
             Some(Err(Trap::Exit(code))) => (STATUS_EXIT, 0, code),
             Some(Err(t)) => {
@@ -12673,8 +12735,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // exit/fs) against the re-granted caps, and pass the child-entry its `Instantiator` handle
                 // as `f{entry}`'s first param (`[I64]->[I64]`, `child_entry_ok`). An import-free child
                 // (empty manifest) is unaffected; a manifest phase (nifler_ce) resolves its caps via it.
-                let cinst = host.grant_instantiator(0, child_size);
-                let cas = host.grant_address_space(0, child_size);
+                let (cinst, cas) = host.grant_starter_caps(child_size);
                 if host
                     .bind_child_manifest(&d.child.imports, &d.child.types)
                     .is_err()
@@ -12745,8 +12806,7 @@ pub extern "C" fn temen_op13jit_step() -> i32 {
                 // window would refuse the `vm_map` growth it exists for. Growth is bounded by the minted
                 // memory's `maximum`.
                 let reservation = 1u64 << temen_ir::DEFAULT_RESERVED_LOG2;
-                let cinst = host.grant_instantiator(0, reservation);
-                let cas = host.grant_address_space(0, reservation);
+                let (cinst, cas) = host.grant_starter_caps(reservation);
                 if host
                     .bind_child_manifest(&d.child.imports, &d.child.types)
                     .is_err()
