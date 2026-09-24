@@ -320,20 +320,32 @@ fn run_with_instantiator(src: &str, quota: Quota, win_log2: u8) -> JitOutcome {
 /// `max_vcpus = 2` is the root plus one live child, so the **second** concurrent §14 child trips the
 /// ceiling — the same answer, and the same trap, the interpreter gives when its scheduler refuses.
 /// `max_vcpus = 3` admits both.
+///
+/// Nothing holds the first child live: it runs on its own OS thread and just returns, so on a loaded
+/// machine it can finish before the second spawn is metered (#1604). Then only one child is live and
+/// admitting the second is correct — the root returns its slot, `1`. That run is checked and the
+/// spawn pair tried again until the first child is still live at the second spawn. A JIT that stopped
+/// metering §14 children would return `1` every time and fail here.
 #[test]
 fn a_second_live_nested_child_trips_the_vcpu_ceiling() {
-    let tight = run_with_instantiator(
-        TWO_LIVE_CHILDREN,
-        Quota {
-            max_fibers: 1 << 16,
-            max_vcpus: 2,
-        },
-        17,
-    );
+    let tripped = (0..50).any(|_| {
+        let tight = run_with_instantiator(
+            TWO_LIVE_CHILDREN,
+            Quota {
+                max_fibers: 1 << 16,
+                max_vcpus: 2,
+            },
+            17,
+        );
+        match tight {
+            JitOutcome::Trapped(TrapKind::ThreadFault) => true,
+            JitOutcome::Returned(ref v) if v == &[1] => false, // the first child had finished
+            other => panic!("a §14 spawn at the vCPU ceiling: {other:?}"),
+        }
+    });
     assert!(
-        matches!(tight, JitOutcome::Trapped(TrapKind::ThreadFault)),
-        "a §14 child must be metered like `thread.spawn`, not spawn a host thread for free; \
-         got {tight:?}"
+        tripped,
+        "a §14 child must be metered like `thread.spawn`, not spawn a host thread for free"
     );
 
     let roomy = run_with_instantiator(
