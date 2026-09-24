@@ -32,6 +32,10 @@
 //! [`crate::DOMAIN_DONE_CODE`] sentinel ([`Domain::begin_teardown`]); every park site (futex `wait`,
 //! `thread.join`) returns on observing a non-zero cell — woken promptly by
 //! [`Domain::wake_all_parked`] — so the caller's trailing guard unwinds it at its next safepoint. A
+//! *running* vCPU reaches no park site, so code that runs beside other vCPUs polls the same cell at
+//! every loop back-edge and on entry to a function that tail-calls (`emit_domain_poll`), and
+//! unwinds from there. A §14 carve child has a cell of its own, which the parent's teardown sets
+//! (`ChildExec::shutdown_and_join`). A
 //! durable **freeze** is *not* teardown: the root unwinds under `UNWINDING` and parked siblings
 //! return through the freeze re-issue machinery instead (the sentinel is skipped).
 

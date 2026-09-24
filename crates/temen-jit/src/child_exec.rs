@@ -85,7 +85,8 @@ pub(crate) struct ChildTask {
     window: mem::GuestWindow,
     fault: (usize, usize),
     /// The task's own trap cell (R4). Heap-stable: baked into the child's frames at first entry.
-    trap: Box<AtomicI64>,
+    /// Shared with the task's [`Entry`] so teardown can reach it while a worker holds the task.
+    trap: Arc<AtomicI64>,
     /// The entry's result buffer (heap-stable, written by the trampoline at return).
     results: Box<[i64]>,
     /// The arguments, alive until the fiber body's first entry reads them.
@@ -149,7 +150,7 @@ impl ChildTask {
             return Err(teardown);
         }
         let fault = window.fault_range();
-        let trap = Box::new(AtomicI64::new(0));
+        let trap = Arc::new(AtomicI64::new(0));
         let results: Box<[i64]> = vec![0i64; n_results.max(1)].into_boxed_slice();
         let args: Box<[i64]> = args.into_boxed_slice();
         // The child's own execution context over a private, unused fiber table: the child compiles
@@ -165,7 +166,7 @@ impl ChildTask {
         let r = SendRaw(results.as_ptr() as *mut i64);
         let b = SendRaw(base);
         let t = SendRaw(code.fn_table.as_ptr() as *const core::ffi::c_void);
-        let c = SendRaw(&*trap as *const AtomicI64 as *mut i64);
+        let c = SendRaw(Arc::as_ptr(&trap) as *mut i64);
         // The body: enter the child once through the limit-taking trampoline with this fiber's
         // stack low bound (§2b path B — the prologue checks guard the fiber stack). Every park inside
         // is a `fiber_event_park` yield from within this call; the body returns when the entry does.
@@ -255,6 +256,11 @@ struct Entry {
     counted: bool,
     /// A wake arrived (possibly while the task was still running toward its park).
     woken: bool,
+    /// A **carve** child's trap cell, for a teardown that ends the parent's domain: the parent's
+    /// completion ends its nested children, running ones included (DESIGN §12 domain teardown),
+    /// and a running task is reachable only through this — its `task` is on a worker. `None` for a
+    /// detached child, which a parent's completion does not end.
+    stop: Option<Arc<AtomicI64>>,
 }
 
 struct ExecState {
@@ -326,6 +332,7 @@ impl ChildExec {
             .map(|&(_, cap)| cap as usize)
             .min()
             .unwrap_or(g.tasks.len() + 1);
+        let stop = task.copy_back.is_some().then(|| Arc::clone(&task.trap));
         g.tasks.insert(
             id,
             Entry {
@@ -333,6 +340,7 @@ impl ChildExec {
                 parked: false,
                 counted: false,
                 woken: false,
+                stop,
             },
         );
         g.runnable.push_back(id);
@@ -625,10 +633,15 @@ impl ChildExec {
     }
 
     /// Run teardown (`Nursery::join_children`): poison every parked task so it unwinds, let the
-    /// runnable ones finish, wait for quiescence, join the workers. A task that never started runs
-    /// to its end as before (the OS-thread path ran it too); one parked forever would have hung the
-    /// join, and now unwinds through its trailing guard instead — the interpreter's teardown sweep.
-    pub(crate) fn shutdown_and_join(self: &Arc<Self>) {
+    /// runnable ones finish, wait for quiescence, join the workers. One parked forever would have
+    /// hung the join, and unwinds through its trailing guard instead — the interpreter's teardown
+    /// sweep.
+    ///
+    /// `end_domain` — the parent's domain is ending (not freezing): its **carve** children end with
+    /// it, running or not yet started, as the oracle ends them. Their cell gets the completion
+    /// sentinel, which their entry and back-edge polls observe (`emit_domain_poll`). A
+    /// freeze skips this, so a child the freeze reaches still unwinds under its own freeze word.
+    pub(crate) fn shutdown_and_join(self: &Arc<Self>, end_domain: bool) {
         let workers = {
             let mut g = lock(&self.state);
             g.shutdown = true;
@@ -638,6 +651,14 @@ impl ChildExec {
                         t.trap
                             .store(crate::DOMAIN_DONE_CODE as i64, Ordering::Relaxed);
                     }
+                } else if let Some(stop) = e.stop.as_ref().filter(|_| end_domain) {
+                    // Never clobber a trap the child already recorded.
+                    let _ = stop.compare_exchange(
+                        0,
+                        crate::DOMAIN_DONE_CODE as i64,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    );
                 }
             }
             self.wake_all_parked(&mut g);
