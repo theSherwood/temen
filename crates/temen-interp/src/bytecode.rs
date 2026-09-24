@@ -4069,18 +4069,18 @@ impl<'p> Vcpu<'p> {
     /// Advance this vCPU until it finishes, traps, or hits a host-serviced event. The host must
     /// `deliver_*` the result of any `Spawn`/`Join`/`Wait`/`Notify` before calling `run` again.
     ///
-    /// A **durable** host is refused (`Trapped(Malformed)`) rather than run non-durable (#1694): this
-    /// driver keeps no per-fiber shadow-SP swap and has no freeze driver, so a freeze would leave its
-    /// parked fibers out of the artifact. A durable run belongs on the cooperative scheduler
-    /// ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`]).
+    ///
+    /// A **durable** host runs durable (#1694): each fiber switch keeps the per-context shadow-SP.
+    /// This driver has no freeze driver, though, so a run that ends frozen with a parked fiber, whose
+    /// continuation only a freeze driver could flatten, fails closed (`FiberFault`) rather than hand
+    /// back an artifact missing it. A freeze with no parked fiber is driven wholly by the IR. The
+    /// cooperative scheduler ([`compile_and_run_capture_reserved_with_host`], [`SharedProgram`])
+    /// flattens them.
     pub fn run(&mut self) -> VcpuEvent {
         let durable = match self.shared_host {
             Some(m) => m.lock_unpoisoned().is_durable(),
             None => self.host.is_durable(),
         };
-        if durable {
-            return VcpuEvent::Trapped(Trap::Malformed);
-        }
         // #1366: this driver surfaces cap parks (`VcpuEvent::CapPending`) — admit host-completed
         // punts on its host. A cheap flag store per resume.
         match self.shared_host {
@@ -4106,7 +4106,7 @@ impl<'p> Vcpu<'p> {
                 table: &dom.table,
                 fuel: &mut self.fuel,
                 mem: &mut self.mem,
-                durable: false,
+                durable,
                 host: match self.shared_host {
                     Some(m) => HostCell::Shared(m),
                     None => HostCell::Excl(&mut self.host),
@@ -4154,7 +4154,23 @@ impl<'p> Vcpu<'p> {
                 // #1157: this path passes `preemptible: false`, so the quantum never yields here.
                 | Ok(VcpuStop::Preempted) => return VcpuEvent::Trapped(Trap::ThreadFault),
                 Err(t) => return VcpuEvent::Trapped(t),
-                Ok(VcpuStop::Done(vals)) => return VcpuEvent::Done(vals),
+                Ok(VcpuStop::Done(vals)) => {
+                    let froze = durable
+                        && self.mem.as_ref().map(|m| m.durable_state())
+                            == Some(super::STATE_UNWINDING);
+                    let parked = self.fibers.iter().any(|f| {
+                        matches!(
+                            f,
+                            FiberState::Parked { .. }
+                                | FiberState::WaitParked { .. }
+                                | FiberState::CapParked { .. }
+                        )
+                    });
+                    if froze && parked {
+                        return VcpuEvent::Trapped(Trap::FiberFault);
+                    }
+                    return VcpuEvent::Done(vals);
+                }
                 Ok(VcpuStop::TierUp {
                     func,
                     argv,

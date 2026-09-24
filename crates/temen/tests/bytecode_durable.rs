@@ -199,16 +199,41 @@ fn single_fiber_multi_live_freeze_thaw() {
     check(MULTI_LIVE);
 }
 
-/// #1694 — the bytecode drivers that keep no per-fiber shadow-SP swap and have no freeze driver refuse
-/// a durable host rather than run it silently non-durable: the resumable `Vcpu` traps `Malformed` at
-/// its first `run`, and the parallel entry answers `None` (outside it), so the caller falls back to
-/// the cooperative scheduler, which keeps durability.
+/// #1694 — no bytecode driver runs a durable host silently non-durable. The resumable `Vcpu` runs it
+/// durable, and since it has no freeze driver, a run that ends frozen with a parked fiber traps
+/// `FiberFault` rather than hand back an artifact missing that fiber. The cooperative engine freezes
+/// the same module whole. The parallel entry, which keeps no durability at all, answers `None`
+/// (outside it), so its caller falls back.
 #[test]
-fn drivers_that_cannot_freeze_refuse_a_durable_host() {
+fn no_bytecode_driver_runs_a_durable_host_non_durable() {
+    // The root resumes a fiber that suspends once, then resumes it again: frozen from the start, the
+    // fiber is parked when the root unwinds.
     let m = parse_module(
-        "memory 16\nfunc () -> (i64) {\nblock 0 () {\n  v0 = i64.const 7\n  return v0\n  }\n}\n",
+        "memory 17 shadow 16448 65536
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 1
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6, v7 = cont.resume v2 v3
+  return v7
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (v0: i64, v1: i64) {
+  v2 = i64.const 1
+  v3 = suspend v2
+  v4 = i64.const 7
+  return v4
+  }
+}
+",
     )
     .expect("parse");
+    let inst = transform_module(&m).expect("transform");
+    verify_module(&inst).expect("verify");
     let durable = || {
         let mut h = Host::new();
         h.set_durable(true);
@@ -216,30 +241,56 @@ fn drivers_that_cannot_freeze_refuse_a_durable_host() {
     };
     let back =
         || std::sync::Arc::new(temen_interp::Region::owned_zeroed(1 << 20, 4096).expect("backing"));
-
-    let prog = bytecode::VcpuProgram::compile(&m).expect("compiles");
-    let mut plain = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[], back(), &[], Host::new())
+    let prog = bytecode::VcpuProgram::compile(&inst).expect("compiles");
+    let resumable = |state: i32| {
+        let mut v = bytecode::Vcpu::new_root_with_powerbox(
+            &prog,
+            0,
+            &[],
+            back(),
+            &window_with(state),
+            durable(),
+        )
         .expect("builds");
+        v.run()
+    };
     assert!(
-        matches!(plain.run(), bytecode::VcpuEvent::Done(ref v) if v == &[Value::I64(7)]),
-        "a plain host runs"
+        matches!(resumable(STATE_NORMAL), bytecode::VcpuEvent::Done(ref v) if v == &[Value::I64(7)]),
+        "the resumable driver runs a durable host"
     );
-    let mut vcpu = bytecode::Vcpu::new_root_with_powerbox(&prog, 0, &[], back(), &[], durable())
-        .expect("builds");
     assert!(
-        matches!(vcpu.run(), bytecode::VcpuEvent::Trapped(Trap::Malformed)),
-        "the resumable driver refuses a durable host"
+        matches!(
+            resumable(STATE_UNWINDING),
+            bytecode::VcpuEvent::Trapped(Trap::FiberFault)
+        ),
+        "frozen with a parked fiber it cannot flatten, it fails closed"
+    );
+    let mut h = durable();
+    let mut fuel = 1_000_000u64;
+    let (r, _) = bytecode::compile_and_run_capture_reserved_with_host(
+        &inst,
+        0,
+        &[],
+        &mut fuel,
+        &window_with(STATE_UNWINDING),
+        SIZE_LOG2,
+        &mut h,
+    )
+    .expect("cooperative");
+    assert!(
+        r.is_ok() && !h.frozen_fibers().is_empty(),
+        "the cooperative engine freezes it whole"
     );
 
     let mut fuel = 1_000_000u64;
     let mut h = durable();
     assert!(
         bytecode::compile_and_run_capture_over_parallel_with_host(
-            &m,
+            &inst,
             0,
             &[],
             &mut fuel,
-            &[],
+            &window_with(STATE_NORMAL),
             back(),
             &mut h,
         )
