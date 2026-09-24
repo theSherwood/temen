@@ -161,7 +161,7 @@ unsafe fn file_task(
     code: std::sync::Arc<crate::CompiledModule>,
     mapped_log2: u8,
     reserved_log2: u8,
-    init: impl FnOnce(&mut [u8]),
+    init: impl FnOnce(&mut crate::mem::GuestWindow),
     premap: impl FnOnce(*mut u8, u64, u64) -> bool,
     copy_back: Option<crate::child_exec::CopyBack>,
     args: Vec<i64>,
@@ -274,11 +274,11 @@ unsafe fn file_carve_task(
         code,
         size_log2,
         size_log2,
-        move |rw| {
+        move |w| {
             let src = src;
             // SAFETY: the carve is committed parent memory (Instantiator-bounded), size = `size`.
             let carve = unsafe { std::slice::from_raw_parts(src.0.add(sub_base as usize), size) };
-            rw[..size].copy_from_slice(carve);
+            w.rw_mut()[..size].copy_from_slice(carve);
         },
         |_, _, _| true,
         Some(Box::new(move |image: &[u8]| {
@@ -943,7 +943,8 @@ impl Nursery {
             code,
             mapped_log2,
             reserved_log2,
-            move |rw| {
+            move |w| {
+                let rw = w.rw_mut();
                 let n = image.len().min(rw.len());
                 rw[..n].copy_from_slice(&image[..n]);
                 let s = temen_ir::durable_abi::STATE_OFF as usize;
@@ -1911,7 +1912,7 @@ unsafe fn spawn_detached_child(
     code: crate::CompiledModule,
     mapped_log2: u8,
     reserved_log2: u8,
-    seeds: Vec<(u64, Vec<u8>)>,
+    seeds: Vec<Seed>,
     premap_apply: Option<crate::PremapApply>,
     args: Vec<i64>,
     n_results: usize,
@@ -1937,18 +1938,29 @@ unsafe fn spawn_detached_child(
         mapped_log2,
         reserved_log2,
         // The window image: the module's data segments, then the payload at the args base; a durable
-        // child's window also starts durable (`temen_durable::init_durable_window`'s one word).
-        |rw| {
-            for (off, bytes) in &seeds {
-                let off = *off as usize;
-                if let Some(end) = off.checked_add(bytes.len()) {
-                    if end <= rw.len() {
-                        rw[off..end].copy_from_slice(bytes);
-                    }
-                }
+        // child's window also starts durable (`temen_durable::init_durable_window`'s one word). Then
+        // the `readonly` segments go RO, as in a root's window (#1730): a detached child is
+        // root-shaped, so a write to its const data faults.
+        |w| {
+            let len = w.rw_mut().len();
+            let seeds: Vec<&Seed> = seeds
+                .iter()
+                .filter(|s| {
+                    (s.offset as usize)
+                        .checked_add(s.bytes.len())
+                        .is_some_and(|end| end <= len)
+                })
+                .collect();
+            let rw = w.rw_mut();
+            for s in &seeds {
+                let off = s.offset as usize;
+                rw[off..off + s.bytes.len()].copy_from_slice(&s.bytes);
             }
             if let Some(a) = durable {
                 init_durable_words(rw, a);
+            }
+            for s in seeds.iter().filter(|s| s.readonly) {
+                w.protect_ro(s.offset, s.bytes.len() as u64);
             }
         },
         // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the child
@@ -1986,6 +1998,14 @@ unsafe fn spawn_detached_child(
             EINVAL as i32
         }
     }
+}
+
+/// One run of bytes a detached child's fresh window starts with: a data segment, or the args
+/// payload.
+struct Seed {
+    offset: u64,
+    bytes: Vec<u8>,
+    readonly: bool,
 }
 
 /// A fresh durable window's control words, as `temen_durable::init_durable_window` writes them: the
@@ -2219,12 +2239,20 @@ pub(crate) unsafe extern "C" fn instantiate_detached(
         temen_ir::child_entry_handles(arity, gc.inst_handle, gc.as_handle).collect();
     let n_results = child_funcs[entry as usize].results.len();
     // The window image: the module's data segments, then the payload at the args base.
-    let mut seeds: Vec<(u64, Vec<u8>)> = child_data
+    let mut seeds: Vec<Seed> = child_data
         .iter()
-        .map(|d| (d.offset, d.bytes.clone()))
+        .map(|d| Seed {
+            offset: d.offset,
+            bytes: d.bytes.clone(),
+            readonly: d.readonly,
+        })
         .collect();
     if !payload.is_empty() {
-        seeds.push((temen_ir::module_args_base(), payload));
+        seeds.push(Seed {
+            offset: temen_ir::module_args_base(),
+            bytes: payload,
+            readonly: false,
+        });
     }
     spawn_detached_child(
         rt,

@@ -146,6 +146,7 @@ fn dispatch_loop_module() -> Module {
         data_exports: vec![],
         data_ptrs: vec![],
         data_funcrefs: vec![],
+        tls: Vec::new(),
         impl_exports: vec![],
         types: vec![TypeEntry::Func(hty)], // #922: the call.dyn handler sig, index 0
         debug_info: None,

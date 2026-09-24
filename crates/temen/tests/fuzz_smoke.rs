@@ -140,6 +140,7 @@ block 0 () { v0 = i64.const 7
         ir::DataPtr {
             at: 0,
             target: ir::DataPtrTarget::SelfOff(8),
+            tls: false,
         },
         ir::DataPtr {
             at: 8,
@@ -147,11 +148,13 @@ block 0 () { v0 = i64.const 7
                 name: "g".into(),
                 addend: -2,
             },
+            tls: false,
         },
     ];
     u.data_exports = vec![ir::DataExport {
         name: "h".into(),
         offset: 4,
+        tls: false,
     }];
     u.funcs.push(ir::Func {
         params: vec![],
@@ -159,10 +162,14 @@ block 0 () { v0 = i64.const 7
         blocks: vec![ir::Block {
             params: vec![],
             insts: vec![
-                ir::Inst::DataSelf { offset: 8 },
+                ir::Inst::DataSelf {
+                    offset: 8,
+                    tls: false,
+                },
                 ir::Inst::DataSym {
                     name: b"g".to_vec(),
                     addend: 3,
+                    tls: false,
                 },
                 ir::Inst::DataTop,
             ],

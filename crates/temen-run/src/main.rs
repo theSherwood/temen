@@ -437,11 +437,7 @@ fn run_link(files: &[String], out_path: Option<String>, emit_text: bool) -> Resu
     for f in files {
         let m = load_unit(Path::new(f))?;
         let exports = m.exports.iter().map(|e| (e.name.clone(), e.func)).collect();
-        let data_exports = m
-            .data_exports
-            .iter()
-            .map(|e| (e.name.clone(), e.offset))
-            .collect();
+        let data_exports = m.data_exports.clone();
         units.push(temen_ir::LinkUnit {
             module: m,
             exports,

@@ -2192,17 +2192,28 @@ pub enum Inst {
     /// `CallSym`'s `args` — and never pulls in the concrete `alloc` `String::clone`, keeping every
     /// `Inst`-manipulating crate (e.g. `temen-peval`) translatable by the strict LLVM on-ramp (the
     /// data-oriented IR invariant that keeps the partial evaluator self-hostable).
+    ///
+    /// With `tls` the symbol is a **thread-local** export (#1715) and the result is its offset within
+    /// the program's per-thread block (see [`Module::tls`]), not a window address: code adds it to the
+    /// running thread's block address. Resolving a `tls` reference to a plain data export, or the
+    /// reverse, fails the link ([`LinkError::TlsMismatch`]).
     DataSym {
         name: alloc::vec::Vec<u8>,
         addend: i64,
+        tls: bool,
     },
     /// A **link-form own-data address**: this unit's assigned data base plus `offset` (a unit-local
     /// data offset), materialized as a value — the self-relative counterpart of [`Inst::DataSym`],
     /// for a reference to the unit's *own* global whose final window placement the frontend did not
     /// know at emit time (it is the linker that assigns each unit's data region). [`link`] rewrites
     /// it to [`Inst::ConstI64`]; surviving into a runnable module is a verify error. Result is `i64`.
+    ///
+    /// With `tls`, `offset` is within the unit's thread-local template ([`Module::tls`]) and the
+    /// result is that byte's offset within the program's per-thread block (#1715) — the unit's
+    /// template base in the merged block plus `offset` — not a window address.
     DataSelf {
         offset: u64,
+        tls: bool,
     },
     /// A **link-form data-stack base**: the address just above *all* of the linked program's data
     /// (the post-link top-of-data, [`powerbox_entry_sp`]-aligned), materialized as a value. A
@@ -3925,6 +3936,17 @@ pub struct Module {
     /// twin of [`data_ptrs`](Module::data_ptrs): `ref.func` rides the instruction stream, but a
     /// funcref stored in static data has no instruction to carry it. Empty for a runnable module.
     pub data_funcrefs: Vec<DataFuncref>,
+    /// The unit's **thread-local template** (#1715, D-LINK): the initial bytes of its thread-local
+    /// variables (C `_Thread_local`), as segments at offsets within the unit's own per-thread block
+    /// rather than the window. Every thread gets a private copy of the block; a TLS variable is
+    /// addressed as `thread block + offset` through [`Inst::DataSelf`]/[`Inst::DataSym`] with
+    /// `tls: true`. [`link`] stacks every unit's template into one per-program template, places it
+    /// in the window (a read-only pristine image plus the root thread's writable block, published as
+    /// the data symbols [`TLS_IMAGE_SYM`], [`TLS_END_SYM`] and [`TLS_ROOT_SYM`]), and clears this
+    /// list. A frontend covers the whole block, zero bytes included — a gap between segments or
+    /// after the last one is not part of the block. Empty for a runnable module (a survivor is a
+    /// verify error: nothing places it).
+    pub tls: Vec<Data>,
     /// Provider-side interface **offers** (IMPORTS.md §3.2): interfaces this module implements,
     /// one function per op ([`ImplExport`]). Declaring one confers nothing — the host wires an
     /// offer into an importer's slot, checking signatures structurally, fail-closed. Names share
@@ -4085,6 +4107,26 @@ pub struct DebugInfo {
     /// (installed §22 units have no source). Empty ⇒ no names — consumers fall back to the
     /// synthesized `fn{N}`. Frontend-emitted under `-g`; strippable / untrusted-for-escape (§2a).
     pub func_names: Vec<FuncName>,
+    /// The window address of the **root thread's thread-local block** (#1715) — where a
+    /// [`VarLoc::Tls`] variable lives for a thread whose `vcpu.tls` word is still 0. Set by [`link`]
+    /// (the [`TLS_ROOT_SYM`] address it placed) or by a whole-program frontend that laid the block out
+    /// itself; `None` for a module with no thread-locals. See [`DebugInfo::tls_addr`].
+    pub tls_root: Option<u64>,
+}
+
+impl DebugInfo {
+    /// The window address of byte `off` of a thread's thread-local block ([`VarLoc::Tls`], #1715),
+    /// given that thread's `vcpu.tls` word: the word itself once the thread has installed its block,
+    /// or [`tls_root`](DebugInfo::tls_root) while it is 0 (the root thread). `None` for word 0 in a
+    /// module with no root block.
+    pub fn tls_addr(&self, word: i64, off: u64) -> Option<u64> {
+        let block = if word != 0 {
+            word as u64
+        } else {
+            self.tls_root?
+        };
+        Some(block.wrapping_add(off))
+    }
 }
 
 /// One source function name (DEBUGGING.md §6): the symbolic `name` of function index `func`.
@@ -4238,6 +4280,13 @@ pub enum VarLoc {
     /// `[`GLOBAL_SCOPE`] so it is visible in every frame. (Unlike [`Window`], which is `data-SP +
     /// off`, this is an absolute address — globals live low in the window, below the data stack.)
     Fixed { addr: u64 },
+    /// A **thread-local** variable (C `_Thread_local`, #1715): byte `off` of the program's per-thread
+    /// block, so each thread reads its own copy — `read = window[tls_addr(thread's vcpu.tls word, off)
+    /// ..]` ([`DebugInfo::tls_addr`]). Paired with `func == `[`GLOBAL_SCOPE`] like [`Fixed`]. In an
+    /// object unit `off` is within the unit's own template; [`link`] rebases it into the merged block.
+    ///
+    /// [`Fixed`]: VarLoc::Fixed
+    Tls { off: u64 },
 }
 
 /// The sentinel [`VarInfo::func`] of a **module-scoped global** (no owning function): it resolves in
@@ -4319,7 +4368,23 @@ pub struct Export {
 pub struct DataExport {
     pub name: String,
     pub offset: u64,
+    /// A **thread-local** symbol (#1715): `offset` is within the unit's thread-local template
+    /// ([`Module::tls`]), and a reference resolves to an offset within the per-thread block. A linked
+    /// module carries no thread-local exports (a thread-local has no one window address).
+    pub tls: bool,
 }
+
+/// The data symbol [`link`] defines as the window address of the program's **pristine thread-local
+/// image** (#1715): the merged [`Module::tls`] templates, read-only. A new thread's block is a copy
+/// of `[TLS_IMAGE_SYM, TLS_END_SYM)`.
+pub const TLS_IMAGE_SYM: &str = "__tls_image";
+/// The data symbol [`link`] defines as the end of the pristine thread-local image; the per-thread
+/// block size is `TLS_END_SYM - TLS_IMAGE_SYM` (0 for a program with no thread-locals).
+pub const TLS_END_SYM: &str = "__tls_end";
+/// The data symbol [`link`] defines as the window address of the **root thread's** writable
+/// thread-local block (#1715), initialized like the pristine image. The root vCPU's `vcpu.tls` word
+/// is seeded to 0, so thread-local access uses this block when the word is 0.
+pub const TLS_ROOT_SYM: &str = "__tls_root";
 
 /// A **data-image pointer relocation** ([`Module::data_ptrs`], D-LINK): write the 8-byte
 /// little-endian window address of `target` into this unit's data image at byte offset `at`. Models
@@ -4331,8 +4396,11 @@ pub struct DataExport {
 /// Pointers are 8 bytes because window addresses are `i64` (the width `DataSym`/`DataSelf` yield).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DataPtr {
-    /// Byte offset within this unit's (un-relocated) data image where the 8-byte pointer sits.
+    /// Byte offset within this unit's (un-relocated) data image where the 8-byte pointer sits —
+    /// within its thread-local template ([`Module::tls`]) when `tls` (a `_Thread_local` whose
+    /// initializer holds an address, #1715).
     pub at: u64,
+    pub tls: bool,
     /// The data address the pointer resolves to, once the linker has placed the units' data.
     pub target: DataPtrTarget,
 }
@@ -4700,8 +4768,9 @@ pub struct LinkUnit {
     pub module: Module,
     /// Function symbols this unit provides: `name → local function index`.
     pub exports: Vec<(String, FuncIdx)>,
-    /// Data symbols this unit provides: `name → byte offset within the unit's (un-relocated) data`.
-    pub data_exports: Vec<(String, u64)>,
+    /// Data symbols this unit provides: a name and a byte offset within the unit's (un-relocated)
+    /// data — or, for a thread-local ([`DataExport::tls`]), within its thread-local template.
+    pub data_exports: Vec<DataExport>,
 }
 
 /// Why [`link`] failed (fail-closed; the linked module is also re-verified before it runs).
@@ -4726,6 +4795,9 @@ pub enum LinkError {
     /// An `import.attach` targeted an import whose name resolved to an exported **function** —
     /// a statically-linked call has no slot to rebind (the unit meant a runtime-bound name).
     AttachResolved(String),
+    /// A thread-local reference named a plain data export, or a plain data reference named a
+    /// thread-local export (#1715) — the units disagree on whether the variable is `_Thread_local`.
+    TlsMismatch(String),
 }
 
 /// **Statically link** units into one module — the compile-time loader (dynamic-linking milestones
@@ -4770,7 +4842,7 @@ pub struct LinkUnitRef<'a> {
     /// See [`LinkUnit::exports`].
     pub exports: &'a [(String, FuncIdx)],
     /// See [`LinkUnit::data_exports`].
-    pub data_exports: &'a [(String, u64)],
+    pub data_exports: &'a [DataExport],
 }
 
 impl<'a> From<&'a LinkUnit> for LinkUnitRef<'a> {
@@ -4823,10 +4895,41 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
             .unwrap_or(0);
         dtotal = dbase + span;
     }
+    // Thread-local layout (#1715): each unit's template ([`Module::tls`]) takes `[tbase, tbase +
+    // span)` of the one per-thread block, 16-byte aligned so every unit keeps its own alignment.
+    // The merged template is placed twice above all unit data, each copy on its own host pages (the
+    // same page rule as a unit's `dbase`): a read-only pristine image a new thread's block is copied
+    // from, then the root thread's writable block. With no thread-locals nothing is placed, and the
+    // three symbols name the (empty) range at the data top.
+    let tls_bases: Vec<u64> = units
+        .iter()
+        .scan(0u64, |acc, u| {
+            let base = (*acc + 15) & !15;
+            *acc = base + tls_span(u.module);
+            Some(base)
+        })
+        .collect();
+    let tls_size = units
+        .iter()
+        .zip(&tls_bases)
+        .map(|(u, b)| b + tls_span(u.module))
+        .max()
+        .unwrap_or(0);
+    let (tls_image, tls_root) = if tls_size == 0 {
+        (dtotal, dtotal)
+    } else {
+        let image = page_align(dtotal);
+        let root = page_align(image + tls_size);
+        dtotal = root + tls_size;
+        (image, root)
+    };
     // Symbol tables: exported name → global function index, and exported data name → window address.
     let mut funcs_tab: alloc::collections::BTreeMap<String, FuncIdx> =
         alloc::collections::BTreeMap::new();
     let mut data_tab: alloc::collections::BTreeMap<String, u64> =
+        alloc::collections::BTreeMap::new();
+    // Exported thread-local name → offset within the per-thread block (#1715).
+    let mut tls_tab: alloc::collections::BTreeMap<String, u64> =
         alloc::collections::BTreeMap::new();
     // The merged module's first-class export table — every unit's function exports, in declaration
     // order (deterministic, unlike a by-name map walk), at their reindexed global funcidxs.
@@ -4834,7 +4937,9 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
     // The merged module's first-class data-export table — every unit's data exports at their
     // reindexed (base-added) window offsets, in declaration order. Symmetric with `exports`.
     let mut data_exports: Vec<DataExport> = Vec::new();
-    for (u, (&fbase, &dbase)) in units.iter().zip(fbases.iter().zip(&dbases)) {
+    for ((u, (&fbase, &dbase)), &tbase) in
+        units.iter().zip(fbases.iter().zip(&dbases)).zip(&tls_bases)
+    {
         for (name, local) in u.exports {
             if *local as usize >= u.module.funcs.len() {
                 return Err(LinkError::BadExport {
@@ -4844,6 +4949,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
             }
             if funcs_tab.insert(name.clone(), fbase + local).is_some()
                 || data_tab.contains_key(name)
+                || tls_tab.contains_key(name)
             {
                 return Err(LinkError::DuplicateSymbol(name.clone()));
             }
@@ -4852,16 +4958,42 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
                 func: fbase + local,
             });
         }
-        for (name, local_off) in u.data_exports {
-            let addr = dbase + local_off;
-            if data_tab.insert(name.clone(), addr).is_some() || funcs_tab.contains_key(name) {
-                return Err(LinkError::DuplicateSymbol(name.clone()));
+        for e in u.data_exports {
+            let (tab, addr) = if e.tls {
+                (&mut tls_tab, tbase + e.offset)
+            } else {
+                (&mut data_tab, dbase + e.offset)
+            };
+            if tab.insert(e.name.clone(), addr).is_some() {
+                return Err(LinkError::DuplicateSymbol(e.name.clone()));
             }
-            data_exports.push(DataExport {
-                name: name.clone(),
-                offset: addr,
-            });
+            // A thread-local has no one window address, so only plain data joins the merged table.
+            if !e.tls {
+                data_exports.push(DataExport {
+                    name: e.name.clone(),
+                    offset: addr,
+                    tls: false,
+                });
+            }
         }
+    }
+    for (name, addr) in [
+        (TLS_IMAGE_SYM, tls_image),
+        (TLS_END_SYM, tls_image + tls_size),
+        (TLS_ROOT_SYM, tls_root),
+    ] {
+        if data_tab.insert(name.into(), addr).is_some() {
+            return Err(LinkError::DuplicateSymbol(name.into()));
+        }
+    }
+    // One namespace across functions, data and thread-locals.
+    if let Some(name) = data_tab
+        .keys()
+        .chain(tls_tab.keys())
+        .find(|n| funcs_tab.contains_key(*n))
+        .or_else(|| tls_tab.keys().find(|n| data_tab.contains_key(*n)))
+    {
+        return Err(LinkError::DuplicateSymbol(name.clone()));
     }
     // Per-unit type-section bases (prefix sums), so instruction-level type references
     // (`call.import` dynamic mode, `self.type_id`/`covers`) reindex alongside funcidxs.
@@ -4940,10 +5072,11 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
     let mut has_data_top = false;
     let mut funcs: Vec<Func> = Vec::with_capacity(ftotal as usize);
     let mut data: Vec<Data> = Vec::new();
-    for ((u, ((&fbase, &dbase), &tbase)), disp) in units
+    for (((u, ((&fbase, &dbase), &tbase)), disp), &tls_base) in units
         .iter()
         .zip(fbases.iter().zip(&dbases).zip(&tbases))
         .zip(&disps)
+        .zip(&tls_bases)
     {
         let mut m = u.module.clone();
         offset_type_indices(&mut m, tbase);
@@ -4952,7 +5085,7 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // resolved absolute window address. Must precede the segment shift below so `at` and the
         // covering segment share one coordinate frame; the address written is already absolute
         // (`dbase`-relative for `self`, the symbol's window address for `sym`).
-        apply_unit_data_ptrs(&mut m, dbase, &data_tab)?;
+        apply_unit_data_ptrs(&mut m, dbase, &data_tab, &tls_tab)?;
         // Patch this unit's data-image funcrefs (`data.funcref`, the data→code case): overwrite the
         // 4 placeholder bytes at each slot with the resolved merged funcidx. Like `data.ptr`, this
         // runs while segment offsets are still unit-local (`at` and its covering segment share a
@@ -4963,11 +5096,26 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         for d in &mut m.data {
             d.offset += dbase;
         }
+        // …and its thread-local template into both copies of the merged block (#1715).
+        for t in core::mem::take(&mut m.tls) {
+            let at = tls_base + t.offset;
+            m.data.push(Data {
+                offset: tls_root + at,
+                readonly: false,
+                bytes: t.bytes.clone(),
+            });
+            m.data.push(Data {
+                offset: tls_image + at,
+                readonly: true,
+                bytes: t.bytes,
+            });
+        }
         // …and rewrite its link-form data addresses to concrete `ConstI64`s, now that the window
         // layout is fixed: `data.self <off>` → `dbase + off` (own data), `data.sym "name" +addend`
         // → `addr(name) + addend` (a cross-unit symbol, fail-closed if unexported). This is the
         // data twin of the `call.sym → call` rewrite below — a 1:1, position-independent edit.
-        has_data_top |= resolve_unit_data_addrs(&mut m, dbase, entry_sp, &data_tab)?;
+        has_data_top |=
+            resolve_unit_data_addrs(&mut m, dbase, tls_base, entry_sp, &data_tab, &tls_tab)?;
         offset_func_indices(&mut m, fbase);
         rewrite_unit_imports(&mut m, disp)?;
         funcs.extend(m.funcs);
@@ -5055,12 +5203,20 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
         // module is runnable and carries none.
         data_ptrs: Vec::new(),
         data_funcrefs: Vec::new(),
+        // Every unit's template was placed in the window above; the merged image is plain data.
+        tls: Vec::new(),
         // Interfaces + impl exports (offers, §3.2) merge across units below — see
         // `merge_impl_surfaces`; a link unit's own module may carry both.
         impl_exports: merged_impls,
         types: merged_types,
         // Per-unit debug info merges like every other index space (#1392): see `merge_debug_info`.
-        debug_info: merge_debug_info(units, &fbases, &dbases),
+        debug_info: merge_debug_info(
+            units,
+            &fbases,
+            &dbases,
+            &tls_bases,
+            (tls_size > 0).then_some(tls_root),
+        ),
     })
 }
 
@@ -5075,7 +5231,9 @@ fn link_impl(units: &[LinkUnitRef<'_>], retain: bool) -> Result<Module, LinkErro
 ///   [`TypeDef::Array::elem`], [`Field::ty`]) shift with them. Identical file paths in two units stay
 ///   two entries — consumers key on the string, and deduping would buy nothing but a map.
 /// * a global's absolute [`VarLoc::Fixed`] window address shifts by the unit's `dbase`, exactly as its
-///   data segments did. Every other [`VarLoc`] is **frame**-relative (`Window` is `data-SP + off`) or
+///   data segments did, and a thread-local's [`VarLoc::Tls`] offset by the unit's base in the merged
+///   per-thread block; [`DebugInfo::tls_root`] is the root block the linker placed (#1715). Every
+///   other [`VarLoc`] is **frame**-relative (`Window` is `data-SP + off`) or
 ///   value-indexed (`Ssa`/`SsaList`/`WindowVia`), so it survives relocation unchanged.
 ///
 /// `None` when the merged tables would be empty — no unit carried debug info, or each carried only a
@@ -5088,9 +5246,14 @@ fn merge_debug_info(
     units: &[LinkUnitRef<'_>],
     fbases: &[u32],
     dbases: &[u64],
+    tls_bases: &[u64],
+    tls_root: Option<u64>,
 ) -> Option<DebugInfo> {
-    let mut out = DebugInfo::default();
-    for ((u, &fbase), &dbase) in units.iter().zip(fbases).zip(dbases) {
+    let mut out = DebugInfo {
+        tls_root,
+        ..DebugInfo::default()
+    };
+    for (((u, &fbase), &dbase), &tls_base) in units.iter().zip(fbases).zip(dbases).zip(tls_bases) {
         let Some(di) = &u.module.debug_info else {
             continue;
         };
@@ -5113,6 +5276,9 @@ fn merge_debug_info(
             type_id: v.type_id.map(|t| t + type_base),
             loc: match &v.loc {
                 VarLoc::Fixed { addr } => VarLoc::Fixed { addr: addr + dbase },
+                VarLoc::Tls { off } => VarLoc::Tls {
+                    off: off + tls_base,
+                },
                 other => other.clone(),
             },
             ..v.clone()
@@ -5270,28 +5436,31 @@ fn rewrite_unit_imports(m: &mut Module, disps: &[ImportDisp]) -> Result<(), Link
 fn resolve_unit_data_addrs(
     m: &mut Module,
     dbase: u64,
+    tls_base: u64,
     entry_sp: u64,
     data_tab: &alloc::collections::BTreeMap<String, u64>,
+    tls_tab: &alloc::collections::BTreeMap<String, u64>,
 ) -> Result<bool, LinkError> {
     let mut saw_data_top = false;
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 let addr = match inst {
-                    Inst::DataSelf { offset } => dbase.wrapping_add(*offset),
+                    Inst::DataSelf { offset, tls } => {
+                        let base = if *tls { tls_base } else { dbase };
+                        base.wrapping_add(*offset)
+                    }
                     Inst::DataTop => {
                         saw_data_top = true;
                         entry_sp
                     }
-                    Inst::DataSym { name, addend } => {
+                    Inst::DataSym { name, addend, tls } => {
                         // The name is stored as raw bytes (Copy-clone friendly); resolve it against
                         // the string-keyed symbol table. Non-UTF-8 or unexported ⇒ fail closed.
                         let key = core::str::from_utf8(name).map_err(|_| {
                             LinkError::Unresolved(String::from_utf8_lossy(name).into_owned())
                         })?;
-                        let base = *data_tab
-                            .get(key)
-                            .ok_or_else(|| LinkError::Unresolved(key.to_string()))?;
+                        let base = lookup_data_sym(key, *tls, data_tab, tls_tab)?;
                         base.wrapping_add(*addend as u64)
                     }
                     _ => continue,
@@ -5316,14 +5485,13 @@ fn apply_unit_data_ptrs(
     m: &mut Module,
     dbase: u64,
     data_tab: &alloc::collections::BTreeMap<String, u64>,
+    tls_tab: &alloc::collections::BTreeMap<String, u64>,
 ) -> Result<(), LinkError> {
     for p in &m.data_ptrs {
         let addr: u64 = match &p.target {
             DataPtrTarget::SelfOff(off) => dbase.wrapping_add(*off),
             DataPtrTarget::Sym { name, addend } => {
-                let base = *data_tab
-                    .get(name.as_str())
-                    .ok_or_else(|| LinkError::Unresolved(name.clone()))?;
+                let base = lookup_data_sym(name, false, data_tab, tls_tab)?;
                 base.wrapping_add(*addend as u64)
             }
         };
@@ -5332,7 +5500,9 @@ fn apply_unit_data_ptrs(
         let end =
             p.at.checked_add(8)
                 .ok_or(LinkError::BadDataPtr { at: p.at })?;
-        let seg = m.data.iter_mut().find(|d| {
+        // A thread-local's initializer lives in the unit's template, not its data (#1715).
+        let segs = if p.tls { &mut m.tls } else { &mut m.data };
+        let seg = segs.iter_mut().find(|d| {
             d.offset <= p.at
                 && d.offset
                     .checked_add(d.bytes.len() as u64)
@@ -5344,6 +5514,37 @@ fn apply_unit_data_ptrs(
     }
     m.data_ptrs.clear();
     Ok(())
+}
+
+/// Resolve an exported data symbol for a link-form reference: a window address from `data_tab`, or
+/// for a thread-local reference (`tls`) a per-thread block offset from `tls_tab` (#1715). A name
+/// exported only in the other table is [`LinkError::TlsMismatch`]; one in neither is
+/// [`LinkError::Unresolved`].
+fn lookup_data_sym(
+    name: &str,
+    tls: bool,
+    data_tab: &alloc::collections::BTreeMap<String, u64>,
+    tls_tab: &alloc::collections::BTreeMap<String, u64>,
+) -> Result<u64, LinkError> {
+    let (tab, other) = if tls {
+        (tls_tab, data_tab)
+    } else {
+        (data_tab, tls_tab)
+    };
+    match tab.get(name) {
+        Some(&v) => Ok(v),
+        None if other.contains_key(name) => Err(LinkError::TlsMismatch(name.into())),
+        None => Err(LinkError::Unresolved(name.into())),
+    }
+}
+
+/// The byte span of a unit's thread-local template ([`Module::tls`]): the end of its last segment.
+fn tls_span(m: &Module) -> u64 {
+    m.tls
+        .iter()
+        .map(|d| d.offset.saturating_add(d.bytes.len() as u64))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Apply a unit's **data-image funcref relocations** ([`Module::data_funcrefs`], the data→code
@@ -5889,6 +6090,7 @@ mod import_tests {
         let mut m = Module {
             data_ptrs: Vec::new(),
             data_funcrefs: Vec::new(),
+            tls: Vec::new(),
             types: vec![],
             funcs: vec![Func {
                 params: vec![ValType::I32],
@@ -5994,6 +6196,7 @@ mod link_layout_tests {
             module: Module {
                 data_ptrs: Vec::new(),
                 data_funcrefs: Vec::new(),
+                tls: Vec::new(),
                 types: vec![],
                 funcs: vec![],
                 memory: Some(Memory {
@@ -6097,6 +6300,7 @@ mod link_layout_tests {
             module: Module {
                 data_ptrs: Vec::new(),
                 data_funcrefs: Vec::new(),
+                tls: Vec::new(),
                 types: vec![],
                 funcs: vec![Func {
                     params: vec![],

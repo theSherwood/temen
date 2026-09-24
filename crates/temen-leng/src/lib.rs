@@ -742,11 +742,7 @@ fn link_selected_with_extra(
             .iter()
             .map(|e| (e.name.clone(), e.func))
             .collect();
-        let data_exports = module
-            .data_exports
-            .iter()
-            .map(|e| (e.name.clone(), e.offset))
-            .collect();
+        let data_exports = module.data_exports.clone();
         link_units.push(temen_ir::LinkUnit {
             module,
             exports,

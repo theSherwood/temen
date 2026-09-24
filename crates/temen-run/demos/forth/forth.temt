@@ -1153,7 +1153,7 @@ block 0 (ni: i64, no: i64) {
   blp = i64.const 65736
   z = i64.const 0
   i64.store blp z
-  ; "TEMEN\0\0\0" kind=0 version=11 flags=0
+  ; "TEMEN\0\0\0" kind=0 version=12 flags=0
   c84 = i64.const 84
   call 30 (c84)
   c69 = i64.const 69
@@ -1168,8 +1168,8 @@ block 0 (ni: i64, no: i64) {
   call 30 (z)
   call 30 (z)
   call 30 (z)
-  eleven = i64.const 11
-  call 30 (eleven)
+  twelve = i64.const 12
+  call 30 (twelve)
   call 30 (z)
   call 30 (z)
   call 30 (z)

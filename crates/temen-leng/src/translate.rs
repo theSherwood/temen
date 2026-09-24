@@ -1080,6 +1080,7 @@ impl Translator {
             .map(|(name, (off, _))| temen_ir::DataExport {
                 name: format!("{name}{stem}"),
                 offset: *off,
+                tls: false,
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name)); // deterministic order
@@ -1146,6 +1147,7 @@ impl Translator {
                             data.push(temen_ir::DataExport {
                                 name: cname,
                                 offset: *off,
+                                tls: false,
                             });
                         }
                     }

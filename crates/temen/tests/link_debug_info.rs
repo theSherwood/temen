@@ -19,7 +19,11 @@ fn unit(src: &str, exports: &[(&str, u32)], data_exports: &[(&str, u64)]) -> Lin
         exports: exports.iter().map(|(n, i)| (n.to_string(), *i)).collect(),
         data_exports: data_exports
             .iter()
-            .map(|(n, o)| (n.to_string(), *o))
+            .map(|(n, o)| temen_ir::DataExport {
+                name: n.to_string(),
+                offset: *o,
+                tls: false,
+            })
             .collect(),
     }
 }
