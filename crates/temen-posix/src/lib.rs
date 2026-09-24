@@ -1281,9 +1281,16 @@ struct Proc {
     /// beside the wake/stop/kill doors): `waitpid` fires it with `ParkEvent::TaskExit(child)` to
     /// ask that the calling vCPU be benched until the child exits, then returns the `-ECHILD`
     /// placeholder (which doubles as the degraded poll answer on any route that cannot park).
-    /// `None` (a driver without the door — the bytecode engine, the JIT, a bare unit `Ctx`)
-    /// keeps today's poll everywhere — same degradation family as `stop`/`kill`.
+    /// `None` (a driver without the door — a bare unit `Ctx`, an engine that serves no caller
+    /// requests) keeps today's poll everywhere — same degradation family as `stop`/`kill`.
     park_req: Option<Arc<dyn Fn(temen_interp::ParkEvent) + Send + Sync>>,
+    /// #1768 — an `execve` **staged, not yet committed**: the args blob the new image reads at
+    /// `module_args_base` and the argv [`OP_ARGC`]/[`OP_ARGV`] will answer. The op only stages them
+    /// and requests the image-replace; the engine collects them through
+    /// [`SignalDoor::exec_commit`] when it commits. A refused exec never reaches the commit, so the
+    /// caller's args region and argv are exactly as they were (POSIX: a failed `execve` leaves the
+    /// calling image unchanged). The next `execve` replaces a stale entry.
+    pending_exec: Option<(Vec<u8>, Vec<String>)>,
     /// #799 — this process's pid **is a core scheduler `TaskId`** (a fork twin registered by the
     /// factory with the core-minted pid) — exactly the processes whose exit the core's
     /// twin-completion wake covers, so exactly the ones a blocking `waitpid` may bench on.
@@ -2036,6 +2043,15 @@ impl SignalSource for SignalDoor {
         self.0.lock().unwrap_or_else(|e| e.into_inner()).park_req = Some(req);
     }
 
+    /// #1768 — the engine is committing this process's staged `execve`: replace the argv and hand
+    /// over the args blob for the new image's args region. See [`Proc::pending_exec`].
+    fn exec_commit(&self) -> Option<Vec<u8>> {
+        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (blob, argv) = p.pending_exec.take()?;
+        p.args = argv;
+        Some(blob)
+    }
+
     /// #796 `SA_RESTART` — answer the park sites: does the delivery behind the just-consumed
     /// interrupt want the blocking call restarted?
     fn syscall_restart(&self) -> bool {
@@ -2574,6 +2590,7 @@ fn new_proc(heap_base: u64, heap_end: u64) -> Proc {
         handler_mask_stack: Vec::new(),
         restart_ok: false,
         park_req: None,
+        pending_exec: None,
         core_task: false,
         term_in: None,
     }
@@ -3002,6 +3019,7 @@ impl Proc {
             handler_mask_stack: self.handler_mask_stack.clone(), // forked mid-handler: the twin restores on its inherited return (POSIX fork copies signal state)
             restart_ok: self.restart_ok,
             park_req: None, // the twin's own door lands at mint, like the wake/stop/kill
+            pending_exec: None,
             core_task: false, // stamped by [`fork_factory`] beside the pid
             // #797 — the twin's own terminal token: same handle value (the twin's cloned
             // powerbox table keeps it valid), its own cell (an exec re-points per-process).
@@ -5080,6 +5098,12 @@ impl Ctx<'_> {
     /// path and a command too big for this window — are both checked *above* the write.
     fn execve(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
+        // #1768 — no engine to serve the image-replace (no caller-request door): refuse up front,
+        // before anything is resolved, staged or written. POSIX: a failed `execve` returns to an
+        // unchanged caller.
+        let Some(req) = self.p.park_req.clone() else {
+            return Ok(vec![ENOSYS]);
+        };
         let path_ptr = *args.first().ok_or(Trap::Malformed)? as u64;
         let argv_ptr = *args.get(1).ok_or(Trap::Malformed)? as u64;
         let envp_ptr = *args.get(2).ok_or(Trap::Malformed)? as u64;
@@ -5119,9 +5143,6 @@ impl Ctx<'_> {
         if base + blob.len() as u64 > temen_ir::module_args_end() {
             return Ok(vec![E2BIG]);
         }
-        if mem.write_bytes(base, &blob).is_none() {
-            return Ok(vec![EFAULT]);
-        }
         // POSIX: `execve` **replaces the argument vector**. The packed blob above is what a C crt
         // reads, but the personality keeps its own vector too — what [`OP_ARGC`]/[`OP_ARGV`]
         // answer — and leaving it alone means the new image is told the *previous* program's
@@ -5137,13 +5158,16 @@ impl Ctx<'_> {
         // The **environment is not** replaced, matching this personality's established exec
         // semantics (`c_execve_runs_a_px_linked_command` pins env crossing an `envp = NULL` exec):
         // the env is process state the image-replace carries, like the fd table and the cwd.
-        self.p.args = argv
+        //
+        // #1768 — both are STAGED, not applied: the engine collects them when it commits the
+        // image-replace ([`SignalDoor::exec_commit`]), so an exec the engine refuses leaves the
+        // caller's args region and argv exactly as they were.
+        let argv = argv
             .iter()
             .map(|a| String::from_utf8_lossy(a).into_owned())
             .collect();
-        if let Some(req) = self.p.park_req.clone() {
-            req(temen_interp::ParkEvent::ExecSelf { cmd });
-        }
+        self.p.pending_exec = Some((blob, argv));
+        req(temen_interp::ParkEvent::ExecSelf { cmd });
         Ok(vec![ENOSYS])
     }
 
@@ -6965,6 +6989,77 @@ block 0 (vph: i32) {\n\
             "write to a closed fd 1 is EBADF"
         );
         assert_eq!(st.close(&[1]), EBADF, "double close is EBADF");
+    }
+
+    /// #1768 — `execve` changes nothing the exec replaces until an engine COMMITS the image-replace.
+    /// With no caller-request door (no engine to serve it) it is `-ENOSYS` before anything is resolved
+    /// or written. With a door it only stages: the request goes out, and the caller's args region and
+    /// argv stay as they were — an engine that then refuses returns to an untouched caller — until
+    /// [`SignalDoor::exec_commit`] hands the blob over and replaces the argv, once.
+    #[test]
+    fn execve_stages_its_argv_and_only_a_commit_applies_it() {
+        let mut host = Host::new();
+        let (_h, posix) = grant(&mut host, HEAP_BASE, HEAP_END, Vec::new());
+        posix.register_executable("/bin/c", 5, 16);
+        let args_base = temen_ir::module_args_base() as usize;
+        let mut win = vec![0u8; WIN];
+        win[100_000..100_007].copy_from_slice(b"/bin/c\0");
+        win[100_100..100_102].copy_from_slice(b"x\0");
+        win[100_200..100_208].copy_from_slice(&100_100u64.to_le_bytes()); // argv = ["x", NULL]
+        let call = [100_000, 100_200, 0];
+        let argv_before = posix.root.lock().unwrap().args.clone();
+
+        // No door: refused up front, nothing touched.
+        {
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), vec![ENOSYS]);
+        }
+        assert!(
+            win[args_base..args_base + 64].iter().all(|&b| b == 0),
+            "args region written"
+        );
+        assert_eq!(
+            posix.root.lock().unwrap().args,
+            argv_before,
+            "argv replaced"
+        );
+
+        // A door: the request goes out, and still nothing the exec replaces has changed.
+        let (door, _armed) = cap_signal_source(&posix);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&seen);
+        door.set_park_request(Arc::new(move |ev| rec.lock().unwrap().push(ev)));
+        {
+            ctx!(posix, w_g, p_g, st);
+            let mut mem = temen_interp::WindowMem::new(&mut win, WIN as u64);
+            assert_eq!(st.execve(&call, Some(&mut mem)).unwrap(), vec![ENOSYS]);
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![temen_interp::ParkEvent::ExecSelf { cmd: 5 }]
+        );
+        assert!(
+            win[args_base..args_base + 64].iter().all(|&b| b == 0),
+            "args region written"
+        );
+        assert_eq!(
+            posix.root.lock().unwrap().args,
+            argv_before,
+            "argv replaced"
+        );
+
+        // The commit: the blob for the new image's args region, and the argv, exactly once.
+        assert_eq!(
+            door.exec_commit(),
+            Some(temen_ir::write_args_blob(&[b"x"], &[]))
+        );
+        assert_eq!(posix.root.lock().unwrap().args, vec!["x".to_string()]);
+        assert_eq!(
+            door.exec_commit(),
+            None,
+            "a commit consumes the staged exec"
+        );
     }
 
     #[test]

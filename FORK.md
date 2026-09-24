@@ -853,3 +853,30 @@ capstone lands, `serve_qualifies` correctly folds fork for Cranelift — no dive
 runs on a reifiable tier. The first PR is item 2's foundation: a durable guest's live-offer `call.cap`
 that unwinds pre-result to a window-resident continuation instead of thread-blocking, pinned by a
 freeze/thaw round-trip that resumes past the call with an injected reply.
+### 9.4 `execve` on the JIT (#1768, 2026-09-24)
+
+Exec does **not** need §9.3: an image-replace never returns to its caller, so the caller's native
+stack is simply discarded — nothing has to be reified. The JIT serves it by **unwinding**:
+
+- `temen_run::jit_run` arms the single-threaded, non-serving root (`Host::arm_exec_replace`: the
+  caller-request door, plus a slot for the admitted image). After a personality op the cap thunk takes
+  the request; an `ExecSelf` is admitted and built by **`Host::exec_image`** — the one admission rule and
+  powerbox build all three engines use (the tree-walker's `build_exec_req` and the bytecode engine's
+  `exec_image_build` were two copies of it) — parked, and the run unwound with
+  `temen_jit::HOST_UNWIND_CODE` (the `Exit` mechanism, ending `JitOutcome::HostUnwound`). `jit_run` then
+  runs the parked image in a fresh run in a caller-sized window, under the same watchdog, down any chain
+  of execs. A refusal is `-EINVAL`, as on both interpreters.
+- **A failed `execve` returns to an unchanged caller** (POSIX). The personality used to write the new
+  args blob into the caller's window and replace its argv *before* raising the request, so an exec no
+  engine served (`-ENOSYS`) or the engine refused (`-EINVAL`) still clobbered both. It now **stages**
+  them, and the engine collects them at the commit (`SignalSource::exec_commit`) — the pattern the heap
+  re-base (`pending_exec_heap`) already followed. With no door at all it refuses before touching
+  anything.
+- `caller_request_parity.rs` runs its exec rows on all three engines, plus a row for the refusal only
+  the engine can make.
+
+Fork (and so a blocking wait, whose only children are fork twins) is still §9.3. One design point to add
+to it: compiled code bakes its host `ctx` in as a constant (`lower_cap_call`), so a twin cannot share
+its parent's code. The context should reach compiled code through a per-vCPU pointer (Wasmtime's
+`vmctx`) — which also lets exec'd images and a code cache reuse a compile.
+
