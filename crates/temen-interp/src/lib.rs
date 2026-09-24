@@ -21546,6 +21546,12 @@ impl Host {
         // guest that compiles code can spawn a confined copy of itself that can too — the Forth
         // `sandbox` word. Without them such a child `CapFault`s before defining anything. The grant
         // is what confers the authority; this list only lets the child's manifest *reach* it.
+        // `vm_region_create` (AddressSpace op 5): a child already holds its own `AddressSpace`, whose
+        // op 5 mints a fresh §13/§14 region (per-region anti-bomb cap, `MAX_MINTED_REGION`) — so a
+        // guest can already do this through a dynamic `call.cap`. Listing the name lets a child's
+        // *manifest* reach it: a separately-compiled runtime (JACL's, whose channels create regions)
+        // imports it as `Required`, and without this such a runtime fails closed at spawn even when
+        // the child never mints. Binds to the child's own `AddressSpace` (`first_of`), as `vm_map` does.
         // `stream_write`/`stream_read` are the *same two caps* as `write`/`read` — the frontend's raw
         // stream spelling (`__vm_stream_write`/`__vm_stream_read`), which `default_cap_resolver` maps
         // onto the identical `(type_id, op)` and handle. They are listed because this table is keyed by
@@ -21563,6 +21569,7 @@ impl Host {
             "vm_unmap",
             "vm_protect",
             "vm_page_size",
+            "vm_region_create",
             "vm_jit_compile",
             "vm_jit_compile_linked",
             "vm_jit_invoke2",

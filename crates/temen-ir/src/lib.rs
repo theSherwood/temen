@@ -3769,9 +3769,33 @@ pub fn powerbox_entry_sp(module: &Module) -> u64 {
 /// *values* already flowing through data or patched constants are the caller's to fix; synthesize
 /// before any [`Resolved::Slot`]-style patching.)
 pub fn synth_manifest_start(
+    module: Module,
+    entry: FuncIdx,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    synth_start(module, entry, seed_heap, false)
+}
+
+/// [`synth_manifest_start`] with the **§14 child-entry ABI** instead: `_start` takes the one `i64`
+/// starter capability an `instantiate_module` (Instantiator op 13) child receives, ignores it (the
+/// child reaches its capabilities through its re-granted, name-bound manifest), and returns an `i64`
+/// status the parent reads back through `join`: the entry's `i64` verbatim, an `i32` zero-extended,
+/// or `0` for an entry with no result. The same shape `temen-llvm`'s `TranslateOptions::child_entry`
+/// gives a translated `main`, for a module a frontend links itself — e.g. a separately-compiled
+/// runtime plus a program (`link_with_manifest`) that should run as a confined child.
+pub fn synth_manifest_child_start(
+    module: Module,
+    entry: FuncIdx,
+    seed_heap: bool,
+) -> Result<Module, String> {
+    synth_start(module, entry, seed_heap, true)
+}
+
+fn synth_start(
     mut module: Module,
     entry: FuncIdx,
     seed_heap: bool,
+    child: bool,
 ) -> Result<Module, String> {
     let ef = module.funcs.get(entry as usize).ok_or_else(|| {
         format!(
@@ -3791,6 +3815,12 @@ pub fn synth_manifest_start(
     if ef.results.len() > 1 {
         return Err(format!(
             "powerbox entry must return 0 or 1 value, got {:?}",
+            ef.results
+        ));
+    }
+    if child && !matches!(ef.results.as_slice(), [] | [ValType::I64] | [ValType::I32]) {
+        return Err(format!(
+            "a child entry's result must widen to the i64 status: got {:?}",
             ef.results
         ));
     }
@@ -3820,7 +3850,13 @@ pub fn synth_manifest_start(
     // prepended `_start` becomes function 0.
     offset_func_indices(&mut module, 1);
     let mut insts: Vec<Inst> = Vec::new();
-    let mut next: ValIdx = 0;
+    // A child `_start`'s one param (the ignored starter capability) is value 0.
+    let params = if child {
+        vec![ValType::I64]
+    } else {
+        Vec::new()
+    };
+    let mut next: ValIdx = params.len() as ValIdx;
     if let Some(hb) = heap_base {
         // #1094: the heap bump words live in the guard's scratch page at `guard + BRK`/`TOP`
         // (the whole page-0 scratch relocated up one NULL guard, as temen-leng/-dap/-llvm read it),
@@ -3855,18 +3891,30 @@ pub fn synth_manifest_start(
         func: entry + 1,
         args,
     });
-    let term = if results.is_empty() {
-        Terminator::Return(vec![])
-    } else {
-        Terminator::Return(vec![next]) // the entry's single result, appended by the call
+    // The entry's single result (if any) is value `next`, appended by the call. A child returns it
+    // as the i64 status `join` reads: widened from i32, or 0 for an entry with none.
+    let (results, term) = match (child, results.as_slice()) {
+        (false, []) => (results, Terminator::Return(vec![])),
+        (false, _) | (true, [ValType::I64]) => (results, Terminator::Return(vec![next])),
+        (true, []) => {
+            insts.push(Inst::ConstI64(0));
+            (vec![ValType::I64], Terminator::Return(vec![next]))
+        }
+        (true, _) => {
+            insts.push(Inst::Convert {
+                op: ConvOp::ExtendI32U,
+                a: next,
+            });
+            (vec![ValType::I64], Terminator::Return(vec![next + 1]))
+        }
     };
     module.funcs.insert(
         0,
         Func {
-            params: Vec::new(),
+            params: params.clone(),
             results,
             blocks: vec![Block {
-                params: Vec::new(),
+                params,
                 insts,
                 term,
             }],
