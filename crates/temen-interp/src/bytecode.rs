@@ -1218,16 +1218,7 @@ fn named_child_host(
     let (mut child_host, cinst, cas) = match grants {
         Some((grants_ptr, grants_n)) => {
             let m = pm.ok_or(Trap::Malformed)?;
-            let mut list: Vec<(String, i32)> = Vec::new();
-            for i in 0..grants_n {
-                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                let name = String::from_utf8(m.read_window(name_off, name_len)?)
-                    .map_err(|_| Trap::CapFault)?;
-                list.push((name, handle));
-            }
+            let list = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))?;
             host.spawn_named_child(&list, child_size)
                 .ok_or(Trap::CapFault)?
         }
@@ -1387,21 +1378,15 @@ fn admit_detached_child(
         payload.len() as u64 <= temen_ir::module_args_end() - temen_ir::module_args_base();
     // The op-11 record format: `{name_off u32, name_len u32, handle i32, _ u32}`, fail-closed on a
     // handle the parent may not re-grant.
-    let mut glist: Vec<(String, i32)> = Vec::new();
-    if let Some((gptr, gn)) = grants {
-        let m = pm.ok_or(Trap::Malformed)?;
-        for i in 0..gn {
-            let rec = m.read_window(gptr + i * 16, 16)?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-            let gh = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name = String::from_utf8(m.read_window(name_off, name_len)?)
-                .map_err(|_| Trap::CapFault)?;
-            if !host.can_regrant(gh) {
-                return Err(Trap::CapFault);
-            }
-            glist.push((name, gh));
+    let glist = match grants {
+        Some((gptr, gn)) => {
+            let m = pm.ok_or(Trap::Malformed)?;
+            super::read_grant_records(gptr, gn, |o, l| m.read_window(o, l))?
         }
+        None => Vec::new(),
+    };
+    if !glist.iter().all(|(_, h)| host.can_regrant(*h)) {
+        return Err(Trap::CapFault);
     }
     let premap_ok = match premap {
         Some((r, o)) => host.premap_admit(r, o, child_size)?,
@@ -4129,13 +4114,18 @@ impl<'p> Vcpu<'p> {
                 false, // #1157: not preemptible (run-to-completion; budget is u64::MAX anyway)
             );
             match stop {
-                // §3.6 (I36 slice 2): live calls / svc.wait / child_offer need the cooperative
-                // scheduler's waker topology (`drive`); on this single-vCPU driver nothing could
-                // ever wake or mint them — fail closed rather than hang. Unreachable through the
-                // compile (op-14 implies the drive path); requires a hand-wired live cap.
+                // #1732 — `child_offer` mints over a live child's powerbox, which only the
+                // cooperative scheduler keeps; this driver has none. "Unavailable" is the `-EINVAL`
+                // the oracle gives a child it has nothing to offer over, as on the parallel driver
+                // and the Cranelift nursery: a value, not a trap (INVARIANTS #5, #9).
+                Ok(VcpuStop::ChildOffer { dst, .. }) => {
+                    self.vt.active.set(dst, Reg::from_i32(super::EINVAL as i32));
+                }
+                // §3.6 (I36 slice 2): live calls / svc.wait need the cooperative scheduler's waker
+                // topology (`drive`); on this single-vCPU driver nothing could ever wake them —
+                // fail closed rather than hang. They need a hand-wired live cap to arrive here.
                 Ok(VcpuStop::LiveCall { .. })
                 | Ok(VcpuStop::SvcWait)
-                | Ok(VcpuStop::ChildOffer { .. })
                 | Ok(VcpuStop::CloneCaller { .. })
                 | Ok(VcpuStop::Reap { .. })
                 // `exec_module` image-replace needs the cooperative driver's task/env set; this
@@ -4764,30 +4754,15 @@ impl<'p> Vcpu<'p> {
     /// commits.
     fn read_grant_list(&self, grants_ptr: u64, grants_n: u64) -> Result<Vec<(String, i32)>, Trap> {
         let mem = self.mem.as_ref().ok_or(Trap::Malformed)?;
-        let mut list: Vec<(String, i32)> = Vec::new();
-        for i in 0..grants_n {
-            let rec = mem.read_window(grants_ptr + i * 16, 16)?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name_bytes = mem.read_window(name_off, name_len)?;
-            let name = String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-            // `can_regrant` gate against the run's powerbox (shared when attached) — the same policy
-            // check the cooperative arm applies while parsing the records.
-            match self.shared_host {
-                Some(m) => {
-                    let hg = m.lock_unpoisoned();
-                    hg.can_regrant(handle).then_some(()).ok_or(Trap::CapFault)?;
-                }
-                None => self
-                    .host
-                    .can_regrant(handle)
-                    .then_some(())
-                    .ok_or(Trap::CapFault)?,
-            }
-            list.push((name, handle));
-        }
-        Ok(list)
+        let list = super::read_grant_records(grants_ptr, grants_n, |o, l| mem.read_window(o, l))?;
+        // `can_regrant` gate against the run's powerbox (shared when attached) — the same policy
+        // check the cooperative arm applies to the parsed records.
+        let ok = |h: &Host| list.iter().all(|(_, g)| h.can_regrant(*g));
+        let ok = match self.shared_host {
+            Some(m) => ok(&m.lock_unpoisoned()),
+            None => ok(&self.host),
+        };
+        ok.then_some(list).ok_or(Trap::CapFault)
     }
 
     /// **Re-grant a validated op-13 grant list into a fresh child powerbox** (#1011 slice 3a): for each
@@ -9217,24 +9192,12 @@ fn exec_image_build(
     let child_size = 1u64 << win_log2.expect("mod_ok implies a power-of-two window");
     // Read + authority-check the by-name grant list (16-byte `{name_off, name_len, handle, flags}`
     // records, the op-13 layout) from the caller window.
-    let grants: Result<Vec<(String, i32)>, ()> = (|| {
-        let m = cur_mem.ok_or(())?;
-        let mut list: Vec<(String, i32)> = Vec::new();
-        for i in 0..grants_n {
-            let rec = m.read_window(grants_ptr + i * 16, 16).map_err(|_| ())?;
-            let name_off = u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-            let name_len = u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-            let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-            let name = String::from_utf8(m.read_window(name_off, name_len).map_err(|_| ())?)
-                .map_err(|_| ())?;
-            if !cur_host.can_regrant(handle) {
-                return Err(());
-            }
-            list.push((name, handle));
-        }
-        Ok(list)
-    })();
-    let grants = grants?;
+    let m = cur_mem.ok_or(())?;
+    let grants = super::read_grant_records(grants_ptr, grants_n, |o, l| m.read_window(o, l))
+        .map_err(|_| ())?;
+    if !grants.iter().all(|(_, h)| cur_host.can_regrant(*h)) {
+        return Err(());
+    }
     // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
     // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
     let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
@@ -13169,23 +13132,11 @@ impl CoopSched {
                             None => mem.as_ref(),
                             Some(k) => extra_envs[k].mem.as_ref(),
                         };
-                        let list: Result<Vec<(String, i32)>, Trap> = (|| {
-                            let m = pm.ok_or(Trap::Malformed)?;
-                            let mut list: Vec<(String, i32)> = Vec::new();
-                            for i in 0..grants_n {
-                                let rec = m.read_window(grants_ptr + i * 16, 16)?;
-                                let name_off =
-                                    u32::from_le_bytes([rec[0], rec[1], rec[2], rec[3]]) as u64;
-                                let name_len =
-                                    u32::from_le_bytes([rec[4], rec[5], rec[6], rec[7]]) as usize;
-                                let handle = i32::from_le_bytes([rec[8], rec[9], rec[10], rec[11]]);
-                                let name_bytes = m.read_window(name_off, name_len)?;
-                                let name =
-                                    String::from_utf8(name_bytes).map_err(|_| Trap::CapFault)?;
-                                list.push((name, handle));
-                            }
-                            Ok(list)
-                        })();
+                        let list = pm.ok_or(Trap::Malformed).and_then(|m| {
+                            super::read_grant_records(grants_ptr, grants_n, |o, l| {
+                                m.read_window(o, l)
+                            })
+                        });
                         let list = match list {
                             Ok(l) => l,
                             Err(t) => {
