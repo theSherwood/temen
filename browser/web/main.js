@@ -7,7 +7,7 @@
 // The Worker orchestration itself lives in `par.js` (shared with the playground, `play.js`); this
 // page mirrors `threads-spawn.mjs` exactly.
 
-import { fetchBytes, loadEngine, makeRunner, readParStdout } from '/web/par.js';
+import { fetchBytes, loadEngine, makeRunner, readParStdout, readParStdoutBytes } from '/web/par.js';
 import { compileJit } from '/web/wasmjit.js';
 
 const $ = (id) => document.getElementById(id);
@@ -120,13 +120,22 @@ async function main() {
   try {
     const t0 = performance.now();
     const { value, started } = await runPath('/corpus/threads_io.temenc', { io: true });
-    const ms = (performance.now() - t0).toFixed(0);
     const out = readParStdout(eng);
-    const ok = value === 8n && out === 'tick\n'.repeat(8);
+    // #152 — the same shared-powerbox model with the **on-ramp** grants: a manifest-`_start` guest
+    // (`tests/fixtures/threads_onramp.temt`) whose 4 threads each `write` a letter through the one
+    // bound `write` import, then the root writes the 8-byte total (8060) and `exit`s 7.
+    const r = await runPath('/corpus/threads_onramp.temenc', { onramp: true });
+    const ob = readParStdoutBytes(eng);
+    const letters = new TextDecoder().decode(ob.slice(0, 4)).split('').sort().join('');
+    const total = ob.length === 12 ? new DataView(ob.buffer).getBigInt64(4, true) : null;
+    const ms = (performance.now() - t0).toFixed(0);
+    const ok = value === 8n && out === 'tick\n'.repeat(8) &&
+      r.exit === 7 && letters === 'abcd' && total === 8060n;
     set('capio', ok ? 'pass' : 'fail',
       `capio: ${started} Workers → counter ${value} (want 8), stdout ${JSON.stringify(out)} ` +
-      `(want 8 × "tick\\n") ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
-    log(`capio → ${value}, stdout ${out.length}B across ${started} Workers in ${ms}ms`);
+      `(want 8 × "tick\\n") · on-ramp ×${r.started} Workers → exit ${r.exit} (want 7), ` +
+      `letters ${letters} (want abcd), total ${total} (want 8060) ${ok ? 'PASS' : 'FAIL'} [${ms}ms]`);
+    log(`capio → ${value}, stdout ${out.length}B across ${started} Workers; on-ramp exit ${r.exit} in ${ms}ms`);
   } catch (e) {
     set('capio', 'fail', `capio: error ${e}`);
   }
