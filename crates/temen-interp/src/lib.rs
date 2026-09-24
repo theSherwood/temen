@@ -2696,9 +2696,7 @@ fn seed_domain(
             let cstate = thaw_child_state
                 .iter()
                 .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
-            let want_as = cfuncs
-                .get(fnr.entry as usize)
-                .is_some_and(|f| f.params == [ValType::I64, ValType::I64]);
+            let arity = cfuncs.get(fnr.entry as usize).map_or(0, |f| f.params.len());
             let child_args = if let Some(cs) = cstate {
                 ch.restore_durable_handles(&cs.handles);
                 // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
@@ -2730,19 +2728,17 @@ fn seed_domain(
                         None => hg.self_module.clone(),
                     }
                 };
-                if want_as {
-                    vec![Value::I64(0), Value::I64(0)]
-                } else {
-                    vec![Value::I64(0)]
-                }
+                bytecode::child_entry_args(arity, 0, 0)
             } else {
                 let cinst = ch.grant_instantiator(0, csize);
-                if want_as {
-                    let cas = ch.grant_address_space(0, csize);
-                    vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
+                // A one-arg entry manages no pages of its own; a two-arg entry takes its
+                // AddressSpace, and a powerbox entry (#1720) binds its manifest's `vm_map` to it.
+                let cas = if arity == 1 {
+                    0
                 } else {
-                    vec![Value::I64(cinst as i64)]
-                }
+                    ch.grant_address_space(0, csize)
+                };
+                bytecode::child_entry_args(arity, cinst, cas)
             };
             let cid = claim(s, fnr.task);
             live_ids.insert(fnr.task as TaskId, cid);
@@ -2941,14 +2937,10 @@ fn relaunch_detached(
     sched.wire_signal_doors(&child_host);
     // Entry args are inert under a rewind (the prologue reloads spilled values), so pass zero
     // placeholders of the entry's shape, as the nested re-attach does.
-    let want_as = funcs
+    let arity = funcs
         .get(launch.entry as usize)
-        .is_some_and(|f| f.params.len() >= 2);
-    let args = if want_as {
-        vec![Value::I64(0), Value::I64(0)]
-    } else {
-        vec![Value::I64(0)]
-    };
+        .map_or(0, |f| f.params.len());
+    let args = bytecode::child_entry_args(arity, 0, 0);
     let cid = s.next_task;
     s.next_task += 1;
     s.live += 1;
@@ -11712,8 +11704,6 @@ fn build_exec_req(
     // entry, a clean root context (no serve handler / fibers), a non-durable domain, and a
     // fully-regrantable grant list are also required. Anything else is a probeable
     // `-EINVAL` that leaves the caller running (POSIX `execve` returns only on failure).
-    // `want_as` = the §14 child-entry takes (Instantiator, AddressSpace) rather than just
-    // (Instantiator).
     // The real capacity bound is the caller's **backed prefix**
     // (`window.mapped()`), NOT the reserved VA (`window_size`): the image-replace
     // runs the command in the caller's window, and pages beyond the backed prefix
@@ -11726,20 +11716,13 @@ fn build_exec_req(
     let win_log2 = win_bytes
         .is_power_of_two()
         .then(|| win_bytes.trailing_zeros() as u8);
-    // #1668 — a command enters one of two ways, and both get the same powerbox: the chibicc
-    // `--child-entry` ABI takes its starter caps as arguments, and a powerbox `_start` — how every
-    // nimony program enters — takes none and finds what it needs by name, reading its argv from the
-    // args region the exec already wrote. Admitting only the first meant no nim program could be
-    // exec'd at all: `sh -c "bin/nifler …"` reached nifler and was refused `-EINVAL` here.
+    // #1668 / #1720 — a command enters any way a §14 child may (`bytecode::child_entry_ok`, the one
+    // rule): the chibicc `--child-entry` ABI takes its starter caps as arguments, and a powerbox
+    // `_start` — how every nimony program enters — takes none and finds what it needs by name, reading
+    // its argv from the args region the exec already wrote.
     let entry_params = cmod.as_ref().and_then(|cm| {
         let f = cm.funcs.get(entry as usize)?;
-        if bytecode::child_entry_ok(&f.params, &f.results) {
-            Some(f.params.len())
-        } else if entry == 0 && temen_ir::is_named_powerbox_entry(&cm.module) {
-            Some(0)
-        } else {
-            None
-        }
+        bytecode::child_entry_ok(&f.params, &f.results).then_some(f.params.len())
     });
     let admissible = !durable
         && clean_root
@@ -11778,11 +11761,7 @@ fn build_exec_req(
     match built {
         Some((ch, cinst, cas, child_size)) => {
             let cm = cmod.expect("built");
-            let entry_args = match entry_params {
-                Some(0) => Vec::new(),
-                Some(2) => vec![Value::I64(cinst as i64), Value::I64(cas as i64)],
-                _ => vec![Value::I64(cinst as i64)],
-            };
+            let entry_args = bytecode::child_entry_args(entry_params.unwrap_or(1), cinst, cas);
             // FORK.md §8.6 — the old powerbox is about to be dropped by the image
             // -replace: release its pipe write *and* read ends (the fork-inherited ones
             // this exec did not carry into the new image) and wake any pipe that thereby
@@ -13335,8 +13314,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                             // `AddressSpace`. A missing/mistyped entry is rejected, not run. (The
                             // op-8 positional 3-arg grant form died with §3d — a child discovers
                             // re-granted caps by name, via the record's grant list.)
-                            let want_as =
-                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
+                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
@@ -13616,10 +13594,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                     // §3.6 slice 3: keep a live reference past the move into
                                     // the child vCPU, for `child_offer` (op 14).
                                     let child_host_keep = Arc::clone(&child_host);
-                                    let mut child_args = vec![Value::I64(cinst as i64)];
-                                    if want_as {
-                                        child_args.push(Value::I64(cas as i64));
-                                    }
+                                    let child_args = bytecode::child_entry_args(arity, cinst, cas);
                                     // Quota: the child's fuel, sub-allocated from (and capped
                                     // by) ours. §3b: a budget-funded spawn draws fuel from the
                                     // budget instead (bounded 0 = literally zero fuel — distinct
@@ -13994,8 +13969,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                 glist.push((name, gh));
                             }
                             let cfs: &[Func] = &cm.funcs;
-                            let want_as =
-                                cfs.get(entry as usize).is_some_and(|f| f.params.len() >= 2);
+                            let arity = cfs.get(entry as usize).map_or(0, |f| f.params.len());
                             let ok_entry = cfs
                                 .get(entry as usize)
                                 .is_some_and(|f| bytecode::child_entry_ok(&f.params, &f.results));
@@ -14117,10 +14091,7 @@ fn run_inner(v: &mut VCpu, quantum: u64) -> Result<Inner, Trap> {
                                         rs.wire_signal_doors(&child_host);
                                     }
                                     let child_host_keep = Arc::clone(&child_host);
-                                    let mut child_args = vec![Value::I64(cinst as i64)];
-                                    if want_as {
-                                        child_args.push(Value::I64(cas as i64));
-                                    }
+                                    let child_args = bytecode::child_entry_args(arity, cinst, cas);
                                     // §3b: budget-funded spawn — same consumption as the
                                     // same-module branch above.
                                     let rec_b = rec_budget_h.take().and_then(|bh| {

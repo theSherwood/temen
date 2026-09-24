@@ -164,15 +164,45 @@ fn a_plan_the_root_cannot_honour_is_refused() {
     assert!(err(plan(&wide, vec![node(&[])])).contains("do not fit"));
 }
 
-/// A node the spawn refuses (here: an entry that is not a child-entry shape, so op 15 answers
+/// A node the spawn refuses (here: an entry of no admitted shape — three params — so op 15 answers
 /// `-EINVAL`) ends the run with a trap when the root joins the refused handle. It used to panic the
 /// driver (`drive_op13` indexed its child list with the negative handle).
 #[test]
 fn a_refused_node_ends_the_run_with_a_trap_not_a_host_panic() {
     let m = temen_text::parse_module(
-        "memory 16\nfunc () -> (i32) {\nblock 0 () {\n  vz = i32.const 0\n  return vz\n  }\n}\n",
+        "memory 16\nfunc (i64, i64, i64) -> (i64) {\nblock 0 (va: i64, vb: i64, vc: i64) {\n  return va\n  }\n}\n",
     )
     .expect("parse");
     let plan = Plan::single(16, &[], &[]);
     assert!(run(&plan, &[&m], Host::new(), &[]).is_err());
+}
+
+/// #1720 — a card module nests **as built**: `hello_c.temen` (a powerbox `_start: () -> i32`, the
+/// on-ramp's own build, no `--child-entry` twin) runs as a one-node plan with `stdout`/`exit`
+/// re-granted by name, and prints exactly what its direct on-ramp run prints.
+#[test]
+fn a_card_module_runs_nested_as_built() {
+    let m = temen_encode::decode_module(include_bytes!("../web/assets/hello_c.temen"))
+        .expect("decode hello_c.temen");
+    let direct = temen_browser::onramp_exec(&m, b"");
+    assert_eq!(direct.status, temen_browser::STATUS_OK);
+
+    let mut host = Host::new();
+    let sink = host.shared_stdout(); // a re-granted stdout writes into its granter's shared sink
+    let stdout = host.grant_stream(temen_interp::StreamRole::Out);
+    let exit = host.grant_exit();
+    let window = m.memory.expect("a window").size_log2;
+    let plan = Plan::single(window, &[], &["stdout", "exit"]);
+    let out = run(&plan, &[&m], host, &[stdout, exit]).expect("the nested run completes");
+
+    assert_eq!(
+        *sink.lock().unwrap(),
+        direct.stdout,
+        "same stdout, nested or not"
+    );
+    assert_eq!(
+        out,
+        vec![Value::I64(direct.value)],
+        "same result, widened to the join's i64"
+    );
 }
