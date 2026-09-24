@@ -34,7 +34,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 | `PipeEnd` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `SharedRegion` | ✅ | ⛔ | ✅ | ❔ | ✅ | ✅ | 🔶 |
 | `AddressSpace` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
-| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | 🚧 | 🔶 |
+| `Instantiator` | ⛔ | ✅ | 🚧 | ❔ | ✅ | ⛔ | 🔶 |
 | `Budget` | ⛔ | ✅ | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `Module` | ✅ | 🔶 | ✅ | ❔ | ✅ | ✅ | ✅ |
 | `ModuleLoader` | ⛔ | ⛔ | ✅ | ❔ | ✅ | ✅ | ✅ |
@@ -60,7 +60,7 @@ INVARIANTS.md #14 says an accepted capability must hold across **seven axes**. `
 **`Instantiator`**
 - *nesting* ⛔ — the child is minted its own over its own window; the parent's names coordinates the child cannot use
 - *backend* 🚧 — join (op 1) traps ThreadFault on the oracle and CapFault under the Cranelift thunk (#1573)
-- *code origin* 🚧 — the spawn family reaches `drive_nested`'s catch-all `CapFault` inside a `Jit.invoke`: instantiate/instantiate_module_named/child_offer each answer -EINVAL probeably from the base module, and join's forgery trap differs too (#1578)
+- *code origin* ⛔ — an installed unit answers as the base module does (#1726); an invoked unit is a seam-free leaf with no Instantiator, so every op CapFaults there (§22, #1578)
 - *debugger* 🔶 — instantiate/join/instantiate_module_named/instantiate_detached compile; the coroutine spawns and instantiate_rec fall back, and child_offer (op 14) reaches the debug scheduler and is declined
 
 **`Budget`**

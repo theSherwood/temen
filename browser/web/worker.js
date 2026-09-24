@@ -436,7 +436,14 @@ self.onmessage = async (e) => {
     if (evc === TRAP) {
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
-      if (role === 'root') self.postMessage({ kind: 'trap' });
+      // ev_b = 1: the guest called `exit(ev_a)` — the run's end from any vCPU, as for a process.
+      // Otherwise ev_c/ev_d are the trap name's bytes (a `&'static str` in the shared memory).
+      if (ex.temen_par_ev_b(v) === 1n) {
+        self.postMessage({ kind: 'exit', code: Number(ex.temen_par_ev_a(v)) });
+      } else if (role === 'root') {
+        const p = Number(ex.temen_par_ev_c(v)), n = Number(ex.temen_par_ev_d(v));
+        self.postMessage({ kind: 'trap', why: `guest trap: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n))}` });
+      }
       ex.temen_par_free(v);
       return;
     }

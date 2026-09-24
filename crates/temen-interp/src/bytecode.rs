@@ -868,6 +868,19 @@ fn build_table(n_funcs: usize, table_log2: u8) -> SharedSlots {
     SharedSlots::new(n_funcs, table_log2, 0)
 }
 
+/// The program a **same-module** §14 child (op 0 / op 11) runs: the **spawning frame's** module —
+/// the primary for a plain guest, the unit itself for an installed §22 unit — as `(index, program)`.
+/// Every driver validates the child's entry against, and builds the child over, this one module, so
+/// the two cannot disagree (#1726: they used to validate or build against module 0, so an installed
+/// unit's child ran the base program's function of the same index). The module-aware rule
+/// `thread.spawn` already follows (`VcpuEvent::Spawn { module }`). `None` only for a module index
+/// the source does not hold, which a running frame cannot have.
+fn spawner_module(source: &ModuleSource, spawner: &Vm) -> Option<(u32, std::sync::Arc<Compiled>)> {
+    source
+        .get(spawner.module)
+        .map(|c| (spawner.module as u32, c))
+}
+
 /// A running domain (THREADS.md 4c-domain): its shared [`ModuleSource`] (`mods[0]` = primary, `k≥1` =
 /// installed §22 units / §14 child modules) plus its own [`SharedSlots`] `call.dyn` dispatch table.
 /// Both parts are interior-mutable + thread-safe, so a **parallel** driver can share `&Domain` across
@@ -7299,7 +7312,8 @@ fn dbg_instantiate(
     quota: i64,
     dst: u32,
 ) -> Result<(), Trap> {
-    let c0 = source.primary();
+    // The spawning frame's module (#1726) — the one the entry is validated against and the child runs.
+    let (cmod, c0) = spawner_module(source, &tasks[ti].vt.active).ok_or(Trap::Malformed)?;
     // A confined child's entry is `(i64 instantiator) -> (i64)` or `(i64 instantiator, i64 address_space)
     // -> (i64)`; the latter also gets an `AddressSpace` grant so it manages its own pages.
     let sig = c0.sigs.get(entry as u64 as usize);
@@ -7369,9 +7383,12 @@ fn dbg_instantiate(
     } else {
         (quota as u64).min(pfuel)
     };
-    // The child is its own domain: a fresh natural table over module 0 (no installed §22 units).
-    let child_table = build_table(c0.progs.len(), child_host.jit_table_log2()); // #1296
-    let child_vt = VTask::new(&c0, entry as u64 as usize, &child_args)?;
+    // The child is its own domain: a fresh natural table over the module it runs (no installed §22
+    // units).
+    let child_table = build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod); // #1296
+    let mut child_vt = VTask::new(&c0, entry as u64 as usize, &child_args)?;
+    child_vt.active.module = cmod as usize;
+    child_vt.active.home = cmod as usize;
     let eidx = extra_envs.len();
     extra_envs.push(DbgEnv {
         mem: child_mem,
@@ -10522,6 +10539,20 @@ fn drive_nested(
                 let total = gc_write(mem, buf, cap, roots)?;
                 active.set(dst, Reg::from_i64(total));
             }
+            // #1578 — DESIGN §22: an **invoked** unit (`run_meta` `None`) is a seam-free leaf, so the
+            // whole `Instantiator` is unavailable inside it — named here rather than left to the
+            // catch-all, because it is the contract, not an unserviced seam. The tree-walker refuses
+            // the same way (its `below` guard) and the native tier before it trampolines
+            // (`temen_run::invoke_refuses`). An *installed* unit spawns like the base module (#1726).
+            // (A tier-up bounce — `run_meta` `Some` — keeps the catch-all's refusal below.)
+            Outcome::Instantiate { .. }
+            | Outcome::InstantiateModule { .. }
+            | Outcome::InstantiateDetached { .. }
+            | Outcome::ChildOffer { .. }
+                if run_meta.is_none() =>
+            {
+                return Err(Trap::CapFault)
+            }
             _ => return Err(Trap::CapFault),
         }
     }
@@ -13084,10 +13115,12 @@ impl CoopSched {
                     grants,
                     budget,
                 }) => {
-                    // Validate the child entry signature against module 0 (a same-module child): it
-                    // returns one `i64` and takes either its `Instantiator` (one `i64`) or its
-                    // `Instantiator`+`AddressSpace` (two) — its starter caps over its own window.
-                    let c0 = dom.source.primary();
+                    // Validate the child entry signature against the spawning frame's module (a
+                    // same-module child, #1726): it returns one `i64` and takes either its
+                    // `Instantiator` (one `i64`) or its `Instantiator`+`AddressSpace` (two) — its
+                    // starter caps over its own window.
+                    let (cmod, c0) =
+                        spawner_module(&dom.source, &tasks[ti].vt.active).ok_or(Trap::Malformed)?;
                     let want_as = c0
                         .sigs
                         .get(entry as usize)
@@ -13268,12 +13301,15 @@ impl CoopSched {
                     } else {
                         (quota as u64).min(pfuel)
                     };
-                    // A nested child is its **own** domain: a fresh natural table over module 0 (no access
-                    // to installed §22 units — matching the tree-walker's `DomainTable::new(&cfuncs, 0)`).
-                    let c0 = dom.source.primary();
-                    // (#1296: reserving the install slots the child's re-granted `Jit` carries).
-                    let child_table = build_table(c0.progs.len(), child_host.jit_table_log2());
+                    // A nested child is its **own** domain: a fresh natural table over the module it
+                    // runs (no access to installed §22 units — matching the tree-walker's
+                    // `DomainTable::new(&cfuncs, 0)`). (#1296: reserving the install slots the child's
+                    // re-granted `Jit` carries.)
+                    let child_table =
+                        build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod);
                     let mut child_vt = VTask::new(&c0, entry as usize, &child_args)?;
+                    child_vt.active.module = cmod as usize;
+                    child_vt.active.home = cmod as usize;
                     // #816 env-routed tier-up: a same-module confined child runs module 0, so the
                     // run's bitmap applies to it too — inherit it when the child's window is
                     // servable (`nested_view` shares the parent backing, so a root-lineage carve
@@ -15451,9 +15487,12 @@ fn run_vcpu_parallel<'scope, 'env>(
                 if grants.is_some() || budget != 0 {
                     return (Err(Trap::Malformed), mem);
                 }
-                // Validate the child entry signature against module 0 and the power-of-two-aligned
-                // carve within `[0, isize)` — identical to the cooperative `drive` arm.
-                let c0 = dom.source.primary();
+                // Validate the child entry signature against the spawning frame's module (#1726) and
+                // the power-of-two-aligned carve within `[0, isize)` — identical to the cooperative
+                // `drive` arm.
+                let Some((cmod, c0)) = spawner_module(&dom.source, &vt.active) else {
+                    return (Err(Trap::Malformed), mem);
+                };
                 let want_as = c0
                     .sigs
                     .get(entry as usize)
@@ -15507,13 +15546,16 @@ fn run_vcpu_parallel<'scope, 'env>(
                 } else {
                     (quota as u64).min(fuel)
                 };
-                // Own table over the **shared** source (module 0 = the same primary the child runs).
-                let child_table = build_table(c0.progs.len(), child_host.jit_table_log2()); // #1296
+                // Own table over the **shared** source, mapping into the module the child runs.
+                let child_table =
+                    build_table_for(c0.progs.len(), child_host.jit_table_log2(), cmod); // #1296
                 let child_dom = Domain::child(std::sync::Arc::clone(&dom.source), child_table);
-                let child_vt = match VTask::new(&c0, entry as usize, &child_args) {
+                let mut child_vt = match VTask::new(&c0, entry as usize, &child_args) {
                     Ok(v) => v,
                     Err(t) => return (Err(t), mem),
                 };
+                child_vt.active.module = cmod as usize;
+                child_vt.active.home = cmod as usize;
                 let id = reg
                     .next_id
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

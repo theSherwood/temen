@@ -1648,8 +1648,10 @@ pub extern "C" fn temen_par_root_call_interp(v: *mut ParVcpu, func: u32, args_pt
 /// root guest receives as its args.
 struct ParIoCfg {
     host: std::sync::Mutex<Host>,
-    /// The `Stream(Out)` handle (the root's single entry arg).
-    out: i32,
+    /// The `Stream(Out)` handle — the root's single entry arg. `None` for the **on-ramp** recipe
+    /// ([`temen_par_powerbox_onramp`]): its entry is the paramless manifest `_start`, and its root's
+    /// reservation is the window itself (see [`temen_par_root`]).
+    out: Option<i32>,
 }
 
 /// The leaked [`ParIoCfg`] pointer (or `0`), shared across Workers via shared linear memory.
@@ -1665,6 +1667,13 @@ pub extern "C" fn temen_par_powerbox_io() -> i32 {
     par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
     let mut host = Host::new();
     let out = host.grant_stream(StreamRole::Out);
+    par_publish_io(host, Some(out));
+    1
+}
+
+/// Publish `host` as the run's shared I/O powerbox (clearing the other recipes). Leaked: Workers
+/// hold `&'static` borrows of it for the rest of the run, and the next publish replaces the pointer.
+fn par_publish_io(host: Host, out: Option<i32>) {
     let cfg = Box::into_raw(Box::new(ParIoCfg {
         host: std::sync::Mutex::new(host),
         out,
@@ -1673,6 +1682,44 @@ pub extern "C" fn temen_par_powerbox_io() -> i32 {
     PAR_INST.store(0, std::sync::atomic::Ordering::Release);
     PAR_PB.store(0, std::sync::atomic::Ordering::Release);
     PAR_JIT.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Publish the **on-ramp powerbox** as the run's shared I/O powerbox (#152): the same grants a
+/// single-threaded on-ramp run gets ([`grant_onramp_caps`] — the §3e prefix, the by-name caps, the
+/// manifest import bindings), in one `Mutex<Host>` every vCPU of the run dispatches through. So a
+/// `.temen` off the on-ramp toolchain whose runtime `thread.spawn`s (JACL's worker pool, a pthreads
+/// C program) runs each thread on its own Worker instead of multiplexing them on one. `stdin`
+/// (`[stdin_ptr, stdin_len)`, null/empty ⇒ none) is seeded as the on-ramp run seeds it. Read the
+/// streams back after the run via [`temen_par_stdout_len`] / [`temen_par_stderr_len`]; an `exit`
+/// surfaces as the root's [`PAR_TRAP`] with the code in its operands (see [`temen_par_run`]).
+///
+/// Returns `1`, or `0` — nothing published — for undecodable bytes or a module the on-ramp refuses
+/// ([`onramp_check`]). Call on the main thread before the run, like [`temen_par_powerbox_io`].
+#[no_mangle]
+pub extern "C" fn temen_par_powerbox_onramp(
+    guest_ptr: *const u8,
+    guest_len: usize,
+    stdin_ptr: *const u8,
+    stdin_len: usize,
+) -> i32 {
+    // SAFETY: the host guarantees both ranges are live allocations it just filled.
+    let bytes = unsafe { core::slice::from_raw_parts(guest_ptr, guest_len) };
+    let stdin: &[u8] = if stdin_ptr.is_null() || stdin_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(stdin_ptr, stdin_len) }
+    };
+    let Ok(m) = temen_encode::decode_module(bytes) else {
+        return 0;
+    };
+    if onramp_check(&m).is_err() {
+        return 0;
+    }
+    par_run_gen_bump(); // I22: one bump per run — gates the once-per-run codegen emit (see CodegenGuard)
+    let mut host = Host::new();
+    host.stdin = stdin.to_vec();
+    grant_onramp_caps(&mut host, &m, None);
+    par_publish_io(host, None);
     1
 }
 
@@ -2099,12 +2146,34 @@ pub extern "C" fn temen_par_root(
         };
     }
     let (args, io): (Vec<Value>, Option<&'static ParIoCfg>) = match (par_io(), par_pb()) {
-        (Some(io), _) => (vec![Value::I32(io.out)], Some(io)),
+        (Some(io), _) => (io.out.map(Value::I32).into_iter().collect(), Some(io)),
         (None, Some(pb)) => (vec![Value::I32(pb.jit), Value::I32(pb.code)], None),
         (None, None) => (Vec::new(), None),
     };
     // SAFETY: `prog` is a live program pointer the host keeps alive for the run.
-    match bytecode::Vcpu::new_root(unsafe { prog_ref(prog) }, func, &args, back, &[]) {
+    let prog = unsafe { prog_ref(prog) };
+    // An on-ramp root reserves exactly the window, as every child does (`temen_par_child`): a
+    // `vm_map` past it is refused, rather than succeeding into a tail the shared window drops writes
+    // to. The other recipes keep the default reservation over the window.
+    let root = match io {
+        Some(ParIoCfg { out: None, .. }) => {
+            if !win_size.is_power_of_two() {
+                par_vcpu_retire();
+                return core::ptr::null_mut();
+            }
+            bytecode::Vcpu::new_root_reserved_over_with_powerbox(
+                prog,
+                func,
+                &args,
+                &[],
+                Host::new(),
+                win_size.trailing_zeros() as u8,
+                back,
+            )
+        }
+        _ => bytecode::Vcpu::new_root(prog, func, &args, back, &[]),
+    };
+    match root {
         Ok(inner) => {
             let inner = match io {
                 Some(io) => inner.with_shared_host(&io.host),
@@ -2312,6 +2381,26 @@ pub extern "C" fn temen_par_stdout_ptr() -> *const u8 {
 /// The stashed 4d stdout snapshot (`temen_par_stdout_len` fills it; `_ptr` reads it).
 static mut PAR_OUT: (*mut u8, usize) = (core::ptr::null_mut(), 0);
 
+/// [`temen_par_stdout_len`]'s stderr twin — the shared host's stderr, as [`onramp_exec`] returns it.
+#[no_mangle]
+pub extern "C" fn temen_par_stderr_len() -> usize {
+    let Some(io) = par_io() else { return 0 };
+    let bytes = {
+        let g = io.host.lock().unwrap_or_else(|e| e.into_inner());
+        g.stderr.clone()
+    };
+    // SAFETY: as `temen_par_stdout_len` — main-thread single-reader stash.
+    unsafe { stash(&mut *core::ptr::addr_of_mut!(PAR_ERR), bytes) };
+    unsafe { (*core::ptr::addr_of!(PAR_ERR)).1 }
+}
+#[no_mangle]
+pub extern "C" fn temen_par_stderr_ptr() -> *const u8 {
+    // SAFETY: as above — main-thread single-reader stash.
+    unsafe { (*core::ptr::addr_of!(PAR_ERR)).0 }
+}
+/// The stashed stderr snapshot (`temen_par_stderr_len` fills it; `_ptr` reads it).
+static mut PAR_ERR: (*mut u8, usize) = (core::ptr::null_mut(), 0);
+
 // ---- I22 diagnostics: capture a Rust panic's location+message ----------------------------------
 // `panic = "abort"` lowers a Rust panic to a wasm `unreachable`, which reaches the JS host as a bare
 // `[pageerror] unreachable` with no location — the exact signature of the Jul 12 nightly `real-browser`
@@ -2378,7 +2467,20 @@ pub extern "C" fn temen_par_run(v: *mut ParVcpu) -> i32 {
                 v.a = first_i64(&vals);
                 return PAR_DONE;
             }
-            bytecode::VcpuEvent::Trapped(_) => return PAR_TRAP,
+            // `a` = the exit code and `b` = 1 when the guest called `exit` (an on-ramp program's
+            // normal way out), else `b` = 0; `c`/`d` = pointer/length of the trap's name.
+            bytecode::VcpuEvent::Trapped(t) => {
+                let (code, exited) = match &t {
+                    Trap::Exit(code) => (*code as i64, 1),
+                    _ => (0, 0),
+                };
+                let name = t.name();
+                v.a = code;
+                v.b = exited;
+                v.c = name.as_ptr() as i64;
+                v.d = name.len() as i64;
+                return PAR_TRAP;
+            }
             // wasm-JIT tier-up: hand the func index + marshalled args to the Worker, which runs the
             // emitted `f{func}` and delivers the results (`temen_par_deliver_tierup`) or a trap.
             // Operand `b` carries the window's scalar committed extent — the Worker writes it to the

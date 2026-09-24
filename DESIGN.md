@@ -3096,6 +3096,20 @@ module 0 — fixed to the spawning frame's module). All tiers now claim this sup
   nested-caps emit; the JS drivers service them (the PR #587/#590 bounce pattern). Pinned by the
   browser harness's `instthreads` item and `nested_vm.rs::threaded_unit_matches_oracle`.
 
+**The `Instantiator` in a submitted unit (#1726, #1578).** Same split as threads, same reason.
+*Installed*, a unit's `instantiate` is an ordinary module-aware spawn: a same-module child runs the
+**spawning frame's** module — the unit's function, not module 0's of the same index — on every engine
+(the tree-walker builds the child from the frame's module; the bytecode drivers share one
+`spawner_module`; Cranelift bakes the unit's program into its spawn sites as `self_prog`, and a module
+with an install table stands up the nursery an installed unit spawns through). *Invoked*, the whole
+`Instantiator` is unavailable: a child would outlive the synchronous call over code nothing keeps (an
+invoked unit is never installed), and its handle would name the transient invoke vCPU's child, which
+nobody can join — so every `Instantiator` op `CapFault`s inside a `Jit.invoke` (the tree-walker when
+the op runs; the nested bytecode drive by name; the native tier before it trampolines, through the same
+`invoke_refuses` gate as threads — coarser by the one case of an op on a path that never runs). Pinned
+by `crates/temen/tests/unit_instantiator.rs` (three engines, both routes) and the frontier matrix's
+code-origin column, which drives both routes.
+
 **Unit-own funcrefs (2026-07-30).** A unit can also fiber over its **own** function — not just a parent
 (module-0) one. A unit's `ref.func N` used to lower to the bare index `N`, which resolves against the
 *parent* `fn_table`; so a unit whose own body is a fiber entry (jacl's scheduler running an interpreted

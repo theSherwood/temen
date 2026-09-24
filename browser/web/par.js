@@ -76,6 +76,10 @@ export async function loadEngine() {
 //               child into its OWN `WebAssembly.Memory` on its own Worker (concurrently);
 //   `io`      ⇒ publish the 4d shared I/O powerbox (a `Mutex<Host>` in shared memory every vCPU
 //               dispatches `call.cap` through; read stdout back via `temen_par_stdout_*` after);
+//   `onramp`  ⇒ publish the **on-ramp** powerbox the same way (#152): the grants a single-threaded
+//               on-ramp run gets, manifest imports included, shared by every vCPU — so an on-ramp
+//               `.temen` whose runtime spawns threads runs them on real Workers. `stdin` (bytes)
+//               seeds its stdin; an `exit(code)` from any vCPU ends the run with `exit` = code;
 //   none      ⇒ the recipes are explicitly cleared (`temen_par_powerbox_none`) so a plain compute run
 //               isn't seeded by a previous run's recipe;
 //   `winSize` sizes the shared window; `signal` (an `AbortSignal`) stops the run: every Worker is
@@ -87,7 +91,7 @@ export function makeRunner({ module, memory, ex }) {
   const u8 = () => new Uint8Array(memory.buffer);
   const tlsSize = ex.__tls_size.value, tlsAlign = ex.__tls_align.value || 1;
 
-  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
+  return async function runAcrossWorkers(guest, { jit = false, jitCodegen = false, jitService = 0, inst = false, instCodegen = false, io = false, onramp = false, stdin = null, tierup = false, unit = null, minter = 0, winSize = 1 << 16, signal = null, jitB2 = false, jitRuntime = false, jitRuntimeCodegen = false, jitBlobs = [] } = {}) {
     const gptr = ex.temen_par_alloc(guest.length);
     u8().set(guest, gptr);
     if (jit && ex.temen_par_powerbox(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox failed');
@@ -116,7 +120,13 @@ export function makeRunner({ module, memory, ex }) {
     }
     if (jitCodegen && ex.temen_par_powerbox_jit_codegen(gptr, guest.length) !== 1) throw new Error('temen_par_powerbox_jit_codegen failed');
     if (io && ex.temen_par_powerbox_io() !== 1) throw new Error('temen_par_powerbox_io failed');
-    if (!jit && !jitCodegen && !io && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
+    if (onramp) {
+      const sin = stdin || new Uint8Array(0);
+      const sptr = sin.length ? ex.temen_par_alloc(sin.length) : 0;
+      if (sin.length) u8().set(sin, sptr);
+      if (ex.temen_par_powerbox_onramp(gptr, guest.length, sptr, sin.length) !== 1) throw new Error('temen_par_powerbox_onramp failed (not an on-ramp module)');
+    }
+    if (!jit && !jitCodegen && !io && !onramp && !inst && !instCodegen && !jitRuntime) ex.temen_par_powerbox_none();
     const prog = (jit || jitCodegen || jitRuntime) ? ex.temen_par_compile_jit(gptr, guest.length) : ex.temen_par_compile(gptr, guest.length);
     if (prog === 0) throw new Error('module unsupported on the parallel driver (temen_par_compile null)');
     const win = ex.temen_par_alloc(winSize);
@@ -143,7 +153,7 @@ export function makeRunner({ module, memory, ex }) {
     const workers = new Set();
     let started = 0;
     try {
-      const value = await new Promise((resolve, reject) => {
+      const { value = null, exit = null } = await new Promise((resolve, reject) => {
         if (signal) {
           if (signal.aborted) return reject(new Error('stopped'));
           signal.addEventListener('abort', () => reject(new Error('stopped')), { once: true });
@@ -161,7 +171,9 @@ export function makeRunner({ module, memory, ex }) {
               const { kind, ...cfg2 } = m;
               startVcpu({ role: 'child', ...cfg2 });
             } else if (m.kind === 'done') {
-              resolve(BigInt(m.value));
+              resolve({ value: BigInt(m.value) });
+            } else if (m.kind === 'exit') {
+              resolve({ exit: m.code });
             } else if (m.kind === 'trap' || m.kind === 'fail') {
               reject(new Error(m.why || 'guest trap'));
             }
@@ -178,17 +190,27 @@ export function makeRunner({ module, memory, ex }) {
         startVcpu({ role: 'root', func: 0, slot: rootSlot, stackTop: rootStackTop, tlsBase: rootTlsBase });
       });
       const tierups = (tierup || jitCodegen || instCodegen || jitRuntimeCodegen) ? Atomics.load(new Int32Array(memory.buffer), tierupCell >> 2) : 0;
-      return { value, started, tierups };
+      return { value, exit, started, tierups };
     } finally {
       for (const w of workers) w.terminate();
     }
   };
 }
 
-// Read back the accumulated stdout of the last 4d I/O run (empty string when no I/O powerbox ran).
-// `slice` (not `subarray`) copies out of the SharedArrayBuffer — TextDecoder rejects shared views.
-export function readParStdout({ memory, ex }) {
+// Read back the accumulated stdout of the last 4d I/O or on-ramp run (empty string when no I/O
+// powerbox ran). `slice` (not `subarray`) copies out of the SharedArrayBuffer — TextDecoder rejects
+// shared views. `readParStdoutBytes` is the raw form, for binary output.
+export function readParStdoutBytes({ memory, ex }) {
   const len = ex.temen_par_stdout_len();
-  const u8 = new Uint8Array(memory.buffer);
-  return new TextDecoder().decode(u8.slice(ex.temen_par_stdout_ptr(), ex.temen_par_stdout_ptr() + len));
+  const ptr = ex.temen_par_stdout_ptr();
+  return new Uint8Array(memory.buffer).slice(ptr, ptr + len);
+}
+export function readParStdout(eng) {
+  return new TextDecoder().decode(readParStdoutBytes(eng));
+}
+// The on-ramp run's stderr (the shared host's, as the single-threaded on-ramp run returns it).
+export function readParStderr({ memory, ex }) {
+  const len = ex.temen_par_stderr_len();
+  const ptr = ex.temen_par_stderr_ptr();
+  return new TextDecoder().decode(new Uint8Array(memory.buffer).slice(ptr, ptr + len));
 }
