@@ -1412,9 +1412,7 @@ fn admit_detached_child(
     {
         return Ok(None);
     }
-    let mut mem = Mem::with_reservation(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow);
-    mem.init_data(&cdata);
-    mem.seed_null_guard(temen_ir::module_null_guard());
+    let mut mem = Mem::detached(DEFAULT_RESERVED_LOG2, size_log2 as u8, cshadow, &cdata);
     if !payload.is_empty() {
         let _ = mem.write_bytes(temen_ir::module_args_base(), &payload);
     }

@@ -899,6 +899,7 @@ impl Nursery {
             types,
             shadow,
             image,
+            prots,
             child: gc,
         } = seed;
         let release_addr = self.grant_release.load(Ordering::Acquire);
@@ -954,6 +955,10 @@ impl Nursery {
                 if let Some(th) = rw.get_mut(thaw_off..thaw_off + 4) {
                     th.copy_from_slice(&temen_ir::durable_abi::STATE_REWINDING.to_le_bytes());
                 }
+                // Its protections as captured, then the guard, as a fresh spawn's window has them.
+                let mapped = rw.len() as u64;
+                w.apply_prots(0, &prots, mapped);
+                seed_detached_guard(w, mapped);
             },
             |_, _, _| true,
             None,
@@ -1962,6 +1967,7 @@ unsafe fn spawn_detached_child(
             for s in seeds.iter().filter(|s| s.readonly) {
                 w.protect_ro(s.offset, s.bytes.len() as u64);
             }
+            seed_detached_guard(w, len as u64);
         },
         // The op-15 pre-mapped region, aliased onto the fresh window by the host hook (the child
         // powerbox's own `map` path); none staged ⇒ nothing to do.
@@ -1997,6 +2003,16 @@ unsafe fn spawn_detached_child(
             }
             EINVAL as i32
         }
+    }
+}
+
+/// #964/#1733 — a detached child's window is root-shaped, so it reserves the NULL guard as a root's
+/// does: last, after every host write, and skipped for a window smaller than the guard (as the
+/// interpreter's `seed_null_guard` skips).
+fn seed_detached_guard(w: &crate::mem::GuestWindow, mapped: u64) {
+    let guard = temen_ir::module_null_guard();
+    if guard <= mapped {
+        w.seed_null_guard(0, guard);
     }
 }
 
