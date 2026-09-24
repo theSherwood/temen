@@ -10087,6 +10087,19 @@ fn shadow_switch(
         fiber_sp[in_ctx]
     };
     m.durable_set_sp(region_of(in_ctx), in_sp);
+    // As the tree-walker's `shadow_switch`: carry the active **thaw** phase from the outgoing context
+    // to the incoming one (a resumer does not flip its own word; the deepest frame's flip to `NORMAL`
+    // propagates back up through the switches), and re-arm an incoming fiber whose restored region
+    // still holds a frame (SP above its frame base: seeded frozen residue not yet rewound) to
+    // `REWINDING` whatever the carried phase. Without the re-arm, a thawed fiber first claimed by
+    // post-rewind `NORMAL` code starts fresh and orphans its spilled frame (#1769: a woken wait then
+    // re-parks instead of delivering its wake).
+    let ctx_of = |ctx: usize| if ctx == ROOT_FIBER { 0 } else { ctx + 1 };
+    let phase = m.durable_thaw_state(ctx_of(out_ctx));
+    m.durable_set_thaw_state(ctx_of(in_ctx), phase);
+    if in_ctx != ROOT_FIBER && in_sp > arena.frame_base(ctx_of(in_ctx)) {
+        m.durable_set_thaw_state(ctx_of(in_ctx), super::STATE_REWINDING);
+    }
 }
 
 /// **Freeze driver** (DURABILITY.md §12.8 slice 3.1.4) — the bytecode mirror of the tree-walker's
@@ -10160,7 +10173,10 @@ fn freeze_drive(
                 woken,
                 ..
             } => {
-                vm.set(wait_dst, Reg::from_i32(woken.unwrap_or(0)));
+                vm.set(
+                    wait_dst,
+                    Reg::from_i32(woken.unwrap_or(temen_ir::durable_abi::WAIT_FROZEN)),
+                );
                 (vm, false)
             }
             FiberState::CapParked {
