@@ -386,6 +386,13 @@ impl ChildExec {
     }
 
     fn wake_all_parked(&self, g: &mut ExecState) {
+        // #1711 — a running task may already be past its predicate check and yielding toward a
+        // park that the worker has not filed yet. Latch the wake on it too, so the worker requeues
+        // it instead of parking it on a cell this wake has already satisfied. At worst the task
+        // re-checks once more than it needed to.
+        for e in g.tasks.values_mut().filter(|e| e.task.is_none()) {
+            e.woken = true;
+        }
         let ids: Vec<u64> = g
             .tasks
             .iter()

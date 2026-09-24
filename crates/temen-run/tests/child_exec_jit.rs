@@ -473,3 +473,71 @@ fn a_task_asleep_on_its_own_deadline_is_not_a_deadlock() {
     assert_eq!(run_interp(&p, &a, &b, -1), 0, "the oracle");
     assert_eq!(run_jit(&p, &a, &b, -1), 0);
 }
+
+/// The root's side of [`pingpong`] as a [`parent`] tail: the same turn word, `rounds` times as
+/// `mine = 1`, then join both children and return `1000·A + B`.
+fn tail_root_pingpong(rounds: i64) -> String {
+    format!(
+        "vz0 = i64.const 0
+  br 1(v0, vca, vcb, vz0)
+}}
+block 1 (h1: i32, a1: i32, b1: i32, vi: i64) {{
+  vn = i64.const {rounds}
+  vlt = i64.lt_u vi vn
+  br_if vlt 2(h1, a1, b1, vi) 5(h1, a1, b1)
+}}
+block 2 (h2: i32, a2: i32, b2: i32, vi2: i64) {{
+  vt = i64.const 65536
+  vcur = i32.atomic.load vt
+  vmine = i32.const 1
+  veq = i32.eq vcur vmine
+  br_if veq 4(h2, a2, b2, vi2) 3(h2, a2, b2, vi2)
+}}
+block 3 (h3: i32, a3: i32, b3: i32, vi3: i64) {{
+  vt3 = i64.const 65536
+  vother3 = i32.const 0
+  vinf = i64.const -1
+  vs = i32.atomic.wait vt3 vother3 vinf
+  br 2(h3, a3, b3, vi3)
+}}
+block 4 (h4: i32, a4: i32, b4: i32, vi4: i64) {{
+  vt4 = i64.const 65536
+  vother4 = i32.const 0
+  i32.atomic.store vt4 vother4
+  vone = i32.const 1
+  vw = atomic.notify vt4 vone
+  vstep = i64.const 1
+  vi5 = i64.add vi4 vstep
+  br 1(h4, a4, b4, vi5)
+}}
+block 5 (h5: i32, a5: i32, b5: i32) {{
+  vja = call.cap 6 1 (i32) -> (i64) h5 (a5)
+  vjb = call.cap 6 1 (i32) -> (i64) h5 (b5)
+  vk = i64.const 1000
+  vm = i64.mul vja vk
+  vr = i64.add vm vjb
+  return vr"
+    )
+}
+
+/// **#1711 — a notify that reaches a task while its worker is still filing the park is not lost.**
+///
+/// The root and a child task ping-pong the turn word, every wait infinite. A task's wait yields to
+/// its worker, which marks the entry parked (and counts it in `Domain::parked`) only after it gets
+/// the executor lock back. The executor's wake used to visit only entries already marked parked, so
+/// a root `notify` landing in that window claimed the task's cell and then skipped the task: the
+/// worker parked it on a cell that already said woken, and the root's next infinite wait saw
+/// `live(2) == parked(2)` and trapped `ThreadFault` on a program with no deadlock — typically
+/// within the first few hundred of these round trips.
+#[test]
+fn a_notify_racing_a_tasks_park_is_not_lost() {
+    const ROUNDS: i64 = 3000;
+    let p = module(&parent(&tail_root_pingpong(ROUNDS)));
+    let a = module(&pingpong(0, 1, ROUNDS));
+    let b = module(TRIVIAL);
+    let want = 1000 * ROUNDS;
+    assert_eq!(run_interp(&p, &a, &b, -1), want, "the oracle");
+    for run in 0..5 {
+        assert_eq!(run_jit(&p, &a, &b, -1), want, "run {run}");
+    }
+}
