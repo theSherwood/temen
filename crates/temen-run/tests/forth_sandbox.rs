@@ -10,8 +10,8 @@
 use temen_run::{Backend, RunConfig};
 
 /// The two tiers that can run a nested copy of this kernel. The **Cranelift** tier cannot, and says
-/// so: `compile_child` refuses a §14 child whose module uses §12 fibers or threads ("a §14 JIT child
-/// using fibers/threads is not supported yet"), and the Forth kernel has `task`/`yield`/`resume` and
+/// so: `compile_child` runs a §14 child's fibers (#1469) but refuses one that uses §12 threads ("a
+/// §14 JIT child using thread.spawn/join is not supported yet"), and the Forth kernel has
 /// `spawn`/`join` — so it cannot be its own JIT child. That frontier is pinned by
 /// [`the_jit_tier_declines_a_fiber_bearing_child`] rather than papered over.
 const TIERS: [Backend; 2] = [Backend::TreeWalk, Backend::Bytecode];
@@ -97,10 +97,10 @@ fn a_sandbox_cannot_sandbox() {
     );
 }
 
-/// The declared frontier: the Cranelift tier refuses to compile a §14 child that uses fibers or
-/// threads, and this kernel does — so `sandbox` there is a refusal, not a silent success. Loud by
+/// The declared frontier: the Cranelift tier refuses to compile a §14 child that uses threads, and
+/// this kernel does — so `sandbox` there is a refusal, not a silent success. Loud by
 /// design (`instantiator_rt`: "a child we cannot compile … is a CapFault, not a silent success").
-/// If this starts passing, per-child fiber/thread runtimes landed: move `Backend::Jit` into `TIERS`.
+/// If this starts passing, per-child thread runtimes landed: move `Backend::Jit` into `TIERS`.
 ///
 /// It is also the pin for the **locked-ctx child hooks**: this kernel uses concurrency, so its JIT
 /// run bakes a `*const Mutex<Host>` cap ctx, and the spawn gets far enough to build the child

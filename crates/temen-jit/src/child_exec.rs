@@ -153,14 +153,29 @@ impl ChildTask {
         let trap = Arc::new(AtomicI64::new(0));
         let results: Box<[i64]> = vec![0i64; n_results.max(1)].into_boxed_slice();
         let args: Box<[i64]> = args.into_boxed_slice();
-        // The child's own execution context over a private, unused fiber table: the child compiles
-        // with no `cont.*` env, so the table holds nothing; the runtime exists for its `yielders` /
-        // `active_slots` bookkeeping, which is what `fiber_event_park` and `current_fiber_slot` read.
-        let table = Arc::new(SharedFiberTable::new(
-            1,
-            temen_ir::durable_abi::ShadowArena::EMPTY,
-        ));
-        let rt = Box::new(FiberRuntime::new(table, 0, code.fn_table_mask));
+        // The child domain's own execution context and fiber table (#1469): its `cont.*` handles
+        // live here, numbered from 0 and out of every other domain's reach, as the oracle's
+        // per-domain registry. A child compiled without `cont.*` gets an unused one-slot table; the
+        // runtime still carries the `yielders` / `active_slots` bookkeeping that
+        // `fiber_event_park` and `current_fiber_slot` read.
+        let mut rt = match (code.fiber_cfg, code.call_tramp) {
+            (Some((type_id, mask)), Some(t)) => {
+                let table = Arc::new(SharedFiberTable::new(
+                    temen_ir::Quota::default().max_fibers,
+                    temen_ir::durable_abi::ShadowArena::EMPTY,
+                ));
+                let mut rt = Box::new(FiberRuntime::new(table, type_id, mask));
+                rt.set_call_tramp(t);
+                rt
+            }
+            _ => {
+                let table = Arc::new(SharedFiberTable::new(
+                    1,
+                    temen_ir::durable_abi::ShadowArena::EMPTY,
+                ));
+                Box::new(FiberRuntime::new(table, 0, code.fn_table_mask))
+            }
+        };
         let tramp: LimitedEntry = core::mem::transmute(code.tramp_code_limited);
         let a = SendRaw(args.as_ptr());
         let r = SendRaw(results.as_ptr() as *mut i64);
@@ -178,6 +193,9 @@ impl ChildTask {
             window.restore_rw();
             return Err(teardown);
         };
+        // The child root's frames live on the task stack: its top is the high bound of the
+        // `gc.roots` root-frame scan, as the OS-thread entry SP is a root's.
+        rt.set_root_entry_sp(fiber.stack_top() as usize);
         Ok(ChildTask {
             slot: FiberSlot::platform(fiber),
             rt,
@@ -224,22 +242,6 @@ extern "C" fn resume_shim(
         let c = a as *mut ResumeCall;
         (*c).state = Some((*(*c).fib).resume(0));
     }
-}
-
-thread_local! {
-    /// Whether this OS thread is inside a child-task resume. The futex thunk reads it to skip the
-    /// one transient park a *guest* fiber's resumer polls away — a task has no such resumer, so an
-    /// already-resolved wait must return at once rather than wait for the next sweep.
-    static IN_TASK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Is this OS thread running a child-domain task right now?
-///
-/// `#[inline(never)]` is load-bearing (#1466): this is read on a fiber stack after a possible
-/// migration, and an inlined copy would let LLVM serve it from the *suspending* thread's TLS block.
-#[inline(never)]
-pub(crate) fn in_task() -> bool {
-    IN_TASK.with(|c| c.get())
 }
 
 /// Per-task executor bookkeeping. `task` is `None` while a worker holds the task (running).
@@ -537,7 +539,6 @@ impl ChildExec {
         });
         let prev_tls = vcpu_tls::get();
         vcpu_tls::seed(task.tls);
-        IN_TASK.with(|c| c.set(true));
         task.rt.push_active(Arc::clone(&task.slot));
         let fib = task
             .slot
@@ -560,7 +561,6 @@ impl ChildExec {
             )
         };
         task.rt.pop_active();
-        IN_TASK.with(|c| c.set(false));
         task.tls = vcpu_tls::get();
         vcpu_tls::seed(prev_tls);
         if let Some(s) = prev_shadow {
@@ -573,8 +573,8 @@ impl ChildExec {
             return Outcome::Finished;
         }
         match call.state {
-            // The child compiles with no `cont.*` env, so the only yield a task can make is the
-            // futex thunk's event park.
+            // A guest fiber's `suspend` yields to its resumer inside the task, and the child root's
+            // traps (#1469), so the only yield reaching the worker is the task's event park.
             Some(State::Yielded(_)) if task.slot.took_event_park() => {
                 // Read the park's own answer before the slot goes back to the pool (#1631).
                 let self_resolving = task.slot.took_self_resolving_park();

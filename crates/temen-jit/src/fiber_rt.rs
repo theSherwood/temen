@@ -507,6 +507,12 @@ impl FiberSlot {
         })
     }
 
+    /// #1469 — whether this is a task's platform slot rather than a guest fiber's: the running
+    /// code is a child root exactly when the innermost live resume is one.
+    pub(crate) fn is_platform(&self) -> bool {
+        self.func == -1
+    }
+
     /// D66 — whether the task's last yield was an event park (a futex/join wait inside it), as the
     /// resume seam reads it. The executor classifies a `State::Yielded` with this.
     pub(crate) fn took_event_park(&self) -> bool {
@@ -742,6 +748,13 @@ impl FiberRuntime {
     }
     pub(crate) fn pop_active(&mut self) {
         self.active_slots.pop();
+    }
+
+    /// #1469 — is this runtime a child-domain task's? Its outermost live resume is then the
+    /// executor's resume of the task's platform fiber, and `yielders[0]` is that fiber's yielder,
+    /// which belongs to the worker, not to the guest.
+    fn runs_task(&self) -> bool {
+        self.active_slots.first().is_some_and(|s| s.is_platform())
     }
 
     /// Arm the **durable** fiber-switch swap for this run (DURABILITY.md §12.8): record the window
@@ -1179,6 +1192,12 @@ pub(crate) unsafe extern "C" fn fiber_suspend(value: i64, trap_out: u64) -> i64 
     // Mid-run freeze trigger: count this `suspend` safepoint before the switch (mirroring the
     // interpreter's per-op tick). The promotion takes effect for the *resumer's* poll after this
     // fiber parks (suspend's own trailing poll is deferred to the fiber's next resume).
+    // #1469 — a child root runs on its task's platform fiber, whose yielder is the executor's: the
+    // root suspending is the root computation suspending, a `FiberFault` as on an OS thread.
+    if current_fiber_slot().is_some_and(|s| s.is_platform()) {
+        fault(trap_out);
+        return 0;
+    }
     if (*rt).durable {
         window_tick_arm((*rt).mem_base);
     }
@@ -1244,6 +1263,13 @@ pub(crate) unsafe fn park_is_self_resolving(handle: i64) -> bool {
     rt.table
         .resolve(handle)
         .is_some_and(|(_, slot)| slot.took_self_resolving_park())
+}
+
+/// #1469 — is this thread running a child-domain task (its root or a guest fiber inside it)?
+pub(crate) fn in_task() -> bool {
+    let rt = current();
+    // SAFETY: `current()` is this thread's live runtime; the borrow is momentary.
+    !rt.is_null() && unsafe { (*rt).runs_task() }
 }
 
 pub(crate) fn current_fiber_slot() -> Option<Arc<FiberSlot>> {
@@ -1600,9 +1626,10 @@ pub(crate) unsafe extern "C" fn gc_roots(args: *const GcRootsArgs) -> i64 {
     // (3) The root computation's frames on the OS thread stack, when recorded. Its low bound is the
     // current SP if `gc.roots` is called directly from the root (no fiber on this vCPU), else the
     // outermost fiber's resumer SP — the root's saved low-water mark at the point it resumed the
-    // chain.
+    // chain. A task's root (#1469) runs on its platform fiber, so its outermost guest fiber is
+    // `yielders[1]`: `yielders[0]`'s resumer SP is on the worker's stack.
     if rt.root_entry_sp != 0 {
-        let root_low = match rt.yielders.first() {
+        let root_low = match rt.yielders.get(rt.runs_task() as usize) {
             None => current_sp(),
             Some(&y) => (*y).resumer_sp() as usize,
         };
