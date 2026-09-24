@@ -43,6 +43,12 @@ env:
   # Pin stable so a channel roll can't silently introduce new clippy/rustc lints
   # under -D warnings (bump deliberately, same posture as the nightly-pinned fuzz job).
   RUST_STABLE: "1.97.0"
+  # Part of every Swatinem/rust-cache key, which hashes `RUST*`/`CARGO*` env vars. The key covers
+  # Cargo.lock and the member manifests but NOT the root `Cargo.toml`, so a `[profile]` edit there,
+  # which rebuilds every dependency, still restores the old cache as a full match, and a full match
+  # never saves: every job rebuilds its dependencies on every run, indefinitely. Bump this with any
+  # root-profile change (`Cargo.toml` says so beside the profiles).
+  RUST_CACHE_EPOCH: "1"
   # The Postgres the playground ships. One source of truth on purpose: it keys the build-input cache
   # *and* is read by build-pg-assets.mjs. If those two ever disagree, a bump would hit the old
   # version's cached bitcode + cluster, skip the rebuild, and ship the old Postgres — silently.
