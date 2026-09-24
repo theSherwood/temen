@@ -108,35 +108,19 @@ fn a_live_detached_child_freezes_and_thaws_on_the_jit_through_the_codec() {
     };
     assert_eq!(base, vec![4950], "uninterrupted total");
 
-    // Freeze from the start: the parent spawns the child, unwinds at its next poll; the freeze rings
-    // the child's own freeze word and the harvest carries its window + powerbox onto the Host.
-    //
-    // The child runs on its own OS thread and the ring comes only once the parent has unwound, so on
-    // a loaded machine the child can finish its loop first (#1760). That run is correct too — the
-    // harvest records a completed child, whose result a thaw's join reads back — but it is not the
-    // case under test, so check it and freeze again until the child is live at the freeze.
-    let (fhost, fargs, fsnap) = (0..50)
-        .find_map(|_| {
-            let (mut fhost, fargs) = powerbox(&child);
-            let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
-            write_state(&mut win, STATE_UNWINDING);
-            let (_, fsnap) =
-                temen_run::jit_cap_run(&parent, 0, &fargs, &win, PARENT_LOG2, 0, &mut fhost)
-                    .expect("JIT freeze");
-            assert_eq!(read_state(&fsnap), STATE_UNWINDING, "the parent froze");
-            assert!(
-                fhost.unreached_detached().is_empty(),
-                "the child reached its poll"
-            );
-            if fhost.captured_detached().is_empty() {
-                let done = fhost.frozen_detached();
-                assert_eq!(done.len(), 1, "a child the freeze missed finished");
-                assert_eq!((done[0].slot, done[0].completed_result), (0, Ok(4950)));
-                return None;
-            }
-            Some((fhost, fargs, fsnap))
-        })
-        .expect("the child was live at the freeze in one of 50 runs");
+    // Freeze from the start: the parent spawns the child while already unwinding, so the child starts
+    // with its own freeze word set (#1760) and unwinds at its first poll, however its thread is
+    // scheduled; the harvest carries its window + powerbox onto the Host.
+    let (mut fhost, fargs) = powerbox(&child);
+    let mut win = init_durable_window(1 << PARENT_LOG2, ARENA);
+    write_state(&mut win, STATE_UNWINDING);
+    let (_, fsnap) = temen_run::jit_cap_run(&parent, 0, &fargs, &win, PARENT_LOG2, 0, &mut fhost)
+        .expect("JIT freeze");
+    assert_eq!(read_state(&fsnap), STATE_UNWINDING, "the parent froze");
+    assert!(
+        fhost.unreached_detached().is_empty(),
+        "the child reached its poll"
+    );
     assert_eq!(
         fhost.captured_detached().len(),
         1,
