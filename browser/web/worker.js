@@ -32,7 +32,7 @@ const jitRes = (ret, tc) => tc === 0 ? BigInt(ret) // i32 value
 
 self.onmessage = async (e) => {
   const { module, memory, prog, win, winSize, role, func, sp, arg, slot, stackTop, tlsBase,
-    smod, entry, slog, fuel, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
+    smod, entry, slog, fuel, vcpu, rootDomain, tierup, gptr, glen, tierupCell, jitCodegen, jitService, instCodegen,
     jitB2, jitRuntime, tierupPaged, childMem } = e.data;
   // I22 liveness backstop. The `temen_par_run` loop below already catches host traps, but the SETUP +
   // codegen calls before it (WebAssembly.instantiate, temen_par_enable_jit / _jit_codegen /
@@ -319,6 +319,7 @@ self.onmessage = async (e) => {
           const ttlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
           self.postMessage({
             kind: 'spawn', smod, func, sp: sp.toString(), arg: arg.toString(),
+            rootDomain, // a thread joins its spawner's domain
             win, winSize, fuel,
             slot: tslot, stackTop: tstackTop, tlsBase: ttlsBase,
           });
@@ -389,7 +390,7 @@ self.onmessage = async (e) => {
       ? ex.temen_par_child_confined(prog, win, slog, smod, entry, BigInt(fuel))
       : role === 'detached'
         ? ex.temen_par_child_detached(prog, registerForeign(childMem, fbase), slog, smod, entry, BigInt(fuel))
-        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg));
+        : ex.temen_par_child(prog, win, winSize, smod | 0, func, BigInt(sp), BigInt(arg), BigInt(vcpu ?? 0));
   if (v === 0) { self.postMessage({ kind: 'fail', why: 'vcpu build failed' }); return; }
 
   const handles = []; // local spawn handle (index) → child completion slot ptr
@@ -436,13 +437,18 @@ self.onmessage = async (e) => {
     if (evc === TRAP) {
       Atomics.store(i32(), slot >> 2, 2); // 2 = trapped
       Atomics.notify(i32(), slot >> 2);
-      // ev_b = 1: the guest called `exit(ev_a)` — the run's end from any vCPU, as for a process.
-      // Otherwise ev_c/ev_d are the trap name's bytes (a `&'static str` in the shared memory).
-      if (ex.temen_par_ev_b(v) === 1n) {
+      // A member's trap or `exit` is terminal for its whole domain (DESIGN.md §12, I37 — the
+      // cooperative driver's `teardown_domains`). For the root domain (the root and its threads) that
+      // is the run: report it, and the page tears every Worker down. A §14 confined or detached
+      // child's domain ends with it here; its joiner observes the trap through the slot above.
+      // ev_b = 1: the guest called `exit(ev_a)`. Otherwise ev_c/ev_d are the trap name's bytes (a
+      // `&'static str` in the shared memory).
+      if (rootDomain && ex.temen_par_ev_b(v) === 1n) {
         self.postMessage({ kind: 'exit', code: Number(ex.temen_par_ev_a(v)) });
-      } else if (role === 'root') {
+      } else if (rootDomain) {
         const p = Number(ex.temen_par_ev_c(v)), n = Number(ex.temen_par_ev_d(v));
-        self.postMessage({ kind: 'trap', why: `guest trap: ${new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n))}` });
+        const name = new TextDecoder().decode(new Uint8Array(memory.buffer).slice(p, p + n));
+        self.postMessage({ kind: 'trap', why: `guest trap: ${name}${role === 'root' ? '' : ` (in a spawned thread)`}` });
       }
       ex.temen_par_free(v);
       return;
@@ -459,6 +465,8 @@ self.onmessage = async (e) => {
       const ctlsBase = tlsSize > 0 ? roundUp(ex.temen_par_alloc(tlsSize + tlsAlign), tlsAlign) : 0;
       self.postMessage({
         kind: 'spawn', smod: csmod, func: cfunc, sp: csp.toString(), arg: carg.toString(),
+        vcpu: ex.temen_par_ev_d(v).toString(), // the child's dense vCPU id (seeds its `vcpu.tls`)
+        rootDomain, // a thread joins its spawner's domain
         win, winSize,
         slot: cslot, stackTop: cstackTop, tlsBase: ctlsBase,
       });

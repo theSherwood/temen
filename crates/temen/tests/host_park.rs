@@ -344,6 +344,7 @@ fn drive<'s, 'e>(
                 sp,
                 arg,
                 module,
+                vcpu: vid,
             } => {
                 let id = orch.fresh_id();
                 let child = bytecode::Vcpu::new_child_in(
@@ -354,6 +355,7 @@ fn drive<'s, 'e>(
                     Arc::clone(back),
                 )
                 .expect("child vcpu")
+                .with_vcpu_id(vid)
                 .with_shared_host(pb);
                 scope.spawn(move || {
                     let r = drive(scope, prog, back, pb, orch, child);

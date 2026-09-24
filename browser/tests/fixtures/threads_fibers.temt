@@ -1,0 +1,40 @@
+; #1761 — a fiber that migrates between vCPUs, reading `vcpu.tls` on each. The root creates fiber F
+; and runs it to its first `suspend` (F read tls 0 on the root); a spawned thread (dense vCPU id 1)
+; resumes it, F reads tls 1 and returns 1*10 + 3; the root adds its own tls 0 — 13 on every driver.
+; Shared by `tests/par_onramp.rs` (native, real OS threads) and `gencorpus` (the `capio` item,
+; real Web Workers); the tree-walker/bytecode twin is `crates/temen/tests/fiber_migrate.rs`.
+memory 16
+func () -> (i64) {
+block 0 () {
+  v0 = ref.func 2
+  v1 = i64.const 4096
+  v2 = cont.new v0 v1
+  v3 = i64.const 0
+  v4, v5 = cont.resume v2 v3
+  v6 = thread.spawn 1 v2 v2
+  v7 = thread.join v6
+  v8 = vcpu.tls.get
+  v9 = i64.add v5 v7
+  v10 = i64.add v9 v8
+  return v10
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = i64.const 3
+  v1, v2 = cont.resume varg v0
+  return v2
+  }
+}
+func (i64, i64) -> (i64) {
+block 0 (vsp: i64, varg: i64) {
+  v0 = vcpu.tls.get
+  v1 = suspend v0
+  v2 = vcpu.tls.get
+  v3 = i64.const 10
+  v4 = i64.mul v2 v3
+  v5 = i64.add v4 v1
+  return v5
+  }
+}
+export 0 func "_start" 0
