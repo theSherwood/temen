@@ -351,11 +351,14 @@ pub fn capability_axes(c: Capability) -> [Cell; 7] {
         Capability::Stream | Capability::Exit | Capability::Clock => [F, F, B, U, K, O, F],
 
         // A pipe end is `Stream`-typed but index-carrying: `regrant_into_child` aliases its shared
-        // FIFO into the child (the cross-domain `cmd1 | cmd2` grant), while a freeze cannot carry the
-        // live queue.
+        // FIFO into the child (the cross-domain `cmd1 | cmd2` grant). A pipe whose every end is in
+        // the frozen tree rides as data (#1680); one with an end outside it is the cut's boundary.
         Capability::PipeEnd => [
             F,
-            declines("the live FIFO backing cannot be serialized (NonDurableKind::Pipe)"),
+            conditional(
+                "a pipe the tree minted rides the cut (#1680); an embedder-fed pipe, or one with an \
+                 end outside the cut, is the boundary, not yet carried",
+            ),
             B,
             U,
             K,

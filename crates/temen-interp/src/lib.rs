@@ -2777,6 +2777,9 @@ fn seed_domain(
                 .find(|cs| cs.parent_task == fnr.parent_task && cs.slot == fnr.slot);
             let arity = cfuncs.get(fnr.entry as usize).map_or(0, |f| f.params.len());
             let child_args = if let Some(cs) = cstate {
+                // #1680: its pipe ends re-open on the pipes the root's restore rebuilt, shared
+                // with every other domain of the tree that holds an end.
+                ch.thaw_pipes = host_shared.lock_unpoisoned().thaw_pipes.clone();
                 ch.restore_durable_handles(&cs.handles);
                 // #1296: rebuild the child's §22 unit tables (from their captured, re-verified IR)
                 // and its dispatch-table reservation *before* the run resolves its `JitTable`
@@ -7862,6 +7865,9 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                             // its `JitTable` handle on thaw). Captured beside the handles + serve trio.
                             let jit_tables = hg.capture_durable_jit();
                             let jit_table_log2 = hg.jit_table_log2();
+                            // #1680: the pipes its ends name ride the sink too; their bytes are
+                            // read at capture, once the whole tree has quiesced.
+                            let pipes = hg.durable_pipe_backings();
                             // Record whenever the child holds ANY state a fresh-host thaw would
                             // drop — handles included (every child holds at least its
                             // instantiator grant; restoring the captured table verbatim
@@ -7875,18 +7881,18 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 drop(hg);
                                 let sink =
                                     v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
-                                sink.lock_unpoisoned()
-                                    .frozen_child_state
-                                    .push(FrozenChildState {
-                                        parent_task: v.parent_task as usize,
-                                        slot: v.nested_slot,
-                                        svc_queue: q,
-                                        svc_results: r,
-                                        svc_next_ticket: t,
-                                        handles,
-                                        jit_tables,
-                                        jit_table_log2,
-                                    });
+                                let mut sg = sink.lock_unpoisoned();
+                                sg.frozen_pipes.extend(pipes);
+                                sg.frozen_child_state.push(FrozenChildState {
+                                    parent_task: v.parent_task as usize,
+                                    slot: v.nested_slot,
+                                    svc_queue: q,
+                                    svc_results: r,
+                                    svc_next_ticket: t,
+                                    handles,
+                                    jit_tables,
+                                    jit_table_log2,
+                                });
                             }
                             false
                         }
@@ -18452,8 +18458,9 @@ enum Binding {
     /// in [`Host::pipes`] and which half it is. `write = true` appends to the FIFO (op 1), `false`
     /// drains it (op 0). **Blocking + bounded** (FORK.md §8.6): an empty read parks while a writer is
     /// open (else EOF); a write to a full FIFO parks (backpressure, `PIPE_CAP`) and a write to a
-    /// reader-closed pipe is `-EPIPE`. Index-carrying, so non-durable and non-copyable, like
-    /// [`Binding::SharedRegion`].
+    /// reader-closed pipe is `-EPIPE`. Index-carrying, so non-copyable, like
+    /// [`Binding::SharedRegion`]. Durable when the domain tree minted it (#1680,
+    /// [`DurableBinding::PipeEnd`]).
     PipeEnd {
         pipe: u32,
         write: bool,
@@ -18650,6 +18657,14 @@ pub enum DurableBinding {
     JitTable {
         idx: u32,
     },
+    /// #1680 — one end of a pipe the domain tree minted (DURABILITY §4, "the cut and its boundary"):
+    /// a pipe with every end inside the cut is data, so it rides. `pipe` is the pipe's live global
+    /// id, the key of its [`DurablePipe`]; the codec renumbers it to an artifact-local number on the
+    /// wire and back to the id [`Host::restore_durable_pipes`] minted on restore. `write` is which end.
+    PipeEnd {
+        pipe: u32,
+        write: bool,
+    },
     /// §22 `CompiledCode` handle (DESIGN.md §22): `(domain, unit)` indices into the rebuilt
     /// `jit_tables`, matching [`Binding::JitCode`]. Named only in `invoke`/`release`, so the
     /// index pair is its whole authority — durable once the domain's units are captured.
@@ -18807,6 +18822,29 @@ pub struct FreezeDeclined {
     pub task: u64,
     /// The task's child slot the cause is about, when it is about a child.
     pub slot: Option<usize>,
+}
+
+/// #1680 — a pipe inside the cut, for a snapshot: its buffered bytes, plus the live end counts the
+/// codec checks the cut against. Every end of a pipe that rides must be a [`DurableBinding::PipeEnd`]
+/// somewhere in the frozen tree; a pipe with an end outside it (held by another domain, or fed by
+/// the embedder) crosses the cut's boundary, which this slice does not yet carry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DurablePipe {
+    /// The key its [`DurableBinding::PipeEnd`]s name (see there).
+    pub key: u32,
+    /// The FIFO's contents, oldest first. At most the pipe capacity.
+    pub bytes: Vec<u8>,
+    /// Open write ends: at capture, the live count; on restore, the ends the cut carries — the
+    /// root's and every nested child's, including a child not yet re-created by the thaw.
+    pub writers: usize,
+    /// Open read ends, like `writers`.
+    pub readers: usize,
+}
+
+/// #1680 — a restore offered a pipe larger than a pipe can hold.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PipeRestoreError {
+    pub key: u32,
 }
 
 /// Why a handle table can't be snapshotted in v1: a live slot holds a binding that carries
@@ -20807,6 +20845,13 @@ pub struct Host {
     /// self-unwind into the subtree's shared sink; the codec merges it into the child's
     /// nested record). Empty for plain children, so plain-subtree artifacts are unchanged.
     frozen_child_state: Vec<FrozenChildState>,
+    /// #1680 — the pipes a subtree freeze's nested children hold, by global id, pushed into the
+    /// shared sink by each child's self-unwind beside its [`FrozenChildState`]. Their bytes are read
+    /// at capture ([`Host::capture_durable_pipes`]), once every vCPU has quiesced.
+    frozen_pipes: BTreeMap<u32, PipeBacking>,
+    /// #1680 — the pipes a restore rebuilt ([`Host::restore_durable_pipes`]), by their new global id,
+    /// for [`Host::restore_durable_handles`] to re-open ends on. A thawed nested child is handed a copy.
+    thaw_pipes: BTreeMap<u32, PipeBacking>,
     /// The freeze/thaw **root** vCPU's flattened shadow-SP extent (slice 3.2.1). The single shared
     /// active-SP word holds only the *last* context to run at freeze end (a spawned child), so the
     /// root's own extent — its implicit residue (the thaw caller re-enters the root directly) — is
@@ -21226,6 +21271,8 @@ impl Host {
             thawed_detached: Vec::new(),
             freeze_declined: None,
             frozen_child_state: Vec::new(),
+            frozen_pipes: BTreeMap::new(),
+            thaw_pipes: BTreeMap::new(),
             frozen_root_sp: None,
             cap_names: Vec::new(),
             named_cap_registrar: None,
@@ -23165,7 +23212,13 @@ impl Host {
                 // rides verbatim. The index is valid by construction (`budgets` only grows, and every
                 // `Binding::Budget` is minted from a push), so this is a lookup, not a check.
                 Binding::Budget(i) => DurableBinding::Budget(self.budgets[i as usize]),
-                Binding::PipeEnd { .. } => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
+                // #1680: a pipe the domain tree minted rides by its global id (the codec checks that
+                // every end is inside the cut). An embedder-fed pipe (no channel charge) is fed from
+                // outside the tree: the cut's boundary, not yet carried.
+                Binding::PipeEnd { pipe, write } => match self.pipes.get(pipe as usize) {
+                    Some(b) if b.4.is_some() => DurableBinding::PipeEnd { pipe: b.3, write },
+                    _ => return Err(self.non_durable(slot, NonDurableKind::Pipe)),
+                },
             };
             out.push(DurableHandle {
                 slot: slot as u32,
@@ -23228,7 +23281,10 @@ impl Host {
                 Binding::HostProc(_) => NonDurableKind::HostProc,
                 Binding::Offer(_) => NonDurableKind::Offer,
                 Binding::LiveImpl(_) => NonDurableKind::LiveImpl,
-                Binding::PipeEnd { .. } => NonDurableKind::Pipe,
+                Binding::PipeEnd { pipe, .. } => match self.pipes.get(pipe as usize) {
+                    Some(b) if b.4.is_some() => continue, // #1680: durable, a drain keeps it
+                    _ => NonDurableKind::Pipe,
+                },
             };
             drained.push(NonDurableHandle {
                 slot: slot as u32,
@@ -23290,6 +23346,20 @@ impl Host {
                 // rebuilt separately by `restore_durable_jit` (positionally), so the index re-resolves.
                 DurableBinding::JitTable { idx } => Binding::JitTable(idx),
                 DurableBinding::JitCode { domain, unit } => Binding::JitCode { domain, unit },
+                // #1680: re-open the end on the pipe `restore_durable_pipes` rebuilt under this key.
+                // That pipe's counts already include this end (they are the cut's), so none is
+                // bumped here. A key naming no pipe (a mis-sequenced embedder; the codec rejects it)
+                // leaves the slot closed rather than forging a pipe.
+                DurableBinding::PipeEnd { pipe, write } => match self.thaw_pipes.get(&pipe) {
+                    Some(b) => {
+                        self.pipes.push(b.clone());
+                        Binding::PipeEnd {
+                            pipe: self.pipes.len() as u32 - 1,
+                            write,
+                        }
+                    }
+                    None => continue,
+                },
                 // #1361: re-resolve the module the artifact *names* against what this host has been
                 // granted. `check_modules_for_thaw` validated every carried digest before any slot
                 // was pinned, so this lookup cannot fail here; if a mis-sequenced embedder reached it
@@ -23316,6 +23386,70 @@ impl Host {
             };
             self.grant_at(h.slot, h.generation, h.type_id, binding);
         }
+    }
+
+    /// #1680 — the tree-minted pipes this domain's live ends name, with those its nested children
+    /// pushed into this sink, by global id: the pipe half of [`DurableBinding::PipeEnd`]. Read after
+    /// the freeze has quiesced, so the bytes are the cut's. Ascending key.
+    pub fn capture_durable_pipes(&self) -> Vec<DurablePipe> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut all = self.frozen_pipes.clone();
+        all.extend(self.durable_pipe_backings());
+        all.into_iter()
+            .map(|(key, (fifo, writers, readers, _, _))| DurablePipe {
+                key,
+                bytes: fifo.lock_unpoisoned().iter().copied().collect(),
+                writers: writers.load(SeqCst),
+                readers: readers.load(SeqCst),
+            })
+            .collect()
+    }
+
+    /// #1680 — the tree-minted pipes this domain's live ends name, by global id.
+    fn durable_pipe_backings(&self) -> BTreeMap<u32, PipeBacking> {
+        self.table
+            .iter()
+            .filter_map(|s| match s.entry {
+                Some(Binding::PipeEnd { pipe, .. }) => self.pipes.get(pipe as usize),
+                _ => None,
+            })
+            .filter(|b| b.4.is_some())
+            .map(|b| (b.3, b.clone()))
+            .collect()
+    }
+
+    /// #1680 — rebuild the cut's pipes before [`Self::restore_durable_handles`] re-opens their ends:
+    /// each gets its bytes, a fresh global id, the cut's end counts (every end the tree carries,
+    /// including those of nested children the thaw has yet to re-create), and a channel charge on
+    /// this domain (the thawing root holds the tree's pipe memory). Replaces any earlier set.
+    /// Refuses, with nothing rebuilt, a pipe holding more than a pipe can.
+    ///
+    /// Returns each pipe's new global id, in order: the caller rewrites the carried ends' keys to
+    /// them before re-pinning any ([`DurableBinding::PipeEnd`]).
+    pub fn restore_durable_pipes(
+        &mut self,
+        pipes: &[DurablePipe],
+    ) -> Result<Vec<u32>, PipeRestoreError> {
+        if let Some(p) = pipes.iter().find(|p| p.bytes.len() > PIPE_CAP) {
+            return Err(PipeRestoreError { key: p.key });
+        }
+        let count = |n| Arc::new(std::sync::atomic::AtomicUsize::new(n));
+        self.thaw_pipes.clear();
+        let mut ids = Vec::with_capacity(pipes.len());
+        for p in pipes {
+            let fifo = Arc::new(Mutex::new(p.bytes.iter().copied().collect()));
+            let gid = next_pipe_gid();
+            let b = (
+                fifo,
+                count(p.writers),
+                count(p.readers),
+                gid,
+                self.charge_channel(),
+            );
+            self.thaw_pipes.insert(gid, b);
+            ids.push(gid);
+        }
+        Ok(ids)
     }
 
     /// #1361 — check every carried [`DurableBinding::Module`] digest against this host's re-granted
