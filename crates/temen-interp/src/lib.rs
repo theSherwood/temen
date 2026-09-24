@@ -186,7 +186,7 @@ impl Reg {
 }
 
 /// Reasons execution stopped without producing results.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trap {
     /// Ran out of fuel (potential infinite loop) — see `run`.
     OutOfFuel,
@@ -244,6 +244,80 @@ impl Trap {
             Trap::FiberFault => "FiberFault",
             Trap::ThreadFault => "ThreadFault",
             Trap::Malformed => "Malformed",
+        }
+    }
+
+    /// The trap's stable numeric code: the JIT's trap-cell numbering (`TrapKind`, with `Exit` as
+    /// `7 | code << 32`), which is also what the snapshot codec writes for a trap that rides an
+    /// artifact (#1674). One numbering for both, so a trap crosses engines and artifacts unchanged.
+    pub fn code(self) -> i64 {
+        match self {
+            Trap::DivByZero => 1,
+            Trap::IntOverflow => 2,
+            Trap::BadConversion => 3,
+            Trap::Unreachable => 4,
+            Trap::IndirectCallType => 5,
+            Trap::CapFault => 6,
+            Trap::Exit(k) => 7 | ((k as u32 as i64) << 32),
+            Trap::MemoryFault => 8,
+            Trap::FiberFault => 9,
+            Trap::ThreadFault => 10,
+            Trap::OutOfFuel => 11,
+            Trap::Malformed => 12,
+            Trap::StackOverflow => 13,
+        }
+    }
+
+    /// The trap a [`Self::code`] names, if any.
+    pub fn from_code(c: i64) -> Option<Trap> {
+        Some(match c & 0xffff_ffff {
+            1 => Trap::DivByZero,
+            2 => Trap::IntOverflow,
+            3 => Trap::BadConversion,
+            4 => Trap::Unreachable,
+            5 => Trap::IndirectCallType,
+            6 => Trap::CapFault,
+            7 => Trap::Exit((c >> 32) as i32),
+            8 => Trap::MemoryFault,
+            9 => Trap::FiberFault,
+            10 => Trap::ThreadFault,
+            11 => Trap::OutOfFuel,
+            12 => Trap::Malformed,
+            13 => Trap::StackOverflow,
+            _ => return None,
+        })
+        .filter(|t| t.code() == c)
+    }
+}
+
+#[cfg(test)]
+mod trap_code_tests {
+    use super::Trap;
+
+    #[test]
+    fn every_trap_round_trips_through_its_code_and_nothing_else_decodes() {
+        let all = [
+            Trap::OutOfFuel,
+            Trap::DivByZero,
+            Trap::IntOverflow,
+            Trap::MemoryFault,
+            Trap::StackOverflow,
+            Trap::IndirectCallType,
+            Trap::Unreachable,
+            Trap::BadConversion,
+            Trap::CapFault,
+            Trap::Exit(0),
+            Trap::Exit(-2),
+            Trap::Exit(i32::MAX),
+            Trap::FiberFault,
+            Trap::ThreadFault,
+            Trap::Malformed,
+        ];
+        for t in all {
+            assert_eq!(Trap::from_code(t.code()), Some(t), "{t:?}");
+        }
+        for bad in [0, 14, 1 | (1 << 32), -1] {
+            assert_eq!(Trap::from_code(bad), None, "{bad:#x} is no trap's code");
         }
     }
 }
@@ -2599,7 +2673,7 @@ fn seed_domain(
                 s.results.insert(
                     cid,
                     Outcome {
-                        result: Ok(vec![Value::I64(r)]),
+                        result: r.map(|x| vec![Value::I64(x)]),
                         mem: None,
                         fuel,
                         trap_bt: Vec::new(),
@@ -2845,7 +2919,7 @@ fn seed_domain(
                 s.results.insert(
                     cid,
                     Outcome {
-                        result: Ok(vec![Value::I64(fd.completed_result)]),
+                        result: fd.completed_result.map(|x| vec![Value::I64(x)]),
                         mem: None,
                         fuel,
                         trap_bt: Vec::new(),
@@ -7307,14 +7381,11 @@ fn freeze_census(me: &Seat, sched: &SchedRef, root: &Arc<Mutex<Host>>) -> Option
                 }
                 let nested = seat.nested_children.iter().any(|c| c.slot == slot);
                 live_nested |= nested;
-                match s.results.get(&cid) {
-                    Some(o) if o.result.is_err() => {
-                        return declined(DeclineCause::ChildTrapped, seat.id, Some(slot));
-                    }
-                    None if !nested && !seat.child_freeze.contains_key(&slot) => {
-                        return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
-                    }
-                    _ => {}
+                if !nested
+                    && !s.results.contains_key(&cid)
+                    && !seat.child_freeze.contains_key(&slot)
+                {
+                    return declined(DeclineCause::DetachedUnreachable, seat.id, Some(slot));
                 }
             }
             if live_nested && live_thread {
@@ -7675,23 +7746,12 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                         // NB: a nested child (`v.nested_child`) is **no longer** refused here — a §14
                         // child may record its own live children (grandchildren), tagged with this
                         // vCPU's task id and pushed to the subtree's shared sink (depth-2+, §4).
-                        let mut refuse = false;
                         for c in &live {
                             let cid = v.threads[c.slot].expect("filtered to Some");
                             let completed_result = if v.sched.has_result(cid) {
-                                // Take the finished child's result; a clean `Ok(i64)` rides the artifact,
-                                // a completed-with-trap child is not yet representable — fail closed.
-                                match v.sched.take_result(cid).map(|o| o.result) {
-                                    Some(Ok(vals)) => Some(match vals.first() {
-                                        Some(Value::I64(x)) => *x,
-                                        Some(Value::I32(x)) => *x as i64,
-                                        _ => 0,
-                                    }),
-                                    _ => {
-                                        refuse = true;
-                                        break;
-                                    }
-                                }
+                                // Take the finished child's join outcome — its value, or its trap
+                                // (#1674) — which rides the artifact for the rewound `join`.
+                                v.sched.take_result(cid).map(|o| join_outcome(o.result))
                             } else {
                                 // Still running: broadcast `UNWINDING` into its carve; it self-unwinds.
                                 if let Some(m) = v.mem.as_mut() {
@@ -7719,7 +7779,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                                 completed_result,
                             });
                         }
-                        refuse
+                        false
                     }
                 };
                 // DURABILITY.md §13.4 slice 4c: a **nested child's** host state — its serve trio
@@ -7787,8 +7847,7 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                 // `completed_result` — its result is taken from the scheduler and its separate window
                 // need not ride (reload-not-reissue on thaw, exactly like a completed nested child).
                 // A **still-running** one is rung (step 3) and captured by the harvest (step 4). A
-                // completed-**trapped** one is not representable yet (#1674; the freeze census
-                // declines it at the trigger, #1671).
+                // completed-**trapped** one rides its trap the same way (#1674).
                 let detached_live_refused = froze && {
                     let detached: Vec<usize> = v
                         .child_hosts
@@ -7802,29 +7861,13 @@ fn dispatch(sched: &Arc<Scheduler>, mut v: Box<VCpu>) {
                     let mut refuse = false;
                     for slot in detached {
                         let cid = v.threads[slot].expect("filtered to Some");
-                        if v.sched.has_result(cid) {
-                            match v.sched.take_result(cid).map(|o| o.result) {
-                                Some(Ok(vals)) => {
-                                    let r = match vals.first() {
-                                        Some(Value::I64(x)) => *x,
-                                        Some(Value::I32(x)) => *x as i64,
-                                        _ => 0,
-                                    };
-                                    let sink = v
-                                        .freeze_sink
-                                        .clone()
-                                        .unwrap_or_else(|| Arc::clone(&v.host));
-                                    sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
-                                        parent_task: v.id as usize,
-                                        slot,
-                                        completed_result: r,
-                                    });
-                                }
-                                _ => {
-                                    refuse = true; // completed-with-trap: not representable yet
-                                    break;
-                                }
-                            }
+                        if let Some(o) = v.sched.take_result(cid) {
+                            let sink = v.freeze_sink.clone().unwrap_or_else(|| Arc::clone(&v.host));
+                            sink.lock_unpoisoned().frozen_detached.push(FrozenDetached {
+                                parent_task: v.id as usize,
+                                slot,
+                                completed_result: join_outcome(o.result),
+                            });
                         } else {
                             // #1361 step 3 — **still running**: ring the freeze doorbell and record
                             // the child for harvest. We do not wait for it: this vCPU is itself
@@ -9831,13 +9874,13 @@ pub struct FrozenNested {
     /// modules (host-supplied at restore, D-scope — the module bytes never ride the artifact). A
     /// missing / mismatched re-grant makes the thaw fail closed (per-child R5 identity gate).
     pub module_digest: Option<[u8; 32]>,
-    /// `Some(result)` for a **completed-but-unjoined** child — one that finished before the freeze
-    /// point, so its `thread.join` result must survive in the artifact (its continuation is gone; the
-    /// scheduler result cell isn't captured). The thaw delivers this straight into the parent's join
-    /// table **without re-running** the child (reload-not-reissue — no double side effects); its carve
-    /// gets no `UNWINDING` broadcast (nothing to unwind). `None` for a still-running child (re-attached
-    /// + rewound on thaw). Mirrors [`FrozenVCpu::completed_result`] for `thread.spawn` children.
-    pub completed_result: Option<i64>,
+    /// `Some(outcome)` for a **completed-but-unjoined** child — one that finished before the freeze
+    /// point, so its `thread.join` outcome must survive in the artifact (its continuation is gone; the
+    /// scheduler result cell isn't captured): its value, or the trap its `join` re-raises (#1674).
+    /// The thaw delivers this straight into the parent's join table **without re-running** the child
+    /// (reload-not-reissue — no double side effects); its carve gets no `UNWINDING` broadcast (nothing
+    /// to unwind). `None` for a still-running child (re-attached + rewound on thaw).
+    pub completed_result: Option<Result<i64, Trap>>,
 }
 
 /// #1361 step 2 — a **completed-but-unjoined detached §14 child** captured at a subtree freeze. A
@@ -9857,8 +9900,19 @@ pub struct FrozenDetached {
     pub parent_task: usize,
     /// The spawner's `threads`/join slot the child was minted at — where the reloaded handle resolves.
     pub slot: usize,
-    /// The child's clean `thread.join` result (an `i64`; an `i32` result is sign-extended at capture).
-    pub completed_result: i64,
+    /// The child's `thread.join` outcome: its value (an `i32` result is sign-extended at capture), or
+    /// the trap its `join` re-raises (#1674).
+    pub completed_result: Result<i64, Trap>,
+}
+
+/// A finished child's `thread.join` outcome as a freeze records it: its first result as an `i64` (an
+/// `i32` sign-extended), or its trap.
+fn join_outcome(r: Result<Vec<Value>, Trap>) -> Result<i64, Trap> {
+    r.map(|vals| match vals.first() {
+        Some(Value::I64(x)) => *x,
+        Some(Value::I32(x)) => *x as i64,
+        _ => 0,
+    })
 }
 
 /// #1361 step 3 — a **live** detached §14 child the freeze rang the doorbell for, recorded while the
@@ -18769,9 +18823,6 @@ pub enum JitRestoreError {
 /// it did not begin it. See [`FreezeDeclined`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DeclineCause {
-    /// A §14 child completed with a trap and has not been joined; a trap cannot ride the artifact
-    /// yet (#1674).
-    ChildTrapped,
     /// A child domain holds a handle no artifact can carry (§12.5). The root's own handles are the
     /// codec's to answer ([`Host::capture_durable_handles`]), since its embedder can still drain them.
     NonDurableHandle(NonDurableHandle),

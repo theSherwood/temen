@@ -1687,7 +1687,9 @@ fn jit_durable_enter(cm: &mut CompiledModule, host: &mut Host) -> Result<(), tem
             carve_off: n.carve_off,
             size_log2: n.size_log2,
             entry: n.entry,
-            completed_result: n.completed_result,
+            completed_result: n
+                .completed_result
+                .map(|r| r.map_err(temen_interp::Trap::code)),
         })
         .collect();
     let detached = detached_seeds(host)?;
@@ -1807,7 +1809,13 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
             max_vcpus: usize::MAX,
             same_module,
         };
-        match (h.image, h.outcome) {
+        // A finished child's `join` outcome — its value, or its trap (#1674); `None` for a trap cell
+        // that names no trap, which stays unreached.
+        let outcome = h.outcome.and_then(|(result, trap)| match trap {
+            0 => Some(Ok(result)),
+            t => temen_interp::Trap::from_code(t).map(Err),
+        });
+        match (h.image, outcome) {
             (Some(image), _) => {
                 let pages = image.len() / temen_interp::DURABLE_SNAPSHOT_PAGE as usize;
                 let window = temen_interp::MemLayout::from_dense(
@@ -1835,10 +1843,10 @@ fn jit_detached_leave(cm: &mut CompiledModule, host: &mut Host) {
                     },
                 });
             }
-            (None, Some((result, 0))) => completed.push(temen_interp::FrozenDetached {
+            (None, Some(outcome)) => completed.push(temen_interp::FrozenDetached {
                 parent_task: 0,
                 slot: h.slot,
-                completed_result: result,
+                completed_result: outcome,
             }),
             _ => unreached.push(temen_interp::PendingDetached {
                 parent_task: 0,
@@ -1911,7 +1919,12 @@ fn jit_durable_leave(cm: &mut CompiledModule, host: &mut Host) {
                     size_log2: n.size_log2,
                     entry: n.entry,
                     module_digest: None,
-                    completed_result: n.completed_result,
+                    completed_result: n.completed_result.map(|r| {
+                        r.map_err(|c| {
+                            temen_interp::Trap::from_code(c)
+                                .unwrap_or(temen_interp::Trap::Malformed)
+                        })
+                    }),
                 })
                 .collect(),
         );
