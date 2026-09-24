@@ -1768,26 +1768,35 @@ pub fn compile_and_run_durable(
     cap_ctx: *mut core::ffi::c_void,
     run: DurableRun,
 ) -> Result<(JitOutcome, Vec<u8>, DurableResidue), JitError> {
-    let mut cm = CompiledModule::compile(
-        m,
-        func,
-        cap_thunk,
-        cap_ctx,
-        reserved_log2,
-        None, // sub
-        None, // resolve_module
-        None, // interrupt
-        None, // fuel
-        None, // fast_resolver
-        Quota::default(),
-        0,
-    )?;
-    cm.restore_prots = run.init_prots;
-    cm.set_durable(run.seed);
-    cm.concurrent_durable = run.freeze.is_some();
-    cm.freeze_ctl = run.freeze;
-    let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
-    Ok((outcome, win, cm.take_durable_residue()))
+    let freeze = run.freeze.clone();
+    let r = (|| {
+        let mut cm = CompiledModule::compile(
+            m,
+            func,
+            cap_thunk,
+            cap_ctx,
+            reserved_log2,
+            None, // sub
+            None, // resolve_module
+            None, // interrupt
+            None, // fuel
+            None, // fast_resolver
+            Quota::default(),
+            0,
+        )?;
+        cm.restore_prots = run.init_prots;
+        cm.set_durable(run.seed);
+        cm.concurrent_durable = run.freeze.is_some();
+        cm.freeze_ctl = run.freeze;
+        let (outcome, win) = cm.run(args, Some(init_mem), Some(SNAP_CAP))?;
+        Ok((outcome, win, cm.take_durable_residue()))
+    })();
+    // #1693: retire on every exit. A run that failed before publishing its window would otherwise
+    // leave a request spinning forever on base 0; after the run's own retire this is a no-op.
+    if let Some(fc) = freeze {
+        fc.retire();
+    }
+    r
 }
 
 /// A §14 **nested sub-window**: run the guest confined to `[base, base+child_size)` of a
