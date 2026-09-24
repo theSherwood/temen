@@ -134,7 +134,7 @@ pub unsafe fn fiber_park_current() {
     let slot = fiber_rt::current_fiber_slot().expect("fiber_park_current outside a fiber");
     // #1631 — a bare host-thunk park carries no deadline: nothing wakes it on its own, so it
     // counts as parked.
-    fiber_rt::fiber_event_park(&slot, false);
+    fiber_rt::fiber_event_park(&slot, false, None);
 }
 
 // §12 per-vCPU TLS register (`vcpu.tls.get`/`set`): one i64 per OS thread (a vCPU). Always compiled
