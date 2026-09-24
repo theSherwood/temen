@@ -106,14 +106,20 @@ static long read_line(long fd, char *buf, long lim) {
 }
 
 /* Split `line` into space-separated tokens (runs of spaces collapse), writing pointers into argv and
-   returning the count (capped at MAXARGS). Mutates `line` in place with NUL terminators. The cap is
-   generous so glob expansion (which grows argv) has room. */
-#define MAXARGS 64
+   returning the count, or -1 when there are more than MAXARGS: dropping the rest would run a
+   different command than the one asked for. Mutates `line` in place with NUL terminators. The cap is
+   generous so glob expansion (which grows argv) has room, and so a build step naming every module
+   of a program — nimony's DCE and link steps do — fits. */
+#define MAXARGS 1024
+/* The longest command line: `sh -c` text, a stdin line, a pipeline stage. POSIX promises at least
+   4096 bytes of arguments (`_POSIX_ARG_MAX`); a build tool's step lists every module path. */
+#define LINE_MAX 32768
 static int tokenize(char *line, char **argv) {
   int argc = 0, i = 0;
   for (;;) {
     while (line[i] == ' ') i++;
-    if (line[i] == 0 || argc >= MAXARGS) break;
+    if (line[i] == 0) break;
+    if (argc >= MAXARGS) return -1;
     argv[argc++] = line + i;
     while (line[i] && line[i] != ' ') i++;
     if (line[i] == ' ') line[i++] = 0;
@@ -360,6 +366,7 @@ static int simple_command(char *line) {
 static int exec_line(char *line) {
   char *argv[MAXARGS];
   int argc = tokenize(line, argv);
+  if (argc < 0) { puts_("sh: too many arguments\n"); return 2; }
   if (argc == 0) return 0;
   /* A lone `NAME=VALUE` (identifier before `=`) sets a shell variable, expanding the RHS. */
   if (argc == 1) {
@@ -608,9 +615,9 @@ static int ring_filter_ok(char *st) {
     char c = st[i];
     if (c == '<' || c == '>' || c == '$' || c == '*' || c == '?') return 0;
   }
-  static char cp[256]; scpy(cp, st);
+  static char cp[LINE_MAX]; scpy(cp, st);
   char *av[MAXARGS]; int ac = tokenize(cp, av);
-  if (ac == 0) return 0;
+  if (ac <= 0) return 0;
   char *c0 = av[0];
   if (streq(c0, "cat") || streq(c0, "wc") || streq(c0, "sort") || streq(c0, "uniq")) return ac == 1;
   if (streq(c0, "grep")) {
@@ -638,8 +645,8 @@ static long stage_records(void) { return stage_carve0() + 3 * TEMEN_STAGE_WIN + 
    its input ring `rin`, and (for a non-final stage) its output ring `rout`; argv = the stage's
    tokens (argv[0] picks the filter). Returns the op-13 child handle. */
 static long spawn_stage(long mod, char *stage, long carve, int rin, int rout) {
-  static char cp[256]; scpy(cp, stage);
-  char *av[MAXARGS]; int ac = tokenize(cp, av);
+  static char cp[LINE_MAX]; scpy(cp, stage);
+  char *av[MAXARGS]; int ac = tokenize(cp, av);   /* a ring filter: `ring_filter_ok` admitted it */
   long base = stage_records();
   int *rec = (int *)base;
   char *nm = (char *)(base + 64);
@@ -839,7 +846,7 @@ static int run_top(char *line) {
 }
 
 int main(void) {
-  static char cmd[256];
+  static char cmd[LINE_MAX];
   /* `sh -c "<command>"` — a single command line delivered via argv. */
   if (argc_() >= 3) {
     static char flag[8];
@@ -854,17 +861,19 @@ int main(void) {
     }
   }
   /* Otherwise: a read-eval loop over stdin. */
-  static char line[256];
+  static char line[LINE_MAX];
   for (;;) {
-    int n = 0;
+    int n = 0, over = 0;
     for (;;) {
       char c;
       long r = read(0, &c, 1);
-      if (r <= 0) { if (n == 0) return 0; break; }   /* EOF ends the shell */
+      if (r <= 0) { if (n == 0 && !over) return 0; break; }   /* EOF ends the shell */
       if (c == '\n') break;
-      if (n < 255) line[n++] = c;
+      if (n < LINE_MAX - 1) line[n++] = c; else over = 1;
     }
     line[n] = 0;
+    /* A line that does not fit is refused, not cut short and run as something else. */
+    if (over) { puts_("sh: line too long\n"); last_status = 2; continue; }
     last_status = run_top(line);
   }
 }

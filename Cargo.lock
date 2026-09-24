@@ -821,9 +821,17 @@ dependencies = [
  "temen-interp",
  "temen-ir",
  "temen-jit",
+ "temen-posix-abi",
  "temen-run",
  "temen-text",
  "temen-verify",
+]
+
+[[package]]
+name = "temen-posix-abi"
+version = "0.0.0"
+dependencies = [
+ "temen-ir",
 ]
 
 [[package]]
