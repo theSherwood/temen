@@ -1269,19 +1269,21 @@ pub fn jit_interp_fuel_agree(m: &Module, args: &[Value], budget: u64) -> bool {
 }
 
 fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
-    match t {
-        Trap::DivByZero => Some(TrapKind::DivByZero),
-        Trap::IntOverflow => Some(TrapKind::IntOverflow),
-        Trap::BadConversion => Some(TrapKind::BadConversion),
-        Trap::Unreachable => Some(TrapKind::Unreachable),
-        Trap::IndirectCallType => Some(TrapKind::IndirectCallType),
-        Trap::CapFault => Some(TrapKind::CapFault),
-        // Fuel unification: the JIT now counts fuel at the same safepoints, so `OutOfFuel` is a
-        // modeled, non-droppable trap — when the interp exhausts, the armed JIT must too (it cannot
-        // silently *return* where the interp ran out; enforced by the `(Err, Returned)` arm).
-        Trap::OutOfFuel => Some(TrapKind::OutOfFuel),
-        _ => None,
-    }
+    // Fuel unification: the JIT now counts fuel at the same safepoints, so `OutOfFuel` is a
+    // modeled, non-droppable trap — when the interp exhausts, the armed JIT must too (it cannot
+    // silently *return* where the interp ran out; enforced by the `(Err, Returned)` arm).
+    let modeled = matches!(
+        t,
+        Trap::DivByZero
+            | Trap::IntOverflow
+            | Trap::BadConversion
+            | Trap::Unreachable
+            | Trap::IndirectCallType
+            | Trap::CapFault
+            | Trap::OutOfFuel
+    );
+    // The kind itself is the shared wire code, never a second table (#1735).
+    modeled.then(|| TrapKind::from_code(t.code() as u32).expect("a trap kind"))
 }
 
 fn is_float(t: ValType) -> bool {

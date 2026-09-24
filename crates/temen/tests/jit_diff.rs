@@ -831,15 +831,17 @@ block 0 (v0: i32, v1: f64) {
 /// asserted where it is actually exercised, in `jit_fuzz` (`jit_matches_interp_under_tight_fuel`) and
 /// `jit_fuel`. Leaving it unmapped here is therefore correct: an unarmed run cannot produce it.
 fn interp_trap_kind(t: &Trap) -> Option<TrapKind> {
-    match t {
-        Trap::DivByZero => Some(TrapKind::DivByZero),
-        Trap::IntOverflow => Some(TrapKind::IntOverflow),
-        Trap::BadConversion => Some(TrapKind::BadConversion),
-        Trap::Unreachable => Some(TrapKind::Unreachable),
-        Trap::IndirectCallType => Some(TrapKind::IndirectCallType),
-        Trap::CapFault => Some(TrapKind::CapFault),
-        _ => None,
-    }
+    let asserted = matches!(
+        t,
+        Trap::DivByZero
+            | Trap::IntOverflow
+            | Trap::BadConversion
+            | Trap::Unreachable
+            | Trap::IndirectCallType
+            | Trap::CapFault
+    );
+    // The kind itself is the shared wire code, never a second table (#1735).
+    asserted.then(|| TrapKind::from_code(t.code() as u32).expect("a trap kind"))
 }
 
 /// Run the differential check against function index `idx` (not just 0): the JIT and
@@ -1346,9 +1348,7 @@ mod cap {
     use temen_interp::{
         run_capture_reserved_with_host, run_with_host, GuestMem, Host, StreamRole, Trap, Value,
     };
-    use temen_jit::{
-        compile_and_run_capture_reserved_with_host, compile_and_run_with_host, TrapKind, EXIT_CODE,
-    };
+    use temen_jit::{compile_and_run_capture_reserved_with_host, compile_and_run_with_host};
     use temen_run::MprotectWindow;
     use temen_text::parse_module;
     use temen_verify::verify_module;
@@ -1401,9 +1401,8 @@ mod cap {
                 }
                 *trap_out = 0;
             }
-            Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-            // CapFault (forged/wrong-type/closed) and anything else map to a CapFault trap.
-            Err(_) => *trap_out = TrapKind::CapFault as i64,
+            // The host's trap on the one wire code, as `temen_run::cap_thunk` reports it (#1735).
+            Err(t) => *trap_out = t.code(),
         }
     }
 

@@ -49,7 +49,7 @@ pub mod exec;
 pub mod fs;
 mod jit_proc;
 pub mod posix;
-use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind, EXIT_CODE};
+use temen_jit::{compile_and_run, CompiledModule, JitFrameLoc, JitOutcome, TrapKind};
 pub use temen_peval::{SpecArg, SpecConfig};
 
 /// Render a JIT trap-time backtrace (§5 W3) for a kill message — `\n    #i file:line:col in <name>`
@@ -177,7 +177,7 @@ impl Drop for WindowRegionPurge {
 /// Honours the `CapThunk` contract: `ctx` is a live `*mut Host`; `args`/`results` are valid for
 /// `n_args`/`n_results`; `mem_base` (when non-null) is the guest window with `mem_size` backed
 /// bytes inside a `mem_reserved` reservation; `trap_out` is writable. The trap cell is encoded as
-/// the JIT expects: `0` = ok, a [`TrapKind`] for a fault, or `EXIT_CODE | (code << 32)` for `Exit`.
+/// the JIT expects: `0` = ok, else the host trap's wire code ([`Trap::code`], [`temen_ir::trap_code`]).
 pub unsafe extern "C" fn cap_thunk(
     ctx: *mut c_void,
     mem_base: *mut u8,
@@ -531,8 +531,10 @@ unsafe fn cap_thunk_impl(
                     continue;
                 }
             }
-            Err(Trap::Exit(code)) => *trap_out = EXIT_CODE as i64 | ((code as i64) << 32),
-            Err(_) => *trap_out = TrapKind::CapFault as i64,
+            // #1735 — the host's trap, whichever it is, on the one wire code: every trap but `Exit`
+            // used to become `CapFault` here, so a forged `join` handle reported `CapFault` on the
+            // JIT and `ThreadFault` on the oracle (#1573).
+            Err(t) => *trap_out = t.code(),
         }
         return;
     }
@@ -2419,8 +2421,8 @@ unsafe extern "C" fn fast_clock_now(
             *trap_out = 0;
             ns
         }
-        Some(Err(_)) => {
-            *trap_out = TrapKind::CapFault as i64;
+        Some(Err(t)) => {
+            *trap_out = t.code();
             0
         }
         // A W1 tape is active — take the full path so the input is recorded/replayed.
@@ -2450,12 +2452,8 @@ unsafe fn fast_dispatch(
             *trap_out = 0;
             res.first().copied().unwrap_or(0)
         }
-        Err(Trap::Exit(code)) => {
-            *trap_out = EXIT_CODE as i64 | ((code as i64) << 32);
-            0
-        }
-        Err(_) => {
-            *trap_out = TrapKind::CapFault as i64;
+        Err(t) => {
+            *trap_out = t.code(); // #1735: the host's own trap, as `cap_thunk` reports it
             0
         }
     }
@@ -3343,8 +3341,8 @@ pub unsafe extern "C" fn premap_admit(
     match parent.premap_admit(region, child_off, child_size) {
         Ok(true) => 1,
         Ok(false) => 0,
-        Err(_) => {
-            *trap_out = TrapKind::CapFault as i64;
+        Err(t) => {
+            *trap_out = t.code(); // #1735: the host's own trap
             -1
         }
     }
@@ -3459,13 +3457,7 @@ unsafe fn read_grant_records(
         }
     };
     temen_interp::read_grant_records(grants_ptr, grants_n, read)
-        .map_err(|t| {
-            let kind = match t {
-                Trap::MemoryFault => TrapKind::MemoryFault,
-                _ => TrapKind::CapFault,
-            };
-            *trap_out = kind as i64;
-        })
+        .map_err(|t| *trap_out = t.code())
         .ok()
 }
 

@@ -291,6 +291,55 @@ pub mod page_state {
     pub const BACKED_RO: u8 = 5;
 }
 
+/// The **trap wire code** (#1735): how every engine, thunk and embedder status says *which* trap
+/// ended a run. One numbering, here — the wire-IR crate every engine already depends on — as
+/// [`errno`] is for error values: the interpreters' `Trap::code`/`Trap::from_code`, the Cranelift
+/// JIT's `TrapKind` and trap cell, the host thunks that carry a `Trap` into that cell, the wasm-JIT's
+/// `env.trap` codes, the snapshot codec (#1674) and the browser's run status all use these values,
+/// so a trap crosses any of those boundaries unchanged. They were four encodings before, two of which
+/// collided (the wasm-JIT's 1/2/3 meant DivByZero/IntOverflow/BadConversion to the JIT), and the
+/// Cranelift cap thunk collapsed every host trap to `CAP_FAULT` (#1573).
+///
+/// A code is an `i64`: the kind in the low 32 bits and, for [`EXIT`] alone, the guest's exit status
+/// in the high 32 ([`exit`]). `0` is "no trap". Values are append-only (they ride artifacts).
+pub mod trap_code {
+    /// Integer division or remainder by zero.
+    pub const DIV_BY_ZERO: i64 = 1;
+    /// Signed division overflow (`MIN / -1`).
+    pub const INT_OVERFLOW: i64 = 2;
+    /// A float→int conversion out of range (or NaN).
+    pub const BAD_CONVERSION: i64 = 3;
+    /// An `unreachable` terminator was executed.
+    pub const UNREACHABLE: i64 = 4;
+    /// A `call.dyn` whose callee's type does not match.
+    pub const INDIRECT_CALL_TYPE: i64 = 5;
+    /// A forged, closed or wrong-type capability handle (§3c).
+    pub const CAP_FAULT: i64 = 6;
+    /// The guest chose to exit; the status rides the high 32 bits ([`exit`]).
+    pub const EXIT: i64 = 7;
+    /// A memory access outside the window or against its protection (§4/§5).
+    pub const MEMORY_FAULT: i64 = 8;
+    /// A §12 fiber operation failed (forged/dead handle, root `suspend`, fiber bomb).
+    pub const FIBER_FAULT: i64 = 9;
+    /// A §12 thread operation failed (forged/joined handle, thread bomb), or a domain deadlock.
+    pub const THREAD_FAULT: i64 = 10;
+    /// The host bounded the run (fuel exhausted, or the kill-path interrupt).
+    pub const OUT_OF_FUEL: i64 = 11;
+    /// Structurally invalid in a way a verified module never is (a stale `longjmp` token).
+    pub const MALFORMED: i64 = 12;
+    /// The guest's control stack overflowed.
+    pub const STACK_OVERFLOW: i64 = 13;
+    /// Reserved, JIT-internal: the root completed and the domain is being torn down. Never surfaced.
+    pub const DOMAIN_DONE: i64 = 14;
+    /// Reserved, JIT-internal: a host thunk unwound the run on the host's behalf (`execve`).
+    pub const HOST_UNWIND: i64 = 15;
+
+    /// The code for an exit with guest status `status`.
+    pub const fn exit(status: i32) -> i64 {
+        EXIT | ((status as u32 as i64) << 32)
+    }
+}
+
 /// The **durable (freeze/thaw) ABI layout** (DURABILITY.md §12) — the byte offsets and state-word
 /// values the transform emits and every backend (temen-durable, temen-interp, temen-jit) plus the durable
 /// runtime must agree on. Hoisted here (temen-ir is the common dependency of all three) so the layout

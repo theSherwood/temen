@@ -247,46 +247,48 @@ impl Trap {
         }
     }
 
-    /// The trap's stable numeric code: the JIT's trap-cell numbering (`TrapKind`, with `Exit` as
-    /// `7 | code << 32`), which is also what the snapshot codec writes for a trap that rides an
-    /// artifact (#1674). One numbering for both, so a trap crosses engines and artifacts unchanged.
+    /// The trap's wire code ([`temen_ir::trap_code`]): the one numbering every engine, thunk, artifact
+    /// (#1674) and embedder status shares, so a trap crosses any of them unchanged (#1735).
     pub fn code(self) -> i64 {
+        use temen_ir::trap_code as c;
         match self {
-            Trap::DivByZero => 1,
-            Trap::IntOverflow => 2,
-            Trap::BadConversion => 3,
-            Trap::Unreachable => 4,
-            Trap::IndirectCallType => 5,
-            Trap::CapFault => 6,
-            Trap::Exit(k) => 7 | ((k as u32 as i64) << 32),
-            Trap::MemoryFault => 8,
-            Trap::FiberFault => 9,
-            Trap::ThreadFault => 10,
-            Trap::OutOfFuel => 11,
-            Trap::Malformed => 12,
-            Trap::StackOverflow => 13,
+            Trap::DivByZero => c::DIV_BY_ZERO,
+            Trap::IntOverflow => c::INT_OVERFLOW,
+            Trap::BadConversion => c::BAD_CONVERSION,
+            Trap::Unreachable => c::UNREACHABLE,
+            Trap::IndirectCallType => c::INDIRECT_CALL_TYPE,
+            Trap::CapFault => c::CAP_FAULT,
+            Trap::Exit(k) => c::exit(k),
+            Trap::MemoryFault => c::MEMORY_FAULT,
+            Trap::FiberFault => c::FIBER_FAULT,
+            Trap::ThreadFault => c::THREAD_FAULT,
+            Trap::OutOfFuel => c::OUT_OF_FUEL,
+            Trap::Malformed => c::MALFORMED,
+            Trap::StackOverflow => c::STACK_OVERFLOW,
         }
     }
 
-    /// The trap a [`Self::code`] names, if any.
-    pub fn from_code(c: i64) -> Option<Trap> {
-        Some(match c & 0xffff_ffff {
-            1 => Trap::DivByZero,
-            2 => Trap::IntOverflow,
-            3 => Trap::BadConversion,
-            4 => Trap::Unreachable,
-            5 => Trap::IndirectCallType,
-            6 => Trap::CapFault,
-            7 => Trap::Exit((c >> 32) as i32),
-            8 => Trap::MemoryFault,
-            9 => Trap::FiberFault,
-            10 => Trap::ThreadFault,
-            11 => Trap::OutOfFuel,
-            12 => Trap::Malformed,
-            13 => Trap::StackOverflow,
+    /// The trap a [`Self::code`] names, if any — exact: a code no trap encodes (a reserved
+    /// JIT-internal sentinel, or stray high bits on a non-`Exit` kind) is `None`.
+    pub fn from_code(code: i64) -> Option<Trap> {
+        use temen_ir::trap_code as c;
+        Some(match code & 0xffff_ffff {
+            c::DIV_BY_ZERO => Trap::DivByZero,
+            c::INT_OVERFLOW => Trap::IntOverflow,
+            c::BAD_CONVERSION => Trap::BadConversion,
+            c::UNREACHABLE => Trap::Unreachable,
+            c::INDIRECT_CALL_TYPE => Trap::IndirectCallType,
+            c::CAP_FAULT => Trap::CapFault,
+            c::EXIT => Trap::Exit((code >> 32) as i32),
+            c::MEMORY_FAULT => Trap::MemoryFault,
+            c::FIBER_FAULT => Trap::FiberFault,
+            c::THREAD_FAULT => Trap::ThreadFault,
+            c::OUT_OF_FUEL => Trap::OutOfFuel,
+            c::MALFORMED => Trap::Malformed,
+            c::STACK_OVERFLOW => Trap::StackOverflow,
             _ => return None,
         })
-        .filter(|t| t.code() == c)
+        .filter(|t| t.code() == code)
     }
 }
 
