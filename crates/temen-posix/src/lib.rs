@@ -3737,9 +3737,10 @@ impl Ctx<'_> {
         pid as i64
     }
 
-    /// `waitpid(pid, status_ptr, options) -> pid | -errno`: reap `pid` (or any pending child when
-    /// `pid == -1`), writing its wait-encoded status to `status_ptr` when non-null. `options` (e.g.
-    /// `WNOHANG`) is ignored — a spawned child has already run to completion, so a reap never blocks.
+    /// `waitpid(pid, status_ptr, options) -> pid | 0 | -errno`: reap `pid` (or any pending child
+    /// when `pid == -1`), writing its wait-encoded status to `status_ptr` when non-null. With
+    /// `WNOHANG`, a matching own child that has not exited yet is `0`, as POSIX specifies: pollers
+    /// (`osproc.running`, nifmake's job loop) read `-ECHILD` as "no such child" and give up on it.
     /// `-ECHILD` when there is no such child.
     fn waitpid(&mut self, args: &[i64], mem: Option<&mut dyn GuestMem>) -> Result<Vec<i64>, Trap> {
         let mem = mem.ok_or(Trap::Malformed)?;
@@ -3747,9 +3748,9 @@ impl Ctx<'_> {
         let status_ptr = *args.get(1).unwrap_or(&0) as u64;
         // #863 — reap from the process table: [`ProcEntry::Zombie`] entries are reapable here —
         // completed spawn-delegate children, and (hygiene slice) **exited fork twins**, whose exit
-        // hook flipped them Live → Zombie. A still-running twin is `-ECHILD` (this op never blocks
-        // — a guest polls, or parks in the core's servicer reap, the wait offer, which serves the
-        // same twin independently; use one channel per child).
+        // hook flipped them Live → Zombie. A still-running twin is `0` under `WNOHANG` and otherwise
+        // benches the caller (below) — or parks it in the core's servicer reap, the wait offer, which
+        // serves the same twin independently; use one channel per child.
         let is_zombie = |e: Option<&ProcEntry>| matches!(e, Some(ProcEntry::Zombie { .. }));
         // #1080 pipeline rung — reap ownership: `waitpid` reaps only the caller's OWN children (POSIX).
         // The zombie carries the `ppid` it exited with; a wildcard/`-pgid` reap that ignored it would let
@@ -3827,6 +3828,24 @@ impl Ctx<'_> {
             }
         }
         let Some(p) = reaped else {
+            // `WNOHANG` over a matching own child that is still running: `0`, not `-ECHILD` — the
+            // child exists, it just has nothing to report yet.
+            if (opts & WNOHANG) != 0 {
+                let running = self.w.procs.iter().any(|(&tpid, e)| {
+                    let ProcEntry::Live(t) = e else { return false };
+                    if tpid == self_pid {
+                        return false;
+                    }
+                    let tp = t.lock().unwrap_or_else(|e| e.into_inner());
+                    tp.ppid == self_pid
+                        && (pid == -1
+                            || (pid > 0 && tpid as i64 == pid)
+                            || (pid < -1 && tp.pgid == (-pid) as i32))
+                });
+                if running {
+                    return Ok(vec![0]);
+                }
+            }
             // #799 — blocking `waitpid`: nothing to reap and the caller did not opt out
             // (`WNOHANG`) or ask for stop/continue reports (those keep polling this rung).
             // If the target is a specific, Live, core-task twin — exactly the processes the

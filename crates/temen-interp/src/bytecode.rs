@@ -1314,6 +1314,36 @@ pub(crate) fn child_entry_ok(params: &[ValType], results: &[ValType]) -> bool {
         && (params == [ValType::I64] || params == [ValType::I64, ValType::I64])
 }
 
+/// What an **exec'd image's entry** takes: the count of starter caps its entry receives, or `None`
+/// if exec cannot start it. A command enters one of two ways (#1668): the chibicc `--child-entry`
+/// ABI takes its starter caps as arguments (1: Instantiator, 2: also AddressSpace), and a powerbox
+/// `_start` — how every nimony program enters — takes none and finds what it needs by name. The
+/// one rule both engines' exec paths admit by; it was the tree-walker's alone, so on the bytecode
+/// engine `sh -c "bin/nifler …"` reached nifler and was refused `-EINVAL`.
+pub(crate) fn exec_entry_arity(
+    module: &temen_ir::Module,
+    entry: u64,
+    sig: Option<(&[ValType], &[ValType])>,
+) -> Option<usize> {
+    let (params, results) = sig?;
+    if child_entry_ok(params, results) {
+        Some(params.len())
+    } else if entry == 0 && temen_ir::is_named_powerbox_entry(module) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
+/// The starter caps an exec'd entry of [`exec_entry_arity`] `arity` is called with.
+pub(crate) fn exec_entry_args(arity: usize, cinst: i32, cas: i32) -> Vec<Value> {
+    match arity {
+        0 => Vec::new(),
+        1 => vec![Value::I64(cinst as i64)],
+        _ => vec![Value::I64(cinst as i64), Value::I64(cas as i64)],
+    }
+}
+
 /// A §5 `instantiate_detached` (op 15) child as every bytecode driver builds it — the **one
 /// definition** of admission and of the child powerbox (INVARIANTS #15), shared by the cooperative
 /// executor (`drive`), the OS-thread parallel driver (`run_vcpu_parallel`) and the debug scheduler
@@ -5215,13 +5245,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
@@ -5240,6 +5264,24 @@ pub fn compile_and_run_capture_reserved_with_host(
         reserved_log2,
         host,
     )
+}
+
+/// The modules the reserved-window entries refuse before compiling: multi-vCPU `thread.*` and §14
+/// nesting (`Instantiator` calls) — see [`compile_and_run_capture_reserved_with_host`] for why.
+fn outside_reserved_subset(m: &Module) -> bool {
+    m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+        })
+    })
+}
+
+/// Whether this engine runs `m` at all on the reserved-window path — the question a caller that
+/// must not silently fall back to the tree-walker has to ask first (the answer
+/// [`compile_and_run_capture_reserved_with_host`] gives as `None`, after the fact).
+pub fn admits_reserved(m: &Module) -> bool {
+    !outside_reserved_subset(m) && compile_module_for(m).is_some()
 }
 
 /// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
@@ -5271,13 +5313,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
 ) -> Option<Capture> {
     // Same out-of-scope gate as the compile-and-run entry — a cached program from a caller that also
     // holds the module must still refuse the `thread.*`/§14-nesting shapes the freeze path can't drive.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     if func as usize >= compiled.progs.len() {
@@ -9197,23 +9233,23 @@ fn exec_image_build(
     .ok_or(())?;
     // Entry sig + window fit: the command reuses the caller's window in place, so its declared memory
     // must be `<=` the caller's backed-prefix window (a larger window is a safe §2-masked superset).
-    let want_as = child_compiled
-        .sigs
-        .get(entry as usize)
-        .is_some_and(|(p, _)| p[..] == [ValType::I64, ValType::I64]);
-    let ok_entry = child_compiled
-        .sigs
-        .get(entry as usize)
-        .is_some_and(|(p, r)| child_entry_ok(p, r));
+    let arity = exec_entry_arity(
+        &cmodule,
+        entry,
+        child_compiled
+            .sigs
+            .get(entry as usize)
+            .map(|(p, r)| (&p[..], &r[..])),
+    );
     let win_bytes = cur_mem.map_or(0, |m| m.window.mapped());
     let win_log2 = win_bytes
         .is_power_of_two()
         .then(|| win_bytes.trailing_zeros() as u8);
     let size_ok = (0..64).contains(&size_log2);
     let mod_ok = win_log2.zip(cmem_log2).is_some_and(|(wl, ml)| ml <= wl);
-    if !ok_entry || !size_ok || !mod_ok {
+    let Some(arity) = arity.filter(|_| size_ok && mod_ok) else {
         return Err(());
-    }
+    };
     let child_size = 1u64 << win_log2.expect("mod_ok implies a power-of-two window");
     // Read + authority-check the by-name grant list (16-byte `{name_off, name_len, handle, flags}`
     // records, the op-13 layout) from the caller window.
@@ -9238,12 +9274,16 @@ fn exec_image_build(
     // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
     // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
     let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
-    cur_host.exec_carry(&mut child_host, &cmodule, &cmodule.imports, &cmodule.types)?;
-    let child_args = if want_as {
-        vec![Value::I64(cinst as i64), Value::I64(cas as i64)]
-    } else {
-        vec![Value::I64(cinst as i64)]
-    };
+    let mut starters = [cinst, cas];
+    cur_host.exec_carry(
+        &mut child_host,
+        &cmodule,
+        &cmodule.imports,
+        &cmodule.types,
+        &mut starters,
+    )?;
+    let [cinst, cas] = starters;
+    let child_args = exec_entry_args(arity, cinst, cas);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
     if let Some(m) = cur_mem {
