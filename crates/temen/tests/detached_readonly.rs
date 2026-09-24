@@ -31,13 +31,14 @@ block 0 (vinst: i32, vmod: i32, vbud: i32) {
 }
 ";
 
-/// The child (64 KiB): a readonly segment at 16384 and a writable one at 20480; `body` runs, then
-/// the child returns the i32 at `ret`.
+/// The child (64 KiB): a readonly segment at 16384 and a writable one at 32768; `body` runs, then
+/// the child returns the i32 at `ret`. RO protection is host-page granular, so the two segments sit
+/// in different 16 KiB pages (macOS arm64's page) — at 20480 the writable one shared the RO page.
 fn child(body: &str, ret: u64) -> String {
     format!(
         "memory 16
 data ro 16384 \"abcd\"
-data 20480 \"wxyz\"
+data 32768 \"wxyz\"
 func (i64) -> (i64) {{
 block 0 (v0: i64) {{
 {body}  vra = i64.const {ret}
@@ -98,7 +99,7 @@ const WXYZ: i64 = 0x7a79_7877;
 /// Control: both segments are seeded and readable.
 #[test]
 fn a_detached_child_reads_its_data_segments() {
-    for (at, want) in [(16384, ABCD), (20480, WXYZ)] {
+    for (at, want) in [(16384, ABCD), (32768, WXYZ)] {
         let c = parse(&child("", at));
         assert_eq!(oracle(&c), Ok(want), "oracle reads {at}");
         if let Some(o) = cranelift(&c) {
@@ -111,8 +112,8 @@ fn a_detached_child_reads_its_data_segments() {
 #[test]
 fn a_detached_child_writes_its_writable_segment() {
     let c = parse(&child(
-        "  va = i64.const 20480\n  vz = i32.const 7\n  i32.store va vz\n",
-        20480,
+        "  va = i64.const 32768\n  vz = i32.const 7\n  i32.store va vz\n",
+        32768,
     ));
     assert_eq!(oracle(&c), Ok(7));
     if let Some(o) = cranelift(&c) {
