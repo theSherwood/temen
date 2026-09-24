@@ -3703,7 +3703,7 @@ fn a_compiled_c_shell_runs_the_job_control_loop() {
 /// 2. `waitpid(-1, WUNTRACED)` reports the stop (`SIGTSTP<<8 | 0x7f`) — and only once.
 /// 3. `kill(child, 10)` — delivered **while stopped**, so it must be HELD: the child, were it
 ///    secretly still running, would consume it and exit. A long busy-wait gives the cooperative
-///    scheduler every chance to run it; `waitpid(child, 0)` still `-ECHILD` is the proof of
+///    scheduler every chance to run it; `waitpid(child, WNOHANG)` still `0` is the proof of
 ///    stopped-ness (the interp would happily have scheduled a runnable child during the wait).
 /// 4. `kill(child, SIGCONT)` — the domain resumes, the HELD signal delivers, the child exits 5;
 ///    `waitpid(WCONTINUED)` reports the continue (`0xffff`), then the reap collects the 5.
@@ -3736,15 +3736,16 @@ int main(int argc, char **argv) {
   if (r != pid) return 2;
   if ((status & 0xff) != 0x7f) return 3;                /* stopped marker */
   if (((status >> 8) & 0xff) != 20) return 4;           /* by SIGTSTP */
-  if (__vm_fs(28, -1, (long)&status, 3, 0) != -10) return 6;  /* report-once: the WNOHANG probe
+  if (__vm_fs(28, -1, (long)&status, 3, 0) != 0) return 6;   /* report-once: the WNOHANG probe
+                                              answers 0, "no child changed state" (POSIX; #1770)
                                               (#802 — a blocking WUNTRACED wait now BENCHES until
                                               the child's next transition, POSIX; the pre-#802
                                               plain-2 probe relied on the old polling answer) */
   if (__vm_fs(31, pid, 10, 0, 0) != 0) return 7;        /* the 10 lands while stopped: HELD */
   for (i = 0; i < 200000; i = i + 1) sink = i;          /* every chance to run, were it runnable */
-  if (__vm_fs(28, pid, (long)&status, 1, 0) != -10) return 8;  /* WNOHANG probe (#799 — a plain
+  if (__vm_fs(28, pid, (long)&status, 1, 0) != 0) return 8;   /* WNOHANG probe (#799 — a plain
                                               waitpid now BLOCKS, and a stopped child without
-                                              WUNTRACED would park this probe forever): still
+                                              WUNTRACED would park this probe forever): 0, still
                                               alive, truly stopped */
   if (__vm_fs(31, pid, 18, 0, 0) != 0) return 9;        /* kill(child, SIGCONT): resume */
   /* Retry on both the not-yet poll (-10) and a spurious -EINTR (-4, #1207): the SIGCONT itself fires

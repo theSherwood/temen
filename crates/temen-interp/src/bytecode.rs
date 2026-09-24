@@ -5293,13 +5293,7 @@ pub fn compile_and_run_capture_reserved_with_host(
     // fail-closed refusal of a freeze over a live-or-unjoined §14 child; this engine's own
     // instantiate arm has none of them, so driving a durable §14 module here would both skip the
     // admission rule and mint the exact thaw-faulting artifact the tree-walker refuses.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     // `cont.*` durability is fully supported (DURABILITY.md §12.8): the per-fiber shadow-SP swap keeps
@@ -5318,6 +5312,24 @@ pub fn compile_and_run_capture_reserved_with_host(
         reserved_log2,
         host,
     )
+}
+
+/// The modules the reserved-window entries refuse before compiling: multi-vCPU `thread.*` and §14
+/// nesting (`Instantiator` calls) — see [`compile_and_run_capture_reserved_with_host`] for why.
+fn outside_reserved_subset(m: &Module) -> bool {
+    m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
+        b.insts.iter().any(|i| {
+            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
+                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
+        })
+    })
+}
+
+/// Whether this engine runs `m` at all on the reserved-window path — the question a caller that
+/// must not silently fall back to the tree-walker has to ask first (the answer
+/// [`compile_and_run_capture_reserved_with_host`] gives as `None`, after the fact).
+pub fn admits_reserved(m: &Module) -> bool {
+    !outside_reserved_subset(m) && compile_module_for(m).is_some()
 }
 
 /// #1144 — **compile the reserved-window program without running it**, so a caller (the browser bash
@@ -5349,13 +5361,7 @@ pub fn run_capture_reserved_over_compiled_with_host(
 ) -> Option<Capture> {
     // Same out-of-scope gate as the compile-and-run entry — a cached program from a caller that also
     // holds the module must still refuse the `thread.*`/§14-nesting shapes the freeze path can't drive.
-    let outside = m.funcs.iter().flat_map(|f| f.blocks.iter()).any(|b| {
-        b.insts.iter().any(|i| {
-            matches!(i, Inst::ThreadSpawn { .. } | Inst::ThreadJoin { .. })
-                || matches!(i, Inst::CapCall { type_id, .. } if *type_id == super::cap_id::INSTANTIATOR)
-        })
-    });
-    if outside {
+    if outside_reserved_subset(m) {
         return None;
     }
     if func as usize >= compiled.progs.len() {
@@ -9344,7 +9350,15 @@ fn exec_image_build(
     // Build the command's fresh powerbox, then carry the process state (personality/fds/signals) into
     // it via the shared `exec_carry` (unwinds + `Err` on a manifest-bind failure → the caller refuses).
     let (mut child_host, cinst, cas) = cur_host.spawn_named_child(&grants, child_size).ok_or(())?;
-    cur_host.exec_carry(&mut child_host, &cmodule, &cmodule.imports, &cmodule.types)?;
+    let mut starters = [cinst, cas];
+    cur_host.exec_carry(
+        &mut child_host,
+        &cmodule,
+        &cmodule.imports,
+        &cmodule.types,
+        &mut starters,
+    )?;
+    let [cinst, cas] = starters;
     let child_args = child_entry_args(arity, cinst, cas);
     // Materialize the command image into the caller's window in place: zero the fresh image extent (the
     // C `.bss` guarantee), then write its data segments (bounded to the window by the verifier).
