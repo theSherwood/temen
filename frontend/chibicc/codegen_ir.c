@@ -714,11 +714,9 @@ static void gen_memcpy(int dst, int src, int size) {
   }
 }
 
-// The address of an lvalue, as an SSA i64.
 // A thread-local's address (#1715): this thread's block plus the variable's offset in it. The block
 // is the vCPU's `vcpu.tls` word, or the root block while that word is 0 — the root vCPU's seed, so the
-// root thread needs no setup. A spawned thread installs its own block first (`__vm_tls_install`, in
-// `<pthread.h>`). The offset is a link form under `--emit-object` (`data.self tls` for a thread-local
+// root thread needs no setup. A spawned thread installs its own block first (`<pthread.h>`). The offset is a link form under `--emit-object` (`data.self tls` for a thread-local
 // defined here, `data.sym tls` for one another unit exports), and a constant whole-program.
 static int gen_tls_addr(Obj *var) {
   int w = nv++;
@@ -744,6 +742,7 @@ static int gen_tls_addr(Obj *var) {
   return r;
 }
 
+// The address of an lvalue, as an SSA i64.
 static int gen_addr(Node *node) {
   switch (node->kind) {
   case ND_VAR: {
@@ -1722,13 +1721,15 @@ static int gen_builtin_thread_spawn(Node *node) {
   return r; // i32 thread handle
 }
 
-// Thread-local setup for a new thread (#1715), used by `<pthread.h>`:
+// Thread-local setup for a new thread (#1715), used by `<pthread.h>`. The same three builtins the
+// LLVM on-ramp lowers (temen-llvm, NIM.md §3d), so one `<pthread.h>` serves both compilers:
 //
-//   long __vm_tls_size(void);         // bytes in a thread's block (0: the program has no thread-locals)
-//   void __vm_tls_install(void *blk); // copy the pristine image into blk, then make it this vCPU's block
+//   long  __vm_tls_size(void);          // bytes in a thread's block (0: the program has no thread-locals)
+//   void *__vm_tls_template(void);      // the pristine image a new thread's block is copied from
+//   void  __vm_vcpu_tls_set(long blk);  // make blk this vCPU's block (`vcpu.tls.set`)
 //
-// Both read the linker's `__tls_image`/`__tls_end` (constants whole-program), so a unit that only
-// creates threads needs no thread-locals of its own.
+// The first two read the linker's `__tls_image`/`__tls_end` (constants whole-program), so a unit that
+// only creates threads needs no thread-locals of its own.
 static void gen_tls_image_end(int *img, int *end) {
   *img = nv++;
   *end = nv++;
@@ -1751,15 +1752,18 @@ static int gen_builtin_tls_size(Node *node) {
   return r;
 }
 
-static int gen_builtin_tls_install(Node *node) {
-  if (!node->args || node->args->next)
-    error_tok(node->tok, "codegen_ir: __vm_tls_install(blk) expects 1 argument");
-  int blk = widen_i64(gen_expr(node->args), node->args->ty);
+static int gen_builtin_tls_template(Node *node) {
+  if (node->args)
+    error_tok(node->tok, "codegen_ir: __vm_tls_template() takes no arguments");
   int img, end;
   gen_tls_image_end(&img, &end);
-  int n = nv++;
-  cg("  v%d = i64.sub v%d v%d\n", n, end, img);
-  cg("  mem.copy v%d v%d v%d\n", blk, img, n);
+  return img;
+}
+
+static int gen_builtin_vcpu_tls_set(Node *node) {
+  if (!node->args || node->args->next)
+    error_tok(node->tok, "codegen_ir: __vm_vcpu_tls_set(blk) expects 1 argument");
+  int blk = widen_i64(gen_expr(node->args), node->args->ty);
   cg("  vcpu.tls.set v%d\n", blk);
   return 0; // void
 }
@@ -2177,8 +2181,10 @@ static int gen_expr(Node *node) {
           return gen_builtin_thread_join(node);
         if (!strcmp(fname, "__vm_tls_size"))
           return gen_builtin_tls_size(node);
-        if (!strcmp(fname, "__vm_tls_install"))
-          return gen_builtin_tls_install(node);
+        if (!strcmp(fname, "__vm_tls_template"))
+          return gen_builtin_tls_template(node);
+        if (!strcmp(fname, "__vm_vcpu_tls_set"))
+          return gen_builtin_vcpu_tls_set(node);
         if (!strcmp(fname, "__vm_atomic_add"))
           return gen_builtin_atomic_add(node);
         if (!strcmp(fname, "__vm_atomic_load"))

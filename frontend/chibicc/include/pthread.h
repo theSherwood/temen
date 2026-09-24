@@ -31,8 +31,10 @@ void __vm_atomic_store32(void *p, int v);
 int __vm_atomic_add32(void *p, int v);
 int __vm_wait32(void *p, int expected, long timeout_ns);
 int __vm_notify(void *p, int count);
-long __vm_tls_size(void);         // bytes in a thread's `_Thread_local` block (0: none in the program)
-void __vm_tls_install(void *blk); // copy the initial values into blk; make it this thread's block
+// `_Thread_local` blocks (#1715) — the same builtins chibicc and the LLVM on-ramp both lower.
+long __vm_tls_size(void);         // bytes in a thread's block (0: the program has no thread-locals)
+void *__vm_tls_template(void);    // the program's initial values, which a new block is copied from
+void __vm_vcpu_tls_set(long blk); // make blk this thread's block
 
 // ---- threads (1:1) -------------------------------------------------------------------------
 typedef int pthread_t;
@@ -61,13 +63,17 @@ struct __pthread_rec {
 // with no thread-locals allocates no block and never touches `vcpu.tls`. The install is its own
 // function so that `vcpu.tls` stays out of this entry: the browser's wasm-JIT tier does not compile
 // it, and would otherwise run every thread's entry on the interpreter.
-static void __pthread_tls_install(void *blk) {
-  __vm_tls_install(blk);
+static void __pthread_tls_install(char *blk) {
+  const char *img = (const char *)__vm_tls_template();
+  long n = __vm_tls_size();
+  for (long i = 0; i < n; i++)
+    blk[i] = img[i];
+  __vm_vcpu_tls_set((long)blk);
 }
 static long __pthread_entry(long rec) {
   struct __pthread_rec *r = (struct __pthread_rec *)rec;
   if (r->tls)
-    __pthread_tls_install(r->tls);
+    __pthread_tls_install((char *)r->tls);
   return (long)r->fn(r->arg);
 }
 

@@ -3015,6 +3015,20 @@ fn c_guest_thread_safe_malloc() {
     );
 }
 
+/// `_Thread_local` across threads (`demos/thread_local`, #1715): three workers and the root each keep
+/// their own copies, starting from the program's initial values. The same file runs through the LLVM
+/// on-ramp (`temen-llvm`'s `demo_thread_local_vs_chibicc`) and must print the same.
+#[test]
+#[cfg(all(unix, target_arch = "x86_64"))]
+fn c_guest_thread_local() {
+    let src = include_str!("../../temen-run/demos/thread_local/thread_local.c");
+    let run = run_c_full(src);
+    assert_eq!(
+        run.stdout, b"10010007\n110010008\n210010009\n5\nroot\n",
+        "each thread sees its own copies, on both backends"
+    );
+}
+
 /// §7 slice 3b — a brand-new host capability reached as a plain `extern`, no frontend special-case.
 /// chibicc's builtins are `__vm_*`, but the host policy keys are `vm_*`, so `vm_page_size` is *not*
 /// a recognized builtin: it flows through the GENERIC undefined-extern → `call.import` path, with
